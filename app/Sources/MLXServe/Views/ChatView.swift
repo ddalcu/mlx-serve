@@ -457,7 +457,7 @@ struct ChatView: View {
                     get: { section },
                     set: { appState.selectModelSection($0) }))
             } else if appState.chatWorkspace.isSettings {
-                SettingsView(embedded: true)
+                SettingsView()
             } else if case .create(let experiment) = appState.chatWorkspace {
                 // The four generators were four Window scenes; they are pages
                 // of this window now. Each keeps its own view untouched — only
@@ -481,6 +481,14 @@ struct ChatView: View {
             }
         }
         .navigationTitle("")
+        // No toolbar material in ANY of this split's modes — the transcript,
+        // Models, Settings and the Create pages alike (the three-column split
+        // carries the same modifier). On the SPLIT, not on ChatDetailView:
+        // there it covered only conversation mode, and the chrome flipped as
+        // you switched panes. The BAR itself stays — the traffic lights and
+        // the sidebar-collapse button live in it (live 2026-08-09); see the
+        // long note above `threeColumnSplitView` and ChatDetailView's body.
+        .toolbarBackground(.hidden, for: .windowToolbar)
         // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
         // Cancel takes this sheet down. The getter is recomputed every update,
         // so it also clears ITSELF the moment a chat model lands.
@@ -571,6 +579,10 @@ enum SidebarRowStyle {
 
 struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
+    /// Observed directly — AppState forwards objectWillChange only for the
+    /// server and the agent store, so a badge reading `appState.downloads`
+    /// never repainted while a transfer started, progressed or finished.
+    @EnvironmentObject var downloads: DownloadManager
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
     /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
@@ -623,12 +635,12 @@ struct ChatSidebar: View {
         // that overlap. Not a hand-drawn band — a custom strip pulled into this
         // area once looked native and swallowed every click in it.
         .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
-        // Selecting a conversation is also how you leave the models pane — the
-        // list is the way back, which is the whole reason the browser stopped
-        // being a window.
-        .onChange(of: appState.activeChatId) { _, _ in
-            appState.showConversation()
-        }
+        // No blanket `.onChange(of: activeChatId) { showConversation() }`:
+        // every deliberate route into a conversation (the row button above,
+        // New Chat, the quick launcher) calls showConversation() itself, and
+        // the id ALSO moves on deleteSession's fallback — which yanked the
+        // user out of the Models/Create/Settings pane they were browsing when
+        // they deleted the active chat from the sidebar.
         // No Agents entry here: "Manage Agents…" lives in the composer's agent
         // chip, next to the control it configures, and a second route to the
         // same window only competed with the conversation list. Models is a
@@ -881,7 +893,7 @@ struct ChatSidebar: View {
     }
 
     private var activeDownloadCount: Int {
-        appState.downloads.downloads.values.filter { $0.status == .downloading }.count
+        downloads.downloads.values.filter { $0.status == .downloading }.count
     }
 
 }
@@ -891,6 +903,10 @@ struct ChatSidebar: View {
 struct ChatDetailView: View {
     let sessionId: UUID
     @EnvironmentObject var appState: AppState
+    /// Observed directly (AppState does not forward download publishes) — the
+    /// create banner's "not downloaded" pill and the held-prompt readiness
+    /// checks must repaint when the bytes land.
+    @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var toolExecutor: ToolExecutor
     @EnvironmentObject var mcpManager: MCPManager
@@ -934,25 +950,22 @@ struct ChatDetailView: View {
     /// The composer's create mode (`ChatCreateMode`) — nil for plain chat.
     /// Mirrors `ChatSession.createMode`; see `syncTogglesFromSession`.
     @State private var createMode: ChatCreateMode?
+    /// Expanded state of the create-mode settings disclosure.
+    @State private var showCreateSettings = false
+
+    // Create-mode generation state lives on AppState, keyed by session — NOT
+    // in @State here. This view is reused across tabs (a shared flag leaks
+    // between chats) and torn down on any workspace switch (the progress card
+    // and held prompt vanished while the generation task kept running).
     /// Live progress of a create-mode generation, rendered above the composer.
     /// Not the engine's `mediaProgress`: that one belongs to a TURN the model
     /// drove, and this is the user driving directly with no turn at all.
-    @State private var createProgress: MediaGenProgress?
-    /// Expanded state of the create-mode settings disclosure.
-    @State private var showCreateSettings = false
+    private var createProgress: MediaGenProgress? { appState.createProgress[sessionId] }
     /// Last create-mode failure, shown inline instead of thrown away.
-    @State private var createError: String?
+    private var createError: String? { appState.createErrors[sessionId] }
     /// A prompt typed before its model was on disk. Held (never dropped) while
     /// the download runs, then generated — see `ChatCreateSend`.
-    @State private var heldCreatePrompt: HeldCreatePrompt?
-
-    struct HeldCreatePrompt: Equatable {
-        let prompt: String
-        let sourcePath: String?
-        /// True once the transfer is under way, so the row can stop offering a
-        /// second Download press.
-        var downloading: Bool = false
-    }
+    private var heldCreatePrompt: HeldCreatePrompt? { appState.heldCreatePrompts[sessionId] }
     // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
     // matching mode is off, confirm before sending. `intentSuppress` remembers a
     // per-session "Send anyway" so we stop nagging that chat (keyed by session
@@ -1635,9 +1648,10 @@ struct ChatDetailView: View {
         // picker, the mode discs and the server control are in the COMPOSER row
         // (they configure the message, or report the thing you discover by
         // typing); Settings is a sidebar destination and still ⌘, from the menu
-        // bar. What was left was an empty band across the top of the window.
-        // The window's own toolbar material, full width. This was hidden for a
-        // no material now, in every mode — but the BAR stays.
+        // bar. What was left was an empty band across the top of the window,
+        // so its MATERIAL is hidden — by `standardSplitView`, which hosts every
+        // mode of this window, not here (on this view it covered only
+        // conversation mode and the chrome flipped as you switched panes).
         //
         // What the material was FOR: it frosted content scrolling under the
         // floating toolbar cluster, and `scrollEdgeEffectStyle` needs a bar to
@@ -1651,7 +1665,6 @@ struct ChatDetailView: View {
         // Hiding the bar ITSELF (`.toolbar(.hidden)`) is the thing that must
         // not come back: the traffic lights and the sidebar-collapse button are
         // its residents, and it took them with it (live 2026-08-09).
-        .toolbarBackground(.hidden, for: .windowToolbar)
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
@@ -2365,9 +2378,11 @@ struct ChatDetailView: View {
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
                             Button("Cancel") {
-                                // Give the words back rather than dropping them.
+                                // Give the words — and the attachments — back
+                                // rather than dropping them.
                                 inputText = held.prompt
-                                heldCreatePrompt = nil
+                                restorePendingImages(held.sourceImages)
+                                appState.heldCreatePrompts.removeValue(forKey: sessionId)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -2416,7 +2431,7 @@ struct ChatDetailView: View {
                     selectedId: settings.resolvedModel.id,
                     lanModel: nil,
                     capabilityOf: { $0.capabilityLabel },
-                    isDownloaded: { appState.downloads.bundleReady($0.bundle) },
+                    isDownloaded: { downloads.bundleReady($0.bundle) },
                     downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
                     onSelect: { preset in
                         var s = ImageGenSettings.load()
@@ -2425,7 +2440,7 @@ struct ChatDetailView: View {
                         s.save()
                     },
                     onDownload: { preset in
-                        appState.downloads.startBundle(preset.bundle) { appState.refreshModels() }
+                        downloads.startBundle(preset.bundle) { appState.refreshModels() }
                     },
                     lanCapability: "image")
                 Text("Size: \(settings.resolvedResolution(for: settings.resolvedModel).label) — change it in Create ▸ Image for the full set of controls.")
@@ -2451,9 +2466,9 @@ struct ChatDetailView: View {
 
     private func createModelReady(_ mode: ChatCreateMode) -> Bool {
         switch mode {
-        case .image: return appState.downloads.bundleReady(ImageGenSettings.load().resolvedModel.bundle)
-        case .video: return appState.downloads.bundleReady(VideoGenSettings.load().resolvedModel.bundle)
-        case .audio: return appState.downloads.bundleReady(AudioGenSettings.load().resolvedModel.bundle)
+        case .image: return downloads.bundleReady(ImageGenSettings.load().resolvedModel.bundle)
+        case .video: return downloads.bundleReady(VideoGenSettings.load().resolvedModel.bundle)
+        case .audio: return downloads.bundleReady(AudioGenSettings.load().resolvedModel.bundle)
         }
     }
 
@@ -2471,18 +2486,28 @@ struct ChatDetailView: View {
     private func startHeldDownload(_ mode: ChatCreateMode) {
         guard var held = heldCreatePrompt, !held.downloading else { return }
         held.downloading = true
-        heldCreatePrompt = held
+        appState.heldCreatePrompts[sessionId] = held
         let bundle: MediaBundle
         switch mode {
         case .image: bundle = ImageGenSettings.load().resolvedModel.bundle
         case .video: bundle = VideoGenSettings.load().resolvedModel.bundle
         case .audio: bundle = AudioGenSettings.load().resolvedModel.bundle
         }
-        appState.downloads.startBundle(bundle) {
+        downloads.startBundle(bundle) {
             appState.refreshModels()
-            guard let pending = heldCreatePrompt, pending.downloading else { return }
-            heldCreatePrompt = nil
-            runCreateGeneration(mode, prompt: pending.prompt, sourcePath: pending.sourcePath)
+            guard let pending = appState.heldCreatePrompts[sessionId],
+                  pending.downloading else { return }
+            // `onFinish` fires on failure and cancel too (DownloadManager's
+            // contract) — completion is only a generation when the model is
+            // actually on disk. Otherwise the prompt STAYS HELD and the offer
+            // row re-arms, which is the promise in the card's own text.
+            guard createModelReady(mode) else {
+                appState.heldCreatePrompts[sessionId]?.downloading = false
+                return
+            }
+            appState.heldCreatePrompts.removeValue(forKey: sessionId)
+            runCreateGeneration(mode, prompt: pending.prompt,
+                                sourceImages: pending.sourceImages)
         }
     }
 
@@ -2497,28 +2522,26 @@ struct ChatDetailView: View {
         case .ignore:
             return
         case .offerDownload:
-            // Typing is never blocked on a download. Hold what was written and
-            // offer to fetch the model; the words come back on Cancel.
-            let sourceImages = consumePendingImages()
-            heldCreatePrompt = .init(
-                prompt: prompt,
-                sourcePath: sourceImages?.first.flatMap { try? ChatImagePreview.writeTempFile($0).path })
+            // Typing is never blocked on a download. Hold what was written —
+            // attachments included — and offer to fetch the model; words and
+            // photos both come back on Cancel.
+            appState.heldCreatePrompts[sessionId] = HeldCreatePrompt(
+                prompt: prompt, sourceImages: consumePendingImages())
             inputText = ""
-            createError = nil
+            appState.createErrors.removeValue(forKey: sessionId)
         case .generate:
             let sourceImages = consumePendingImages()
-            let sourcePath = sourceImages?.first.flatMap { try? ChatImagePreview.writeTempFile($0).path }
             inputText = ""
-            runCreateGeneration(mode, prompt: prompt, sourcePath: sourcePath,
-                                sourceImages: sourceImages)
+            runCreateGeneration(mode, prompt: prompt, sourceImages: sourceImages)
         }
     }
 
     /// Run it. Split from `generateInChat` because a held prompt reaches this
     /// from the download's completion hook, with no composer state left to read.
     private func runCreateGeneration(_ mode: ChatCreateMode, prompt: String,
-                                     sourcePath: String?, sourceImages: [ChatImage]? = nil) {
-        createError = nil
+                                     sourceImages: [ChatImage]?) {
+        let sourcePath = sourceImages?.first.flatMap { try? ChatImagePreview.writeTempFile($0).path }
+        appState.createErrors.removeValue(forKey: sessionId)
         // A create-mode prompt is your own message: it wins the scroll, the same
         // way a sent turn does (`proceedSend`).
         applyScroll(.userSentMessage)
@@ -2527,10 +2550,14 @@ struct ChatDetailView: View {
         userMessage.images = sourceImages
         appendCreateMessage(userMessage)
 
+        // Captures appState + the session ID, never view state: the result and
+        // any error land on the right chat even if this view is torn down by a
+        // workspace switch while the generation runs.
         Task { @MainActor in
-            createProgress = MediaGenProgress(kind: mode.progressKind, step: 0, total: 0,
-                                              message: "Starting…", startedAt: Date())
-            defer { createProgress = nil }
+            appState.createProgress[sessionId] = MediaGenProgress(
+                kind: mode.progressKind, step: 0, total: 0,
+                message: "Starting…", startedAt: Date())
+            defer { appState.createProgress.removeValue(forKey: sessionId) }
             do {
                 let path = try await runCreate(mode, prompt: prompt, sourcePath: sourcePath)
                 guard let kind = GeneratedMediaHandoff.kind(for: mode.experiment) else { return }
@@ -2543,9 +2570,16 @@ struct ChatDetailView: View {
                 }
                 appendCreateMessage(result)
             } catch {
-                createError = error.localizedDescription
+                appState.createErrors[sessionId] = error.localizedDescription
             }
         }
+    }
+
+    /// Put consumed attachments back on the composer strip (held-prompt
+    /// Cancel) — the inverse of `consumePendingImages`.
+    private func restorePendingImages(_ images: [ChatImage]?) {
+        guard let images else { return }
+        pendingImages.append(contentsOf: images.compactMap { NSImage(data: $0.data) })
     }
 
     /// One switch, one place: each mode's request is built from the SAME saved
@@ -2572,7 +2606,7 @@ struct ChatDetailView: View {
                 request.editMode = preset.supportsReferenceEdit
             }
             return try await appState.imageGen.generateForAgent(
-                request, server: server, onProgress: { createProgress = $0 })
+                request, server: server, onProgress: { appState.createProgress[sessionId] = $0 })
         case .video:
             let settings = VideoGenSettings.load()
             let preset = settings.resolvedModel
@@ -2590,12 +2624,12 @@ struct ChatDetailView: View {
                 cfgScale: settings.cfgScale)
             request.firstFrameImagePath = sourcePath
             return try await appState.videoGen.generateForAgent(
-                request, server: server, onProgress: { createProgress = $0 })
+                request, server: server, onProgress: { appState.createProgress[sessionId] = $0 })
         case .audio:
             let settings = AudioGenSettings.load()
             let request = AudioGenRequest(model: settings.resolvedModel, text: prompt)
             return try await appState.audioGen.generateForAgent(
-                request, server: server, onProgress: { createProgress = $0 })
+                request, server: server, onProgress: { appState.createProgress[sessionId] = $0 })
         }
     }
 
@@ -2623,8 +2657,11 @@ struct ChatDetailView: View {
         // Pre-send nudge: if the message looks like it needs a mode that's off,
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
+        // Never in create mode: that text goes to a generator, not the model,
+        // so "turn Tools on for this message?" is unanswerable there.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
+        if createMode == nil, composerState != .generatingHere, server.status == .running,
+           !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return

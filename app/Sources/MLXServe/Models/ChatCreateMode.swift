@@ -66,6 +66,18 @@ enum ChatCreateMode: String, CaseIterable, Identifiable {
 
 }
 
+/// A create-mode prompt typed before its model was on disk. Held (never
+/// dropped) while the download runs, then generated — see `ChatCreateSend`.
+/// The attachments ride along: giving only the words back on Cancel, or
+/// generating without the source photo, is half the message lost.
+struct HeldCreatePrompt: Equatable {
+    let prompt: String
+    let sourceImages: [ChatImage]?
+    /// True once the transfer is under way, so the offer row can stop
+    /// offering a second Download press.
+    var downloading: Bool = false
+}
+
 /// What pressing Generate does, given whether the chosen model is on disk.
 enum ChatCreateSend: Equatable {
     /// Ready — run it now.

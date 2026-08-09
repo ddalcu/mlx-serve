@@ -338,6 +338,35 @@ final class ComposerModeControlTests: XCTestCase {
                        "the floating cluster is gone; its controls live in the composer row")
     }
 
+    /// The hidden material sits on the SPLITS themselves, never on one pane
+    /// inside them. Attached to ChatDetailView it covered only conversation
+    /// mode — switching to Models / Settings / Create brought the default
+    /// toolbar material back and the window chrome flipped per mode, which is
+    /// exactly the "no material now, in every mode" contract broken.
+    func testBothSplitViewsCarryTheHiddenMaterialThemselves() throws {
+        let source = try chatViewSource()
+        func body(of marker: String, until end: String) throws -> String {
+            let afterStart = try XCTUnwrap(source.range(of: marker),
+                                           "marker \(marker) not found").upperBound
+            let tail = source[afterStart...]
+            let stop = try XCTUnwrap(tail.range(of: end),
+                                     "end marker \(end) not found").lowerBound
+            return String(tail[..<stop])
+        }
+        let modifier = ".toolbarBackground(.hidden, for: .windowToolbar)"
+        let three = try body(of: "private var threeColumnSplitView",
+                             until: "private var standardSplitView")
+        XCTAssertTrue(three.contains(modifier),
+                      "the three-column split (Tasks/Agents) must drop the material itself")
+        let standard = try body(of: "private var standardSplitView",
+                                until: "private func createPane")
+        XCTAssertTrue(standard.contains(modifier), """
+            the standard split must drop the material itself — on ChatDetailView \
+            it covers only conversation mode, and Models/Settings/Create regain \
+            the default toolbar band.
+            """)
+    }
+
     /// The sidebar's pinned destinations rely on the PLATFORM to frost what
     /// scrolls beneath them — `scrollEdgeEffectStyle`, which needs the
     /// toolbar's bar to attach to.

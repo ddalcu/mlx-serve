@@ -141,4 +141,17 @@ final class ChatEmptyStateTests: XCTestCase {
         XCTAssertTrue(app.contains("BuildFeatures.current.cliLauncher"),
                       "the Claude Code menu item must carry the MAS gate")
     }
+
+    /// Iterating the catalog is not the same as RENDERING it: the media items
+    /// became `.create(...)` actions (windowId is nil on all four), so a menu
+    /// body that filters on `item.windowId` draws an empty section while every
+    /// "shares the catalog" grep above stays green — which is exactly how the
+    /// Tools menu shipped with no Image/Video/Audio/3D entries.
+    func testToolsMenuRendersTheCreateActionsTheCatalogActuallyCarries() throws {
+        let app = try source("Sources/MLXServe/MLXServeApp.swift")
+        XCTAssertFalse(app.contains("if let windowId = item.windowId"),
+                       "the media section filters on a windowId no item carries — it renders nothing")
+        XCTAssertTrue(app.contains("case .create(let experiment) = item.action"),
+                      "the media section must dispatch the .create actions through appState.showCreate")
+    }
 }

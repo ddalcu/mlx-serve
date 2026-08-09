@@ -7981,17 +7981,15 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 /// retry after (#126). The counts are knowable only server-side and go to the
 /// log; what the client needs is the knob.
 ///
-/// TWO gates reach this arm and the sentence must fit both, since the client
-/// cannot tell them apart: the resident-model budget (a static cap) and the
-/// load preflight (actual free memory against the model plus its warmup
-/// headroom — `scheduler.loadRequirementBytes`, routed here by
-/// `scheduler.loadErrorFor`). Naming only the cap sends a user hunting for a
-/// flag they never set when the real answer is to unload something.
+/// ONE gate reaches this arm: the resident-model budget with no evictable
+/// LRU victim (scheduler's `planEvictionsLocked` refusal). The free-memory
+/// PREFLIGHT refuses as `error.InsufficientMemory` and gets its own message
+/// below (#144) — blaming free memory here sends a user quitting apps when
+/// the fix is unloading a model or moving the cap.
 pub const not_enough_memory_message =
-    "Not enough memory to load model: either too little free memory for the model plus its warmup headroom, " ++
-    "or it would exceed the resident-model budget with no loaded model to evict. " ++
-    "Unload the model you are chatting with (tray > Models > eject) or close other apps; " ++
-    "raise or disable the cap with --max-resident-mem <size>|0. " ++
+    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model can be evicted. " ++
+    "Unload the model you are chatting with (tray > Models > eject), " ++
+    "or raise or disable the cap with --max-resident-mem <size>|0. " ++
     "The server log names the exact figures and the current cap.";
 
 /// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
@@ -14797,6 +14795,11 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const m = not_enough_memory_message;
     try testing.expect(std.mem.indexOf(u8, m, "--max-resident-mem") != null);
     try testing.expect(std.mem.indexOf(u8, m, "retry after current requests") == null);
+    // Only the resident-budget gate raises NotEnoughMemory; the free-memory
+    // preflight has its own arm (insufficient_free_memory_message). Blaming
+    // free memory here sends the user quitting apps when the fix is the cap.
+    try testing.expect(std.mem.indexOf(u8, m, "free memory") == null);
+    try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
 
     const src = @embedFile("server.zig");
     const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";

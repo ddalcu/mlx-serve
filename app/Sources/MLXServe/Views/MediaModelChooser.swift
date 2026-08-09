@@ -224,11 +224,17 @@ extension MediaModelChooser {
             onSelect: { preset in
                 lanModel.wrappedValue = nil
                 selected.wrappedValue = preset
+                // Persist HERE, like onSelectLan: the panes persist on
+                // `.onChange(of: model)`, which never fires when the local
+                // pick already IS this preset — deselecting a LAN model back
+                // to the same local one would survive only until relaunch.
+                persist()
             },
             onDownload: { preset in
                 // Downloading also selects — you fetch the one you mean to use.
                 lanModel.wrappedValue = nil
                 selected.wrappedValue = preset
+                persist()
                 downloads.startBundle(bundleOf(preset)) { onDownloadFinished() }
             },
             lanCapability: capability,

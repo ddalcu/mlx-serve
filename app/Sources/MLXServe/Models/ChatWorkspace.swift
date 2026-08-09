@@ -20,8 +20,8 @@ enum ChatWorkspace: Equatable {
     /// from every other row in that column, none of which start anything. It is
     /// a pane like Tasks now: the list is column two, the editor is the detail.
     case agents
-    /// App settings. A window until 2026-08-08 (and still ⌘, from the menu bar,
-    /// which macOS expects) — but the sidebar lists it, so it renders here too.
+    /// App settings. A window until 2026-08-08; the sidebar's row and the
+    /// menu bar's ⌘, both switch to this mode now (the Window scene is gone).
     case settings
 
     var isModels: Bool {

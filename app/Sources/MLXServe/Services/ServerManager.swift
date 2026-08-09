@@ -385,6 +385,18 @@ class ServerManager: ObservableObject {
         logBuffer.clear()
     }
 
+    /// The gen panes' "Show Log" body: the pane's own stream lines, with the
+    /// server log's tail appended — or standing alone, because a model that
+    /// failed to LOAD never streamed anything, so the pane log is empty for
+    /// exactly the failure people click Log for (live 2026-08-08: a memory
+    /// refusal showed "(no output)"). ONE copy; it was pasted into all four
+    /// gen views, which is how a tweak lands in some panes and not others.
+    nonisolated func combinedGenLog(own lines: [String]) -> String {
+        let own = lines.joined(separator: "\n")
+        let serverTail = String(currentServerLogSnapshot().suffix(6000))
+        return own.isEmpty ? serverTail : own + "\n\n——— server log ———\n" + serverTail
+    }
+
     /// Pure helper: clamp `buf` to at most `maxBytes` characters by keeping
     /// the tail. Mirrors `String(buf.suffix(maxBytes))` but avoids the
     /// alloc when already in range, and well-defined at the degenerate

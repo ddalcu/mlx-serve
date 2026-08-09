@@ -610,14 +610,7 @@ struct VoiceGenView: View {
     }
 
     private func showLogWindow() {
-        // The pane's own log holds the STREAM. A model that failed to LOAD
-        // never streamed anything, so this was empty for exactly the failure
-        // people click it for — see ImageGenView.
-        let own = service.log.joined(separator: "\n")
-        let serverTail = String(server.currentServerLogSnapshot().suffix(6000))
-        let logText = own.isEmpty
-            ? serverTail
-            : own + "\n\n——— server log ———\n" + serverTail
+        let logText = server.combinedGenLog(own: service.log)
         let alert = NSAlert()
         alert.messageText = "Audio generation log"
         alert.informativeText = logText.isEmpty ? "(no output)" : logText

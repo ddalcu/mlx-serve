@@ -21,14 +21,6 @@ enum ChatMetrics {
     /// window's edges no longer do it.
     static let transcriptSpacing: CGFloat = 18
 
-    /// The column's actual width for a given available width: the measure, or
-    /// the window minus its gutters when that is narrower. Never non-positive —
-    /// a negative frame width is a crash in some SwiftUI containers and a
-    /// silently invisible column in the rest, and layout does report zero.
-    static func columnWidth(available: CGFloat) -> CGFloat {
-        max(1, min(contentMaxWidth, available - gutter * 2))
-    }
-
     /// Inner padding + radius of a message bubble (and the tool-call card,
     /// which is styled as one).
     static let bubblePaddingH: CGFloat = 14

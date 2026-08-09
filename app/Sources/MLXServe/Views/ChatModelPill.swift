@@ -73,13 +73,25 @@ struct ChatModelPill: View {
         )
     }
 
-    /// A live transfer for the model this chat is pointed at, if any. The pill
-    /// is where the user is already looking when they wonder why nothing
-    /// answers, so a download in flight belongs here rather than only in the
-    /// browser two clicks away.
+    /// A live transfer the CHAT could be waiting on, if any. The pill is where
+    /// the user is already looking when they wonder why nothing answers, so a
+    /// download in flight belongs here rather than only in the browser two
+    /// clicks away — but never a media bundle's transfer: `.values.first` over
+    /// the unordered dictionary picked ANY in-flight download, so a 30 GB
+    /// video pack grew a progress hairline under the chat model's name (and
+    /// suppressed the download-arrow affordance while it ran).
+    static func chatDownload(in downloads: [String: DownloadManager.DownloadState],
+                             mediaRepos: Set<String>) -> DownloadManager.DownloadState? {
+        downloads
+            .filter { $0.value.status == .downloading && !mediaRepos.contains($0.key) }
+            .min { $0.key < $1.key }?  // stable pick when two are running
+            .value
+    }
+
     private var activeDownload: DownloadManager.DownloadState? {
         guard server.lanChatModelId == nil else { return nil }
-        return downloads.downloads.values.first { $0.status == .downloading }
+        return Self.chatDownload(in: downloads.downloads,
+                                 mediaRepos: downloads.mediaBundleRepos)
     }
 
     /// True when this Mac has nothing chat-pickable on disk — the state where

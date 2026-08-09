@@ -36,6 +36,35 @@ final class AgentsWorkspaceModel: ObservableObject {
     func message(_ title: String, _ text: String) {
         alert = AlertItem(title: title, kind: .message(text))
     }
+
+    /// Write the draft back to the store — Save, selection changes and
+    /// `adopt` all commit through here. Wake-phrase collisions are refused at
+    /// save time: a colliding phrase makes both agents unreachable by voice
+    /// and there is nothing to see until you try talking.
+    func commitDraft(to store: AgentStore, defaultAgentId: UUID?) {
+        guard var d = draft, !d.isBuiltIn else { return }
+        if let phrase = d.wakePhrase,
+           WakeWord.collides(phrase, with: store.takenWakePhrases(excluding: d.id)) {
+            d.wakePhrase = nil
+            draft = d
+            message("That wake phrase is taken",
+                    "Another agent (or the app's own phrase) already answers to that name, so both would be unreachable. Pick a different one.")
+        }
+        store.update(d)
+        // A live tab talking to this agent picks the change up on its next
+        // turn; its voice applies from the next sentence.
+        if defaultAgentId == d.id { ActiveAgentVoice.set(d.resolvedVoice) }
+    }
+
+    /// Select `agent` for editing, committing the outgoing draft FIRST.
+    /// Create/duplicate set `selectedId` AND `draft` in one move, so the
+    /// detail pane's `onChange(of: selectedId)` commit reads the NEW agent —
+    /// without this, pending edits to whoever was selected are silently lost.
+    func adopt(_ agent: Agent, committingTo store: AgentStore, defaultAgentId: UUID?) {
+        commitDraft(to: store, defaultAgentId: defaultAgentId)
+        selectedId = agent.id
+        draft = agent
+    }
 }
 
 struct AgentsWindow: View {
@@ -189,8 +218,7 @@ struct AgentListPane: View {
             agent.capabilities = starter.capabilities
         }
         store.add(agent)
-        model.selectedId = agent.id
-        model.draft = agent
+        model.adopt(agent, committingTo: store, defaultAgentId: appState.defaultAgentId)
     }
 }
 
@@ -261,8 +289,11 @@ struct AgentDetailPane: View {
         appState.pendingAgentSelection = nil
         // A deep link to the agent ALREADY showing can't rely on
         // `onChange(of: selectedId)` — the id doesn't change, so the draft has
-        // to be reloaded here or the click does nothing at all.
+        // to be reloaded here or the click does nothing at all. Commit first,
+        // exactly like a selection change would: the reload must not discard
+        // pending edits.
         if model.selectedId == id {
+            model.commitDraft(to: store, defaultAgentId: appState.defaultAgentId)
             model.draft = store.agent(id: id)
         } else {
             model.selectedId = id
@@ -270,27 +301,14 @@ struct AgentDetailPane: View {
     }
 
     private func duplicate(_ agent: Agent) {
-        let copy = store.duplicate(agent)
-        model.selectedId = copy.id
-        model.draft = copy
+        model.adopt(store.duplicate(agent), committingTo: store,
+                    defaultAgentId: appState.defaultAgentId)
     }
 
-    /// Write the draft back to the store. Wake-phrase collisions are refused
-    /// HERE, at save time: a colliding phrase makes both agents unreachable by
-    /// voice and there is nothing to see until you try talking.
+    /// Write the draft back to the store (the model owns the rule — see
+    /// `AgentsWorkspaceModel.commitDraft`).
     private func commit() {
-        guard var d = model.draft, !d.isBuiltIn else { return }
-        if let phrase = d.wakePhrase,
-           WakeWord.collides(phrase, with: store.takenWakePhrases(excluding: d.id)) {
-            d.wakePhrase = nil
-            model.draft = d
-            model.message("That wake phrase is taken",
-                          "Another agent (or the app's own phrase) already answers to that name, so both would be unreachable. Pick a different one.")
-        }
-        store.update(d)
-        // A live tab talking to this agent picks the change up on its next turn;
-        // its voice applies from the next sentence.
-        if appState.defaultAgentId == d.id { ActiveAgentVoice.set(d.resolvedVoice) }
+        model.commitDraft(to: store, defaultAgentId: appState.defaultAgentId)
     }
 
     /// Ask the current model to turn the brief into a system prompt. A failure
@@ -800,7 +818,7 @@ private struct AgentEditor: View {
                 Text("Off").tag(TriChoice.off)
             }
             .labelsHidden()
-            .fixedSize()
+            .frame(width: Self.triPickerWidth)
             .disabled(readOnly)
         }
         AgentEditorRow("Approve tools") {
@@ -810,28 +828,54 @@ private struct AgentEditor: View {
                 Text("Ask every time").tag(TriChoice.off)
             }
             .labelsHidden()
-            .fixedSize()
+            .frame(width: Self.triPickerWidth)
             .disabled(readOnly)
         }
     }
 
+    /// ONE width for the tri-state pop-ups: `.fixedSize()` sized each to its
+    /// own widest menu item, so Thinking and Approve tools rendered two
+    /// different-width controls stacked on the same trailing edge. Wide
+    /// enough for "Ask every time".
+    private static let triPickerWidth: CGFloat = 150
+
     private var advancedToolsDisclosure: some View {
         DisclosureGroup(isExpanded: $showAdvancedTools) {
-                Text("Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above.")
-                    .font(.caption2).foregroundStyle(.secondary)
-                ForEach(AgentToolKind.allCases.filter { $0 != .searchDocuments }, id: \.self) { tool in
-                    Toggle(isOn: toolBinding(tool)) {
-                        Label(tool.displayName, systemImage: tool.icon)
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    // The chat's Tools menu's own groups (`AgentToolGroup`) —
+                    // one grouping for both surfaces, and SessionToolDisableTests
+                    // pins that the groups cover exactly the toggleable set. A
+                    // flat 19-row centered column was a list nobody could scan.
+                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .topLeading),
+                                        GridItem(.flexible(), alignment: .topLeading)],
+                              alignment: .leading, spacing: 16) {
+                        ForEach(AgentToolGroup.allCases, id: \.self) { group in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(group.title.uppercased())
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .kerning(0.5)
+                                ForEach(group.tools, id: \.self) { tool in
+                                    Toggle(isOn: toolBinding(tool)) {
+                                        Label(tool.displayName, systemImage: tool.icon)
+                                    }
+                                    .disabled(readOnly || !showAdvancedTools)
+                                }
+                            }
+                        }
                     }
-                    .disabled(readOnly || !showAdvancedTools)
-                }
-                if showAdvancedTools {
-                    Button("Back to the simple switches") {
-                        agent.capabilities.closeAdvanced()
-                        showAdvancedTools = false
+                    if showAdvancedTools {
+                        Button("Back to the simple switches") {
+                            agent.capabilities.closeAdvanced()
+                            showAdvancedTools = false
+                        }
+                        .disabled(readOnly)
                     }
-                    .disabled(readOnly)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
             } label: {
                 // macOS only hit-tests the chevron on a DisclosureGroup's plain
                 // string label, so the word "Advanced" was dead. The label holds
@@ -1088,12 +1132,13 @@ private struct AgentEditor: View {
         n >= 1024 ? "\(n / 1024)K" : "\(n)"
     }
 
-    /// The right-hand "App default" checkbox every sampling row carries:
-    /// checked = nil (follow Settings, control grayed), unchecking seeds from
-    /// the app's saved value so the control picks up exactly where the gray
-    /// preview was.
+    /// The right-hand "Default" checkbox every sampling row carries: checked =
+    /// nil (follow Settings, control grayed), unchecking seeds from the app's
+    /// saved value so the control picks up exactly where the gray preview was.
+    /// One word on purpose — "App default" wrapped onto two lines beside the
+    /// sliders.
     private func appDefaultToggle<T>(value: Binding<T?>, seed: T) -> some View {
-        Toggle("App default", isOn: Binding(
+        Toggle("Default", isOn: Binding(
             get: { value.wrappedValue == nil },
             set: { value.wrappedValue = $0 ? nil : seed }))
             .toggleStyle(.checkbox)

@@ -11,28 +11,10 @@ import XCTest
 /// than the answers above it is the seam you can't unsee.
 final class ChatColumnMetricsTests: XCTestCase {
 
-    func testWideWindowsGetTheReadingMeasure() {
-        XCTAssertEqual(ChatMetrics.columnWidth(available: 1600), ChatMetrics.contentMaxWidth)
-        XCTAssertEqual(ChatMetrics.columnWidth(available: 1000), ChatMetrics.contentMaxWidth)
-    }
-
-    /// Below the cap the column is the window minus its gutters — never a fixed
-    /// width that would clip, and never wider than what it is given.
-    func testNarrowWindowsFallBackToTheAvailableWidth() {
-        let narrow = ChatMetrics.columnWidth(available: 600)
-        XCTAssertEqual(narrow, 600 - ChatMetrics.gutter * 2)
-        XCTAssertLessThan(narrow, ChatMetrics.contentMaxWidth)
-    }
-
-    /// A window can be reported at zero during layout; a negative frame width is
-    /// a crash in some SwiftUI containers and a silently invisible column in the
-    /// rest.
-    func testDegenerateWidthsStayPositive() {
-        for available in [CGFloat(0), 1, 10, ChatMetrics.gutter * 2] {
-            XCTAssertGreaterThan(ChatMetrics.columnWidth(available: available), 0,
-                                 "available=\(available) produced a non-positive column")
-        }
-    }
+    // `ChatMetrics.columnWidth(available:)` and its tests are gone: no view
+    // ever called it (the transcript and composer cap with
+    // `.frame(maxWidth: contentMaxWidth)` directly), so the tests pinned a
+    // helper that existed only to be tested.
 
     /// The measure is a reading width, not a hunch: ~70-90 characters at the
     /// chat's body size. Pinned so "make it a bit wider" is a decision someone

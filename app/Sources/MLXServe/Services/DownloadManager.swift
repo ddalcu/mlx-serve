@@ -894,6 +894,7 @@ class DownloadManager: ObservableObject {
         // a pack in a non-destination root must not grow a fragment dir in the
         // destination (it shadows the real pack and the server dies loading it).
         let packDir = existingModelDir(for: repoId)
+        mediaBundleRepos.insert(repoId)
         turboLoraFetches.insert(repoId)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -940,10 +941,17 @@ class DownloadManager: ObservableObject {
     // files the engine reads (`FileSelection`). Tracked under the bundle id so
     // the gen pane can show aggregate progress / cancel.
 
+    /// Repo ids whose transfers arrived as components of a media BUNDLE (or a
+    /// Turbo-adapter fetch). Surfaces about the CHAT model filter on this —
+    /// the model pill's progress hairline must not render a 30 GB video pack
+    /// as the chat model arriving (`ChatModelPill.chatDownload`).
+    private(set) var mediaBundleRepos: Set<String> = []
+
     /// Download a bundle's components sequentially (skipping any already on
     /// disk). `onFinish` runs once after the last component settles. Stops the
     /// bundle if a component fails.
     func startBundle(_ bundle: MediaBundle, onFinish: @escaping @MainActor () -> Void) {
+        for comp in bundle.components { mediaBundleRepos.insert(comp.repo) }
         activeTasks[bundle.id]?.cancel()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }

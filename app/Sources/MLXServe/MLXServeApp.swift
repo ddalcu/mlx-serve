@@ -266,9 +266,12 @@ struct MLXCoreApp: App {
 
                 Divider()
 
+                // The four generators are PAGES of the chat window now
+                // (`.create(...)` actions, windowId nil) — dispatch through the
+                // one door, `AppState.showCreate`.
                 ForEach(ChatEmptyState.mediaItems) { item in
-                    if let windowId = item.windowId {
-                        Button("\(item.title)…") { openAndFocus(windowId) }
+                    if case .create(let experiment) = item.action {
+                        Button("\(item.title)…") { appState.showCreate(experiment) }
                     }
                 }
 

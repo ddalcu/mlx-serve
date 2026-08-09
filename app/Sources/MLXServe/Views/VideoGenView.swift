@@ -1356,15 +1356,7 @@ struct VideoGenView: View {
     }
 
     private func showLogWindow() {
-        // The pane's own log holds the STREAM (progress lines). A model that
-        // failed to LOAD never streamed anything, so this was empty for exactly
-        // the failure people click it for — the reason was in the server's log
-        // all along (live 2026-08-08: a memory refusal showed "(no output)").
-        let own = service.log.joined(separator: "\n")
-        let serverTail = String(server.currentServerLogSnapshot().suffix(6000))
-        let text = own.isEmpty
-            ? serverTail
-            : own + "\n\n——— server log ———\n" + serverTail
+        let text = server.combinedGenLog(own: service.log)
         let alert = NSAlert()
         alert.messageText = "Video generation log"
         alert.informativeText = text.isEmpty ? "(no output)" : text

@@ -658,6 +658,12 @@ private struct WelcomeModelRow: View {
     private func startDownload() {
         downloads.start(repoId: pick.repoId) {
             appState.refreshModels()
+            // `onFinish` runs on failure and cancel too (DownloadManager's
+            // contract) — only a download that actually landed proceeds.
+            // Otherwise the row re-offers Get/Resume; dismissing the welcome
+            // sheet into a chat with no model is the dead end it exists to
+            // prevent.
+            guard downloads.isReady(pick.repoId) else { return }
             useAndChat()
         }
     }

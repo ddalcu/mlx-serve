@@ -33,14 +33,6 @@ struct SettingsView: View {
                                  selfUpdate: BuildFeatures.current.selfUpdate)
     }
 
-    /// True when this renders inside the chat window's detail column
-    /// (`ChatWorkspace.settings`). A `NavigationSplitView` nested inside another
-    /// fights the outer sidebar for column behaviour, so the embedded shell is a
-    /// plain two-pane HStack — same category list, same form. Tasks answers the
-    /// same problem the other way, by becoming real columns of the window's own
-    /// split (`TaskListPane` / `TaskDetailPane`).
-    var embedded: Bool = false
-
     var body: some View {
         shell
         .navigationTitle("Settings")
@@ -52,22 +44,20 @@ struct SettingsView: View {
         }
     }
 
-    @ViewBuilder
+    /// This only ever renders inside the chat window's detail column
+    /// (`ChatWorkspace.settings`; the Settings Window scene is gone). A
+    /// `NavigationSplitView` nested inside another fights the outer sidebar
+    /// for column behaviour, so the shell is a plain two-pane HStack — same
+    /// category list, same form. Tasks answers the same problem the other
+    /// way, by becoming real columns of the window's own split
+    /// (`TaskListPane` / `TaskDetailPane`).
     private var shell: some View {
-        if embedded {
-            HStack(spacing: 0) {
-                categoryList
-                    .frame(width: 210)
-                Divider()
-                form
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        } else {
-            NavigationSplitView {
-                categoryList
-            } detail: {
-                form
-            }
+        HStack(spacing: 0) {
+            categoryList
+                .frame(width: 210)
+            Divider()
+            form
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
