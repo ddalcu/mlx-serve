@@ -86,19 +86,23 @@ final class SidebarSessionGroupsTests: XCTestCase {
 
     /// Threads created before agents had their own section are stored as
     /// "New Chat" with an agent attached. Normalizing at DISPLAY fixes them
-    /// without rewriting anything on disk, and self-corrects both ways.
+    /// without rewriting anything on disk, and self-corrects both ways. An
+    /// agent thread is named for its agent — the rest of that rule lives in
+    /// `ChatSessionTitleTests`.
     func testAPlaceholderIsDrawnAsTheKindOfThreadItIs() {
-        XCTAssertEqual(ChatSessionTitle.display(title: "New Chat", hasAgent: true), "New agent")
-        XCTAssertEqual(ChatSessionTitle.display(title: "New agent", hasAgent: false), "New Chat")
-        XCTAssertEqual(ChatSessionTitle.display(title: "New Chat", hasAgent: false), "New Chat")
+        XCTAssertEqual(ChatSessionTitle.display(title: "New Chat", agentName: "Chef"), "Chef")
+        XCTAssertEqual(ChatSessionTitle.display(title: "New agent", agentName: nil), "New Chat")
+        XCTAssertEqual(ChatSessionTitle.display(title: "New Chat", agentName: nil), "New Chat")
     }
 
     /// A title the thread earned is never rewritten — that would rename a
-    /// conversation out from under the user.
+    /// conversation out from under the user. On an agent thread the agent's
+    /// name takes the title line, so the thread's own title becomes its
+    /// SUBJECT rather than being lost.
     func testARealTitleIsNeverNormalized() {
-        XCTAssertEqual(ChatSessionTitle.display(title: "Dinner plans", hasAgent: true),
+        XCTAssertEqual(ChatSessionTitle.display(title: "Dinner plans", agentName: nil),
                        "Dinner plans")
-        XCTAssertEqual(ChatSessionTitle.display(title: "Dinner plans", hasAgent: false),
+        XCTAssertEqual(ChatSessionTitle.subject(title: "Dinner plans", agentName: "Chef"),
                        "Dinner plans")
     }
 

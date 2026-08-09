@@ -520,7 +520,8 @@ struct ChatView: View {
             get: {
                 ChatWorkspace.gateShouldPresent(gateIsBlocking: gateIsBlocking,
                                                 cancelled: gateCancelled,
-                                                workspace: appState.chatWorkspace)
+                                                workspace: appState.chatWorkspace,
+                                                welcomePresented: appState.showWelcome)
             },
             set: { _ in })) {
             ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
@@ -777,6 +778,11 @@ struct ChatSidebar: View {
             appState.showConversation()
             appState.activeChatId = session.id
         } label: {
+            // An agent thread is named for its AGENT, with the agent's own
+            // symbol beside it — the Agents section is a list of who you talk
+            // to, so that answer belongs on the first line rather than in a
+            // caption under a title derived from whatever you typed first.
+            let agent = appState.agents.agent(id: session.agentId)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     if session.isExternalBridge {
@@ -785,34 +791,30 @@ struct ChatSidebar: View {
                             .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
                             .help("Telegram conversation (view only)")
                     }
+                    if let agent {
+                        Image(systemName: agent.symbol)
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.accentColor)
+                    }
                     Text(ChatSessionTitle.display(title: session.title,
-                                                  hasAgent: session.agentId != nil))
+                                                  agentName: agent?.name))
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                 }
-                // Who this chat is talking to, when it isn't the app
-                // defaults. Sits on the timestamp line rather than the
-                // title's so a long agent name can never squeeze the
-                // title, which is what the row is FOR — and it answers
-                // "why does this thread behave differently" without
-                // opening it.
-                // The subtitle line exists only to answer "why does
-                // this thread behave differently" — i.e. which agent
-                // it belongs to. The timestamp answered nothing the
-                // list's own order didn't already say, and it put a
-                // second line under every row to say it.
-                if let agent = appState.agents.agent(id: session.agentId) {
-                    HStack(spacing: 4) {
-                        Image(systemName: agent.symbol)
-                            .font(.system(size: 9))
-                            .foregroundStyle(Color.accentColor)
-                        Text(agent.name)
-                            .font(.caption2)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .foregroundStyle(Color.accentColor)
-                    }
+                // What this particular conversation is about, displaced from
+                // the title line by the agent's name. It is also the only
+                // thing telling a second thread with the same agent apart
+                // from the first — without it the sidebar draws two identical
+                // rows. Absent until the thread has said something, so a new
+                // one is a single line exactly like a destination row.
+                if let subject = ChatSessionTitle.subject(title: session.title,
+                                                          agentName: agent?.name) {
+                    Text(subject)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(.secondary)
                 }
             }
             // Room kept for the delete button at ALL times, not only while
@@ -1479,23 +1481,27 @@ struct ChatDetailView: View {
             // top-to-bottom LinearGradient — a different typeface from the rest
             // of the app, wearing a fade that reads as a rendering artefact at
             // this size rather than as depth.
-            Text(activeAgent == nil ? "How can I help you today?" : "Agent")
+            // The agent's NAME, not the word "Agent" with the name as its
+            // caption — the name is the thing, the category isn't (same
+            // inversion the sidebar rows had). Under it, what the agent is
+            // FOR, which is what tells you what to ask it.
+            Text(ChatGreeting.heading(agentName: activeAgent?.name))
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.primary)
-            if server.status != .running {
-                Text("Start the server to begin.")
+            if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
+                                                    serverRunning: server.status == .running) {
+                Text(subtitle)
                     .font(.callout)
                     .foregroundStyle(.secondary)
-            } else if let agent = activeAgent {
-                // The name alone: the heading above already says what it is.
-                Text(agent.name)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
             // Discovery chips: the features that otherwise live only in the
             // menu-bar tray (media generation, Model Browser, Tasks, the CLI
-            // launcher). Under the greeting, gone once the conversation starts.
-            if session?.isExternalBridge != true {
+            // launcher). Under the greeting, gone once the conversation starts
+            // — and absent entirely on an agent thread, where they advertise
+            // the app to somebody who has already picked who to talk to.
+            if ChatGreeting.showsDiscoveryChips(hasAgent: activeAgent != nil,
+                                                isExternalBridge: session?.isExternalBridge == true) {
                 EmptyStateChipRow(onCreateInChat: { experiment in
                     // Stay in the chat: the chip turns the COMPOSER into a
                     // generator rather than throwing the user into the Create
@@ -1902,15 +1908,19 @@ struct ChatDetailView: View {
                           isIdle: composerState == .idle,
                           onSend: { sendMessage() })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
-            .padding(.horizontal, 5)
+            .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
             .disabled(server.status != .running)
+            // The placeholder stands in for the first character you type, so it
+            // has to sit exactly where that character lands — which is three
+            // insets in, not one (`ComposerTextMetrics`). It was a literal 9
+            // against a real 14, so the caret overlapped its own placeholder.
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
                     Text(composerPlaceholder)
                         .font(.body)
                         .foregroundStyle(.secondary)
-                        .padding(.leading, 9)
-                        .padding(.top, 8)
+                        .padding(.leading, ComposerTextMetrics.placeholderLeading)
+                        .padding(.top, ComposerTextMetrics.placeholderTop)
                         .allowsHitTesting(false)
                 }
             }
@@ -4249,7 +4259,10 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var isIdle: Bool
     var onSend: () -> Void
 
-    let inset = NSSize(width: 7, height: 8)
+    /// Read from the SAME constants the placeholder overlay reads — the two
+    /// are related only by arithmetic nobody's type system checks.
+    let inset = NSSize(width: ComposerTextMetrics.containerInsetWidth,
+                       height: ComposerTextMetrics.containerInsetHeight)
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -4276,7 +4289,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         tv.isVerticallyResizable = true
         tv.isHorizontallyResizable = false
         tv.textContainer?.widthTracksTextView = true
-        tv.textContainer?.lineFragmentPadding = 2
+        tv.textContainer?.lineFragmentPadding = ComposerTextMetrics.lineFragmentPadding
         tv.autoresizingMask = [.width]
         tv.string = text
         tv.onBecomeFocus = { [weak c = context.coordinator] in c?.setFocus(true) }

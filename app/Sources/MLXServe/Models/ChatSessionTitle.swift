@@ -32,14 +32,47 @@ enum ChatSessionTitle {
 
     /// What the sidebar actually draws.
     ///
-    /// A placeholder is normalized to the one matching the thread's KIND, so a
-    /// thread created before agents had their own section — stored as
-    /// "New Chat" with an agent attached — reads as "New agent" without
-    /// rewriting anything on disk. Stateless, so it cannot corrupt a title the
-    /// way a load-time migration could, and it self-corrects in both directions
-    /// if a thread's agent is set or cleared. A real title is never touched.
-    static func display(title: String, hasAgent: Bool) -> String {
-        isPlaceholder(title) ? placeholder(hasAgent: hasAgent) : title
+    /// An agent thread is named for its AGENT. The Agents section is a list of
+    /// who you talk to, so the row has to say who — it used to say so only in a
+    /// caption under a title derived from the first thing you happened to type,
+    /// which put the answer on the second line of every row and the wrong thing
+    /// on the first. Read LIVE from the agent rather than copied into the title
+    /// at creation, so renaming an agent renames its threads and nothing on disk
+    /// has to be rewritten.
+    ///
+    /// Everything else is unchanged: a placeholder is normalized to the one
+    /// matching the thread's KIND, so a thread created before agents had their
+    /// own section — stored as "New Chat" with an agent attached — still reads
+    /// as an agent thread. Stateless, so it cannot corrupt a title the way a
+    /// load-time migration could, and it self-corrects in both directions if a
+    /// thread's agent is set or cleared.
+    static func display(title: String, agentName: String?) -> String {
+        if let named = trimmedName(agentName) { return named }
+        return isPlaceholder(title) ? placeholder(hasAgent: agentName != nil) : title
+    }
+
+    /// The caption under an agent thread's name: what that conversation is
+    /// ABOUT.
+    ///
+    /// It is the thread's own title, displaced from the title line by the
+    /// agent's name — and it is what tells a second thread with the same agent
+    /// apart from the first, which the sidebar could otherwise only show as two
+    /// identical rows. Nil for a plain conversation (its title is already on the
+    /// title line) and nil for a thread that hasn't said anything yet, since a
+    /// caption repeating the placeholder says nothing twice.
+    static func subject(title: String, agentName: String?) -> String? {
+        guard trimmedName(agentName) != nil, !isPlaceholder(title) else { return nil }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// An agent whose name is blank (half-saved, or mid-rename) can't name a
+    /// row — the caller falls back to the placeholder rather than drawing an
+    /// empty one.
+    private static func trimmedName(_ name: String?) -> String? {
+        guard let name else { return nil }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// The title a first user message earns the thread.
