@@ -379,9 +379,13 @@ struct ChatView: View {
     /// launch still on `.automatic` looked right, which is what made it read as
     /// intermittent).
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
-    /// The three-column (Tasks) split's visibility. `.all` is the only value
-    /// that means "show all three" — the state above cannot supply it.
+    /// The three-column (Tasks / Agents) split's visibility. `.all` is the only
+    /// value that means "show all three" — the state above cannot supply it.
     @State private var tasksColumnVisibility = NavigationSplitViewVisibility.all
+    /// The Agents pane's editing state, owned here so it survives while the
+    /// user moves between agents. The standalone Agents window owns its own —
+    /// two surfaces editing one draft would fight over it.
+    @StateObject private var agentsModel = AgentsWorkspaceModel()
     /// Flipped by the gate sheet's Cancel, and by nothing else.
     ///
     /// The sheet was first presented on a `.constant(true)` binding, which made
@@ -416,14 +420,21 @@ struct ChatView: View {
         // not inside the content area — a list of tasks is navigation, and
         // nesting it in the detail column made the window look like it had two
         // unrelated sidebars stacked horizontally.
-        if appState.chatWorkspace.isTasks {
-            tasksSplitView
+        if appState.chatWorkspace.isThreeColumn {
+            threeColumnSplitView
         } else {
             standardSplitView
         }
     }
 
-    private var tasksSplitView: some View {
+    /// The three-column modes (Tasks, Agents), in ONE split view.
+    ///
+    /// One split rather than one per mode: the column widths, the toolbar
+    /// material and — the part that bit once already — the visibility state are
+    /// then shared by construction, instead of being copied per mode and
+    /// drifting. Only the two columns' CONTENT varies.
+    @ViewBuilder
+    private var threeColumnSplitView: some View {
         NavigationSplitView(columnVisibility: $tasksColumnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
@@ -432,14 +443,26 @@ struct ChatView: View {
             // A pane TYPE, never `SomeView().someProperty`: an environment
             // reader has to be the column itself, or its @EnvironmentObject is
             // read out of a value SwiftUI never installed (see `TaskListPane`).
-            TaskListPane()
-                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
-                // Every column carries the material — the bar is ONE surface
-                // across the window, and a column that opts out shows a seam.
-                .toolbarBackground(.visible, for: .windowToolbar)
+            Group {
+                if appState.chatWorkspace.isAgents {
+                    AgentListPane(model: agentsModel, showsHeader: true)
+                } else {
+                    TaskListPane()
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
+            // Every column carries the material — the bar is ONE surface
+            // across the window, and a column that opts out shows a seam.
+            .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
-            TaskDetailPane()
-                .toolbarBackground(.visible, for: .windowToolbar)
+            Group {
+                if appState.chatWorkspace.isAgents {
+                    AgentDetailPane(model: agentsModel)
+                } else {
+                    TaskDetailPane()
+                }
+            }
+            .toolbarBackground(.visible, for: .windowToolbar)
         }
         .navigationTitle("")
         .onAppear { AppActivation.focus() }
@@ -657,18 +680,22 @@ struct ChatSidebar: View {
         // list of places stays where the eye learned it.
         .safeAreaInset(edge: .top) {
             VStack(spacing: 2) {
-                // No agent button beside New Chat: the Agents row below owns
-                // that now, and two routes to the same place in adjacent
-                // controls is the duplication the destination list removed.
-                destinationRow("New Chat", icon: "square.and.pencil",
-                               selected: false) {
-                    appState.showConversation()
-                    _ = appState.newChatSession()
+                // New Chat, and beside it the choice of WHO the chat is with.
+                // The two are adjacent because they are one decision made at
+                // one moment: a session's agent is fixed once the session
+                // exists (there is no `setAgent`), so this is the only place it
+                // can be picked. It briefly lived on the Agents row instead,
+                // which made that row mean "start something" while every other
+                // destination means "go somewhere" — and took the editor with
+                // it into a menu.
+                HStack(spacing: 4) {
+                    destinationRow("New Chat", icon: "square.and.pencil",
+                                   selected: false) {
+                        appState.showConversation()
+                        _ = appState.newChatSession()
+                    }
+                    newAgentChatMenu
                 }
-                // Agents and Settings still open their own windows: each is a
-                // NavigationSplitView of its own, and one nested inside this
-                // window's would fight it for column behaviour. Embedding them
-                // is the same shell refactor TasksView just took.
                 agentsRow
                 destinationRow("Tasks", icon: "clock.badge.checkmark",
                                selected: appState.chatWorkspace.isTasks) {
@@ -874,7 +901,29 @@ struct ChatSidebar: View {
     /// icon button beside New Chat; deleting that button without moving the menu
     /// would have quietly removed the capability, not just the control.
     @ViewBuilder
+    /// Agents is a DESTINATION, like every other row in this column.
+    ///
+    /// It used to open a menu of agents that started a chat as one of them,
+    /// which made this the only row whose verb was "start something" rather
+    /// than "go somewhere" — and buried the editor behind a "Manage Agents…"
+    /// item at the bottom of it. Starting a chat as an agent still lives beside
+    /// New Chat (`newAgentChatMenu`), where picking who you are talking to
+    /// belongs.
     private var agentsRow: some View {
+        destinationRow("Agents", icon: "person.2",
+                       selected: appState.chatWorkspace.isAgents) {
+            appState.chatWorkspace.isAgents ? appState.showConversation() : appState.showAgents()
+        }
+    }
+
+    /// Start a chat AS an agent.
+    ///
+    /// Next to New Chat because that is WHEN the choice is made: a session's
+    /// agent is fixed once the session exists (there is no `setAgent` any
+    /// more), so this is the only place it can be picked. Removing it along
+    /// with the Agents row's menu would have left `startChat(withAgent:)` with
+    /// no caller at all — the capability, not just the control, silently gone.
+    private var newAgentChatMenu: some View {
         Menu {
             if appState.agents.allAgents.isEmpty {
                 Text("No agents yet")
@@ -894,16 +943,22 @@ struct ChatSidebar: View {
                 .disabled(!AgentModelSwitch.isSelectable(decision))
             }
             Divider()
-            Button("Manage Agents…") {
-                AppActivation.openWindow(id: "agents", using: openWindow)
-            }
+            // The editor is a PANE now, so this goes there rather than opening
+            // a window — one place agents are managed.
+            Button("Manage Agents…") { appState.showAgents() }
         } label: {
-            destinationLabel("Agents", icon: "person.2", selected: false)
+            Image(systemName: "person.badge.plus")
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 30, height: ChatMetrics.sidebarButtonHeight)
+                .background(
+                    RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                        .fill(Color.primary.opacity(0.07)))
+                .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .frame(height: ChatMetrics.sidebarButtonHeight)
+        .help("New chat with an agent")
     }
 
     /// The Code Launcher row: the tray's own CLI list, so the two can't drift.

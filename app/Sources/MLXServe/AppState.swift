@@ -232,6 +232,13 @@ class AppState: ObservableObject {
         pendingChatOpenTick += 1
     }
 
+    /// Show the Agents pane. The standalone Agents window still exists for the
+    /// composer's "Edit Agent…" deep link; this is the sidebar's route.
+    func showAgents() {
+        chatWorkspace = .agents
+        pendingChatOpenTick += 1
+    }
+
     /// Show Settings in the content area — the sidebar's row. ⌘, from the menu
     /// bar still opens the WINDOW: that shortcut is a macOS convention, and a
     /// window is what people expect it to produce.

@@ -26,6 +26,11 @@ enum ChatWorkspace: Equatable {
     /// argument as the browser applies — a task is something you set up and then
     /// go back to chatting, not a place you live.
     case tasks
+    /// The agent list + editor. The sidebar row used to open a MENU of agents,
+    /// which made "Agents" mean "start a chat as somebody" — a different verb
+    /// from every other row in that column, none of which start anything. It is
+    /// a pane like Tasks now: the list is column two, the editor is the detail.
+    case agents
     /// App settings. A window until 2026-08-08 (and still ⌘, from the menu bar,
     /// which macOS expects) — but the sidebar lists it, so it renders here too.
     case settings
@@ -36,6 +41,13 @@ enum ChatWorkspace: Equatable {
     }
 
     var isTasks: Bool { self == .tasks }
+
+    var isAgents: Bool { self == .agents }
+
+    /// Whether this mode is laid out as a three-column split (sidebar, list,
+    /// detail) rather than sidebar + content. One answer, read by the view: two
+    /// separate checks are how one of them ends up on the wrong split.
+    var isThreeColumn: Bool { isTasks || isAgents }
 
     var isSettings: Bool { self == .settings }
 

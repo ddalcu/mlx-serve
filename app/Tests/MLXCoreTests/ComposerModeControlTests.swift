@@ -234,17 +234,38 @@ final class ComposerModeControlTests: XCTestCase {
                       "model / workspace / voice all live outside the turn")
     }
 
-    func testTheAgentPickerLivesOnTheAgentsDestination() throws {
+    /// Starting a chat AS an agent must remain reachable, wherever the control
+    /// lives.
+    ///
+    /// It has moved twice — composer chip → the sidebar's Agents row → back
+    /// beside New Chat, once Agents became a destination like every other row.
+    /// The second move nearly dropped it: taking the menu off the Agents row
+    /// left `startChat(withAgent:)` with no caller anywhere in the UI, which is
+    /// the capability disappearing rather than relocating. A session's agent is
+    /// fixed once the session exists (there is no `setAgent`), so this is the
+    /// only moment it can be decided — pin the CAPABILITY, not the coordinates.
+    func testStartingAChatAsAnAgentStaysReachable() throws {
         let chat = try chatViewSource()
-        // It moved off the icon button beside New Chat and onto the sidebar's
-        // Agents row — but it MOVED, it wasn't dropped: starting a chat as
-        // somebody is the only moment a session's agent can be decided.
-        XCTAssertTrue(chat.contains("private var agentsRow"),
-                      "the sidebar's Agents destination owns the agent picker now")
         XCTAssertTrue(chat.contains("appState.startChat(withAgent: agent.id)"),
-                      "picking an agent starts a chat as that agent")
-        XCTAssertTrue(chat.contains("Button(\"Manage Agents…\")"),
-                      "…and the editor stays reachable from the same row")
+                      "some control must still start a chat as a chosen agent")
+        XCTAssertTrue(chat.contains("private var newAgentChatMenu"),
+                      "…and it sits beside New Chat, where the choice is made")
+        XCTAssertTrue(chat.contains("Button(\"Manage Agents…\") { appState.showAgents() }"),
+                      "the editor is a pane now, so managing agents goes there, not to a window")
+    }
+
+    /// Agents is a DESTINATION, not a menu: every other row in that column
+    /// means "go somewhere", and a row that instead starts a conversation was
+    /// the odd one out — with the editor buried at the bottom of its menu.
+    func testTheAgentsRowIsADestinationNotAMenu() throws {
+        let chat = try chatViewSource()
+        let start = try XCTUnwrap(chat.range(of: "private var agentsRow"))
+        let rest = chat[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    }")?.upperBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("appState.showAgents()"),
+                      "the Agents row opens the Agents pane")
+        XCTAssertFalse(body.contains("Menu {"),
+                       "the Agents row must not open a menu any more")
     }
 
     // MARK: - Content passing under floating chrome

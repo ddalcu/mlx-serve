@@ -123,6 +123,7 @@ final class ChatWorkspaceTests: XCTestCase {
             "MusicGenService": ".environmentObject(appState.musicGen)",
             "Model3DGenService": ".environmentObject(appState.model3dGen)",
             "TaskScheduler": ".environmentObject(appState.taskScheduler)",
+            "AgentStore": ".environmentObject(appState.agents)",
         ]
 
         // Every view the chat window hosts as a MODE — the browser, the four
@@ -134,7 +135,12 @@ final class ChatWorkspaceTests: XCTestCase {
                       "Sources/MLXServe/Views/VideoGenView.swift",
                       "Sources/MLXServe/Views/AudioGenView.swift",
                       "Sources/MLXServe/Views/Model3DGenView.swift",
-                      "Sources/MLXServe/Views/TasksView.swift"]
+                      "Sources/MLXServe/Views/TasksView.swift",
+                      // Agents is a mode now too, and its panes read a store
+                      // the chat scene did not inject — the same first-render
+                      // trap the Tasks columns hit, invisible to this audit for
+                      // exactly as long as the file was missing from this list.
+                      "Sources/MLXServe/Views/AgentsWindow.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()
         for path in hosted {

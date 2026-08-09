@@ -23,84 +23,135 @@ enum AgentsWindowFocus {
     }
 }
 
-struct AgentsWindow: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var store: AgentStore
+/// The editing state the two agent columns share.
+///
+/// It is an object, not `@State` on a parent, because the list and the editor
+/// are now separate COLUMNS of the chat window's split — the selection is made
+/// in one and the draft is edited in the other, so neither can own the other's
+/// state (the same reason a task's selection lives on `AppState`). The window
+/// and the chat-window pane each own one of these, so opening both does not
+/// make them fight over one draft.
+@MainActor
+final class AgentsWorkspaceModel: ObservableObject {
+    @Published var selectedId: UUID?
+    /// The row being edited, held apart from the store so typing doesn't
+    /// rewrite the JSON on every keystroke; committed on change of
+    /// focus/selection and on Save.
+    @Published var draft: Agent?
+    @Published var isWriting = false
+    @Published var alert: AlertItem?
 
-    @State private var selectedId: UUID?
-    /// The row being edited, held locally so typing doesn't rewrite the JSON on
-    /// every keystroke; committed on change of focus/selection and on Save.
-    @State private var draft: Agent?
-    @State private var alertItem: AlertItem?
-    @State private var isWriting = false
-
-    /// ONE alert presentation path for this window — an alert modifier on an
+    /// ONE alert presentation path per surface — an alert modifier on an
     /// ancestor shadows a descendant's, so a second one would silently never
     /// present (the sandbox ✕-confirm class).
-    private struct AlertItem: Identifiable {
+    struct AlertItem: Identifiable {
         enum Kind { case message(String), confirmDelete(Agent) }
         let id = UUID()
         let title: String
         let kind: Kind
     }
 
+    func message(_ title: String, _ text: String) {
+        alert = AlertItem(title: title, kind: .message(text))
+    }
+}
+
+struct AgentsWindow: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var store: AgentStore
+
+    @StateObject private var model = AgentsWorkspaceModel()
+
     var body: some View {
         NavigationSplitView {
-            sidebar
+            AgentListPane(model: model)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
-            if let draft {
-                AgentEditor(agent: bindingToDraft(draft),
-                            isWriting: $isWriting,
-                            onWrite: { writePrompt() },
-                            onSave: { commit() },
-                            onDuplicate: { duplicate(draft) },
-                            onDelete: { alertItem = AlertItem(title: "Delete “\(draft.name)”?",
-                                                              kind: .confirmDelete(draft)) },
-                            onNotify: { alertItem = AlertItem(title: $0, kind: .message($0)) })
-                    .environmentObject(appState)
-            } else {
-                ContentUnavailableView("No agent selected",
-                                       systemImage: "person.crop.circle.badge.questionmark",
-                                       description: Text("Pick an agent, or create one from a description."))
-            }
+            AgentDetailPane(model: model)
         }
-        .onChange(of: selectedId) { _, newValue in
-            commit()
-            draft = store.agent(id: newValue)
-        }
-        .onAppear {
-            AppActivation.focus()
-            applyFocus()
-        }
-        // The window is a single reused instance, so a deep link that arrives
-        // while it is already open has to move the selection — `onAppear` alone
-        // would leave the user staring at whoever they were editing.
-        .onChange(of: appState.pendingAgentSelection) { _, _ in applyFocus() }
-        .alert(item: $alertItem) { item in
-            switch item.kind {
-            case .message(let text):
-                return Alert(title: Text("Agents"), message: Text(text),
-                             dismissButton: .default(Text("OK")))
-            case .confirmDelete(let agent):
-                return Alert(title: Text(item.title),
-                             message: Text("This can't be undone."),
-                             primaryButton: .destructive(Text("Delete")) {
-                                 store.delete(id: agent.id)
-                                 selectedId = store.allAgents.first?.id
-                                 draft = store.agent(id: selectedId)
-                             },
-                             secondaryButton: .cancel())
-            }
+        .onAppear { AppActivation.focus() }
+    }
+}
+
+// MARK: - The two columns
+
+/// The agent list. A column of the chat window's split when Agents is up, and
+/// the leading column of the standalone Agents window.
+struct AgentListPane: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var store: AgentStore
+    @ObservedObject var model: AgentsWorkspaceModel
+
+    /// Whether to draw the pane's own title row. The standalone window has a
+    /// real title bar; the chat-window column has only what it draws itself.
+    var showsHeader = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if showsHeader { header }
+            list
         }
     }
 
-    // MARK: Sidebar
+    /// Same shape as the Tasks column's: a plain row ABOVE the list, so it
+    /// needs no backdrop and therefore draws no rule.
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("Agents")
+                .font(.title3.weight(.semibold))
+            Spacer()
+            newAgentMenu
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+    }
 
-    private var sidebar: some View {
-        List(selection: $selectedId) {
+    /// `+` offers the TYPES, not a blank row.
+    ///
+    /// "New Agent" with an empty prompt is a form to fill in from nothing; the
+    /// starters are the app's own worked examples, and starting from one is how
+    /// most people should arrive at an agent. Blank stays available at the
+    /// bottom for someone who knows exactly what they want.
+    private var newAgentMenu: some View {
+        Menu {
+            Section("Start from a type") {
+                ForEach(Agent.starters) { starter in
+                    Button {
+                        newAgent(basedOn: starter)
+                    } label: {
+                        Label(starter.name, systemImage: starter.symbol)
+                    }
+                }
+            }
+            Divider()
+            Button {
+                newAgent(basedOn: nil)
+            } label: {
+                Label("Blank agent", systemImage: "square.dashed")
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.primary)
+                .frame(width: 24, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(0.07)))
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .help("New agent")
+    }
+
+    private var list: some View {
+        List(selection: $model.selectedId) {
             Section("Your agents") {
                 if store.sortedAgents.isEmpty {
-                    Text("None yet — tap + and describe the assistant you want.")
+                    Text("None yet — tap + and pick a type, or describe the assistant you want.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .listRowSeparator(.hidden)
@@ -117,63 +168,125 @@ struct AgentsWindow: View {
                 }
             }
         }
-        .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         .toolbar {
-            ToolbarItem {
-                Button { newAgent() } label: { Image(systemName: "plus") }
-                    .help("New agent")
+            // The standalone window keeps its toolbar control; the embedded
+            // column has the header's own + instead.
+            if !showsHeader {
+                ToolbarItem {
+                    newAgentMenu
+                }
             }
         }
     }
 
-    // MARK: Actions
+    /// A new agent, optionally seeded from a starter.
+    ///
+    /// Seeding COPIES the starter's prompt and capabilities into a new,
+    /// editable identity — it never selects the starter itself, which is
+    /// `isBuiltIn` and refuses every edit (`commit` returns early on one), so
+    /// "create from a type" that landed on the read-only original would be a
+    /// form that silently discards what you type into it.
+    private func newAgent(basedOn starter: Agent?) {
+        var agent = Agent(name: starter.map { "\($0.name) copy" } ?? "New Agent",
+                          brief: starter?.brief ?? "",
+                          systemPrompt: starter?.systemPrompt ?? "")
+        if let starter {
+            agent.symbol = starter.symbol
+            agent.capabilities = starter.capabilities
+        }
+        store.add(agent)
+        model.selectedId = agent.id
+        model.draft = agent
+    }
+}
+
+/// The selected agent's editor.
+struct AgentDetailPane: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var store: AgentStore
+    @ObservedObject var model: AgentsWorkspaceModel
+
+    var body: some View {
+        Group {
+            if let draft = model.draft {
+                AgentEditor(agent: bindingToDraft(draft),
+                            isWriting: $model.isWriting,
+                            onWrite: { writePrompt() },
+                            onSave: { commit() },
+                            onDuplicate: { duplicate(draft) },
+                            onDelete: { model.alert = .init(title: "Delete “\(draft.name)”?",
+                                                            kind: .confirmDelete(draft)) },
+                            onNotify: { model.message($0, $0) })
+            } else {
+                ContentUnavailableView("No agent selected",
+                                       systemImage: "person.crop.circle.badge.questionmark",
+                                       description: Text("Pick an agent, or create one from a type."))
+            }
+        }
+        .onChange(of: model.selectedId) { _, newValue in
+            commit()
+            model.draft = store.agent(id: newValue)
+        }
+        .onAppear { applyFocus() }
+        // A deep link that arrives while this is already open has to move the
+        // selection — `onAppear` alone would leave the user staring at whoever
+        // they were editing.
+        .onChange(of: appState.pendingAgentSelection) { _, _ in applyFocus() }
+        .alert(item: $model.alert) { item in
+            switch item.kind {
+            case .message(let text):
+                return Alert(title: Text("Agents"), message: Text(text),
+                             dismissButton: .default(Text("OK")))
+            case .confirmDelete(let agent):
+                return Alert(title: Text(item.title),
+                             message: Text("This can't be undone."),
+                             primaryButton: .destructive(Text("Delete")) {
+                                 store.delete(id: agent.id)
+                                 model.selectedId = store.allAgents.first?.id
+                                 model.draft = store.agent(id: model.selectedId)
+                             },
+                             secondaryButton: .cancel())
+            }
+        }
+    }
 
     private func bindingToDraft(_ current: Agent) -> Binding<Agent> {
-        Binding(get: { draft ?? current }, set: { draft = $0 })
+        Binding(get: { model.draft ?? current }, set: { model.draft = $0 })
     }
 
     /// Land on whoever was asked for, then consume the request.
     private func applyFocus() {
         guard let id = AgentsWindowFocus.selection(pending: appState.pendingAgentSelection,
-                                                   current: selectedId,
+                                                   current: model.selectedId,
                                                    first: store.allAgents.first?.id) else { return }
         appState.pendingAgentSelection = nil
         // A deep link to the agent ALREADY showing can't rely on
         // `onChange(of: selectedId)` — the id doesn't change, so the draft has
         // to be reloaded here or the click does nothing at all.
-        if selectedId == id {
-            draft = store.agent(id: id)
+        if model.selectedId == id {
+            model.draft = store.agent(id: id)
         } else {
-            selectedId = id
+            model.selectedId = id
         }
-    }
-
-    private func newAgent() {
-        commit()
-        let agent = Agent(name: "New Agent", brief: "", systemPrompt: "")
-        store.add(agent)
-        selectedId = agent.id
-        draft = agent
     }
 
     private func duplicate(_ agent: Agent) {
         let copy = store.duplicate(agent)
-        selectedId = copy.id
-        draft = copy
+        model.selectedId = copy.id
+        model.draft = copy
     }
 
     /// Write the draft back to the store. Wake-phrase collisions are refused
     /// HERE, at save time: a colliding phrase makes both agents unreachable by
     /// voice and there is nothing to see until you try talking.
     private func commit() {
-        guard var d = draft, !d.isBuiltIn else { return }
+        guard var d = model.draft, !d.isBuiltIn else { return }
         if let phrase = d.wakePhrase,
            WakeWord.collides(phrase, with: store.takenWakePhrases(excluding: d.id)) {
             d.wakePhrase = nil
-            draft = d
-            alertItem = AlertItem(
-                title: "That wake phrase is taken",
-                kind: .message("Another agent (or the app's own phrase) already answers to that name, so both would be unreachable. Pick a different one."))
+            model.draft = d
+            model.message("That wake phrase is taken",
+                          "Another agent (or the app's own phrase) already answers to that name, so both would be unreachable. Pick a different one.")
         }
         store.update(d)
         // A live tab talking to this agent picks the change up on its next turn;
@@ -184,28 +297,28 @@ struct AgentsWindow: View {
     /// Ask the current model to turn the brief into a system prompt. A failure
     /// falls back to the user's own words rather than losing what they typed.
     private func writePrompt() {
-        guard var d = draft, !d.isBuiltIn else { return }
+        guard var d = model.draft, !d.isBuiltIn else { return }
         let brief = d.brief.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !brief.isEmpty else {
-            alertItem = AlertItem(title: "Describe the agent first",
-                                  kind: .message("Write a line or two about the assistant you want, then let the model turn it into a prompt."))
+            model.message("Describe the agent first",
+                          "Write a line or two about the assistant you want, then let the model turn it into a prompt.")
             return
         }
-        isWriting = true
+        model.isWriting = true
         Task {
-            defer { isWriting = false }
+            defer { model.isWriting = false }
             let result: AgentWriter.Draft
             do {
                 result = try await AgentComposer.draftAgent(brief: brief, appState: appState)
             } catch {
                 result = AgentWriter.fallbackDraft(brief: brief)
-                alertItem = AlertItem(title: "Wrote it from your description",
-                                      kind: .message("\(error.localizedDescription)\n\nYour description was saved as the prompt — edit it directly, or try again once a model is running."))
+                model.message("Wrote it from your description",
+                              "\(error.localizedDescription)\n\nYour description was saved as the prompt — edit it directly, or try again once a model is running.")
             }
             d.systemPrompt = result.systemPrompt
             if d.name.isEmpty || d.name == "New Agent" { d.name = result.name }
             if d.symbol == "sparkles" { d.symbol = AgentSymbol.pick(for: "\(brief) \(result.name)") }
-            draft = d
+            model.draft = d
             commit()
         }
     }
