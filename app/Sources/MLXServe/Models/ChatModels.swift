@@ -40,12 +40,6 @@ struct ChatSession: Identifiable, Codable {
     /// leak between conversations. Switching applies to subsequent turns only.
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
-    ///
-    /// Stored as raw strings rather than `AgentToolKind` so a tool retired in a
-    /// later build leaves an unrecognized name on disk instead of failing the
-    /// whole session's decode — `disabledToolKinds` drops what it can't resolve.
-    /// Subtractive only: it can take away what the agent already allowed, never
-    /// grant what it forbids (see `AgentResolution.resolve`).
     var disabledTools: [String]
 
     init(title: String = "New Chat") {
@@ -173,15 +167,6 @@ struct ChatImage: Identifiable, Codable, Equatable {
 }
 
 /// A generated media file attached to a message BY REFERENCE.
-///
-/// Images ride `ChatMessage.images` as JPEG bytes, which is fine for a picture
-/// but not for the rest: a 30 s track is tens of MB and a 4 s clip more, and
-/// `chat-history.json` would carry every one of them forever. So audio and video
-/// are a path into the same `~/.mlx-serve/generations` tree the tray windows
-/// write to — the file the service already produced, not a second copy.
-///
-/// The file can go away (the user empties that folder), so every renderer treats
-/// a missing path as a normal state rather than assuming it resolves.
 struct ChatMediaRef: Codable, Equatable, Identifiable {
     enum Kind: String, Codable { case image, audio, video }
 
@@ -834,10 +819,6 @@ struct LocalModel: Identifiable, Hashable {
     /// name plus the quant it is (`unsloth/Qwen3.5-4B-GGUF · Q4_K_M`) — sibling
     /// quants share a `name`, so the name alone can't tell them apart, and
     /// `name` has to stay the repo name because filters and grouping key off it.
-    ///
-    /// The resolved `quantLabel` wins: the bare token is a property of ONE
-    /// filename and two builds of the same scheme reduce to the same one, which
-    /// is how the picker ended up with two identical titles.
     var displayLabel: String {
         guard let quantFile else { return name }
         return "\(name) · \(quantLabel ?? DownloadManager.quantLabel(forFilename: quantFile))"
@@ -943,12 +924,6 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // speculative decode (~1.1–1.4× decode on agent/code workloads).
     GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
     // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
-    // Our own mixed 2/3/8-bit safetensors mirror, so it takes the plain repo
-    // download path; it replaced the `antirez/deepseek-v4-gguf` IQ2XXS entry
-    // that the embedded ds4 engine served (same model, one engine fewer in the
-    // way, but 118 GB instead of 87 — the 96 GB tier no longer has a DeepSeek
-    // entry here). The id keeps its "dsv4" token: that is what the tray filter
-    // reads.
     GemmaModelOption(
         id: "dsv4-flash-mlx",
         displayName: "DeepSeek-V4-Flash (MLX native)",
@@ -957,10 +932,6 @@ let gemmaModelOptions: [GemmaModelOption] = [
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
-    // The imatrix-calibrated 2-bit build (mlx-community oQ2e): the FULL
-    // 192-expert model with attention/router/shared-expert/embeddings kept at
-    // 8-bit, ~84 GB — so a 128 GB Mac loads it WITH real context headroom
-    // (the older ~110 GB mixed build loaded but left almost none). No MTP head.
     GemmaModelOption(
         id: "hy3-oq2e",
         displayName: "Hunyuan 3 295B-A21B (2-bit)",

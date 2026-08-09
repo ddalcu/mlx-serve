@@ -4,24 +4,6 @@ import SwiftUI
 /// selected task's run history + transcript. The unattended "claw" surface —
 /// create a goal, give it autonomy and (optionally) a schedule, and let it run
 /// in the background.
-///
-/// It has no shell of its own. It was a `Window`, then briefly a two-pane HStack
-/// inside the chat window's detail column; it is now the CONTENT and DETAIL
-/// columns of that window's own three-column split (`ChatView.tasksSplitView`),
-/// because a list of tasks is navigation and belongs beside the app's sidebar
-/// rather than inside the area it navigates. Selection therefore lives on
-/// `AppState` — neither column can own the other's state.
-///
-/// **The two columns are two VIEW TYPES, and that is load-bearing** (live crash
-/// 2026-08-08): they used to be `taskList` / `taskDetail` computed properties on
-/// one `TasksView`, which the split view read as `TasksView().taskList`. That
-/// constructs a view VALUE and immediately evaluates a property that touches
-/// `@EnvironmentObject` — but SwiftUI populates that storage when it INSTALLS a
-/// view in the hierarchy, and this instance never was one, so the first click on
-/// Tasks trapped in `TasksView.$appState.getter`. A `.environmentObject(…)` at
-/// the call site cannot save it: the modifier decorates the view the property
-/// already returned, long after the property read the empty box. An environment
-/// reader has to BE the column, not produce it.
 
 /// The middle column: the task list.
 struct TaskListPane: View {
@@ -33,13 +15,6 @@ struct TaskListPane: View {
     var body: some View {
         taskListBody
         // The column's own title and control, in the window's toolbar.
-        //
-        // Safe there because both are STATIC: the `»`-eviction rule is about
-        // strips whose members appear or change width at runtime, which is
-        // what NSToolbar cannot re-measure. A fixed word and one button are
-        // not that. It rode a header row inside the pane while the toolbar
-        // belonged to the chat; the chat's cluster is gone, so the band is
-        // free and this is where macOS puts a column's title.
         .toolbar {
             // Title and control in ONE leading item, so the + sits beside the
             // word rather than across the column at the trailing edge — and

@@ -5,12 +5,6 @@ import UniformTypeIdentifiers
 /// Image generation window — native FLUX.2, Krea-2-Turbo and Mage-Flow (no
 /// Python). The model picker lists every `ImageModelPreset`; the server
 /// auto-routes to the right image backend by the model's `model_type`.
-///
-/// UI layering: a Quality picker drives steps (hidden where the schedule is
-/// distillation-fixed), a Resolution picker pins to model-trained buckets, and
-/// Advanced lets the user override individual fields. Every control in Advanced
-/// is gated on a preset capability flag — the pane shows nothing this backend
-/// would ignore or reject.
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
@@ -291,40 +285,16 @@ struct ImageGenView: View {
     /// Best-per-capability up front, everything else behind "Other Models", and
     /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        let featured = MediaModelPicks.featured(
-            ImageModelPreset.all,
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-            capabilityOf: \.capabilityLabel)
-        return MediaModelChooser(
-            featured: featured,
-            others: MediaModelPicks.others(ImageModelPreset.all, featured: featured),
+        MediaModelChooser.pane(
+            all: ImageModelPreset.all,
             onThisMac: CustomMediaModels.imagePresets(from: server.allModels),
-            selectedId: model.id,
-            lanModel: lanModel,
+            capability: "image",
+            selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            isDownloaded: { downloads.bundleReady($0.bundle) },
-            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
-            onSelect: { preset in
-                lanModel = nil
-                model = preset
-            },
-            onDownload: { preset in
-                // Downloading also selects: you fetch the one you mean to use,
-                // and a progress bar under a row you then have to click would
-                // be the same two-step the old bottom-of-pane button was.
-                lanModel = nil
-                model = preset
-                downloads.startBundle(preset.bundle) { appState.refreshModels() }
-            },
-            lanCapability: "image",
-            onSelectLan: { id in
-                lanModel = id
-                if let base = ImageModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
-                    model = base
-                }
-                persist()
-            }
-        )
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
         .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
     }
 

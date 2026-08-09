@@ -3,11 +3,6 @@ import AppKit
 import SwiftUI
 
 /// A silent, looping, chrome-free video — a demo, not a player.
-///
-/// `AVPlayerView` would bring transport controls to something you watch rather
-/// than operate, so this is a bare `AVPlayerLayer`. `AVPlayerLooper` owns the
-/// queue (hence the empty `AVQueuePlayer`) and is what makes the wrap seamless
-/// — seek-to-zero on `didPlayToEndTime` hitches every cycle.
 struct LoopingVideoView: NSViewRepresentable {
     let url: URL
     var gravity: AVLayerVideoGravity = .resizeAspect

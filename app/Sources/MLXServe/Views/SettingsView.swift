@@ -5,11 +5,6 @@ import UniformTypeIdentifiers
 /// Single-window form for the user-facing mlx-serve tunables. Bindings flow
 /// through `appState.serverOptions`; AppState's `didSet` auto-saves to
 /// UserDefaults.
-///
-/// Intentionally narrow surface: only the things end-users actually want to
-/// tune. Request-timeout lives in the CLI for power users; per-request
-/// spec-decode overrides duplicate what the Speculative Decoding toggles
-/// already express; "Enable thinking" lives on the chat toolbar.
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -271,10 +266,6 @@ private struct SettingsVisibleRowCountKey: PreferenceKey {
 /// Wraps one row so the filter can hide it, and reports it as visible when it
 /// survives. `searchText` is conventionally `[label, description]` — the same
 /// text the row renders, so what you read is what you can search for.
-///
-/// Rows that don't match render nothing, which is what keeps a filtered screen
-/// short. Note they must not be dropped from the *section's* tree wholesale —
-/// see `SettingsSection.collapsed`.
 private struct SearchableRow<Content: View>: View {
     let searchText: [String]
     @ViewBuilder var content: Content
@@ -344,13 +335,6 @@ private struct NoSearchResults: View {
 
 /// Restores the fields of whatever the sidebar has selected — that one section,
 /// or (under "All Settings") the whole screen, keeping the Telegram bot token.
-///
-/// The scope FOLLOWS the sidebar, and the confirmation says which scope it is
-/// before anything is wiped. It has to: a button labelled "Reset to Defaults"
-/// sitting at the bottom of the Voice pane reads as "reset Voice", so it had
-/// better not be quietly wiping the server flags too. Sections with nothing of
-/// their own to reset (Model Folders, Updates) show no button rather than a
-/// button that does nothing — see `SettingsReset`.
 private struct ResetDefaultsFooter: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.settingsSelection) private var selection
@@ -469,12 +453,6 @@ private struct RestartBanner: View {
 ///   - No model yet: All sections shown (so users can pre-tune before
 ///                   loading); a banner clarifies that some controls only
 ///                   apply once a matching engine is loaded.
-///
-/// `ModelInfo.engine` is the source of truth — it's computed from the
-/// `architecture` string the server reports in `/v1/models`. Pre-load
-/// (`server.modelInfo == nil`) defaults to `.mlx` for display purposes
-/// since that's still the most common path, but a banner notes the
-/// fallback so power users know what's going on.
 private struct EngineAwareSections: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.settingsSearchQuery) private var query
@@ -483,9 +461,6 @@ private struct EngineAwareSections: View {
     /// Resolved engine for routing UI decisions. Nil when no model has
     /// loaded yet (server stopped or first start in progress) — that
     /// case shows all sections so users can pre-tune.
-    ///
-    /// `SettingsCategory.visible(engine:)` applies the SAME rule to the sidebar,
-    /// so the list and the form can't disagree about what exists.
     private var engine: ServerEngine? { server.modelInfo?.engine }
 
     var body: some View {
@@ -1634,21 +1609,6 @@ private struct Ds4PerformanceSectionContent: View {
 // MARK: - Drafter row
 
 /// Three-state speculative-decoding toggle for the Gemma 4 assistant drafter.
-///
-/// State is derived from (loaded model architecture, isMoE, drafter on disk):
-///   - **Available, dense Gemma 4** → toggle on/off; status pill shows the
-///     auto-discovered checkpoint name in green.
-///   - **Available, MoE Gemma 4** → toggle stays usable but flipping on shows
-///     a yellow caution pill: drafter regresses on MoE at single-stream
-///     batch=1 (verify expert-routing penalty), so PLD is the recommended
-///     path. Per-request `enable_drafter:true` still works.
-///   - **Unavailable** → disabled toggle, with a one-line explainer naming
-///     the reason (non-Gemma-4 target, or no matching drafter on disk). A
-///     missing checkpoint gets a "Download drafter" button right here — the
-///     Model Browser's drafter catalog is gone (the drafter now rides along
-///     with its target, `DownloadManager.companionDrafterRepo`), and HF search
-///     filters drafter repos out, so this is the only way to fetch one for a
-///     Gemma 4 that landed before that.
 private struct DrafterRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -1762,10 +1722,6 @@ private struct DrafterRow: View {
                 .padding(.top, 2)
             } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
                 // A dense Gemma 4 is loaded but its drafter isn't on disk —
-                // a model downloaded before drafters rode along. Fetch it from
-                // here: the browser has no drafter catalog any more, and HF
-                // search filters these repos out, so a "Browse" button would
-                // send the user somewhere that can't help.
                 Button(downloads.downloads[repo]?.status == .downloading
                        ? "Downloading drafter…" : "Download drafter") {
                     downloads.start(repoId: repo) { appState.refreshModels() }

@@ -1,28 +1,6 @@
 import Foundation
 
 /// Moving a Create-pane result into a conversation.
-///
-/// There are two ways to make an asset in this app and they are deliberately
-/// different things:
-///
-/// * **Create** is the workshop. You hold the controls — model, steps, size,
-///   references, LoRA — it runs at full quality, and you iterate: ten renders to
-///   get one. Results pile up in the pane's `recent` strip and on disk. Nothing
-///   here is a conversation.
-/// * **Chat** is asking someone to make it. You describe it in a sentence, the
-///   model picks the tool and writes the prompt, and it runs at PREVIEW settings
-///   (`MediaChatDefaults`) with one generation per turn — because it is sharing
-///   the GPU with the reply you are waiting for. The result is part of the
-///   thread, so "now make it winter" has something to refer to.
-///
-/// Whoever holds the controls is the whole distinction, and the consequences —
-/// quality vs. context, iteration vs. conversation — follow from it.
-///
-/// This is the bridge in one direction: something you made in the workshop,
-/// carried into a conversation so you can talk about it. It lands in a NEW chat
-/// rather than whichever one happened to be open — a render appearing in the
-/// middle of an unrelated thread is the surprise, and Create is iterative, so
-/// "the open chat" is rarely the one you meant.
 enum GeneratedMediaHandoff {
 
     /// Which transcript attachment a generator's output becomes. 3D is
@@ -39,11 +17,6 @@ enum GeneratedMediaHandoff {
     }
 
     /// The message that opens the new conversation.
-    ///
-    /// A USER message: the model in that thread did not make this and has never
-    /// seen it, so filing it as assistant output would be the same class of lie
-    /// as rendering an error as something the model said. It also leaves the
-    /// turn to the user — the handoff starts a conversation, it doesn't take one.
     static func message(path: String, prompt: String,
                         kind: ChatMediaRef.Kind) -> ChatMessage {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -1,28 +1,6 @@
 import Foundation
 
 /// The composer's "make me one of these" mode.
-///
-/// There were two ways to create an asset and they sat at opposite ends of the
-/// app: the Create panes (you hold every control, full quality, no
-/// conversation) and the chat tools (the model interprets your sentence and
-/// decides, at preview settings). Clicking "Create Image" in the chat threw you
-/// out of the chat and into a form.
-///
-/// This is the third shape, and it is the one the chip should have done all
-/// along: the CHAT surface, driven directly. Your prompt goes straight to the
-/// generator — no model reading it, no tool call, no turn — the composer's
-/// existing attach button supplies a source image, the result lands in the
-/// transcript, and the handful of settings that matter hide behind a
-/// disclosure. Same window, same input, no form.
-///
-/// So the three ways now read as one spectrum of WHO IS DRIVING:
-/// * **Chat, plain** — the model decides everything (it may not generate at all).
-/// * **Chat, create mode** — you decide the prompt, the app decides the rest.
-/// * **Create pane** — you decide everything.
-///
-/// Persisted per session as a RAW STRING (`ChatSession.createMode`), the same
-/// tolerance the per-chat tool switches use: a mode retired in a later build
-/// leaves an unknown name behind rather than failing the whole session's decode.
 enum ChatCreateMode: String, CaseIterable, Identifiable {
     case image, video, audio
 
@@ -89,12 +67,6 @@ enum ChatCreateMode: String, CaseIterable, Identifiable {
 }
 
 /// What pressing Generate does, given whether the chosen model is on disk.
-///
-/// The missing-model case is NOT a wall in front of the composer: you type the
-/// prompt, press Generate, and the app then asks whether to fetch the model and
-/// runs what you wrote as soon as it lands. Making someone go and download
-/// something before they are allowed to describe what they want is the same
-/// "answer a question you can't answer yet" problem the model picker had.
 enum ChatCreateSend: Equatable {
     /// Ready — run it now.
     case generate

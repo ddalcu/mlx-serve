@@ -253,38 +253,16 @@ struct VideoGenView: View {
     /// Best-per-capability up front, everything else behind "Other Models", and
     /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        let featured = MediaModelPicks.featured(
-            VideoModelPreset.all,
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-            capabilityOf: \.capabilityLabel)
-        return MediaModelChooser(
-            featured: featured,
-            others: MediaModelPicks.others(VideoModelPreset.all, featured: featured),
+        MediaModelChooser.pane(
+            all: VideoModelPreset.all,
             onThisMac: CustomMediaModels.videoPresets(from: server.allModels),
-            selectedId: model.id,
-            lanModel: lanModel,
+            capability: "video",
+            selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            isDownloaded: { downloads.bundleReady($0.bundle) },
-            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
-            onSelect: { preset in
-                lanModel = nil
-                model = preset
-            },
-            onDownload: { preset in
-                // Downloading also selects — you fetch the one you mean to use.
-                lanModel = nil
-                model = preset
-                downloads.startBundle(preset.bundle) { appState.refreshModels() }
-            },
-            lanCapability: "video",
-            onSelectLan: { id in
-                lanModel = id
-                if let base = VideoModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
-                    model = base
-                }
-                persist()
-            }
-        )
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
         .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
     }
 
@@ -389,14 +367,6 @@ struct VideoGenView: View {
     /// Soft hint when the chosen length looks too aggressive for the Mac's
     /// total RAM at the current resolution. Doesn't block — the user might
     /// know better (e.g. they just freed memory).
-    ///
-    /// On H3 it also says the NUMBER and the two ways out, because "may exceed
-    /// your RAM" on a job this long is a shrug: the memory is dominated by the
-    /// fast recipe's step cache, so turning Max quality ON is the low-memory
-    /// mode — backwards from every other quality toggle, and impossible to
-    /// Turbo only counts on a preset that declares it — the state survives
-    /// preset switches (the `firstFrameImageURL` convention), and a stale
-    /// `true` must not shape another backend's requests or estimates.
     private var turboEngaged: Bool { turbo && model.supportsTurbo }
     /// What the server's recipe actually runs: turbo forces it off, so every
     /// plan/estimate call reads THIS, never `!bestQuality` alone.
@@ -444,12 +414,6 @@ struct VideoGenView: View {
     }
 
     /// "about 50 min — estimated for M4 Max", under the Generate button.
-    ///
-    /// H3 only: it is the one backend where the options change the answer by an
-    /// order of magnitude (20 minutes to three hours on the same Mac), so
-    /// "generate and find out" is not an acceptable interface. Recomputed as
-    /// the controls move, which is the whole point — it is how you learn that
-    /// the widescreen canvas costs 2.9x, not 2x.
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         return H3TimeEstimate.describeBest(
@@ -622,10 +586,6 @@ struct VideoGenView: View {
 
     // ── Speech & sound (audio-to-video) ──
     // Attach real speech/audio and the model generates the video AGAINST it:
-    // voices, lip sync and performance follow the clip, and the clip itself
-    // becomes the mp4's soundtrack (guaranteed words — no hoping the joint
-    // model nails quoted dialogue). Two sources: any audio file, or a line
-    // synthesized by the local Qwen3-TTS voice right from this pane.
     @ViewBuilder
     private var speechSection: some View {
         // A backend that GENERATES its soundtrack takes no audio input, so the
@@ -854,10 +814,6 @@ struct VideoGenView: View {
                 .foregroundStyle(.secondary)
             }
             // Steps — more steps = more detail/smoother motion, but slower.
-            // The range and the copy are the PRESET's: the old ones were LTX's
-            // ("runs well from ~8"), shown verbatim on a backend where 8 steps
-            // is below anything we have a verdict on and the fast recipe's
-            // warmup/tail windows cover the whole schedule.
             intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
             Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)

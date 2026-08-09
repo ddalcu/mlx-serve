@@ -1,11 +1,6 @@
 import Foundation
 
 /// The two first-run decisions, as pure data.
-///
-/// Both surfaces they drive are awkward to test directly — the welcome window
-/// is a bare `NSHostingView` outside the SwiftUI Scene graph, and the chat gate
-/// is a sheet over a window — so the DECISION lives here and each view stays a
-/// thin renderer of it. Same shape as `ChatModeToggles`/`ModelUseState`.
 
 // MARK: - What a launch opens
 
@@ -44,17 +39,6 @@ enum LaunchDecision: Equatable {
 // MARK: - Leaving the welcome window
 
 /// Every way out of the welcome window, and what each one leaves on screen.
-///
-/// Live dead end: "Browse all models" dismissed the window and opened ONLY the
-/// Model Browser. Close that browser — or download a model without spotting its
-/// "Use" button — and you are looking at an empty desktop with the app in the
-/// menu bar, unable to get back to the screen you started from: the welcome
-/// window is `.floating`, `_welcomeWindow` is already closed, and nothing
-/// re-opens it until the next launch.
-///
-/// So the rule is a TYPE, not a habit: an exit always opens Chat and always
-/// closes the window. Browse opens the browser too, on top of the chat window
-/// it just queued, which is why closing the browser now lands on a composer.
 enum WelcomeExit: CaseIterable, Equatable {
     /// The footer's primary button.
     case startChatting
@@ -81,18 +65,6 @@ enum WelcomeExit: CaseIterable, Equatable {
 
 /// Whether the chat window must block on "you need a model first", and what
 /// that block says.
-///
-/// The condition is a CHAT-CAPABLE model, not "any model": someone whose only
-/// download is an image backend has a full `~/.mlx-serve/models` and still
-/// cannot send a message. `localModels` already covers LM Studio's folder and
-/// the Hugging Face hub cache (`DownloadManager.discoverLocalModels`), so
-/// anyone who arrived with models never sees the sheet — and because it's
-/// `@Published`, the sheet clears itself the moment a download lands.
-///
-/// LAN-discovered chat models count as usable, same as `trayHasNoUsableModels`:
-/// a Mac with nothing downloaded can still chat on a peer's model, and a gate
-/// that blocked it would lock the user out of a conversation they can already
-/// have.
 enum ChatGateState: Equatable {
     /// A chat model is available — no sheet.
     case hidden

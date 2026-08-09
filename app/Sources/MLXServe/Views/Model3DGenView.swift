@@ -129,38 +129,16 @@ struct Model3DGenView: View {
     /// Best-per-capability up front, everything else behind "Other Models", and
     /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        let featured = MediaModelPicks.featured(
-            Model3DModelPreset.all,
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-            capabilityOf: \.capabilityLabel)
-        return MediaModelChooser(
-            featured: featured,
-            others: MediaModelPicks.others(Model3DModelPreset.all, featured: featured),
+        MediaModelChooser.pane(
+            all: Model3DModelPreset.all,
             onThisMac: CustomMediaModels.meshPresets(from: server.allModels),
-            selectedId: model.id,
-            lanModel: lanModel,
+            capability: "3d",
+            selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            isDownloaded: { downloads.bundleReady($0.bundle) },
-            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
-            onSelect: { preset in
-                lanModel = nil
-                model = preset
-            },
-            onDownload: { preset in
-                // Downloading also selects — you fetch the one you mean to use.
-                lanModel = nil
-                model = preset
-                downloads.startBundle(preset.bundle) { appState.refreshModels() }
-            },
-            lanCapability: "3d",
-            onSelectLan: { id in
-                lanModel = id
-                if let base = Model3DModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
-                    model = base
-                }
-                persist()
-            }
-        )
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
@@ -515,13 +493,6 @@ enum Model3DThumbnailer {
 
 /// Loads a `.glb` mesh into an `SCNScene`. Factored out (pure) so the load path
 /// is unit-testable against a fixture without standing up a view.
-///
-/// macOS has NO built-in glTF loader — ModelIO / SceneKit only parse obj / usd
-/// / stl / … — so we read the GLB container ourselves. Scoped to what the
-/// mlx-serve GLB writer emits: a single embedded BIN buffer, POSITION (+ optional
-/// NORMAL) VEC3-float attributes, and TRIANGLES indices (uint16/uint32/uint8).
-/// Anything outside that shape returns nil and the caller falls back to ModelIO
-/// (for the obj/usd formats it does handle).
 enum GLBMeshLoader {
     /// Load the file at `url` into a scene, or nil if it can't be parsed.
     static func loadScene(url: URL) -> SCNScene? {

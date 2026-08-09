@@ -5,15 +5,6 @@ import Metal
 
 /// This Mac's memory, framed the way a model picker needs it: how much RAM the
 /// machine HAS, and how much of it can actually be USED for a model.
-///
-/// "Usable" is the Metal GPU working-set ceiling (`recommendedMaxWorkingSetSize`)
-/// — the same limit the server's own auto-context budget and OOM guard use
-/// (`getGpuWorkingSetLimit`). It's ~75% of physical RAM on Apple Silicon, and
-/// it's the honest answer to "how big a model can this Mac run", where physical
-/// RAM alone overpromises (a 24 GB Mac can't hand 24 GB to one model).
-///
-/// The fit verdict compares a model's requirement against USABLE, not total.
-/// Pure except for `current()`, which reads the Metal device.
 struct SystemMemoryInfo: Equatable {
     let totalBytes: UInt64
     let usableBytes: UInt64

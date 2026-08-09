@@ -3,10 +3,6 @@ import Foundation
 /// The three features listed as clickable bullets in the welcome screen's left
 /// column. Selecting one drives the right column (`rightPanel`). Pure data so
 /// the order, copy and panel mapping are testable without standing up a view.
-///
-/// ORDER IS LOAD-BEARING: "Run models locally" leads and is the default
-/// selection — it's the first-run fact that matters most (you can't chat
-/// without a model), and its panel is the recommended-download card.
 enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
     case runModels
     case menuBar

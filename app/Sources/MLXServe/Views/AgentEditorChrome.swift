@@ -2,13 +2,6 @@ import SwiftUI
 
 /// The Agents editor's geometry — one source of truth for numbers that must
 /// agree across independently-written sections.
-///
-/// They used to belong to a grouped `Form`, which owned the radii, insets,
-/// label typography and section spacing — and right-aligns a TextField's text,
-/// which put the agent's own name against the trailing edge of its field.
-/// Owning them means they can drift, so the relationships are pinned by
-/// `AgentEditorLayoutTests`. Geometry is the design frame's; type is the
-/// platform's semantic scale, which is what survives a Dynamic Type change.
 enum AgentEditorMetrics {
     /// Column edge → content.
     static let contentPadding: CGFloat = 24
@@ -71,10 +64,6 @@ extension View {
 // MARK: - Structure
 
 /// A section: its title, then whatever it titles.
-///
-/// One builder, so two headings cannot stop matching. The title is `.title3`
-/// weighted rather than `.headline`, which on macOS is the same 13pt as the
-/// labels under it — a heading the same size as its content is not a heading.
 struct AgentSection<Content: View>: View {
     let title: String
     @ViewBuilder let content: () -> Content
@@ -117,11 +106,6 @@ struct AgentCard<Content: View>: View {
 }
 
 /// A labelled field: the label above, the field on its own card surface below.
-///
-/// The label sits OUTSIDE the field rather than beside it inside — a Form puts
-/// it inside and then right-aligns the value, which is what had the agent's
-/// name pinned to the trailing edge of a field with the word "Name" at the
-/// other end of it.
 struct AgentLabeledField<Content: View>: View {
     let label: String
     @ViewBuilder let content: () -> Content
@@ -147,9 +131,6 @@ struct AgentLabeledField<Content: View>: View {
 
 /// One row inside a card: what it is on the left, what it's set to on the
 /// right, and the sentence explaining it underneath.
-///
-/// The caption belongs to the ROW, not to the card — a card-level footnote
-/// can't say which of three rows it is about.
 struct AgentEditorRow<Trailing: View>: View {
     let title: String
     var caption: String?

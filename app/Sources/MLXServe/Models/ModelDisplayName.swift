@@ -1,17 +1,6 @@
 import Foundation
 
 /// A readable name for a model, built from its repo id.
-///
-/// A Hugging Face id is a filename, not a title: `mlx-community/gemma-4-12b-it-qat-4bit`
-/// carries an org that is identical across most of your models, packaging
-/// tokens that mean nothing to a reader (`it`, `qat`, `mlx`), and hyphens where
-/// spaces belong. The pill shows the READABLE form; the id itself survives as
-/// subtext wherever there is room for two lines, because it is the thing you
-/// paste into a config, match against `/v1/models`, and search Hugging Face
-/// for — losing it would be trading a precise name for a pretty one.
-///
-/// Pure, so the rules are pinned by tests rather than discovered by opening the
-/// picker and reading forty model names.
 enum ModelDisplayName {
 
     /// Packaging detail. True of every model in the list, so it distinguishes
@@ -97,10 +86,6 @@ enum ModelDisplayName {
     }
 
     /// `12b`, `0.6b`, `82m`, `a3b` (a MoE's ACTIVE parameters) — all sizes.
-    ///
-    /// The unit keeps its conventional case: a lowercase `b` for billions
-    /// (`12B` reads as an acronym) and an uppercase `M` for millions, which is
-    /// how every checkpoint in the catalogue spells it.
     private static func parameterCount(_ token: String) -> String? {
         guard let unit = token.last, unit == "b" || unit == "m" else { return nil }
         var head = token.dropLast()

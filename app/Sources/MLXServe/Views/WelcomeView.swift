@@ -509,11 +509,6 @@ struct WelcomeCardAnchorKey: PreferenceKey {
 
 /// One clickable feature in the welcome screen's left column. Selecting it
 /// drives the right panel.
-///
-/// Unselected rows carry NO fill or border — three filled boxes stacked above
-/// each other competed with the panel they were supposed to be pointing at.
-/// Selection is the accent tint plus the connector leaving its right edge;
-/// hover gets a faint fill so the row still announces it's clickable.
 private struct WelcomeFeatureCard: View {
     let feature: WelcomeFeature
     let isSelected: Bool

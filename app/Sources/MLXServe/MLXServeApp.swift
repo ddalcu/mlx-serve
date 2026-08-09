@@ -148,15 +148,9 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.processRegistry)
                 .frame(minWidth: 800, minHeight: 500)
                 // The intro screen, as a DIALOG over the chat window rather
-                // than a floating window of its own.
-                //
-                // The injections are NOT redundant with the chain above: a
-                // sheet does not inherit the environment of the view it hangs
-                // on — SwiftUI presents its content in its own hosting context
-                // — so without them the app traps in `WelcomeView.server` on
-                // every launch (live crash 2026-08-09). Every other sheet in
-                // the app injects the same way. Guard:
-                // `SheetEnvironmentAuditTests`.
+                // than a floating window of its own. The injections below are
+                // NOT redundant: a sheet does not inherit the environment of
+                // the view it hangs on (`SheetEnvironmentAuditTests`).
                 .sheet(isPresented: $appState.showWelcome) {
                     WelcomeView(onDismiss: { appState.showWelcome = false },
                                 hasChatModels: appState.welcomeHasChatModels,

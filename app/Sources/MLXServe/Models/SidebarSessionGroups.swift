@@ -2,11 +2,6 @@ import Foundation
 
 /// How the sidebar's conversation list is divided: agent threads above, plain
 /// chats below.
-///
-/// ONE function returning both halves, rather than two filters: a partition
-/// written as two predicates can drift into overlapping (a session in both
-/// sections) or into a gap (a session in neither, invisible with nothing to
-/// point at). Here the split is exhaustive and disjoint by construction.
 enum SidebarSessionGroups {
 
     /// - Returns: the agent-owned threads and the plain ones, each in the order

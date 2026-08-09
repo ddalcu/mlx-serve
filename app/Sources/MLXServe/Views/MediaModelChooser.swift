@@ -1,18 +1,6 @@
 import SwiftUI
 
 /// The Model control at the top of every Create pane.
-///
-/// It replaces a flat `Picker` over the whole catalogue — seven entries for
-/// images, ordered by download size, with the RAM cost visible only after you
-/// picked one. This leads with the best model per capability that this Mac can
-/// run (`MediaModelPicks`), says why each is there, and hides the rest behind
-/// "Other Models".
-///
-/// The **Download button lives on the model row**, not next to Generate. Those
-/// two were stacked at the bottom of the pane, so the pane's main action area
-/// showed two competing buttons and neither said which one you needed — and the
-/// thing being downloaded was named 200pt away, at the top. Downloading is part
-/// of choosing a model; generating is what you do after.
 struct MediaModelChooser<P: MediaModelSizing>: View {
     /// Featured picks — one per capability, best that fits.
     let featured: [MediaModelPicks.Pick<P>]
@@ -203,5 +191,53 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+}
+
+extension MediaModelChooser {
+    /// The Create panes' whole Model control.
+    ///
+    /// All four panes differ only in their catalogue, their discovered
+    /// checkpoints and their capability tag — the featured/others split, the
+    /// download wiring and the LAN handoff were copied four times, so a fix to
+    /// one copy left three behind.
+    static func pane(all: [P], onThisMac: [P], capability: String,
+                     selected: Binding<P>, lanModel: Binding<String?>,
+                     capabilityOf: @escaping (P) -> String,
+                     bundleOf: @escaping (P) -> MediaBundle,
+                     downloads: DownloadManager,
+                     onDownloadFinished: @escaping () -> Void,
+                     persist: @escaping () -> Void) -> MediaModelChooser<P> {
+        let featured = MediaModelPicks.featured(
+            all,
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            capabilityOf: capabilityOf)
+        return MediaModelChooser(
+            featured: featured,
+            others: MediaModelPicks.others(all, featured: featured),
+            onThisMac: onThisMac,
+            selectedId: selected.wrappedValue.id,
+            lanModel: lanModel.wrappedValue,
+            capabilityOf: capabilityOf,
+            isDownloaded: { downloads.bundleReady(bundleOf($0)) },
+            downloadLabel: { "Download \(bundleOf($0).approxSizeLabel)" },
+            onSelect: { preset in
+                lanModel.wrappedValue = nil
+                selected.wrappedValue = preset
+            },
+            onDownload: { preset in
+                // Downloading also selects — you fetch the one you mean to use.
+                lanModel.wrappedValue = nil
+                selected.wrappedValue = preset
+                downloads.startBundle(bundleOf(preset)) { onDownloadFinished() }
+            },
+            lanCapability: capability,
+            onSelectLan: { id in
+                lanModel.wrappedValue = id
+                if let base = all.first(where: { $0.id == LanPick.base(of: id) }) {
+                    selected.wrappedValue = base
+                }
+                persist()
+            })
     }
 }

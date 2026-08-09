@@ -14,13 +14,6 @@ enum ChatMetrics {
 
     /// The reading measure — the width the transcript AND the composer are
     /// capped at, centred in whatever the window gives them.
-    ///
-    /// Both used to be full-width: on a 1400pt window a line of prose ran the
-    /// whole way across (~180 characters, about twice what text is comfortable
-    /// at) and the input pill grew with the window until it read as a document
-    /// rather than a message field. It is ONE number for both, because a
-    /// composer even slightly narrower or wider than the answers above it is a
-    /// seam you can't unsee.
     static let contentMaxWidth: CGFloat = 740
 
     /// Between turns in the transcript. Wider than the old 12: with the column
@@ -58,30 +51,10 @@ enum ChatMetrics {
 
     /// Exact height of BOTH controls in the sidebar's bottom row (New Chat +
     /// the agent menu).
-    ///
-    /// They are `.plain` buttons drawing their own background — the same shape
-    /// as the composer's discs — precisely so this number is the height. Don't
-    /// put them back on `.buttonStyle(.bordered)`: a bordered control keeps its
-    /// INTRINSIC size and merely centers inside whatever frame it's given, so
-    /// its height can only be steered indirectly through the label, and a text
-    /// label and a bare glyph never land on the same number. Measured through
-    /// the accessibility API while both sat inside 28pt frames: New Chat 24pt,
-    /// the menu 17pt.
     static let sidebarButtonHeight: CGFloat = 28
     static let sidebarButtonCornerRadius: CGFloat = 6
 
     /// The transcript's reading size.
-    ///
-    /// A conversation is the one place in this app you READ rather than scan,
-    /// and macOS's 13pt body is a control-label size — right for a sidebar row
-    /// or a settings field, small for prose you sit with. Everything the
-    /// transcript renders derives from this rather than restating a number:
-    /// headings, list bullets and inline code were five separate literals, and
-    /// five literals are five chances to change four of them.
-    ///
-    /// The font itself is the system font, which on macOS IS SF Pro — a
-    /// `.custom("SF Pro")` would be the same typeface with none of the optical
-    /// sizing or the weight mapping, so it is deliberately never spelled.
     static let transcriptFontSize: CGFloat = 16
     /// Fenced/inline code inside the transcript. Monospaced digits and glyphs
     /// run wide, so matching the prose size makes code look larger than the
@@ -90,14 +63,6 @@ enum ChatMetrics {
 
     /// Panel edge → row edge. Every row in the sidebar reads it, so the
     /// destinations and the conversations are the same width by construction.
-    ///
-    /// They were not: the destinations are a `VStack` with this padding, while
-    /// the conversations are `List` rows, and `listRowInsets` measures from the
-    /// list's OWN content area — which a `.sidebar`-style list has already
-    /// inset. The same "8" in both places therefore drew two different widths,
-    /// with the chats pushed right by the list's built-in margin. The rows zero
-    /// their `listRowInsets` and apply this instead, so both start from the
-    /// panel edge.
     static let sidebarGutter: CGFloat = 8
     /// Row edge → label. The icon of a destination and the title of a chat both
     /// start here, which is what makes the column read as one list.

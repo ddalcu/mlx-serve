@@ -226,13 +226,6 @@ struct StatusMenuView: View {
     // MARK: - Header
 
     /// App name + version, the single status chip, and Settings.
-    ///
-    /// The state used to be said twice (a bare dot up here, the word "Running"
-    /// down in the server row); it's one chip now. The gear moved up from the
-    /// picker row for two reasons: Settings configures the app, not the model
-    /// slot next to it, and the picker's collapsed title is a full repo id that
-    /// wants every point of that row. It still renders in BOTH states — with no
-    /// models downloaded this is the tray's only route to Settings.
     private var header: some View {
         HStack(spacing: 8) {
             Text("MLX Core")
@@ -358,11 +351,6 @@ struct StatusMenuView: View {
     }
 
     /// The one state-driven action, plus the log window.
-    ///
-    /// Only the start/loading states are filled: with the server up, the action
-    /// the user actually wants is Chat, and a full-width red fill made "Stop
-    /// Server" the loudest thing in a panel that spends its life in that state.
-    /// Stop keeps its red — as a tinted bezel, not a slab.
     private var serverControls: some View {
         let control = ServerControlButtonPresentation(status: server.status)
         return HStack(spacing: 6) {
@@ -1110,16 +1098,6 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
 }
 
 /// Full-window terminal-style view of the live server stderr buffer.
-///
-/// Crucially, the view *pulls* — it owns a `LogPoller` that ticks at 2 Hz
-/// while the window is open and reads `server.currentServerLogSnapshot()`.
-/// `ServerManager` itself does NOT publish the log (see the `logBuffer`
-/// comment there). Result: stderr volume can't slow ChatView's SSE token
-/// loop — those views never re-render due to log activity, regardless of
-/// whether this window is open.
-///
-/// Auto-scroll defaults on; the toggle pins to the user's last interaction
-/// so selecting a region above doesn't get yanked away by new output.
 struct ServerLogWindowView: View {
     @EnvironmentObject var server: ServerManager
     @State private var autoScroll = true
@@ -1129,9 +1107,6 @@ struct ServerLogWindowView: View {
     init() {
         // Closure captures nothing at init — it'll be rebound to `server`
         // on first appear via the environment-object lookup pattern below.
-        // We can't reach `@EnvironmentObject` in init(), so the poller
-        // starts with a placeholder snapshot that returns "" until
-        // `.onAppear` rebinds it through `start(server:)`.
         _poller = StateObject(wrappedValue: LogPoller(interval: 0.5) { "" })
     }
 
@@ -1273,15 +1248,6 @@ struct ServerLogWindowView: View {
 /// AppKit-backed terminal-style log view. Wraps `NSTextView` in an
 /// `NSScrollView` and exposes a SwiftUI-friendly `text` + `autoScroll`
 /// surface.
-///
-/// Why not SwiftUI `Text` in a `ScrollView`? Because SwiftUI `Text`
-/// re-lays-out its entire string on every `@Published` change. At 10 Hz
-/// with a 64 KB monospace block that's enough main-thread work to starve
-/// ChatView's SSE loop when this window is open. `NSTextView` does
-/// incremental `textStorage.append` for the common case (new bytes at the
-/// end of an existing prefix) — a few ms regardless of buffer size — and
-/// only falls back to a full replacement when the in-memory buffer is
-/// trimmed from the head (i.e. the 64 KB cap kicks in).
 struct TerminalLogTextView: NSViewRepresentable {
     let text: String
     let autoScroll: Bool

@@ -2,11 +2,6 @@ import Foundation
 
 /// The three places you can drive this app from, as the welcome screen's second
 /// panel lists them.
-///
-/// The window and the menu-bar icon ship in the same bundle and cannot be
-/// absent, so their trailing state is a fact rather than a control. Only the
-/// Terminal command is something you install, which is what makes it the one
-/// action on the panel instead of a lone install row with no context.
 enum WelcomeSurface: String, CaseIterable, Identifiable {
     case app
     case menuBar

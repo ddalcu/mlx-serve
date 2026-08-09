@@ -8,12 +8,6 @@ import SwiftUI
 /// conversation starts. Media generation, the Model Browser, Tasks and the
 /// coding-agent launcher all lived only in the menu-bar tray, and users
 /// reported not finding any of them.
-///
-/// Pure data so the surfaces are testable: every window id is pinned against
-/// the scene graph in ChatEmptyStateTests, the Tools command menu (the
-/// always-available twin in the menu bar) iterates the SAME `mediaItems`
-/// catalog, and the Code Launcher chip renders the tray Code button's own
-/// `CLILauncherMenuItems` — one list per surface pair, so none can drift.
 enum ChatEmptyState {
     enum Action: Equatable {
         case window(String)   // a Window scene id, opened via AppActivation

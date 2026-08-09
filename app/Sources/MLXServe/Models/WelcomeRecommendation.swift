@@ -2,12 +2,6 @@ import Foundation
 
 /// The welcome screen's "here's what fits your Mac" summary: the machine's
 /// physical RAM (as a label) plus the ONE model recommended for it.
-///
-/// Pure data so the RAM formatting, the pick, and the rationale sentence are
-/// testable without a view. The pick itself is NOT decided here — it delegates
-/// to `RecommendedModelPick.starterPick(physicalMemoryBytes:)`, the single
-/// source of truth the Model Browser and chat gate also read, so the welcome
-/// screen can never recommend a different model than the rest of the app.
 struct WelcomeRecommendation: Equatable {
     /// e.g. "24 GB" — the machine's physical memory, rounded to whole GB.
     let memoryText: String

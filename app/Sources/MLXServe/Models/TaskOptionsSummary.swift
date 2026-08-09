@@ -1,15 +1,6 @@
 import Foundation
 
 /// The one-line summary under the New Task sheet's collapsed "Options" row.
-///
-/// Progressive disclosure creates exactly one hazard: a setting that IS set but
-/// invisible, because nobody expands a row that looks empty. So the row names
-/// every collapsed option that DIFFERS from its default — and returns nil when
-/// none of them do, because "Options" with a blank line under it reads as a
-/// section that failed to load rather than one with nothing to say.
-///
-/// Same rule, same shape as `AgentAdvancedSummary`; the two are deliberately
-/// siblings so the app has ONE idea of what a collapsed section owes the user.
 enum TaskOptionsSummary {
 
     /// - Parameters:

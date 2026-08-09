@@ -1,18 +1,6 @@
 import SwiftUI
 
 /// Shared visual system for the menu-bar panel.
-///
-/// The tray had grown one treatment per section: seven full-width dividers,
-/// four section-header styles, horizontal padding written as a literal `16`
-/// beside dividers inset to `12`, and `.bordered` / `.borderedProminent` /
-/// `.plain` / `.link` / `.borderless` controls all inside 320 points. These
-/// primitives are the one place that geometry lives now, and they speak the
-/// same language as the welcome screen's cards (same fill, stroke and header
-/// treatment) so the two surfaces read as one app.
-///
-/// Nothing here animates. A continuously-redrawing view inside this
-/// `MenuBarExtra(.window)` popover starves SwiftUI button hit-testing and
-/// wedges every control in the panel — see `VoiceTrayPanel`'s status dot.
 enum TrayMetrics {
     /// Panel width. 340 rather than the old 320: the model picker's collapsed
     /// title is a full repo id ("mlx-community/gemma-4-12b-it-4bit") and every
@@ -154,10 +142,6 @@ struct TrayRowSeparator: View {
 /// Quick Launcher and the Agent Sandbox badge are the same kind of thing — a
 /// capability you switch on or step into — and rendering them three different
 /// ways made the panel read as three panels.
-///
-/// The trailing control is a real sibling view, never a tap gesture wrapped
-/// around the row: a parent `onTapGesture` + `contentShape` silently swallows
-/// child button clicks on macOS.
 struct TrayFeatureRow<Trailing: View>: View {
     let icon: String
     let title: String

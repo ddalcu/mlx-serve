@@ -4,17 +4,6 @@ import AppKit
 /// The Agents window: saved personas on the left, the selected one's editor on
 /// the right. Configuration only — you TALK to an agent in the Chat window (or
 /// the tray, or a task); this is where you decide who they are.
-///
-/// Everything an agent owns is an override of an app default, so every control
-/// here has a "use the app's setting" state. The one thing deliberately absent is
-/// the Agent Sandbox: that stays a single global flag.
-/// Which agent the window should be showing.
-///
-/// Pure because the interesting part is a three-way precedence, and the window
-/// is a single reused `Window`: a deep link ("Set by Chef · Edit Agent…" on a
-/// locked composer disc) has to retarget one that is already open on somebody
-/// else, while a plain re-publish must not yank the user's selection back to the
-/// top of the list mid-edit. Tested in `AgentsWindowFocusTests`.
 enum AgentsWindowFocus {
     /// The id to select, or nil to leave the selection exactly as it is.
     static func selection(pending: UUID?, current: UUID?, first: UUID?) -> UUID? {
@@ -24,13 +13,6 @@ enum AgentsWindowFocus {
 }
 
 /// The editing state the two agent columns share.
-///
-/// It is an object, not `@State` on a parent, because the list and the editor
-/// are now separate COLUMNS of the chat window's split — the selection is made
-/// in one and the draft is edited in the other, so neither can own the other's
-/// state (the same reason a task's selection lives on `AppState`). The window
-/// and the chat-window pane each own one of these, so opening both does not
-/// make them fight over one draft.
 @MainActor
 final class AgentsWorkspaceModel: ObservableObject {
     @Published var selectedId: UUID?
@@ -90,9 +72,6 @@ struct AgentListPane: View {
             .toolbar {
                 // Same shape as the Tasks column (`PaneTitleBar`), except the
                 // control is a MENU — the + offers the agent types.
-                // Title only: "Create New Agent" is a row at the top of the
-                // list now, so a + here would be a second create route beside
-                // the first.
                 if #available(macOS 26.0, *) {
                     ToolbarItem(placement: .navigation) { paneTitleOnly }
                         .sharedBackgroundVisibility(.hidden)
@@ -110,11 +89,6 @@ struct AgentListPane: View {
     }
 
     /// `+` offers the TYPES, not a blank row.
-    ///
-    /// "New Agent" with an empty prompt is a form to fill in from nothing; the
-    /// starters are the app's own worked examples, and starting from one is how
-    /// most people should arrive at an agent. Blank stays available at the
-    /// bottom for someone who knows exactly what they want.
     @ViewBuilder
     var newAgentMenuItems: some View {
         Section("Start from a type") {
@@ -206,12 +180,6 @@ struct AgentListPane: View {
     }
 
     /// A new agent, optionally seeded from a starter.
-    ///
-    /// Seeding COPIES the starter's prompt and capabilities into a new,
-    /// editable identity — it never selects the starter itself, which is
-    /// `isBuiltIn` and refuses every edit (`commit` returns early on one), so
-    /// "create from a type" that landed on the read-only original would be a
-    /// form that silently discards what you type into it.
     private func newAgent(basedOn starter: Agent?) {
         var agent = Agent(name: starter.map { "\($0.name) copy" } ?? "New Agent",
                           brief: starter?.brief ?? "",
@@ -485,12 +453,6 @@ private struct AgentEditor: View {
 
     var body: some View {
         // A ScrollView of hand-built cards, not a `Form(.formStyle(.grouped))`.
-        // The Form owned the card radius, the row insets, the label typography
-        // and the section spacing — so none of the design could be specified —
-        // and it right-aligns a TextField's text, which put the agent's own
-        // NAME hard against the trailing edge of a field labelled at the other
-        // end. Every surface below comes from `AgentEditorChrome`, so six cards
-        // cannot end up with five radii.
         ScrollView {
             editorColumn
                 .frame(maxWidth: AgentEditorMetrics.contentMaxWidth, alignment: .leading)
@@ -550,11 +512,6 @@ private struct AgentEditor: View {
     // MARK: Name & description
 
     /// Who this agent IS: the symbol on its own card, the name beside it.
-    ///
-    /// A name is the first thing you set and the thing every other field is
-    /// about, so it reads as a title — not a `TextField("Name")` in a list of
-    /// settings, which is what made the editor feel like a preferences pane
-    /// rather than a person. The symbol is the picker itself (click the glyph).
     private var identityHeader: some View {
         HStack(alignment: .bottom, spacing: AgentEditorMetrics.labelSpacing) {
             symbolPicker
@@ -718,11 +675,6 @@ private struct AgentEditor: View {
     // MARK: More options
 
     /// The disclosure row for the collapsed sections.
-    ///
-    /// A Button rather than a `DisclosureGroup`: the four things it reveals are
-    /// sections with their own titles, and nesting them inside a disclosure
-    /// loses those headers. Toggling a flag that gates them keeps each section
-    /// exactly as it was.
     private var moreOptionsSection: some View {
         Button {
             withAnimation(.easeInOut(duration: 0.15)) { showMoreOptions.toggle() }
@@ -756,10 +708,6 @@ private struct AgentEditor: View {
     // MARK: Prompt
 
     /// The prompt, then the things you can do to it.
-    ///
-    /// The write action and the counter sit BELOW the editor: above, they
-    /// separated the section's title from the thing it titles, and the counter
-    /// read as a budget for something you hadn't seen yet.
     private var promptSection: some View {
         AgentSection("Prompt") {
             AgentCard {
@@ -817,10 +765,8 @@ private struct AgentEditor: View {
     /// Every control here sits on the trailing edge of an `AgentEditorRow`, the
     /// same grammar Identity speaks — a stack of leading-aligned controls in a
     /// card beside a card of trailing-aligned ones reads as two designs.
-    ///
-    /// `.switch` explicitly: a macOS `Toggle` outside a Form is a CHECKBOX, and
-    /// the grouped Form was silently promoting these to switches. Losing that
-    /// promotion is exactly the kind of thing a source scan can't see.
+    /// `.switch` explicitly: a macOS Toggle outside a Form is a CHECKBOX, and
+    /// the Form had been promoting these silently.
     @ViewBuilder
     private var capabilityToggles: some View {
         AgentEditorRow("Tools") {
@@ -1281,12 +1227,6 @@ private struct AgentEditor: View {
 /// "App voice" entry for the nil case and the uploaded-clip library in between.
 /// A `Menu` rather than a `Picker` because it also carries ACTIONS (add a clip,
 /// open the folder), which a Picker can't hold.
-///
-/// There were two of these; the voice-mode sheet's copy (`VoiceSelectorMenu`)
-/// is gone. The speaking voice belongs to WHO is answering, so it is set here
-/// for an agent and in Settings ▸ Voice for the app itself — a third picker
-/// inside the orb could only disagree with the two that own it, and the
-/// synthesizer re-reads the value per utterance anyway.
 private struct AgentVoiceMenu: View {
     @Binding var voice: AgentVoice?
     let systemVoices: [VoiceOption]

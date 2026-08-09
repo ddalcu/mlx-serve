@@ -2,14 +2,6 @@ import SwiftUI
 
 /// A pane column's title, with its create control beside it, for the window
 /// toolbar.
-///
-/// Shared by Tasks and Agents so the two columns cannot drift, and factored out
-/// because the styling is not obvious: on macOS 26 a `ToolbarItem` draws a
-/// Liquid Glass capsule around whatever it holds. With a title and a button in
-/// one item, that capsule wrapped BOTH — a lozenge reading "Tasks +", with the
-/// title's baseline padding and the button's hit area fighting inside one
-/// shape. The item asks for no shared background, so the title reads as a
-/// title and the button carries its own (hover-lit) target.
 struct PaneTitleBar: View {
     let title: String
     let addHelp: String

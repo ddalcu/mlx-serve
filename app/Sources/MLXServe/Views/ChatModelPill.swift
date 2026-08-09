@@ -2,16 +2,6 @@ import SwiftUI
 
 /// The chat window's model picker: which model this conversation is talking to,
 /// with a status dot, sitting at the LEADING edge of the toolbar.
-///
-/// Leading placement is deliberate. The trailing cluster (voice, settings, the
-/// three mode pills) is at its width budget, and anything runtime-variable added
-/// there re-triggers the » overflow-eviction class — which is also why this
-/// pill's label is width-CAPPED and truncated rather than sized to the model
-/// name. A 60-character Hugging Face repo id must not be able to push the
-/// toolbar around.
-///
-/// Selection goes through `ChatModelSelection`, the same definition the menu-bar
-/// tray uses, so the two pickers cannot disagree about what is loaded.
 struct ChatModelPill: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -37,16 +27,6 @@ struct ChatModelPill: View {
     private static let compactNameWidth: CGFloat = 150
 
     /// What the PILL shows: the model name without its org.
-    ///
-    /// The org is the half of a Hugging Face id that's identical across most of
-    /// your models, and it was eating the width budget from the left while the
-    /// middle-truncation ate the part that identifies the model
-    /// ("mlx-commun…B-it-qat-4bit"). The MENU keeps full ids — that's where
-    /// you're choosing between them, and two orgs can ship the same name.
-    ///
-    /// A LAN id is `org/model@peer`, so taking the last path component keeps
-    /// the peer; anything without a slash, or ending in one, is left alone
-    /// rather than rendered as an empty pill.
     static func headerName(_ full: String) -> String {
         guard let slash = full.lastIndex(of: "/") else { return full }
         let tail = full[full.index(after: slash)...]

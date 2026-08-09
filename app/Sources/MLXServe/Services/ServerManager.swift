@@ -30,17 +30,6 @@ class ServerManager: ObservableObject {
         return residentChatModel
     }
     /// The local entry that can ANSWER a chat request.
-    ///
-    /// Media generators share this registry — the image/video/audio panes load
-    /// one through `prepareGenModel`, and the server sorts its default first,
-    /// so `modelInfo` (= `allModels.first`) is regularly a model that would
-    /// 400 a chat turn. Before this the chat pill named it and dotted it green
-    /// while every surface reading `chatModelId` addressed the turn to it; the
-    /// picker's LIST was already chat-only, the resolution under it was not.
-    ///
-    /// Nothing chat-capable resident ⇒ nil, never a stand-in: an unloaded stub
-    /// is a model you could load, and the pill's dot keys on nil to stay amber
-    /// rather than claim ready.
     private var residentChatModel: ModelInfo? {
         if let m = modelInfo, m.servesChat { return m }
         return allModels.first { $0.servesChat && $0.loaded && $0.lanPeer == nil }
@@ -69,21 +58,6 @@ class ServerManager: ObservableObject {
     private var menuIsVisible = false
 
     /// Off-main raw stderr buffer. **There is no `@Published` mirror.**
-    ///
-    /// Why: SwiftUI's `@EnvironmentObject` re-evaluates a view's `body` on
-    /// any `@Published` change of the observed object, regardless of which
-    /// properties the body actually reads. `ChatView` observes
-    /// `ServerManager` (for status / model info), so a `@Published` log
-    /// would force a ChatView body recompute on every flush — competing
-    /// with the SSE token loop on the main thread. Even throttled to
-    /// ~10 Hz that was enough to make generation visibly choppy when the
-    /// log window was open.
-    ///
-    /// Instead, the log views own a small `LogPoller` (`@StateObject`)
-    /// that ticks at its own rate and reads `currentServerLogSnapshot()`.
-    /// Only those views re-render on log activity; everything else
-    /// (ChatView, Settings, the menu popover header) is fully insulated
-    /// from stderr volume.
     let logBuffer = ThrottledLogBuffer(maxBytes: serverLogMaxBytes)
     /// Hard cap on the retained stderr tail shown in the Server Log window.
     /// Was 64 KB (~800 lines) — a single chunked-prefill trace or a model-load
@@ -270,10 +244,6 @@ class ServerManager: ObservableObject {
     /// The teardown belongs here rather than on a button or in the app
     /// delegate: this object spawned the process, and there is exactly one of
     /// it, so every quit route is covered by construction.
-    ///
-    /// `queue: nil` on purpose — delivered synchronously on the posting thread
-    /// (AppKit posts this on the main one). `.main` would ENQUEUE the teardown
-    /// for a runloop turn that, during termination, may never come.
     init() {
         quitObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: nil
@@ -587,15 +557,6 @@ class ServerManager: ObservableObject {
     /// Wire the popover's open/close into the live-polling state. Called
     /// from `StatusMenuView`'s `onAppear`/`onDisappear`. Drives the /props
     /// ticker so it only runs when there's a UI on screen to consume it.
-    ///
-    /// - When the menu opens while the server is `.running`: immediate
-    ///   `refreshStatus()` + start the 3 s ticker.
-    /// - When the menu closes while the server is `.running`: cancel the
-    ///   ticker.
-    /// - During `.starting` / `.stopped`: no-op on close (we'd cancel the
-    ///   health-check poll by accident otherwise). On open during `.starting`,
-    ///   the health source is already ticking; we just record the visibility
-    ///   for when the server transitions.
     func setMenuVisible(_ visible: Bool) {
         guard menuIsVisible != visible else { return }
         menuIsVisible = visible
@@ -740,12 +701,6 @@ class ServerManager: ObservableObject {
     /// Every `--model-dir` a launch should carry: all configured library
     /// folders, plus the selected model's own parent when it lives outside all
     /// of them.
-    ///
-    /// That last clause is what `discoveryModelDir` used to do ALONE, and it
-    /// was an either/or: pointing the server at an outside model's parent meant
-    /// the whole `~/.mlx-serve/models` library stopped being discovered, and
-    /// pointing it at the library meant an outside model never reached
-    /// `/v1/models` at all. `--model-dir` is repeatable now, so it is both.
     nonisolated static func launchModelDirs(selectedModel: String,
                                             roots: [String]? = nil) -> [String] {
         var dirs = roots ?? ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
@@ -871,9 +826,6 @@ class ServerManager: ObservableObject {
 /// append without hopping to main on every chunk — that hop was the
 /// per-token bottleneck that starved ChatView's SSE loop when the log
 /// window was open.
-///
-/// `@unchecked Sendable` is honest here: the only shared state (`content`)
-/// is fully guarded by `lock`. There are no escaping references.
 final class ThrottledLogBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var content = ""
@@ -885,11 +837,6 @@ final class ThrottledLogBuffer: @unchecked Sendable {
     /// Only re-trim once the buffer exceeds the cap by 25%, then cut back to
     /// the cap. That amortizes the O(n) `suffix` copy over `maxBytes / 4`
     /// appended characters instead of paying it on every append.
-    ///
-    /// CONTRACT: the buffer always retains AT LEAST the last `maxBytes`
-    /// characters and never exceeds `maxRetained`. Trimming down to a
-    /// low-water mark instead would keep a strict `maxBytes` ceiling but throw
-    /// away a quarter of the tail every cycle — worse for a log.
     var maxRetained: Int { maxBytes + maxBytes / 4 }
     private var highWater: Int { maxRetained }
 
@@ -931,13 +878,6 @@ final class ThrottledLogBuffer: @unchecked Sendable {
 
 /// Pull-based bridge from `ThrottledLogBuffer` (off-main, lock-guarded
 /// source of truth) to a SwiftUI view that wants to render the log.
-///
-/// `ServerManager` deliberately does NOT publish the log — see the
-/// comment above `logBuffer` for why. Views that want live log content
-/// own a `LogPoller` as `@StateObject`, call `start()` on appear and
-/// `stop()` on disappear. The view re-renders on each `text` change at
-/// its own rate (default ~2 Hz); the rest of the app — ChatView,
-/// Settings, the menu popover — is fully insulated from log volume.
 @MainActor
 final class LogPoller: ObservableObject {
     /// Latest snapshot fetched from the source. Only assigned when

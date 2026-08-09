@@ -1,17 +1,6 @@
 import Foundation
 
 /// Which media models a Create pane leads with.
-///
-/// The picker used to be a flat menu of every preset — seven for images —
-/// ordered by download size, with the RAM cost visible only after you'd picked.
-/// That asks a question only someone who already knows the answer can answer.
-/// So: lead with the best model per CAPABILITY that this Mac can actually run,
-/// say why each one is there, and put everything else behind "Other Models".
-///
-/// Two models are both featured only when they do genuinely different jobs (a
-/// generator and an editor; a silent video model and one that scores its own
-/// soundtrack). Two models that do the SAME job are a ranking, not a choice, and
-/// the pane makes it for you.
 enum MediaModelPicks {
 
     /// A featured model, and why it is being offered.

@@ -224,13 +224,6 @@ class AppState: ObservableObject {
     @Published var selectedTaskId: UUID?
 
     /// Show the model browser — the ONE way in.
-    ///
-    /// It used to be `openAndFocus("modelBrowser")`, repeated at five call
-    /// sites. Both halves are required and neither is optional: setting the
-    /// mode without opening the window switches a window nobody is looking at,
-    /// and opening the window without the mode lands on a transcript. The tick
-    /// is the same always-present-menu-bar-label bridge the Quick Launcher and
-    /// the welcome window use, since neither can reach SwiftUI's `openWindow`.
     func showModels(_ section: ModelBrowserSection = .recommended) {
         chatWorkspace = .models(section)
         pendingChatOpenTick += 1
@@ -283,13 +276,6 @@ class AppState: ObservableObject {
 
     /// "Send to Chat" on a Create-pane result: open a NEW conversation holding
     /// it, and switch to Chats so the user SEES where it went.
-    ///
-    /// A new chat, not the active one, for two reasons (`GeneratedMediaHandoff`):
-    /// Create is iterative, so whichever thread happens to be open is rarely the
-    /// one you meant; and a render appearing mid-way through an unrelated
-    /// conversation is exactly the kind of surprise a hand-off should not spring.
-    /// Switching modes is not a nicety either — a message appended to a chat you
-    /// are not looking at is indistinguishable from nothing happening.
     @discardableResult
     func sendGeneratedMediaToNewChat(path: String, prompt: String,
                                      kind: ChatMediaRef.Kind) -> UUID {
@@ -526,11 +512,6 @@ class AppState: ObservableObject {
     /// The model list changed (a download landed): fill in a pairing that
     /// wasn't possible a moment ago — downloading a Gemma 4 fetches its drafter
     /// too, and it finishes after the model is already selected.
-    ///
-    /// Only ever ADDS. Clearing belongs to the model switch: this runs on every
-    /// refresh (1 Hz while a download is in flight), and a user who deliberately
-    /// switched a drafter on where we don't recommend one — the MoE caution in
-    /// Settings — must not have a background rescan take it away.
     private func adoptNewlyAvailableDrafter() {
         guard serverOptions.drafterPath.isEmpty, !serverOptions.drafterOptOut else { return }
         let paired = DrafterPairing.decide(
@@ -620,12 +601,6 @@ class AppState: ObservableObject {
     /// fresh one. Every agent keeps its OWN conversation, so speaking to Chef
     /// continues Chef's thread instead of talking into whatever tab was open (and
     /// instead of quietly rebranding that tab as Chef).
-    ///
-    /// An ACTIVE thread of the same agent wins over a more recently touched one —
-    /// the user opened that one deliberately. Task-run and Telegram-bridge
-    /// sessions are never adopted: they're hidden/transient vehicles (and task
-    /// runs now carry an `agentId` too), so a turn landing in one would corrupt a
-    /// run or write into a read-only mirror. Pure → `AgentSessionThreadTests`.
     nonisolated static func sessionForAgent(_ agentId: UUID?,
                                            sessions: [ChatSession],
                                            activeId: UUID?) -> UUID? {
@@ -723,12 +698,6 @@ class AppState: ObservableObject {
     }
 
     /// Drop one message from a conversation.
-    ///
-    /// It leaves the history the model sees, not just the view — pruning a bad
-    /// turn so the next request isn't built on it is the whole point. Any
-    /// HIDDEN tool-result messages belonging to the same assistant turn go with
-    /// it: a tool result whose call is gone is an orphan the model can only be
-    /// confused by, and it is invisible, so nothing would ever clean it up.
     func deleteMessage(in sessionId: UUID, messageId: UUID) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })

@@ -368,16 +368,6 @@ struct ChatView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.dismissWindow) private var dismissWindow
     /// The two-column (chat) split's visibility.
-    ///
-    /// One state per COLUMN COUNT, never one shared between them:
-    /// `NavigationSplitViewVisibility` is interpreted against the split view's
-    /// arity, so the same value means different things in each. `.doubleColumn`
-    /// is "sidebar + detail" here — the ordinary look, which SwiftUI resolves to
-    /// on its own — and "content + detail, SIDEBAR HIDDEN" in a three-column
-    /// split. Sharing one value therefore ate the top-level sidebar the moment
-    /// Tasks was opened from a chat that had been shown even once (a fresh
-    /// launch still on `.automatic` looked right, which is what made it read as
-    /// intermittent).
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
     /// The three-column (Tasks / Agents) split's visibility. `.all` is the only
     /// value that means "show all three" — the state above cannot supply it.
@@ -387,16 +377,6 @@ struct ChatView: View {
     /// two surfaces editing one draft would fight over it.
     @StateObject private var agentsModel = AgentsWorkspaceModel()
     /// Flipped by the gate sheet's Cancel, and by nothing else.
-    ///
-    /// The sheet was first presented on a `.constant(true)` binding, which made
-    /// it properly blocking and made Cancel UNIMPLEMENTABLE: AppKit refuses to
-    /// close a window that has an attached sheet, so the click did nothing and
-    /// the user was stuck (measured through the accessibility API — the sheet
-    /// was still on screen afterwards). The binding's setter still swallows
-    /// SwiftUI's own dismissals, so Esc and click-away can't drop the user onto
-    /// the dead composer underneath; Cancel is the one door, and it ends the
-    /// sheet before closing the window. Window scenes rebuild their content on
-    /// reopen, so this resets itself.
     @State private var gateCancelled = false
 
     /// The starter recommendation this Mac gets — same function the welcome
@@ -428,11 +408,6 @@ struct ChatView: View {
     }
 
     /// The three-column modes (Tasks, Agents), in ONE split view.
-    ///
-    /// One split rather than one per mode: the column widths, the toolbar
-    /// material and — the part that bit once already — the visibility state are
-    /// then shared by construction, instead of being copied per mode and
-    /// drifting. Only the two columns' CONTENT varies.
     @ViewBuilder
     private var threeColumnSplitView: some View {
         NavigationSplitView(columnVisibility: $tasksColumnVisibility) {
@@ -462,9 +437,6 @@ struct ChatView: View {
         .navigationTitle("")
         // Nothing lives in the toolbar here — each pane draws its own title
         // row — so the band carries no material. Its BAR still has to exist:
-        // the traffic lights and the sidebar-collapse button are its residents,
-        // and `.toolbar(.hidden)` takes them with it (live 2026-08-09 — a
-        // window you cannot close, zoom, or collapse the sidebar of).
         .toolbarBackground(.hidden, for: .windowToolbar)
         .onAppear { AppActivation.focus() }
     }
@@ -512,10 +484,6 @@ struct ChatView: View {
         // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
         // Cancel takes this sheet down. The getter is recomputed every update,
         // so it also clears ITSELF the moment a chat model lands.
-        // …and it stands down over the models pane: the browser it is asking
-        // the user to go and use now lives behind it, in this window
-        // (`ChatWorkspace.gateShouldPresent`). Deferred, not dismissed — it
-        // returns the moment they go back to a conversation with no model.
         .sheet(isPresented: Binding(
             get: {
                 ChatWorkspace.gateShouldPresent(gateIsBlocking: gateIsBlocking,
@@ -571,11 +539,6 @@ struct ChatView: View {
 
 /// A sidebar destination's chrome: nothing drawn until you hover it, and the
 /// SAME gray when it is the selected one.
-///
-/// The rows used to carry a permanent `sidebarActionButton()` fill, which made
-/// six always-highlighted blocks and left selection with nothing to say. Gray
-/// now means exactly one thing in this panel — "this is the row you are on, or
-/// the row you are pointing at" — and the conversation rows below use it too.
 struct DestinationRowButton<Label: View>: View {
     let selected: Bool
     let action: () -> Void
@@ -678,13 +641,6 @@ struct ChatSidebar: View {
         .safeAreaInset(edge: .top) {
             VStack(spacing: 2) {
                 // New Chat, and beside it the choice of WHO the chat is with.
-                // The two are adjacent because they are one decision made at
-                // one moment: a session's agent is fixed once the session
-                // exists (there is no `setAgent`), so this is the only place it
-                // can be picked. It briefly lived on the Agents row instead,
-                // which made that row mean "start something" while every other
-                // destination means "go somewhere" — and took the editor with
-                // it into a menu.
                 destinationRow("New Chat", icon: "square.and.pencil",
                                selected: false) {
                     appState.showConversation()
@@ -724,24 +680,10 @@ struct ChatSidebar: View {
             // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
             // has something to attach to again and the platform frosts what
             // scrolls beneath this block.
-            //
-            // The bar's MATERIAL is still hidden, and the 2026-07-30 note says
-            // the effect drew nothing in that state — that was measured with a
-            // floating cluster to clip under, and this block is a solid column
-            // of controls rather than a strip of text. If conversation rows
-            // become visible sliding through the destinations, this is the
-            // line to bring back (or make the material visible again).
         }
     }
 
     /// A section heading, sitting on the same left edge as the rows under it.
-    ///
-    /// A list section header carries its own indent, which put "Agents" and
-    /// "Chats" left of every row in the panel — a third alignment in a column
-    /// that is supposed to read as one list. Zeroing the row insets and
-    /// applying the panel's own gutter (plus the row's inner inset, since a
-    /// heading has no row chrome to sit inside) puts the text where the labels
-    /// beneath it start.
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
             .font(.caption.weight(.semibold))
@@ -755,11 +697,6 @@ struct ChatSidebar: View {
     }
 
     /// One conversation row, shared by both sections.
-    ///
-    /// A view BUILDER rather than a copy per section: two hand-maintained
-    /// copies of a row this involved (hover, selection fill, delete button,
-    /// context menu, list-row insets) is how the two sections start looking
-    /// like different kinds of thing.
     @ViewBuilder
     private func sessionRow(_ session: ChatSession) -> some View {
         // Exactly ONE row in this panel is lit at a time. A conversation is
@@ -909,19 +846,6 @@ struct ChatSidebar: View {
 
     /// The Agents row. A MENU, because "Agents" is two things: the agents you
     /// can start a conversation as, and the editor for them.
-    ///
-    /// Starting a chat as somebody has to live here — it is the ONLY moment it
-    /// can be decided (`AppState.startChat(withAgent:)`; a session's agent is
-    /// fixed once the session exists, there is no `setAgent`). It used to be an
-    /// icon button beside New Chat; deleting that button without moving the menu
-    /// would have quietly removed the capability, not just the control.
-    /// Agents is a DESTINATION, like every other row in this column.
-    ///
-    /// It used to open a menu of agents that started a chat as one of them,
-    /// which made this the only row whose verb was "start something" rather
-    /// than "go somewhere" — and buried the editor behind a "Manage Agents…"
-    /// item at the bottom of it. Starting a chat as an agent lives in that
-    /// editor now, beside everything else about the agent.
     private var agentsRow: some View {
         destinationRow("Agents", icon: "person.2",
                        selected: appState.chatWorkspace.isAgents) {
@@ -999,11 +923,6 @@ struct ChatDetailView: View {
     // Tool-approval gate state. `pendingApproval` is set right before each
     // tool call when Agent mode is on; the sheet at the bottom of `body`
     // observes it and resumes `approvalContinuation` with the user's choice.
-    // `toolAllowList` is the soft "Allow all tools this session" decision, keyed
-    // by session id so it is remembered PER TAB: SwiftUI reuses this view across
-    // `sessionId` changes, so a per-session set survives switching tabs (a plain
-    // Bool was shared across tabs and got wiped on every switch). A session
-    // re-arms only when the user toggles Agent off in that tab.
     @State private var pendingApproval: ToolApprovalRequest?
     @State private var toolAllowList = SessionToolAllowList()
     // Plain Bool (not @FocusState): the composer is an NSTextView wrapper, so
@@ -1094,12 +1013,6 @@ struct ChatDetailView: View {
     }
 
     /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
-    ///
-    /// Built from the SAME `resolvedAgentSettings` the turn runs under, not from
-    /// the agent's `capabilities` directly: a second copy of that rule is exactly
-    /// how the discs ended up disagreeing with what ran (every agent defaults
-    /// `web: true`, so resolution forced the tool loop on while the wrench still
-    /// rendered OFF). Cheap — the resolution is a pure fold.
     private var agentModeLock: AgentModeLock? {
         guard let agent = activeAgent else { return nil }
         let resolved = appState.resolvedAgentSettings(
@@ -1117,10 +1030,6 @@ struct ChatDetailView: View {
     }
 
     // MARK: Mode controls (Think / Tools / MCP)
-    //
-    // Icon-only, rendered in the COMPOSER row next to the paperclip — see
-    // `modeIcon` for why state has to read from colour alone once the captions
-    // are gone, and `composerControls` for the row itself.
 
     @ViewBuilder private var serverStartControl: some View {
         let control = ChatServerStartControl.resolve(
@@ -1161,12 +1070,6 @@ struct ChatDetailView: View {
     // The per-tab agent PICKER used to sit here, between the paperclip and the
     // mode discs. Starting a chat as an agent lives in the sidebar's Agents
     // destination now:
-    // it configures the whole conversation rather than the message being
-    // written, and a session's agent is fixed once the session exists — a
-    // mid-thread switch left half a conversation running under someone else's
-    // prompt, tools, model and voice, and flipped the three discs beside it
-    // while it did. The chat still SHOWS who it's talking to (the sidebar row,
-    // and the locked discs name the agent on hover).
 
     /// The agent this tab is talking to (nil = none).
     private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
@@ -1206,15 +1109,6 @@ struct ChatDetailView: View {
     }
 
     /// Shared look for the composer's icon-only mode controls.
-    ///
-    /// Captioned pills in the toolbar became bare glyphs here, so the state has
-    /// to read from COLOR alone: tinted glyph on a tinted disc when on, secondary
-    /// on the same neutral disc as the paperclip when off. Same circle geometry
-    /// as every other composer control, so the row stays on one baseline.
-    /// `lockedBy` draws an inset ring inside the disc — the control still reads
-    /// its state from colour, and the ring says the state isn't yours to change.
-    /// A dimmed-out glyph was the alternative and it loses the ON/OFF reading,
-    /// which is the one thing the disc has to keep saying.
     private func modeIcon(_ icon: String, isOn: Bool, onColor: Color,
                           lockedBy: String? = nil) -> some View {
         Image(systemName: icon)
@@ -1289,19 +1183,6 @@ struct ChatDetailView: View {
 
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
     /// switches and the workspace.
-    ///
-    /// It used to open the menu on click, with on/off as the first row. This is
-    /// the composer's most-flipped control, so the frequent action was paying a
-    /// click plus a scan down a long list every time. A bare glyph meaning two
-    /// things by WHERE you click is still out (that was the split-pill problem);
-    /// meaning two things by WHICH button is the standard macOS split, and
-    /// `primaryAction:` also gives press-and-hold for free — the context menu is
-    /// there because press-and-hold is not something anyone discovers.
-    ///
-    /// While the tab has an agent this is a LOCKED indicator: `AgentResolution`
-    /// takes the loop straight from the agent's capabilities and ignores whatever
-    /// the chat says, so a live toggle here would be a control that changes
-    /// nothing. It shows what the agent decided and points at the editor.
     private var agentToggle: some View {
         Group {
             if let owner = toolbarToggles.toolsLockedBy {
@@ -1506,8 +1387,6 @@ struct ChatDetailView: View {
                     // Stay in the chat: the chip turns the COMPOSER into a
                     // generator rather than throwing the user into the Create
                     // page's form (`ChatCreateMode`). 3D has no chat mode —
-                    // the transcript can't show a mesh — so it still opens the
-                    // page, which is the only place that can.
                     if let mode = ChatCreateMode(rawValue: experiment.rawValue) {
                         withAnimation(.easeInOut(duration: 0.15)) { setCreateMode(mode) }
                         inputFocused = true
@@ -1596,14 +1475,6 @@ struct ChatDetailView: View {
                 .scrollPosition($scrollPosition)
                 // While following, the scroll view keeps its own bottom edge
                 // glued as the content grows, so a streamed token costs NOTHING:
-                // no scroll command, no second layout pass, no state change.
-                // Measured over 40 growths (~/claude-tmp/chatscroll-probe):
-                // this anchor emitted ONE geometry event, while re-issuing
-                // `scrollTo(edge:)` per growth emitted two per token (the drift,
-                // then the correction). Flipping the value to nil starts the
-                // drift again, which is how the anchor is known to react to a
-                // CHANGING value rather than being read once at creation — so
-                // the moment the user takes over, growth stops dragging them.
                 .defaultScrollAnchor(scrollModel.isPinnedToBottom ? .bottom : nil,
                                      for: .sizeChanges)
                 // The scroll view's OWN geometry says how far the end sits below
@@ -1692,11 +1563,6 @@ struct ChatDetailView: View {
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
                 // same border, so they read as belonging to it.
-                //
-                // They used to sit BESIDE the input, which cost the field ~200pt
-                // of width (most of a line) on every message, and that cost grew
-                // with each new control. Stacked, the field is as wide as the
-                // transcript it answers.
                 VStack(alignment: .leading, spacing: 6) {
                     composerField
                     composerControls
@@ -2029,11 +1895,6 @@ struct ChatDetailView: View {
     /// every entry point behaves identically. Embeds on the local server's GPU;
     /// auto-downloads the default encoder model (35 MB, one-time) when none is
     /// available. Server down → lexical-only retrieval. Must run on the main actor.
-    ///
-    /// The pick is persisted (path on the session, security-scoped bookmark in
-    /// defaults) so the index can be rebuilt after a relaunch — under the App
-    /// Sandbox the panel's grant dies with the process; the bookmark is what
-    /// makes the folder reachable again. See `restoreAttachedFolderIfNeeded`.
     private func attachDocumentFolder(_ url: URL) {
         SecurityScopedBookmark.store(url, name: SecurityScopedBookmark.attachedFolderName(sessionId))
         if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
@@ -2352,11 +2213,6 @@ struct ChatDetailView: View {
     }
 
     /// Decode speed of the most recent reply that was actually timed.
-    ///
-    /// Mirrors `contextUsage`'s shape above: the LAST message carrying a real
-    /// figure, not the last message — a turn that errored or is still streaming
-    /// has none, and falling back to "no reading" there would blank a number the
-    /// previous reply legitimately produced.
     private var lastDecodeSpeed: Double? {
         session?.messages.last { ($0.tokensPerSecond ?? 0) > 0 }?.tokensPerSecond
     }
@@ -2788,9 +2644,6 @@ struct ChatDetailView: View {
     /// Decide whether to nudge before sending. MCP takes priority over Agent
     /// because a named server is the more specific signal; both are gated on the
     /// matching mode being off and the suggestion not already declined this chat.
-    ///
-    /// A mode the tab's agent decides is never nudged about: accepting would
-    /// change nothing and the message would send exactly as it was.
     private func detectIntentPrompt(for text: String) -> IntentPrompt? {
         let toggles = toolbarToggles
         let servers = enabledMCPServerNames()
@@ -2887,12 +2740,6 @@ struct ChatDetailView: View {
 // MARK: - Context Monitor
 
 /// What the chat considers "occupied context".
-///
-/// This was a full-width bar above the composer; it is now the composer's
-/// `ContextPill`, which shows the same reading in one control's width and puts
-/// the breakdown in a popover. Only the summing rule stayed here — the bar's
-/// clamped ratio and colour bands moved to `ContextWindowStats`, which needs an
-/// UNCLAMPED figure so it can display 100.3%.
 enum ContextMonitor {
     /// Total context occupied right now: the last completed turn (prompt + its
     /// reply) plus the in-flight reply's running count. Pure → ContextMonitorTests.
@@ -3137,12 +2984,6 @@ struct MessageBubble: View {
                 }
 
                 // Content.
-                //
-                // Only the USER gets a bubble. An assistant reply is the page's
-                // main content — long, formatted, full of code blocks and
-                // tables — and boxing it wastes the column's width and fights
-                // every block that wants the full measure. A tool-call summary
-                // keeps its card so it still reads as machinery, not prose.
                 if !message.content.isEmpty || message.isStreaming {
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
@@ -3213,13 +3054,6 @@ struct MessageBubble: View {
     }
 
     /// Timestamp and token stats on the left, actions pinned to the right.
-    ///
-    /// The actions are ALWAYS visible. Fading them in on hover meant they moved
-    /// under the pointer as the row re-rendered mid-stream and were awkward to
-    /// hit; two small tertiary glyphs cost nothing to leave on. They sit at the
-    /// trailing edge — past the stats, against the reply's right edge — so the
-    /// eye finds them in the same place on every message instead of at a spot
-    /// that shifts with the length of the stats text.
     private var footer: some View {
         HStack(spacing: 8) {
             Text(message.timestamp.formatted(date: .abbreviated, time: .shortened))
@@ -3325,12 +3159,6 @@ struct ChatModeToggles: Equatable {
 }
 
 /// What the chat's agent decided about Think / Tools / MCP.
-///
-/// `AgentResolution` takes Tools and MCP straight from the agent's capabilities
-/// and ignores the chat's own toggles — so without this the discs showed one
-/// thing and the turn ran another (every agent defaults `web: true`, which forces
-/// the tool loop on while the wrench renders OFF). Built from the SAME resolution
-/// the turn uses (`ChatDetailView.agentModeLock`), so the two can't drift.
 struct AgentModeLock: Equatable {
     var name: String
     /// nil = the agent left thinking unset; the chat's own toggle stands.
@@ -3852,13 +3680,6 @@ struct MarkdownText: View {
     // MARK: NSAttributedString assembly
 
     /// Rendered prose runs, keyed by their source text.
-    ///
-    /// A streamed reply re-renders the whole message ~20 times a second, but
-    /// only the LAST segment can still be growing — every earlier prose run is
-    /// final and was already built. Rebuilding them all cost 4 ms per pass on a
-    /// 60-paragraph reply, so they are remembered instead. Safe against a theme
-    /// change because the colours that adapt are dynamic `NSColor`s, which
-    /// resolve when drawn rather than when built.
     private static let renderCache: NSCache<NSString, NSAttributedString> = {
         let c = NSCache<NSString, NSAttributedString>()
         c.countLimit = 256

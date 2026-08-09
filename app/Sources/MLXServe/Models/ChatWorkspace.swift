@@ -1,17 +1,6 @@
 import Foundation
 
 /// What the chat window's detail column is showing.
-///
-/// The Model Browser used to be its own `Window`, which meant every route to it
-/// was a route OUT of the chat window — and a window the user then had to find
-/// their way back from. That is how "Browse all models" on the welcome screen
-/// could end with an empty desktop and an app that lives in the menu bar
-/// (`WelcomeExit`). It is a MODE of the chat window now: the sidebar keeps the
-/// conversation list and gains one row that swaps the detail column, so the way
-/// back is always on screen and there is nothing to close.
-///
-/// Pure so the two rules that make the mode safe — how you get in, and what the
-/// gate sheet is allowed to cover — are pinned without rendering a window.
 enum ChatWorkspace: Equatable {
     /// The transcript for `AppState.activeChatId`.
     case conversation
@@ -78,23 +67,6 @@ enum ChatWorkspace: Equatable {
     static let defaultEntry: ChatWorkspace = .models(.recommended)
 
     /// Whether the "you need a model to chat" gate may cover the window.
-    ///
-    /// The gate is a blocking sheet with exactly one door (Cancel, which closes
-    /// the window), and the model browser now lives BEHIND it in the same
-    /// window. Presenting it over the models pane would be a locked door
-    /// standing in front of its own key: the user is already doing the one
-    /// thing the sheet is asking for. It re-presents the moment they go back to
-    /// a conversation still having no model — nothing is dismissed, only
-    /// deferred.
-    /// Keyed on `isConversation`, not on `!isModels`: the gate asks for a CHAT
-    /// model, and a media generator needs none of one — blocking the image pane
-    /// behind "download a chat model first" would be a demand the pane can't
-    /// even use. Every non-transcript mode stands it down.
-    /// It also stands down while the WELCOME sheet is up. Two sheets on one
-    /// window is one sheet plus a thing nobody can see, and the welcome answers
-    /// the gate's own question better — it is the screen with the starter
-    /// models on it. Deferred, not dismissed: the gate returns the moment the
-    /// welcome closes on a conversation that still has no model.
     static func gateShouldPresent(gateIsBlocking: Bool,
                                   cancelled: Bool,
                                   workspace: ChatWorkspace,

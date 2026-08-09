@@ -292,38 +292,16 @@ struct VoiceGenView: View {
     /// Best-per-capability up front, everything else behind "Other Models", and
     /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        let featured = MediaModelPicks.featured(
-            AudioModelPreset.all,
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-            capabilityOf: \.capabilityLabel)
-        return MediaModelChooser(
-            featured: featured,
-            others: MediaModelPicks.others(AudioModelPreset.all, featured: featured),
+        MediaModelChooser.pane(
+            all: AudioModelPreset.all,
             onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
-            selectedId: model.id,
-            lanModel: lanModel,
+            capability: "audio",
+            selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            isDownloaded: { downloads.bundleReady($0.bundle) },
-            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
-            onSelect: { preset in
-                lanModel = nil
-                model = preset
-            },
-            onDownload: { preset in
-                // Downloading also selects — you fetch the one you mean to use.
-                lanModel = nil
-                model = preset
-                downloads.startBundle(preset.bundle) { appState.refreshModels() }
-            },
-            lanCapability: "audio",
-            onSelectLan: { id in
-                lanModel = id
-                if let base = AudioModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
-                    model = base
-                }
-                persist()
-            }
-        )
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 

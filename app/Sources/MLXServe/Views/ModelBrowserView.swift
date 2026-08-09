@@ -1,20 +1,6 @@
 import SwiftUI
 
 /// Model Browser: a sidebar over six destinations (`ModelBrowserSection`).
-///
-/// It used to be one pane with a `Toggle("Downloaded")` push-button that swapped
-/// the data source underneath you, and it deleted on-disk models from the search
-/// results — so the model you just finished downloading vanished at 100%. Now
-/// Discover marks what you own instead of hiding it, Downloads is a first-class
-/// queue rather than rows stapled to the top of a list, and My Models shows
-/// everything the tray picker offers rather than only what we fetched ourselves.
-/// The model browser, as the chat window's second mode.
-///
-/// It used to be a `Window` with its own `NavigationSplitView` sidebar. It now
-/// renders inside the chat window's detail column (`ChatWorkspace`) and owns
-/// NOTHING but content: the five sections are the chat window's own SIDEBAR
-/// while this mode is up (`ChatSidebar.modelsSidebar`), which is where a mode
-/// switch belongs and what gives the table back the full width it needs.
 struct ModelBrowserPane: View {
     /// Which section is showing. The pane's own bar drives it: the sidebar is
     /// the conversation list (plus the Models row that gets you here), so the
@@ -101,12 +87,6 @@ struct ModelBrowserPane: View {
 // MARK: - Section bar
 
 /// The browser's five sections, across the top of the content area.
-///
-/// Real buttons rather than a `.segmented` Picker: the Downloads section
-/// carries a live spinner and three of them carry counts, and a segmented
-/// control holds text only — losing those would cost the pane its at-a-glance
-/// state. No Done button: the sidebar's Models row is the way back, and it is
-/// visible the whole time.
 private struct ModelBrowserSectionBar: View {
     @Binding var section: ModelBrowserSection
     let badges: ModelBrowserBadgeCounts
@@ -1493,13 +1473,6 @@ private struct ModelBrowserRow: View {
 
 /// The action cell for a GGUF repo: one menu covering every quant, in every
 /// state.
-///
-/// A GGUF repo ships a folder of quants and the user picks which to run, so this
-/// control never "completes". Quants on disk carry a ✓ and load on click; the
-/// rest download on click; each can be deleted individually. The repo's file
-/// list is fetched lazily from the HF tree API the first time the menu opens —
-/// what's on DISK, though, is read every render, so a finished download shows up
-/// without a refetch.
 private struct GgufQuantMenu: View {
     let repoId: String
     let state: DownloadManager.DownloadState?
@@ -1607,12 +1580,6 @@ private struct GgufQuantMenu: View {
 
 /// The action cell for a multi-variant MLX repo — the directory-shaped twin of
 /// `GgufQuantMenu`.
-///
-/// The repo publishes one complete model per quant subfolder, so like a GGUF
-/// shelf this control never "completes": variants on disk carry a ✓ and load on
-/// click, the rest download on click, each deletes on its own. Nothing is
-/// fetched here — the variant list came back with the search row (the same tree
-/// call that fills the RAM column), so the menu opens instantly.
 private struct MlxVariantMenu: View {
     let repoId: String
     let variants: [MlxVariant]
@@ -1730,9 +1697,6 @@ private struct LocalModelRow: View {
                     // The READABLE name. `displayLabel` (the repo id, plus a
                     // quant suffix so two quants of one GGUF repo are two
                     // distinguishable rows) survives as the subtext below —
-                    // that string is what you paste into a config, match
-                    // against `/v1/models` and search Hugging Face for, so it
-                    // is demoted, never dropped.
                     Text(ModelDisplayName.pretty(model.displayLabel))
                         .font(.callout.weight(.medium))
                         .lineLimit(1)

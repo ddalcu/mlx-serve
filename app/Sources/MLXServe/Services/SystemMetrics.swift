@@ -3,16 +3,6 @@ import Foundation
 import IOKit
 
 /// Host telemetry read straight from the kernel — no subprocesses.
-///
-/// Two groups:
-///  * GPU utilization + memory pressure (IOKit/Mach, the same APIs as
-///    `status.zig`), moved here out of `ChatView`.
-///  * In-process replacements for the three binaries the app used to spawn:
-///    `/usr/sbin/lsof`, `/bin/ps` and `/usr/bin/vm_stat`. None is reachable
-///    from inside the App Sandbox container, and each spawn is a host escape
-///    from the Agent Sandbox. These call the same kernel interfaces the tools
-///    themselves use — `libproc` (what lsof reads) and `host_statistics64`
-///    (what vm_stat prints) — so the results match.
 enum SystemMetrics {
 
     // MARK: - GPU / memory pressure
@@ -61,10 +51,6 @@ enum SystemMetrics {
     // MARK: - Memory (was: /usr/bin/vm_stat)
 
     /// Free + inactive bytes: pages reclaimable without paging out.
-    ///
-    /// `vm_stat` prints `Pages free` as `free_count - speculative_count`, not
-    /// `free_count` — speculative pages are listed on their own line. Matching
-    /// that keeps the number identical to what the tool reported.
     static func availableBytes() -> UInt64 {
         var stats = vm_statistics64_data_t()
         var count = mach_msg_type_number_t(
@@ -170,10 +156,6 @@ enum SystemMetrics {
     // MARK: - Listening sockets (was: /usr/sbin/lsof -nP -iTCP:<port> -sTCP:LISTEN -t)
 
     /// PIDs with a TCP socket in LISTEN state bound to `port`.
-    ///
-    /// Processes we can't introspect (other users, or restricted by the
-    /// sandbox) return no fd list and are skipped — the same practical result
-    /// as unprivileged `lsof`.
     static func pidsListening(onTCPPort port: UInt16) -> [pid_t] {
         var found: [pid_t] = []
         for pid in allPids() where pid > 0 {
