@@ -300,36 +300,40 @@ final class ComposerModeControlTests: XCTestCase {
                                     "both the sidebar and the transcript scroll under floating chrome")
     }
 
-    /// The window has NO toolbar, in any mode.
+    /// The toolbar carries no material — and its BAR still exists.
     ///
     /// Everything that lived in it moved somewhere it belongs: the model
     /// picker, the mode discs and the server control to the COMPOSER row (they
     /// configure the message, or report what you discover by typing), Settings
-    /// to a sidebar destination. What remained was an empty band.
+    /// to a sidebar destination. What remained was an empty band, so the
+    /// material goes.
     ///
-    /// The ban that stays is on `.toolbarBackground(.hidden)`, which is a
-    /// different thing and the actual trap: it keeps a bar and strips only its
-    /// material, so `scrollEdgeEffectStyle` stays attached to something
-    /// invisible and frosts nothing — that is how transcript text once clipped
-    /// mid-line under the model picker (2026-07-30). Removing the bar outright
-    /// is fine because nothing floats over the transcript any longer.
-    func testTheWindowHasNoToolbarInAnyMode() throws {
+    /// The bar does NOT go with it. `.toolbar(.hidden, for: .windowToolbar)`
+    /// removes the bar itself, and the traffic lights and the sidebar-collapse
+    /// button are its residents — hiding it produced a window that could not be
+    /// closed, zoomed, or have its sidebar collapsed (live 2026-08-09). The
+    /// older trap it was chosen to avoid — `scrollEdgeEffectStyle` attached to
+    /// an invisible bar, transcript text clipping mid-line (2026-07-30) — was
+    /// about the floating CLUSTER, which no longer exists; the one surface that
+    /// still needs frosting owns a backdrop of its own instead.
+    func testTheToolbarKeepsItsBarAndLosesItsMaterial() throws {
         let raw = try chatViewSource()
-        // Comments explain the ban, so scanning them finds it in its own prose.
         let source = raw
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
             .joined(separator: "\n")
-        XCTAssertFalse(source.contains(".toolbarBackground("), """
-            The chat window must not set a toolbar material — there is no \
-            toolbar. `.toolbarBackground(.hidden)` especially: it keeps the bar \
-            and removes only what makes it visible.
+
+        XCTAssertFalse(source.contains(".toolbar(.hidden, for: .windowToolbar)"), """
+            Hiding the window toolbar takes the traffic lights and the \
+            sidebar-collapse button with it. Hide its MATERIAL instead.
             """)
-        let hidden = source.components(separatedBy: ".toolbar(.hidden, for: .windowToolbar)").count - 1
+        let hidden = source.components(separatedBy: ".toolbarBackground(.hidden, for: .windowToolbar)").count - 1
         XCTAssertEqual(hidden, 2, """
             Both split views (the chat's two-column and the three-column Tasks / \
-            Agents) must hide the window toolbar.
+            Agents) must drop the toolbar material — nothing lives in that band.
             """)
+        XCTAssertFalse(source.contains(".toolbarBackground(.visible"),
+                       "no column should re-assert the material the window no longer needs")
         XCTAssertFalse(source.contains("private var floatingToolbar"),
                        "the floating cluster is gone; its controls live in the composer row")
     }

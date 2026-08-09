@@ -460,18 +460,12 @@ struct ChatView: View {
             }
         }
         .navigationTitle("")
-        // No toolbar in these modes — nothing lives in it. Each pane draws its
-        // own title row, so the band was an empty strip of chrome taking the
-        // top of the window.
-        //
-        // This is `.toolbar(.hidden)`, which removes the BAR, and deliberately
-        // not `.toolbarBackground(.hidden)`, which keeps a bar and takes only
-        // its material: the latter leaves `scrollEdgeEffectStyle` attached to
-        // something invisible, which is how transcript text ended up clipping
-        // mid-line under the model picker (2026-07-30). The chat split keeps
-        // its toolbar, because the model picker and the Start control live
-        // there.
-        .toolbar(.hidden, for: .windowToolbar)
+        // Nothing lives in the toolbar here — each pane draws its own title
+        // row — so the band carries no material. Its BAR still has to exist:
+        // the traffic lights and the sidebar-collapse button are its residents,
+        // and `.toolbar(.hidden)` takes them with it (live 2026-08-09 — a
+        // window you cannot close, zoom, or collapse the sidebar of).
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .onAppear { AppActivation.focus() }
     }
 
@@ -1768,17 +1762,21 @@ struct ChatDetailView: View {
         // typing); Settings is a sidebar destination and still ⌘, from the menu
         // bar. What was left was an empty band across the top of the window.
         // The window's own toolbar material, full width. This was hidden for a
-        // no bar at all now, in every mode.
+        // no material now, in every mode — but the BAR stays.
         //
-        // What the old material was FOR: it frosted content scrolling under the
+        // What the material was FOR: it frosted content scrolling under the
         // floating toolbar cluster, and `scrollEdgeEffectStyle` needs a bar to
         // attach to (text clipped mid-line under the model picker, live
-        // 2026-07-30). Both of those were about the CLUSTER, and the cluster is
-        // gone — nothing floats over the transcript any more. The sidebar's
-        // pinned destinations are the one place content still passes beneath
-        // something, so that block carries its own backdrop rather than relying
-        // on an effect with nothing to attach to.
-        .toolbar(.hidden, for: .windowToolbar)
+        // 2026-07-30). Both were about the CLUSTER, and the cluster is gone —
+        // nothing floats over the transcript any more. What still passes under
+        // something is the sidebar's pinned destinations, so that block carries
+        // its own backdrop rather than relying on an effect with nothing to
+        // attach to.
+        //
+        // Hiding the bar ITSELF (`.toolbar(.hidden)`) is the thing that must
+        // not come back: the traffic lights and the sidebar-collapse button are
+        // its residents, and it took them with it (live 2026-08-09).
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
