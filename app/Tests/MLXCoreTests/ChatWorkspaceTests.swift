@@ -213,6 +213,37 @@ final class ChatWorkspaceTests: XCTestCase {
             """)
     }
 
+    /// `NavigationSplitViewVisibility` is interpreted against the split view's
+    /// COLUMN COUNT, so one state shared by a two-column and a three-column
+    /// split means different things in each. `.doubleColumn` — which SwiftUI
+    /// resolves to on its own for an ordinary two-column window — is "sidebar +
+    /// detail" in the chat view and "content + detail, SIDEBAR HIDDEN" in the
+    /// three-column Tasks view. Sharing one value ate the top-level sidebar as
+    /// soon as Tasks was opened from a chat window that had been shown once; a
+    /// fresh launch was still on `.automatic` and looked right, which is what
+    /// made it read as intermittent rather than as a wiring bug.
+    func testEachSplitViewOwnsItsColumnVisibilityState() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+        let pattern = try NSRegularExpression(pattern: #"NavigationSplitView\(columnVisibility:\s*\$(\w+)\)"#)
+        let range = NSRange(chat.startIndex..., in: chat)
+        let bindings: [String] = pattern.matches(in: chat, range: range).compactMap { match in
+            Range(match.range(at: 1), in: chat).map { String(chat[$0]) }
+        }
+        XCTAssertEqual(bindings.count, 2, "expected the two split views — update this audit")
+        XCTAssertEqual(Set(bindings).count, bindings.count, """
+            The two NavigationSplitViews share one columnVisibility state \
+            (\(bindings)). That value is read against each split's COLUMN COUNT: \
+            .doubleColumn is "sidebar + detail" in the two-column chat view and \
+            "content + detail, sidebar hidden" in the three-column Tasks view, so \
+            sharing it hides the top-level sidebar in Tasks.
+            """)
+        // …and the three-column one starts on the only value that shows three.
+        XCTAssertTrue(chat.contains("tasksColumnVisibility = NavigationSplitViewVisibility.all"), """
+            The Tasks split must start at `.all` — `.automatic` only happens to \
+            show three columns, and no other value can.
+            """)
+    }
+
     /// Both Tasks columns are real view types, each declaring the environment it
     /// reads — which is what makes the window's injection reach them.
     func testTasksColumnsAreTheirOwnPaneTypes() throws {

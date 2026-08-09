@@ -367,7 +367,21 @@ struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @Environment(\.dismissWindow) private var dismissWindow
+    /// The two-column (chat) split's visibility.
+    ///
+    /// One state per COLUMN COUNT, never one shared between them:
+    /// `NavigationSplitViewVisibility` is interpreted against the split view's
+    /// arity, so the same value means different things in each. `.doubleColumn`
+    /// is "sidebar + detail" here — the ordinary look, which SwiftUI resolves to
+    /// on its own — and "content + detail, SIDEBAR HIDDEN" in a three-column
+    /// split. Sharing one value therefore ate the top-level sidebar the moment
+    /// Tasks was opened from a chat that had been shown even once (a fresh
+    /// launch still on `.automatic` looked right, which is what made it read as
+    /// intermittent).
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
+    /// The three-column (Tasks) split's visibility. `.all` is the only value
+    /// that means "show all three" — the state above cannot supply it.
+    @State private var tasksColumnVisibility = NavigationSplitViewVisibility.all
     /// Flipped by the gate sheet's Cancel, and by nothing else.
     ///
     /// The sheet was first presented on a `.constant(true)` binding, which made
@@ -410,7 +424,7 @@ struct ChatView: View {
     }
 
     private var tasksSplitView: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
+        NavigationSplitView(columnVisibility: $tasksColumnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
                 .toolbarBackground(.visible, for: .windowToolbar)
