@@ -90,23 +90,23 @@ struct AgentListPane: View {
             .toolbar {
                 // Same shape as the Tasks column (`PaneTitleBar`), except the
                 // control is a MENU — the + offers the agent types.
+                // Title only: "Create New Agent" is a row at the top of the
+                // list now, so a + here would be a second create route beside
+                // the first.
                 if #available(macOS 26.0, *) {
-                    ToolbarItem(placement: .navigation) { titleAndNewMenu }
+                    ToolbarItem(placement: .navigation) { paneTitleOnly }
                         .sharedBackgroundVisibility(.hidden)
                 } else {
-                    ToolbarItem(placement: .navigation) { titleAndNewMenu }
+                    ToolbarItem(placement: .navigation) { paneTitleOnly }
                 }
             }
     }
 
-    private var titleAndNewMenu: some View {
-        HStack(spacing: 6) {
-            Text("Agents")
-                .font(.headline)
-                .foregroundStyle(.primary)
-            newAgentMenu
-        }
-        .padding(.leading, 4)
+    private var paneTitleOnly: some View {
+        Text("Agents")
+            .font(.headline)
+            .foregroundStyle(.primary)
+            .padding(.leading, 4)
     }
 
     /// `+` offers the TYPES, not a blank row.
@@ -115,57 +115,94 @@ struct AgentListPane: View {
     /// starters are the app's own worked examples, and starting from one is how
     /// most people should arrive at an agent. Blank stays available at the
     /// bottom for someone who knows exactly what they want.
-    private var newAgentMenu: some View {
-        Menu {
-            Section("Start from a type") {
-                ForEach(Agent.starters) { starter in
-                    Button {
-                        newAgent(basedOn: starter)
-                    } label: {
-                        Label(starter.name, systemImage: starter.symbol)
-                    }
+    @ViewBuilder
+    var newAgentMenuItems: some View {
+        Section("Start from a type") {
+            ForEach(Agent.starters) { starter in
+                Button {
+                    newAgent(basedOn: starter)
+                } label: {
+                    Label(starter.name, systemImage: starter.symbol)
                 }
             }
-            Divider()
-            Button {
-                newAgent(basedOn: nil)
-            } label: {
-                Label("Blank agent", systemImage: "square.dashed")
-            }
+        }
+        Divider()
+        Button {
+            newAgent(basedOn: nil)
         } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.primary)
-                .frame(width: 22, height: 22)
-                .contentShape(Rectangle())
+            Label("Blank agent", systemImage: "square.dashed")
+        }
+    }
+
+    private var list: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                sectionLabel("Your agents")
+                createRow
+                ForEach(store.sortedAgents) { agent in
+                    agentRow(agent)
+                }
+                sectionLabel("Starters")
+                    .padding(.top, 10)
+                ForEach(Agent.starters) { agent in
+                    agentRow(agent)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private func sectionLabel(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .kerning(0.5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+    }
+
+    /// The one way to make an agent, and it offers the TYPES — a dashed row
+    /// rather than a filled one, because it creates rather than navigates.
+    private var createRow: some View {
+        Menu {
+            newAgentMenuItems
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 18)
+                Text("Create New Agent")
+                    .font(.subheadline)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .frame(height: 34)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .foregroundStyle(.quaternary))
+            .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .help("New agent")
+        .help("New agent — start from a type, or blank")
     }
 
-    private var list: some View {
-        List(selection: $model.selectedId) {
-            Section("Your agents") {
-                if store.sortedAgents.isEmpty {
-                    Text("None yet — tap + and pick a type, or describe the assistant you want.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .listRowSeparator(.hidden)
-                }
-                ForEach(store.sortedAgents) { agent in
-                    AgentRow(agent: agent, decision: appState.agentModelDecision(for: agent))
-                        .tag(agent.id)
-                }
-            }
-            Section("Starters") {
-                ForEach(Agent.starters) { agent in
-                    AgentRow(agent: agent, decision: appState.agentModelDecision(for: agent))
-                        .tag(agent.id)
-                }
-            }
-        }
+    private func agentRow(_ agent: Agent) -> some View {
+        AgentListRow(agent: agent,
+                     decision: appState.agentModelDecision(for: agent),
+                     selected: model.selectedId == agent.id,
+                     select: { model.selectedId = agent.id },
+                     startChat: {
+                         appState.showConversation()
+                         appState.startChat(withAgent: agent.id)
+                     })
     }
 
     /// A new agent, optionally seeded from a starter.
@@ -320,29 +357,79 @@ struct AgentDetailPane: View {
 
 // MARK: - Sidebar row
 
-private struct AgentRow: View {
+private struct AgentListRow: View {
     let agent: Agent
     let decision: AgentModelSwitch.Decision
+    let selected: Bool
+    let select: () -> Void
+    let startChat: () -> Void
+
+    @State private var hovering = false
+
+    private var selectable: Bool { AgentModelSwitch.isSelectable(decision) }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: agent.symbol)
-                .font(.system(size: 12))
-                .frame(width: 18)
-                .foregroundStyle(AgentModelSwitch.isSelectable(decision) ? Color.accentColor : .secondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(agent.name).font(.subheadline).lineLimit(1)
-                if let sub = subtitle {
-                    Text(sub).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+        // A real Button for the row, and the start-chat control as a sibling
+        // laid OVER its trailing edge — never a tap gesture wrapped around
+        // both, which on macOS swallows the child's clicks silently.
+        Button(action: select) {
+            HStack(spacing: 8) {
+                Image(systemName: agent.symbol)
+                    .font(.system(size: 12))
+                    .frame(width: 18)
+                    .foregroundStyle(selectable ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(agent.name)
+                        .font(.subheadline)
+                        .foregroundStyle(selected ? Color.accentColor : .primary)
+                        .lineLimit(1)
+                    if let sub = subtitle {
+                        Text(sub).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
                 }
+                Spacer(minLength: 0)
+                // Reserved at all times, so the name doesn't reflow under the
+                // pointer as the trailing control appears.
+                Color.clear.frame(width: 20, height: 1)
             }
-            Spacer(minLength: 0)
-            if agent.isBuiltIn {
-                Image(systemName: "lock").font(.caption2).foregroundStyle(.tertiary)
-                    .help("Built-in — duplicate it to make changes")
-            }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 34)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(SidebarRowStyle.fill(selected: selected, hovering: hovering)))
+            .contentShape(Rectangle())
         }
-        .opacity(AgentModelSwitch.isSelectable(decision) ? 1 : 0.55)
+        .buttonStyle(.plain)
+        .opacity(selectable ? 1 : 0.55)
+        .overlay(alignment: .trailing) { trailingControl }
+        .onHover { hovering = $0 }
+    }
+
+    /// A built-in says so; anything else offers the one thing you do WITH an
+    /// agent rather than to it. Only on the row you are pointing at or on —
+    /// a control on every row is a column of buttons, not a list of agents.
+    @ViewBuilder
+    private var trailingControl: some View {
+        if hovering || selected {
+            Button(action: startChat) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!selectable)
+            .help("Start a chat with \(agent.name)")
+            .padding(.trailing, 6)
+        } else if agent.isBuiltIn {
+            Image(systemName: "lock")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.trailing, 10)
+                .help("Built-in — duplicate it to make changes")
+        }
     }
 
     private var subtitle: String? {
@@ -398,9 +485,12 @@ private struct AgentEditor: View {
 
     var body: some View {
         Form {
-            Section {
-                identityHeader
-                    .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
+            Section("Name") {
+                nameRow
+                    .listRowInsets(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
+            }
+            Section("Description") {
+                briefField
             }
             if readOnly {
                 Section {
@@ -429,17 +519,14 @@ private struct AgentEditor: View {
                 workspaceSection
                 samplingSection
             }
-            if !readOnly {
-                Section {
-                    HStack {
-                        Button("Duplicate", action: onDuplicate)
-                        Spacer()
-                        Button("Delete", role: .destructive, action: onDelete)
-                    }
-                }
-            }
         }
         .formStyle(.grouped)
+        // The one thing you DO with an agent, on its own bar. Duplicate and
+        // Delete are toolbar icons — they act on the agent, not with it, and a
+        // destructive control sitting beside the primary action is how the
+        // wrong one gets clicked.
+        .safeAreaInset(edge: .bottom) { startChatBar }
+        .toolbar { agentActions }
         .onAppear {
             previewer.attach(server: appState.server)
             showAdvancedTools = agent.capabilities.advancedTools != nil
@@ -466,13 +553,61 @@ private struct AgentEditor: View {
     /// picker itself (click the glyph), the brief sits under the name as its
     /// one-line description, and the primary action — talking to it — is where
     /// a primary action belongs, on the trailing edge of the header.
-    private var identityHeader: some View {
-        HStack(alignment: .top, spacing: 14) {
+    private var nameRow: some View {
+        HStack(spacing: 12) {
             symbolPicker
-            nameAndBrief
-            Spacer(minLength: 8)
-            startChatButton
+            TextField("Name", text: $agent.name)
+                .textFieldStyle(.plain)
+                .font(.title3.weight(.semibold))
+                .disabled(readOnly)
         }
+    }
+
+    /// Same `prompt:` rule as the wake phrase: an example handed to the title
+    /// argument becomes a permanent LABEL beside the field instead of showing
+    /// through an empty one.
+    private var briefField: some View {
+        TextField("", text: $agent.brief,
+                  prompt: Text("e.g. a blunt Swift code reviewer that never comments on style"),
+                  axis: .vertical)
+            .textFieldStyle(.plain)
+            .lineLimit(1...3)
+            .disabled(readOnly)
+    }
+
+    /// Duplicate and Delete, as icons. Delete is HIDDEN on a built-in rather
+    /// than shown disabled: it can only fail there, and a dead control is worse
+    /// than an absent one.
+    @ToolbarContentBuilder
+    private var agentActions: some ToolbarContent {
+        ToolbarItem {
+            Button(action: onDuplicate) {
+                Image(systemName: "plus.square.on.square")
+            }
+            .help("Duplicate this agent")
+        }
+        if !readOnly {
+            ToolbarItem {
+                Button(action: onDelete) {
+                    Image(systemName: "trash")
+                }
+                .help("Delete this agent")
+            }
+        }
+    }
+
+    private var startChatBar: some View {
+        HStack {
+            Button(action: onStartChat) {
+                Label("Start Chat with this Agent", systemImage: "bubble.left.and.bubble.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(.bar)
     }
 
     /// The symbol IS its own picker — click the glyph.
@@ -495,12 +630,14 @@ private struct AgentEditor: View {
 
     private var symbolBadge: some View {
         Image(systemName: agent.symbol)
-            .font(.system(size: 22, weight: .medium))
+            .font(.system(size: 19, weight: .medium))
             .foregroundStyle(Color.accentColor)
-            .frame(width: 52, height: 52)
-            .background(Circle().fill(Color.accentColor.opacity(0.12)))
+            .frame(width: 44, height: 44)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.14)))
             .overlay(alignment: .bottomTrailing) { symbolEditHint }
-            .contentShape(Circle())
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     @ViewBuilder
@@ -511,38 +648,6 @@ private struct AgentEditor: View {
                 .symbolRenderingMode(.palette)
                 .foregroundStyle(Color.white, Color.accentColor)
         }
-    }
-
-    private var nameAndBrief: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            TextField("Name", text: $agent.name)
-                .textFieldStyle(.plain)
-                .font(.title2.weight(.semibold))
-                .disabled(readOnly)
-            // Same `prompt:` rule as the wake phrase: an example handed to the
-            // title argument becomes a permanent LABEL beside the field instead
-            // of showing through an empty one.
-            TextField("", text: $agent.brief,
-                      prompt: Text("e.g. a blunt Swift code reviewer that never comments on style"),
-                      axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(1...3)
-                .disabled(readOnly)
-        }
-    }
-
-    /// The one thing you come here to DO with an agent, rather than to it. A
-    /// session's agent is fixed at creation, so this is also the only moment it
-    /// can be chosen.
-    private var startChatButton: some View {
-        Button(action: onStartChat) {
-            Label("New Chat", systemImage: "bubble.left.and.bubble.right")
-        }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.large)
-        .help("Start a conversation as \(agent.name)")
     }
 
     private var identitySection: some View {

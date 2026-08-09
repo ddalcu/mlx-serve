@@ -1475,19 +1475,20 @@ struct ChatDetailView: View {
     /// which is what pinned the whole group to the bottom of the window.
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Text("How can I help you today?")
-                .font(.system(size: 30, weight: .semibold, design: .rounded))
-                // Subtle top-to-bottom fade for depth; primary-based so it
-                // reads in both appearances without picking a color.
-                .foregroundStyle(LinearGradient(
-                    colors: [.primary, .primary.opacity(0.55)],
-                    startPoint: .top, endPoint: .bottom))
+            // Plain SF Pro, one solid colour. It was `design: .rounded` under a
+            // top-to-bottom LinearGradient — a different typeface from the rest
+            // of the app, wearing a fade that reads as a rendering artefact at
+            // this size rather than as depth.
+            Text(activeAgent == nil ? "How can I help you today?" : "Agent")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(.primary)
             if server.status != .running {
                 Text("Start the server to begin.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else if let agent = activeAgent {
-                Text("Talking to \(agent.name)")
+                // The name alone: the heading above already says what it is.
+                Text(agent.name)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
