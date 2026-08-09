@@ -296,8 +296,15 @@ final class ChatWorkspaceTests: XCTestCase {
         // `.sharedBackgroundVisibility(.hidden)`).
         XCTAssertTrue(tasks.contains("ToolbarItem(placement: .navigation)"),
                       "title and + ride one leading item, so the + is next to the word")
-        XCTAssertFalse(tasks.contains("RoundedRectangle(cornerRadius: 6, style: .continuous)"),
-                       "the + must not draw its own fill inside a toolbar item")
+        // …and the platform's own capsule is suppressed, or it wraps the title
+        // AND the button into one "Tasks +" lozenge.
+        XCTAssertTrue(tasks.contains(".sharedBackgroundVisibility(.hidden)"), """
+            The toolbar item must drop its shared background: on macOS 26 that \
+            capsule wraps everything the item holds, so a title beside a button \
+            renders as one lozenge around both.
+            """)
+        XCTAssertTrue(tasks.contains("paneTitle("),
+                      "Tasks and Agents share one title-bar shape (`PaneTitleBar`)")
         XCTAssertFalse(tasks.contains(".buttonStyle(.borderless)"), """
             `.borderless` gives a bare glyph with nothing to aim at — inside a \
             toolbar item the capsule is the target, which is why `.plain` is \

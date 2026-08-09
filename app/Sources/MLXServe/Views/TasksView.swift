@@ -42,24 +42,17 @@ struct TaskListPane: View {
         // free and this is where macOS puts a column's title.
         .toolbar {
             // Title and control in ONE leading item, so the + sits beside the
-            // word rather than across the column at the trailing edge.
-            //
-            // A bare glyph here, with no fill of its own: a ToolbarItem on
-            // macOS 26 draws its own capsule around whatever it holds, so a
-            // button that also draws one renders as a box inside a box. That
-            // is why the chat's old cluster asked for
-            // `.sharedBackgroundVisibility(.hidden)` — same class.
-            ToolbarItem(placement: .navigation) {
-                HStack(spacing: 8) {
-                    Text("Tasks")
-                        .font(.headline)
-                    Button { showNewTask = true } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 12, weight: .semibold))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("New task")
+            // word rather than across the column at the trailing edge — and
+            // with the platform's own capsule suppressed, or it wraps both into
+            // a "Tasks +" lozenge (`PaneTitleBar`).
+            if #available(macOS 26.0, *) {
+                ToolbarItem(placement: .navigation) {
+                    paneTitle("Tasks", help: "New task") { showNewTask = true }
+                }
+                .sharedBackgroundVisibility(.hidden)
+            } else {
+                ToolbarItem(placement: .navigation) {
+                    paneTitle("Tasks", help: "New task") { showNewTask = true }
                 }
             }
         }

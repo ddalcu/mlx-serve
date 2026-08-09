@@ -1,0 +1,55 @@
+import SwiftUI
+
+/// A pane column's title, with its create control beside it, for the window
+/// toolbar.
+///
+/// Shared by Tasks and Agents so the two columns cannot drift, and factored out
+/// because the styling is not obvious: on macOS 26 a `ToolbarItem` draws a
+/// Liquid Glass capsule around whatever it holds. With a title and a button in
+/// one item, that capsule wrapped BOTH — a lozenge reading "Tasks +", with the
+/// title's baseline padding and the button's hit area fighting inside one
+/// shape. The item asks for no shared background, so the title reads as a
+/// title and the button carries its own (hover-lit) target.
+struct PaneTitleBar: View {
+    let title: String
+    let addHelp: String
+    let add: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(.primary)
+            Button(action: add) {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    // A square target the glyph sits in the middle of, rather
+                    // than the glyph's own bounds — a bare symbol is a few
+                    // points across and awkward to hit.
+                    .frame(width: 22, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.primary.opacity(hovering ? 0.12 : 0)))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .help(addHelp)
+        }
+        // Breathing room from the column's leading edge; the toolbar gives none
+        // once the shared background is off.
+        .padding(.leading, 4)
+    }
+}
+
+extension View {
+    /// The pane title + create control, with the toolbar's own capsule
+    /// suppressed where the platform draws one.
+    @ViewBuilder
+    func paneTitle(_ title: String, help: String = "New", add: @escaping () -> Void) -> some View {
+        PaneTitleBar(title: title, addHelp: help, add: add)
+    }
+}

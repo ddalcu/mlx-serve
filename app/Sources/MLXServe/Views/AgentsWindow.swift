@@ -88,17 +88,25 @@ struct AgentListPane: View {
             // takes — both are static, so neither is the runtime-variable
             // content NSToolbar cannot re-measure.
             .toolbar {
-                // Same shape as the Tasks column: title and control in one
-                // leading item, the control bare (a ToolbarItem draws its own
-                // capsule, so a second one reads as a box inside a box).
-                ToolbarItem(placement: .navigation) {
-                    HStack(spacing: 8) {
-                        Text("Agents")
-                            .font(.headline)
-                        newAgentMenu
-                    }
+                // Same shape as the Tasks column (`PaneTitleBar`), except the
+                // control is a MENU — the + offers the agent types.
+                if #available(macOS 26.0, *) {
+                    ToolbarItem(placement: .navigation) { titleAndNewMenu }
+                        .sharedBackgroundVisibility(.hidden)
+                } else {
+                    ToolbarItem(placement: .navigation) { titleAndNewMenu }
                 }
             }
+    }
+
+    private var titleAndNewMenu: some View {
+        HStack(spacing: 6) {
+            Text("Agents")
+                .font(.headline)
+                .foregroundStyle(.primary)
+            newAgentMenu
+        }
+        .padding(.leading, 4)
     }
 
     /// `+` offers the TYPES, not a blank row.
@@ -128,6 +136,7 @@ struct AgentListPane: View {
             Image(systemName: "plus")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Color.primary)
+                .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)
@@ -390,15 +399,8 @@ private struct AgentEditor: View {
     var body: some View {
         Form {
             Section {
-                HStack {
-                    Label("Talk to this agent in its own thread",
-                          systemImage: "bubble.left.and.bubble.right")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("New Chat", action: onStartChat)
-                        .buttonStyle(.borderedProminent)
-                }
+                identityHeader
+                    .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
             }
             if readOnly {
                 Section {
@@ -455,17 +457,96 @@ private struct AgentEditor: View {
 
     // MARK: Identity
 
-    private var identitySection: some View {
-        Section("Identity") {
-            TextField("Name", text: $agent.name)
-                .disabled(readOnly)
-            Picker("Symbol", selection: $agent.symbol) {
-                ForEach(AgentSymbol.pickerChoices, id: \.self) { symbol in
-                    Label(symbol, systemImage: symbol).labelStyle(.iconOnly).tag(symbol)
+    /// Who this agent IS, as a header rather than a row.
+    ///
+    /// A name is the first thing you set and the thing every other field is
+    /// about, so it reads as a title with the symbol beside it — not a
+    /// `TextField("Name")` in a list of settings, which is what made the editor
+    /// feel like a preferences pane rather than a person. The symbol is the
+    /// picker itself (click the glyph), the brief sits under the name as its
+    /// one-line description, and the primary action — talking to it — is where
+    /// a primary action belongs, on the trailing edge of the header.
+    private var identityHeader: some View {
+        HStack(alignment: .top, spacing: 14) {
+            symbolPicker
+            nameAndBrief
+            Spacer(minLength: 8)
+            startChatButton
+        }
+    }
+
+    /// The symbol IS its own picker — click the glyph.
+    private var symbolPicker: some View {
+        Menu {
+            ForEach(AgentSymbol.pickerChoices, id: \.self) { symbol in
+                Button { agent.symbol = symbol } label: {
+                    Label(symbol, systemImage: symbol)
                 }
             }
-            .pickerStyle(.menu)
-            .disabled(readOnly)
+        } label: {
+            symbolBadge
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .disabled(readOnly)
+        .help("Change the symbol")
+    }
+
+    private var symbolBadge: some View {
+        Image(systemName: agent.symbol)
+            .font(.system(size: 22, weight: .medium))
+            .foregroundStyle(Color.accentColor)
+            .frame(width: 52, height: 52)
+            .background(Circle().fill(Color.accentColor.opacity(0.12)))
+            .overlay(alignment: .bottomTrailing) { symbolEditHint }
+            .contentShape(Circle())
+    }
+
+    @ViewBuilder
+    private var symbolEditHint: some View {
+        if !readOnly {
+            Image(systemName: "pencil.circle.fill")
+                .font(.system(size: 14))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(Color.white, Color.accentColor)
+        }
+    }
+
+    private var nameAndBrief: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            TextField("Name", text: $agent.name)
+                .textFieldStyle(.plain)
+                .font(.title2.weight(.semibold))
+                .disabled(readOnly)
+            // Same `prompt:` rule as the wake phrase: an example handed to the
+            // title argument becomes a permanent LABEL beside the field instead
+            // of showing through an empty one.
+            TextField("", text: $agent.brief,
+                      prompt: Text("e.g. a blunt Swift code reviewer that never comments on style"),
+                      axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1...3)
+                .disabled(readOnly)
+        }
+    }
+
+    /// The one thing you come here to DO with an agent, rather than to it. A
+    /// session's agent is fixed at creation, so this is also the only moment it
+    /// can be chosen.
+    private var startChatButton: some View {
+        Button(action: onStartChat) {
+            Label("New Chat", systemImage: "bubble.left.and.bubble.right")
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .help("Start a conversation as \(agent.name)")
+    }
+
+    private var identitySection: some View {
+        Section("Identity") {
             LabeledContent("Wake phrase") {
                 VStack(alignment: .leading, spacing: 2) {
                     // `prompt:`, not the title argument — a TextField's title is a
@@ -535,14 +616,12 @@ private struct AgentEditor: View {
     private var promptSection: some View {
         Section("Prompt") {
             VStack(alignment: .leading, spacing: 6) {
-                Text("What should this agent be?").font(.caption).foregroundStyle(.secondary)
-                // Same `prompt:` rule as the wake phrase: an example handed to the
-                // title argument becomes a permanent LABEL beside the field.
-                TextField("", text: $agent.brief,
-                          prompt: Text("e.g. a blunt Swift code reviewer that never comments on style"),
-                          axis: .vertical)
-                    .lineLimit(2...4)
-                    .disabled(readOnly)
+                // The description itself lives in the HEADER, under the name,
+                // where it reads as what the agent IS. It was edited here too —
+                // one value with two fields on one screen, which is confusing
+                // even when (as here, sharing a binding) they cannot disagree.
+                Text("Written from the description under the name.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button {
                         onWrite()
