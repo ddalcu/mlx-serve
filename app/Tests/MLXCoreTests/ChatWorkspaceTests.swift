@@ -24,11 +24,11 @@ final class ChatWorkspaceTests: XCTestCase {
     func testTheModelGateStandsDownWhileTheModelsPaneIsShowing() {
         XCTAssertFalse(
             ChatWorkspace.gateShouldPresent(gateIsBlocking: true, cancelled: false,
-                                            workspace: .models(.recommended)),
+                                            workspace: .models(.recommended), welcomePresented: false),
             "the gate must not cover the browser it is asking the user to use")
         XCTAssertFalse(
             ChatWorkspace.gateShouldPresent(gateIsBlocking: true, cancelled: false,
-                                            workspace: .models(.discover)),
+                                            workspace: .models(.discover), welcomePresented: false),
             "…on any section")
     }
 
@@ -37,13 +37,13 @@ final class ChatWorkspaceTests: XCTestCase {
     func testTheGateReturnsInConversationMode() {
         XCTAssertTrue(
             ChatWorkspace.gateShouldPresent(gateIsBlocking: true, cancelled: false,
-                                            workspace: .conversation))
+                                            workspace: .conversation, welcomePresented: false))
         XCTAssertFalse(
             ChatWorkspace.gateShouldPresent(gateIsBlocking: false, cancelled: false,
-                                            workspace: .conversation))
+                                            workspace: .conversation, welcomePresented: false))
         XCTAssertFalse(
             ChatWorkspace.gateShouldPresent(gateIsBlocking: true, cancelled: true,
-                                            workspace: .conversation),
+                                            workspace: .conversation, welcomePresented: false),
             "Cancel still wins — it is the sheet's one door")
     }
 

@@ -28,6 +28,14 @@ enum LaunchDecision: Equatable {
         welcomeSuppressed ? .openChat : .showWelcome
     }
 
+    /// Constant, and that IS the point: the welcome is a SHEET on the chat
+    /// window now, and a sheet with no host window is a screen nobody can see.
+    /// `.showWelcome` used to skip opening Chat — the welcome floated over an
+    /// empty desktop and every exit had to remember to open one.
+    var opensChatWindow: Bool { true }
+
+    var presentsWelcome: Bool { self == .showWelcome }
+
     /// UserDefaults key behind `welcomeSuppressed`. Absent ⇒ false ⇒ the
     /// welcome shows, which is the pre-existing behaviour on every launch.
     static let suppressDefaultsKey = "suppressWelcomeWindow"
@@ -61,8 +69,11 @@ enum WelcomeExit: CaseIterable, Equatable {
 
     var opensModelBrowser: Bool { self == .browseModels }
 
-    /// Also constant — see the type comment: the window floats above
-    /// everything, so anything it opens is invisible until it closes.
+    /// Also constant. It used to be load-bearing against the dead end above:
+    /// the welcome floated over everything, so anything it opened was
+    /// invisible until it closed. As a SHEET on the chat window the dead end
+    /// is unbuildable — whatever dismisses it, a composer is what's behind it —
+    /// so this is now simply what "leaving" means.
     var closesWelcome: Bool { true }
 }
 

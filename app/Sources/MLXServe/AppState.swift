@@ -195,13 +195,23 @@ class AppState: ObservableObject {
     }
     /// "Open the chat window" for callers that can't reach SwiftUI's
     /// `openWindow`: the quick launcher's "Open in chat" (a non-activating
-    /// NSPanel) and the welcome window (a bare `NSHostingView` outside the
-    /// Scene graph). The menu-bar label observes it — the label is always
-    /// installed, so this works with no window open, same bridge as the
-    /// task-notification deep-link. An Int tick so every bump fires onChange,
-    /// no reset dance. ONE bridge for both callers rather than a second
-    /// near-identical tick: they want the same window.
+    /// NSPanel) and the launch path. The menu-bar label observes it — the label
+    /// is always installed, so this works with no window open, same bridge as
+    /// the task-notification deep-link. An Int tick so every bump fires
+    /// onChange, no reset dance. ONE bridge for both callers rather than a
+    /// second near-identical tick: they want the same window.
     @Published var pendingChatOpenTick = 0
+
+    /// Is the welcome screen up? It is a SHEET on the chat window (see
+    /// `LaunchDecision`), so this is a flag the scene binds rather than a
+    /// window somebody has to remember to close — which is what it was, with
+    /// its own `NSHostingView` inheriting no environment and a `.floating`
+    /// level that could leave it over an empty desktop.
+    @Published var showWelcome = false
+    /// What the welcome screen should say about this Mac's library, sampled at
+    /// launch. Held beside the flag because the sheet's content is built by the
+    /// scene, which has no business re-deriving it.
+    @Published var welcomeHasChatModels = false
 
     /// What the chat window's detail column is showing: the transcript, or the
     /// model browser (`ChatWorkspace`). App-level rather than view-local
@@ -408,26 +418,25 @@ class AppState: ObservableObject {
         // ⌘Tab-selectable; menu-bar-only → back to accessory.
         ActivationPolicyManager.shared.start()
 
-        // The welcome window is the app's intro / quick-start screen and hosts
+        // The welcome screen is the app's intro / quick-start screen and hosts
         // the CLI install button, so it shows on every launch — unless the user
         // ticked "Don't show this again", in which case the launch goes
-        // straight to Chat (`LaunchDecision`). Either way the user ends up in
-        // front of a composer rather than looking at an empty desktop.
+        // straight to Chat (`LaunchDecision`).
+        //
+        // The chat window opens in BOTH branches: the welcome is a SHEET on it,
+        // and a sheet with no host window is a screen nobody can see. That is
+        // also why the user can no longer end up in front of nothing — whatever
+        // dismisses the sheet, a composer is what was already behind it.
         let suppressed = UserDefaults.standard.bool(forKey: LaunchDecision.suppressDefaultsKey)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             let hasChat = self.localModels.contains(where: \.isChatPickable)
-            switch LaunchDecision.resolve(welcomeSuppressed: suppressed, hasChatModels: hasChat) {
-            case .openChat:
-                self.pendingChatOpenTick += 1
-            case .showWelcome:
-                Self.showWelcomeWindow(
-                    appState: self,
-                    hasChatModels: hasChat,
-                    onDismiss: { Self._welcomeWindow?.close() },
-                    onOpenModelBrowser: { self.showModels() },
-                    onOpenChat: { self.pendingChatOpenTick += 1 }
-                )
+            let decision = LaunchDecision.resolve(welcomeSuppressed: suppressed,
+                                                  hasChatModels: hasChat)
+            if decision.opensChatWindow { self.pendingChatOpenTick += 1 }
+            if decision.presentsWelcome {
+                self.welcomeHasChatModels = hasChat
+                self.showWelcome = true
             }
         }
 
@@ -795,49 +804,9 @@ class AppState: ObservableObject {
         activeChatId = chatSessions.first?.id
     }
 
-    // MARK: - Welcome Window
-
-    private static func showWelcomeWindow(
-        appState: AppState,
-        hasChatModels: Bool,
-        onDismiss: @escaping () -> Void,
-        onOpenModelBrowser: @escaping () -> Void,
-        onOpenChat: @escaping () -> Void
-    ) {
-        // This is an NSHostingView, so it inherits NO environment — the starter
-        // card's `@EnvironmentObject`s have to be handed to it explicitly or
-        // SwiftUI traps the first time the card renders.
-        let view = WelcomeView(onDismiss: onDismiss,
-                               hasChatModels: hasChatModels,
-                               onOpenModelBrowser: onOpenModelBrowser,
-                               onOpenChat: onOpenChat)
-            .environmentObject(appState)
-            .environmentObject(appState.downloads)
-            .environmentObject(appState.server)
-        let hostingView = NSHostingView(rootView: view)
-
-        // Let SwiftUI compute the intrinsic size
-        let fittingSize = hostingView.fittingSize
-        hostingView.frame = NSRect(origin: .zero, size: fittingSize)
-
-        let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: fittingSize),
-            styleMask: [.titled, .closable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = hostingView
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.isMovableByWindowBackground = true
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        _welcomeWindow = window
-    }
-
-    private static var _welcomeWindow: NSWindow?
+    // The welcome screen is a SHEET on the chat window (`showWelcome`,
+    // presented by the chat scene) — it was a hand-built `NSWindow` around an
+    // `NSHostingView` here, which is why it inherited no environment (every
+    // object the starter card reads had to be passed in by hand or SwiftUI
+    // trapped at first render) and why it could float over an empty desktop.
 }

@@ -31,7 +31,7 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
     var title: String {
         switch self {
         case .runModels:  return "Run models locally"
-        case .menuBar:    return "Lives in your menu bar"
+        case .menuBar:    return "App, Menu Bar, or Terminal"
         case .agentTools: return "Agent with tools"
         }
     }
@@ -41,7 +41,7 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
         case .runModels:
             return "No cloud, no API keys. All processing stays on your device."
         case .menuBar:
-            return "Click the icon in the top-right of your screen to start a server, download models, and chat."
+            return "Use the window, the menu-bar icon, or the mlx-serve command — whichever suits the moment."
         case .agentTools:
             return "Let the model read files, run commands, search the web, and write code."
         }
@@ -51,8 +51,8 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
     var rightPanel: WelcomeRightPanel {
         switch self {
         case .runModels:  return .modelDownload   // Gemma 4 recommended-download card
-        case .agentTools: return .cliInstall       // Terminal-command install row
-        case .menuBar:    return .placeholder       // gray square (for now)
+        case .menuBar:    return .surfaces         // App / Menu bar / Terminal, the last installable
+        case .agentTools: return .toolsDemo        // looping screen recording of the tool loop
         }
     }
 }
@@ -63,8 +63,11 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
 enum WelcomeRightPanel: Equatable {
     /// The recommended-model download card (`RecommendedStarterCard`).
     case modelDownload
-    /// The `mlx-serve` Terminal-command install row.
-    case cliInstall
-    /// A neutral gray square stand-in until real art lands.
-    case placeholder
+    /// The three places you can drive the app from (`WelcomeSurface`): the
+    /// window, the menu bar, and the `mlx-serve` command — the last of which is
+    /// the only one with anything to install.
+    case surfaces
+    /// A looping, silent screen recording of the agent using its tools. A demo
+    /// answers "what does this DO" in a way a paragraph cannot.
+    case toolsDemo
 }

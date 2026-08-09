@@ -90,9 +90,15 @@ enum ChatWorkspace: Equatable {
     /// model, and a media generator needs none of one — blocking the image pane
     /// behind "download a chat model first" would be a demand the pane can't
     /// even use. Every non-transcript mode stands it down.
+    /// It also stands down while the WELCOME sheet is up. Two sheets on one
+    /// window is one sheet plus a thing nobody can see, and the welcome answers
+    /// the gate's own question better — it is the screen with the starter
+    /// models on it. Deferred, not dismissed: the gate returns the moment the
+    /// welcome closes on a conversation that still has no model.
     static func gateShouldPresent(gateIsBlocking: Bool,
                                   cancelled: Bool,
-                                  workspace: ChatWorkspace) -> Bool {
-        gateIsBlocking && !cancelled && workspace.isConversation
+                                  workspace: ChatWorkspace,
+                                  welcomePresented: Bool) -> Bool {
+        gateIsBlocking && !cancelled && workspace.isConversation && !welcomePresented
     }
 }

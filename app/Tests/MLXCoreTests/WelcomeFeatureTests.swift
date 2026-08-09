@@ -31,11 +31,11 @@ final class WelcomeFeatureTests: XCTestCase {
     }
 
     func testPanelMappingMatchesTheSpec() {
-        // Run models locally  → the Gemma 4 recommended-download card
+        // Run models locally        → the Gemma 4 recommended-download card
         XCTAssertEqual(WelcomeFeature.runModels.rightPanel, .modelDownload)
-        // Agent with tools    → the Terminal-command install row
-        XCTAssertEqual(WelcomeFeature.agentTools.rightPanel, .cliInstall)
-        // Lives in your menu bar → a gray square placeholder (for now)
-        XCTAssertEqual(WelcomeFeature.menuBar.rightPanel, .placeholder)
+        // App, Menu Bar, or Terminal → the three surfaces, Terminal installable
+        XCTAssertEqual(WelcomeFeature.menuBar.rightPanel, .surfaces)
+        // Agent with tools           → the looping, silent tools demo
+        XCTAssertEqual(WelcomeFeature.agentTools.rightPanel, .toolsDemo)
     }
 }

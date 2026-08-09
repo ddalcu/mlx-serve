@@ -256,26 +256,101 @@ struct WelcomeView: View {
         switch panel {
         case .modelDownload:
             runModelsPanel
-        case .cliInstall:
-            // The App Store build can't install a CLI symlink; show the neutral
-            // stand-in there rather than a row that offers an impossible action.
-            if BuildFeatures.current.cliInstaller {
-                cliSection
-            } else {
-                placeholderSquare
-            }
-        case .placeholder:
-            placeholderSquare
+        case .surfaces:
+            surfacesPanel
+        case .toolsDemo:
+            toolsDemoPanel
         }
     }
 
-    /// Neutral gray square stand-in (menu-bar feature art lands later). Fills
-    /// the panel so the whole right side reads as the placeholder.
-    private var placeholderSquare: some View {
-        RoundedRectangle(cornerRadius: 12)
-            .fill(Color.gray.opacity(0.22))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    // MARK: - Surfaces panel (App / Menu bar / Terminal)
+
+    /// Where you can drive this app from. Two of the three ship inside the
+    /// bundle, so they state "Installed" rather than offering a control that
+    /// could do nothing; only the Terminal command is something to add, which
+    /// is what makes it read as the one action on the panel instead of a lone
+    /// install row with no context.
+    private var surfacesPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(WelcomeSurface.ordered) { surface in
+                surfaceRow(surface)
+            }
+            Spacer(minLength: 0)
+        }
     }
+
+    private func surfaceRow(_ surface: WelcomeSurface) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: surface.icon)
+                .font(.system(size: 18))
+                .foregroundColor(.accentColor)
+                .frame(width: 26, alignment: .center)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(surface.title)
+                    .font(.headline)
+                Text(caption(for: surface))
+                    .font(.callout)
+                    .foregroundStyle(captionStyle(for: surface))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(caption(for: surface))
+            }
+            Spacer(minLength: 0)
+            if surface.shipsWithTheApp {
+                installedBadge
+            } else {
+                cliTrailingControl
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+    }
+
+    /// The Terminal row's caption is live (where the link would go, whether a
+    /// password is needed, any failure); the other two are constants.
+    private func caption(for surface: WelcomeSurface) -> String {
+        surface.shipsWithTheApp ? surface.caption : cliCaption
+    }
+
+    private func captionStyle(for surface: WelcomeSurface) -> AnyShapeStyle {
+        if !surface.shipsWithTheApp, cliError != nil { return AnyShapeStyle(Color.red) }
+        return AnyShapeStyle(.secondary)
+    }
+
+    /// Stated, not offered: these two are the app itself.
+    private var installedBadge: some View {
+        Label("Installed", systemImage: "checkmark.circle.fill")
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.green)
+            .labelStyle(.titleAndIcon)
+    }
+
+    // MARK: - Tools demo panel
+
+    /// A silent, looping screen recording of the agent using its tools. A demo
+    /// answers "what does this actually do" in a way the sentence on the card
+    /// beside it cannot — and it is muted and chrome-free because it is
+    /// illustration, not media the user came here to operate.
+    @ViewBuilder
+    private var toolsDemoPanel: some View {
+        if let url = BundledAsset.url(Self.toolsDemoFileName) {
+            LoopingVideoView(url: url)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        } else {
+            // A build that shipped without the asset says so quietly rather
+            // than leaving a black rectangle that reads as a broken player.
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.gray.opacity(0.22))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(
+                    Text("Demo unavailable in this build.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary))
+        }
+    }
+
+    static let toolsDemoFileName = "tools.mov"
 
     /// The Run-models panel: the live memory meter, then the best model of each
     /// type that fits this Mac (`WelcomeModelPicks`), each with a one-line
@@ -357,32 +432,22 @@ struct WelcomeView: View {
         }
     }
 
-    // MARK: - CLI install row
+    // MARK: - CLI install state (the Terminal row of the surfaces panel)
 
-    @ViewBuilder private var cliSection: some View {
-        HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "terminal")
-                .font(.system(size: 18))
-                .foregroundColor(.accentColor)
-                .frame(width: 26, alignment: .center)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Terminal command")
-                    .font(.headline)
-                Text(cliCaption)
-                    .font(.callout)
-                    .foregroundStyle(cliError == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.red))
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(cliCaption)
-            }
-            Spacer(minLength: 0)
-            cliTrailingControl
-        }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
-    }
+    /// The App Store build never probes (it cannot symlink out of the sandbox),
+    /// so `cliProbe` stays nil there forever — which as a bare `case nil` was a
+    /// spinner that never resolves. The row states the situation instead.
+    private var cliInstallable: Bool { BuildFeatures.current.cliInstaller }
 
     @ViewBuilder private var cliTrailingControl: some View {
+        if !cliInstallable {
+            EmptyView()
+        } else {
+            cliProbeControl
+        }
+    }
+
+    @ViewBuilder private var cliProbeControl: some View {
         switch cliProbe {
         case nil:
             ProgressView().controlSize(.small)
@@ -407,6 +472,9 @@ struct WelcomeView: View {
 
     private var cliCaption: String {
         if let cliError { return cliError }
+        guard cliInstallable else {
+            return "Not available in the App Store build — get the CLI from GitHub."
+        }
         switch cliProbe {
         case nil:
             return "Run mlx-serve from Terminal."
