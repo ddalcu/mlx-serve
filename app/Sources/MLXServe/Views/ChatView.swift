@@ -651,7 +651,6 @@ struct ChatSidebar: View {
                                     .foregroundStyle(Color.accentColor)
                             }
                         }
-                        Spacer(minLength: 0)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
@@ -673,7 +672,17 @@ struct ChatSidebar: View {
                 }
                 .padding(.leading, 8)
                 .padding(.trailing, 6)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.vertical, 3)
+                // A row is as tall as what is IN it: one line matches a
+                // destination row exactly, and only the rows carrying an agent
+                // subtitle grow. `maxHeight: .infinity` here (with a trailing
+                // `Spacer` inside the label) proposed the largest height the
+                // list would give and let the spacer soak it up, so a
+                // single-line chat sat in the same two-line block as its
+                // neighbours — visible as a tall highlight around one line of
+                // text. `minHeight` is the floor, never a fixed height.
+                .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+                       alignment: .leading)
                 // One meaning for gray in this panel: destinations and
                 // conversations share `SidebarRowStyle` (the accent-filled,
                 // white-text row made a selected chat look like a different

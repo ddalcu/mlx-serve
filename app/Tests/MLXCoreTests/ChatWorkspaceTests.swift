@@ -306,6 +306,44 @@ final class ChatWorkspaceTests: XCTestCase {
                       "the destination column's gutter moved — the two must match")
     }
 
+    /// A conversation row is as tall as what is IN it: a chat with no agent
+    /// subtitle matches a destination row exactly, and only the ones carrying a
+    /// subtitle grow.
+    ///
+    /// `maxHeight: .infinity` on the row, with a trailing `Spacer` inside the
+    /// label, proposed the largest height the list would hand out and let the
+    /// spacer soak it up — so every row sat in the two-line block sized for its
+    /// tallest neighbour, which reads as a tall highlight wrapped around one
+    /// line of text.
+    func testAConversationRowIsOnlyAsTallAsItsContent() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+        guard let list = chat.range(of: "private var conversationsSidebar"),
+              let end = chat.range(of: "private func destinationRow",
+                                   range: list.upperBound..<chat.endIndex) else {
+            return XCTFail("the sidebar's conversation list moved — update this audit")
+        }
+        let body = String(chat[list.upperBound..<end.lowerBound])
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+
+        XCTAssertFalse(body.contains("maxHeight: .infinity"), """
+            A conversation row must not claim the full row height — that is what \
+            inflated every row to the tallest one's size.
+            """)
+        XCTAssertFalse(body.contains("Spacer(minLength: 0)"), """
+            A trailing Spacer in the row label expands to whatever height is \
+            proposed, which is the other half of the same bug.
+            """)
+        // The floor is the destination row's own height, so a single-line chat
+        // and a destination are the same size — one number, read from one place.
+        XCTAssertTrue(body.contains("minHeight: ChatMetrics.sidebarButtonHeight"), """
+            A single-line conversation row should match a destination row: use \
+            `minHeight: ChatMetrics.sidebarButtonHeight`, never a literal or a \
+            fixed height.
+            """)
+    }
+
     /// The sidebar is a list of DESTINATIONS above the conversation list, and
     /// selecting one changes only the content area — the panel itself never
     /// rearranges, so the places stay where the eye learned them.
