@@ -1,9 +1,5 @@
 import SwiftUI
 
-/// The Tasks window: a list of scheduled/on-demand agent tasks on the left, and the
-/// selected task's run history + transcript on the right. The unattended "claw"
-/// surface — create a goal, give it autonomy and (optionally) a schedule, and let it
-/// run in the background.
 /// The Tasks surface: a list of scheduled/on-demand agent tasks, and the
 /// selected task's run history + transcript. The unattended "claw" surface —
 /// create a goal, give it autonomy and (optionally) a schedule, and let it run
@@ -15,18 +11,26 @@ import SwiftUI
 /// because a list of tasks is navigation and belongs beside the app's sidebar
 /// rather than inside the area it navigates. Selection therefore lives on
 /// `AppState` — neither column can own the other's state.
-struct TasksView: View {
+///
+/// **The two columns are two VIEW TYPES, and that is load-bearing** (live crash
+/// 2026-08-08): they used to be `taskList` / `taskDetail` computed properties on
+/// one `TasksView`, which the split view read as `TasksView().taskList`. That
+/// constructs a view VALUE and immediately evaluates a property that touches
+/// `@EnvironmentObject` — but SwiftUI populates that storage when it INSTALLS a
+/// view in the hierarchy, and this instance never was one, so the first click on
+/// Tasks trapped in `TasksView.$appState.getter`. A `.environmentObject(…)` at
+/// the call site cannot save it: the modifier decorates the view the property
+/// already returned, long after the property read the empty box. An environment
+/// reader has to BE the column, not produce it.
+
+/// The middle column: the task list.
+struct TaskListPane: View {
     @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
     @EnvironmentObject var scheduler: TaskScheduler
 
     @State private var showNewTask = false
 
-    /// Unused: the two panes are consumed directly as columns. Kept so the type
-    /// still satisfies `View` for callers that render it whole (previews).
-    var body: some View { taskList }
-
-    var taskList: some View {
+    var body: some View {
         taskListBody
         .sheet(isPresented: $showNewTask) {
             NewTaskSheet { newTask in
@@ -78,17 +82,21 @@ struct TasksView: View {
                 .background(.bar)
             }
     }
+}
 
-    @ViewBuilder
-    var taskDetail: some View {
+/// The detail column: the selected task's runs and transcript.
+struct TaskDetailPane: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var scheduler: TaskScheduler
 
-            if let id = appState.selectedTaskId, let task = scheduler.tasks.first(where: { $0.id == id }) {
-                TaskDetailView(task: task)
-            } else {
-                ContentUnavailableView("Select a task",
-                                       systemImage: "clock.badge.checkmark",
-                                       description: Text("Pick a task to see its runs, or create a new one."))
-            }
+    var body: some View {
+        if let id = appState.selectedTaskId, let task = scheduler.tasks.first(where: { $0.id == id }) {
+            TaskDetailView(task: task)
+        } else {
+            ContentUnavailableView("Select a task",
+                                   systemImage: "clock.badge.checkmark",
+                                   description: Text("Pick a task to see its runs, or create a new one."))
+        }
     }
 }
 

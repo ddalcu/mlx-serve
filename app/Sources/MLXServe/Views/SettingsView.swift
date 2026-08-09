@@ -41,8 +41,9 @@ struct SettingsView: View {
     /// True when this renders inside the chat window's detail column
     /// (`ChatWorkspace.settings`). A `NavigationSplitView` nested inside another
     /// fights the outer sidebar for column behaviour, so the embedded shell is a
-    /// plain two-pane HStack — same category list, same form. Identical split to
-    /// `TasksView.embedded`.
+    /// plain two-pane HStack — same category list, same form. Tasks answers the
+    /// same problem the other way, by becoming real columns of the window's own
+    /// split (`TaskListPane` / `TaskDetailPane`).
     var embedded: Bool = false
 
     var body: some View {

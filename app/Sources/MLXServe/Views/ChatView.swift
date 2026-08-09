@@ -415,15 +415,16 @@ struct ChatView: View {
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
                 .toolbarBackground(.visible, for: .windowToolbar)
         } content: {
-            TasksView().taskList
-                .environmentObject(appState.taskScheduler)
+            // A pane TYPE, never `SomeView().someProperty`: an environment
+            // reader has to be the column itself, or its @EnvironmentObject is
+            // read out of a value SwiftUI never installed (see `TaskListPane`).
+            TaskListPane()
                 .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
                 // Every column carries the material — the bar is ONE surface
                 // across the window, and a column that opts out shows a seam.
                 .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
-            TasksView().taskDetail
-                .environmentObject(appState.taskScheduler)
+            TaskDetailPane()
                 .toolbarBackground(.visible, for: .windowToolbar)
         }
         .navigationTitle("")
@@ -659,19 +660,30 @@ struct ChatSidebar: View {
                 .padding(.leading, 8)
                 .padding(.trailing, 6)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Rectangle())
-                .onHover { isHovered in
-                    hoveredSessionId = isHovered ? session.id : nil
-                }
                 // One meaning for gray in this panel: destinations and
                 // conversations share `SidebarRowStyle` (the accent-filled,
                 // white-text row made a selected chat look like a different
                 // KIND of thing from a selected destination).
-                .listRowBackground(
+                //
+                // One SHAPE too, and that is why the fill rides the row's own
+                // CONTENT: as a `listRowBackground` it filled the whole row
+                // rect, because that modifier is the row's backdrop and the
+                // `listRowInsets` beside it move only the content — so a
+                // selected chat ran edge to edge under a column of
+                // destinations inset 8pt. Here it sits inside the same insets
+                // and matches a destination's `.background` exactly.
+                .background(
                     RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
                         .fill(SidebarRowStyle.fill(selected: isSelected,
                                                    hovering: hoveredSessionId == session.id))
                 )
+                .contentShape(Rectangle())
+                .onHover { isHovered in
+                    hoveredSessionId = isHovered ? session.id : nil
+                }
+                // The row's own backdrop must be CLEAR, or the list draws a
+                // second edge-to-edge surface under the inset one.
+                .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
                 // No rules between conversations: the rows are separated by
                 // their own hover/selection shape, and a hairline under every

@@ -122,16 +122,19 @@ final class ChatWorkspaceTests: XCTestCase {
             "AudioGenService": ".environmentObject(appState.audioGen)",
             "MusicGenService": ".environmentObject(appState.musicGen)",
             "Model3DGenService": ".environmentObject(appState.model3dGen)",
+            "TaskScheduler": ".environmentObject(appState.taskScheduler)",
         ]
 
-        // Every view the chat window hosts as a MODE — the browser and the four
-        // media generators. All five were windows of their own, with their own
+        // Every view the chat window hosts as a MODE — the browser, the four
+        // media generators, and Tasks (whose two panes are columns of the
+        // window's own split). All were windows of their own, with their own
         // environments; the chat window inherited that obligation.
         let hosted = ["Sources/MLXServe/Views/ModelBrowserView.swift",
                       "Sources/MLXServe/Views/ImageGenView.swift",
                       "Sources/MLXServe/Views/VideoGenView.swift",
                       "Sources/MLXServe/Views/AudioGenView.swift",
-                      "Sources/MLXServe/Views/Model3DGenView.swift"]
+                      "Sources/MLXServe/Views/Model3DGenView.swift",
+                      "Sources/MLXServe/Views/TasksView.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()
         for path in hosted {
@@ -170,6 +173,107 @@ final class ChatWorkspaceTests: XCTestCase {
         }
     }
 
+    /// A column of a split view must be a view TYPE, never a computed property
+    /// read off a synthetic instance.
+    ///
+    /// Live crash 2026-08-08: the Tasks columns were `TasksView().taskList` and
+    /// `TasksView().taskDetail`. That builds a view VALUE and immediately
+    /// evaluates a property which touches `@EnvironmentObject` — but SwiftUI
+    /// fills that storage when it INSTALLS a view in the hierarchy, and this
+    /// instance never was one, so the first click on Tasks trapped in
+    /// `TasksView.$appState.getter`. The `.environmentObject(…)` chained at the
+    /// call site cannot help: it decorates the view the property already
+    /// returned, long after the property read the empty box.
+    ///
+    /// The previous audit could not see it — it checks that the WINDOW injects
+    /// what its panes read, which was true the whole time. What was wrong is
+    /// where the reading happened.
+    func testSplitViewColumnsAreViewTypesNotPropertiesOfSyntheticInstances() throws {
+        // Comments describe this bug, so scanning them finds it in the prose
+        // that warns about it.
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+
+        // `Foo(…).bar` where `bar` is NOT a call. A view MODIFIER is always
+        // `.foo(…)`, so requiring the absence of `(` separates the legitimate
+        // shape from the crashing one without an allowlist to keep up to date.
+        let pattern = try NSRegularExpression(
+            pattern: #"\b([A-Z]\w*(?:View|Pane))\s*\([^)]*\)\s*\.\s*([a-z]\w*)\s*(?![\(\w])"#)
+        let range = NSRange(chat.startIndex..., in: chat)
+        let offenders: [String] = pattern.matches(in: chat, range: range).compactMap { match in
+            Range(match.range, in: chat).map { String(chat[$0]) }
+        }
+        XCTAssertTrue(offenders.isEmpty, """
+            A split-view column reads a property off a freshly constructed view: \
+            \(offenders). SwiftUI never installed that instance, so any \
+            @EnvironmentObject it touches traps at first render. Give the column \
+            its own View type (`TaskListPane` / `TaskDetailPane`) instead.
+            """)
+    }
+
+    /// Both Tasks columns are real view types, each declaring the environment it
+    /// reads — which is what makes the window's injection reach them.
+    func testTasksColumnsAreTheirOwnPaneTypes() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+        XCTAssertTrue(chat.contains("TaskListPane()"), "the content column must be TaskListPane")
+        XCTAssertTrue(chat.contains("TaskDetailPane()"), "the detail column must be TaskDetailPane")
+        XCTAssertFalse(chat.contains("TasksView()"), """
+            TasksView() is back as a synthetic instance — that is the 2026-08-08 \
+            crash shape.
+            """)
+
+        let tasks = try source("Sources/MLXServe/Views/TasksView.swift")
+        for pane in ["struct TaskListPane: View", "struct TaskDetailPane: View"] {
+            XCTAssertTrue(tasks.contains(pane), "missing \(pane)")
+        }
+    }
+
+    /// One meaning for gray in the sidebar means one SHAPE as well as one
+    /// colour. A conversation's fill has to ride the row CONTENT: as a
+    /// `listRowBackground` it filled the entire row rect — that modifier is the
+    /// row's backdrop, and the `listRowInsets` beside it move only the content —
+    /// so a selected chat ran edge to edge beneath destinations inset 8pt.
+    func testTheConversationHighlightIsInsetLikeADestinationRow() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+        guard let list = chat.range(of: "private var conversationsSidebar"),
+              let end = chat.range(of: "private func destinationRow",
+                                   range: list.upperBound..<chat.endIndex) else {
+            return XCTFail("the sidebar's conversation list moved — update this audit")
+        }
+        let body = String(chat[list.upperBound..<end.lowerBound])
+
+        // The fill is a `.background` on the row, and the row's own backdrop is
+        // clear — the two halves of the fix; either alone still draws edge to
+        // edge. Which modifier OWNS the fill is the whole question, so ask it
+        // directly: walk back from the fill to the nearest enclosing modifier.
+        guard let fill = body.range(of: "SidebarRowStyle.fill(selected: isSelected") else {
+            return XCTFail("the conversation rows stopped reading SidebarRowStyle")
+        }
+        let before = String(body[body.startIndex..<fill.lowerBound])
+        let owner: String? = [".listRowBackground(", ".background("]
+            .compactMap { modifier in before.range(of: modifier, options: .backwards).map { ($0.lowerBound, modifier) } }
+            .max(by: { $0.0 < $1.0 })?.1
+        XCTAssertEqual(owner, ".background(", """
+            The conversation highlight must be a `.background` on the row \
+            content, not the row's `listRowBackground` — that one spans the \
+            full row rect and ignores `listRowInsets`, which is exactly the \
+            edge-to-edge selection this test exists to prevent.
+            """)
+        XCTAssertTrue(body.contains(".listRowBackground(Color.clear)"), """
+            The row's own backdrop must be clear, or the list draws a second \
+            edge-to-edge surface under the inset one.
+            """)
+
+        // …and the insets it sits inside match the destinations' own gutter.
+        XCTAssertTrue(body.contains("leading: 8") && body.contains("trailing: 8"), """
+            The conversation rows must use the same 8pt gutter the destination \
+            column does (`.padding(.horizontal, 8)`).
+            """)
+        XCTAssertTrue(chat.contains(".padding(.horizontal, 8)"),
+                      "the destination column's gutter moved — the two must match")
+    }
 
     /// The sidebar is a list of DESTINATIONS above the conversation list, and
     /// selecting one changes only the content area — the panel itself never

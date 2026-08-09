@@ -112,7 +112,7 @@ struct MLXCoreApp: App {
                 .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
                     // A tapped task notification: the Tasks pane is part of the
                     // chat window now, so this brings that window up on it and
-                    // TasksView consumes the id in .onAppear/.onChange.
+                    // TaskListPane consumes the id in .onAppear/.onChange.
                     if taskId != nil { appState.showTasks() }
                 }
                 // Quick launcher "Open in chat" (⌘↩): same always-present bridge —
