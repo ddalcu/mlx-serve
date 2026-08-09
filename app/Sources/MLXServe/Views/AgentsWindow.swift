@@ -87,9 +87,17 @@ struct AgentListPane: View {
             // Title and control in the toolbar, the same shape the Tasks column
             // takes — both are static, so neither is the runtime-variable
             // content NSToolbar cannot re-measure.
-            .navigationTitle("Agents")
             .toolbar {
-                ToolbarItem { newAgentMenu }
+                // Same shape as the Tasks column: title and control in one
+                // leading item, the control bare (a ToolbarItem draws its own
+                // capsule, so a second one reads as a box inside a box).
+                ToolbarItem(placement: .navigation) {
+                    HStack(spacing: 8) {
+                        Text("Agents")
+                            .font(.headline)
+                        newAgentMenu
+                    }
+                }
             }
     }
 
@@ -120,10 +128,6 @@ struct AgentListPane: View {
             Image(systemName: "plus")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Color.primary)
-                .frame(width: 24, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.primary.opacity(0.07)))
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)

@@ -720,14 +720,16 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.top, 10)
             .padding(.bottom, 8)
-            // Rows scroll UNDER this block, and with the window toolbar gone
-            // there is no bar for `scrollEdgeEffectStyle` to attach to — so it
-            // frosts nothing and a conversation would slide visibly through the
-            // destinations. The block carries its own backdrop instead. A
-            // material, not `.bar`: `.bar` draws a separator along its edge,
-            // which is the rule removed from the Tasks header for the same
-            // reason.
-            .background(.regularMaterial)
+            // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
+            // has something to attach to again and the platform frosts what
+            // scrolls beneath this block.
+            //
+            // The bar's MATERIAL is still hidden, and the 2026-07-30 note says
+            // the effect drew nothing in that state — that was measured with a
+            // floating cluster to clip under, and this block is a solid column
+            // of controls rather than a strip of text. If conversation rows
+            // become visible sliding through the destinations, this is the
+            // line to bring back (or make the material visible again).
         }
     }
 

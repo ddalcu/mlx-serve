@@ -112,20 +112,23 @@ struct ChatModelPill: View {
         Menu {
             menuContent
         } label: {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
                     Image(systemName: "cpu")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text(Self.headerName(displayName))
-                        .font(compact ? .caption.weight(.medium) : .callout.weight(.medium))
+                    // The READABLE name (`ModelDisplayName`). The repo id it is
+                    // built from stays the identity and is still what the menu
+                    // rows carry underneath — this is the label, not a rename.
+                    Text(ModelDisplayName.pretty(displayName))
+                        .font(compact ? .callout.weight(.semibold) : .callout.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth,
                                alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
                     Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(.secondary)
                     if needsDownload {
                         // Nothing on disk: the one thing to do is get one, so
@@ -137,7 +140,7 @@ struct ChatModelPill: View {
                     } else {
                         Circle()
                             .fill(statusColor)
-                            .frame(width: 6, height: 6)
+                            .frame(width: 8, height: 8)
                     }
                 }
                 if let active = activeDownload {
@@ -147,15 +150,21 @@ struct ChatModelPill: View {
                     ProgressView(value: max(0, min(1, active.fileProgress)))
                         .progressViewStyle(.linear)
                         .tint(.green)
-                        .frame(height: 2)
+                        .frame(height: 3)
                         .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth)
                 }
             }
-            .padding(.horizontal, showsBackground ? 10 : 4)
+            .padding(.horizontal, showsBackground ? 12 : 4)
             .padding(.vertical, 4)
+            // The composer row's own control height, so the pill lines up with
+            // the discs and the send button rather than sitting a few points
+            // shy of them. A FLOOR, not a fixed height: a download adds the
+            // progress hairline under the name and the capsule grows to hold
+            // it, which is the shape in the mockup.
+            .frame(minHeight: compact ? ChatMetrics.composerIconSize : 0)
             .background(showsBackground ? Color.secondary.opacity(0.12) : Color.clear)
-            .clipShape(Capsule())
-            .contentShape(Capsule())
+            .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 999, style: .continuous))
+            .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)

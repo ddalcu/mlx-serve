@@ -40,10 +40,27 @@ struct TaskListPane: View {
         // not that. It rode a header row inside the pane while the toolbar
         // belonged to the chat; the chat's cluster is gone, so the band is
         // free and this is where macOS puts a column's title.
-        .navigationTitle("Tasks")
         .toolbar {
-            ToolbarItem {
-                NewTaskButton { showNewTask = true }
+            // Title and control in ONE leading item, so the + sits beside the
+            // word rather than across the column at the trailing edge.
+            //
+            // A bare glyph here, with no fill of its own: a ToolbarItem on
+            // macOS 26 draws its own capsule around whatever it holds, so a
+            // button that also draws one renders as a box inside a box. That
+            // is why the chat's old cluster asked for
+            // `.sharedBackgroundVisibility(.hidden)` — same class.
+            ToolbarItem(placement: .navigation) {
+                HStack(spacing: 8) {
+                    Text("Tasks")
+                        .font(.headline)
+                    Button { showNewTask = true } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 12, weight: .semibold))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("New task")
+                }
             }
         }
         .sheet(isPresented: $showNewTask) {
@@ -81,35 +98,6 @@ struct TaskListPane: View {
                 }
             }
             .scrollContentBackground(.hidden)
-    }
-}
-
-/// The `+` in the Tasks column header.
-///
-/// `.borderless` gave a bare glyph with no target to aim at and nothing under
-/// the pointer on hover. This is the shape the rest of the app's icon controls
-/// use (a `.plain` button drawing its own fill), so it reads as a control and
-/// answers the click before it happens — and a bordered style is declined for
-/// the reason `ChatMetrics` records: a bordered control keeps its intrinsic
-/// size and merely centers inside whatever frame it is given.
-private struct NewTaskButton: View {
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: "plus")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.primary)
-                .frame(width: 24, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.primary.opacity(hovering ? 0.14 : 0.07)))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .help("New task")
     }
 }
 

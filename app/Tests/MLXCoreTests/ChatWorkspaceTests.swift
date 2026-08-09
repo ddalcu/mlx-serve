@@ -289,12 +289,19 @@ final class ChatWorkspaceTests: XCTestCase {
         // appear or change width at runtime.
         XCTAssertTrue(tasks.contains("\"Tasks\""), "the column still needs its title")
         XCTAssertTrue(tasks.contains(".toolbar {"), "title and + ride the toolbar now")
-        // And the + is a real control with a target, not a bare glyph.
-        XCTAssertTrue(tasks.contains("struct NewTaskButton"),
-                      "the + should be the app's icon-button shape, not `.borderless`")
+        // The + sits beside the title in ONE leading item, and draws no fill of
+        // its own: a ToolbarItem on macOS 26 draws a capsule around whatever it
+        // holds, so a button that also draws one is a box inside a box (the
+        // class the chat's old cluster answered with
+        // `.sharedBackgroundVisibility(.hidden)`).
+        XCTAssertTrue(tasks.contains("ToolbarItem(placement: .navigation)"),
+                      "title and + ride one leading item, so the + is next to the word")
+        XCTAssertFalse(tasks.contains("RoundedRectangle(cornerRadius: 6, style: .continuous)"),
+                       "the + must not draw its own fill inside a toolbar item")
         XCTAssertFalse(tasks.contains(".buttonStyle(.borderless)"), """
-            `.borderless` gives a bare glyph with nothing to aim at and no hover \
-            feedback — see the bordered-control note in ChatMetrics.
+            `.borderless` gives a bare glyph with nothing to aim at — inside a \
+            toolbar item the capsule is the target, which is why `.plain` is \
+            right HERE and was wrong in the pane header.
             """)
     }
 

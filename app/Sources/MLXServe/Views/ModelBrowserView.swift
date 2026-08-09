@@ -1700,9 +1700,13 @@ private struct LocalModelRow: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
-                    // `displayLabel`, so two quants of one GGUF repo are two
-                    // distinguishable rows rather than two identical ones.
-                    Text(model.displayLabel)
+                    // The READABLE name. `displayLabel` (the repo id, plus a
+                    // quant suffix so two quants of one GGUF repo are two
+                    // distinguishable rows) survives as the subtext below —
+                    // that string is what you paste into a config, match
+                    // against `/v1/models` and search Hugging Face for, so it
+                    // is demoted, never dropped.
+                    Text(ModelDisplayName.pretty(model.displayLabel))
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                     // Drafter checkpoints are real, supported models — they
@@ -1718,6 +1722,13 @@ private struct LocalModelRow: View {
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
                 }
+                // The id itself, under the readable name.
+                Text(model.displayLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
                 // Metadata caption: params · quant · architecture · engine, so
                 // the row actually tells the user what the model is — previously
                 // it was just a name and a delete button.

@@ -338,10 +338,15 @@ final class ComposerModeControlTests: XCTestCase {
                        "the floating cluster is gone; its controls live in the composer row")
     }
 
-    /// Content still passes under the sidebar's pinned destinations, and with
-    /// no bar there is no scroll-edge effect to frost it — so that block owns a
-    /// backdrop of its own, or conversations slide visibly through it.
-    func testThePinnedDestinationsCarryTheirOwnBackdrop() throws {
+    /// The sidebar's pinned destinations rely on the PLATFORM to frost what
+    /// scrolls beneath them — `scrollEdgeEffectStyle`, which needs the
+    /// toolbar's bar to attach to.
+    ///
+    /// They carried a hand-drawn `.regularMaterial` backdrop for exactly as
+    /// long as the bar was hidden outright. With the bar back the backdrop
+    /// goes: a band drawn by hand over a sidebar is the same class as the strip
+    /// that once looked native and swallowed every click in it.
+    func testThePinnedDestinationsRelyOnTheScrollEdgeEffect() throws {
         let source = try chatViewSource()
         guard let start = source.range(of: "safeAreaInset(edge: .top)"),
               let end = source.range(of: "private func sectionHeader",
@@ -349,12 +354,20 @@ final class ComposerModeControlTests: XCTestCase {
             return XCTFail("the sidebar's destination inset moved — update this audit")
         }
         let inset = String(source[start.upperBound..<end.lowerBound])
-        XCTAssertTrue(inset.contains(".background(.regularMaterial)"), """
-            The destinations block needs its own backdrop now that no toolbar \
-            frosts what scrolls beneath it.
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+        XCTAssertFalse(inset.contains(".background(.regularMaterial)"), """
+            The destinations block draws its own band again. The toolbar's bar \
+            is back, so the platform's scroll-edge effect has something to \
+            attach to — a hand-drawn strip over a sidebar is the class that \
+            once looked native and ate every click in it.
             """)
         XCTAssertFalse(inset.contains(".background(.bar)"),
-                       "`.bar` draws a separator — the rule removed from the Tasks header")
+                       "`.bar` also draws a separator — the rule removed from the Tasks header")
+        // The effect itself must still be asked for.
+        XCTAssertTrue(source.contains(".scrollEdgeEffectStyle("),
+                      "the sidebar list still needs the native edge effect")
     }
 
     // MARK: - Hover card dismissal
