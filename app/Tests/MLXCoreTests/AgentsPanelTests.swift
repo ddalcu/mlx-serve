@@ -46,7 +46,7 @@ final class AgentsPanelTests: XCTestCase {
     func testABuiltInOffersDuplicateButNotDelete() throws {
         let s = try source()
         guard let start = s.range(of: "private var agentActions: some ToolbarContent"),
-              let end = s.range(of: "private var startChatBar",
+              let end = s.range(of: "private var startChatButton",
                                 range: start.upperBound..<s.endIndex) else {
             return XCTFail("the agent toolbar actions moved — update this audit")
         }

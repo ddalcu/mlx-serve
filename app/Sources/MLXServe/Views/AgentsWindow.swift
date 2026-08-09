@@ -484,48 +484,19 @@ private struct AgentEditor: View {
     private var readOnly: Bool { agent.isBuiltIn }
 
     var body: some View {
-        Form {
-            Section("Name") {
-                nameRow
-                    .listRowInsets(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
-            }
-            Section("Description") {
-                briefField
-            }
-            if readOnly {
-                Section {
-                    HStack(spacing: 8) {
-                        Image(systemName: "lock.fill").foregroundStyle(.secondary)
-                        Text("This is one of the built-in agents. Duplicate it to make it yours.")
-                            .font(.callout)
-                        Spacer()
-                        Button("Duplicate", action: onDuplicate)
-                    }
-                }
-            }
-            identitySection
-            promptSection
-            // Everything below is collapsed by default. An agent is a prompt, a
-            // name and a voice; capabilities, a pinned model, a workspace and
-            // sampling are real but rarely-touched, and putting five sections of
-            // them between "what should this be?" and the Delete button made the
-            // editor read as a settings panel. The row names whatever is set
-            // behind it (`AgentAdvancedSummary`) so a collapsed non-default is
-            // still discoverable.
-            moreOptionsSection
-            if showMoreOptions {
-                capabilitiesSection
-                modelSection
-                workspaceSection
-                samplingSection
-            }
+        // A ScrollView of hand-built cards, not a `Form(.formStyle(.grouped))`.
+        // The Form owned the card radius, the row insets, the label typography
+        // and the section spacing — so none of the design could be specified —
+        // and it right-aligns a TextField's text, which put the agent's own
+        // NAME hard against the trailing edge of a field labelled at the other
+        // end. Every surface below comes from `AgentEditorChrome`, so six cards
+        // cannot end up with five radii.
+        ScrollView {
+            editorColumn
+                .frame(maxWidth: AgentEditorMetrics.contentMaxWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(AgentEditorMetrics.contentPadding)
         }
-        .formStyle(.grouped)
-        // The one thing you DO with an agent, on its own bar. Duplicate and
-        // Delete are toolbar icons — they act on the agent, not with it, and a
-        // destructive control sitting beside the primary action is how the
-        // wrong one gets clicked.
-        .safeAreaInset(edge: .bottom) { startChatBar }
         .toolbar { agentActions }
         .onAppear {
             previewer.attach(server: appState.server)
@@ -542,24 +513,82 @@ private struct AgentEditor: View {
         .onDisappear { onSave() }
     }
 
-    // MARK: Identity
+    /// The column itself. Each section is its own typed property rather than a
+    /// nesting of expressions: one deeply-nested view expression here took the
+    /// release build from ~48s to over ten minutes with no warning, which is
+    /// SwiftUI's type-checker grinding rather than anything being wrong.
+    private var editorColumn: some View {
+        VStack(alignment: .leading, spacing: AgentEditorMetrics.sectionSpacing) {
+            identityHeader
+            descriptionField
+            readOnlyNotice
+            promptSection
+            identitySection
+            // Everything below is collapsed by default. An agent is a prompt, a
+            // name and a voice; capabilities, a pinned model, a workspace and
+            // sampling are real but rarely-touched, and putting five sections of
+            // them between "what should this be?" and the Delete button made the
+            // editor read as a settings panel. The row names whatever is set
+            // behind it (`AgentAdvancedSummary`) so a collapsed non-default is
+            // still discoverable.
+            moreOptionsSection
+            advancedSections
+            startChatButton
+        }
+    }
 
-    /// Who this agent IS, as a header rather than a row.
+    @ViewBuilder
+    private var advancedSections: some View {
+        if showMoreOptions {
+            capabilitiesSection
+            modelSection
+            workspaceSection
+            samplingSection
+        }
+    }
+
+    // MARK: Name & description
+
+    /// Who this agent IS: the symbol on its own card, the name beside it.
     ///
     /// A name is the first thing you set and the thing every other field is
-    /// about, so it reads as a title with the symbol beside it — not a
-    /// `TextField("Name")` in a list of settings, which is what made the editor
-    /// feel like a preferences pane rather than a person. The symbol is the
-    /// picker itself (click the glyph), the brief sits under the name as its
-    /// one-line description, and the primary action — talking to it — is where
-    /// a primary action belongs, on the trailing edge of the header.
-    private var nameRow: some View {
-        HStack(spacing: 12) {
+    /// about, so it reads as a title — not a `TextField("Name")` in a list of
+    /// settings, which is what made the editor feel like a preferences pane
+    /// rather than a person. The symbol is the picker itself (click the glyph).
+    private var identityHeader: some View {
+        HStack(alignment: .bottom, spacing: AgentEditorMetrics.labelSpacing) {
             symbolPicker
-            TextField("Name", text: $agent.name)
-                .textFieldStyle(.plain)
-                .font(.title3.weight(.semibold))
-                .disabled(readOnly)
+                .padding(AgentEditorMetrics.avatarPadding)
+                .agentSurface(radius: AgentEditorMetrics.wellRadius)
+            AgentLabeledField("Name") { nameField }
+        }
+    }
+
+    private var nameField: some View {
+        TextField("Name", text: $agent.name)
+            .textFieldStyle(.plain)
+            .font(.title3.weight(.medium))
+            .disabled(readOnly)
+    }
+
+    private var descriptionField: some View {
+        AgentLabeledField("Description") { briefField }
+    }
+
+    /// A built-in refuses every edit, so it says so where you would start
+    /// typing — and offers the one move that makes it yours.
+    @ViewBuilder
+    private var readOnlyNotice: some View {
+        if readOnly {
+            AgentCard {
+                HStack(spacing: 8) {
+                    Image(systemName: "lock.fill").foregroundStyle(.secondary)
+                    Text("This is one of the built-in agents. Duplicate it to make it yours.")
+                        .font(.callout)
+                    Spacer(minLength: 8)
+                    Button("Duplicate", action: onDuplicate)
+                }
+            }
         }
     }
 
@@ -596,18 +625,19 @@ private struct AgentEditor: View {
         }
     }
 
-    private var startChatBar: some View {
-        HStack {
-            Button(action: onStartChat) {
-                Label("Start Chat with this Agent", systemImage: "bubble.left.and.bubble.right")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+    /// The one thing you DO with an agent, in the flow of the column at the end
+    /// of it — sized, not stretched: a full-width button reads as a bar. It was
+    /// one (`safeAreaInset`), which spent a permanent strip of the pane on a
+    /// control you press once. Duplicate and Delete stay toolbar icons: they act
+    /// on the agent rather than with it, and a destructive control beside the
+    /// primary action is how the wrong one gets clicked.
+    private var startChatButton: some View {
+        Button(action: onStartChat) {
+            Label("Start Chat with this Agent", systemImage: "bubble.left.and.bubble.right")
+                .frame(maxWidth: AgentEditorMetrics.primaryMaxWidth)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .background(.bar)
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
     }
 
     /// The symbol IS its own picker — click the glyph.
@@ -632,12 +662,10 @@ private struct AgentEditor: View {
         Image(systemName: agent.symbol)
             .font(.system(size: 19, weight: .medium))
             .foregroundStyle(Color.accentColor)
-            .frame(width: 44, height: 44)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.accentColor.opacity(0.14)))
+            .frame(width: AgentEditorMetrics.avatarSize, height: AgentEditorMetrics.avatarSize)
+            .background(Circle().fill(Color.accentColor.opacity(0.16)))
             .overlay(alignment: .bottomTrailing) { symbolEditHint }
-            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .contentShape(Circle())
     }
 
     @ViewBuilder
@@ -650,25 +678,32 @@ private struct AgentEditor: View {
         }
     }
 
+    /// Voice belongs to identity, not to a section of its own: how an agent
+    /// SOUNDS is the same kind of fact as what it's called and what wakes it,
+    /// and all three are what you set when making one.
     private var identitySection: some View {
-        Section("Identity") {
-            LabeledContent("Wake phrase") {
-                VStack(alignment: .leading, spacing: 2) {
-                    // `prompt:`, not the title argument — a TextField's title is a
-                    // LABEL, so passing the app phrase there parked it beside the
-                    // field permanently instead of showing through an empty one.
-                    TextField("", text: Binding(get: { agent.wakePhrase ?? "" },
-                                                set: { agent.wakePhrase = $0.isEmpty ? nil : $0 }),
-                              prompt: Text(appPhraseDisplay))
-                        .disabled(readOnly)
-                    Text("Say this to hand the conversation to \(agent.name). Blank uses the app's own phrase.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
+        AgentSection("Identity") {
+            AgentCard {
+                wakePhraseRow
+                Divider()
+                voiceRows
             }
-            // Voice belongs to identity, not to a section of its own: how an
-            // agent SOUNDS is the same kind of fact as what it's called and what
-            // wakes it, and all three are what you set when making one.
-            voiceRows
+        }
+    }
+
+    private var wakePhraseRow: some View {
+        AgentEditorRow("Wake phrase",
+                       caption: "Say this to hand the conversation to \(agent.name). Blank uses the app's own phrase.") {
+            // `prompt:`, not the title argument — a TextField's title is a
+            // LABEL, so passing the app phrase there parked it beside the
+            // field permanently instead of showing through an empty one.
+            TextField("", text: Binding(get: { agent.wakePhrase ?? "" },
+                                        set: { agent.wakePhrase = $0.isEmpty ? nil : $0 }),
+                      prompt: Text(appPhraseDisplay))
+                .textFieldStyle(.plain)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 220)
+                .disabled(readOnly)
         }
     }
 
@@ -685,102 +720,157 @@ private struct AgentEditor: View {
     /// The disclosure row for the collapsed sections.
     ///
     /// A Button rather than a `DisclosureGroup`: the four things it reveals are
-    /// `Section`s, and nesting sections inside a disclosure loses their headers
-    /// and their grouped-form styling. Toggling a flag that gates them keeps
-    /// each section exactly as it was.
+    /// sections with their own titles, and nesting them inside a disclosure
+    /// loses those headers. Toggling a flag that gates them keeps each section
+    /// exactly as it was.
     private var moreOptionsSection: some View {
-        Section {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { showMoreOptions.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: showMoreOptions ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.semibold))
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { showMoreOptions.toggle() }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: showMoreOptions ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("More options").font(.headline)
+                Spacer(minLength: 8)
+                // What's set behind the row while it's shut, so a collapsed
+                // non-default isn't a setting nobody can find again.
+                if !showMoreOptions, let summary = AgentAdvancedSummary.text(for: agent) {
+                    Text(summary)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Text("More options")
-                    Spacer()
-                    // What's set behind the row while it's shut, so a collapsed
-                    // non-default isn't a setting nobody can find again.
-                    if !showMoreOptions, let summary = AgentAdvancedSummary.text(for: agent) {
-                        Text(summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .help("Capabilities, model, workspace and sampling. Most agents need none of these.")
+            .padding(.horizontal, AgentEditorMetrics.cardPadding)
+            .padding(.vertical, AgentEditorMetrics.cardPadding - 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .agentSurface()
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .help("Capabilities, model, workspace and sampling. Most agents need none of these.")
     }
 
     // MARK: Prompt
 
+    /// The prompt, then the things you can do to it.
+    ///
+    /// The write action and the counter sit BELOW the editor: above, they
+    /// separated the section's title from the thing it titles, and the counter
+    /// read as a budget for something you hadn't seen yet.
     private var promptSection: some View {
-        Section("Prompt") {
-            VStack(alignment: .leading, spacing: 6) {
-                // The description itself lives in the HEADER, under the name,
-                // where it reads as what the agent IS. It was edited here too —
-                // one value with two fields on one screen, which is confusing
-                // even when (as here, sharing a binding) they cannot disagree.
-                Text("Written from the description under the name.")
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button {
-                        onWrite()
-                    } label: {
-                        if isWriting {
-                            HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Writing…") }
-                        } else {
-                            Text("Write it for me")
-                        }
-                    }
-                    .disabled(readOnly || isWriting)
-                    .help("Ask the current model to turn your description into a system prompt. You can edit whatever it writes.")
-                    Spacer()
-                    Text("\(agent.systemPrompt.count)/\(AgentWriter.maxPromptCharacters)")
-                        .font(.caption2).foregroundStyle(.tertiary)
-                }
+        AgentSection("Prompt") {
+            AgentCard {
+                promptEditor
+                promptActions
             }
-            TextEditor(text: $agent.systemPrompt)
-                .font(.body)
-                .frame(minHeight: 120)
-                .disabled(readOnly)
+        }
+    }
+
+    private var promptEditor: some View {
+        TextEditor(text: $agent.systemPrompt)
+            .font(.body)
+            .scrollContentBackground(.hidden)
+            .frame(minHeight: AgentEditorMetrics.promptMinHeight)
+            .padding(AgentEditorMetrics.wellPadding)
+            .agentWell()
+            .disabled(readOnly)
+    }
+
+    private var promptActions: some View {
+        HStack(spacing: 12) {
+            AgentPillButton(title: isWriting ? "Writing…" : "Write it for me",
+                            systemImage: "sparkles",
+                            isBusy: isWriting,
+                            action: onWrite)
+                .disabled(readOnly || isWriting)
+                .help("Ask the current model to turn your description into a system prompt. You can edit whatever it writes.")
+            // The description itself lives in the header, under the name, where
+            // it reads as what the agent IS. It was edited here too — one value
+            // with two fields on one screen, which is confusing even when (as
+            // here, sharing a binding) they cannot disagree.
+            Text("Written from the description under the name.")
+                .font(.subheadline).foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Text("\(agent.systemPrompt.count)/\(AgentWriter.maxPromptCharacters)")
+                .font(.subheadline).foregroundStyle(.tertiary)
+                .monospacedDigit()
         }
     }
 
     // MARK: Capabilities
 
     private var capabilitiesSection: some View {
-        Section("Capabilities") {
-            Toggle("Tools", isOn: Binding(get: { agent.capabilities.tools },
-                                          set: { agent.capabilities.tools = $0 }))
+        AgentSection("Capabilities") {
+            AgentCard(spacing: 12) {
+                capabilityToggles
+                Divider()
+                advancedToolsDisclosure
+            }
+        }
+    }
+
+    /// Every control here sits on the trailing edge of an `AgentEditorRow`, the
+    /// same grammar Identity speaks — a stack of leading-aligned controls in a
+    /// card beside a card of trailing-aligned ones reads as two designs.
+    ///
+    /// `.switch` explicitly: a macOS `Toggle` outside a Form is a CHECKBOX, and
+    /// the grouped Form was silently promoting these to switches. Losing that
+    /// promotion is exactly the kind of thing a source scan can't see.
+    @ViewBuilder
+    private var capabilityToggles: some View {
+        AgentEditorRow("Tools") {
+            Toggle("", isOn: Binding(get: { agent.capabilities.tools },
+                                     set: { agent.capabilities.tools = $0 }))
+                .labelsHidden()
+                .toggleStyle(.switch)
                 .disabled(readOnly || showAdvancedTools)
                 .help("The tool-calling loop: shell, files, search, tasks, media generation.")
-            Toggle("MCP", isOn: Binding(get: { agent.capabilities.mcp },
-                                        set: { agent.capabilities.mcp = $0 }))
+        }
+        AgentEditorRow("MCP") {
+            Toggle("", isOn: Binding(get: { agent.capabilities.mcp },
+                                     set: { agent.capabilities.mcp = $0 }))
+                .labelsHidden()
+                .toggleStyle(.switch)
                 .disabled(readOnly)
                 .help("Add the tools from every enabled Model Context Protocol server.")
-            Toggle("Web", isOn: Binding(get: { agent.capabilities.web },
-                                        set: { agent.capabilities.web = $0 }))
+        }
+        AgentEditorRow("Web") {
+            Toggle("", isOn: Binding(get: { agent.capabilities.web },
+                                     set: { agent.capabilities.web = $0 }))
+                .labelsHidden()
+                .toggleStyle(.switch)
                 .disabled(readOnly || showAdvancedTools)
                 .help("Browse pages and search the web (browse + webSearch).")
-            Picker("Thinking", selection: tristate($agent.enableThinking)) {
+        }
+        AgentEditorRow("Thinking") {
+            Picker("", selection: tristate($agent.enableThinking)) {
                 Text("App default").tag(TriChoice.appDefault)
                 Text("On").tag(TriChoice.on)
                 Text("Off").tag(TriChoice.off)
             }
+            .labelsHidden()
+            .fixedSize()
             .disabled(readOnly)
-            Picker("Approve tools", selection: tristate($agent.autoApproveTools)) {
+        }
+        AgentEditorRow("Approve tools") {
+            Picker("", selection: tristate($agent.autoApproveTools)) {
                 Text("App default").tag(TriChoice.appDefault)
                 Text("Automatically").tag(TriChoice.on)
                 Text("Ask every time").tag(TriChoice.off)
             }
+            .labelsHidden()
+            .fixedSize()
             .disabled(readOnly)
+        }
+    }
 
-            DisclosureGroup(isExpanded: $showAdvancedTools) {
+    private var advancedToolsDisclosure: some View {
+        DisclosureGroup(isExpanded: $showAdvancedTools) {
                 Text("Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above.")
                     .font(.caption2).foregroundStyle(.secondary)
                 ForEach(AgentToolKind.allCases.filter { $0 != .searchDocuments }, id: \.self) { tool in
@@ -806,11 +896,10 @@ private struct AgentEditor: View {
                     .contentShape(Rectangle())
                     .onTapGesture { showAdvancedTools.toggle() }
             }
-            .onChange(of: showAdvancedTools) { _, expanded in
-                // Seed from the coarse resolution so the two views can never
-                // disagree at the moment Advanced opens.
-                if expanded { agent.capabilities.openAdvanced() }
-            }
+        .onChange(of: showAdvancedTools) { _, expanded in
+            // Seed from the coarse resolution so the two views can never
+            // disagree at the moment Advanced opens.
+            if expanded { agent.capabilities.openAdvanced() }
         }
     }
 
@@ -828,9 +917,18 @@ private struct AgentEditor: View {
     // MARK: Model
 
     private var modelSection: some View {
-        Section("Model") {
-            Picker("Model", selection: Binding(get: { agent.modelPath ?? "" },
-                                               set: { agent.modelPath = $0.isEmpty ? nil : $0 })) {
+        AgentSection("Model") {
+            AgentCard(spacing: 12) {
+                modelPicker
+                modelState
+            }
+        }
+    }
+
+    private var modelPicker: some View {
+        AgentEditorRow("Model") {
+            Picker("", selection: Binding(get: { agent.modelPath ?? "" },
+                                          set: { agent.modelPath = $0.isEmpty ? nil : $0 })) {
                 Text("Current").tag("")
                 ForEach(appState.localModels.filter(\.isChatPickable), id: \.path) { model in
                     Text(model.name).tag(model.path)
@@ -839,62 +937,73 @@ private struct AgentEditor: View {
                     Text("\(info.name) (network)").tag(info.name)
                 }
             }
+            .labelsHidden()
+            .frame(maxWidth: 260)
             .disabled(readOnly)
-            let decision = appState.agentModelDecision(for: agent)
-            switch decision {
-            case .needsDownload(let path):
-                HStack {
-                    Label("Not downloaded", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange).font(.caption)
-                    Spacer()
-                    Button("Open Model Browser") {
-                        appState.showModels()
-                    }
-                    .controlSize(.small)
-                    .help("This agent can't answer until \((path as NSString).lastPathComponent) is on disk. Nothing is downloaded automatically.")
+        }
+    }
+
+    @ViewBuilder
+    private var modelState: some View {
+        switch appState.agentModelDecision(for: agent) {
+        case .needsDownload(let path):
+            HStack {
+                Label("Not downloaded", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange).font(.subheadline)
+                Spacer(minLength: 8)
+                Button("Open Model Browser") {
+                    appState.showModels()
                 }
-            case .unavailable(let reason):
-                Label(reason, systemImage: "wifi.slash").foregroundStyle(.orange).font(.caption)
-            case .noChange, .load, .lan:
-                Text("Selecting this agent loads its model; “Current” leaves whatever is running alone.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                .controlSize(.small)
+                .help("This agent can't answer until \((path as NSString).lastPathComponent) is on disk. Nothing is downloaded automatically.")
             }
+        case .unavailable(let reason):
+            Label(reason, systemImage: "wifi.slash").foregroundStyle(.orange).font(.subheadline)
+        case .noChange, .load, .lan:
+            Text("Selecting this agent loads its model; “Current” leaves whatever is running alone.")
+                .font(.subheadline).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     // MARK: Workspace
 
     private var workspaceSection: some View {
-        Section("Workspace") {
-            LabeledContent("Folder") {
-                HStack(spacing: 8) {
+        AgentSection("Workspace") {
+            AgentCard(spacing: 12) {
+                AgentEditorRow("Folder",
+                               caption: "Where this agent's file and shell tools run. Several agents may share a folder.") {
                     Text(agent.workingDirectory ?? "App default")
-                        .font(.caption.monospaced())
+                        .font(.subheadline.monospaced())
                         .lineLimit(1).truncationMode(.head)
                         .foregroundStyle(agent.workingDirectory == nil ? .secondary : .primary)
-                    Spacer()
-                    Button("Choose…") {
-                        guard let picked = WorkspacePicker.pickDirectory() else { return }
-                        agent.workingDirectory = picked
-                        // Per-agent folders need per-agent bookmarks under the
-                        // App Sandbox — the global default's slot can't stand in.
-                        SecurityScopedBookmark.store(URL(fileURLWithPath: picked),
-                                                     name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
-                        onSave()
-                    }
-                    .disabled(readOnly)
-                    if agent.workingDirectory != nil {
-                        Button("Reset") {
-                            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
-                            agent.workingDirectory = nil
-                            onSave()
-                        }
-                        .disabled(readOnly)
-                    }
                 }
+                workspaceActions
             }
-            Text("Where this agent's file and shell tools run. Several agents may share a folder.")
-                .font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private var workspaceActions: some View {
+        HStack(spacing: 8) {
+            Button("Choose…") {
+                guard let picked = WorkspacePicker.pickDirectory() else { return }
+                agent.workingDirectory = picked
+                // Per-agent folders need per-agent bookmarks under the
+                // App Sandbox — the global default's slot can't stand in.
+                SecurityScopedBookmark.store(URL(fileURLWithPath: picked),
+                                             name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
+                onSave()
+            }
+            .disabled(readOnly)
+            if agent.workingDirectory != nil {
+                Button("Reset") {
+                    SecurityScopedBookmark.clear(name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
+                    agent.workingDirectory = nil
+                    onSave()
+                }
+                .disabled(readOnly)
+            }
+            Spacer(minLength: 0)
         }
     }
 
@@ -902,36 +1011,44 @@ private struct AgentEditor: View {
 
     @ViewBuilder
     private var voiceRows: some View {
-        AgentVoiceMenu(voice: $agent.voice,
-                       systemVoices: appState.voice.availableVoices,
-                       clips: clips,
-                       globalClipPath: appState.serverOptions.voiceClonePath,
-                       globalClipLabel: appState.serverOptions.voiceCloneLabel,
-                       cloneAvailable: ttsDownloaded,
-                       onAddClip: { addVoiceClip() },
-                       onRevealClips: { VoiceClipLibrary.revealInFinder() })
-            .disabled(readOnly)
+        AgentEditorRow("Voice", caption: voiceCaption) {
+            AgentVoiceMenu(voice: $agent.voice,
+                           systemVoices: appState.voice.availableVoices,
+                           clips: clips,
+                           globalClipPath: appState.serverOptions.voiceClonePath,
+                           globalClipLabel: appState.serverOptions.voiceCloneLabel,
+                           cloneAvailable: ttsDownloaded,
+                           onAddClip: { addVoiceClip() },
+                           onRevealClips: { VoiceClipLibrary.revealInFinder() })
+                .disabled(readOnly)
+        }
         // An agent already pointing at a clip when the model is gone would
         // just quietly speak in the system voice — say so instead.
         if case .clone = agent.voice, !ttsDownloaded,
            let reason = VoiceCloneMenuModel.cloneUnavailableReason(ttsModelDownloaded: false) {
             Label(reason, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption).foregroundStyle(.orange)
+                .font(.subheadline).foregroundStyle(.orange)
         }
-        HStack(spacing: 10) {
+        voiceActions
+    }
+
+    /// Nil rather than a sentence when the agent has its own voice: the row's
+    /// trailing control already names what will speak.
+    private var voiceCaption: String? {
+        agent.voice == nil ? "Speaks with the app's voice (Settings ▸ Voice)." : nil
+    }
+
+    private var voiceActions: some View {
+        HStack(spacing: 8) {
             Button("Preview") { previewVoice() }
                 .disabled(previewer.active != nil || agent.voice == nil)
             Button("Add Voice…") { addVoiceClip() }
                 .disabled(readOnly)
                 .help("Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.")
             if let error = previewer.error ?? clipError {
-                Text(error).font(.caption2).foregroundStyle(.orange)
+                Text(error).font(.subheadline).foregroundStyle(.orange)
             }
-            Spacer()
-        }
-        if agent.voice == nil {
-            Text("Speaks with the app's voice (Settings ▸ Voice).")
-                .font(.caption2).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
     }
 
@@ -972,37 +1089,44 @@ private struct AgentEditor: View {
     // MARK: Sampling
 
     private var samplingSection: some View {
-        Section("Sampling") {
-            LabeledContent("Temperature") {
-                HStack(spacing: 10) {
-                    Toggle("App default", isOn: Binding(
-                        get: { agent.temperature == nil },
-                        set: { agent.temperature = $0 ? nil : appState.serverOptions.defaultTemperature }))
-                        .toggleStyle(.checkbox)
-                        .disabled(readOnly)
-                    if let value = agent.temperature {
-                        Slider(value: Binding(get: { value }, set: { agent.temperature = $0 }),
-                               in: 0...1.5, step: 0.05)
-                            .frame(width: 160)
-                            .disabled(readOnly)
-                        Text(String(format: "%.2f", value)).font(.caption.monospaced())
-                    }
-                }
+        AgentSection("Sampling") {
+            AgentCard(spacing: 12) {
+                AgentEditorRow("Temperature") { temperatureControls }
+                Divider()
+                AgentEditorRow("Max tokens") { maxTokensControls }
             }
-            LabeledContent("Max tokens") {
-                HStack(spacing: 10) {
-                    Toggle("App default", isOn: Binding(
-                        get: { agent.maxTokens == nil },
-                        set: { agent.maxTokens = $0 ? nil : appState.maxTokens }))
-                        .toggleStyle(.checkbox)
-                        .disabled(readOnly)
-                    if let value = agent.maxTokens {
-                        TextField("", value: Binding(get: { value }, set: { agent.maxTokens = $0 }),
-                                  format: .number)
-                            .frame(width: 90)
-                            .disabled(readOnly)
-                    }
-                }
+        }
+    }
+
+    private var temperatureControls: some View {
+        HStack(spacing: 10) {
+            Toggle("App default", isOn: Binding(
+                get: { agent.temperature == nil },
+                set: { agent.temperature = $0 ? nil : appState.serverOptions.defaultTemperature }))
+                .toggleStyle(.checkbox)
+                .disabled(readOnly)
+            if let value = agent.temperature {
+                Slider(value: Binding(get: { value }, set: { agent.temperature = $0 }),
+                       in: 0...1.5, step: 0.05)
+                    .frame(width: 140)
+                    .disabled(readOnly)
+                Text(String(format: "%.2f", value)).font(.subheadline.monospaced())
+            }
+        }
+    }
+
+    private var maxTokensControls: some View {
+        HStack(spacing: 10) {
+            Toggle("App default", isOn: Binding(
+                get: { agent.maxTokens == nil },
+                set: { agent.maxTokens = $0 ? nil : appState.maxTokens }))
+                .toggleStyle(.checkbox)
+                .disabled(readOnly)
+            if let value = agent.maxTokens {
+                TextField("", value: Binding(get: { value }, set: { agent.maxTokens = $0 }),
+                          format: .number)
+                    .frame(width: 90)
+                    .disabled(readOnly)
             }
         }
     }
@@ -1055,8 +1179,10 @@ private struct AgentVoiceMenu: View {
     let onAddClip: () -> Void
     let onRevealClips: () -> Void
 
+    /// The menu alone — the "Voice" label belongs to the `AgentEditorRow` this
+    /// sits in, which also owns the caption under it. A `LabeledContent` here
+    /// would draw a second label beside the row's own.
     var body: some View {
-        LabeledContent("Voice") {
             Menu {
                 choice("App voice", isOn: voice == nil) { voice = nil }
                 Divider()
@@ -1100,7 +1226,6 @@ private struct AgentVoiceMenu: View {
                 Text(label)
             }
             .fixedSize()
-        }
     }
 
     /// One tickable row — a real Button so the whole row is the hit target.
