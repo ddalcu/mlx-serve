@@ -297,13 +297,13 @@ final class ChatWorkspaceTests: XCTestCase {
             edge-to-edge surface under the inset one.
             """)
 
-        // …and the insets it sits inside match the destinations' own gutter.
-        XCTAssertTrue(body.contains("leading: 8") && body.contains("trailing: 8"), """
-            The conversation rows must use the same 8pt gutter the destination \
-            column does (`.padding(.horizontal, 8)`).
+        // …and it sits inside the panel's shared gutter, which is what makes it
+        // the same width as a destination's. The constants themselves are
+        // pinned by `testEverySidebarRowSharesOneGutterAndOneInset`.
+        XCTAssertTrue(body.contains("ChatMetrics.sidebarGutter"), """
+            The conversation rows must take the panel's gutter from the shared \
+            constant — a literal here is how this drifted from the destinations.
             """)
-        XCTAssertTrue(chat.contains(".padding(.horizontal, 8)"),
-                      "the destination column's gutter moved — the two must match")
     }
 
     /// A conversation row is as tall as what is IN it: a chat with no agent
@@ -344,6 +344,47 @@ final class ChatWorkspaceTests: XCTestCase {
             """)
     }
 
+    /// Every row in the sidebar is the same width, inset the same, whichever
+    /// half of the panel it belongs to.
+    ///
+    /// They weren't: the destinations are a `VStack` with `.padding(.horizontal,
+    /// 8)`, the conversations are `List` rows with `.listRowInsets(leading: 8)`
+    /// — and those measure from the list's OWN content area, which a `.sidebar`
+    /// list has already inset. The identical "8" therefore drew two different
+    /// widths, the chats pushed right by the list's built-in margin. Two
+    /// literals that happen to match are not the same number; one constant is.
+    func testEverySidebarRowSharesOneGutterAndOneInset() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+
+        // The conversation rows must not take the gutter through listRowInsets,
+        // which is the modifier that measures from the wrong edge.
+        XCTAssertTrue(chat.contains(".listRowInsets(EdgeInsets())"), """
+            The conversation rows must zero their listRowInsets and apply \
+            ChatMetrics.sidebarGutter themselves — listRowInsets measures from \
+            the list's own (already inset) content area, so it cannot line up \
+            with the destinations above.
+            """)
+        for literal in ["leading: 8", "trailing: 8", "trailing: 6"] {
+            XCTAssertFalse(chat.contains(literal), """
+                A sidebar row still carries the hand-written inset `\(literal)`. \
+                The panel has one gutter (ChatMetrics.sidebarGutter) and one row \
+                inset (ChatMetrics.sidebarRowInset); a literal beside them is how \
+                the two halves drifted apart.
+                """)
+        }
+        // Both halves read the constants — the destinations' column, the rows,
+        // and the section headings.
+        XCTAssertGreaterThanOrEqual(
+            chat.components(separatedBy: "ChatMetrics.sidebarGutter").count - 1, 3,
+            "the gutter constant should be read by the destination column, the rows and the headers")
+        XCTAssertGreaterThanOrEqual(
+            chat.components(separatedBy: "ChatMetrics.sidebarRowInset").count - 1, 3,
+            "the row inset should be read by the destination label, the rows and the headers")
+    }
+
     /// The sidebar is a list of DESTINATIONS above the conversation list, and
     /// selecting one changes only the content area — the panel itself never
     /// rearranges, so the places stay where the eye learned them.
@@ -360,9 +401,9 @@ final class ChatWorkspaceTests: XCTestCase {
         // Two section headings now, and the Agents one renders only when it has
         // rows — a heading with nothing under it promises content that is not
         // there, which is why it can't live in the pinned top inset.
-        XCTAssertTrue(chat.contains("Text(\"Chats\")"),
+        XCTAssertTrue(chat.contains("sectionHeader(\"Chats\")"),
                       "the conversation list needs its heading")
-        XCTAssertTrue(chat.contains("Text(\"Agents\")"),
+        XCTAssertTrue(chat.contains("sectionHeader(\"Agents\")"),
                       "agent threads get their own section above the chats")
         XCTAssertFalse(chat.contains("Text(\"Recent\")"),
                        "\"Recent\" was renamed to \"Chats\"")

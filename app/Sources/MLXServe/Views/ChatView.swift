@@ -615,7 +615,7 @@ struct ChatSidebar: View {
                         sessionRow(session)
                     }
                 } header: {
-                    Text("Agents")
+                    sectionHeader("Agents")
                 }
             }
             Section {
@@ -623,7 +623,7 @@ struct ChatSidebar: View {
                     sessionRow(session)
                 }
             } header: {
-                Text("Chats")
+                sectionHeader("Chats")
             }
         }
         .listStyle(.sidebar)
@@ -687,10 +687,32 @@ struct ChatSidebar: View {
                 // do that — it would sit above an empty list announcing a
                 // section that isn't there.
             }
-            .padding(.horizontal, 8)
+            // One gutter for the whole panel — the conversation rows below
+            // apply the same constant, so the two halves are the same width by
+            // construction rather than by two numbers that happen to agree.
+            .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.top, 10)
             .padding(.bottom, 8)
         }
+    }
+
+    /// A section heading, sitting on the same left edge as the rows under it.
+    ///
+    /// A list section header carries its own indent, which put "Agents" and
+    /// "Chats" left of every row in the panel — a third alignment in a column
+    /// that is supposed to read as one list. Zeroing the row insets and
+    /// applying the panel's own gutter (plus the row's inner inset, since a
+    /// heading has no row chrome to sit inside) puts the text where the labels
+    /// beneath it start.
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, ChatMetrics.sidebarGutter + ChatMetrics.sidebarRowInset)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+            .listRowInsets(EdgeInsets())
     }
 
     /// One conversation row, shared by both sections.
@@ -766,8 +788,7 @@ struct ChatSidebar: View {
                 .help("Delete chat")
             }
         }
-        .padding(.leading, 8)
-        .padding(.trailing, 6)
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
         .padding(.vertical, 3)
         // A row is as tall as what is IN it: one line matches a
         // destination row exactly, and only the rows carrying an agent
@@ -800,10 +821,18 @@ struct ChatSidebar: View {
         .onHover { isHovered in
             hoveredSessionId = isHovered ? session.id : nil
         }
+        // The gutter is applied HERE, not through `listRowInsets`, because
+        // those measure from the list's own content area — which a
+        // `.sidebar` list has already inset — so the same number produced a
+        // narrower, further-right row than the destinations above. Zeroing
+        // the insets puts the row's own edge on the panel's, and one
+        // constant then sets both columns' width.
+        .padding(.horizontal, ChatMetrics.sidebarGutter)
+        .padding(.vertical, 1)
         // The row's own backdrop must be CLEAR, or the list draws a
         // second edge-to-edge surface under the inset one.
         .listRowBackground(Color.clear)
-        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .listRowInsets(EdgeInsets())
         // No rules between conversations: the rows are separated by
         // their own hover/selection shape, and a hairline under every
         // one of them read as a table.
@@ -845,8 +874,9 @@ struct ChatSidebar: View {
             }
         }
         .foregroundStyle(Color.primary)
-        .padding(.leading, 8)
-        .padding(.trailing, 6)
+        // The SAME inner inset a conversation row uses, so a destination's icon
+        // and a chat's title start on one line down the column.
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
     }

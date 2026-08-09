@@ -70,6 +70,21 @@ enum ChatMetrics {
     static let sidebarButtonHeight: CGFloat = 28
     static let sidebarButtonCornerRadius: CGFloat = 6
 
+    /// Panel edge → row edge. Every row in the sidebar reads it, so the
+    /// destinations and the conversations are the same width by construction.
+    ///
+    /// They were not: the destinations are a `VStack` with this padding, while
+    /// the conversations are `List` rows, and `listRowInsets` measures from the
+    /// list's OWN content area — which a `.sidebar`-style list has already
+    /// inset. The same "8" in both places therefore drew two different widths,
+    /// with the chats pushed right by the list's built-in margin. The rows zero
+    /// their `listRowInsets` and apply this instead, so both start from the
+    /// panel edge.
+    static let sidebarGutter: CGFloat = 8
+    /// Row edge → label. The icon of a destination and the title of a chat both
+    /// start here, which is what makes the column read as one list.
+    static let sidebarRowInset: CGFloat = 8
+
     // The Think / Agent / MCP capsules that used to live in the window toolbar
     // had their own `togglePill*` geometry here. They are icon-only composer
     // controls now and draw from `composerIconSize` / `composerControlSize` like
