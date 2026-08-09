@@ -177,18 +177,25 @@ struct AgentLabeledField<Content: View>: View {
 struct AgentEditorRow<Trailing: View>: View {
     let title: String
     var caption: String?
+    /// Baseline for a row whose trailing side is a line of text or one control;
+    /// `.center` when it is a STACK (a slider over its end labels), where
+    /// baseline-aligning the title to the slider's first text lifts it clear
+    /// off the row.
+    var alignment: VerticalAlignment = .firstTextBaseline
     @ViewBuilder let trailing: () -> Trailing
 
     init(_ title: String, caption: String? = nil,
+         alignment: VerticalAlignment = .firstTextBaseline,
          @ViewBuilder trailing: @escaping () -> Trailing) {
         self.title = title
         self.caption = caption
+        self.alignment = alignment
         self.trailing = trailing
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
+            HStack(alignment: alignment, spacing: 12) {
                 Text(title)
                     .font(.headline)
                     .foregroundStyle(.primary)
