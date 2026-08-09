@@ -585,7 +585,10 @@ class AppState: ObservableObject {
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
     func newChatSession(agentId: UUID? = nil) -> UUID {
-        var session = ChatSession()
+        // An agent's thread is called "New agent" until it has something to be
+        // named after — the sidebar lists it under Agents, where "New Chat"
+        // would describe the wrong thing.
+        var session = ChatSession(title: ChatSessionTitle.placeholder(hasAgent: agentId != nil))
         // Seed the new tab's MCP toggle from the global default so a user who
         // generally runs with MCP on keeps it; Think/Tools start off. Each tab
         // then remembers its own choice (ChatSession.useMCP/enableThinking).
@@ -693,12 +696,13 @@ class AppState: ObservableObject {
         guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
         chatSessions[idx].messages.append(message)
         chatSessions[idx].updatedAt = Date()
-        // Auto-title from first user message
-        if chatSessions[idx].title == "New Chat",
+        // Auto-title from the first user message. The gate is "is this still a
+        // placeholder", NOT one spelled-out literal: an agent thread starts as
+        // "New agent", and a literal compare would leave it that way forever.
+        if ChatSessionTitle.isPlaceholder(chatSessions[idx].title),
            message.role == .user,
-           !message.content.isEmpty {
-            let title = String(message.content.prefix(40))
-            chatSessions[idx].title = title + (message.content.count > 40 ? "..." : "")
+           let title = ChatSessionTitle.derived(fromFirstMessage: message.content) {
+            chatSessions[idx].title = title
         }
     }
 

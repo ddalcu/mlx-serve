@@ -605,118 +605,25 @@ struct ChatSidebar: View {
         // agent label sitting on whichever won. Selection is ours now, drawn by
         // the one `SidebarRowStyle` both halves of this panel read.
         List {
-            ForEach(appState.visibleChatSessions) { session in
-                let isSelected = session.id == appState.activeChatId
-                HStack(spacing: 0) {
-                    // A REAL button, beside the delete button — never a tap
-                    // gesture wrapped around the row: on macOS that swallows
-                    // the child button's clicks silently.
-                    Button {
-                        appState.showConversation()
-                        appState.activeChatId = session.id
-                    } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 4) {
-                            if session.isExternalBridge {
-                                Image(systemName: "paperplane.fill")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                                    .help("Telegram conversation (view only)")
-                            }
-                            Text(session.title)
-                                .font(.subheadline.weight(isSelected ? .semibold : .regular))
-                                .lineLimit(1)
-                                .foregroundStyle(.primary)
-                        }
-                        // Who this chat is talking to, when it isn't the app
-                        // defaults. Sits on the timestamp line rather than the
-                        // title's so a long agent name can never squeeze the
-                        // title, which is what the row is FOR — and it answers
-                        // "why does this thread behave differently" without
-                        // opening it.
-                        // The subtitle line exists only to answer "why does
-                        // this thread behave differently" — i.e. which agent
-                        // it belongs to. The timestamp answered nothing the
-                        // list's own order didn't already say, and it put a
-                        // second line under every row to say it.
-                        if let agent = appState.agents.agent(id: session.agentId) {
-                            HStack(spacing: 4) {
-                                Image(systemName: agent.symbol)
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(Color.accentColor)
-                                Text(agent.name)
-                                    .font(.caption2)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                    .foregroundStyle(Color.accentColor)
-                            }
-                        }
+            // Two sections, one row builder. Agent threads sit above the plain
+            // chats — the section is HIDDEN when there are none, because an
+            // empty heading is a promise of content that isn't there.
+            let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+            if !groups.agents.isEmpty {
+                Section {
+                    ForEach(groups.agents) { session in
+                        sessionRow(session)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    if hoveredSessionId == session.id {
-                        Button {
-                            appState.deleteSession(session.id)
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 14))
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Delete chat")
-                    }
+                } header: {
+                    Text("Agents")
                 }
-                .padding(.leading, 8)
-                .padding(.trailing, 6)
-                .padding(.vertical, 3)
-                // A row is as tall as what is IN it: one line matches a
-                // destination row exactly, and only the rows carrying an agent
-                // subtitle grow. `maxHeight: .infinity` here (with a trailing
-                // `Spacer` inside the label) proposed the largest height the
-                // list would give and let the spacer soak it up, so a
-                // single-line chat sat in the same two-line block as its
-                // neighbours — visible as a tall highlight around one line of
-                // text. `minHeight` is the floor, never a fixed height.
-                .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
-                       alignment: .leading)
-                // One meaning for gray in this panel: destinations and
-                // conversations share `SidebarRowStyle` (the accent-filled,
-                // white-text row made a selected chat look like a different
-                // KIND of thing from a selected destination).
-                //
-                // One SHAPE too, and that is why the fill rides the row's own
-                // CONTENT: as a `listRowBackground` it filled the whole row
-                // rect, because that modifier is the row's backdrop and the
-                // `listRowInsets` beside it move only the content — so a
-                // selected chat ran edge to edge under a column of
-                // destinations inset 8pt. Here it sits inside the same insets
-                // and matches a destination's `.background` exactly.
-                .background(
-                    RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
-                        .fill(SidebarRowStyle.fill(selected: isSelected,
-                                                   hovering: hoveredSessionId == session.id))
-                )
-                .contentShape(Rectangle())
-                .onHover { isHovered in
-                    hoveredSessionId = isHovered ? session.id : nil
+            }
+            Section {
+                ForEach(groups.chats) { session in
+                    sessionRow(session)
                 }
-                // The row's own backdrop must be CLEAR, or the list draws a
-                // second edge-to-edge surface under the inset one.
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
-                // No rules between conversations: the rows are separated by
-                // their own hover/selection shape, and a hairline under every
-                // one of them read as a table.
-                .listRowSeparator(.hidden)
-                .contextMenu {
-                    Button("Delete", role: .destructive) {
-                        appState.deleteSession(session.id)
-                    }
-                }
+            } header: {
+                Text("Chats")
             }
         }
         .listStyle(.sidebar)
@@ -774,20 +681,139 @@ struct ChatSidebar: View {
                     appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
                 }
 
-                HStack {
-                    Text("Recent")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .padding(.top, 10)
-                .padding(.leading, 6)
-                .padding(.bottom, 2)
+                // No heading here any more: the list carries its own section
+                // headers ("Agents", "Chats"), and one of them appears only
+                // when it has rows. A heading pinned in this inset could not
+                // do that — it would sit above an empty list announcing a
+                // section that isn't there.
             }
             .padding(.horizontal, 8)
             .padding(.top, 10)
-            .padding(.bottom, 4)
+            .padding(.bottom, 8)
         }
+    }
+
+    /// One conversation row, shared by both sections.
+    ///
+    /// A view BUILDER rather than a copy per section: two hand-maintained
+    /// copies of a row this involved (hover, selection fill, delete button,
+    /// context menu, list-row insets) is how the two sections start looking
+    /// like different kinds of thing.
+    @ViewBuilder
+    private func sessionRow(_ session: ChatSession) -> some View {
+        let isSelected = session.id == appState.activeChatId
+        HStack(spacing: 0) {
+            // A REAL button, beside the delete button — never a tap
+            // gesture wrapped around the row: on macOS that swallows
+            // the child button's clicks silently.
+            Button {
+                appState.showConversation()
+                appState.activeChatId = session.id
+            } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    if session.isExternalBridge {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                            .help("Telegram conversation (view only)")
+                    }
+                    Text(ChatSessionTitle.display(title: session.title,
+                                                  hasAgent: session.agentId != nil))
+                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                }
+                // Who this chat is talking to, when it isn't the app
+                // defaults. Sits on the timestamp line rather than the
+                // title's so a long agent name can never squeeze the
+                // title, which is what the row is FOR — and it answers
+                // "why does this thread behave differently" without
+                // opening it.
+                // The subtitle line exists only to answer "why does
+                // this thread behave differently" — i.e. which agent
+                // it belongs to. The timestamp answered nothing the
+                // list's own order didn't already say, and it put a
+                // second line under every row to say it.
+                if let agent = appState.agents.agent(id: session.agentId) {
+                    HStack(spacing: 4) {
+                        Image(systemName: agent.symbol)
+                            .font(.system(size: 9))
+                            .foregroundStyle(Color.accentColor)
+                        Text(agent.name)
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if hoveredSessionId == session.id {
+                Button {
+                    appState.deleteSession(session.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Delete chat")
+            }
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 6)
+        .padding(.vertical, 3)
+        // A row is as tall as what is IN it: one line matches a
+        // destination row exactly, and only the rows carrying an agent
+        // subtitle grow. `maxHeight: .infinity` here (with a trailing
+        // `Spacer` inside the label) proposed the largest height the
+        // list would give and let the spacer soak it up, so a
+        // single-line chat sat in the same two-line block as its
+        // neighbours — visible as a tall highlight around one line of
+        // text. `minHeight` is the floor, never a fixed height.
+        .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+               alignment: .leading)
+        // One meaning for gray in this panel: destinations and
+        // conversations share `SidebarRowStyle` (the accent-filled,
+        // white-text row made a selected chat look like a different
+        // KIND of thing from a selected destination).
+        //
+        // One SHAPE too, and that is why the fill rides the row's own
+        // CONTENT: as a `listRowBackground` it filled the whole row
+        // rect, because that modifier is the row's backdrop and the
+        // `listRowInsets` beside it move only the content — so a
+        // selected chat ran edge to edge under a column of
+        // destinations inset 8pt. Here it sits inside the same insets
+        // and matches a destination's `.background` exactly.
+        .background(
+            RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                .fill(SidebarRowStyle.fill(selected: isSelected,
+                                           hovering: hoveredSessionId == session.id))
+        )
+        .contentShape(Rectangle())
+        .onHover { isHovered in
+            hoveredSessionId = isHovered ? session.id : nil
+        }
+        // The row's own backdrop must be CLEAR, or the list draws a
+        // second edge-to-edge surface under the inset one.
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        // No rules between conversations: the rows are separated by
+        // their own hover/selection shape, and a hairline under every
+        // one of them read as a table.
+        .listRowSeparator(.hidden)
+        .contextMenu {
+            Button("Delete", role: .destructive) {
+                appState.deleteSession(session.id)
+            }
+        }
+
     }
 
     /// One destination row. All of them are the same shape by construction —

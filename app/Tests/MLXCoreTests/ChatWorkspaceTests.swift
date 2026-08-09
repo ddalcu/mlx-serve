@@ -357,8 +357,17 @@ final class ChatWorkspaceTests: XCTestCase {
         for row in ["New Chat", "Agents", "Tasks", "Code Launcher", "Models", "Settings"] {
             XCTAssertTrue(chat.contains("\"\(row)\""), "the sidebar is missing the \(row) destination")
         }
-        XCTAssertTrue(chat.contains("Text(\"Recent\")"),
+        // Two section headings now, and the Agents one renders only when it has
+        // rows — a heading with nothing under it promises content that is not
+        // there, which is why it can't live in the pinned top inset.
+        XCTAssertTrue(chat.contains("Text(\"Chats\")"),
                       "the conversation list needs its heading")
+        XCTAssertTrue(chat.contains("Text(\"Agents\")"),
+                      "agent threads get their own section above the chats")
+        XCTAssertFalse(chat.contains("Text(\"Recent\")"),
+                       "\"Recent\" was renamed to \"Chats\"")
+        XCTAssertTrue(chat.contains("if !groups.agents.isEmpty"),
+                      "the Agents section must be hidden when empty")
         // Pinned above the list, so no destination scrolls away.
         guard let inset = chat.range(of: "safeAreaInset(edge: .top)"),
               let rows = chat.range(of: "destinationRow(", range: inset.upperBound..<chat.endIndex) else {
