@@ -237,21 +237,31 @@ final class ComposerModeControlTests: XCTestCase {
     /// Starting a chat AS an agent must remain reachable, wherever the control
     /// lives.
     ///
-    /// It has moved twice — composer chip → the sidebar's Agents row → back
-    /// beside New Chat, once Agents became a destination like every other row.
-    /// The second move nearly dropped it: taking the menu off the Agents row
-    /// left `startChat(withAgent:)` with no caller anywhere in the UI, which is
-    /// the capability disappearing rather than relocating. A session's agent is
-    /// fixed once the session exists (there is no `setAgent`), so this is the
-    /// only moment it can be decided — pin the CAPABILITY, not the coordinates.
+    /// It has moved three times — composer chip → the sidebar's Agents row →
+    /// beside New Chat → into the agent's own editor, once Agents became a pane
+    /// where everything about an agent lives together. Every move has been one
+    /// edit away from deleting the capability instead of relocating it: taking
+    /// the menu off the Agents row once left `startChat(withAgent:)` with no
+    /// caller anywhere in the UI, and the test passed, because it was pinned to
+    /// a control's coordinates. A session's agent is fixed once the session
+    /// exists (there is no `setAgent`), so this is the only moment it can be
+    /// decided — pin that it is reachable AT ALL, from anywhere.
     func testStartingAChatAsAnAgentStaysReachable() throws {
-        let chat = try chatViewSource()
-        XCTAssertTrue(chat.contains("appState.startChat(withAgent: agent.id)"),
-                      "some control must still start a chat as a chosen agent")
-        XCTAssertTrue(chat.contains("private var newAgentChatMenu"),
-                      "…and it sits beside New Chat, where the choice is made")
-        XCTAssertTrue(chat.contains("Button(\"Manage Agents…\") { appState.showAgents() }"),
-                      "the editor is a pane now, so managing agents goes there, not to a window")
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let views = try FileManager.default
+            .contentsOfDirectory(at: root.appendingPathComponent("Sources/MLXServe/Views"),
+                                 includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "swift" }
+        let callers = try views.filter {
+            try String(contentsOf: $0, encoding: .utf8).contains("startChat(withAgent:")
+        }
+        XCTAssertFalse(callers.isEmpty, """
+            Nothing in the UI calls startChat(withAgent:) any more. A session's \
+            agent can only be chosen when the session is created, so with no \
+            caller the capability is gone, not moved.
+            """)
     }
 
     /// Agents is a DESTINATION, not a menu: every other row in that column

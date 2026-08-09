@@ -213,6 +213,11 @@ struct AgentDetailPane: View {
                             isWriting: $model.isWriting,
                             onWrite: { writePrompt() },
                             onSave: { commit() },
+                            onStartChat: {
+                                commit()
+                                appState.showConversation()
+                                appState.startChat(withAgent: draft.id)
+                            },
                             onDuplicate: { duplicate(draft) },
                             onDelete: { model.alert = .init(title: "Delete “\(draft.name)”?",
                                                             kind: .confirmDelete(draft)) },
@@ -369,6 +374,11 @@ private struct AgentEditor: View {
     @Binding var isWriting: Bool
     let onWrite: () -> Void
     let onSave: () -> Void
+    /// Start a conversation as this agent. The only moment a session's agent
+    /// can be decided (there is no `setAgent`), so it needs a home — it used to
+    /// be a menu in the sidebar, which is the wrong place now that agents have
+    /// a pane of their own.
+    let onStartChat: () -> Void
     let onDuplicate: () -> Void
     let onDelete: () -> Void
     let onNotify: (String) -> Void
@@ -399,6 +409,17 @@ private struct AgentEditor: View {
 
     var body: some View {
         Form {
+            Section {
+                HStack {
+                    Label("Talk to this agent in its own thread",
+                          systemImage: "bubble.left.and.bubble.right")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("New Chat", action: onStartChat)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
             if readOnly {
                 Section {
                     HStack(spacing: 8) {

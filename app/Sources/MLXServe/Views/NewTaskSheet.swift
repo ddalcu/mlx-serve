@@ -121,8 +121,14 @@ struct NewTaskSheet: View {
                     Text("Check Hacker News and write me the top AI stories")
                         .font(.body)
                         .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 16)
+                        // The editor's own 8pt padding, plus the 5pt
+                        // line-fragment padding NSTextView puts inside its text
+                        // container — that inset is horizontal only, so a
+                        // matching 5 on the vertical (or the 16 this had) drops
+                        // the placeholder a line below the cursor it is
+                        // standing in for.
+                        .padding(.horizontal, 8 + 5)
+                        .padding(.vertical, 8)
                         .allowsHitTesting(false)
                 }
             }

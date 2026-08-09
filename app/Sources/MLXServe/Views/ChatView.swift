@@ -688,13 +688,10 @@ struct ChatSidebar: View {
                 // which made that row mean "start something" while every other
                 // destination means "go somewhere" — and took the editor with
                 // it into a menu.
-                HStack(spacing: 4) {
-                    destinationRow("New Chat", icon: "square.and.pencil",
-                                   selected: false) {
-                        appState.showConversation()
-                        _ = appState.newChatSession()
-                    }
-                    newAgentChatMenu
+                destinationRow("New Chat", icon: "square.and.pencil",
+                               selected: false) {
+                    appState.showConversation()
+                    _ = appState.newChatSession()
                 }
                 agentsRow
                 destinationRow("Tasks", icon: "clock.badge.checkmark",
@@ -758,15 +755,22 @@ struct ChatSidebar: View {
     /// like different kinds of thing.
     @ViewBuilder
     private func sessionRow(_ session: ChatSession) -> some View {
-        let isSelected = session.id == appState.activeChatId
-        HStack(spacing: 0) {
-            // A REAL button, beside the delete button — never a tap
-            // gesture wrapped around the row: on macOS that swallows
-            // the child button's clicks silently.
-            Button {
-                appState.showConversation()
-                appState.activeChatId = session.id
-            } label: {
+        // Exactly ONE row in this panel is lit at a time. A conversation is
+        // where you ARE only while the window is showing conversations —
+        // otherwise opening Tasks left the last chat lit alongside the Tasks
+        // destination, two "you are here" marks for one window.
+        let isSelected = SidebarSelection.isConversationSelected(
+            sessionId: session.id, activeChatId: appState.activeChatId,
+            workspace: appState.chatWorkspace)
+        // The button IS the row: it carries the padding, the height floor and
+        // the contentShape, so every pixel of the fill is clickable. As a
+        // sibling sized by an outer frame, the label was CENTRED in the row's
+        // height and only its own text band answered a click — the dead strip
+        // along the top and bottom of the highlight.
+        Button {
+            appState.showConversation()
+            appState.activeChatId = session.id
+        } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     if session.isExternalBridge {
@@ -805,36 +809,22 @@ struct ChatSidebar: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // Room kept for the delete button at ALL times, not only while
+            // hovering: reserving it on hover reflows the title under the
+            // pointer, right as you are aiming at it.
+            .padding(.leading, ChatMetrics.sidebarRowInset)
+            .padding(.trailing, ChatMetrics.sidebarRowInset + 18)
+            .padding(.vertical, 5)
+            // A row is as tall as what is IN it: one line matches a
+            // destination row exactly, and only the rows carrying an agent
+            // subtitle grow. The floor lives on the LABEL so the button — the
+            // thing that answers clicks — is the full height of the fill.
+            // `minHeight` is a floor, never a fixed height.
+            .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+                   alignment: .leading)
             .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if hoveredSessionId == session.id {
-                Button {
-                    appState.deleteSession(session.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Delete chat")
-            }
         }
-        .padding(.horizontal, ChatMetrics.sidebarRowInset)
-        .padding(.vertical, 3)
-        // A row is as tall as what is IN it: one line matches a
-        // destination row exactly, and only the rows carrying an agent
-        // subtitle grow. `maxHeight: .infinity` here (with a trailing
-        // `Spacer` inside the label) proposed the largest height the
-        // list would give and let the spacer soak it up, so a
-        // single-line chat sat in the same two-line block as its
-        // neighbours — visible as a tall highlight around one line of
-        // text. `minHeight` is the floor, never a fixed height.
-        .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
-               alignment: .leading)
+        .buttonStyle(.plain)
         // One meaning for gray in this panel, and one SHAPE: the fill rides the
         // row's own content inside the stack's gutter, exactly as a
         // destination's `.background` does. (It was a `listRowBackground` once,
@@ -845,7 +835,24 @@ struct ChatSidebar: View {
                 .fill(SidebarRowStyle.fill(selected: isSelected,
                                            hovering: hoveredSessionId == session.id))
         )
-        .contentShape(Rectangle())
+        // A real Button laid OVER the row, never a tap gesture around one: an
+        // overlay is hit-tested first, so its clicks reach it rather than the
+        // row underneath, and the row keeps its whole area clickable.
+        .overlay(alignment: .trailing) {
+            if hoveredSessionId == session.id {
+                Button {
+                    appState.deleteSession(session.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                .help("Delete chat")
+            }
+        }
         .onHover { isHovered in
             hoveredSessionId = isHovered ? session.id : nil
         }
@@ -900,65 +907,18 @@ struct ChatSidebar: View {
     /// fixed once the session exists, there is no `setAgent`). It used to be an
     /// icon button beside New Chat; deleting that button without moving the menu
     /// would have quietly removed the capability, not just the control.
-    @ViewBuilder
     /// Agents is a DESTINATION, like every other row in this column.
     ///
     /// It used to open a menu of agents that started a chat as one of them,
     /// which made this the only row whose verb was "start something" rather
     /// than "go somewhere" — and buried the editor behind a "Manage Agents…"
-    /// item at the bottom of it. Starting a chat as an agent still lives beside
-    /// New Chat (`newAgentChatMenu`), where picking who you are talking to
-    /// belongs.
+    /// item at the bottom of it. Starting a chat as an agent lives in that
+    /// editor now, beside everything else about the agent.
     private var agentsRow: some View {
         destinationRow("Agents", icon: "person.2",
                        selected: appState.chatWorkspace.isAgents) {
             appState.chatWorkspace.isAgents ? appState.showConversation() : appState.showAgents()
         }
-    }
-
-    /// Start a chat AS an agent.
-    ///
-    /// Next to New Chat because that is WHEN the choice is made: a session's
-    /// agent is fixed once the session exists (there is no `setAgent` any
-    /// more), so this is the only place it can be picked. Removing it along
-    /// with the Agents row's menu would have left `startChat(withAgent:)` with
-    /// no caller at all — the capability, not just the control, silently gone.
-    private var newAgentChatMenu: some View {
-        Menu {
-            if appState.agents.allAgents.isEmpty {
-                Text("No agents yet")
-            }
-            ForEach(appState.agents.allAgents) { agent in
-                let decision = appState.agentModelDecision(for: agent)
-                Button {
-                    appState.showConversation()
-                    appState.startChat(withAgent: agent.id)
-                } label: {
-                    // An agent whose pinned model isn't downloaded says so
-                    // rather than failing at send.
-                    Label(AgentModelSwitch.isSelectable(decision)
-                          ? agent.name : "\(agent.name) — model not downloaded",
-                          systemImage: agent.symbol)
-                }
-                .disabled(!AgentModelSwitch.isSelectable(decision))
-            }
-            Divider()
-            // The editor is a PANE now, so this goes there rather than opening
-            // a window — one place agents are managed.
-            Button("Manage Agents…") { appState.showAgents() }
-        } label: {
-            Image(systemName: "person.badge.plus")
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 30, height: ChatMetrics.sidebarButtonHeight)
-                .background(
-                    RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
-                        .fill(Color.primary.opacity(0.07)))
-                .contentShape(Rectangle())
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .help("New chat with an agent")
     }
 
     /// The Code Launcher row: the tray's own CLI list, so the two can't drift.
