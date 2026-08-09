@@ -300,28 +300,57 @@ final class ComposerModeControlTests: XCTestCase {
                                     "both the sidebar and the transcript scroll under floating chrome")
     }
 
-    /// Both columns carry the SYSTEM toolbar material, and the effect needs it:
-    /// with the band hidden there is no bar for `scrollEdgeEffectStyle` to
-    /// attach to, so it drew nothing and transcript text clipped mid-line under
-    /// the model picker (live 2026-07-30). The system material is the
-    /// 100%-width surface; the hand-drawn strip that predated it is the thing
-    /// that must not come back.
-    func testBothColumnsCarryTheSystemToolbarMaterial() throws {
-        let source = try chatViewSource()
-        XCTAssertFalse(source.contains(".toolbarBackground(.hidden, for: .windowToolbar)"), """
-            hiding the band leaves the scroll-edge effect with nothing to attach \
-            to — content then runs straight into the floating controls.
+    /// The window has NO toolbar, in any mode.
+    ///
+    /// Everything that lived in it moved somewhere it belongs: the model
+    /// picker, the mode discs and the server control to the COMPOSER row (they
+    /// configure the message, or report what you discover by typing), Settings
+    /// to a sidebar destination. What remained was an empty band.
+    ///
+    /// The ban that stays is on `.toolbarBackground(.hidden)`, which is a
+    /// different thing and the actual trap: it keeps a bar and strips only its
+    /// material, so `scrollEdgeEffectStyle` stays attached to something
+    /// invisible and frosts nothing — that is how transcript text once clipped
+    /// mid-line under the model picker (2026-07-30). Removing the bar outright
+    /// is fine because nothing floats over the transcript any longer.
+    func testTheWindowHasNoToolbarInAnyMode() throws {
+        let raw = try chatViewSource()
+        // Comments explain the ban, so scanning them finds it in its own prose.
+        let source = raw
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+        XCTAssertFalse(source.contains(".toolbarBackground("), """
+            The chat window must not set a toolbar material — there is no \
+            toolbar. `.toolbarBackground(.hidden)` especially: it keeps the bar \
+            and removes only what makes it visible.
             """)
-        // EVERY column of every split view in this file, not a fixed two: Tasks
-        // renders as a three-column split (sidebar / task list / task detail),
-        // and a column that opts out of the material shows a seam where the bar
-        // should be continuous.
-        let visible = source.components(separatedBy: ".toolbarBackground(.visible, for: .windowToolbar)").count - 1
-        let splits = source.components(separatedBy: "NavigationSplitView(").count - 1
-        let columns = splits + (source.components(separatedBy: "} content: {").count - 1)
-            + (source.components(separatedBy: "} detail: {").count - 1)
-        XCTAssertEqual(visible, columns,
-                       "every split-view column must carry the material — the bar is one surface")
+        let hidden = source.components(separatedBy: ".toolbar(.hidden, for: .windowToolbar)").count - 1
+        XCTAssertEqual(hidden, 2, """
+            Both split views (the chat's two-column and the three-column Tasks / \
+            Agents) must hide the window toolbar.
+            """)
+        XCTAssertFalse(source.contains("private var floatingToolbar"),
+                       "the floating cluster is gone; its controls live in the composer row")
+    }
+
+    /// Content still passes under the sidebar's pinned destinations, and with
+    /// no bar there is no scroll-edge effect to frost it — so that block owns a
+    /// backdrop of its own, or conversations slide visibly through it.
+    func testThePinnedDestinationsCarryTheirOwnBackdrop() throws {
+        let source = try chatViewSource()
+        guard let start = source.range(of: "safeAreaInset(edge: .top)"),
+              let end = source.range(of: "private func sectionHeader",
+                                     range: start.upperBound..<source.endIndex) else {
+            return XCTFail("the sidebar's destination inset moved — update this audit")
+        }
+        let inset = String(source[start.upperBound..<end.lowerBound])
+        XCTAssertTrue(inset.contains(".background(.regularMaterial)"), """
+            The destinations block needs its own backdrop now that no toolbar \
+            frosts what scrolls beneath it.
+            """)
+        XCTAssertFalse(inset.contains(".background(.bar)"),
+                       "`.bar` draws a separator — the rule removed from the Tasks header")
     }
 
     // MARK: - Hover card dismissal

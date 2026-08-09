@@ -438,7 +438,6 @@ struct ChatView: View {
         NavigationSplitView(columnVisibility: $tasksColumnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
-                .toolbarBackground(.visible, for: .windowToolbar)
         } content: {
             // A pane TYPE, never `SomeView().someProperty`: an environment
             // reader has to be the column itself, or its @EnvironmentObject is
@@ -451,9 +450,6 @@ struct ChatView: View {
                 }
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
-            // Every column carries the material — the bar is ONE surface
-            // across the window, and a column that opts out shows a seam.
-            .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
             Group {
                 if appState.chatWorkspace.isAgents {
@@ -462,9 +458,20 @@ struct ChatView: View {
                     TaskDetailPane()
                 }
             }
-            .toolbarBackground(.visible, for: .windowToolbar)
         }
         .navigationTitle("")
+        // No toolbar in these modes — nothing lives in it. Each pane draws its
+        // own title row, so the band was an empty strip of chrome taking the
+        // top of the window.
+        //
+        // This is `.toolbar(.hidden)`, which removes the BAR, and deliberately
+        // not `.toolbarBackground(.hidden)`, which keeps a bar and takes only
+        // its material: the latter leaves `scrollEdgeEffectStyle` attached to
+        // something invisible, which is how transcript text ended up clipping
+        // mid-line under the model picker (2026-07-30). The chat split keeps
+        // its toolbar, because the model picker and the Start control live
+        // there.
+        .toolbar(.hidden, for: .windowToolbar)
         .onAppear { AppActivation.focus() }
     }
 
@@ -472,11 +479,6 @@ struct ChatView: View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
-                // Both columns carry the window's toolbar material, so the bar
-                // reads as one surface across the split rather than appearing
-                // only over the detail side. It is also what the list's
-                // scroll-edge effect attaches to.
-                .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
             // Two modes in one column: the transcript, or the model browser
             // (`ChatWorkspace`). The browser used to be its own Window, so
@@ -724,6 +726,14 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.top, 10)
             .padding(.bottom, 8)
+            // Rows scroll UNDER this block, and with the window toolbar gone
+            // there is no bar for `scrollEdgeEffectStyle` to attach to — so it
+            // frosts nothing and a conversation would slide visibly through the
+            // destinations. The block carries its own backdrop instead. A
+            // material, not `.bar`: `.bar` draws a separator along its edge,
+            // which is the rule removed from the Tasks header for the same
+            // reason.
+            .background(.regularMaterial)
         }
     }
 
@@ -1114,59 +1124,6 @@ struct ChatDetailView: View {
     // `modeIcon` for why state has to read from colour alone once the captions
     // are gone, and `composerControls` for the row itself.
 
-    /// The chat pane's ONE toolbar resident: model picker, voice, settings, as a
-    /// single floating capsule at the leading edge.
-    ///
-    /// It rides a real `ToolbarItem` because that band's own layer swallows
-    /// clicks from anything else placed in it (a custom strip pulled in via
-    /// ignoresSafeArea looked native and was completely dead). What changed is
-    /// the BACKGROUND: the band no longer paints a 100%-width strip across the
-    /// window, so this cluster carries its own material and reads as floating
-    /// over the transcript. That material is load-bearing — without it, content
-    /// scrolling under the cluster bleeds through the controls, which is exactly
-    /// why the band used to be painted at 0.8 opacity.
-    ///
-    /// The three mode controls that used to sit here are in the COMPOSER row
-    /// now: their captions were most of this cluster's width budget, and they
-    /// configure the message being written, not the window.
-    private var floatingToolbar: some View {
-        // Voice moved OUT to the composer row (`voiceToggle`): it configures
-        // the conversation you're having, not the window — and it freed this
-        // cluster's width budget.
-        HStack(spacing: 4) {
-            // The model picker moved to the COMPOSER row: it configures the
-            // message being written, not the window — the same argument that
-            // moved Think/Tools/MCP out of here — and down there it has the
-            // width for a download control and a progress hairline.
-            // The server being down is discovered HERE — you type and nothing
-            // answers — so the fix is offered here too, next to the picker,
-            // instead of only in the tray. Transient by construction: it is
-            // gone the moment the server is up, so it costs the cluster's width
-            // budget only while it has something to say.
-            serverStartControl
-            Divider().frame(height: 14)
-            Button {
-                appState.showSettings()
-            } label: {
-                Image(systemName: "gear")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.primary)
-                    .frame(width: 22, height: 22)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 0.5))
-    }
-
-    /// Start the server from the chat window. Drawn rather than styled
-    /// (`.plain` + explicit padding/fill) — a `.bordered` control keeps its
-    /// intrinsic size and would sit at a different height to the pill beside
-    /// it, which is the sidebar New Chat lesson.
     @ViewBuilder private var serverStartControl: some View {
         let control = ChatServerStartControl.resolve(
             status: server.status,
@@ -1805,39 +1762,23 @@ struct ChatDetailView: View {
             }
             return true
         }
-        // ONE toolbar item — see `floatingToolbar` for why a real ToolbarItem is
-        // the only clickable resident of that band, and why its width stays
-        // bounded (the » eviction gotcha).
-        .toolbar {
-            if #available(macOS 26.0, *) {
-                // Liquid Glass gives every toolbar item its own capsule
-                // background + border; hide it so the controls float bare on
-                // the content, matching the sidebar's seamless look.
-                //
-                // The model picker rides its OWN item at the LEADING edge, not
-                // the trailing cluster: that cluster is at its width budget and
-                // a model name is runtime-variable, which is exactly what
-                // re-triggers » eviction. Its label is width-capped for the
-                // same reason (`ChatModelPill.maxNameWidth`).
-                ToolbarItem(placement: .navigation) {
-                    floatingToolbar
-                }
-                .sharedBackgroundVisibility(.hidden)
-            } else {
-                ToolbarItem(placement: .navigation) {
-                    floatingToolbar
-                }
-            }
-        }
+        // No toolbar: everything that lived in it has a better home. The model
+        // picker, the mode discs and the server control are in the COMPOSER row
+        // (they configure the message, or report the thing you discover by
+        // typing); Settings is a sidebar destination and still ⌘, from the menu
+        // bar. What was left was an empty band across the top of the window.
         // The window's own toolbar material, full width. This was hidden for a
-        // while — the floating cluster carries its own material, so the band
-        // read as a divider above a mostly empty bar. But hiding it left the
-        // transcript running to the window's top edge with nothing between the
-        // two: text clipped mid-line under the model picker (live 2026-07-30),
-        // and `scrollEdgeEffectStyle` had no bar to attach to, so it drew
-        // nothing. The system material IS the 100%-width surface here — the
-        // hand-drawn strip that predated it is what must not come back.
-        .toolbarBackground(.visible, for: .windowToolbar)
+        // no bar at all now, in every mode.
+        //
+        // What the old material was FOR: it frosted content scrolling under the
+        // floating toolbar cluster, and `scrollEdgeEffectStyle` needs a bar to
+        // attach to (text clipped mid-line under the model picker, live
+        // 2026-07-30). Both of those were about the CLUSTER, and the cluster is
+        // gone — nothing floats over the transcript any more. The sidebar's
+        // pinned destinations are the one place content still passes beneath
+        // something, so that block carries its own backdrop rather than relying
+        // on an effect with nothing to attach to.
+        .toolbar(.hidden, for: .windowToolbar)
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
@@ -2001,6 +1942,12 @@ struct ChatDetailView: View {
         // reason Think/Tools/MCP moved down here, and it has room for the
         // download affordances the toolbar never did.
         ChatModelPill(compact: true)
+        // The recovery goes where the problem is DISCOVERED: the pill's dot
+        // going grey is the only thing that says the server is down, so the fix
+        // sits next to it. Transient by construction (`ChatServerStartControl`
+        // resolves to `.hidden` the moment it is up), which is what earns it a
+        // slot in a row that is already at its width budget.
+        serverStartControl
 
         Spacer(minLength: 8)
 
