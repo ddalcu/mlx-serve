@@ -82,30 +82,15 @@ struct AgentListPane: View {
     @EnvironmentObject var store: AgentStore
     @ObservedObject var model: AgentsWorkspaceModel
 
-    /// Whether to draw the pane's own title row. The standalone window has a
-    /// real title bar; the chat-window column has only what it draws itself.
-    var showsHeader = false
-
     var body: some View {
-        VStack(spacing: 0) {
-            if showsHeader { header }
-            list
-        }
-    }
-
-    /// Same shape as the Tasks column's: a plain row ABOVE the list, so it
-    /// needs no backdrop and therefore draws no rule.
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("Agents")
-                .font(.title3.weight(.semibold))
-            Spacer()
-            newAgentMenu
-        }
-        .padding(.leading, 16)
-        .padding(.trailing, 12)
-        .padding(.top, 14)
-        .padding(.bottom, 10)
+        list
+            // Title and control in the toolbar, the same shape the Tasks column
+            // takes — both are static, so neither is the runtime-variable
+            // content NSToolbar cannot re-measure.
+            .navigationTitle("Agents")
+            .toolbar {
+                ToolbarItem { newAgentMenu }
+            }
     }
 
     /// `+` offers the TYPES, not a blank row.
@@ -165,15 +150,6 @@ struct AgentListPane: View {
                 ForEach(Agent.starters) { agent in
                     AgentRow(agent: agent, decision: appState.agentModelDecision(for: agent))
                         .tag(agent.id)
-                }
-            }
-        }
-        .toolbar {
-            // The standalone window keeps its toolbar control; the embedded
-            // column has the header's own + instead.
-            if !showsHeader {
-                ToolbarItem {
-                    newAgentMenu
                 }
             }
         }

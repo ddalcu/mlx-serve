@@ -31,9 +31,20 @@ struct TaskListPane: View {
     @State private var showNewTask = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            taskListBody
+        taskListBody
+        // The column's own title and control, in the window's toolbar.
+        //
+        // Safe there because both are STATIC: the `»`-eviction rule is about
+        // strips whose members appear or change width at runtime, which is
+        // what NSToolbar cannot re-measure. A fixed word and one button are
+        // not that. It rode a header row inside the pane while the toolbar
+        // belonged to the chat; the chat's cluster is gone, so the band is
+        // free and this is where macOS puts a column's title.
+        .navigationTitle("Tasks")
+        .toolbar {
+            ToolbarItem {
+                NewTaskButton { showNewTask = true }
+            }
         }
         .sheet(isPresented: $showNewTask) {
             NewTaskSheet { newTask in
@@ -51,28 +62,6 @@ struct TaskListPane: View {
                 appState.selectedTaskId = taskId; appState.pendingTaskDeepLink = nil
             }
         }
-    }
-
-    /// The column's own title row. The create control rides it rather than a
-    /// ToolbarItem: this is a middle column of the chat window's split, and that
-    /// window's toolbar belongs to the chat.
-    ///
-    /// A plain row ABOVE the list, not a `safeAreaInset` over it. The inset
-    /// needed an opaque backdrop so rows didn't scroll through the title, that
-    /// backdrop was `.bar`, and a `.bar` draws a separator along its edge — the
-    /// horizontal rule under the title. Nothing scrolls under a sibling, so the
-    /// backdrop and its rule are both simply unnecessary.
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("Tasks")
-                .font(.title3.weight(.semibold))
-            Spacer()
-            NewTaskButton { showNewTask = true }
-        }
-        .padding(.leading, 16)
-        .padding(.trailing, 12)
-        .padding(.top, 14)
-        .padding(.bottom, 10)
     }
 
     private var taskListBody: some View {

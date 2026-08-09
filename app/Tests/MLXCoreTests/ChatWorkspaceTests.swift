@@ -283,6 +283,12 @@ final class ChatWorkspaceTests: XCTestCase {
             """)
         XCTAssertFalse(tasks.contains("Divider()"),
                        "no explicit rule under the Tasks title either")
+        // The title and the + moved INTO the toolbar once the chat's own
+        // cluster was gone and the band was free. Both are static, which is why
+        // they are safe there — the `»`-eviction rule is about members that
+        // appear or change width at runtime.
+        XCTAssertTrue(tasks.contains("\"Tasks\""), "the column still needs its title")
+        XCTAssertTrue(tasks.contains(".toolbar {"), "title and + ride the toolbar now")
         // And the + is a real control with a target, not a bare glyph.
         XCTAssertTrue(tasks.contains("struct NewTaskButton"),
                       "the + should be the app's icon-button shape, not `.borderless`")

@@ -444,7 +444,7 @@ struct ChatView: View {
             // read out of a value SwiftUI never installed (see `TaskListPane`).
             Group {
                 if appState.chatWorkspace.isAgents {
-                    AgentListPane(model: agentsModel, showsHeader: true)
+                    AgentListPane(model: agentsModel)
                 } else {
                     TaskListPane()
                 }
