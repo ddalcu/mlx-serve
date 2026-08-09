@@ -31,7 +31,10 @@ struct TaskListPane: View {
     @State private var showNewTask = false
 
     var body: some View {
-        taskListBody
+        VStack(spacing: 0) {
+            header
+            taskListBody
+        }
         .sheet(isPresented: $showNewTask) {
             NewTaskSheet { newTask in
                 scheduler.addTask(newTask)
@@ -50,6 +53,28 @@ struct TaskListPane: View {
         }
     }
 
+    /// The column's own title row. The create control rides it rather than a
+    /// ToolbarItem: this is a middle column of the chat window's split, and that
+    /// window's toolbar belongs to the chat.
+    ///
+    /// A plain row ABOVE the list, not a `safeAreaInset` over it. The inset
+    /// needed an opaque backdrop so rows didn't scroll through the title, that
+    /// backdrop was `.bar`, and a `.bar` draws a separator along its edge — the
+    /// horizontal rule under the title. Nothing scrolls under a sibling, so the
+    /// backdrop and its rule are both simply unnecessary.
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("Tasks")
+                .font(.title3.weight(.semibold))
+            Spacer()
+            NewTaskButton { showNewTask = true }
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+    }
+
     private var taskListBody: some View {
         List(selection: $appState.selectedTaskId) {
                 if scheduler.tasks.isEmpty {
@@ -66,21 +91,36 @@ struct TaskListPane: View {
                         .tag(task.id)
                 }
             }
-            // The create control rides the pane's own header rather than a
-            // ToolbarItem: this is a middle column of the chat window's split
-            // now, and that window's toolbar belongs to the chat.
-            .safeAreaInset(edge: .top) {
-                HStack {
-                    Text("Tasks").font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Button { showNewTask = true } label: { Image(systemName: "plus") }
-                        .buttonStyle(.borderless)
-                        .help("New task")
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.bar)
-            }
+            .scrollContentBackground(.hidden)
+    }
+}
+
+/// The `+` in the Tasks column header.
+///
+/// `.borderless` gave a bare glyph with no target to aim at and nothing under
+/// the pointer on hover. This is the shape the rest of the app's icon controls
+/// use (a `.plain` button drawing its own fill), so it reads as a control and
+/// answers the click before it happens — and a bordered style is declined for
+/// the reason `ChatMetrics` records: a bordered control keeps its intrinsic
+/// size and merely centers inside whatever frame it is given.
+private struct NewTaskButton: View {
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.primary)
+                .frame(width: 24, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(hovering ? 0.14 : 0.07)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("New task")
     }
 }
 

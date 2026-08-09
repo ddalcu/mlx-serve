@@ -244,6 +244,48 @@ final class ChatWorkspaceTests: XCTestCase {
             """)
     }
 
+    /// The Tasks column's title row draws no rule under itself.
+    ///
+    /// The rule was never an explicit `Divider` — it came from `.background(.bar)`
+    /// on a `safeAreaInset`, and a `.bar` material draws a separator along its
+    /// edge. The backdrop existed only so rows didn't scroll through the title,
+    /// which a plain sibling row above the list doesn't need. Searching for
+    /// "Divider" would have found nothing and cleared a header that had one.
+    func testTheTasksHeaderDrawsNoRuleUnderItself() throws {
+        let file = try source("Sources/MLXServe/Views/TasksView.swift")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+        // Scoped to the list pane: the DETAIL column has a legitimate divider
+        // between a task's header and its run history, and a file-wide ban
+        // would forbid it.
+        guard let start = file.range(of: "struct TaskListPane"),
+              let end = file.range(of: "struct TaskDetailPane",
+                                   range: start.upperBound..<file.endIndex) else {
+            return XCTFail("the Tasks panes moved — update this audit")
+        }
+        let tasks = String(file[start.upperBound..<end.lowerBound])
+
+        XCTAssertFalse(tasks.contains(".background(.bar)"), """
+            The Tasks header is back on a `.bar` backdrop, which draws the \
+            separator this removed. A header that is a sibling of the list needs \
+            no backdrop at all.
+            """)
+        XCTAssertFalse(tasks.contains("safeAreaInset(edge: .top)"), """
+            The header is back to overlaying the list, which is what forced an \
+            opaque backdrop (and therefore a rule) in the first place.
+            """)
+        XCTAssertFalse(tasks.contains("Divider()"),
+                       "no explicit rule under the Tasks title either")
+        // And the + is a real control with a target, not a bare glyph.
+        XCTAssertTrue(tasks.contains("struct NewTaskButton"),
+                      "the + should be the app's icon-button shape, not `.borderless`")
+        XCTAssertFalse(tasks.contains(".buttonStyle(.borderless)"), """
+            `.borderless` gives a bare glyph with nothing to aim at and no hover \
+            feedback — see the bordered-control note in ChatMetrics.
+            """)
+    }
+
     /// Both Tasks columns are real view types, each declaring the environment it
     /// reads — which is what makes the window's injection reach them.
     func testTasksColumnsAreTheirOwnPaneTypes() throws {
