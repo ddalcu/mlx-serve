@@ -947,25 +947,11 @@ struct ChatDetailView: View {
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
     @State private var composerHeight: CGFloat = 36
-    /// The composer's create mode (`ChatCreateMode`) — nil for plain chat.
-    /// Mirrors `ChatSession.createMode`; see `syncTogglesFromSession`.
-    @State private var createMode: ChatCreateMode?
-    /// Expanded state of the create-mode settings disclosure.
-    @State private var showCreateSettings = false
-
-    // Create-mode generation state lives on AppState, keyed by session — NOT
-    // in @State here. This view is reused across tabs (a shared flag leaks
-    // between chats) and torn down on any workspace switch (the progress card
-    // and held prompt vanished while the generation task kept running).
-    /// Live progress of a create-mode generation, rendered above the composer.
-    /// Not the engine's `mediaProgress`: that one belongs to a TURN the model
-    /// drove, and this is the user driving directly with no turn at all.
-    private var createProgress: MediaGenProgress? { appState.createProgress[sessionId] }
-    /// Last create-mode failure, shown inline instead of thrown away.
-    private var createError: String? { appState.createErrors[sessionId] }
-    /// A prompt typed before its model was on disk. Held (never dropped) while
-    /// the download runs, then generated — see `ChatCreateSend`.
-    private var heldCreatePrompt: HeldCreatePrompt? { appState.heldCreatePrompts[sessionId] }
+    // The composer's "create mode" (the chip rewired the composer into a
+    // generator) is GONE: a media chip navigates to the Create pane, exactly
+    // like the Tools menu. In-chat media generation is the agent tools' job
+    // (`generate_image` & co.) — one way to drive a generator from a chat,
+    // not two.
     // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
     // matching mode is off, confirm before sending. `intentSuppress` remembers a
     // per-session "Send anyway" so we stop nagging that chat (keyed by session
@@ -995,16 +981,6 @@ struct ChatDetailView: View {
         isAgentMode = session?.mode == .agent
         enableThinking = session?.enableThinking ?? false
         mcpMode = session?.useMCP ?? false
-        createMode = ChatCreateMode.from(session?.createMode)
-    }
-
-    /// Enter or leave the composer's create mode, persisting it on the session
-    /// (the view is reused across tabs, so this cannot live in `@State` alone).
-    private func setCreateMode(_ mode: ChatCreateMode?) {
-        createMode = mode
-        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        appState.chatSessions[idx].createMode = mode?.rawValue
-        appState.saveChatHistory()
     }
 
     /// True when the visible session mirrors a Telegram conversation. The
@@ -1396,17 +1372,9 @@ struct ChatDetailView: View {
             // the app to somebody who has already picked who to talk to.
             if ChatGreeting.showsDiscoveryChips(hasAgent: activeAgent != nil,
                                                 isExternalBridge: session?.isExternalBridge == true) {
-                EmptyStateChipRow(onCreateInChat: { experiment in
-                    // Stay in the chat: the chip turns the COMPOSER into a
-                    // generator rather than throwing the user into the Create
-                    // page's form (`ChatCreateMode`). 3D has no chat mode —
-                    if let mode = ChatCreateMode(rawValue: experiment.rawValue) {
-                        withAnimation(.easeInOut(duration: 0.15)) { setCreateMode(mode) }
-                        inputFocused = true
-                    } else {
-                        appState.showCreate(experiment)
-                    }
-                })
+                // A media chip navigates to the Create pane, exactly like the
+                // Tools menu — the composer never becomes a generator.
+                EmptyStateChipRow()
                     .padding(.top, 18)
             }
         }
@@ -1458,14 +1426,6 @@ struct ChatDetailView: View {
                            let progress = chatEngine.mediaProgress {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
-                        }
-                        // Create mode's own generation. It belongs HERE, under
-                        // the prompt that started it — in the banner above the
-                        // composer it read as chrome, and the transcript just
-                        // sat there looking like nothing had happened.
-                        if let createProgress {
-                            MediaProgressCard(progress: createProgress)
-                                .id("createProgress")
                         }
                     }
                     // The reading measure. The window is free to be as wide as
@@ -1567,11 +1527,6 @@ struct ChatDetailView: View {
                 // conversation and duplicated the composer's own toggles).
                 // Renders nothing while voice is off.
                 VoiceOrbView(controller: appState.voice, sessionId: sessionId)
-
-                // Create mode: what the composer is about to do with what you
-                // type, plus its settings and progress. Above the input, so it
-                // is read before the prompt is written.
-                createModeBanner
 
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
@@ -1774,11 +1729,7 @@ struct ChatDetailView: View {
     /// The input field. No background or border of its own — the composer
     /// container draws those around both rows. NSTextView-backed so a big paste
     /// stays smooth and the mouse wheel scrolls once it grows past the cap.
-    /// What the input asks for. In create mode it must NOT say "Message" — the
-    /// field looks identical and nothing is being sent to anyone.
-    private var composerPlaceholder: String {
-        createMode?.placeholder ?? "Ask me anything…"
-    }
+    private var composerPlaceholder: String { "Ask me anything…" }
 
     private var composerField: some View {
         GrowingTextEditor(text: $inputText,
@@ -2296,350 +2247,6 @@ struct ChatDetailView: View {
         Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
     }
 
-    // MARK: - Create mode
-
-    /// The banner above the composer while a create mode is on. It has to say
-    /// that the chat model is not reading this — the composer looks exactly like
-    /// chat, and "why didn't it answer me?" is the one bad outcome this mode can
-    /// produce.
-    @ViewBuilder
-    private var createModeBanner: some View {
-        if let mode = createMode {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: mode.experiment.icon)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Color.accentColor)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(mode.title).font(.subheadline.weight(.semibold))
-                        // The model doing the work — the one fact that changes
-                        // with the asset type and the only one the user can act
-                        // on. It replaced a paragraph explaining the mode.
-                        HStack(spacing: 5) {
-                            Text(createModelName(mode))
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            if !createModelReady(mode) {
-                                Text("not downloaded")
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(.quaternary, in: Capsule())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.15)) {
-                            showCreateSettings.toggle()
-                        }
-                    } label: {
-                        Label("Settings", systemImage: "slider.horizontal.3")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Model and size for this mode")
-                    // Leaving is a real control, not a second click on the chip
-                    // that got you here — that chip is scrolled away by now.
-                    Button {
-                        setCreateMode(nil)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Back to chatting")
-                }
-                if showCreateSettings {
-                    createSettings(mode)
-                }
-                if let held = heldCreatePrompt {
-                    // The prompt is HELD, not thrown away: pressing Generate
-                    // without the model is answered here, and what was typed
-                    // runs the moment the bytes land.
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("\(createModelName(mode)) isn't downloaded yet.")
-                            .font(.caption.weight(.medium))
-                        Text("“\(held.prompt)” will generate as soon as it finishes.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                        HStack(spacing: 8) {
-                            Button {
-                                startHeldDownload(mode)
-                            } label: {
-                                Text("Download \(createDownloadSize(mode)) & Generate")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            Button("Cancel") {
-                                // Give the words — and the attachments — back
-                                // rather than dropping them.
-                                inputText = held.prompt
-                                restorePendingImages(held.sourceImages)
-                                appState.heldCreatePrompts.removeValue(forKey: sessionId)
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
-                }
-                if let createError {
-                    Label(createError, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .textSelection(.enabled)
-                }
-            }
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.accentColor.opacity(0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(Color.accentColor.opacity(0.25), lineWidth: 1)
-            )
-        }
-    }
-
-    /// The "minor adjustments" — the model (same control the Create pane uses)
-    /// and the output size. Everything else stays at the pane's saved settings,
-    /// which is what makes this mode and that pane the SAME configuration rather
-    /// than two that drift.
-    @ViewBuilder
-    private func createSettings(_ mode: ChatCreateMode) -> some View {
-        switch mode {
-        case .image:
-            let settings = ImageGenSettings.load()
-            let featured = MediaModelPicks.featured(
-                ImageModelPreset.all,
-                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-                capabilityOf: \.capabilityLabel)
-            VStack(alignment: .leading, spacing: 8) {
-                MediaModelChooser(
-                    featured: featured,
-                    others: MediaModelPicks.others(ImageModelPreset.all, featured: featured),
-                    selectedId: settings.resolvedModel.id,
-                    lanModel: nil,
-                    capabilityOf: { $0.capabilityLabel },
-                    isDownloaded: { downloads.bundleReady($0.bundle) },
-                    downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
-                    onSelect: { preset in
-                        var s = ImageGenSettings.load()
-                        s.modelId = preset.id
-                        s.resolutionId = preset.defaultResolution.id
-                        s.save()
-                    },
-                    onDownload: { preset in
-                        downloads.startBundle(preset.bundle) { appState.refreshModels() }
-                    },
-                    lanCapability: "image")
-                Text("Size: \(settings.resolvedResolution(for: settings.resolvedModel).label) — change it in Create ▸ Image for the full set of controls.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        case .video, .audio:
-            Text("Uses your saved settings from Create ▸ \(mode.experiment.title). Open that page for the full set of controls.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// The model this mode will use, from the same saved settings its Create
-    /// page reads — one configuration, two surfaces.
-    private func createModelName(_ mode: ChatCreateMode) -> String {
-        switch mode {
-        case .image: return ImageGenSettings.load().resolvedModel.name
-        case .video: return VideoGenSettings.load().resolvedModel.name
-        case .audio: return AudioGenSettings.load().resolvedModel.name
-        }
-    }
-
-    private func createModelReady(_ mode: ChatCreateMode) -> Bool {
-        switch mode {
-        case .image: return downloads.bundleReady(ImageGenSettings.load().resolvedModel.bundle)
-        case .video: return downloads.bundleReady(VideoGenSettings.load().resolvedModel.bundle)
-        case .audio: return downloads.bundleReady(AudioGenSettings.load().resolvedModel.bundle)
-        }
-    }
-
-    private func createDownloadSize(_ mode: ChatCreateMode) -> String {
-        switch mode {
-        case .image: return ImageGenSettings.load().resolvedModel.bundle.approxSizeLabel
-        case .video: return VideoGenSettings.load().resolvedModel.bundle.approxSizeLabel
-        case .audio: return AudioGenSettings.load().resolvedModel.bundle.approxSizeLabel
-        }
-    }
-
-    /// Fetch the missing model, then run what was already typed. The completion
-    /// hook is the ONLY thing that starts the generation — a held prompt whose
-    /// download fails stays held rather than silently disappearing.
-    private func startHeldDownload(_ mode: ChatCreateMode) {
-        guard var held = heldCreatePrompt, !held.downloading else { return }
-        held.downloading = true
-        appState.heldCreatePrompts[sessionId] = held
-        let bundle: MediaBundle
-        switch mode {
-        case .image: bundle = ImageGenSettings.load().resolvedModel.bundle
-        case .video: bundle = VideoGenSettings.load().resolvedModel.bundle
-        case .audio: bundle = AudioGenSettings.load().resolvedModel.bundle
-        }
-        downloads.startBundle(bundle) {
-            appState.refreshModels()
-            guard let pending = appState.heldCreatePrompts[sessionId],
-                  pending.downloading else { return }
-            // `onFinish` fires on failure and cancel too (DownloadManager's
-            // contract) — completion is only a generation when the model is
-            // actually on disk. Otherwise the prompt STAYS HELD and the offer
-            // row re-arms, which is the promise in the card's own text.
-            guard createModelReady(mode) else {
-                appState.heldCreatePrompts[sessionId]?.downloading = false
-                return
-            }
-            appState.heldCreatePrompts.removeValue(forKey: sessionId)
-            runCreateGeneration(mode, prompt: pending.prompt,
-                                sourceImages: pending.sourceImages)
-        }
-    }
-
-    /// Generate directly from the composer — no turn, no model reading the
-    /// prompt, no tool call. The user message is what they typed; the result is
-    /// a media message, exactly the shape the in-chat tools already produce.
-    private func generateInChat(_ mode: ChatCreateMode) {
-        let prompt = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch ChatCreateSend.decide(prompt: prompt,
-                                     modelReady: createModelReady(mode),
-                                     busy: createProgress != nil) {
-        case .ignore:
-            return
-        case .offerDownload:
-            // Typing is never blocked on a download. Hold what was written —
-            // attachments included — and offer to fetch the model; words and
-            // photos both come back on Cancel.
-            appState.heldCreatePrompts[sessionId] = HeldCreatePrompt(
-                prompt: prompt, sourceImages: consumePendingImages())
-            inputText = ""
-            appState.createErrors.removeValue(forKey: sessionId)
-        case .generate:
-            let sourceImages = consumePendingImages()
-            inputText = ""
-            runCreateGeneration(mode, prompt: prompt, sourceImages: sourceImages)
-        }
-    }
-
-    /// Run it. Split from `generateInChat` because a held prompt reaches this
-    /// from the download's completion hook, with no composer state left to read.
-    private func runCreateGeneration(_ mode: ChatCreateMode, prompt: String,
-                                     sourceImages: [ChatImage]?) {
-        let sourcePath = sourceImages?.first.flatMap { try? ChatImagePreview.writeTempFile($0).path }
-        appState.createErrors.removeValue(forKey: sessionId)
-        // A create-mode prompt is your own message: it wins the scroll, the same
-        // way a sent turn does (`proceedSend`).
-        applyScroll(.userSentMessage)
-
-        var userMessage = ChatMessage(role: .user, content: prompt)
-        userMessage.images = sourceImages
-        appendCreateMessage(userMessage)
-
-        // Captures appState + the session ID, never view state: the result and
-        // any error land on the right chat even if this view is torn down by a
-        // workspace switch while the generation runs.
-        Task { @MainActor in
-            appState.createProgress[sessionId] = MediaGenProgress(
-                kind: mode.progressKind, step: 0, total: 0,
-                message: "Starting…", startedAt: Date())
-            defer { appState.createProgress.removeValue(forKey: sessionId) }
-            do {
-                let path = try await runCreate(mode, prompt: prompt, sourcePath: sourcePath)
-                guard let kind = GeneratedMediaHandoff.kind(for: mode.experiment) else { return }
-                var result = ChatMessage(role: .assistant, content: "")
-                result.media = [ChatMediaRef(kind: kind, path: path, prompt: prompt)]
-                if kind == .image, let data = FileManager.default.contents(atPath: path) {
-                    // Both, like the in-chat tool path: the bytes the transcript
-                    // draws AND the ref that gives it a Reveal-in-Finder row.
-                    result.images = [ChatImage(data: data)]
-                }
-                appendCreateMessage(result)
-            } catch {
-                appState.createErrors[sessionId] = error.localizedDescription
-            }
-        }
-    }
-
-    /// Put consumed attachments back on the composer strip (held-prompt
-    /// Cancel) — the inverse of `consumePendingImages`.
-    private func restorePendingImages(_ images: [ChatImage]?) {
-        guard let images else { return }
-        pendingImages.append(contentsOf: images.compactMap { NSImage(data: $0.data) })
-    }
-
-    /// One switch, one place: each mode's request is built from the SAME saved
-    /// settings its Create page uses, and run through the service's
-    /// `generateForAgent` — the entry point that deliberately does not touch a
-    /// pane's own phase/task/recent state.
-    private func runCreate(_ mode: ChatCreateMode, prompt: String,
-                           sourcePath: String?) async throws -> String {
-        switch mode {
-        case .image:
-            let settings = ImageGenSettings.load()
-            let preset = settings.resolvedModel
-            let resolution = settings.resolvedResolution(for: preset)
-            let steps = preset.stepsAreFixed
-                ? preset.fixedSteps
-                : preset.settings(settings.quality).steps
-            var request = ImageGenRequest(
-                model: preset, prompt: prompt, seed: -1,
-                width: resolution.width, height: resolution.height, steps: steps)
-            if let sourcePath {
-                request.initImagePath = sourcePath
-                // An editor edits; a variation model renoises. Same rule the
-                // pane uses — a source image MEANS edit where editing exists.
-                request.editMode = preset.supportsReferenceEdit
-            }
-            return try await appState.imageGen.generateForAgent(
-                request, server: server, onProgress: { appState.createProgress[sessionId] = $0 })
-        case .video:
-            let settings = VideoGenSettings.load()
-            let preset = settings.resolvedModel
-            let resolution = settings.resolvedResolution(for: preset)
-            // The pane's own saved frame count, clamped to what this model can
-            // actually render — a preset switch can leave a ladder value the new
-            // model has no bucket for.
-            let frames = min(settings.numFrames, preset.maxFrames)
-            var request = VideoGenRequest(
-                model: preset, prompt: prompt,
-                width: resolution.width, height: resolution.height,
-                numFrames: frames, fps: preset.fps,
-                mode: settings.mode,
-                steps: settings.steps,
-                cfgScale: settings.cfgScale)
-            request.firstFrameImagePath = sourcePath
-            return try await appState.videoGen.generateForAgent(
-                request, server: server, onProgress: { appState.createProgress[sessionId] = $0 })
-        case .audio:
-            let settings = AudioGenSettings.load()
-            let request = AudioGenRequest(model: settings.resolvedModel, text: prompt)
-            return try await appState.audioGen.generateForAgent(
-                request, server: server, onProgress: { appState.createProgress[sessionId] = $0 })
-        }
-    }
-
-    private func appendCreateMessage(_ message: ChatMessage) {
-        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        appState.chatSessions[idx].messages.append(message)
-        appState.chatSessions[idx].updatedAt = Date()
-        appState.saveChatHistory()
-    }
-
     // MARK: - Send Message
 
     /// Thin wrapper: build the turn config from the toolbar @State, consume the
@@ -2657,11 +2264,8 @@ struct ChatDetailView: View {
         // Pre-send nudge: if the message looks like it needs a mode that's off,
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
-        // Never in create mode: that text goes to a generator, not the model,
-        // so "turn Tools on for this message?" is unanswerable there.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if createMode == nil, composerState != .generatingHere, server.status == .running,
-           !trimmed.isEmpty,
+        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -2710,12 +2314,6 @@ struct ChatDetailView: View {
     }
 
     private func proceedSend() {
-        // Create mode: the composer drives the generator directly. No turn, no
-        // model reading the prompt — see `generateInChat`.
-        if let createMode {
-            generateInChat(createMode)
-            return
-        }
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
         let attachedAudio = consumePendingAudio()

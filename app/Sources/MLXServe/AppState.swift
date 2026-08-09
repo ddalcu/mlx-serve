@@ -223,20 +223,6 @@ class AppState: ObservableObject {
     /// `NavigationSplitView` — neither can own the other's state.
     @Published var selectedTaskId: UUID?
 
-    // Create-mode generation state, keyed by SESSION. The composer's create
-    // mode drives a generator directly — no turn, no engine ledger — so this
-    // cannot live in the detail view's @State: that view is reused across
-    // tabs (state leaks between chats) and torn down entirely on a workspace
-    // switch (the progress card and held prompt vanished while the detached
-    // generation task kept running). App-level and id-keyed, like the
-    // engine's own `mediaProgressSessionId`.
-    /// Live progress of a create-mode generation, per session.
-    @Published var createProgress: [UUID: MediaGenProgress] = [:]
-    /// Last create-mode failure, shown inline instead of thrown away.
-    @Published var createErrors: [UUID: String] = [:]
-    /// Prompts typed before their model was on disk — held, never dropped.
-    @Published var heldCreatePrompts: [UUID: HeldCreatePrompt] = [:]
-
     /// Show the model browser — the ONE way in.
     func showModels(_ section: ModelBrowserSection = .recommended) {
         chatWorkspace = .models(section)
@@ -657,11 +643,6 @@ class AppState: ObservableObject {
         SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
         SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
         chatSessions.removeAll { $0.id == id }
-        // …and its create-mode state (progress/error/held prompt), which is
-        // keyed by session id here and would otherwise leak forever.
-        createProgress.removeValue(forKey: id)
-        createErrors.removeValue(forKey: id)
-        heldCreatePrompts.removeValue(forKey: id)
         // Stop the in-flight turn if it belonged to this session — otherwise
         // it ghost-runs invisibly with no Stop control anywhere, and no server
         // restart can clear it. The sweep is per turn: only the deleted chat's

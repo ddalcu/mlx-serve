@@ -133,33 +133,8 @@ final class PerSessionUIStateTests: XCTestCase {
         XCTAssertNil(ChatSession().agentId, "the default is still \"None (app defaults)\"")
     }
 
-    // MARK: - Create-mode generation state is app-level AND per session
-
-    /// Third instance of the class this file exists for — and a new twist:
-    /// `createProgress`/`createError`/`heldCreatePrompt` were single @State
-    /// values on the reused detail view, so chat A's progress card rendered in
-    /// chat B's transcript; AND the view dies on any workspace switch, so
-    /// switching to the Models pane mid-generation lost the card and the held
-    /// prompt while the detached task kept running. The state lives on
-    /// AppState now, keyed by session id.
-    func testCreateModeGenerationStateIsNotViewLocal() throws {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/MLXServe/Views/ChatView.swift")
-        let chat = try String(contentsOf: url, encoding: .utf8)
-        for banned in ["@State private var createProgress",
-                       "@State private var createError",
-                       "@State private var heldCreatePrompt"] {
-            XCTAssertFalse(chat.contains(banned), """
-                \(banned): create-mode generation state must live on AppState \
-                keyed by session id — view-local @State leaks across tabs and \
-                dies on every workspace switch.
-                """)
-        }
-        // …and the reads are keyed by the session, not another shared value.
-        XCTAssertTrue(chat.contains("appState.createProgress[sessionId]"))
-        XCTAssertTrue(chat.contains("appState.heldCreatePrompts[sessionId]"))
-    }
+    // (The composer's create mode — a third instance of this class, with its
+    // progress/held-prompt state view-local — was removed outright: media
+    // chips navigate to the Create pane, and in-chat generation is the agent
+    // tools' job.)
 }

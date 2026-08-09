@@ -57,11 +57,10 @@ final class ChatGreetingTests: XCTestCase {
         XCTAssertTrue(ChatGreeting.showsDiscoveryChips(hasAgent: false, isExternalBridge: false))
     }
 
-    /// Three of the four chips navigate OUT of the conversation and the fourth
-    /// rewires the composer into a generator the agent has no part in — offered
-    /// directly above the field where you were about to type to someone
-    /// specific. Worse, an agent whose capabilities exclude image generation
-    /// cannot do what "Create Media" sits there offering.
+    /// Every chip navigates OUT of the conversation — offered directly above
+    /// the field where you were about to type to someone specific. Worse, an
+    /// agent whose capabilities exclude image generation cannot do what
+    /// "Create Media" sits there offering.
     func testAnAgentThreadDoesNotOfferThem() {
         XCTAssertFalse(ChatGreeting.showsDiscoveryChips(hasAgent: true, isExternalBridge: false))
     }

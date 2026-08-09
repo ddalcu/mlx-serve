@@ -83,12 +83,6 @@ enum ChatEmptyState {
 
 /// Discovery chips rendered under the empty conversation's greeting.
 struct EmptyStateChipRow: View {
-    /// Set by the chat, which turns a media chip into a COMPOSER MODE rather
-    /// than a jump to the Create page: the whole point of the chip is that you
-    /// stay where you are. nil (the menu-bar twin, which has no session in
-    /// hand) falls back to opening the page.
-    var onCreateInChat: ((GenExperiment) -> Void)?
-
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
@@ -167,11 +161,8 @@ struct EmptyStateChipRow: View {
         case .tasks:
             appState.showTasks()
         case .create(let experiment):
-            if let onCreateInChat {
-                onCreateInChat(experiment)
-            } else {
-                appState.showCreate(experiment)
-            }
+            // Straight to the Create pane — the same door the Tools menu uses.
+            appState.showCreate(experiment)
         case .mediaMenu, .codeLauncher:
             break  // rendered as menus; nothing to open on click
         }

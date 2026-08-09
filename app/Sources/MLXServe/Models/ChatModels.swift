@@ -29,11 +29,8 @@ struct ChatSession: Identifiable, Codable {
     /// Agent toggle. See PerSessionUIStateTests.
     var enableThinking: Bool
     var useMCP: Bool
-    /// The composer's create mode (`ChatCreateMode`), or nil for plain chat.
-    /// A RAW STRING on purpose — a mode retired in a later build leaves an
-    /// unknown name here instead of failing the whole session's decode, the
-    /// same tolerance the per-chat tool switches use.
-    var createMode: String?
+    // The composer's create mode (`createMode`) is retired: sessions saved by
+    // builds that had it simply carry a key this decoder no longer asks for.
     /// The agent (persona) this tab is talking to; nil = none, i.e. the app's own
     /// defaults and today's behavior. Per-session like the toggles above — the
     /// detail view is REUSED across tabs, so an app-wide "active agent" would
@@ -55,7 +52,6 @@ struct ChatSession: Identifiable, Codable {
         self.isExternalBridge = false
         self.enableThinking = false
         self.useMCP = false
-        self.createMode = nil
         self.agentId = nil
         self.disabledTools = []
     }
@@ -67,7 +63,7 @@ struct ChatSession: Identifiable, Codable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId, createMode
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
     }
 
@@ -85,7 +81,6 @@ struct ChatSession: Identifiable, Codable {
         // existed come back with the keys absent → default both off.
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
-        createMode = try c.decodeIfPresent(String.self, forKey: .createMode)
         // Absent (every session saved before agents existed) → no agent → the
         // app defaults, unchanged on upgrade.
         agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)

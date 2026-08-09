@@ -33,72 +33,20 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
 
-            VStack(spacing: 0) {
-                ForEach(featured) { pick in
-                    row(pick.preset, capability: pick.capability, fits: pick.fits)
-                    if pick.id != featured.last?.id || showsSelectedExtraRow {
-                        Divider().padding(.leading, 26)
-                    }
-                }
-                // A pick from "Other Models" gets the same row — so its download
-                // control is in the same place as everything else's, rather than
-                // the user having to hunt for where the button went.
-                if let extra = selectedNonFeatured {
-                    row(extra, capability: capabilityOf(extra), fits: true, isOtherPick: true)
-                }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.primary.opacity(0.04))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-            )
+            // ONE row: the model that will run. A stack of radio rows read as
+            // a multi-select and grew with the catalogue; what the pane has to
+            // SAY is the current pick — changing it is the menu's job.
+            currentRow
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.primary.opacity(0.04))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
 
-            HStack(spacing: 8) {
-                if !others.isEmpty || !onThisMac.isEmpty || !lanModels.isEmpty {
-                    Menu("Other Models") {
-                        ForEach(others) { preset in
-                            Button {
-                                onSelect(preset)
-                            } label: {
-                                Text(isDownloaded(preset)
-                                     ? preset.name
-                                     : "\(preset.name) — not downloaded")
-                            }
-                        }
-                        // Yours, found on disk. No "not downloaded" suffix is
-                        // possible here — discovery IS the evidence it's there.
-                        if !onThisMac.isEmpty {
-                            Divider()
-                            Section("On This Mac") {
-                                ForEach(onThisMac) { preset in
-                                    Button(preset.name) { onSelect(preset) }
-                                }
-                            }
-                        }
-                        if !lanModels.isEmpty {
-                            Divider()
-                            Section("On Your Network") {
-                                ForEach(lanModels, id: \.name) { m in
-                                    Button(m.lanDisplayName) { onSelectLan(m.name) }
-                                }
-                            }
-                        }
-                    }
-                    .menuStyle(.button)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .fixedSize()
-                }
-                if let lanModel {
-                    Text("Running on \(LanPick.peer(of: lanModel)) over your network — nothing to download.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
-            }
+            switcherMenu
         }
     }
 
@@ -109,88 +57,148 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
 
     private var lanModels: [ModelInfo] { server.lanModels(capability: lanCapability) }
 
-    /// The selected preset when it came from "Other Models" — nil when the
-    /// selection is one of the featured rows (or a LAN model).
-    /// Searches BOTH menu groups: a discovered checkpoint you selected needs
-    /// the same row — with the same download control in the same place — as
-    /// one picked out of the catalogue, or choosing your own model makes the
-    /// row disappear.
-    private var selectedNonFeatured: P? {
-        guard lanModel == nil,
-              !featured.contains(where: { $0.preset.id == selectedId }) else { return nil }
-        return others.first { $0.id == selectedId } ?? onThisMac.first { $0.id == selectedId }
+    /// What the one row shows. A LAN pick wins (the local preset underneath is
+    /// only the family the request is shaped by); a local id resolves through
+    /// featured, then the rest of the catalogue, then discovered checkpoints —
+    /// a persisted id nothing resolves any more (a deleted custom model) still
+    /// renders by name rather than drawing an empty box.
+    private var current: (name: String, detail: String, ram: String?, fits: Bool, preset: P?) {
+        if let lanModel {
+            let display = lanModels.first { $0.name == lanModel }?.lanDisplayName
+                ?? lanModel.replacingOccurrences(of: "@", with: " · ")
+            return (display,
+                    "Running on \(LanPick.peer(of: lanModel)) over your network — nothing to download.",
+                    nil, true, nil)
+        }
+        if let pick = featured.first(where: { $0.preset.id == selectedId }) {
+            return (pick.preset.name, pick.capability,
+                    "· ~\(pick.preset.approxRAMGB) GB RAM", pick.fits, pick.preset)
+        }
+        if let p = others.first(where: { $0.id == selectedId })
+            ?? onThisMac.first(where: { $0.id == selectedId }) {
+            return (p.name, capabilityOf(p), "· ~\(p.approxRAMGB) GB RAM", true, p)
+        }
+        return (selectedId, "", nil, true, nil)
     }
 
-    private var showsSelectedExtraRow: Bool { selectedNonFeatured != nil }
-
-    /// Two REAL side-by-side buttons — select and download — never a tap
-    /// gesture wrapped around the row. A parent `onTapGesture` + `contentShape`
-    /// swallows plain child buttons on macOS: the download click would die
-    /// silently, with no error anywhere (see the app-side rule; it has shipped
-    /// twice).
-    @ViewBuilder
-    private func row(_ preset: P, capability: String, fits: Bool,
-                     isOtherPick: Bool = false) -> some View {
-        let selected = lanModel == nil && preset.id == selectedId
-        HStack(alignment: .top, spacing: 8) {
-            Button {
-                onSelect(preset)
-            } label: {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                        .font(.system(size: 13))
-                        .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-                        .padding(.top, 1)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(preset.name)
-                            .font(.subheadline.weight(selected ? .semibold : .regular))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        HStack(spacing: 4) {
-                            // The REASON this model is on screen. Without it the
-                            // list is just names again — the state this replaced.
-                            Text(capability)
+    /// The current pick's row: name, why it's here, and its download control —
+    /// a real sibling Button, never a tap gesture around the row (the
+    /// swallowed-click class).
+    private var currentRow: some View {
+        let cur = current
+        return HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(cur.name)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if !cur.detail.isEmpty || cur.ram != nil {
+                    HStack(spacing: 4) {
+                        if !cur.detail.isEmpty {
+                            Text(cur.detail)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text("· ~\(preset.approxRAMGB) GB RAM")
+                        }
+                        if let ram = cur.ram {
+                            Text(ram)
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
                         }
-                        if !fits {
-                            // Warn, don't block: it may still run, slowly.
-                            Label("Needs more memory than this Mac has",
-                                  systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
                     }
-                    Spacer(minLength: 8)
                 }
-                .contentShape(Rectangle())
+                if !cur.fits {
+                    // Warn, don't block: it may still run, slowly.
+                    Label("Needs more memory than this Mac has",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
-            .buttonStyle(.plain)
-
+            Spacer(minLength: 8)
             // Downloading is part of CHOOSING — so it lives here, on the model,
-            // and never beside Generate.
-            if isDownloaded(preset) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .help("Downloaded and ready to use")
-                    .padding(.top, 1)
-            } else {
-                Button {
-                    onDownload(preset)
-                } label: {
-                    Text(downloadLabel(preset))
-                        .font(.caption.weight(.medium))
+            // and never beside Generate. Absent for a LAN pick: the pack is on
+            // someone else's Mac.
+            if let preset = cur.preset {
+                if isDownloaded(preset) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .help("Downloaded and ready to use")
+                        .padding(.top, 1)
+                } else {
+                    Button {
+                        onDownload(preset)
+                    } label: {
+                        Text(downloadLabel(preset))
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Download this model — you can keep using the app while it transfers")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Download this model — you can keep using the app while it transfers")
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+
+    /// The one switcher: everything pickable, grouped, current pick ticked.
+    /// Checkmarks are our own per-row Labels keyed by ID — never a Picker,
+    /// whose menu ticks by row TITLE and double-ticks duplicate names.
+    private var switcherMenu: some View {
+        Menu("Change Model") {
+            if !featured.isEmpty {
+                Section("Recommended for This Mac") {
+                    ForEach(featured) { pick in menuRow(pick.preset) }
+                }
+            }
+            if !others.isEmpty {
+                Section("More Models") {
+                    ForEach(others) { menuRow($0) }
+                }
+            }
+            // Yours, found on disk. No "not downloaded" suffix is possible
+            // here — discovery IS the evidence it's there.
+            if !onThisMac.isEmpty {
+                Section("On This Mac") {
+                    ForEach(onThisMac) { menuRow($0, showDownloadState: false) }
+                }
+            }
+            if !lanModels.isEmpty {
+                Section("On Your Network") {
+                    ForEach(lanModels, id: \.name) { m in
+                        Button {
+                            onSelectLan(m.name)
+                        } label: {
+                            if lanModel == m.name {
+                                Label(m.lanDisplayName, systemImage: "checkmark")
+                            } else {
+                                Text(m.lanDisplayName)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private func menuRow(_ preset: P, showDownloadState: Bool = true) -> some View {
+        let title = showDownloadState && !isDownloaded(preset)
+            ? "\(preset.name) — not downloaded"
+            : preset.name
+        Button {
+            onSelect(preset)
+        } label: {
+            if lanModel == nil && preset.id == selectedId {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
+            }
+        }
     }
 }
 
