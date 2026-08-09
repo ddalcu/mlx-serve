@@ -681,11 +681,15 @@ pub const ModelRegistry = struct {
     /// basename-derived id differs from the discovered `org/name` id —
     /// two ids for one path would let the same weights load twice.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.peekByPathLocked(path);
+    }
+
+    fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         var trimmed = path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         if (trimmed.len == 0) return null;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             var entry_path: []const u8 = entry_ptr.*.path;
@@ -693,6 +697,30 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
         }
         return null;
+    }
+
+    /// Re-run discovery over the roots the server booted with and absorb NEW
+    /// dirs as `.unloaded` stubs (`POST /v1/models/rescan` — the Model
+    /// Browser downloads models while the server runs, and a boot-only scan
+    /// can't see them). Add-only: an id or path already registered wins
+    /// (first-wins, like boot) and live entries are never re-pointed or
+    /// removed. Returns the number of stubs added. No roots (a `--model`-only
+    /// server) rescans nothing.
+    pub fn rescan(self: *ModelRegistry) !u32 {
+        const roots = if (self.discovery) |d| d.roots else &.{};
+        if (roots.len == 0) return 0;
+        var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
+        defer found.deinit();
+        var added: u32 = 0;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (found.models) |m| {
+            if (self.entries.get(m.id) != null) continue;
+            if (self.peekByPathLocked(m.path) != null) continue;
+            _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
+            added += 1;
+        }
+        return added;
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -755,7 +783,7 @@ pub const ModelRegistry = struct {
                     self.state_cond.waitUncancelable(self.io, &self.mutex);
                     continue;
                 },
-                .error_state => return error.LoadFailed,
+                .error_state => return loadErrorFromName(entry.error_name),
                 .unloaded => return error.NotLoaded,
             }
         }
@@ -984,6 +1012,38 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// Map a stored load-failure name back to the typed error `ensureLoaded`
+    /// surfaces. A memory-preflight refusal keeps its identity so the HTTP
+    /// layer answers with a named 503 instead of the generic "Model load
+    /// failed" 500 (#144); everything else is `LoadFailed` with the name
+    /// readable via `loadErrorNameDupe`.
+    /// `OutOfMemory` counts too: an allocator failure during a load is the same
+    /// actionable thing to the user as the preflight's own refusal, and it
+    /// reached the client as a generic "Model load failed" 500 before
+    /// (2026-08-08). Merge note: this arm came from the branch's
+    /// `scheduler.loadErrorFor`, which this function replaced — the name-based
+    /// half survived the refactor, the second name did not.
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
+        if (name) |n| {
+            if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
+            if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
+        }
+        return error.LoadFailed;
+    }
+
+    test "a memory refusal keeps its own error out to the client" {
+        // Live 2026-08-08: the image engine refused for memory, the name was
+        // freed, and the pane showed a generic "Model load failed" with an
+        // empty log — the one failure the user could have fixed, rendered
+        // unactionable. Both spellings of "out of memory" have to survive.
+        try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("InsufficientMemory"));
+        try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
+        // Everything else stays a load failure — guessing a diagnosis is worse
+        // than reporting the honest generic one.
+        try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
+        try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(null));
+    }
+
     /// Mark an entry as `.error_state` and store `error_name` (duped).
     /// Future `ensureLoaded` calls fail with `error.LoadFailed` until the
     /// entry is reset to `.unloaded` (Phase D may add a retry path).
@@ -993,6 +1053,23 @@ pub const ModelRegistry = struct {
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
         self.state_cond.broadcast(self.io);
+    }
+
+    /// Duped copy of the stored load-failure name for `id` (empty/"mlx-serve"
+    /// route to the default), or null when the entry isn't in `.error_state`.
+    /// Caller frees. Feeds the HTTP "Model load failed: <name>" message (#144).
+    pub fn loadErrorNameDupe(self: *ModelRegistry, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
+        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "mlx-serve"))
+            self.default_id
+        else
+            id_or_empty;
+        if (id.len == 0) return null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.entries.get(id) orelse return null;
+        if (entry.state != .error_state) return null;
+        const name = entry.error_name orelse return null;
+        return alloc.dupe(u8, name) catch null;
     }
 
     /// Snapshot of every entry for `/v1/models`. Sort: default first
@@ -1186,6 +1263,32 @@ test "ModelRegistry: ensureLoaded reports error_state" {
     try testing.expectError(error.LoadFailed, reg.ensureLoaded("broken"));
     try testing.expect(stub.error_name != null);
     try testing.expectEqualStrings("MissingVisionWeights", stub.error_name.?);
+}
+
+test "ModelRegistry: memory-refused loads keep their identity, other failures expose their name" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("krea", "/path/to/krea", 1024);
+
+    // #144: a memory-preflight refusal must not collapse into the generic
+    // "Model load failed" 500 — it maps back to the memory error so the HTTP
+    // layer can answer with a named 503.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(stub, "InsufficientMemory");
+    reg.mutex.unlock(reg.io);
+    try testing.expectError(error.InsufficientMemory, reg.ensureLoaded("krea"));
+
+    // Any other failure stays LoadFailed, with the stored name readable for
+    // the "Model load failed: <name>" message.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(stub, "FileNotFound");
+    reg.mutex.unlock(reg.io);
+    try testing.expectError(error.LoadFailed, reg.ensureLoaded("krea"));
+    const name = reg.loadErrorNameDupe(testing.allocator, "krea");
+    defer if (name) |n| testing.allocator.free(n);
+    try testing.expectEqualStrings("FileNotFound", name.?);
+    // Non-error entries have no name to report.
+    try testing.expectEqual(@as(?[]u8, null), reg.loadErrorNameDupe(testing.allocator, "missing"));
 }
 
 test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted" {
@@ -1468,4 +1571,36 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     bge.config = null;
     chat.config = null;
     chat2.config = null;
+}
+
+test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // One model present at boot.
+    try tmp.dir.createDirPath(io, "org/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/model.safetensors", .data = "0123" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    try testing.expect(reg.peek("org/first") != null);
+
+    // A second model lands on disk AFTER boot (the Model Browser download).
+    try tmp.dir.createDirPath(io, "org/second");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/second/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/second/transformer.safetensors", .data = "0123" });
+
+    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
+    try testing.expectEqualStrings("minimax_h3", stub.arch_hint);
+    try testing.expectEqual(LoadState.unloaded, stub.state);
+    // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expect(reg.peek("org/first") != null);
 }

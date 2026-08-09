@@ -237,6 +237,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// plain chat do NOT share one).
         var temperature: Double? = nil
         var maxTokens: Int? = nil
+        /// The rest of the sampling surface; nil = the user's saved default
+        /// (`ServerOptions`). Applied by `requestDefaults(from:)`.
+        var topP: Double? = nil
+        var topK: Int? = nil
+        var repeatPenalty: Double? = nil
+        var presencePenalty: Double? = nil
+        var reasoningBudget: Int? = nil
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
@@ -262,9 +269,30 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 autoApprove: r.autoApprove,
                 temperature: r.temperatureOverride,
                 maxTokens: r.maxTokensOverride,
+                topP: r.topPOverride,
+                topK: r.topKOverride,
+                repeatPenalty: r.repeatPenaltyOverride,
+                presencePenalty: r.presencePenaltyOverride,
+                reasoningBudget: r.reasoningBudgetOverride,
                 voice: r.voiceOverride,
                 wakePhrase: r.wakePhrase
             )
+        }
+
+        /// The per-request defaults for this turn: the user's saved sampling
+        /// with the agent's overrides laid on top. An override REPLACES the
+        /// saved value — including with the canonical "off" (top_k 0, repeat
+        /// 1.0, presence 0.0, budget -1), which clears the global rather than
+        /// leaving it standing, mapped to an omitted field exactly as
+        /// `RequestDefaults.from` maps it.
+        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
+            var d = APIClient.RequestDefaults.from(opts)
+            if let v = topP { d.topP = v }
+            if let v = topK { d.topK = v > 0 ? v : nil }
+            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            return d
         }
 
         /// The tools to ADVERTISE: none unless the loop is actually running.
@@ -513,7 +541,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
                 enableThinking: config.enableThinking || appState.serverOptions.defaultEnableThinking,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
             var coalescer = StreamCoalescer()
@@ -797,7 +825,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 temperature: turnTemperature(config, default: Self.agentLoopTemperature),
                 enableThinking: config.enableThinking,
                 toolsJSON: combinedToolsJSON,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
 
@@ -1278,7 +1306,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runImageTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = ImageGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         // A LAN model picked in the Image pane needs no local download — the
         // hosting Mac has the weights.
         let lanId = LanPick.lanId(s.modelId)
@@ -1309,7 +1337,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runSpeechTool(_ args: [String: String],
                                onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = AudioGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1329,7 +1357,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runMusicTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = MusicGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1345,7 +1373,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runVideoTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = VideoGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: "\(model.approxFirstRunDownloadGB)",

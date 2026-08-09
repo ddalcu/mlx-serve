@@ -305,13 +305,41 @@ enum H3TimeEstimate {
     /// to go, and where the cadence evens out to 1:1 the same run flipped to a
     /// full-cost lap and doubled what was left. Averaging over whole cycles
     /// prices a step at what it actually costs amortized.
-    static func liveEta(stepDurations: [Double], totalSteps: Int) -> Double? {
+    /// `floorPerStep`/`tail` come from `livePricing`: the observed mean
+    /// under-prices what is LEFT (cheap cached middle laps dominate the
+    /// history while the tail steps always refresh at full cost), so a
+    /// remaining step is never priced below the model's amortized figure —
+    /// and the VAE decode after the last step, which never appears in step
+    /// events, stays in the number instead of arriving as a surprise stall.
+    static func liveEta(stepDurations: [Double], totalSteps: Int,
+                        floorPerStep: Double = 0, tail: Double = 0) -> Double? {
         let laps = Array(stepDurations.dropFirst())
         guard laps.count >= 2, totalSteps > 0 else { return nil }
         let remaining = totalSteps - stepDurations.count
-        guard remaining > 0 else { return 0 }
-        let mean = laps.reduce(0, +) / Double(laps.count)
-        return mean * Double(remaining)
+        guard remaining > 0 else { return tail }
+        let mean = max(laps.reduce(0, +) / Double(laps.count), floorPerStep)
+        return mean * Double(remaining) + tail
+    }
+
+    /// The pre-run model decomposed for the live readout: the amortized cost
+    /// of ONE step and the after-sampling tail (fixed stages + VAE decode),
+    /// both calibrated like `describeBest` — this Mac's history when it has
+    /// any, else the hardware model. `speedFactor` is one scalar, so scaling
+    /// the parts equals scaling the whole.
+    static func livePricing(model: VideoModelPreset, width: Int, height: Int, frames: Int,
+                            steps: Int, fast: Bool,
+                            history: H3RunHistory = .load()) -> (perStep: Double, tail: Double) {
+        let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: 250)
+        let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+        let vae = vaeAnchorSeconds * (Double(width) * Double(height) * Double(frames)) / vaeAnchorPixels
+        let tail = fixedSeconds + vae
+        if history.speedFactor != nil {
+            return (history.apply(toAnchorSeconds: perStep), history.apply(toAnchorSeconds: tail))
+        }
+        let hw = H3Hardware.current
+        let cores = hw.gpuCores > 0 ? Double(hw.gpuCores) : Double(H3Hardware.anchor.gpuCores)
+        let scale = Double(H3Hardware.anchor.gpuCores) / cores
+        return (perStep * scale, tail * scale)
     }
 
     /// "about 50 min" / "about 3 h 20 min", with where the number came from.
@@ -378,8 +406,9 @@ struct H3StepClock {
 
     /// Seconds remaining, or nil while there is not enough to say. See
     /// `H3TimeEstimate.liveEta` for why the first lap is discarded.
-    func eta(totalSteps: Int) -> Double? {
-        H3TimeEstimate.liveEta(stepDurations: durations, totalSteps: totalSteps)
+    func eta(totalSteps: Int, floorPerStep: Double = 0, tail: Double = 0) -> Double? {
+        H3TimeEstimate.liveEta(stepDurations: durations, totalSteps: totalSteps,
+                               floorPerStep: floorPerStep, tail: tail)
     }
 }
 

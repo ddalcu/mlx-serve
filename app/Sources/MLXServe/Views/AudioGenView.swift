@@ -299,6 +299,7 @@ struct VoiceGenView: View {
         return MediaModelChooser(
             featured: featured,
             others: MediaModelPicks.others(AudioModelPreset.all, featured: featured),
+            onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
             selectedId: model.id,
             lanModel: lanModel,
             capabilityOf: { $0.capabilityLabel },
@@ -588,7 +589,7 @@ struct VoiceGenView: View {
 
     private func hydrate() {
         let s = AudioGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature

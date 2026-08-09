@@ -16,8 +16,15 @@ import SwiftUI
 struct MediaModelChooser<P: MediaModelSizing>: View {
     /// Featured picks — one per capability, best that fits.
     let featured: [MediaModelPicks.Pick<P>]
-    /// Everything else, behind the "Other Models" menu.
+    /// Everything else in the CATALOGUE, behind the "Other Models" menu.
     let others: [P]
+    /// Checkpoints discovered on disk that the catalogue doesn't know about
+    /// (`CustomMediaModels`) — your own conversions, community packs. Listed
+    /// under their own heading rather than mixed into `others`: "Other Models"
+    /// means "the rest of what we ship", and a model the user put there
+    /// themselves is a different kind of thing. Default empty so a pane that
+    /// has no notion of custom checkpoints doesn't have to say so.
+    var onThisMac: [P] = []
     /// Currently selected preset id (local pick).
     let selectedId: String
     /// nil for a local pick, otherwise the LAN routing id it runs on.
@@ -62,7 +69,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
             )
 
             HStack(spacing: 8) {
-                if !others.isEmpty || !lanModels.isEmpty {
+                if !others.isEmpty || !onThisMac.isEmpty || !lanModels.isEmpty {
                     Menu("Other Models") {
                         ForEach(others) { preset in
                             Button {
@@ -71,6 +78,16 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                                 Text(isDownloaded(preset)
                                      ? preset.name
                                      : "\(preset.name) — not downloaded")
+                            }
+                        }
+                        // Yours, found on disk. No "not downloaded" suffix is
+                        // possible here — discovery IS the evidence it's there.
+                        if !onThisMac.isEmpty {
+                            Divider()
+                            Section("On This Mac") {
+                                ForEach(onThisMac) { preset in
+                                    Button(preset.name) { onSelect(preset) }
+                                }
                             }
                         }
                         if !lanModels.isEmpty {
@@ -106,10 +123,14 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
 
     /// The selected preset when it came from "Other Models" — nil when the
     /// selection is one of the featured rows (or a LAN model).
+    /// Searches BOTH menu groups: a discovered checkpoint you selected needs
+    /// the same row — with the same download control in the same place — as
+    /// one picked out of the catalogue, or choosing your own model makes the
+    /// row disappear.
     private var selectedNonFeatured: P? {
         guard lanModel == nil,
               !featured.contains(where: { $0.preset.id == selectedId }) else { return nil }
-        return others.first { $0.id == selectedId }
+        return others.first { $0.id == selectedId } ?? onThisMac.first { $0.id == selectedId }
     }
 
     private var showsSelectedExtraRow: Bool { selectedNonFeatured != nil }

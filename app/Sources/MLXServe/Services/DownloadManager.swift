@@ -115,6 +115,16 @@ class DownloadManager: ObservableObject {
         return [modelsDir, ModelRoots.builtInRoot]
     }
 
+    /// The folders READS check — everything the server scans (destination,
+    /// built-in, LM Studio, custom folder), so a pack in ANY served folder
+    /// never reads as "not downloaded" (`ModelRoots.readRoots`). Writes and
+    /// deletes stay on `ownedRoots`. A test-pinned root stays alone —
+    /// hermetic tests must never resolve into the developer's real library.
+    var readRoots: [String] {
+        guard pinnedRoot == nil else { return [modelsDir] }
+        return ModelRoots().readRoots(lmStudioRoot: lmStudioRoot)
+    }
+
     // MARK: - Path resolution
     //
     // New downloads land under `<modelsDir>/<author>/<name>/` (same shape as
@@ -425,12 +435,13 @@ class DownloadManager: ObservableObject {
         Self.newLayoutDir(rootDir: modelsDir, repoId: repoId)
     }
 
-    /// Where `repoId` lives, across every owned root. Reads must check them
+    /// Where `repoId` lives, across every SERVED root. Reads must check them
     /// all: resolving against the destination alone is how moving it made a
-    /// pre-move library read as absent (re-download offers on models already
-    /// on disk). Write targets keep using `newLayoutDir(for:)`.
+    /// pre-move library read as absent, and skipping the custom scan folder is
+    /// how a pack there got a Download bar over a copy already being served.
+    /// Write targets keep using `newLayoutDir(for:)`.
     func existingModelDir(for repoId: String) -> String? {
-        Self.existingModelDir(roots: ownedRoots, repoId: repoId)
+        Self.existingModelDir(roots: readRoots, repoId: repoId)
     }
 
     /// First root holding the repo wins — the destination leads `ownedRoots`,
@@ -635,8 +646,14 @@ class DownloadManager: ObservableObject {
     /// (`LiquidAI/LFM2.5-2.6B-MLX-4bit`) for the server to discover it. Progress
     /// stays keyed on `repoId` — the row the user clicked is the repo's.
     func download(repoId: String, selection: FileSelection = .chatDefault,
-                  alertOnFailure: Bool = true, destRepoId: String? = nil) async {
-        let destDir = newLayoutDir(for: destRepoId ?? repoId)
+                  alertOnFailure: Bool = true, destRepoId: String? = nil,
+                  destDirOverride: String? = nil) async {
+        // `destDirOverride`: an absolute dir that already holds the model —
+        // used when a fetch ADDS to an existing pack (the Turbo adapter),
+        // which may live in a non-destination owned root. Writing it to the
+        // destination instead creates a fragment dir that reads as a (broken)
+        // model to every resolver (live 2026-08-08).
+        let destDir = destDirOverride ?? newLayoutDir(for: destRepoId ?? repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
 
@@ -873,16 +890,47 @@ class DownloadManager: ObservableObject {
             }
             return
         }
+        // The adapter belongs BESIDE the pack's weights, wherever those live —
+        // a pack in a non-destination root must not grow a fragment dir in the
+        // destination (it shadows the real pack and the server dies loading it).
+        let packDir = existingModelDir(for: repoId)
+        turboLoraFetches.insert(repoId)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.download(repoId: repoId,
                                 selection: FileSelection(keepSafetensors: [TurboLoraFetch.fileName]),
-                                alertOnFailure: true)
-            self.finalizeIfCancelled(repoId: repoId)
+                                alertOnFailure: true,
+                                destDirOverride: packDir)
+            self.finalizeCancelledTurboLora(repoId: repoId, packDir: packDir)
+            self.turboLoraFetches.remove(repoId)
             self.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    /// Repo ids whose `activeTasks` entry is a Turbo-adapter fetch, not a full
+    /// pack download — `cancelTurboLora` must never cancel the latter.
+    private var turboLoraFetches: Set<String> = []
+
+    /// Stop an in-flight Turbo-adapter fetch (the toggle's off-flip). With no
+    /// adapter fetch running this does NOTHING — the generic `cancel(_:)`
+    /// no-task fallback wipes the repo's whole download dir, which here is a
+    /// live pack.
+    func cancelTurboLora(repoId: String) {
+        guard turboLoraFetches.contains(repoId) else { return }
+        activeTasks[repoId]?.cancel()
+    }
+
+    /// Cancel cleanup for a Turbo-adapter fetch: drop the ONE file's partials,
+    /// never the directory — the destination is the pack itself.
+    private func finalizeCancelledTurboLora(repoId: String, packDir: String?) {
+        guard Task.isCancelled else { return }
+        downloads.removeValue(forKey: repoId)
+        let dir = packDir ?? newLayoutDir(for: repoId)
+        let base = (dir as NSString).appendingPathComponent(TurboLoraFetch.fileName)
+        try? FileManager.default.removeItem(atPath: base + ".partial")
+        try? FileManager.default.removeItem(atPath: base + ".partial.parts")
     }
 
     // MARK: - Media bundles
@@ -925,7 +973,7 @@ class DownloadManager: ObservableObject {
     }
 
     func componentReady(_ comp: MediaComponent) -> Bool {
-        Self.componentReady(comp, roots: ownedRoots)
+        Self.componentReady(comp, roots: readRoots)
     }
 
     /// Multi-root form: ready in ANY owned root — a pack downloaded before the
@@ -1761,9 +1809,7 @@ class DownloadManager: ObservableObject {
     /// drafter for the loaded base model and by the Model Browser to badge
     /// already-downloaded drafter rows.
     func discoverDrafters() -> [LocalDrafter] {
-        var roots = ownedRoots
-        if let lms = lmStudioRoot { roots.append(lms) }
-        return Self.discoverDrafters(in: roots)
+        Self.discoverDrafters(in: readRoots)
     }
 
     /// Pick the drafter that pairs with the loaded base model. Returns nil

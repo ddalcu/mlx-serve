@@ -60,6 +60,14 @@ struct ResolvedAgentSettings: Sendable, Equatable {
     /// every user who never makes an agent. nil = "this path's own default".
     var temperatureOverride: Double?
     var maxTokensOverride: Int?
+    /// The remaining sampling knobs, raw for the same reason. These have no
+    /// decided twin — their app defaults live in `ServerOptions` and are laid
+    /// under them by `TurnConfig.requestDefaults(from:)` at request time.
+    var topPOverride: Double?
+    var topKOverride: Int?
+    var repeatPenaltyOverride: Double?
+    var presencePenaltyOverride: Double?
+    var reasoningBudgetOverride: Int?
     var voice: AgentVoice?
     /// The AGENT's own voice, nil when it didn't pick one.
     ///
@@ -145,6 +153,11 @@ enum AgentResolution {
             maxTokens: agent.maxTokens ?? defaults.maxTokens,
             temperatureOverride: agent.temperature,
             maxTokensOverride: agent.maxTokens,
+            topPOverride: agent.topP,
+            topKOverride: agent.topK,
+            repeatPenaltyOverride: agent.repeatPenalty,
+            presencePenaltyOverride: agent.presencePenalty,
+            reasoningBudgetOverride: agent.reasoningBudget,
             voice: agent.resolvedVoice ?? defaults.voice,
             voiceOverride: agent.resolvedVoice,
             wakePhrase: agent.wakePhrase.flatMap(WakeWord.normalizePhrase) ?? defaults.wakePhrase

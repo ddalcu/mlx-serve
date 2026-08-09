@@ -1088,45 +1088,166 @@ private struct AgentEditor: View {
 
     // MARK: Sampling
 
+    // Every row shows its control: on App default it renders the app's saved
+    // value grayed out, so the row says what the agent will actually run with
+    // instead of hiding it. The checkbox sits to the RIGHT of the control.
+
+    private static let topKPresets: [Int] = [0, 5, 10, 20, 40, 64, 100, 200, 500, 1000]
+    /// Same grid as Settings ▸ Max Tokens; 0 = Auto (omit, server pegs to the
+    /// remaining context).
+    private static let maxTokensPresets: [Int] = [
+        0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+    ]
+
+    /// Merge note: the seven controls are main's (#135 — an agent can pin its
+    /// own sampling); the card and the row grammar are this branch's. They were
+    /// written against a grouped `Form`, so each row moved from
+    /// `LabeledContent` to `AgentEditorRow` — otherwise this card would be the
+    /// one place in the editor where a label sits in a different column from
+    /// every other label.
     private var samplingSection: some View {
         AgentSection("Sampling") {
             AgentCard(spacing: 12) {
-                AgentEditorRow("Temperature") { temperatureControls }
+                sliderRow("Temperature", value: $agent.temperature,
+                          seed: appState.serverOptions.defaultTemperature, in: 0...1.5, step: 0.05,
+                          ends: ("Focused", "Creative"))
                 Divider()
-                AgentEditorRow("Max tokens") { maxTokensControls }
+                sliderRow("Top-p", value: $agent.topP,
+                          seed: appState.serverOptions.defaultTopP, in: 0.1...1.0, step: 0.01,
+                          ends: ("Focused", "Varied"))
+                Divider()
+                // 0 omits the field, so the model's own generation_config wins.
+                presetRow("Top-k", value: $agent.topK, seed: appState.serverOptions.defaultTopK,
+                          presets: Self.topKPresets, ends: ("Auto", "Wide"),
+                          label: { $0 == 0 ? "Auto" : "\($0)" })
+                Divider()
+                sliderRow("Repeat penalty", value: $agent.repeatPenalty,
+                          seed: appState.serverOptions.defaultRepeatPenalty, in: 1.0...2.0, step: 0.01,
+                          ends: ("Off", "Strong"))
+                Divider()
+                sliderRow("Presence penalty", value: $agent.presencePenalty,
+                          seed: appState.serverOptions.defaultPresencePenalty, in: 0.0...2.0, step: 0.01,
+                          ends: ("Off", "Strong"))
+                Divider()
+                presetRow("Max tokens", value: $agent.maxTokens, seed: appState.maxTokens,
+                          presets: Self.maxTokensPresets, ends: ("Auto", "Long"),
+                          label: { $0 <= 0 ? "Auto" : Self.formatTokens($0) })
+                Divider()
+                reasoningEffortRow
             }
         }
     }
 
-    private var temperatureControls: some View {
-        HStack(spacing: 10) {
-            Toggle("App default", isOn: Binding(
-                get: { agent.temperature == nil },
-                set: { agent.temperature = $0 ? nil : appState.serverOptions.defaultTemperature }))
-                .toggleStyle(.checkbox)
-                .disabled(readOnly)
-            if let value = agent.temperature {
-                Slider(value: Binding(get: { value }, set: { agent.temperature = $0 }),
-                       in: 0...1.5, step: 0.05)
-                    .frame(width: 140)
-                    .disabled(readOnly)
-                Text(String(format: "%.2f", value)).font(.subheadline.monospaced())
+    private static func formatTokens(_ n: Int) -> String {
+        n >= 1024 ? "\(n / 1024)K" : "\(n)"
+    }
+
+    /// The right-hand "App default" checkbox every sampling row carries:
+    /// checked = nil (follow Settings, control grayed), unchecking seeds from
+    /// the app's saved value so the control picks up exactly where the gray
+    /// preview was.
+    private func appDefaultToggle<T>(value: Binding<T?>, seed: T) -> some View {
+        Toggle("App default", isOn: Binding(
+            get: { value.wrappedValue == nil },
+            set: { value.wrappedValue = $0 ? nil : seed }))
+            .toggleStyle(.checkbox)
+            .disabled(readOnly)
+    }
+
+    private func sliderRow(_ title: String, value: Binding<Double?>, seed: Double,
+                           in range: ClosedRange<Double>, step: Double,
+                           ends: (String, String)) -> some View {
+        let isDefault = value.wrappedValue == nil
+        return AgentEditorRow(title, alignment: .center) {
+            HStack(spacing: 10) {
+                VStack(spacing: 1) {
+                    Slider(value: Binding(get: { value.wrappedValue ?? seed },
+                                          set: { value.wrappedValue = $0 }),
+                           in: range, step: step)
+                        .disabled(readOnly || isDefault)
+                    endLabels(ends, dimmed: isDefault)
+                }
+                .frame(width: 160)
+                Text(String(format: "%.2f", value.wrappedValue ?? seed))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(isDefault ? .secondary : .primary)
+                    .frame(width: Self.valueColumnWidth, alignment: .trailing)
+                appDefaultToggle(value: value, seed: seed)
             }
         }
     }
 
-    private var maxTokensControls: some View {
-        HStack(spacing: 10) {
-            Toggle("App default", isOn: Binding(
-                get: { agent.maxTokens == nil },
-                set: { agent.maxTokens = $0 ? nil : appState.maxTokens }))
-                .toggleStyle(.checkbox)
-                .disabled(readOnly)
-            if let value = agent.maxTokens {
-                TextField("", value: Binding(get: { value }, set: { agent.maxTokens = $0 }),
-                          format: .number)
-                    .frame(width: 90)
-                    .disabled(readOnly)
+    /// The value readout is a FIXED column: its text changes length while you
+    /// drag ("Auto" → "5" → "1000"), and letting it resize reflows the HStack
+    /// and moves the slider under the pointer mid-drag.
+    private static let valueColumnWidth: CGFloat = 44
+
+    /// Snapping preset slider (the Settings idiom) for values whose useful
+    /// range spans orders of magnitude — a linear slider wastes its whole
+    /// travel on the far end.
+    private func presetRow(_ title: String, value: Binding<Int?>, seed: Int,
+                           presets: [Int], ends: (String, String),
+                           label: @escaping (Int) -> String) -> some View {
+        let isDefault = value.wrappedValue == nil
+        let effective = value.wrappedValue ?? seed
+        return AgentEditorRow(title, alignment: .center) {
+            HStack(spacing: 10) {
+                VStack(spacing: 1) {
+                    Slider(value: Binding(
+                        get: { Double(Self.closestIndex(in: presets, to: effective)) },
+                        set: { value.wrappedValue = presets[max(0, min(Int($0.rounded()), presets.count - 1))] }),
+                           in: 0...Double(presets.count - 1), step: 1)
+                        .disabled(readOnly || isDefault)
+                    endLabels(ends, dimmed: isDefault)
+                }
+                .frame(width: 160)
+                Text(label(effective))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(isDefault ? .secondary : .primary)
+                    .frame(width: Self.valueColumnWidth, alignment: .trailing)
+                appDefaultToggle(value: value, seed: seed)
+            }
+        }
+    }
+
+    /// The one-word meaning of each end of a slider, tucked under the track.
+    private func endLabels(_ ends: (String, String), dimmed: Bool) -> some View {
+        HStack {
+            Text(ends.0)
+            Spacer()
+            Text(ends.1)
+        }
+        .font(.caption2)
+        .foregroundStyle(dimmed ? .tertiary : .secondary)
+    }
+
+    /// A stored value off the grid still positions the slider sensibly.
+    private static func closestIndex(in presets: [Int], to value: Int) -> Int {
+        presets.enumerated().min { abs($0.element - value) < abs($1.element - value) }?.offset ?? 0
+    }
+
+    /// Effort levels rather than a token field — the levels are the server's
+    /// own `reasoning_effort` budgets (`AgentReasoningEffort`), stored as
+    /// tokens so the wire stays `reasoning_budget`.
+    private var reasoningEffortRow: some View {
+        let isDefault = agent.reasoningBudget == nil
+        let seedTokens = AgentReasoningEffort
+            .nearest(to: appState.serverOptions.defaultReasoningBudget).budgetTokens
+        return AgentEditorRow("Reasoning budget", alignment: .center) {
+            HStack(spacing: 10) {
+                Picker("", selection: Binding(
+                    get: { AgentReasoningEffort.nearest(to: agent.reasoningBudget
+                                                        ?? appState.serverOptions.defaultReasoningBudget) },
+                    set: { agent.reasoningBudget = $0.budgetTokens })) {
+                    ForEach(AgentReasoningEffort.allCases, id: \.self) { level in
+                        Text(level.label).tag(level)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .disabled(readOnly || isDefault)
+                appDefaultToggle(value: $agent.reasoningBudget, seed: seedTokens)
             }
         }
     }

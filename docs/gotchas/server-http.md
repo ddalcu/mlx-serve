@@ -848,3 +848,39 @@ App side: `ModelRoots` is the one answer to both "where do downloads go" and "wh
 ## Context-overflow 400s name BOTH counts (`contextOverflowMessage`)
 
 All four text-gen surfaces: "Prompt exceeds maximum context length: N tokens requested, M available". The legacy sentence stays the PREFIX (clients key on it); the counts are only knowable server-side, since the request is rejected before any usage is reported, and without them a client can only say "too long" instead of offering the one action that fixes it. bufPrint failure falls back to the bare sentence rather than sending no body (the media-gen fixed-buffer class). The app renders it as a card.
+
+## A load failure crosses the inference-thread boundary by NAME (#144)
+
+Issue #144: Krea-2-Turbo mixed 4/8 answered `HTTP 500 {"message":"Model load
+failed"}` on a reporter's machine while loading fine elsewhere. The real reason
+(the media memory preflight refusing — peak ~14.7 GB against their free RAM)
+existed only as a server-log line; the reporter deleted and redownloaded the
+model, which could never have helped.
+
+On-demand loads run on the inference thread and failures come back as
+`req.error_name` — and `ensureLoaded` FREED the name unread, returning bare
+`error.LoadFailed`. So every cold-load failure (memory refusal, missing file,
+malformed config) collapsed into one unactionable 500, while the eviction-gate
+refusal (`error.NotEnoughMemory`, raised on the CONN thread) had a named 503
+the whole time. The message quality depended on which THREAD noticed the
+problem, not on what the problem was.
+
+Fix: map the name back to a typed error at the boundary
+(`ModelRegistry.loadErrorFromName`, also applied on both `.error_state` fast
+paths so retries answer the same). `InsufficientMemory` gets its OWN 503
+(`insufficient_free_memory_message`) rather than folding into the gate's: a
+preflight refusal is about free RAM and `--skip-mem-preflight`, the gate's is
+about `--max-resident-mem` — different knobs, and #126 says name the knob.
+Everything else stays `LoadFailed` and the HTTP arm echoes the registry's
+stored name: `Model load failed: FileNotFound`.
+
+One subtlety: a memory refusal now resets the entry to `.unloaded` instead of
+`.error_state`. The 503 tells the user to close apps and retry — with a sticky
+error_state that retry failed fast until a server restart, so the error message
+itself promised a remedy the state machine forbade. Transient refusals must not
+poison the entry.
+
+Guard: `model_registry.zig` test "memory-refused loads keep their identity,
+other failures expose their name".
+
+**Third bite (2026-08-09): `ownedRoots` fixed the destination move and became the next too-narrow list.** A Mage-Flow pack sitting in the CUSTOM scan folder (`/Volumes/G Drive SSD/models`, one of the server's `--model-dir` roots) was served by `/v1/models` while the Image pane showed a BundleDownloadBar over it — `bundleReady`/`componentReady`, `existingModelDir(for:)` and `ServerManager.resolveModelDir` all read `ownedRoots` (destination + built-in only), which deliberately excluded LM Studio + custom folders. The exclusion conflated two questions: "may the app DELETE here?" (no — other tools'/the user's trees) and "is this repo on disk?" (must check everywhere the server serves). Fix: `ModelRoots.readRoots` ≡ `scanRoots` (destination, built-in, LM Studio, custom — same first-wins order the server uses) behind every read: `existingModelDir(for:)` (which also targets the Turbo-adapter fetch — the adapter belongs beside the pack wherever it lives), `componentReady`, `discoverDrafters`, `resolveModelDir`, the voice-clone disk check. Writes, cancel cleanup and delete scoping stay on `ownedRoots`/`modelsDir`; a test-pinned root still stands alone. Guard: `testReadRootsCoverEveryServedFolderButOwnedRootsStayNarrow` (ModelRootsTests).

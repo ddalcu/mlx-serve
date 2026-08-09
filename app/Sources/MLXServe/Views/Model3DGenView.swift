@@ -136,6 +136,7 @@ struct Model3DGenView: View {
         return MediaModelChooser(
             featured: featured,
             others: MediaModelPicks.others(Model3DModelPreset.all, featured: featured),
+            onThisMac: CustomMediaModels.meshPresets(from: server.allModels),
             selectedId: model.id,
             lanModel: lanModel,
             capabilityOf: { $0.capabilityLabel },
@@ -350,7 +351,7 @@ struct Model3DGenView: View {
 
     private func hydrate() {
         let s = Model3DGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         steps = s.steps
         guidance = s.guidance

@@ -367,6 +367,56 @@ final class H3PlanningTests: XCTestCase {
         XCTAssertEqual(history.speedFactor!, 1.0, accuracy: 0.01)
     }
 
+    /// The observed lap mean under-prices what is LEFT: the fast recipe's
+    /// cheap cached laps dominate the history while the tail steps always
+    /// refresh at full cost, and the VAE decode after the last step never
+    /// appears in step events at all (live 2026-08-09: "about 77 sec left"
+    /// with minutes to go). The live ETA floors the lap price at the pre-run
+    /// model's own amortized per-step cost and carries the model's
+    /// after-sampling tail.
+    func testLiveEtaFloorsAtTheModelsPerStepPriceAndCarriesTheVaeTail() {
+        // 12 observed laps of 2 s (a heavily cached middle), 10 steps to go.
+        let laps = [30.0] + Array(repeating: 2.0, count: 12)
+        // Floor 0 / tail 0 is byte-identical to the old behavior.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: laps, totalSteps: 23)!,
+                       20.0, accuracy: 0.001)
+        // The model prices a step at 9 s amortized: the promise floors there,
+        // and the VAE tail rides on top.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: laps, totalSteps: 23,
+                                              floorPerStep: 9, tail: 40)!,
+                       130.0, accuracy: 0.001)
+        // A machine running SLOWER than the model keeps its own (higher) mean.
+        let slow = [30.0] + Array(repeating: 12.0, count: 12)
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: slow, totalSteps: 23,
+                                              floorPerStep: 9, tail: 40)!,
+                       160.0, accuracy: 0.001)
+        // Sampling done, decode not: the tail is what is left.
+        let done = Array(repeating: 2.0, count: 24)
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: done, totalSteps: 23,
+                                              floorPerStep: 9, tail: 40)!,
+                       40.0, accuracy: 0.001)
+    }
+
+    /// The live floor and tail ARE the pre-run estimate, decomposed — one
+    /// model, two readouts. If the decomposition drifts from `seconds()` the
+    /// live number stops meaning anything.
+    func testLivePricingIsThePreRunEstimateDecomposed() {
+        let whole = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124,
+                                           steps: 30, fast: true)
+        let p = H3TimeEstimate.livePricing(model: h3, width: 1344, height: 768, frames: 124,
+                                           steps: 30, fast: true, history: H3RunHistory(records: []))
+        XCTAssertEqual(p.perStep * 30 + p.tail, whole, accuracy: 0.001)
+        // Own-history calibration scales both parts, same as `describeBest`.
+        var history = H3RunHistory(records: [])
+        let anchor = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124,
+                                            steps: 30, fast: true, hardware: .anchor)
+        history.record(predictedOnAnchor: anchor, measured: anchor * 2)
+        let calibrated = H3TimeEstimate.livePricing(model: h3, width: 1344, height: 768, frames: 124,
+                                                    steps: 30, fast: true, history: history)
+        XCTAssertEqual(calibrated.perStep * 30 + calibrated.tail,
+                       history.apply(toAnchorSeconds: anchor), accuracy: 0.001)
+    }
+
     /// The estimate a user reads is a RANGE with named provenance — a bare
     /// point estimate on a 3-hour job reads as a promise.
     func testEstimateTextSaysHowLongAndWhereTheNumberCameFrom() {

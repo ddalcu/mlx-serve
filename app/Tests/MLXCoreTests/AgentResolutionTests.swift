@@ -106,6 +106,52 @@ final class AgentResolutionTests: XCTestCase {
         XCTAssertFalse(r.mcpEnabled, "an agent's MCP flag overrides the surface toggle")
     }
 
+    func testSamplingOverridesRideRawThroughResolution() {
+        // Same contract as temperatureOverride: the resolution carries the
+        // agent's RAW values (nil = "the path's own default") so the request
+        // builder can lay them over the user's saved sampling defaults.
+        let none = AgentResolution.resolve(agent: agent(), defaults: defaults())
+        XCTAssertNil(none.topPOverride)
+        XCTAssertNil(none.topKOverride)
+        XCTAssertNil(none.repeatPenaltyOverride)
+        XCTAssertNil(none.presencePenaltyOverride)
+        XCTAssertNil(none.reasoningBudgetOverride)
+
+        let a = agent {
+            $0.topP = 0.8
+            $0.topK = 20
+            $0.repeatPenalty = 1.15
+            $0.presencePenalty = 0.6
+            $0.reasoningBudget = 1024
+        }
+        let r = AgentResolution.resolve(agent: a, defaults: defaults())
+        XCTAssertEqual(r.topPOverride, 0.8)
+        XCTAssertEqual(r.topKOverride, 20)
+        XCTAssertEqual(r.repeatPenaltyOverride, 1.15)
+        XCTAssertEqual(r.presencePenaltyOverride, 0.6)
+        XCTAssertEqual(r.reasoningBudgetOverride, 1024)
+    }
+
+    func testReasoningEffortLevelsMapToTheServersOwnBudgets() {
+        // The editor shows effort levels; the wire stays `reasoning_budget`,
+        // in the server's own `effortBudget` denominations (low 512 /
+        // medium 2048 / high 8192; unlimited = -1). Sending `reasoning_effort`
+        // instead would also flip thinking on/off, which the Capabilities
+        // tri-state owns.
+        XCTAssertEqual(AgentReasoningEffort.low.budgetTokens, 512)
+        XCTAssertEqual(AgentReasoningEffort.medium.budgetTokens, 2048)
+        XCTAssertEqual(AgentReasoningEffort.high.budgetTokens, 8192)
+        XCTAssertEqual(AgentReasoningEffort.unlimited.budgetTokens, -1)
+
+        // Stored numbers from older builds — and whatever the app default is —
+        // land on the nearest level instead of leaving the picker unselected.
+        XCTAssertEqual(AgentReasoningEffort.nearest(to: -1), .unlimited)
+        XCTAssertEqual(AgentReasoningEffort.nearest(to: 512), .low)
+        XCTAssertEqual(AgentReasoningEffort.nearest(to: 1024), .low)
+        XCTAssertEqual(AgentReasoningEffort.nearest(to: 4096), .medium)
+        XCTAssertEqual(AgentReasoningEffort.nearest(to: 32768), .high)
+    }
+
     func testEmptySystemPromptYieldsNoPrefix() {
         let a = agent { $0.systemPrompt = "   \n " }
         XCTAssertEqual(AgentResolution.resolve(agent: a, defaults: defaults()).systemPromptPrefix, "")

@@ -47,6 +47,68 @@ final class AgentTurnConfigTests: XCTestCase {
         let config = ChatTurnEngine.TurnConfig.from(resolved { _ in })
         XCTAssertNil(config.temperature)
         XCTAssertNil(config.maxTokens)
+        XCTAssertNil(config.topP)
+        XCTAssertNil(config.topK)
+        XCTAssertNil(config.repeatPenalty)
+        XCTAssertNil(config.presencePenalty)
+        XCTAssertNil(config.reasoningBudget)
+    }
+
+    // MARK: - Request defaults (the agent's sampling laid over the user's)
+
+    func testRequestDefaultsWithoutOverridesMatchTheGlobalBuild() {
+        // No agent overrides ⇒ byte-identical to what the call sites sent before
+        // (RequestDefaults.from) — the upgrade guarantee at the request layer.
+        var opts = ServerOptions()
+        opts.defaultTopP = 0.9
+        opts.defaultTopK = 20
+        opts.defaultRepeatPenalty = 1.15
+        opts.defaultPresencePenalty = 0.6
+        opts.defaultReasoningBudget = 1024
+        let config = ChatTurnEngine.TurnConfig.from(resolved { _ in })
+        XCTAssertEqual(config.requestDefaults(from: opts), APIClient.RequestDefaults.from(opts))
+    }
+
+    func testRequestDefaultsApplyTheAgentsSamplingOverrides() {
+        var opts = ServerOptions()
+        opts.defaultTopP = 0.9
+        opts.defaultTopK = 20
+        opts.defaultRepeatPenalty = 1.15
+        opts.defaultPresencePenalty = 0.6
+        opts.defaultReasoningBudget = 1024
+
+        // Each override REPLACES the saved default — including replacing it
+        // with the canonical "off" value, which must clear the global rather
+        // than leave it standing (an agent that wants top_k off against a
+        // global top_k 20 would otherwise be un-expressible). The off values
+        // map exactly as RequestDefaults.from maps them: omitted from the body.
+        let config = ChatTurnEngine.TurnConfig.from(resolved {
+            $0.topP = 0.7
+            $0.topK = 0          // 0 = model default ⇒ field omitted
+            $0.repeatPenalty = 1.0   // 1.0 = off ⇒ omitted
+            $0.presencePenalty = 1.3
+            $0.reasoningBudget = -1  // -1 = unlimited ⇒ omitted
+        })
+        let d = config.requestDefaults(from: opts)
+        XCTAssertEqual(d.topP, 0.7)
+        XCTAssertNil(d.topK)
+        XCTAssertNil(d.repeatPenalty)
+        XCTAssertEqual(d.presencePenalty, 1.3)
+        XCTAssertNil(d.reasoningBudget)
+
+        // And the non-off direction: a value where the global had none.
+        var quiet = ServerOptions()
+        quiet.defaultTopK = 0
+        quiet.defaultRepeatPenalty = 1.0
+        let loud = ChatTurnEngine.TurnConfig.from(resolved {
+            $0.topK = 40
+            $0.repeatPenalty = 1.1
+            $0.reasoningBudget = 2048
+        })
+        let d2 = loud.requestDefaults(from: quiet)
+        XCTAssertEqual(d2.topK, 40)
+        XCTAssertEqual(d2.repeatPenalty, 1.1)
+        XCTAssertEqual(d2.reasoningBudget, 2048)
     }
 
     func testTheAgentsVoiceRidesTheTurnSoItCanNeverGoStale() {

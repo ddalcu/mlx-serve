@@ -298,6 +298,7 @@ struct ImageGenView: View {
         return MediaModelChooser(
             featured: featured,
             others: MediaModelPicks.others(ImageModelPreset.all, featured: featured),
+            onThisMac: CustomMediaModels.imagePresets(from: server.allModels),
             selectedId: model.id,
             lanModel: lanModel,
             capabilityOf: { $0.capabilityLabel },
@@ -729,7 +730,7 @@ struct ImageGenView: View {
     /// writes trigger doesn't reapply preset defaults over them.
     private func hydrate() {
         let s = ImageGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)

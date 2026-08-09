@@ -89,6 +89,23 @@ struct ModelRoots {
         return dest == Self.builtInRoot ? [dest] : [dest, Self.builtInRoot]
     }
 
+    /// The folders the app READS when asking "is this repo on disk?" — the
+    /// same list the server scans, in the same first-wins order. A pack in ANY
+    /// served folder must not be offered as a download (live 2026-08-09: a
+    /// Mage-Flow pack in the custom scan folder showed a Download bar, and
+    /// Generate could not resolve its dir). Only WRITES, cancel cleanup and
+    /// deletes stay on `ownedRoots` — the extra folders are the user's or
+    /// another tool's trees the app must not delete into.
+    func readRoots(lmStudioRoot: String?) -> [String] {
+        scanRoots(lmStudioRoot: lmStudioRoot)
+    }
+
+    /// Static convenience for read sites without a DownloadManager instance
+    /// (ServerManager's resolver, the voice-clone disk check).
+    static func readRoots() -> [String] {
+        ModelRoots().readRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+    }
+
     /// Every folder to scan, in the order the server should take them:
     /// download destination first, because `--model-dir` is first-wins on a
     /// repeated model id and the folder we write into holds the live copy.

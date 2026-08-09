@@ -29,6 +29,25 @@ final class ModelRootsTests: XCTestCase {
         return p
     }
 
+    /// A model in the custom scan folder (or LM Studio's) is served by the
+    /// server, so the app's "is it on disk?" reads must find it there too —
+    /// reading only `ownedRoots` is how a pack in the custom folder got a
+    /// Download bar over a copy already being served. Writes/deletes stay on
+    /// `ownedRoots`, so the custom folder must NOT appear there.
+    func testReadRootsCoverEveryServedFolderButOwnedRootsStayNarrow() {
+        let dest = tempDir("dest"), custom = tempDir("custom"), lms = tempDir("lms")
+        var roots = ModelRoots(defaults: defaults)
+        roots.configuredDownloadRoot = dest
+        roots.customRoot = custom
+        let read = roots.readRoots(lmStudioRoot: lms)
+        XCTAssertEqual(read, roots.scanRoots(lmStudioRoot: lms))
+        XCTAssertEqual(read.first, dest)
+        XCTAssertTrue(read.contains(custom))
+        XCTAssertTrue(read.contains(lms))
+        XCTAssertFalse(roots.ownedRoots.contains(custom))
+        XCTAssertFalse(roots.ownedRoots.contains(lms))
+    }
+
     // MARK: - The download destination
 
     /// With nothing configured the destination is exactly what it has always

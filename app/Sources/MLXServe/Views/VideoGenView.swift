@@ -260,6 +260,7 @@ struct VideoGenView: View {
         return MediaModelChooser(
             featured: featured,
             others: MediaModelPicks.others(VideoModelPreset.all, featured: featured),
+            onThisMac: CustomMediaModels.videoPresets(from: server.allModels),
             selectedId: model.id,
             lanModel: lanModel,
             capabilityOf: { $0.capabilityLabel },
@@ -891,8 +892,13 @@ struct VideoGenView: View {
                         // than at Generate: 744 MB discovered 30 seconds into
                         // a job reads as a hang, and this way the Downloads
                         // pane shows it while the user finishes their prompt.
+                        // The off-flip CANCELS an in-flight fetch — without
+                        // that, a briefly-ticked box still downloads 744 MB
+                        // in the background with nothing on screen saying so.
                         if on, turboFetchDecision == .fetch {
                             downloads.startTurboLora(repoId: model.repo)
+                        } else if !on {
+                            downloads.cancelTurboLora(repoId: model.repo)
                         }
                     }
                 if turboFetchDecision == .fetch {
@@ -1223,7 +1229,7 @@ struct VideoGenView: View {
 
     private func hydrate() {
         let s = VideoGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)

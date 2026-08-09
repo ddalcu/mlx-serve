@@ -825,3 +825,27 @@ The reference block calls comfy_kitchen CUDA kernels that do not run on a Mac, s
 ## A permutation-invariant checksum cannot see a permutation (H3 layout fixture)
 
 The per-axis position SUM passes unchanged when the two stereo channels' pinned `w` coordinates are swapped. Pair any column checksum with a row-index-WEIGHTED one (`pos_weighted`) — found by doing red-on-revert properly rather than by inspection.
+
+## An incomplete media pack reads as a model everywhere and dies in the text loader (live 2026-08-08)
+
+The Video pane's Turbo-adapter fetch wrote to the DESTINATION root while the 4-bit H3 pack lived in another owned root, creating `models-dl/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit/` holding only config.json + tokenizer files + `turbo_lora.safetensors` (0.7 GB). That fragment carries a valid `minimax_h3` config.json, so: (1) server discovery registered it as a model, and first-wins across `--model-dir` roots SHADOWED both complete copies in later roots; (2) the app's `resolveModelDir` walks the same order and resolved it too, so a plain Generate — Turbo unchecked — loaded it; (3) `gen.detectModality` correctly declined it (missing `transformer.safetensors`) but the loader then fell through to the MLX TEXT path, globbed the lora as an LM, and hit `MISSING WEIGHT: model.embed_tokens.weight` → `log.err` + `unreachable` → dead process. Nothing heals the fragment: readiness is checked across ALL owned roots, the pack reads complete elsewhere, so no download is ever offered for the fragment dir.
+
+The class is bigger than the fragment: EVERY H3/LTX pack download holds a valid config.json for the tens of minutes its big weights are still `.partial`, and an interrupted pull stays that way — a boot (or `/v1/models/rescan`) during that window registers a landmine.
+
+Four-part fix, each half load-bearing:
+- `model_discovery.requiredMediaMarker` is the ONE completeness table (`gen.requiredMarkerFor` DELEGATES — gen can import discovery, not the reverse); discovery skips marker-missing media dirs like any half-pulled download, and `probeModelDir` (register-by-path) answers `error.IncompleteMediaPack` → a named 400.
+- The scheduler's preload refuses a media-typed dir that failed its marker BY NAME instead of falling through to the text loader — by-path loads never see discovery, and `unreachable` on a missing weight means one stale dir kills the server.
+- `startTurboLora` downloads INTO the pack's resolved dir (`download(destDirOverride:)`) — an adapter's whole point is to sit beside weights that already exist.
+- The Turbo toggle's off-flip cancels an in-flight fetch via `cancelTurboLora`, which is surgical (drops the one file's `.partial` + sidecar) and a NO-OP with nothing running — the generic `cancel(_:)` no-task fallback wipes the repo's whole download dir, which for an adapter fetch is a live 40-69 GB pack.
+
+Guards: `discovery skips an incomplete media pack` + `probeModelDir refuses…` (model_discovery.zig), `incompleteMediaDir` (gen.zig), `tests/test_model_rescan.sh` (incl. server-survives-the-refused-load), `TurboLoraFetchTargetTests`.
+
+## A directory-entry filter that skips symlinks measures an HF-cache model at ZERO (live 2026-08-09)
+
+A first-launch user loaded `DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw` (121 GB) straight out of the HuggingFace hub cache and the machine went 34 GB into swap within a minute. The log had already said why nothing stopped it: `[preflight] weights ~0.00 GB, available 71.19 GB`. A hub-cache snapshot dir holds SYMLINKS into `../../blobs`; entry iteration reports them as `.sym_link`, and every server-side size sum filtered `if (entry.kind != .file) continue;` — so every weight file measured zero, and `memInsufficientForLoad` deliberately treats 0 as "unknown → allow" (a failed memory query must never block a load).
+
+The class was every size sum, not just the preflight: `scheduler.modelDiskBytes` (the preflight), discovery's `bytes_on_disk` loops in `tryAddModel`/`sumComponentWeights`/`probeModelDir` (feeding `/v1/models`, the app's RAM column, and `scheduler.gateEstimateBytes` — the #126 admission/eviction gate, which also passed at ~0), `gen.sumSafetensorsIn` (media residency), and cli's `list` size loop + GGUF classification. The app was INNOCENT: `DownloadManager` already resolves symlinks for sizes and deliberately scans the hub cache as a read-only root — it is what hands the server these snapshot paths.
+
+Fix: every entry filter also accepts `.sym_link` and stats through it (`Dir.statFile` FOLLOWS symlinks by default — all stat-RESULT checks already worked), plus a post-stat `st.kind == .file` check so a symlink-to-directory can't be summed; dangling links hit the existing `catch continue`. Zero now means a genuinely weightless dir, so the allow-on-zero semantic stands. Guards: `modelDiskBytes follows HF-cache symlinks` (scheduler.zig), `discovery measures a SYMLINKED (HF hub cache) model dir's real bytes` (model_discovery.zig).
+
+Same report, second item: the CLI bound `0.0.0.0` by default, putting a first-launch server on whatever network the laptop joins. Kept (the app and Agent Sandbox need wide binds they set EXPLICITLY) but serve mode now warns when the bind is non-loopback and nobody chose it — no `--host`, no `--lan-share` (`server.shouldWarnOpenBind`); the default flips to 127.0.0.1 in a future release, at which point the helper's host check silences the warning without a code change.

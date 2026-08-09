@@ -51,6 +51,22 @@ const supported_model_types = [_][]const u8{
 /// and `/v1/load-model` by-path accept them; the modality engine (not the MLX
 /// transformer) handles the load. Kept as inline string checks so this module
 /// stays filesystem-only (no mlx/gen import). Mirrors `gen.modalityFromType`.
+/// A file that must exist beside config.json for `model_type` to count as a
+/// COMPLETE media pack. Every H3/LTX download holds a valid config.json for
+/// the tens of minutes its big weights are still `.partial` (and a turbo-lora
+/// fragment forever) — registering such a dir shadows complete copies in
+/// later roots, and loading it falls through to the text loader, which dies
+/// on the first missing weight. The ONE table: `gen.requiredMarkerFor`
+/// delegates here, so discovery, register-by-path and the load guard agree.
+pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
+    // LTX: distinguishes the real bundle from any other "AudioVideo" config
+    // and proves the text path can load.
+    if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
+    // MiniMax-H3: our converted layout always writes this next to config.json.
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
+    return null;
+}
+
 pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
@@ -457,6 +473,11 @@ pub const DiscoveredModel = struct {
 pub const DiscoveryResult = struct {
     models: []DiscoveredModel,
     allocator: std.mem.Allocator,
+    /// The roots this result was scanned from (owned dupes; set by
+    /// `discoverModelsMany`). Kept so `ModelRegistry.rescan` can re-walk
+    /// them at runtime — models downloaded after boot are invisible to a
+    /// boot-only scan.
+    roots: []const []const u8 = &.{},
 
     pub fn deinit(self: *DiscoveryResult) void {
         for (self.models) |*m| {
@@ -465,6 +486,10 @@ pub const DiscoveryResult = struct {
             if (m.model_type.len > 0) self.allocator.free(m.model_type);
         }
         self.allocator.free(self.models);
+        if (self.roots.len > 0) {
+            for (self.roots) |r| self.allocator.free(r);
+            self.allocator.free(self.roots);
+        }
     }
 };
 
@@ -598,6 +623,27 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 /// the second folder can live on an external drive, and unplugging it must not
 /// stop the server serving everything else.
 pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8) !DiscoveryResult {
+    // Dupe the roots first so the result can carry them (see
+    // `DiscoveryResult.roots`).
+    var roots_owned: []const []const u8 = &.{};
+    if (roots.len > 0) {
+        const dupes = try allocator.alloc([]const u8, roots.len);
+        var done: usize = 0;
+        errdefer {
+            for (dupes[0..done]) |r| allocator.free(r);
+            allocator.free(dupes);
+        }
+        for (roots) |r| {
+            dupes[done] = try allocator.dupe(u8, r);
+            done += 1;
+        }
+        roots_owned = dupes;
+    }
+    errdefer if (roots_owned.len > 0) {
+        for (roots_owned) |r| allocator.free(r);
+        allocator.free(roots_owned);
+    };
+
     var merged = std.ArrayList(DiscoveredModel).empty;
     errdefer {
         for (merged.items) |*m| {
@@ -635,7 +681,7 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         }
     }
 
-    return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator };
+    return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
 }
 
 /// Core scan over an already-open root. Two layouts are recognized:
@@ -753,6 +799,17 @@ fn tryAddModel(
     };
     errdefer if (model_type.len > 0) allocator.free(model_type);
 
+    // An incomplete media pack stays invisible, like any half-pulled
+    // download (see `requiredMediaMarker`).
+    if (requiredMediaMarker(model_type)) |marker| {
+        const present = if (sub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
+        if (!present) {
+            log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)", .{ name, model_type, marker });
+            allocator.free(model_type);
+            return true;
+        }
+    }
+
     // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
     // GGUF entries already carry the picked file's size instead.
     if (!bytes_ok) {
@@ -761,9 +818,10 @@ fn tryAddModel(
             defer sd.close(io);
             var sd_iter = sd.iterate();
             while (sd_iter.next(io) catch null) |sub_entry| {
-                if (sub_entry.kind != .file) continue;
+                if (sub_entry.kind != .file and sub_entry.kind != .sym_link) continue;
                 if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
                 const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
+                if (st.kind != .file) continue;
                 bytes += @intCast(st.size);
                 bytes_ok = true;
             }
@@ -808,9 +866,10 @@ fn sumComponentWeights(io: std.Io, parent: std.Io.Dir, name: []const u8, bytes: 
         defer comp.close(io);
         var cit = comp.iterate();
         while (cit.next(io) catch null) |f| {
-            if (f.kind != .file) continue;
+            if (f.kind != .file and f.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, f.name, ".safetensors")) continue;
             const st = comp.statFile(io, f.name, .{}) catch continue;
+            if (st.kind != .file) continue;
             bytes.* += @intCast(st.size);
             found_any = true;
         }
@@ -874,6 +933,15 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     };
     errdefer allocator.free(model_type);
 
+    // Same completeness rule as tryAddModel: registering an incomplete media
+    // pack by path would hand it straight to the text loader.
+    if (requiredMediaMarker(model_type)) |marker| {
+        var msub = dir.openDir(io, base, .{}) catch return error.ModelDirNotFound;
+        defer msub.close(io);
+        const present = if (msub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
+        if (!present) return error.IncompleteMediaPack;
+    }
+
     var bytes: u64 = 0;
     var bytes_ok = false;
     var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
@@ -881,9 +949,10 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
         defer sd.close(io);
         var it = sd.iterate();
         while (it.next(io) catch null) |entry| {
-            if (entry.kind != .file) continue;
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
             const st = sd.statFile(io, entry.name, .{}) catch continue;
+            if (st.kind != .file) continue;
             bytes += @intCast(st.size);
             bytes_ok = true;
         }
@@ -1165,6 +1234,30 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
     var none = try discoverModelsMany(io, allocator, &.{});
     defer none.deinit();
     try std.testing.expectEqual(@as(usize, 0), none.models.len);
+}
+
+test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // HF hub-cache snapshot shape: every file is a symlink into ../../blobs.
+    // bytes_on_disk feeds /v1/models, the app's RAM column AND
+    // scheduler.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/w1", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "org/snap-model");
+    try tmp.dir.symLink(io, "../../blobs/cfg", "org/snap-model/config.json", .{});
+    try tmp.dir.symLink(io, "../../blobs/w1", "org/snap-model/model.safetensors", .{});
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("org/snap-model", result.models[0].id);
+    try testing.expectEqual(@as(?u64, 10), result.models[0].bytes_on_disk);
 }
 
 test "discoverModels finds GGUF dirs without config.json (issue #59)" {
@@ -1713,4 +1806,51 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         const m = parseStubMeta(a, "not json", true);
         try testing.expect(!m.found);
     }
+}
+
+test "discovery skips an incomplete media pack (media model_type without its marker)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The live 2026-08-08 shape: a turbo-lora fragment (and equally, any
+    // in-flight H3 pack) holds a valid minimax_h3 config.json and SOME
+    // safetensors, but not transformer.safetensors. Registering it shadows
+    // complete copies in later roots and the text loader dies on it.
+    try tmp.dir.createDirPath(io, "ddalcu/h3-fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-fragment/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-fragment/turbo_lora.safetensors", .data = "0123" });
+    // A COMPLETE pack (marker present) stays discovered.
+    try tmp.dir.createDirPath(io, "ddalcu/h3-complete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-complete/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-complete/transformer.safetensors", .data = "0123" });
+    // LTX has its own marker (connector.safetensors).
+    try tmp.dir.createDirPath(io, "x/ltx-partial");
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-partial/config.json", .data = "{\"model_type\":\"AudioVideo\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-partial/vae_decoder.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("ddalcu/h3-complete", result.models[0].id);
+}
+
+test "probeModelDir refuses an incomplete media pack by name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "h3-fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "h3-fragment/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "h3-fragment/turbo_lora.safetensors", .data = "0123" });
+    const dir = try std.fs.path.join(allocator, &.{ root, "h3-fragment" });
+    defer allocator.free(dir);
+
+    try testing.expectError(error.IncompleteMediaPack, probeModelDir(io, allocator, dir));
 }

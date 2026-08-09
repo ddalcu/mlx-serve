@@ -95,8 +95,15 @@ struct ImageGenSettings: Codable, Equatable {
 extension ImageGenSettings {
     /// The persisted model, or the catalog default when the id is unknown
     /// (uninstalled / renamed preset).
-    var resolvedModel: ImageModelPreset {
-        ImageModelPreset.all.first { $0.id == modelId } ?? .flux2Klein4B_Q4
+    var resolvedModel: ImageModelPreset { resolvedModel(models: []) }
+
+    /// Same, but also resolving custom (user-added) models against the live
+    /// `/v1/models` list — a custom id with the list unavailable (server
+    /// down) falls back like any unknown id.
+    func resolvedModel(models: [ModelInfo]) -> ImageModelPreset {
+        ImageModelPreset.all.first { $0.id == modelId }
+            ?? CustomMediaModels.imagePreset(for: modelId, from: models)
+            ?? .flux2Klein4B_Q4
     }
 
     /// The persisted resolution revalidated against `m`'s buckets — unknown ids
@@ -159,8 +166,12 @@ struct AudioGenSettings: Codable, Equatable {
 }
 
 extension AudioGenSettings {
-    var resolvedModel: AudioModelPreset {
-        AudioModelPreset.all.first { $0.id == modelId } ?? .qwen3TTS06B8bit
+    var resolvedModel: AudioModelPreset { resolvedModel(models: []) }
+
+    func resolvedModel(models: [ModelInfo]) -> AudioModelPreset {
+        AudioModelPreset.all.first { $0.id == modelId }
+            ?? CustomMediaModels.audioPreset(for: modelId, from: models)
+            ?? .qwen3TTS06B8bit
     }
 
     init(from decoder: Decoder) throws {
@@ -198,8 +209,12 @@ struct MusicGenSettings: Codable, Equatable {
 }
 
 extension MusicGenSettings {
-    var resolvedModel: MusicModelPreset {
-        MusicModelPreset.all.first { $0.id == modelId } ?? .acestepXLTurbo8bit
+    var resolvedModel: MusicModelPreset { resolvedModel(models: []) }
+
+    func resolvedModel(models: [ModelInfo]) -> MusicModelPreset {
+        MusicModelPreset.all.first { $0.id == modelId }
+            ?? CustomMediaModels.musicPreset(for: modelId, from: models)
+            ?? .acestepXLTurbo8bit
     }
 
     init(from decoder: Decoder) throws {
@@ -258,11 +273,20 @@ extension VideoGenSettings {
     /// resolutions and request capability-gating on this value, and the old
     /// blanket LTX fallback sent a remote H3 off-canvas sizes and frame
     /// counts below its trained floor.
-    var resolvedModel: VideoModelPreset {
+    var resolvedModel: VideoModelPreset { resolvedModel(models: []) }
+
+    func resolvedModel(models: [ModelInfo]) -> VideoModelPreset {
         if let local = VideoModelPreset.all.first(where: { $0.id == modelId }) { return local }
-        if let lan = LanPick.lanId(modelId),
-           let matched = VideoModelPreset.all.first(where: { $0.id == LanPick.base(of: lan) }) {
-            return matched
+        // A custom pick (local or a peer's) adopts its family preset the same
+        // way — the pane gates canvases, frame ladders and request fields on
+        // the resolved value, so an unmatched custom must not keep another
+        // backend's knobs.
+        if let lan = LanPick.lanId(modelId) {
+            let base = LanPick.base(of: lan)
+            if let matched = VideoModelPreset.all.first(where: { $0.id == base }) { return matched }
+            if let custom = CustomMediaModels.videoPreset(for: base, from: models) { return custom }
+        } else if let custom = CustomMediaModels.videoPreset(for: modelId, from: models) {
+            return custom
         }
         return .ltx23Q4
     }
@@ -333,8 +357,12 @@ struct Model3DGenSettings: Codable, Equatable {
 }
 
 extension Model3DGenSettings {
-    var resolvedModel: Model3DModelPreset {
-        Model3DModelPreset.all.first { $0.id == modelId } ?? .hunyuan3d21_8bit
+    var resolvedModel: Model3DModelPreset { resolvedModel(models: []) }
+
+    func resolvedModel(models: [ModelInfo]) -> Model3DModelPreset {
+        Model3DModelPreset.all.first { $0.id == modelId }
+            ?? CustomMediaModels.meshPreset(for: modelId, from: models)
+            ?? .hunyuan3d21_8bit
     }
 
     init(from decoder: Decoder) throws {

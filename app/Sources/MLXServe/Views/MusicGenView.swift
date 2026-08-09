@@ -162,12 +162,16 @@ struct MusicGenView: View {
             Text("Model").font(.subheadline.weight(.semibold))
             Picker("", selection: LanPick.selection(
                 model: $model, lanModel: $lanModel,
-                resolve: { id in MusicModelPreset.all.first { $0.id == id } },
+                resolve: { [models = server.allModels] id in
+                    MusicModelPreset.all.first { $0.id == id }
+                        ?? CustomMediaModels.musicPreset(for: id, from: models)
+                },
                 persist: persist)
             ) {
                 ForEach(MusicModelPreset.all) { preset in
                     Text(preset.name).tag(preset.id)
                 }
+                CustomModelPickerRows(presets: CustomMediaModels.musicPresets(from: server.allModels))
                 LanModelPickerRows(capability: "music")
             }
             .labelsHidden()
@@ -377,7 +381,7 @@ struct MusicGenView: View {
 
     private func hydrate() {
         let s = MusicGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         durationSeconds = Double(s.durationSeconds)
         vocalLanguage = s.vocalLanguage

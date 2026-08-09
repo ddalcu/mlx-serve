@@ -81,7 +81,8 @@ fn printUsage(io: std.Io) void {
         \\Options:
         \\  --model <dir>       Path to MLX model directory
         \\  --serve             Start HTTP server mode
-        \\  --host <ip>         Bind address (default: 0.0.0.0)
+        \\  --host <ip>         Bind address (default: 0.0.0.0 — open to the local
+        \\                      network; a future version will default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
@@ -402,6 +403,7 @@ pub fn main(init: std.process.Init) !void {
     var extra_roots_n: usize = 0;
     var port: u16 = 11234;
     var host: []const u8 = "0.0.0.0";
+    var host_explicit = false;
     // `--log-file <path|off>`. null = default (`~/.mlx-serve/logs/mlx-serve-<port>.log`).
     var log_file_arg: ?[]const u8 = null;
     var serve_mode = false;
@@ -493,6 +495,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             i += 1;
             host = args[i];
+            host_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--serve")) {
             serve_mode = true;
         } else if (std.mem.eql(u8, args[i], "--stream")) {
@@ -884,6 +887,11 @@ pub fn main(init: std.process.Init) !void {
             log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
+        }
+        // Above every serve dispatch (GGUF/headless/media return early below).
+        if (server_mod.shouldWarnOpenBind(host_explicit, server_mod.g_lan_share_spec != null, host)) {
+            log.warn("Listening on {s}:{d} — reachable by every device on the network this Mac is on.\n", .{ host, port });
+            log.warn("Restrict to this Mac with --host 127.0.0.1 (a future version will make that the default).\n", .{});
         }
     }
 

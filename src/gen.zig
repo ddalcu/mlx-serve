@@ -223,12 +223,10 @@ fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// weight map and died on `model.norm.weight`. A per-MODALITY guard cannot
 /// survive a modality growing a second backend.
 pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
-    // LTX: distinguishes the real bundle from any other "AudioVideo" config
-    // and proves the text path can load.
-    if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
-    // MiniMax-H3: our converted layout always writes this next to config.json.
-    if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
-    return null;
+    // The table lives in model_discovery (fs-only, so discovery and
+    // register-by-path apply the SAME completeness rule) — this module can
+    // import that one, just not the other way around.
+    return discovery.requiredMediaMarker(model_type);
 }
 
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
@@ -244,6 +242,22 @@ pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         }
     }
     return modality;
+}
+
+/// True when `model_dir` declares a media `model_type` whose required marker
+/// is missing — an incomplete pack (an in-flight or interrupted download, or
+/// a stray fragment). The load path refuses these BY NAME: falling through to
+/// the text loader globs whatever safetensors ARE present and dies on the
+/// first missing weight (`unreachable` in ReleaseFast — live 2026-08-08, a
+/// turbo-lora fragment killed the server on a plain Generate).
+pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const mt = peekModelType(io, allocator, model_dir) orelse return false;
+    defer allocator.free(mt);
+    if (modalityFromType(mt) == null) return false;
+    const marker = requiredMarkerFor(mt) orelse return false;
+    const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return false;
+    defer allocator.free(p);
+    return !fileExists(io, p);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -3370,19 +3384,24 @@ pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
 }
 
 fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
+    // Symlinked weights count (statFile follows) — an HF hub-cache snapshot
+    // is ALL symlinks into ../../blobs; skipping them billed a pack at 0.
     var total: u64 = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".safetensors")) {
+        if ((entry.kind == .file or entry.kind == .sym_link) and std.mem.endsWith(u8, entry.name, ".safetensors")) {
             const st = dir.statFile(io, entry.name, .{}) catch continue;
+            if (st.kind != .file) continue;
             total += @intCast(st.size);
         } else if (entry.kind == .directory) {
             var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(io);
             var sit = sub.iterate();
             while (sit.next(io) catch null) |se| {
-                if (se.kind != .file or !std.mem.endsWith(u8, se.name, ".safetensors")) continue;
+                if (se.kind != .file and se.kind != .sym_link) continue;
+                if (!std.mem.endsWith(u8, se.name, ".safetensors")) continue;
                 const st = sub.statFile(io, se.name, .{}) catch continue;
+                if (st.kind != .file) continue;
                 total += @intCast(st.size);
             }
         }
@@ -4922,4 +4941,36 @@ test "media markers are per-TYPE, not per-modality" {
     }
     // A non-media type never carries one.
     try std.testing.expect(requiredMarkerFor("gemma4") == null);
+}
+
+test "incompleteMediaDir: marker-missing media dir is refused, complete and non-media are not" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fragment/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.createDirPath(io, "complete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "complete/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "complete/transformer.safetensors", .data = "x" });
+    try tmp.dir.createDirPath(io, "chat");
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/config.json", .data = "{\"model_type\":\"gemma4\"}" });
+
+    const frag = try std.fs.path.join(allocator, &.{ root, "fragment" });
+    defer allocator.free(frag);
+    const comp = try std.fs.path.join(allocator, &.{ root, "complete" });
+    defer allocator.free(comp);
+    const chat_dir = try std.fs.path.join(allocator, &.{ root, "chat" });
+    defer allocator.free(chat_dir);
+
+    try testing.expect(incompleteMediaDir(io, allocator, frag));
+    try testing.expect(!incompleteMediaDir(io, allocator, comp));
+    try testing.expect(!incompleteMediaDir(io, allocator, chat_dir));
+    // The refused dir is exactly the one detectModality declines.
+    try testing.expect(detectModality(io, allocator, frag) == null);
+    try testing.expectEqual(Modality.video, detectModality(io, allocator, comp).?);
 }

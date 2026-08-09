@@ -71,6 +71,33 @@ func isMediaModelType(_ modelType: String) -> Bool {
     return mediaModelTypePrefixes.contains { modelType.hasPrefix($0) }
 }
 
+/// The `config` block the HF API returns when asked (`expand[]=config`).
+/// `model_type` is the field the server dispatches on, so it's the definitive
+/// arch signal a search row can carry. A diffusers repo has no `model_type`;
+/// HF surfaces the pipeline's own class instead
+/// (`{"diffusers":{"_class_name":"MageFlowPipeline"}}`).
+struct HFConfigMeta: Codable {
+    let modelType: String?
+    var diffusers: DiffusersMeta? = nil
+    var diffusersClassName: String? { diffusers?.className }
+
+    struct DiffusersMeta: Codable {
+        let className: String?
+        enum CodingKeys: String, CodingKey { case className = "_class_name" }
+    }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers }
+}
+
+/// Served media families recognizable from a diffusers repo's `_class_name`.
+/// Only pipelines our engines load in that repo's OWN layout belong here —
+/// the class is a family claim, and the tree check still has to prove the
+/// files. Krea and FLUX conversions ship a root config.json with `model_type`
+/// (they come through the main door); their raw upstream layouts are not
+/// served, so their classes deliberately map nowhere.
+private let servedDiffusersClasses: [String: String] = [
+    "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+]
+
 struct HFModel: Identifiable, Codable {
     let id: String
     let downloads: Int?
@@ -79,6 +106,14 @@ struct HFModel: Identifiable, Codable {
     let tags: [String]?
     let safetensors: HFSafetensors?
     let pipelineTag: String?
+    var config: HFConfigMeta? = nil
+
+    /// Whether the repo's file TREE proved the family bundle's ready markers
+    /// (set by `HFSearchService` from the tree fetch; nil = not checked yet
+    /// or unfetchable). Media repos are judged by this, never by tags alone —
+    /// a raw upstream checkpoint declares the same `model_type` as a
+    /// converted pack, and only the converted layout loads.
+    var mediaStructureVerified: Bool? = nil
 
     /// Fallback file size from tree API (not from JSON — set by HFSearchService).
     /// For safetensors repos this is the sum across all `.safetensors` shards.
@@ -104,13 +139,34 @@ struct HFModel: Identifiable, Codable {
     var mlxVariants: [MlxVariant] = []
 
     enum CodingKeys: String, CodingKey {
-        case id, downloads, likes, lastModified, tags, safetensors
+        case id, downloads, likes, lastModified, tags, safetensors, config
         case pipelineTag = "pipeline_tag"
     }
 
+    /// The served media family this repo declares — `config.model_type`
+    /// first (definitive), else a served diffusers `_class_name` (Mage-Flow —
+    /// diffusers repos carry no model_type), else a tag spelling a media
+    /// model_type verbatim (mlx-serve packs tag it, e.g. "minimax_h3").
+    /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
+    /// (voice-mode-only catalog rule).
+    var mediaFamilyModelType: String? {
+        if let t = config?.modelType, isMediaModelType(t) { return t }
+        if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
+        return (tags ?? []).first(where: isMediaModelType)
+    }
+
+    var isServedMediaRepo: Bool { mediaFamilyModelType != nil }
+
     /// Whether mlx-serve supports this model's pipeline type.
     /// Models with unknown pipeline (nil/empty) get benefit of the doubt.
+    ///
+    /// A served media repo is judged by its VERIFIED structure instead —
+    /// its pipeline tag ("text-to-video") would fail the chat allowlist, and
+    /// whitelisting media pipeline tags broadly would hand a Download button
+    /// to every diffusers repo on HF. nil (tree not checked / unfetchable)
+    /// stays conservatively incompatible.
     var isCompatible: Bool {
+        if isServedMediaRepo { return mediaStructureVerified == true }
         guard let tag = pipelineTag, !tag.isEmpty else { return true }
         return compatiblePipelineTags.contains(tag)
     }
@@ -127,7 +183,7 @@ struct HFModel: Identifiable, Codable {
     /// internally, so flagging these "Unsupported architecture" was a false
     /// negative that hid legit downloads.
     var isSupportedArchitecture: Bool {
-        if isGgufRepo { return true }
+        if isGgufRepo || isServedMediaRepo { return true }
         guard let tags, !tags.isEmpty else { return true }
         return tags.contains { tag in
             supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
@@ -170,6 +226,10 @@ struct HFModel: Identifiable, Codable {
 
     /// Human-readable reason why this model isn't compatible.
     var incompatibleReason: String? {
+        if isServedMediaRepo {
+            return mediaStructureVerified == true ? nil
+                : "Not an mlx-serve pack (missing converted files)"
+        }
         if !isCompatible, let tag = pipelineTag {
             return "Not supported (\(tag))"
         }

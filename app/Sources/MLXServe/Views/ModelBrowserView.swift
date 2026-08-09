@@ -1350,6 +1350,31 @@ private struct ModelBrowserRow: View {
         )
     }
 
+    /// A verified community media pack downloads as its FAMILY bundle — the
+    /// same allowlists + ready markers the catalog packs use — never the flat
+    /// chat-default pull, which would miss subdirs and grab repo junk. nil for
+    /// everything that isn't a served media repo.
+    private var mediaBundle: MediaBundle? {
+        guard model.mediaStructureVerified == true,
+              let arch = model.mediaFamilyModelType else { return nil }
+        return CustomMediaModels.bundle(arch: arch, repoId: model.id)
+    }
+
+    /// Start (or resume) this row's download. The media arm also asks the
+    /// running server to rescan afterward — boot-time discovery can't see a
+    /// model downloaded mid-session, and the media panes' "On This Mac" rows
+    /// read `/v1/models`.
+    private func startDownload() {
+        if let b = mediaBundle {
+            downloads.startBundle(b) {
+                appState.refreshModels()
+                server.rescanModels()
+            }
+        } else {
+            downloads.start(repoId: model.id) { appState.refreshModels() }
+        }
+    }
+
     @ViewBuilder
     private var actionCell: some View {
         // Same shelf shape as GGUF, in directories instead of files: some MLX
@@ -1406,14 +1431,14 @@ private struct ModelBrowserRow: View {
 
             case .failed(let resumable):
                 Button(resumable ? "Resume" : "Retry") {
-                    downloads.start(repoId: model.id) { appState.refreshModels() }
+                    startDownload()
                 }
                 .font(.callout)
                 .controlSize(.small)
 
             case .notDownloaded(let resumable):
                 Button(resumable ? "Resume" : "Download") {
-                    downloads.start(repoId: model.id) { appState.refreshModels() }
+                    startDownload()
                 }
                 .font(.callout)
                 .controlSize(.small)
@@ -1431,7 +1456,9 @@ private struct ModelBrowserRow: View {
                     .foregroundStyle(.secondary)
             }
             Button {
-                downloads.cancel(model.id)
+                // A bundle download's task is keyed by the BUNDLE id — a
+                // per-repo cancel would only wipe state, not stop the loop.
+                if let b = mediaBundle { downloads.cancelBundle(b) } else { downloads.cancel(model.id) }
                 appState.refreshModels()
             } label: {
                 Image(systemName: "xmark.circle.fill")

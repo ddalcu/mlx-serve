@@ -1,5 +1,30 @@
 # Changelog
 
+## v26.8.4 — Unreleased
+
+### Agents can pin their own sampling.
+- Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens in the agent editor. 
+- Each is an override: App default follows Settings, a set value wins for that agent's turns, and an off value (top-k 0, repeat penalty 1.0) clears your global default for that agent.
+
+### Use your own media models
+- The image, video, voice, music and 3D panes now list models you added yourself under "On This Mac". Anything in your model folders with a media architecture the server can run shows up in the picker and gets its family's settings and controls.
+- The Model Browser offers community packs of those families too. A repo's file layout is checked against the family's converted shape before the Download button appears, so only packs that will actually load are offered, and they download as a full bundle like the built-in ones.
+- Models downloaded while the server runs show up without a restart: new `POST /v1/models/rescan` re-walks the model folders, and the app calls it after every download.
+
+### Fixes
+- A half-downloaded media pack can no longer take down the server. An interrupted H3 or LTX pull holds a valid config for the whole download, so it registered as a model, could hide your complete copy in another folder, and loading it killed the process. Incomplete packs stay invisible now, and loading one by path is a clear error instead.
+- The H3 Turbo adapter downloads into the pack's own folder instead of the default downloads folder, which used to create exactly such a broken fragment when the pack lived elsewhere. Untick Turbo while it fetches and only the adapter's partial file is removed, not the pack.
+- "Model load failed" now says why (issue #144). Every on-demand load failure answered with that bare 500 no matter the cause. A load refused by the memory check now comes back as a clear not-enough-free-memory error you can retry after closing other apps, and any other failure names its reason, like `Model load failed: FileNotFound`.
+- Picking a download folder no longer hides the models you already have. The server kept serving the built-in `~/.mlx-serve/models`, but the app's picker, delete and download checks stopped looking there the moment you set a custom location. Both are always scanned now.
+- Media packs in your extra model folders are recognized. A pack in the custom scan folder (or LM Studio's) was served by the server while the pane still showed a Download button for it, and Generate could not find it. The app's "is it on disk" checks now look in every folder the server scans; deleting stays limited to the app's own folders.
+- Long code blocks no longer make the chat stutter. A streaming reply re-renders many times a second, and each pass paid a full text layout plus a pile of color allocations on a big block; that work is done once now.
+- GGUF repos that ship the same quant for several releases now label each file with its build (`0731` and so on), so you can tell the new DeepSeek 0731 files from the older ones instead of staring at two identical rows in the quant picker.
+- The MiniMax-H3 time estimate stopped swinging. Under the fast recipe most steps are near-free cache hits, and depending on where those fell the estimate could read "about 0 sec" with minutes to go, or double the real remainder. Steps are priced at their average cost now.
+- The live "time left" during a video generation stopped under-promising. It was priced from the steps already done, which under the fast recipe are mostly cheap cache hits, while the closing steps always run at full cost and the video decode after the last step was not counted at all, so "2 min left" could take 4 or more. A remaining step is never priced below the estimate model's own figure now, and the decode time stays in the number. If anything it now errs a little long on heavily cached runs.
+- Models served straight from the HuggingFace cache no longer slip past the memory check. Those folders store weights as symlinks, and every size scan skipped symlinks, so a 121 GB model measured as 0 bytes and loaded a machine deep into swap. All size scans follow symlinks now, so the preflight refuses what does not fit and `/v1/models` sizes and the app's RAM column are right for those folders too.
+- Starting the server without `--host` now warns that it is reachable from the network you are on, since the default bind is still `0.0.0.0`. Pass `--host 127.0.0.1` to keep it local. A future version will make `127.0.0.1` the default; an explicit `--host` or `--lan-share` is unaffected and not nagged.
+- Internal docs reorganized and compacted.
+
 ## v26.8.3 — MiniMax-H3 references and Turbo, stacked LoRAs, model folders
 
 ### MiniMax-H3: references, Turbo, longer clips

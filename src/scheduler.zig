@@ -1531,6 +1531,8 @@ pub const Scheduler = struct {
     ///   error.UnknownModelId    — id isn't in the registry.
     ///   error.NoDefaultModel    — id empty AND no default set.
     ///   error.NotEnoughMemory   — would exceed caps and no LRU victim.
+    ///   error.InsufficientMemory — memory preflight refused the load (free
+    ///                             RAM can't hold weights + headroom).
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
@@ -1598,8 +1600,9 @@ pub const Scheduler = struct {
                         continue :wait_loop;
                     },
                     .error_state => {
+                        const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
                         self.registry.mutex.unlock(self.io);
-                        return error.LoadFailed;
+                        return load_err;
                     },
                     .unloaded => break :wait_loop,
                 }
@@ -1704,10 +1707,13 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
 
         if (req.error_name) |name| {
+            // The failure crosses the thread boundary by NAME — map it back
+            // to a typed error so a memory-preflight refusal surfaces as a
+            // named 503, not the generic "Model load failed" 500 (#144).
             defer self.allocator.free(name);
             // On success the inference thread took ownership of cpu_state;
             // on failure it didn't, so we still hold it.
-            return loadErrorFor(name);
+            return ModelRegistry.loadErrorFromName(name);
         }
 
         // Success — inference thread installed cpu_state onto the entry.
@@ -1726,6 +1732,13 @@ pub const Scheduler = struct {
     /// under registry.mutex.
     pub fn release(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.release(lm);
+    }
+
+    /// Duped stored failure name for the id `ensureLoaded` just refused with
+    /// `error.LoadFailed` — feeds the "Model load failed: <name>" HTTP
+    /// message (#144). Caller frees.
+    pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
+        return self.registry.loadErrorNameDupe(alloc, id_or_empty);
     }
 
     /// Run a media-generation job on the inference thread. Posts `req` to the
@@ -1937,32 +1950,6 @@ fn signalStarted(sch: *Scheduler) void {
     sch.started.store(true, .release);
     sch.started_cond.broadcast(sch.io);
 }
-
-/// Which error a failed load reports to the HTTP layer.
-///
-/// The name was being FREED and every failure collapsed to `LoadFailed`, so a
-/// refusal the server had a precise sentence for ("needs ~5.8 GB free, 5.4 GB
-/// available") reached the client as "Model load failed" and the app showed
-/// that. Memory is the one load failure a user can act on, so it keeps its own
-/// error — and its own status code — all the way out.
-pub fn loadErrorFor(error_name: []const u8) anyerror {
-    if (std.mem.eql(u8, error_name, "InsufficientMemory")) return error.NotEnoughMemory;
-    if (std.mem.eql(u8, error_name, "OutOfMemory")) return error.NotEnoughMemory;
-    return error.LoadFailed;
-}
-
-test "a memory refusal keeps its own error out to the client" {
-    // Live 2026-08-08: the image engine refused for memory, the name was freed,
-    // and the pane showed a generic "Model load failed" with an empty log — the
-    // one failure the user could have fixed, rendered unactionable.
-    try std.testing.expectEqual(error.NotEnoughMemory, loadErrorFor("InsufficientMemory"));
-    try std.testing.expectEqual(error.NotEnoughMemory, loadErrorFor("OutOfMemory"));
-    // Everything else stays a load failure — guessing a diagnosis is worse than
-    // reporting the honest generic one.
-    try std.testing.expectEqual(error.LoadFailed, loadErrorFor("FileNotFound"));
-    try std.testing.expectEqual(error.LoadFailed, loadErrorFor("unknown"));
-}
-
 /// Set the load_error_name + flip load_failed. Best-effort dupe; on OOM the
 /// parent still sees `load_failed=true` and surfaces "unknown".
 fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
@@ -2033,6 +2020,12 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
         const stub = try gen_mod.buildStubCpuState(allocator, modality);
         return .{ .config = stub.config, .tok = stub.tok, .chat_config = stub.chat_config };
+    }
+    // A media-typed dir that FAILED its marker check must not fall through to
+    // the text path below: it would glob whatever safetensors are present and
+    // die on the first missing weight. Refuse by name instead (#144 flow).
+    if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
+        return error.IncompleteMediaPack;
     }
 
     const config = try allocator.create(ModelConfig);
@@ -2493,19 +2486,48 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
-/// "unknown" by the caller, which then skips the check).
+/// "unknown" by the caller, which then skips the check). Symlinked weights
+/// count (statFile follows links) — an HF hub-cache snapshot is ALL symlinks.
 fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     var it = dir.iterate();
     var total: u64 = 0;
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
         total += @intCast(st.size);
     }
     return total;
+}
+
+test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
+    // A model served straight out of the HuggingFace hub cache is a snapshot
+    // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
+    // 121 GB checkpoint at 0 bytes, and memInsufficientForLoad treats 0 as
+    // "unknown" → the preflight waved the load through into 34 GB of swap.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/abc123", .data = "0123456789abcdef" });
+    try tmp.dir.createDirPath(io, "snapshots/rev");
+    try tmp.dir.symLink(io, "../../blobs/abc123", "snapshots/rev/model.safetensors", .{});
+    // A dangling link (blob pruned) is skipped, never an error…
+    try tmp.dir.symLink(io, "../../blobs/gone", "snapshots/rev/model-00002.safetensors", .{});
+    // …and a symlink to a DIRECTORY must not be summed (statFile follows it).
+    try tmp.dir.symLink(io, "../../blobs", "snapshots/rev/dir.safetensors", .{});
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/snapshots/rev", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(snap);
+
+    try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
 }
 
 /// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk
@@ -3652,9 +3674,17 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     doLoadOnInferenceThread(sch, req) catch |err| {
         log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
         sch.registry.mutex.lockUncancelable(sch.io);
-        // markErrorLocked dupes the error name onto the entry; the
-        // conn thread reads it back from the entry, not from req.
-        sch.registry.markErrorLocked(req.entry, @errorName(err));
+        if (err == error.InsufficientMemory) {
+            // A memory-preflight refusal is transient, not a property of the
+            // checkpoint: the 503 tells the user to free memory and retry, so
+            // the entry must go back to .unloaded — stuck in .error_state the
+            // retry would fail fast until a server restart (#144).
+            sch.registry.markUnloadedLocked(req.entry);
+        } else {
+            // markErrorLocked dupes the error name onto the entry; the
+            // conn thread reads it back from the entry, not from req.
+            sch.registry.markErrorLocked(req.entry, @errorName(err));
+        }
         sch.registry.mutex.unlock(sch.io);
         finishLoadRequest(sch, req, @errorName(err));
         return;
