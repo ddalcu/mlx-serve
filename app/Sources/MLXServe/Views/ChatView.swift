@@ -3196,7 +3196,12 @@ struct MessageBubble: View {
                             MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content)
                                 .textSelection(.enabled)
                         } else {
+                            // The user's own turn is plain text (no markdown
+                            // render), so it needs the transcript size stated —
+                            // otherwise your message and the reply to it are
+                            // two different sizes in the same column.
                             Text(message.content)
+                                .font(.system(size: ChatMetrics.transcriptFontSize))
                                 .textSelection(.enabled)
                         }
                         if message.isStreaming {
@@ -3922,7 +3927,10 @@ struct MarkdownText: View {
                 result.append(renderInline(text))
 
             case .heading(let level, let text):
-                let size: CGFloat = level == 1 ? 18 : level == 2 ? 16 : 14
+                // Scaled from the body size, so raising the reading size
+                // raises the headings with it instead of flattening them.
+                let base = ChatMetrics.transcriptFontSize
+                let size: CGFloat = level == 1 ? base + 5 : level == 2 ? base + 3 : base + 1
                 let p = NSMutableParagraphStyle()
                 p.paragraphSpacingBefore = 4
                 p.paragraphSpacing = 2
@@ -3941,7 +3949,7 @@ struct MarkdownText: View {
                 p.headIndent = 8
                 p.tailIndent = -8
                 let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                    .font: NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular),
                     .backgroundColor: NSColor.textBackgroundColor.blended(withFraction: 0.85, of: .black) ?? NSColor.darkGray,
                     .foregroundColor: NSColor(white: 0.92, alpha: 1.0),
                     .paragraphStyle: p,
@@ -3952,7 +3960,7 @@ struct MarkdownText: View {
 
             case .listItem(let text):
                 let bullet = NSAttributedString(string: "• ", attributes: [
-                    .font: NSFont.systemFont(ofSize: 13),
+                    .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
@@ -4003,7 +4011,7 @@ struct MarkdownText: View {
     /// doesn't adapt, so we overwrite missing-or-static colors with
     /// `.labelColor` (links keep their dynamic `linkColor`).
     private static func renderInline(_ text: String) -> NSAttributedString {
-        let bodyFont = NSFont.systemFont(ofSize: 13)
+        let bodyFont = NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize)
         let result: NSMutableAttributedString
         if let attr = try? AttributedString(
             markdown: text,
@@ -4123,8 +4131,11 @@ struct MarkdownText: View {
             }.joined(separator: "  ")
         }
 
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let monoBold = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        // A table is column-aligned with padded spaces, so it must be the same
+        // monospaced size as a fenced block or the columns stop lining up with
+        // the code around them.
+        let mono = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular)
+        let monoBold = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .semibold)
         let result = NSMutableAttributedString()
 
         // Header row (bold) + horizontal rule using box-drawing chars. Explicit

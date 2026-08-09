@@ -70,6 +70,24 @@ enum ChatMetrics {
     static let sidebarButtonHeight: CGFloat = 28
     static let sidebarButtonCornerRadius: CGFloat = 6
 
+    /// The transcript's reading size.
+    ///
+    /// A conversation is the one place in this app you READ rather than scan,
+    /// and macOS's 13pt body is a control-label size — right for a sidebar row
+    /// or a settings field, small for prose you sit with. Everything the
+    /// transcript renders derives from this rather than restating a number:
+    /// headings, list bullets and inline code were five separate literals, and
+    /// five literals are five chances to change four of them.
+    ///
+    /// The font itself is the system font, which on macOS IS SF Pro — a
+    /// `.custom("SF Pro")` would be the same typeface with none of the optical
+    /// sizing or the weight mapping, so it is deliberately never spelled.
+    static let transcriptFontSize: CGFloat = 16
+    /// Fenced/inline code inside the transcript. Monospaced digits and glyphs
+    /// run wide, so matching the prose size makes code look larger than the
+    /// sentence around it.
+    static let transcriptCodeFontSize: CGFloat = 14
+
     /// Panel edge → row edge. Every row in the sidebar reads it, so the
     /// destinations and the conversations are the same width by construction.
     ///
