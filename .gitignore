@@ -71,8 +71,8 @@ tests/llmprobe-smoke-results/
 containers/agent-shell-mlxserve/rootfs.tar.gz
 containers/agent-shell-mlxserve/rootfs.tar.gz.sha256
 
-# Session handoff + mission log: local working notes, not project context.
-# The checked-in context files are CLAUDE.md / app/CLAUDE.md.
-/handoff.md
+# Local working notes, not project context. The mission log's TOP entry is the
+# session handoff — one file, so two copies of "where things stand" cannot
+# drift apart. Checked-in context stays in CLAUDE.md / app/CLAUDE.md.
 /missionlog.md
 /.mc.json
