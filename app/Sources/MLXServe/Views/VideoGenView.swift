@@ -1076,15 +1076,6 @@ struct VideoGenView: View {
         return ["png", "jpg", "jpeg", "heic", "heif", "webp", "tiff", "tif", "gif", "bmp"].contains(ext)
     }
 
-    private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
-            Stepper(value: value, step: step) {
-                Text(String(value.wrappedValue))
-            }
-        }
-    }
-
     /// Labeled slider for a `Double` setting, with a live value readout on the
     /// right and an optional hover tooltip.
     private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, help: String? = nil) -> some View {
