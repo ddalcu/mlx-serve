@@ -1234,7 +1234,16 @@ private struct AgentEditor: View {
                         Text(level.label).tag(level)
                     }
                 }
-                .pickerStyle(.segmented)
+                // A MENU picker, like the Model row above it. As a segmented
+                // control this row rendered torn apart — a phantom ~110pt of
+                // claimed height pushed a dead band into the card and the
+                // Default checkbox out of the row, bare box, label gone (live
+                // 2026-08-09 screenshot) — and neither `.fixedSize()`, an
+                // explicit frame, nor sibling order changed it, while the same
+                // segmented style renders fine in every other pane. Whatever
+                // macOS 26 dislikes is specific to this card's subtree; the
+                // menu style is the shape the card already proves out.
+                .pickerStyle(.menu)
                 .labelsHidden()
                 .fixedSize()
                 .disabled(readOnly || isDefault)

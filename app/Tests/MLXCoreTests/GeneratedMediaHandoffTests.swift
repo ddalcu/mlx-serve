@@ -38,17 +38,6 @@ final class GeneratedMediaHandoffTests: XCTestCase {
         }
     }
 
-    /// Every generator maps to a kind the transcript can actually render —
-    /// `ChatMediaRef.Kind` has no 3D case, so a mesh hands off as a file the
-    /// chat names rather than a player it cannot draw.
-    func testEveryGeneratorHasAHandoffKind() {
-        XCTAssertEqual(GeneratedMediaHandoff.kind(for: .image), .image)
-        XCTAssertEqual(GeneratedMediaHandoff.kind(for: .video), .video)
-        XCTAssertEqual(GeneratedMediaHandoff.kind(for: .audio), .audio)
-        XCTAssertNil(GeneratedMediaHandoff.kind(for: .model3d),
-                     "a .glb has no player in the transcript — the pane keeps it")
-    }
-
     /// The panes must not each build their own hand-off. Four copies of "make a
     /// session, make a message, switch modes" is four chances for one of them to
     /// land in the wrong chat.

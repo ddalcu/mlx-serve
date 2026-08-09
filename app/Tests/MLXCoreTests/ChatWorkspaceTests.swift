@@ -494,6 +494,14 @@ final class ChatWorkspaceTests: XCTestCase {
             return XCTFail("the destinations must ride the sidebar's top inset")
         }
         XCTAssertLessThan(inset.lowerBound, rows.lowerBound)
+        // The Create section: rows for the generators, from the SAME catalogue
+        // the chips and the Tools menu iterate (`sidebarCreateItems`, pinned in
+        // ChatEmptyStateTests) — a hand list here is where the three surfaces
+        // would drift apart.
+        XCTAssertTrue(chat.contains("ChatEmptyState.sidebarCreateItems"),
+                      "the sidebar's Create rows must come from the shared catalogue")
+        XCTAssertTrue(chat.contains("sectionHeader(\"Create\")"),
+                      "the generator rows get their own heading above Chats")
         // Both directions from the same row.
         XCTAssertTrue(chat.contains("appState.showConversation()"))
         XCTAssertTrue(chat.contains("appState.showModels()"))

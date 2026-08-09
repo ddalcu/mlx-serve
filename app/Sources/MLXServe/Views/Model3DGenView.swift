@@ -135,6 +135,9 @@ struct Model3DGenView: View {
             capability: "3d",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.meshPreset(for: $0, from: models)
+            },
             bundleOf: { $0.bundle },
             downloads: downloads,
             onDownloadFinished: { appState.refreshModels() },

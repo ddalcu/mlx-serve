@@ -88,6 +88,23 @@ final class ChatEmptyStateTests: XCTestCase {
         }
     }
 
+    /// The sidebar's Create rows are the SAME catalogue minus 3D — a filter on
+    /// `mediaItems`, never a second hand-written list (which is where a title
+    /// or an icon quietly drifts from the chips and the Tools menu). 3D's
+    /// absence is deliberate: it stays reachable from the Create Media chip,
+    /// the Tools menu and the tray.
+    func testTheSidebarCreateRowsAreTheCatalogMinus3D() {
+        let expected = ChatEmptyState.mediaItems.filter { $0.action != .create(.model3d) }
+        XCTAssertEqual(ChatEmptyState.sidebarCreateItems.map(\.id), expected.map(\.id),
+                       "same items, same order as the shared catalogue")
+        XCTAssertEqual(ChatEmptyState.sidebarCreateItems.count, 3)
+        for item in ChatEmptyState.sidebarCreateItems {
+            guard case .create = item.action else {
+                return XCTFail("\(item.id) is not a Create page — the sidebar rows only link to generators")
+            }
+        }
+    }
+
     /// Window ids are string literals on both sides; a renamed scene id would
     /// otherwise leave a chip that silently opens nothing.
     func testEveryWindowIdTheCatalogUsesExistsInTheSceneGraph() throws {

@@ -9,6 +9,9 @@ struct MusicGenView: View {
     @EnvironmentObject var service: MusicGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For the model row's Download button (`MediaModelChooser`) — a completed
+    /// transfer has to re-scan the models directory.
+    @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
     @State private var lyrics: String = ""
@@ -157,29 +160,22 @@ struct MusicGenView: View {
         }
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { [models = server.allModels] id in
-                    MusicModelPreset.all.first { $0.id == id }
-                        ?? CustomMediaModels.musicPreset(for: id, from: models)
-                },
-                persist: persist)
-            ) {
-                ForEach(MusicModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                CustomModelPickerRows(presets: CustomMediaModels.musicPresets(from: server.allModels))
-                LanModelPickerRows(capability: "music")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            Text("~\(model.approxRAMGB) GB RAM • \(model.fixedSteps)-step distilled")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: MusicModelPreset.all,
+            onThisMac: CustomMediaModels.musicPresets(from: server.allModels),
+            capability: "music",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.musicPreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
     }
 
     private var durationSection: some View {
@@ -274,7 +270,7 @@ struct MusicGenView: View {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 // Local-only models have no HF download yet — steer the user to
                 // the on-device conversion instead of a Download button.
-                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle) }
+                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle, showsStartButton: false) }
             }
             HStack {
                 if service.isRunning {

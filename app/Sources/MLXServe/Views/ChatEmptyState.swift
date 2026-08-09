@@ -47,6 +47,15 @@ enum ChatEmptyState {
              tint: .brown, action: .create(.model3d)),
     ]
 
+    /// The sidebar's Create rows: the catalogue above minus 3D. A filter, never
+    /// a second list — the chips, the Tools menu and the sidebar must stay one
+    /// catalogue. 3D is deliberately absent from the column (it keeps its chip,
+    /// menu and tray routes): three everyday generators were asked for, and the
+    /// pinned destination block has a height budget.
+    static var sidebarCreateItems: [Item] {
+        mediaItems.filter { $0.action != .create(.model3d) }
+    }
+
     /// The chip row. The Code Launcher is DMG-only — the MAS build can't
     /// detect or launch other apps' CLIs (same gate as the tray's Code
     /// button), and a chip that can only fail is the dead-control class.

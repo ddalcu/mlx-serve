@@ -259,6 +259,9 @@ struct VideoGenView: View {
             capability: "video",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.videoPreset(for: $0, from: models)
+            },
             bundleOf: { $0.bundle },
             downloads: downloads,
             onDownloadFinished: { appState.refreshModels() },

@@ -1,20 +1,10 @@
 import Foundation
 
-/// Moving a Create-pane result into a conversation.
+/// Moving a Create-pane result into a conversation. Image, video and audio
+/// only — the 3D pane offers no "Send to Chat": `ChatMediaRef.Kind` has no
+/// mesh case and the transcript has no viewer for one, so a `.glb` stays in
+/// the pane that made it rather than becoming a row the chat can't draw.
 enum GeneratedMediaHandoff {
-
-    /// Which transcript attachment a generator's output becomes. 3D is
-    /// deliberately absent: `ChatMediaRef.Kind` has no mesh case and the
-    /// transcript has no viewer for one, so a `.glb` stays in the pane that
-    /// made it rather than becoming a row the chat can only fail to draw.
-    static func kind(for experiment: GenExperiment) -> ChatMediaRef.Kind? {
-        switch experiment {
-        case .image:   return .image
-        case .video:   return .video
-        case .audio:   return .audio
-        case .model3d: return nil
-        }
-    }
 
     /// The message that opens the new conversation.
     static func message(path: String, prompt: String,

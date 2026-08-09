@@ -677,7 +677,25 @@ struct ChatSidebar: View {
                     appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
                 }
 
-                // No heading here any more: the list carries its own section
+                // The Create pages, from the SAME catalogue the discovery chips
+                // and the Tools menu iterate (`sidebarCreateItems` — a filter on
+                // `mediaItems`, so the three surfaces cannot drift). Each row is
+                // the mode switch for its generator page, exactly like Models.
+                sectionHeader("Create")
+                ForEach(ChatEmptyState.sidebarCreateItems) { item in
+                    if case .create(let experiment) = item.action {
+                        destinationRow(item.title, icon: item.systemImage,
+                                       selected: appState.chatWorkspace.experiment == experiment) {
+                            if appState.chatWorkspace.experiment == experiment {
+                                appState.showConversation()
+                            } else {
+                                appState.showCreate(experiment)
+                            }
+                        }
+                    }
+                }
+
+                // No "Chats" heading here: the list carries its own section
                 // headers ("Agents", "Chats"), and one of them appears only
                 // when it has rows. A heading pinned in this inset could not
                 // do that — it would sit above an empty list announcing a

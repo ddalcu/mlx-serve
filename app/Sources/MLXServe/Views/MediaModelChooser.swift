@@ -76,7 +76,12 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
         }
         if let p = others.first(where: { $0.id == selectedId })
             ?? onThisMac.first(where: { $0.id == selectedId }) {
-            return (p.name, capabilityOf(p), "· ~\(p.approxRAMGB) GB RAM", true, p)
+            // Same warn-don't-block check the featured picks carry — the
+            // models most likely to overrun this Mac are exactly the big ones
+            // that DIDN'T make the featured list.
+            let fits = p.meetsSystemRequirements(
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+            return (p.name, capabilityOf(p), "· ~\(p.approxRAMGB) GB RAM", fits, p)
         }
         return (selectedId, "", nil, true, nil)
     }
@@ -212,6 +217,7 @@ extension MediaModelChooser {
     static func pane(all: [P], onThisMac: [P], capability: String,
                      selected: Binding<P>, lanModel: Binding<String?>,
                      capabilityOf: @escaping (P) -> String,
+                     resolveCustom: @escaping (String) -> P?,
                      bundleOf: @escaping (P) -> MediaBundle,
                      downloads: DownloadManager,
                      onDownloadFinished: @escaping () -> Void,
@@ -248,8 +254,14 @@ extension MediaModelChooser {
             lanCapability: capability,
             onSelectLan: { id in
                 lanModel.wrappedValue = id
-                if let base = all.first(where: { $0.id == LanPick.base(of: id) }) {
-                    selected.wrappedValue = base
+                // Adopt the preset the request will be SHAPED by: catalogue
+                // first, then the pane's custom-family resolver — a peer's own
+                // conversion has no catalogue row, and leaving `model` on the
+                // previous pick sends another family's canvas and frame
+                // ladders (the H3-sent-LTX-shapes class).
+                let base = LanPick.base(of: id)
+                if let preset = all.first(where: { $0.id == base }) ?? resolveCustom(base) {
+                    selected.wrappedValue = preset
                 }
                 persist()
             })

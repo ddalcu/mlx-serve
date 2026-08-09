@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// Model Browser: a sidebar over six destinations (`ModelBrowserSection`).
+/// Model Browser: five sections (`ModelBrowserSection`), switched by the bar
+/// across the top of the content area.
 struct ModelBrowserPane: View {
     /// Which section is showing. The pane's own bar drives it: the sidebar is
     /// the conversation list (plus the Models row that gets you here), so the

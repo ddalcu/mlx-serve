@@ -165,17 +165,6 @@ extension AudioModelPreset: CustomizableMediaPreset {}
 extension MusicModelPreset: CustomizableMediaPreset {}
 extension Model3DModelPreset: CustomizableMediaPreset {}
 
-/// "On This Mac" rows for a media pane's model Picker — the custom-model twin
-/// of `LanModelPickerRows`. Renders nothing when there are no custom models
-/// (or the server is down, since the list comes from `/v1/models`).
-struct CustomModelPickerRows<P: CustomizableMediaPreset & Identifiable>: View where P.ID == String {
-    let presets: [P]
-
-    var body: some View {
-        if !presets.isEmpty {
-            Section("On This Mac") {
-                ForEach(presets) { Text($0.name).tag($0.id) }
-            }
-        }
-    }
-}
+// The old pickers' "On This Mac" Section (`CustomModelPickerRows`) retired
+// with them — `MediaModelChooser` draws that section itself from the
+// `onThisMac` list every pane passes it.

@@ -170,7 +170,6 @@ struct ChatModelPill: View {
         let pickable = pickableModels
         if pickable.isEmpty && lanChatModels.isEmpty {
             Text("No chat models downloaded")
-            Divider()
         } else {
             // Same duplicate-name suffixing as the tray: a menu keys its
             // checkmark by row TITLE, so two same-named rows both tick.
@@ -193,7 +192,6 @@ struct ChatModelPill: View {
                     }
                 }
             }
-            Divider()
         }
         Divider()
         Button("Manage Models…") {
