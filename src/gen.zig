@@ -1953,6 +1953,12 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         .cond_weights = cond_weights,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
+        // Client hung up mid-generation — there is nobody to answer, and
+        // saying "generation failed" would be a lie about a job we stopped.
+        if (err == error.Cancelled) {
+            log.info("[image] generation cancelled — client disconnected\n", .{});
+            return;
+        }
         log.err("[image] generation failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "generation failed");

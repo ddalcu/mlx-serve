@@ -2332,6 +2332,7 @@ pub const Engine = struct {
 
         const run_steps = steps - start_step;
         for (start_step..steps) |i| {
+            if (progress) |p| if (p.cancelled()) return error.Cancelled;
             const tc: f32 = @floatCast(ts[i]);
             const tp: f32 = @floatCast(ts[i + 1]);
             const v = try self.dit.forwardPrebuilt(img, ctx, tc, rope.cos, rope.sin, full_mask, txt_mask, s);

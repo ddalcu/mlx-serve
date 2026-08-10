@@ -2131,6 +2131,7 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
     const r = try reshape(noise_bf, &[_]c_int{ 1, 128, @intCast(nlat) }, s); defer _ = mlx.mlx_array_free(r);
     var latents = try transpose(r, &[_]c_int{ 0, 2, 1 }, s); // [1,nlat,128]
     { var c = mlx.mlx_array_new(); try mlx.check(mlx.mlx_contiguous(&c, latents, false, s)); _ = mlx.mlx_array_free(latents); latents = c; }
+    errdefer _ = mlx.mlx_array_free(latents);
 
     const img_ids = try buildLatentIds(a, lh, lw); defer a.free(img_ids);
     const txt_ids = try buildTextIds(a, @intCast(prompt_len)); defer a.free(txt_ids);
@@ -2202,6 +2203,7 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
 
     const run_steps = steps - start_step;
     for (start_step..steps) |t| {
+        if (progress) |p| if (p.cancelled()) return error.Cancelled;
         const nz = blk: {
             if (ref_tokens.ctx != null) {
                 const input = try concat(&[_]mlx.mlx_array{ latents, ref_tokens }, 1, s);
