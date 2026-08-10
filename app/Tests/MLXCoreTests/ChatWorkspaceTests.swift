@@ -76,6 +76,19 @@ final class ChatWorkspaceTests: XCTestCase {
         }
     }
 
+    /// The tray's Chat button lands on the TRANSCRIPT, not merely on the
+    /// window: with the window parked on Models/Tasks/Create, a Chat that only
+    /// focuses leaves the user staring at the pane they left (live report
+    /// 2026-08-09). Same door shape as showModels() — mode AND window.
+    func testTheTrayChatButtonSwitchesBackToTheConversation() throws {
+        let appState = try source("Sources/MLXServe/AppState.swift")
+        XCTAssertTrue(appState.contains("func showChat("),
+                      "AppState owns the one door into the conversation")
+        let app = try source("Sources/MLXServe/MLXServeApp.swift")
+        XCTAssertTrue(app.contains("openChat: { appState.showChat() }"),
+                      "the tray's Chat button must switch the mode, not just focus the window")
+    }
+
     // MARK: - The retired window
 
     /// A scene id left behind after its `Window` is deleted is a control that
@@ -474,9 +487,11 @@ final class ChatWorkspaceTests: XCTestCase {
     /// notification): they arrive with nothing to have watched.
     func testTheSidebarListsEveryDestinationAboveTheConversations() throws {
         let chat = try source("Sources/MLXServe/Views/ChatView.swift")
-        for row in ["New Chat", "Agents", "Tasks", "Code Launcher", "Models", "Settings"] {
+        for row in ["New Chat", "Agents", "Tasks", "Code", "Models", "Settings"] {
             XCTAssertTrue(chat.contains("\"\(row)\""), "the sidebar is missing the \(row) destination")
         }
+        XCTAssertFalse(chat.contains("\"Code Launcher\""),
+                       "the sidebar row is called \"Code\" — the launcher menu it opens is unchanged")
         // Two section headings now, and the Agents one renders only when it has
         // rows — a heading with nothing under it promises content that is not
         // there, which is why it can't live in the pinned top inset.
@@ -508,6 +523,27 @@ final class ChatWorkspaceTests: XCTestCase {
         XCTAssertTrue(chat.contains("appState.showTasks()"))
         // The switcher these replaced is gone, not left as a second route.
         XCTAssertFalse(chat.contains("SidebarModeSwitcher"))
+    }
+
+    /// A HOSTED pane must not demand a window-sized minimum: the gen views kept
+    /// their 820-880pt window-era floors after becoming pages of the chat
+    /// window, so at a small window the whole split overflowed the detail
+    /// column and clipped BOTH edges (live screenshot 2026-08-09) — the right
+    /// answer is the preview side resizing. The controls column keeps its
+    /// form-protecting floor; what must never come back is a root frame sized
+    /// for a window this view no longer is.
+    func testGenPanesDoNotDemandWindowSizedMinimums() throws {
+        for pane in ["ImageGenView", "VideoGenView", "AudioGenView",
+                     "MusicGenView", "Model3DGenView"] {
+            let text = try source("Sources/MLXServe/Views/\(pane).swift")
+            for floor in ["minWidth: 7", "minWidth: 8", "minWidth: 9",
+                          "minHeight: 6", "minHeight: 7"] {
+                XCTAssertFalse(text.contains(floor), """
+                    \(pane) demands a window-sized minimum (\(floor)…) — it is \
+                    a page of the chat window now; let the preview side shrink.
+                    """)
+            }
+        }
     }
 
     /// The browser's sub-items live across the top of the CONTENT area, because

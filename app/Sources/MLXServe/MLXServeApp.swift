@@ -78,7 +78,7 @@ struct MLXCoreApp: App {
     var body: some Scene {
         MenuBarExtra {
             StatusMenuView(
-                openChat: { openAndFocus("chat") },
+                openChat: { appState.showChat() },
                 openModelBrowser: { appState.showModels() },
                 openImageGen: { appState.showCreate(.image) },
                 openVideoGen: { appState.showCreate(.video) },
@@ -146,7 +146,9 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.chatEngine)
                 .environmentObject(appState.voice)
                 .environmentObject(appState.processRegistry)
-                .frame(minWidth: 800, minHeight: 500)
+                // 950: this window hosts Models/Settings/Create panes and the
+                // composer row carries the model pill now — 800 clipped them.
+                .frame(minWidth: 950, minHeight: 500)
                 // The intro screen, as a DIALOG over the chat window rather
                 // than a floating window of its own. The injections below are
                 // NOT redundant: a sheet does not inherit the environment of

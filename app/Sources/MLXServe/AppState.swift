@@ -295,6 +295,16 @@ class AppState: ObservableObject {
         chatWorkspace = .conversation
     }
 
+    /// Show the CONVERSATION and bring the window up — the tray's Chat button
+    /// and any other outside-the-window caller. `showConversation()` alone is
+    /// for switches made INSIDE the window; from the tray it left the window
+    /// parked on whatever pane it was showing, so "Chat" just focused Models
+    /// (live report 2026-08-09). Same door shape as `showModels()`.
+    func showChat() {
+        showConversation()
+        pendingChatOpenTick += 1
+    }
+
     /// Owns the global hotkey + floating panel. App-level like the voice
     /// controller so it works with every window closed.
     lazy var quickLauncher = QuickLauncherController(appState: self)

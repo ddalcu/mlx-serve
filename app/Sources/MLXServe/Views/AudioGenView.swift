@@ -144,8 +144,9 @@ struct VoiceGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
         readyView
-        .frame(minWidth: 820, minHeight: 600)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -203,7 +204,8 @@ struct VoiceGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 420)
+            // The preview gives way in a small window.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }

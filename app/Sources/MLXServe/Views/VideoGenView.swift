@@ -79,8 +79,9 @@ struct VideoGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
         readyView
-        .frame(minWidth: 880, minHeight: 660)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -151,7 +152,8 @@ struct VideoGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 460)
+            // The preview gives way in a small window; the player scales.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }

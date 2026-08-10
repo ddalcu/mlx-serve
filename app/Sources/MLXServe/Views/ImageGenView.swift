@@ -58,8 +58,10 @@ struct ImageGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor: this is a PAGE of the chat window now, and a
+        // root minimum wider than the detail column overflows it and clips
+        // both edges. Small windows shrink the preview side instead.
         readyView
-        .frame(minWidth: 880, minHeight: 640)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -104,7 +106,9 @@ struct ImageGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 460)
+            // The preview is what gives way in a small window — the generated
+            // image scales to fit; the controls column keeps its form floor.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }

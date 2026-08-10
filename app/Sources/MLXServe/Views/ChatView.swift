@@ -658,15 +658,6 @@ struct ChatSidebar: View {
                     appState.showConversation()
                     _ = appState.newChatSession()
                 }
-                agentsRow
-                destinationRow("Tasks", icon: "clock.badge.checkmark",
-                               selected: appState.chatWorkspace.isTasks) {
-                    appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
-                }
-                // A launcher is a CHOICE of CLI, so the row is the menu it has
-                // always been (the tray's own list, shared) rather than an
-                // invented pane with one list in it.
-                codeLauncherRow
                 destinationRow("Models", icon: "square.stack.3d.up",
                                selected: appState.chatWorkspace.isModels,
                                badge: activeDownloadCount) {
@@ -694,6 +685,20 @@ struct ChatSidebar: View {
                         }
                     }
                 }
+
+                // The agent/automation cluster, below Create. A GAP on its
+                // first row instead of a heading: nothing here is a Create
+                // item, and proximity is what would say otherwise.
+                agentsRow
+                    .padding(.top, 10)
+                destinationRow("Tasks", icon: "clock.badge.checkmark",
+                               selected: appState.chatWorkspace.isTasks) {
+                    appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
+                }
+                // A launcher is a CHOICE of CLI, so the row is the menu it has
+                // always been (the tray's own list, shared) rather than an
+                // invented pane with one list in it.
+                codeLauncherRow
 
                 // No "Chats" heading here: the list carries its own section
                 // headers ("Agents", "Chats"), and one of them appears only
@@ -901,7 +906,8 @@ struct ChatSidebar: View {
                         AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
                     })
             } label: {
-                destinationLabel("Code Launcher", icon: "terminal", selected: false)
+                // "Code", matching the tray's own Code button over the same menu.
+                destinationLabel("Code", icon: "terminal", selected: false)
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
@@ -2109,23 +2115,43 @@ struct ChatDetailView: View {
         case .none:
             break
         case .toBottom(let animated):
-            if animated {
-                // A discrete jump the user asked for (their own message, the
-                // button) — the movement is the feedback that it landed.
-                withAnimation(.easeOut(duration: 0.2)) {
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
+            if case .geometryChanged = event {
+                // `onScrollGeometryChange` delivers its action INSIDE the
+                // window's layout flush, and `scrollPosition` is @State —
+                // writing it there re-enters layout while AppKit is mid-flush.
+                // Under a streaming re-layout storm (code block re-highlights,
+                // then markdown re-measures) that loop is the #136 beachball,
+                // and the write that lands at the wrong point in the flush is
+                // the uncaught NSException crash (live crash log 2026-08-09:
+                // StoredLocationBase.beginUpdate → setNeedsUpdateConstraints →
+                // _crashOnException). One runloop turn later is outside the
+                // flush, and coalesces the storm to one correction per turn.
+                DispatchQueue.main.async { performScroll(animated: animated) }
             } else {
-                // Following the stream is a direct offset set, explicitly
-                // unanimated: this used to run a 0.15s `withAnimation` per
-                // STREAMED TOKEN, so dozens of animations a second each started
-                // over the top of the one still running. That is the stutter,
-                // and it got worse the longer the transcript grew.
-                var instant = Transaction()
-                instant.disablesAnimations = true
-                withTransaction(instant) {
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
+                // Button taps and sends run from event handling, not layout —
+                // they stay synchronous so the jump lands with the click.
+                performScroll(animated: animated)
+            }
+        }
+    }
+
+    private func performScroll(animated: Bool) {
+        if animated {
+            // A discrete jump the user asked for (their own message, the
+            // button) — the movement is the feedback that it landed.
+            withAnimation(.easeOut(duration: 0.2)) {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        } else {
+            // Following the stream is a direct offset set, explicitly
+            // unanimated: this used to run a 0.15s `withAnimation` per
+            // STREAMED TOKEN, so dozens of animations a second each started
+            // over the top of the one still running. That is the stutter,
+            // and it got worse the longer the transcript grew.
+            var instant = Transaction()
+            instant.disablesAnimations = true
+            withTransaction(instant) {
+                scrollPosition.scrollTo(edge: .bottom)
             }
         }
     }
