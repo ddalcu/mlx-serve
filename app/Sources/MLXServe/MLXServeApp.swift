@@ -146,9 +146,10 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.chatEngine)
                 .environmentObject(appState.voice)
                 .environmentObject(appState.processRegistry)
-                // 950: this window hosts Models/Settings/Create panes and the
-                // composer row carries the model pill now — 800 clipped them.
-                .frame(minWidth: 950, minHeight: 500)
+                // 1070: this window hosts Models/Settings/Create panes and the
+                // composer row carries the model pill now — smaller floors
+                // clipped them.
+                .frame(minWidth: 1070, minHeight: 500)
                 // The intro screen, as a DIALOG over the chat window rather
                 // than a floating window of its own. The injections below are
                 // NOT redundant: a sheet does not inherit the environment of
