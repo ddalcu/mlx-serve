@@ -29,7 +29,14 @@ BASE="http://127.0.0.1:$PORT"
 BIN="$(dirname "$0")/../zig-out/bin/mlx-serve"
 LOG=$(mktemp /tmp/muse_test_serve.XXXXXX)
 
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" > "$LOG" 2>&1 &
+# Optional: MUSE_TEST_DRAFTER points at the DFlash assistant — the whole
+# suite must stay green with speculative decoding engaged.
+DRAFTER_ARGS=()
+if [ -n "${MUSE_TEST_DRAFTER:-}" ]; then
+    DRAFTER_ARGS=(--drafter "$MUSE_TEST_DRAFTER")
+fi
+
+"$BIN" --model "$MODEL" "${DRAFTER_ARGS[@]}" --serve --host 127.0.0.1 --port "$PORT" > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT

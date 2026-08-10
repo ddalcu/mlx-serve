@@ -884,3 +884,26 @@ Guard: `model_registry.zig` test "memory-refused loads keep their identity,
 other failures expose their name".
 
 **Third bite (2026-08-09): `ownedRoots` fixed the destination move and became the next too-narrow list.** A Mage-Flow pack sitting in the CUSTOM scan folder (`/Volumes/G Drive SSD/models`, one of the server's `--model-dir` roots) was served by `/v1/models` while the Image pane showed a BundleDownloadBar over it — `bundleReady`/`componentReady`, `existingModelDir(for:)` and `ServerManager.resolveModelDir` all read `ownedRoots` (destination + built-in only), which deliberately excluded LM Studio + custom folders. The exclusion conflated two questions: "may the app DELETE here?" (no — other tools'/the user's trees) and "is this repo on disk?" (must check everywhere the server serves). Fix: `ModelRoots.readRoots` ≡ `scanRoots` (destination, built-in, LM Studio, custom — same first-wins order the server uses) behind every read: `existingModelDir(for:)` (which also targets the Turbo-adapter fetch — the adapter belongs beside the pack wherever it lives), `componentReady`, `discoverDrafters`, `resolveModelDir`, the voice-clone disk check. Writes, cancel cleanup and delete scoping stay on `ownedRoots`/`modelsDir`; a test-pinned root still stands alone. Guard: `testReadRootsCoverEveryServedFolderButOwnedRootsStayNarrow` (ModelRootsTests).
+
+## A per-surface spec re-derivation is a list of ONE (DFlash serial-decode miss, live 2026-08-10)
+
+First live boot of the DFlash block-drafter: the boot log said `DFlash
+speculative decoding: ENABLED`, the request parse said `drafter=enabled
+(block_size=16)` — and every request decoded serial at 16 tok/s with no
+`[spec-stats]` line at all. The parse-time `enable_drafter` was correct;
+what dropped the sidecar was the NEXT layer down: four per-surface
+re-derivations (`use_drafter = ... lm.drafter != null ...` in the
+completions, chat non-streaming, Anthropic messages and Responses handlers)
+plus two parse-default/fallthrough guards, all written against the Gemma
+drafter's handle only. `enable_drafter` arrived true, the guard saw
+`lm.drafter == null` (the sidecar loaded as `lm.dflash`), and the submit
+passed neither handle. Nothing errored — the regular-decode fallback is
+output-identical, which is exactly why engagement must be asserted by
+COUNTS (`[spec-stats] attempts>0`), never by output shape.
+
+Fix: every drafter-loaded gate reads `lm.drafter != null or lm.dflash !=
+null`, and a source scan in dflash.zig fails any non-comment server.zig
+line that mentions `lm.drafter != null` without a `dflash` sibling on the
+same line ("every server-side drafter-loaded gate also consults lm.dflash").
+Same class as the dsv4 PLD-dispatch hole: the wiring that matters is not
+where the flag is PARSED but every site that re-derives it.

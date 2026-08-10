@@ -122,14 +122,21 @@ fn printUsage(io: std.Io) void {
         \\  --no-pld            Force-disable Prompt Lookup Decoding.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
-        \\  --drafter <dir>     Path to a Gemma 4 assistant drafter checkpoint.
-        \\                        When set, the drafter is loaded at startup,
-        \\                        bound to the target model, and used as the
-        \\                        default draft source for new requests
-        \\                        (priority: drafter > PLD > regular).
-        \\  --draft-block-size <n>  Tokens per drafter round. Default is
-        \\                        auto-detected per Gemma 4 target (E2B=2,
-        \\                        E4B=4, 26B-A4B=4, 31B=8); pass to override.
+        \\  --drafter <dir>     Path to an assistant drafter checkpoint —
+        \\                        either a Gemma 4 cross-attention drafter or
+        \\                        a DFlash block-drafter (auto-detected from
+        \\                        its config: block_size + mask_token_id +
+        \\                        target_layer_ids). Loaded at startup, bound
+        \\                        to the target model, default draft source
+        \\                        for new requests (priority: MTP > dflash >
+        \\                        drafter > PLD > regular).
+        \\  --draft-block-size <n>  Tokens per drafter round. Gemma default is
+        \\                        auto-detected per target (E2B=2, E4B=4,
+        \\                        26B-A4B=4, 31B=8); DFlash uses its config's
+        \\                        block_size (an explicit value only clamps
+        \\                        it DOWN). Pass to override.
+        \\  --no-drafter        Never load a speculative-decoding drafter, including
+        \\                      one shipped inside the checkpoint (drafter/ subdir)
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
@@ -426,6 +433,7 @@ pub fn main(init: std.process.Init) !void {
     var pld_draft_len: u32 = 5;
     var pld_key_len: u32 = 3;
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
+    var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
@@ -575,6 +583,8 @@ pub fn main(init: std.process.Init) !void {
             if (args[i].len > 0) server_mod.g_lan_name = args[i];
         } else if (std.mem.eql(u8, args[i], "--lan-discover")) {
             server_mod.g_lan_discover = true;
+        } else if (std.mem.eql(u8, args[i], "--no-drafter")) {
+            no_drafter = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
@@ -1216,6 +1226,7 @@ pub fn main(init: std.process.Init) !void {
             .model_dir = model_dir,
             .ctx_size = ctx_size,
             .drafter_dir = drafter_dir orelse "",
+            .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
             .mtp_depth = mtp_depth,
             .load_vision = load_vision,

@@ -23,6 +23,7 @@ test {
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
     _ = @import("drafter.zig");
+    _ = @import("dflash.zig");
     _ = @import("mtp.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");

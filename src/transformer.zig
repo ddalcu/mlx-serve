@@ -582,15 +582,17 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
             \\}}
             \\threadgroup_barrier(mem_flags::mem_threadgroup);
             \\
-            \\if (part == 0 && lane < {d}) {{
-            \\  float total = 0.0f;
-            \\  _Pragma("unroll")
-            \\  for (int p = 0; p < K_PARTS; ++p) {{
-            \\    total += partials[p * {d} + int(lane)];
+            \\if (part == 0) {{
+            \\  for (int i = int(lane); i < {d}; i += 32) {{
+            \\    float total = 0.0f;
+            \\    _Pragma("unroll")
+            \\    for (int p = 0; p < K_PARTS; ++p) {{
+            \\      total += partials[p * {d} + i];
+            \\    }}
+            \\    int j = i / {d};
+            \\    int row = i - j * {d};
+            \\    y[row * N + n0 + j] = T(total);
             \\  }}
-            \\  int j = int(lane) / {d};
-            \\  int row = int(lane) - j * {d};
-            \\  y[row * N + n0 + j] = T(total);
             \\}}
         , .{ bn, nacc, acc_init, body, acc_sum, nacc, nacc, nacc, nacc, nacc, m, m });
     }
@@ -705,30 +707,113 @@ fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-/// Column-tile width per M: 4 columns through M=6 (24 accumulators, the
-/// measured register ceiling), 2 columns for M=7 (14 accumulators) — one
-/// deep-verify width past MTPLX's family (their contract caps depth at 3).
-/// M=8 measured a CLIFF (T(7) round 636 ms vs 115 stock — spill/occupancy
-/// past 7 live Vec8 row vectors), so 8+ falls back to stock qmm and the
-/// adaptive depth cap keeps verify at seq <= 7.
-fn vqmmBn(m: c_int) c_int {
-    return if (m <= 6) 4 else 2;
+/// Column-tile width per M. A threadgroup owns `bn` output columns and
+/// streams ALL M activation rows over its K partition, so the x traffic is
+/// `N/bn * K * M * 2` bytes against `N * K * bits/8` of weight — at M=5,
+/// K=6656, N=19968, bn=4 that is 332 MB of activation reads for 66 MB of
+/// weights. Widening the tile is the direct lever on that ratio; the ceiling
+/// is the accumulator budget (`bn * m` live floats per thread) and N's
+/// divisibility by bn. Measured per (M, bn) by the width-sweep µbench.
+pub const VQMM_BN_CHOICES = [_]c_int{ 2, 4, 8 };
+
+/// Forced column tile for A/Bs (`MLX_SERVE_VQMM_BN`), 0 = per-M default.
+/// Test seam: the parity test drives every tile without touching the env.
+pub var vqmm_bn_test_override: ?c_int = null;
+var vqmm_bn_override_cache: ?c_int = null;
+fn vqmmBnOverride() c_int {
+    if (vqmm_bn_test_override) |v| return v;
+    if (vqmm_bn_override_cache) |v| return v;
+    var v: c_int = 0;
+    if (std.c.getenv("MLX_SERVE_VQMM_BN")) |p| {
+        const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
+        for (VQMM_BN_CHOICES) |c| {
+            if (c == parsed) v = parsed;
+        }
+    }
+    vqmm_bn_override_cache = v;
+    return v;
 }
 
-const VQMM_SOURCES = [6][:0]const u8{
-    verifyQmmSource(2, 4), verifyQmmSource(3, 4), verifyQmmSource(4, 4),
-    verifyQmmSource(5, 4), verifyQmmSource(6, 4), verifyQmmSource(7, 2),
+/// Column tile per M: 4 columns through M=6 (24 accumulators, the measured
+/// register ceiling), 2 for M=7 (14) — one deep-verify width past MTPLX's
+/// family. M=8 measured a CLIFF at bn=4 (T(7) round 636 ms vs 115 stock —
+/// spill/occupancy past 7 live Vec8 row vectors), so 8+ falls back to stock.
+///
+/// WIDENING THE TILE IS DISPROVEN. The activation-traffic arithmetic above
+/// predicts bn=8 should nearly halve the dominant read; measured on the Muse
+/// 4-bit trunk shapes it is 5-8% SLOWER at every width (M=5: 45.9 ms vs 43.0
+/// whole-forward, same direction at M 2/3/4). The x rows are 66 KB and stay
+/// cache-resident, so the "traffic" was never leaving the cache — the extra
+/// accumulators just cost occupancy. `MLX_SERVE_VQMM_BN` keeps the sweep
+/// available for other shapes; the ceiling below admits the 8-column tile
+/// only under that override.
+pub const VQMM_MAX_ACC: c_int = 40;
+
+/// Simdgroups per threadgroup, each owning a K partition. Wide-N shapes
+/// already emit N/bn threadgroups, so the grid does not need more
+/// parallelism there — 2 keeps the reduction cheap, and the sweep agrees:
+/// on the Muse trunk shapes at M=5 the whole-forward estimate is 42.4 ms at
+/// 2, 42.5 at 1, 44.5 at 4, 49.0 at 8. `MLX_SERVE_VQMM_KPARTS` (1..8) forces
+/// a value for that sweep.
+var vqmm_kparts_override_cache: ?c_int = null;
+fn vqmmKParts(N: c_int) c_int {
+    const forced = vqmm_kparts_override_cache orelse blk: {
+        var v: c_int = 0;
+        if (std.c.getenv("MLX_SERVE_VQMM_KPARTS")) |p| {
+            const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
+            if (parsed >= 1 and parsed <= 8) v = parsed;
+        }
+        vqmm_kparts_override_cache = v;
+        break :blk v;
+    };
+    if (forced != 0) return forced;
+    return if (N >= 4096) 2 else 4;
+}
+
+pub fn vqmmBnFor(m: c_int, N: c_int) c_int {
+    const forced = vqmmBnOverride();
+    if (forced != 0 and @mod(N, forced) == 0 and forced * m <= VQMM_MAX_ACC) return forced;
+    const want: c_int = if (m <= 6) 4 else 2;
+    return if (@mod(N, want) == 0) want else 0;
+}
+
+fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
+    const mi: usize = @intCast(m - 2);
+    const bi: usize = switch (bn) {
+        2 => 0,
+        4 => 1,
+        else => 2,
+    };
+    return mi * VQMM_BN_CHOICES.len + bi;
+}
+
+const VQMM_N_KERNELS = 6 * VQMM_BN_CHOICES.len;
+
+const VQMM_SOURCES = blk: {
+    var out: [VQMM_N_KERNELS][:0]const u8 = undefined;
+    for (2..8) |m| {
+        for (VQMM_BN_CHOICES, 0..) |bn, bi| {
+            out[(m - 2) * VQMM_BN_CHOICES.len + bi] = verifyQmmSource(m, @intCast(bn));
+        }
+    }
+    break :blk out;
 };
-const VQMM_NAMES = [6][*:0]const u8{
-    "mlxserve_vqmm_ks_m2", "mlxserve_vqmm_ks_m3", "mlxserve_vqmm_ks_m4",
-    "mlxserve_vqmm_ks_m5", "mlxserve_vqmm_ks_m6", "mlxserve_vqmm_ks_m7",
+const VQMM_NAMES = blk: {
+    var out: [VQMM_N_KERNELS][*:0]const u8 = undefined;
+    for (2..8) |m| {
+        for (VQMM_BN_CHOICES, 0..) |bn, bi| {
+            out[(m - 2) * VQMM_BN_CHOICES.len + bi] =
+                std.fmt.comptimePrint("mlxserve_vqmm_ks_m{d}_n{d}", .{ m, bn });
+        }
+    }
+    break :blk out;
 };
 
-var vqmm_kernels: [6]?mlx.mlx_fast_metal_kernel = @splat(null);
+var vqmm_kernels: [VQMM_N_KERNELS]?mlx.mlx_fast_metal_kernel = @splat(null);
 
-fn getVerifyQmmKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
+fn getVerifyQmmKernel(m: c_int, bn: c_int) !mlx.mlx_fast_metal_kernel {
     if (m < 2 or m > 7) return error.UnsupportedShape;
-    const idx: usize = @intCast(m - 2);
+    const idx = vqmmSourceIdx(m, bn);
     if (vqmm_kernels[idx]) |k| return k;
     const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "K_size", "N_size" };
     const output_names = [_][*:0]const u8{"y"};
@@ -953,7 +1038,9 @@ pub fn verifyQmm(
     // x rides in with its original shape — the kernel indexes the buffer
     // linearly, and a contiguous [.., M, K] has the same layout as [M, K]
     // (ensure_row_contiguous copies the rare non-contiguous case).
-    const k_parts: c_int = if (N >= 4096) 2 else 4;
+    const k_parts: c_int = vqmmKParts(N);
+    const bn = vqmmBnFor(m, N);
+    if (bn == 0) return null;
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
 
@@ -961,7 +1048,7 @@ pub fn verifyQmm(
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     const y_shape = [_]c_int{ m, N };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32 * k_parts, @divExact(N, vqmmBn(m)), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32 * k_parts, @divExact(N, bn), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * k_parts, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
@@ -971,7 +1058,7 @@ pub fn verifyQmm(
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-    const kernel = try getVerifyQmmKernel(m);
+    const kernel = try getVerifyQmmKernel(m, bn);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
@@ -1168,7 +1255,7 @@ fn computeNaxAvailable() bool {
 var vqmm_nax_env_cache: ?bool = null;
 /// Lane kill switch: MLX_SERVE_VERIFY_QMM_NAX=0 (the family-wide
 /// MLX_SERVE_VERIFY_QMM=0 also covers it via verifyQmm's entry gate).
-fn naxLaneEnvEnabled() bool {
+pub fn naxLaneEnvEnabled() bool {
     if (vqmm_nax_env_cache) |v| return v;
     var on = true;
     if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX")) |p| {
@@ -3915,6 +4002,18 @@ const BitsCache = QuantParamsCache;
 // pre-refactor code. Concurrent batching (Phase 1+) constructs one ctx per
 // in-flight request so multiple slots can share a Transformer's weights while
 // owning their own caches.
+/// DFlash capture request: intermediate layer OUTPUTS, `hidden_states[i+1]`
+/// semantics (the residual stream AFTER layer `ids[k]` completes, before the
+/// next layer's input norm). Standard forward path only (v1).
+pub const CaptureLayers = struct {
+    /// Trunk layer indices to capture, ascending.
+    ids: []const u32,
+    /// Filled per forward: `out[k]` = h after layer `ids[k]`, ALL positions
+    /// `[B, L, H]`, refcount-shared with the live graph. Caller owns the
+    /// handles (init with `mlx_array_new`, free after use).
+    out: []mlx.mlx_array,
+};
+
 pub const ForwardCtx = struct {
     cache: *KVCache,
     moe_seq_offset: *usize,
@@ -3925,6 +4024,11 @@ pub const ForwardCtx = struct {
     /// position only. Used by the Qwen MTP head, whose committed-history
     /// cache needs the trunk hidden at every verify/prefill position.
     capture_hidden_all: ?*mlx.mlx_array = null,
+    /// DFlash: capture the residual stream at these layer OUTPUTS (all
+    /// positions). Honored by `forwardStandardWith` only — DflashModel.bind
+    /// refuses non-standard-path targets so this can never be silently
+    /// ignored on an engaged path.
+    capture_layers: ?*CaptureLayers = null,
     /// PLD spec-decode: when true, the GatedDeltaNet trunk records per-position
     /// SSM/conv state during the verify forward (see `SSMCacheEntry.spec_*`),
     /// so partial-accept rollback needs no re-forward. Set only by `nextPld`
@@ -6485,7 +6589,14 @@ pub const Transformer = struct {
         return self.qmatmul(x, w, sc, bi);
     }
 
-    fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    /// Raw embedding-table lookup: gather + dequant to bf16 ONLY — no
+    /// normed-embeddings RMS norm, no emb_scale. The DFlash noise embeds are
+    /// contractually the raw table rows (the reference calls `F.embedding`
+    /// on the weight directly — the un-foldable embed norm is exactly what
+    /// makes this hook possible); the trunk's own forward goes through
+    /// `embedding`, which layers the norm/scale on top of this. Returns
+    /// `[B, L, hidden]` bf16, caller frees.
+    pub fn rawEmbedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const id_shape = mlx.getShape(token_ids);
         const batch = id_shape[0];
         const seq_len = id_shape[1];
@@ -6532,27 +6643,31 @@ pub const Transformer = struct {
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
         var reshaped = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(reshaped);
         try mlx.check(mlx.mlx_reshape(&reshaped, emb, &out_shape, 3, self.s));
+        return reshaped;
+    }
+
+    fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const raw = try self.rawEmbedding(token_ids);
 
         // MuseGlimmer: weight-less RMS norm on the looked-up embeddings (the
         // reference's MuseGlimmerTextNormedEmbedding — deliberately NOT folded
         // into the table). Mutually exclusive with emb_scale by construction
         // (scale_embeddings is false whenever normed_embeddings is set).
         if (self.config.normed_embeddings) {
+            defer _ = mlx.mlx_array_free(raw);
             var normed = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_fast_rms_norm(&normed, reshaped, self.ones_hidden.?, self.config.rms_norm_eps, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&normed, raw, self.ones_hidden.?, self.config.rms_norm_eps, self.s));
             return normed;
         }
 
         if (self.emb_scale) |scale| {
+            defer _ = mlx.mlx_array_free(raw);
             var scaled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&scaled, reshaped, scale, self.s));
+            try mlx.check(mlx.mlx_multiply(&scaled, raw, scale, self.s));
             return scaled;
         }
-        var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&result, reshaped));
-        return result;
+        return raw;
     }
 
     /// Dense [vocab, hidden] bf16 view of the embedding table. DiffusionGemma
@@ -7132,6 +7247,26 @@ pub const Transformer = struct {
         if (self.hybrid_layers != null) return self.forwardHybridWith(ctx, token_ids);
         if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
         return self.forwardStandardWith(ctx, token_ids);
+    }
+
+    /// Does `forwardWith` route this model through `forwardStandardWith`?
+    /// Mirrors the dispatch chain above IN ORDER. DFlash's capture seam
+    /// (`ForwardCtx.capture_layers`) lives in the standard path only (v1),
+    /// so `DflashModel.bind` gates on this predicate.
+    pub fn usesStandardForward(self: *const Transformer) bool {
+        return self.dsv4 == null and
+            self.bert_layers == null and
+            !self.config.use_bidirectional_attention and
+            self.hybrid_layers == null and
+            self.moe_layers == null;
+    }
+
+    /// Project a hidden state through the trunk's lm_head, dense (no argmax
+    /// prune). DFlash draft logits come from the assistant's hidden through
+    /// THIS head — the reference applies the bare Linear (no softcap /
+    /// output_multiplier; both are monotone, so draft argmax is unaffected).
+    pub fn lmHeadForDraft(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        return self.lmHeadProject(x, false);
     }
 
     /// Free compiled JIT closures (compiled_forward / compiled_gelu /
@@ -8045,6 +8180,14 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
                 _ = mlx.mlx_array_free(h);
                 h = h_scaled;
+            }
+
+            // DFlash capture: this h IS `hidden_states[li+1]` — the layer's
+            // final output (post layer_scalar / PLE on archs that have them).
+            if (ctx.capture_layers) |cl| {
+                for (cl.ids, cl.out) |cid, *slot| {
+                    if (cid == li) _ = mlx.mlx_array_set(slot, h);
+                }
             }
 
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % std_eval_cadence == 0) {
@@ -22967,17 +23110,29 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             defer _ = mlx.mlx_array_free(x);
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-            // Kernel path — must ENGAGE for every listed M.
-            const got_opt = try verifyQmm(s, x, wq, wsc, wbi, 4, cs.gs);
-            try testing.expect(got_opt != null);
-            const got = got_opt.?;
-            defer _ = mlx.mlx_array_free(got);
-            const gsh = mlx.getShape(got);
-            try testing.expectEqual(@as(c_int, 1), gsh[0]);
-            try testing.expectEqual(m, gsh[1]);
-            try testing.expectEqual(cs.n, gsh[2]);
+            // Kernel path — must ENGAGE for every listed M, at EVERY column
+            // tile the sweep can force. `MLX_SERVE_VQMM_BN` is an A/B lever,
+            // so a tile that silently computed the wrong thing would only
+            // show up mid-measurement; null forces the shipped per-M default.
+            for ([_]?c_int{null} ++ [_]?c_int{ 2, 4, 8 }) |bn_force| {
+                if (bn_force) |bn| {
+                    // The NAX tile ignores bn; only the split-K rows sweep.
+                    if (mi >= simd_ms.len) continue;
+                    if (@mod(cs.n, bn) != 0 or bn * m > VQMM_MAX_ACC) continue;
+                }
+                vqmm_bn_test_override = bn_force;
+                defer vqmm_bn_test_override = null;
+                const got_opt = try verifyQmm(s, x, wq, wsc, wbi, 4, cs.gs);
+                try testing.expect(got_opt != null);
+                const got = got_opt.?;
+                defer _ = mlx.mlx_array_free(got);
+                const gsh = mlx.getShape(got);
+                try testing.expectEqual(@as(c_int, 1), gsh[0]);
+                try testing.expectEqual(m, gsh[1]);
+                try testing.expectEqual(cs.n, gsh[2]);
 
-            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, cs.gs, wdq_t, got, label);
+                try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, cs.gs, wdq_t, got, label);
+            }
         }
 
         // Ineligible widths fall through to stock (null). The NAX probe is
@@ -24464,6 +24619,118 @@ test "Laguna-XS decode µbench: bf16 attention projections (MLX_SERVE_LAGUNA_UBE
             const tms = @as(f64, @floatFromInt(sw2.read())) / 1.0e6 / @as(f64, @floatFromInt(IT));
             std.debug.print("[laguna-ubench] {d} trivial DEPENDENT ops: {d:.3} ms => {d:.1} us/dispatch\n", .{ chain, tms, tms * 1000.0 / @as(f64, @floatFromInt(chain)) });
         }
+    }
+}
+
+test "spec-verify width sweep µbench (MLX_SERVE_VERIFY_WIDTH_UBENCH=1)" {
+    // What does one spec-verify forward cost as a function of the block width?
+    // MLX routes transposed qmm by `get_qmv_batch_limit(K, N)`: below it the
+    // weight-reuse qmv kernel runs (cost ~flat in M, bandwidth-bound), at and
+    // above it the 32x32-tiled qmm_splitk runs (compute-bound, and a width of
+    // 16 wastes half the 32-row tile). The limit is a per-shape number, so the
+    // cliff is what this prints — a whole-model per-round estimate at each M.
+    if (std.c.getenv("MLX_SERVE_VERIFY_WIDTH_UBENCH") == null) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const tio = testing.io;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const rnd = prng.random();
+    // One eval per BATCH of independent launches, not per launch: a per-call
+    // eval barrier costs ~0.14 ms of sync on this box, which is more than the
+    // whole kv projection and would swamp the very ratios being measured. A
+    // real forward pipelines its dispatches, so the bench must too. Each
+    // repetition slices its own x rows so the launches stay distinct ops.
+    const WARM = 2;
+    const ITERS = 6;
+    const BATCH = 16;
+
+    // Muse-Glimmer-30B trunk: hidden 6656, inter 19968, 32/2 heads hd128,
+    // 52 layers, vocab 202048. `per_layer` counts how many times this shape
+    // runs in one layer so the sweep can price a whole forward.
+    const shapes = [_]struct { name: []const u8, k: c_int, n: c_int, per_layer: f64, layers: f64 }{
+        .{ .name = "q", .k = 6656, .n = 4096, .per_layer = 1, .layers = 52 },
+        .{ .name = "kv", .k = 6656, .n = 256, .per_layer = 2, .layers = 52 },
+        .{ .name = "o", .k = 4096, .n = 6656, .per_layer = 1, .layers = 52 },
+        .{ .name = "gate/up", .k = 6656, .n = 19968, .per_layer = 2, .layers = 52 },
+        .{ .name = "down", .k = 19968, .n = 6656, .per_layer = 1, .layers = 52 },
+        .{ .name = "lm_head", .k = 6656, .n = 202048, .per_layer = 1, .layers = 1 },
+    };
+    const widths = [_]c_int{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 16 };
+    var totals: [widths.len]f64 = @splat(0);
+
+    std.debug.print("\n[vw-ubench] {s:>8} {s:>3} {s:>10} {s:>9}\n", .{ "shape", "M", "ms", "vs_M1" });
+    for (shapes) |sh| {
+        const wn: usize = @intCast(sh.n * sh.k);
+        const wbuf = try allocator.alloc(f32, wn);
+        for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+        const wshape = [_]c_int{ sh.n, sh.k };
+        const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+        allocator.free(wbuf);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        var wsc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wsc);
+        var wbi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wbi);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+        for ([_]mlx.mlx_array{ wq, wsc, wbi }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        var base_ms: f64 = 0;
+        for (widths, 0..) |m, wi| {
+            const xn: usize = @as(usize, @intCast(m * sh.k)) * BATCH;
+            const xbuf = try allocator.alloc(f32, xn);
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const xshape = [_]c_int{ BATCH, m, sh.k };
+            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var xall = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xall);
+            try mlx.check(mlx.mlx_astype(&xall, x32, .bfloat16, s));
+            var xs: [BATCH]mlx.mlx_array = undefined;
+            defer for (&xs) |*a| {
+                _ = mlx.mlx_array_free(a.*);
+            };
+            for (&xs, 0..) |*a, r| {
+                a.* = mlx.mlx_array_new();
+                const start = [_]c_int{ @intCast(r), 0, 0 };
+                const stop = [_]c_int{ @as(c_int, @intCast(r)) + 1, m, sh.k };
+                const strides = [_]c_int{ 1, 1, 1 };
+                try mlx.check(mlx.mlx_slice(a, xall, &start, 3, &stop, 3, &strides, 3, s));
+                try mlx.check(mlx.mlx_array_eval(a.*));
+            }
+
+            var it: usize = 0;
+            var sw = io_util.Stopwatch.init(tio);
+            while (it < WARM + ITERS) : (it += 1) {
+                if (it == WARM) sw.reset();
+                var outs: [BATCH]mlx.mlx_array = undefined;
+                for (&outs, &xs) |*o, xi| o.* = try qmatmulBits(xi, wq, wsc, wbi, 4, 64, .affine, s);
+                const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+                try mlx.check(mlx.mlx_eval(vec));
+                _ = mlx.mlx_vector_array_free(vec);
+                for (outs) |o| _ = mlx.mlx_array_free(o);
+            }
+            const ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS * BATCH) / 1e6;
+            if (wi == 0) base_ms = ms;
+            totals[wi] += ms * sh.per_layer * sh.layers;
+            std.debug.print("[vw-ubench] {s:>8} {d:>3} {d:>10.4} {d:>8.2}x\n", .{ sh.name, m, ms, ms / base_ms });
+        }
+    }
+    std.debug.print("\n[vw-ubench] whole-forward estimate (all linears, 52 layers + lm_head)\n", .{});
+    std.debug.print("[vw-ubench] {s:>3} {s:>10} {s:>9} {s:>12}\n", .{ "M", "ms", "vs_M1", "ms/token" });
+    for (widths, totals) |m, tot| {
+        std.debug.print("[vw-ubench] {d:>3} {d:>10.2} {d:>8.2}x {d:>12.2}\n", .{ m, tot, tot / totals[0], tot / @as(f64, @floatFromInt(m)) });
     }
 }
 

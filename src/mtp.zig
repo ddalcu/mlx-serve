@@ -90,12 +90,12 @@ pub const HISTORY_WINDOW_THRESHOLD: usize = 16384;
 
 /// One linear: quantized (w packed u32, s/b bf16) when `s.ctx != null`,
 /// otherwise a pre-transposed bf16 weight `[in, out]` for plain matmul.
-const QLinear = struct {
+pub const QLinear = struct {
     w: mlx.mlx_array,
     s: mlx.mlx_array,
     b: mlx.mlx_array,
 
-    fn deinit(self: *QLinear) void {
+    pub fn deinit(self: *QLinear) void {
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.s);
         _ = mlx.mlx_array_free(self.b);
@@ -837,6 +837,10 @@ fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u
 /// instead of the whole matrix — a 248K×5120 lm_head would otherwise
 /// materialize 2.5 GB). Rows quantize independently in MLX's affine packing,
 /// so per-chunk triples concatenate along axis 0 into a valid whole.
+///
+/// A DENSE source (`scales.ctx == null`, e.g. a bf16 lm_head) skips the
+/// dequantize and quantizes the row chunk directly — same chunking, one
+/// requantizer.
 pub fn requantizeRows(
     s: mlx.mlx_stream,
     w: mlx.mlx_array,
@@ -866,7 +870,12 @@ pub fn requantizeRows(
 
         var dense = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dense);
-        {
+        if (scales.ctx == null) {
+            var raw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(raw);
+            try sliceRows(&raw, w, r0, r1, s);
+            try mlx.check(mlx.mlx_astype(&dense, raw, .bfloat16, s));
+        } else {
             var wq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wq);
             var sq = mlx.mlx_array_new();

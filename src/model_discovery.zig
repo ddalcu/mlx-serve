@@ -1490,6 +1490,9 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqual(ModelKind.embed, modelKindFromType("bert"));
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
+    // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
+    // as primary models.
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("muse_glimmer_assistant"));
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("vit"));
     // Labels stay column-friendly.
     try testing.expectEqualStrings("3d", ModelKind.mesh.label());

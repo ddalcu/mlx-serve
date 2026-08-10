@@ -39,6 +39,8 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const DrafterModel = drafter_mod.DrafterModel;
+const dflash_mod = @import("dflash.zig");
+const DflashModel = dflash_mod.DflashModel;
 const mtp_mod = @import("mtp.zig");
 const MtpModel = mtp_mod.MtpModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
@@ -120,6 +122,10 @@ pub const LoadedModel = struct {
     chat_config: ?*ChatConfig,
     vision_encoder: ?*VisionEncoder,
     drafter: ?*DrafterModel,
+    /// DFlash block-drafter sidecar. Mutually exclusive with `drafter` by the
+    /// loader's config-contract probe; `drafter_path`/`drafter_block_size`
+    /// are shared between the two sidecar kinds.
+    dflash: ?*DflashModel = null,
     /// Echoed in `/v1/models` so the Swift app can show the drafter checkpoint
     /// path; empty when no drafter is loaded. Allocator-owned dupe.
     drafter_path: []const u8,
@@ -288,6 +294,11 @@ pub const LoadedModel = struct {
             self.allocator.destroy(d);
             self.drafter = null;
         }
+        if (self.dflash) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
+            self.dflash = null;
+        }
         if (self.vision_encoder) |v| {
             v.deinit();
             self.allocator.destroy(v);
@@ -386,6 +397,11 @@ pub const LoadedModel = struct {
             d.deinit();
             self.allocator.destroy(d);
             self.drafter = null;
+        }
+        if (self.dflash) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
+            self.dflash = null;
         }
         if (self.vision_encoder) |v| {
             v.deinit();

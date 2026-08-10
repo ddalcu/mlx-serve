@@ -840,6 +840,10 @@ class DownloadManager: ObservableObject {
     /// too: it runs on llama.cpp, which has no drafter path at all.
     nonisolated static func companionDrafterRepo(forRepoId repoId: String) -> String? {
         let base = (repoId as NSString).lastPathComponent.lowercased()
+        // Muse-Glimmer pairs with its DFlash assistant (one published size).
+        if base.contains("muse-glimmer"), !base.contains("assistant"), !base.contains("gguf") {
+            return "meta-models/Muse-Glimmer-30B-assistant"
+        }
         guard base.contains("gemma-4") || base.contains("gemma4") else { return nil }
         // A drafter must not pull itself — that download is an infinite regress.
         guard !base.contains("assistant"), !base.contains("gguf") else { return nil }
@@ -1780,6 +1784,9 @@ class DownloadManager: ObservableObject {
     nonisolated static let drafterModelTypes: Set<String> = [
         "gemma4_assistant",
         "gemma4_unified_assistant",
+        // DFlash block-drafter for Muse-Glimmer-30B (server auto-detects the
+        // kind from the sidecar's config contract; same --drafter flag).
+        "muse_glimmer_assistant",
     ]
 
     /// Walk the given scan roots for published Gemma 4 assistant drafter
