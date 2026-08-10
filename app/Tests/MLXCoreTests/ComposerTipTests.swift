@@ -61,6 +61,15 @@ final class ComposerTipTests: XCTestCase {
         }
     }
 
+    /// Same rule for the brain disc since its right-click grew the
+    /// reasoning-effort picker.
+    func testThinkingTipNamesTheRightClickMenu() {
+        for tip in [ComposerTip.thinking(isOn: true), .thinking(isOn: false)] {
+            XCTAssertTrue(tip.body.lowercased().contains("right-click"),
+                          "the effort picker is undiscoverable unless the card names it: \(tip.body)")
+        }
+    }
+
     /// The workspace is what every file and shell call resolves against, and it
     /// is otherwise two clicks away inside the menu.
     func testToolsTipNamesTheWorkspaceOrSaysItIsUnset() {

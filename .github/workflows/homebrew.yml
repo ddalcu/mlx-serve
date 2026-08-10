@@ -1,0 +1,68 @@
+name: Homebrew
+
+# The release pipeline creates the GitHub release as a DRAFT, so its assets
+# aren't downloadable until someone publishes it. Pushing the formulas at
+# build time advertised a version nobody could install for however long the
+# draft sat unpublished — so the formula push waits for the draft → published
+# transition instead. `published` fires on that transition (and on a direct
+# publish); creating or editing a draft never fires it.
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-formulas:
+    # Pre-releases never reach brew.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # A release event checks out the TAG by default; the formula commit
+      # belongs on main. Full history so the retry rebase below has a
+      # merge base.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern MLXCore.dmg \
+            --pattern mlx-serve-bin-macos-arm64.tar.gz
+
+      - name: Update Homebrew formulas
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          DMG_SHA=$(shasum -a 256 MLXCore.dmg | awk '{print $1}')
+          CLI_SHA=$(shasum -a 256 mlx-serve-bin-macos-arm64.tar.gz | awk '{print $1}')
+
+          sed -i "s/version \".*\"/version \"$VERSION\"/" Casks/mlx-core.rb
+          sed -i "s/sha256 \".*\"/sha256 \"$DMG_SHA\"/" Casks/mlx-core.rb
+
+          sed -i "s/version \".*\"/version \"$VERSION\"/" Formula/mlx-serve.rb
+          sed -i "s/sha256 \".*\"/sha256 \"$CLI_SHA\"/" Formula/mlx-serve.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/mlx-core.rb Formula/mlx-serve.rb
+          git commit -m "brew: update to v$VERSION"
+
+          # Retry with rebase in case main advanced meanwhile
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push attempt $i rejected; rebasing on latest main and retrying..."
+            git fetch origin main
+            git rebase origin/main
+            sleep $((i * 2))
+          done
+          echo "failed to push Homebrew formula update after 5 attempts" >&2
+          exit 1

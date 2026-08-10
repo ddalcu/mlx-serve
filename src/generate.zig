@@ -23,6 +23,8 @@ const ssmRestore = transformer_mod.ssmRestore;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
+const dflash_mod = @import("dflash.zig");
+const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
 
 /// Module-level overrides for prefill behavior. Defaults match the original
@@ -647,6 +649,47 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
     return step -| last_clear >= interval;
 }
 
+/// Number of accepted draft tokens that may accompany the always-committed
+/// anchor token without crossing the request's output-token ceiling.
+pub fn capAcceptedForTokenBudget(accepted: u32, completion: u32, max_tokens: u32) u32 {
+    const remaining = max_tokens -| completion;
+    if (remaining <= 1) return 0;
+    return @min(accepted, remaining - 1);
+}
+
+test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
+    try std.testing.expectEqual(@as(u32, 15), capAcceptedForTokenBudget(15, 0, 400));
+    try std.testing.expectEqual(@as(u32, 2), capAcceptedForTokenBudget(15, 397, 400));
+    try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 399, 400));
+    try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 400, 400));
+    try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
+}
+
+test "every speculative decoder caps accepted drafts before commit" {
+    // Class guard: every speculative path commits an always-emitted anchor
+    // plus zero or more accepted drafts. A new/forgotten arm must cap that
+    // accepted prefix before it mutates generated ids, KV/module state, or
+    // usage. Output-only clipping in the scheduler is already too late.
+    const source = @embedFile("generate.zig");
+    const names = [_][]const u8{
+        "nextDspark",
+        "nextPld",
+        "nextDrafter",
+        "nextDflash",
+        "nextMtp",
+    };
+    for (names) |name| {
+        const signature = try std.fmt.allocPrint(testing.allocator, "    pub fn {s}", .{name});
+        defer testing.allocator.free(signature);
+        const start = std.mem.indexOf(u8, source, signature) orelse return error.MissingSpecDecoder;
+        const end = std.mem.indexOfPos(u8, source, start + signature.len, "\n    pub ") orelse source.len;
+        if (std.mem.indexOf(u8, source[start..end], "capAcceptedForTokenBudget(") == null) {
+            std.debug.print("{s} does not cap accepted drafts before commit\n", .{name});
+            return error.UncappedSpecDecoder;
+        }
+    }
+}
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -766,6 +809,34 @@ pub const Generator = struct {
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     drafter_accepted_tokens: u64 = 0,
 
+    // ── DFlash block-drafter state ──
+    // External block-parallel assistant (src/dflash.zig). When
+    // `dflash != null`, callers use `nextDflash` instead of `next`. Weights
+    // are owned by the server (per-model); the per-request context cache
+    // (`dflash_ctx`) is OWNED by the Generator — built during prefill from
+    // the trunk's capture_layers hiddens, freed in `deinit`.
+    dflash: ?*DflashModel = null,
+    dflash_ctx: ?dflash_mod.DflashCtx = null,
+    /// Effective block size (assistant config, clamped by --draft-block-size).
+    /// Drafts per round = dflash_block_size - 1.
+    dflash_block_size: u32 = 0,
+    /// Request-class break-even yield, normalized by the scheduler to the
+    /// effective draft width. Thinking requests use the lower calibration
+    /// because their less-predictable reasoning preamble pays back later.
+    dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+    /// Stats: count of nextDflash calls that ran a verify forward.
+    dflash_attempted: u64 = 0,
+    /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
+    dflash_accepted_tokens: u64 = 0,
+    /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
+    /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
+    /// fully-lazy round — a traced round is slower than a real one by
+    /// whatever overlap the barriers destroy. Diagnostic only.
+    dflash_trace: DflashTrace = .{},
+    /// Trace-only stopwatch across the scheduler gap (round return → next
+    /// round entry); bills the `.gap` phase. Null when not tracing.
+    dflash_gap_watch: ?io_util.Stopwatch = null,
+
     // ── Qwen native MTP head state ──
     // The model's own one-layer multi-token-prediction head (src/mtp.zig).
     // When `mtp != null`, callers use `nextMtp` instead of `next`. The head
@@ -866,7 +937,7 @@ pub const Generator = struct {
     // Set to true mid-request when the per-request acceptance rate
     // (`*_accepted_tokens / *_attempted`) falls below
     // `RUNTIME_GATE_MIN_RATE` after `RUNTIME_GATE_WARMUP` attempts. When set,
-    // both `nextPld` and `nextDrafter` short-circuit to `next()` for the
+    // `nextPld`, `nextDrafter`, and `nextDflash` short-circuit to `next()` for the
     // remainder of the request — the prompt-time gate could not foresee that
     // the workload's *runtime* draft acceptance rate wasn't paying for the
     // per-step verify overhead. The flag is sticky for the rest of the
@@ -930,6 +1001,31 @@ pub const Generator = struct {
         const rate = @as(f32, @floatFromInt(accepted)) /
             @as(f32, @floatFromInt(drafts_proposed));
         return rate < RUNTIME_GATE_MIN_PER_DRAFT_RATE;
+    }
+
+    // DFlash has different economics from sequential-token drafters: one
+    // assistant call proposes the whole block and the M5 NAX verify lane makes
+    // wide blocks cheap. Per-draft percentage therefore penalizes block 16
+    // even when it is decisively profitable. The stable cross-width signal is
+    // accepted drafts per verify round. M5 Muse sweeps put code/tool traffic at
+    // 4.4-15.0 accepted/round and the regressing prose/vision class at
+    // 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
+    // workloads accepting 62-86% remain above it as well.
+    pub const DFLASH_GATE_WARMUP: u64 = 3;
+    pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
+    pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
+
+    pub fn dflashGateWarmup() u64 {
+        const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
+        if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
+        return @intCast(n);
+    }
+
+    pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {
+        if (attempted < dflashGateWarmup()) return false;
+        const avg = @as(f32, @floatFromInt(accepted)) /
+            @as(f32, @floatFromInt(attempted));
+        return avg < min_avg;
     }
 
     // ── PLD yield gate (cold-path economics) ──
@@ -1052,6 +1148,30 @@ pub const Generator = struct {
             );
             return;
         }
+        if (self.dflash != null and self.dflash_attempted > 0) {
+            const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
+                @as(f64, @floatFromInt(self.dflash_attempted));
+            const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
+            const drafts_proposed: u64 = self.dflash_attempted * @as(u64, drafts_per_round);
+            const per_draft_pct: f64 = if (drafts_proposed > 0)
+                100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
+                    @as(f64, @floatFromInt(drafts_proposed))
+            else
+                0.0;
+            log.info(
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s}\n",
+                .{
+                    self.dflash_attempted,
+                    self.dflash_accepted_tokens,
+                    avg_per_round,
+                    self.dflash_min_accepted_per_round,
+                    per_draft_pct,
+                    self.dflash_block_size,
+                    if (self.spec_disabled_runtime) "true" else "false",
+                },
+            );
+            return;
+        }
         if (self.drafter != null and self.drafter_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.drafter_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.drafter_attempted));
@@ -1128,6 +1248,21 @@ pub const Generator = struct {
         /// Number of tokens per draft round. Default 4 (3 drafter steps +
         /// 1 t1 prepend → length-4 verify forward).
         drafter_block_size: u32 = 4,
+        /// Enable the DFlash block-drafter. When set, `dflash` must be
+        /// non-null and `bind()`-ed to `xfm`. Prefill captures the trunk's
+        /// target_layer_ids outputs chunk-by-chunk into the per-request
+        /// assistant context cache (`Generator.dflash_ctx`). Same
+        /// lazy-pre-forward skip semantics as PLD/drafter/MTP.
+        dflash_enabled: bool = false,
+        /// Non-owning pointer to the loaded DFlash assistant.
+        dflash: ?*DflashModel = null,
+        /// Effective DFlash block size (loader-resolved: assistant config
+        /// clamped by --draft-block-size). 0 → the assistant config's value.
+        dflash_block_size: u32 = 0,
+        /// Accepted drafts/round required after warmup. Scheduler scales the
+        /// M5/block-16 calibration to the effective draft width and lowers it
+        /// for requests whose resolved mode has thinking enabled.
+        dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
         /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
         /// history KV cache chunk-by-chunk (full-hidden capture) and the
@@ -1186,6 +1321,12 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// A DFlash assistant context restored from the prefix cache, whose
+        /// `absLen()` already equals `ssm_checkpoint_pos_offset`. Ownership
+        /// transfers to the Generator. Null = start the assistant blind at
+        /// the offset (a restore forwards no trunk layers, so a cold context
+        /// is what a reused prefix would otherwise get).
+        dflash_ctx_restored: ?dflash_mod.DflashCtx = null,
         /// Cooperative abort for abandoned requests: checked between prefill
         /// chunks. The scheduler passes `&slot.cancelled`, set by the conn
         /// thread when the client disconnects mid-prefill. When it flips,
@@ -1288,7 +1429,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled)) {
+        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -1320,6 +1461,8 @@ pub const Generator = struct {
             options.drafter = null;
             options.mtp_enabled = false;
             options.mtp = null;
+            options.dflash_enabled = false;
+            options.dflash = null;
         }
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
@@ -1457,6 +1600,28 @@ pub const Generator = struct {
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
 
+        // DFlash: build the assistant's context cache during prefill — every
+        // chunk's target_layer_ids captures project through the encoder and
+        // append immediately (the chunk's activation graph then frees with
+        // the chunk eval). On KV-prefix reuse the context covers only the
+        // freshly forwarded tail (`base_pos = ssm_cp_offset`) — sliding-
+        // window semantics, same rule as the MTP history.
+        const dflash_active = options.dflash_enabled and options.dflash != null;
+        var dflash_ctx: ?dflash_mod.DflashCtx = if (!dflash_active)
+            null
+        else if (options.dflash_ctx_restored) |restored| blk: {
+            std.debug.assert(restored.absLen() == ssm_cp_offset);
+            break :blk restored;
+        } else try dflash_mod.DflashCtx.init(allocator, options.dflash.?, ssm_cp_offset);
+        errdefer if (dflash_ctx) |*dc| dc.deinit();
+        var dfl_out_buf: []mlx.mlx_array = &.{};
+        defer if (dfl_out_buf.len > 0) allocator.free(dfl_out_buf);
+        var dfl_cl: transformer_mod.CaptureLayers = undefined;
+        if (dflash_active) {
+            dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
+            dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf };
+        }
+
         // Start of the final (logits) forward's token span. Without SSM
         // checkpointing this is the last prompt token (the classic 1-token
         // logits forward); with checkpointing the chunk loop stops
@@ -1526,8 +1691,13 @@ pub const Generator = struct {
                 const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
                 var chunk_hidden_all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(chunk_hidden_all);
+                if (dflash_active) {
+                    for (dfl_out_buf) |*a| a.* = mlx.mlx_array_new();
+                    ctx.capture_layers = &dfl_cl;
+                }
                 const chunk_logits = if (xfm.compiled_forward != null and
                     !mtp_capture and
+                    !dflash_active and
                     ctx.cache == &xfm.cache and
                     ssm_match and
                     ctx.capture_hidden == null and
@@ -1539,6 +1709,11 @@ pub const Generator = struct {
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
                 } else try xfm.forwardWith(&ctx, chunk_input);
                 _ = mlx.mlx_array_free(chunk_logits);
+                if (dflash_active) {
+                    ctx.capture_layers = null;
+                    try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
+                    for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+                }
                 if (trace_enabled) chunked_ns += prefill_sw.read() - chunk_start_ns;
 
                 // MTP history for this chunk: hiddens [pos, end) pair with
@@ -1582,6 +1757,8 @@ pub const Generator = struct {
                     // the trunk KV so the chunk's activation graph (incl. the
                     // full-hidden capture) can be freed before the next chunk.
                     if (mtp_cache) |*mc| mc.appendEvalArrays(eval_vec);
+                    // Same discipline for the DFlash context appended above.
+                    if (dflash_ctx) |*dc| dc.appendEvalArrays(eval_vec);
                     // Phase 1: also force SSM state to materialize so any
                     // snapshot below holds a concrete tensor, not a lazy node
                     // that would re-execute the prefill graph if anyone reads
@@ -1704,6 +1881,13 @@ pub const Generator = struct {
         const tail_mtp_capture = mtp_active and tail_len > 1;
         var tail_hidden_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(tail_hidden_all);
+        // DFlash context for the tail span (rides ctx into all three forward
+        // arms below; the forwardWithCapture* wrappers only override
+        // capture_hidden/_all).
+        if (dflash_active) {
+            for (dfl_out_buf) |*a| a.* = mlx.mlx_array_new();
+            ctx.capture_layers = &dfl_cl;
+        }
         const raw_logits = if (tail_mtp_capture) blk: {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -1743,6 +1927,11 @@ pub const Generator = struct {
                 tail_mrope_ctx,
                 allocator,
             );
+        }
+        if (dflash_active) {
+            ctx.capture_layers = null;
+            try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + final_start);
+            for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
         }
         // Slice to the last position when the span is longer than one token,
         // so downstream sampling/grammar paths see the classic shape.
@@ -1796,10 +1985,14 @@ pub const Generator = struct {
         // cannot pipeline because grammar advancement depends on the realized id.
         if (sampling.constraint != null) {
             // Grammar-constrained requests never speculate; release the MTP
-            // history cache if dispatch enabled it anyway.
+            // history cache / DFlash context if dispatch enabled them anyway.
             if (mtp_cache) |*mc| {
                 mc.deinit();
                 mtp_cache = null;
+            }
+            if (dflash_ctx) |*dc| {
+                dc.deinit();
+                dflash_ctx = null;
             }
             var gen = Generator{
                 .xfm = xfm,
@@ -1834,7 +2027,7 @@ pub const Generator = struct {
         // token forwarded; first sampled token deferred). The lazy
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
-        if (drafter_active or pld_active or mtp_active or dspark_active) {
+        if (drafter_active or pld_active or mtp_active or dspark_active or dflash_active) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -1872,6 +2065,15 @@ pub const Generator = struct {
                 .dspark_stochastic = dspark_stochastic,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
+                .dflash = if (dflash_active) options.dflash else null,
+                .dflash_ctx = dflash_ctx,
+                .dflash_block_size = if (options.dflash_block_size > 0)
+                    options.dflash_block_size
+                else if (dflash_active)
+                    options.dflash.?.config.block_size
+                else
+                    0,
+                .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
@@ -1883,6 +2085,7 @@ pub const Generator = struct {
                 .mtp_depth_current = 1,
             };
             mtp_cache = null; // ownership transferred to the Generator
+            dflash_ctx = null; // ownership transferred to the Generator
             // pending_logits/pending_token left empty — the lazy pipeline is
             // skipped under PLD / drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
@@ -2037,6 +2240,10 @@ pub const Generator = struct {
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;
+        }
+        if (self.dflash_ctx) |*dc| {
+            dc.deinit();
+            self.dflash_ctx = null;
         }
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
@@ -2240,10 +2447,15 @@ pub const Generator = struct {
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         const mdl = self.xfm.dsv4.?;
         const t1 = self.next_token_id;
+        const accepted_cap = capAcceptedForTokenBudget(
+            std.math.maxInt(u32),
+            self.completion_tokens,
+            self.max_tokens,
+        );
         var round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mdl, t1)
+            try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
         else
-            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1);
+            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
         errdefer round.deinit(allocator);
         // dsparkRound advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
@@ -2270,7 +2482,7 @@ pub const Generator = struct {
     /// (the toy-vocab exactness test's invariant), and the correction always
     /// derives from the ORIGINAL verify logits at the acceptance point — the
     /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32) !dsv4_mod.DsparkRound {
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32, accepted_cap: u32) !dsv4_mod.DsparkRound {
         const s = self.xfm.s;
         var pending = try dsv4_mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
         defer pending.deinit();
@@ -2339,6 +2551,9 @@ pub const Generator = struct {
                 if (u >= accept_prob) break;
                 accepted += 1;
             }
+            // Pick the correction at the request-budget boundary and let
+            // dsparkFinish roll module-owned state back to that same point.
+            accepted = @min(accepted, accepted_cap);
             try mlx.check(mlx.mlx_array_eval(bg.corr_samples));
             const corr = mlx.mlx_array_data_int32(bg.corr_samples) orelse return error.MlxArrayDataNull;
             next_token = @intCast(corr[accepted]);
@@ -2658,6 +2873,11 @@ pub const Generator = struct {
                 accepted += 1;
             }
         }
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
         const full_accept = accepted == m;
 
         // ── Phase 6: Sample new_t1 from per_pos_logits[accepted] ──
@@ -3116,6 +3336,12 @@ pub const Generator = struct {
             }
         }
 
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
+
         // Sample the next pending token from the verify output at position
         // `accepted`:
         //   - full accept (accepted == m): position m predicts the bonus
@@ -3229,6 +3455,372 @@ pub const Generator = struct {
             .tokens = tokens,
             .accepted_tokens = accepted,
         };
+    }
+
+    /// DFlash block-drafter step. ONE assistant forward proposes
+    /// `block_size - 1` drafts, conditioned on the trunk's cached
+    /// target_layer_ids hiddens (the per-request `dflash_ctx`); the trunk
+    /// verify over `[t1, drafts...]` follows the standard spec invariant
+    /// (`cache.step = prompt_len + emitted`, t1 NOT in cache on entry,
+    /// correction from ORIGINAL `verify_logits[accepted]`).
+    ///
+    /// Rollback is an offset-only `cache.truncate` — legal because
+    /// `DflashModel.bind` restricts targets to the pure-KVCache standard
+    /// path (no SSM, no module-owned state), where a position's K/V depend
+    /// only on earlier positions (causal) and are identical whether computed
+    /// in a width-16 verify or any re-forward. No re-forward runs at all:
+    /// the next round's context comes from slicing THIS round's verify
+    /// captures to the committed prefix — exactly the reference's
+    /// `hidden_states[i+1][:, :n_accepted]`.
+    ///
+    /// Drafts are greedy (argmax over the trunk lm_head on assistant
+    /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
+    /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
+    pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done) return null;
+        std.debug.assert(self.dflash != null);
+        std.debug.assert(self.dflash_ctx != null);
+        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+            return null;
+        }
+
+        if (self.spec_disabled_runtime) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
+
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const model = self.dflash.?;
+        const dctx = &self.dflash_ctx.?;
+        const bs: u32 = @max(self.dflash_block_size, 2);
+        const m: u32 = bs - 1;
+        const t1: u32 = self.next_token_id;
+        const anchor_pos: usize = self.ctx.cache.step;
+        std.debug.assert(dctx.absLen() == anchor_pos);
+
+        const tracing = dflashTraceEnabled();
+        var ph: io_util.Stopwatch = undefined;
+        if (tracing) {
+            ph = io_util.Stopwatch.init(self.timer.io);
+            if (self.dflash_gap_watch) |*gw| self.dflash_trace.add(.gap, gw.read());
+            self.dflash_gap_watch = null;
+        }
+
+        // ── Phase 1: one assistant forward drafts all m tokens ──
+        const noise_ids = try allocator.alloc(i32, bs);
+        defer allocator.free(noise_ids);
+        noise_ids[0] = @intCast(t1);
+        for (noise_ids[1..]) |*v| v.* = @intCast(model.config.mask_token_id);
+        const noise_shape = [_]c_int{ 1, @intCast(bs) };
+        const noise_input = mlx.mlx_array_new_data(noise_ids.ptr, &noise_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(noise_input);
+        // RAW table rows — no embed norm, no scale (the DFlash contract).
+        const noise_embeds = try xfm.rawEmbedding(noise_input);
+        defer _ = mlx.mlx_array_free(noise_embeds);
+
+        const blk_hidden = try dflash_mod.forwardBlock(model, dctx, noise_embeds, anchor_pos);
+        defer _ = mlx.mlx_array_free(blk_hidden);
+        if (tracing) {
+            try mlx.check(mlx.mlx_array_eval(blk_hidden));
+            self.dflash_trace.add(.assist, ph.read());
+            ph.reset();
+        }
+        const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
+        defer _ = mlx.mlx_array_free(draft_logits_all);
+
+        // Drop the anchor row: drafts = argmax(logits[:, 1:]), lazily.
+        const dl_shape = mlx.getShape(draft_logits_all);
+        var draft_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(draft_logits);
+        {
+            const start = [_]c_int{ 0, 1, 0 };
+            const stop = [_]c_int{ 1, @intCast(bs), dl_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
+        }
+        // Sampled requests accept through the full Leviathan ratio
+        // min(1, p/q), so a GREEDY draft is a one-hot q — and at temperature
+        // the target row is flat, which is exactly where min(1, p(argmax))
+        // collapses. Drafting FROM the request's own distribution makes q
+        // track p and keeps acceptance flat across temperature. Greedy
+        // requests keep the argmax path untouched, so the byte-equality
+        // guard is unaffected.
+        const stochastic = self.sampling.temperature > 0.01;
+        const sample_drafts = stochastic and dflashSampledDraftsEnabled();
+        var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
+        defer if (draft_q.ctx != null) {
+            _ = mlx.mlx_array_free(draft_q);
+        };
+        var draft_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(draft_ids);
+        if (sample_drafts) {
+            draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
+            var logq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(logq);
+            try mlx.check(mlx.mlx_log(&logq, draft_q, s));
+            const null_key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(null_key);
+            var sampled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sampled);
+            try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
+            var as_i32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(as_i32);
+            try mlx.check(mlx.mlx_astype(&as_i32, sampled, .int32, s));
+            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
+            try mlx.check(mlx.mlx_reshape(&draft_ids, as_i32, &row_shape, 2, s));
+        } else {
+            var draft_amax = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(draft_amax);
+            try mlx.check(mlx.mlx_argmax_axis(&draft_amax, draft_logits, 2, false, s));
+            try mlx.check(mlx.mlx_astype(&draft_ids, draft_amax, .int32, s));
+        }
+        if (tracing) {
+            try mlx.check(mlx.mlx_array_eval(draft_ids));
+            self.dflash_trace.add(.head, ph.read());
+            ph.reset();
+        }
+
+        // ── Phase 2: verify input [t1, drafts...] — [1, bs] int32, lazy ──
+        const t1_i32: i32 = @intCast(t1);
+        const t1_shape = [_]c_int{ 1, 1 };
+        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(t1_arr);
+        var verify_input = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_input);
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, t1_arr);
+            _ = mlx.mlx_vector_array_append_value(vec, draft_ids);
+            try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
+        }
+
+        // Verify forward with layer captures — this round's verify IS the
+        // next round's context producer.
+        const cap_out = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (cap_out) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(cap_out);
+        }
+        for (cap_out) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        self.ctx.capture_layers = &cl;
+        defer self.ctx.capture_layers = null;
+        const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        self.dflash_attempted += 1;
+        if (tracing) {
+            // Captures ride the same forward — eval them here or their cost
+            // is billed to `append`.
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, verify_logits);
+            for (cap_out) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
+            try mlx.check(mlx.mlx_eval(vec));
+            self.dflash_trace.add(.verify, ph.read());
+            ph.reset();
+        }
+
+        // ── Phase 3: decide the longest accepted prefix ──
+        const vl_shape = mlx.getShape(verify_logits);
+        var per_pos_logits: ?[]mlx.mlx_array = null;
+        defer if (per_pos_logits) |slots| {
+            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        };
+        if (stochastic) {
+            const slots = try allocator.alloc(mlx.mlx_array, bs);
+            const slice_strides = [_]c_int{ 1, 1, 1 };
+            for (slots, 0..) |*slot, idx| {
+                slot.* = mlx.mlx_array_new();
+                const start = [_]c_int{ 0, @intCast(idx), 0 };
+                const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
+                try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+            }
+            per_pos_logits = slots;
+        }
+        var verify_argmax = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_argmax);
+        if (!stochastic) {
+            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+        }
+        _ = mlx.mlx_array_free(verify_logits);
+
+        // One batched dispatch, then read (drafts branch + verify branch are
+        // separate graphs — eval BOTH before reading either; the v26.5.6
+        // 0%-acceptance class).
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, draft_ids);
+            if (!stochastic) _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+        }
+        var drafts = try allocator.alloc(u32, m);
+        errdefer allocator.free(drafts);
+        {
+            try mlx.check(mlx.mlx_array_eval(draft_ids));
+            const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
+            for (drafts, 0..) |*d, idx| d.* = @intCast(draft_data[idx]);
+        }
+        if (!stochastic) try mlx.check(mlx.mlx_array_eval(verify_argmax));
+
+        var accepted: u32 = 0;
+        if (stochastic) {
+            var k: u32 = 0;
+            while (k < m) : (k += 1) {
+                const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
+                defer _ = mlx.mlx_array_free(target_p);
+                const p_draft = try probAt(target_p, drafts[k], s);
+                const accept_prob: f32 = if (draft_q.ctx != null) blk: {
+                    const q_row = try sliceProbRow(draft_q, k, s);
+                    defer _ = mlx.mlx_array_free(q_row);
+                    break :blk specAcceptProb(p_draft, try probAt(q_row, drafts[k], s));
+                } else @min(1.0, p_draft);
+                const u: f32 = self.prng.random().float(f32);
+                if (u >= accept_prob) break;
+                accepted += 1;
+            }
+        } else {
+            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse return error.MlxArrayDataNull;
+            var k: u32 = 0;
+            while (k < m) : (k += 1) {
+                if (@as(u32, @intCast(argmax_data[k])) != drafts[k]) break;
+                accepted += 1;
+            }
+        }
+
+        // A speculative verify may accept the whole block even when only a
+        // few output positions remain. Cap the accepted prefix BEFORE cache
+        // and assistant-context commit so every representation of the turn —
+        // returned tokens, generated_ids, usage, KV and DFlash context — ends
+        // at exactly max_tokens.
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
+
+        const next_pending: u32 = blk: {
+            if (stochastic) {
+                const correction_logits = per_pos_logits.?[accepted];
+                const probs = try probsAtLastPos(correction_logits, self.sampling, s);
+                defer _ = mlx.mlx_array_free(probs);
+                if (accepted < m) {
+                    // norm(max(0, p − q)) against the q the draft was drawn
+                    // from — a one-hot here is the WRONG residual for a
+                    // sampled draft, and wrong silently.
+                    const q_row = if (draft_q.ctx != null)
+                        try sliceProbRow(draft_q, accepted, s)
+                    else
+                        try pldOneHotRow(drafts[accepted], vl_shape[2], s);
+                    defer _ = mlx.mlx_array_free(q_row);
+                    break :blk try sampleResidual(probs, q_row, s);
+                } else {
+                    break :blk try sampleFromProbs(probs, s);
+                }
+            } else {
+                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse return error.MlxArrayDataNull;
+                break :blk @intCast(argmax_data[accepted]);
+            }
+        };
+
+        if (tracing) {
+            self.dflash_trace.add(.accept, ph.read());
+            ph.reset();
+        }
+
+        // ── Phase 4: commit — truncate on partial accept, then grow the
+        // assistant context by exactly the committed positions ──
+        const n_commit: usize = 1 + @as(usize, accepted);
+        if (accepted < m) {
+            try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+        }
+        if (accepted == m) {
+            try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
+        } else {
+            const sliced = try allocator.alloc(mlx.mlx_array, cap_out.len);
+            defer {
+                for (sliced) |a| _ = mlx.mlx_array_free(a);
+                allocator.free(sliced);
+            }
+            for (cap_out, sliced) |full, *out| {
+                out.* = mlx.mlx_array_new();
+                const fsh = mlx.getShape(full);
+                const start = [_]c_int{ 0, 0, 0 };
+                const stop = [_]c_int{ 1, @intCast(n_commit), fsh[2] };
+                const strides = [_]c_int{ 1, 1, 1 };
+                try mlx.check(mlx.mlx_slice(out, full, &start, 3, &stop, 3, &strides, 3, s));
+            }
+            try dflash_mod.appendContext(model, dctx, sliced, anchor_pos);
+        }
+        // Materialize the appended context off the critical path so next
+        // round's assistant forward doesn't drag this round's verify graph.
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            dctx.appendEvalArrays(eval_vec);
+            if (tracing) {
+                try mlx.check(mlx.mlx_eval(eval_vec));
+                self.dflash_trace.add(.append, ph.read());
+                ph.reset();
+            } else {
+                try mlx.check(mlx.mlx_async_eval(eval_vec));
+            }
+        }
+
+        const tokens = try allocator.alloc(u32, n_commit);
+        tokens[0] = t1;
+        for (drafts[0..accepted], 0..) |d, idx| tokens[1 + idx] = d;
+        try self.generated_ids.append(allocator, t1);
+        for (drafts[0..accepted]) |d| try self.generated_ids.append(allocator, d);
+        allocator.free(drafts);
+
+        self.dflash_accepted_tokens += accepted;
+        self.next_token_id = next_pending;
+        self.advanceStep(@intCast(n_commit));
+        self.checkDflashRuntimeGate();
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+
+        if (tracing) {
+            self.dflashTraceRoundEnd(accepted);
+            self.dflash_gap_watch = io_util.Stopwatch.init(self.timer.io);
+        }
+
+        return DrafterStepResult{
+            .tokens = tokens,
+            .accepted_tokens = accepted,
+        };
+    }
+
+    /// DFlash runtime economics gate. Sticky within the request: once a
+    /// three-round sample proves the block-parallel path yields less than its
+    /// width-normalized request-class threshold, subsequent ticks use the
+    /// regular pipelined decoder through `nextDflash`'s entry fallback.
+    fn checkDflashRuntimeGate(self: *Generator) void {
+        if (self.spec_disabled_runtime) return;
+        if (!dflashGateShouldDisable(
+            self.dflash_attempted,
+            self.dflash_accepted_tokens,
+            self.dflash_min_accepted_per_round,
+        )) return;
+        const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
+            @as(f32, @floatFromInt(self.dflash_attempted));
+        log.info(
+            "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts)\n",
+            .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted },
+        );
+        self.spec_disabled_runtime = true;
     }
 
     /// Runtime acceptance gate for the drafter: after warmup, if the per-draft
@@ -4116,6 +4708,12 @@ pub const Generator = struct {
             }
         }
 
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
+
         const next_pending: u32 = blk: {
             if (stochastic) {
                 if (corr_batch.ctx != null) {
@@ -4831,6 +5429,103 @@ pub const Generator = struct {
         }
     };
 
+    /// Per-phase wall-time accumulator behind MLX_SERVE_DFLASH_TRACE=1.
+    /// `nextDflash` stamps phases with a Stopwatch and emits one summary line
+    /// every LOG_EVERY rounds. Zero cost when the env is absent.
+    pub const DflashTrace = struct {
+        pub const LOG_EVERY: u32 = 16;
+        pub const Phase = enum(u4) { assist, head, verify, accept, append, gap };
+        pub const N_PHASES = @typeInfo(Phase).@"enum".field_names.len;
+
+        rounds: u32 = 0,
+        ns: [N_PHASES]u64 = @splat(0),
+        accepted: u64 = 0,
+
+        pub fn add(self: *DflashTrace, phase: Phase, dur_ns: u64) void {
+            self.ns[@intFromEnum(phase)] += dur_ns;
+        }
+
+        /// Close one round; true when a summary line is due (caller logs,
+        /// then calls reset()).
+        pub fn endRound(self: *DflashTrace, accepted_n: u32) bool {
+            self.rounds += 1;
+            self.accepted += accepted_n;
+            return self.rounds >= LOG_EVERY;
+        }
+
+        pub fn avgMs(self: *const DflashTrace, phase: Phase) f64 {
+            if (self.rounds == 0) return 0.0;
+            return @as(f64, @floatFromInt(self.ns[@intFromEnum(phase)])) /
+                (@as(f64, @floatFromInt(self.rounds)) * 1e6);
+        }
+
+        pub fn totalAvgMs(self: *const DflashTrace) f64 {
+            if (self.rounds == 0) return 0.0;
+            var total: u64 = 0;
+            for (self.ns) |v| total += v;
+            return @as(f64, @floatFromInt(total)) / (@as(f64, @floatFromInt(self.rounds)) * 1e6);
+        }
+
+        pub fn reset(self: *DflashTrace) void {
+            self.* = .{};
+        }
+    };
+
+    /// Sampled DFlash drafts — DEFAULT OFF, measured negative.
+    /// `MLX_SERVE_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the
+    /// request's own filtered distribution and accepts through the full
+    /// Leviathan ratio; off keeps the argmax draft and its one-hot q.
+    ///
+    /// The theory said this should help: a greedy draft's acceptance is
+    /// p(argmax q), which a flattened target row deflates, while a matched
+    /// proposal accepts at 1 − TV(p, q). Measured on Muse 4-bit at temp 0.7
+    /// (3 reps x 4 prompts, same-boot serial reference), it is a LOSS —
+    /// 52.4 tok/s / 54.5% per-draft against 55.5 / 57.7% greedy. This
+    /// assistant's ARGMAX tracks the trunk well while its distribution SHAPE
+    /// does not, so a one-hot proposal is the better proposal and sampling
+    /// spends the round's budget landing on tokens the trunk would not pick.
+    /// Greedy requests never reach this either way.
+    var dflash_sampled_drafts_cache: ?bool = null;
+    fn dflashSampledDraftsEnabled() bool {
+        if (dflash_sampled_drafts_cache) |v| return v;
+        var on = false;
+        if (std.c.getenv("MLX_SERVE_DFLASH_SAMPLED_DRAFTS")) |p| {
+            const val = std.mem.span(p);
+            if (val.len > 0 and val[0] == '1') on = true;
+        }
+        dflash_sampled_drafts_cache = on;
+        return on;
+    }
+
+    var dflash_trace_cache: ?bool = null;
+    fn dflashTraceEnabled() bool {
+        if (dflash_trace_cache) |v| return v;
+        const on = readEnvBool("MLX_SERVE_DFLASH_TRACE");
+        dflash_trace_cache = on;
+        return on;
+    }
+
+    /// Close one traced dflash round; emits + resets at the cadence.
+    fn dflashTraceRoundEnd(self: *Generator, accepted: u32) void {
+        if (!self.dflash_trace.endRound(accepted)) return;
+        const t = &self.dflash_trace;
+        log.info(
+            "  [dflash-trace] rounds={d} avg_ms assist={d:.2} head={d:.2} verify={d:.2} accept={d:.2} append={d:.2} gap={d:.2} total={d:.2} | acc_avg={d:.2}\n",
+            .{
+                t.rounds,
+                t.avgMs(.assist),
+                t.avgMs(.head),
+                t.avgMs(.verify),
+                t.avgMs(.accept),
+                t.avgMs(.append),
+                t.avgMs(.gap),
+                t.totalAvgMs(),
+                @as(f64, @floatFromInt(t.accepted)) / @as(f64, @floatFromInt(t.rounds)),
+            },
+        );
+        t.reset();
+    }
+
     /// Adaptive (EV) controller gate — DEFAULT ON. MLX_SERVE_MTP_ADAPTIVE=0
     /// reverts to the fixed-depth windowed controller for same-boot A/Bs.
     var mtp_adaptive_cache: ?bool = null;
@@ -5381,7 +6076,16 @@ pub const Generator = struct {
         const constraint = self.sampling.constraint.?;
         const s = self.xfm.s;
 
-        _ = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        if (allowed == 0) {
+            // No legal token: every logit would be -inf and argmax over that
+            // row returns id 0, whose bytes then fail `acceptByte` and switch
+            // enforcement off anyway — one garbage token later, and with the
+            // grammar bug reported as model output. Say so and degrade here.
+            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+            constraint.grammar.dead = true;
+            @memset(constraint.mask_buf, true);
+        }
 
         // Also allow every stop-id the generator recognises once the grammar is
         // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
@@ -5664,6 +6368,17 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
         current = masked;
     }
 
+    return filteredProbsRows(current, sampling, s);
+}
+
+/// Temperature → top-k → top-p → softmax over the LAST axis of an owned
+/// `[.., V]` array (consumed). The ONE place a proposal or target density is
+/// built: a draft sampled from a distribution that is not byte-for-byte the
+/// `q` handed to `specAcceptProb` breaks exactness silently, so both sides
+/// come through here. Row-independent, so it serves a single `[1, V]` row and
+/// a whole `[m, V]` block identically.
+fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    var current = owned_rows;
     // Apply temperature → top-k → top-p (same order as `sampleTokenLazy`).
     if (sampling.temperature != 1.0) {
         const t = mlx.mlx_array_new_float(sampling.temperature);
@@ -5691,6 +6406,24 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
     try mlx.check(mlx.mlx_softmax_axis(&probs, current, -1, true, s));
     _ = mlx.mlx_array_free(current);
     return probs;
+}
+
+/// Proposal densities for EVERY row of a `[1, m, V]` draft-logit block, as
+/// `[m, V]`. One filter pass and (at the call site) one categorical over m
+/// rows, rather than m of each — the draft block is on the critical path
+/// ahead of the verify forward.
+fn filteredProbsBlock(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(logits_3d);
+    var rows = mlx.mlx_array_new();
+    const rows_shape = [_]c_int{ shape[0] * shape[1], shape[2] };
+    try mlx.check(mlx.mlx_reshape(&rows, logits_3d, &rows_shape, 2, s));
+    if (sampling.suppress_mask) |m| {
+        var masked = mlx.mlx_array_new();
+        try applySuppressMask(&masked, rows, m, s);
+        _ = mlx.mlx_array_free(rows);
+        rows = masked;
+    }
+    return filteredProbsRows(rows, sampling, s);
 }
 
 /// Read `probs[0, token_id]` as f32. Forces realization with a single eval.
@@ -5759,6 +6492,19 @@ fn pldOneHotRow(index: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const out_shape = [_]c_int{ 1, vocab };
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, mask_f32, &out_shape, 2, s));
+    return out;
+}
+
+/// One row of a `[m, V]` density block as its own `[1, V]` array, so it can
+/// feed `probAt` and `sampleResidual` (both row-shaped). Caller owns it.
+fn sliceProbRow(rows_2d: mlx.mlx_array, row: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(rows_2d);
+    const start = [_]c_int{ @intCast(row), 0 };
+    const stop = [_]c_int{ @as(c_int, @intCast(row)) + 1, shape[1] };
+    const strides = [_]c_int{ 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, rows_2d, &start, 2, &stop, 2, &strides, 2, s));
     return out;
 }
 
@@ -7227,10 +7973,15 @@ fn maskForLogitVocab(allocator: std.mem.Allocator, mask: []const bool, vocab_siz
 
 /// Apply top-k filtering: keep only the top k logits, set the rest to -inf.
 fn applyTopK(res: *mlx.mlx_array, logits: mlx.mlx_array, k: u32, s: mlx.mlx_stream) !void {
-    // Get the top-k values (returned in descending order)
+    // Per-ROW top-k. `mlx_topk` (no axis) flattens, which is indistinguishable
+    // from the right answer for the [1, V] rows every caller passed until the
+    // draft block arrived: on [m, V] it returns the k largest of the WHOLE
+    // block, so one row's cutoff masks every other row to -inf and softmax
+    // hands back NaN. A reduction helper that has only ever seen one row
+    // cannot reveal an axis bug.
     var topk_vals = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(topk_vals);
-    try mlx.check(mlx.mlx_topk(&topk_vals, logits, @intCast(k), s));
+    try mlx.check(mlx.mlx_topk_axis(&topk_vals, logits, @intCast(k), -1, s));
 
     // Get the minimum of the top-k values (the k-th largest) as cutoff
     var cutoff = mlx.mlx_array_new();
@@ -7766,6 +8517,32 @@ test "Generator.runtimeGateShouldDisable handles drafts_per_round=0" {
     // Defensive: if a caller somehow passes a degenerate config (block_size=1
     // → drafts_per_round=0), don't divide by zero. We return false (no trip).
     try testing.expect(!Generator.runtimeGateShouldDisable(100, 0, 0));
+}
+
+test "Generator.dflashGateShouldDisable uses accepted yield across block widths" {
+    // Never decide from fewer than the DFlash warmup number of paid verifies.
+    try testing.expect(!Generator.dflashGateShouldDisable(
+        Generator.DFLASH_GATE_WARMUP - 1,
+        0,
+        Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+    ));
+
+    // Muse prose/vision measured 1.0-1.5 accepted drafts per round at both
+    // block 8 and block 16: that class loses to serial and must fall back.
+    try testing.expect(Generator.dflashGateShouldDisable(3, 3, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(3, 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+
+    // Exactly two is the strict break-even boundary; code/tool traffic at
+    // 4.4+ and echo traffic near a full block remain on DFlash.
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 6, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 45, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+
+    // Thinking preambles recovered from ~1.4 early to 4.4 whole-request; the
+    // resolved-mode threshold keeps that path alive while still cutting off
+    // a truly non-yielding reasoning request.
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 4, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(3, 2, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
 }
 
 test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
@@ -8414,6 +9191,85 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
 
     // Explicit greedy override (MLX_SERVE_MTP_DRAFT_GREEDY=1) wins.
     try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true).temperature);
+}
+
+test "filteredProbsBlock: every draft row is the SAME density the sample is drawn from" {
+    // Exactness rests on q being the true proposal: the draft must be drawn
+    // from byte-for-byte the row handed to `specAcceptProb`. The way that
+    // breaks silently is filtering the two differently — so pin that a row
+    // is a normalized distribution supported ONLY on the kept set, and that
+    // `mlx_random_categorical` over log(q) can never land outside it.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const V: c_int = 8;
+    const M: c_int = 3;
+    // Three rows with deliberately different argmaxes, so a row-blind
+    // implementation (broadcasting one row's mask) fails.
+    const raw = [_]f32{
+        5.0, 4.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 1.0, 4.0, 5.0, 0.0,
+        0.0, 9.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0,
+    };
+    const shape = [_]c_int{ 1, M, V };
+    const logits = mlx.mlx_array_new_data(&raw, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    var sampling = SamplingParams{};
+    sampling.temperature = 0.8;
+    sampling.top_k = 2;
+    const q = try filteredProbsBlock(logits, sampling, s);
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_array_eval(q));
+    const qsh = mlx.getShape(q);
+    try testing.expectEqual(M, qsh[0]);
+    try testing.expectEqual(V, qsh[1]);
+
+    const data = mlx.mlx_array_data_float32(q) orelse return error.MlxArrayDataNull;
+    // Per row: sums to 1, and exactly top_k entries carry mass.
+    const want_support = [_][2]usize{ .{ 0, 1 }, .{ 5, 6 }, .{ 1, 3 } };
+    for (0..@intCast(M)) |r| {
+        var sum: f32 = 0;
+        var nonzero: usize = 0;
+        for (0..@intCast(V)) |c| {
+            const v = data[r * @as(usize, @intCast(V)) + c];
+            sum += v;
+            if (v > 0) nonzero += 1;
+        }
+        try testing.expect(@abs(sum - 1.0) < 1e-5);
+        try testing.expectEqual(@as(usize, 2), nonzero);
+        for (want_support[r]) |c| {
+            try testing.expect(data[r * @as(usize, @intCast(V)) + c] > 0);
+        }
+    }
+
+    // Draw the way nextDflash does and assert every sample is in q's support.
+    var logq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logq);
+    try mlx.check(mlx.mlx_log(&logq, q, s));
+    var draws: usize = 0;
+    while (draws < 24) : (draws += 1) {
+        const null_key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(null_key);
+        var sampled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sampled);
+        try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
+        var ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids);
+        try mlx.check(mlx.mlx_astype(&ids, sampled, .int32, s));
+        try mlx.check(mlx.mlx_array_eval(ids));
+        const idd = mlx.mlx_array_data_int32(ids) orelse return error.MlxArrayDataNull;
+        for (0..@intCast(M)) |r| {
+            const tok: usize = @intCast(idd[r]);
+            // q(draft) > 0 is what keeps the accept ratio finite.
+            try testing.expect(data[r * @as(usize, @intCast(V)) + tok] > 0);
+            // And `sliceProbRow` must hand back THAT row, not another.
+            const row = try sliceProbRow(q, @intCast(r), s);
+            defer _ = mlx.mlx_array_free(row);
+            const got = try probAt(row, @intCast(tok), s);
+            try testing.expectApproxEqAbs(data[r * @as(usize, @intCast(V)) + tok], got, 1e-6);
+        }
+    }
+    _ = allocator;
 }
 
 test "specAcceptProb: full Leviathan ratio, q-clamped" {
@@ -9804,4 +10660,105 @@ test "logprobs publish through the one-token delay, never straight from sampleTo
         }
     }
     try testing.expect(seen >= 1);
+}
+
+test "dflash: nextDflash greedy equals serial decode, invariants exact each round" {
+    // Hermetic end-to-end round loop on the tiny llama trunk + tiny DFlash
+    // assistant (dflash.TinyFix). The bar is the spec-decode contract:
+    //   - greedy dflash-on emits EXACTLY the serial greedy tokens (any bug in
+    //     verify alignment, rollback truncate, correction indexing, or the
+    //     anchor-row drop shifts the stream);
+    //   - after EVERY round: trunk cache.step == prompt_len + emitted and the
+    //     assistant context tracks it exactly (base + step == cache.step) at
+    //     whatever accepted counts the round produced.
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_len = try tmp_trunk.dir.realPath(io, &trunk_buf);
+    const trunk_path = trunk_buf[0..trunk_len];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+
+    var tmp_asst = std.testing.tmpDir(.{});
+    defer tmp_asst.cleanup();
+    var asst_buf: [512]u8 = undefined;
+    const asst_len = try tmp_asst.dir.realPath(io, &asst_buf);
+    const asst_path = asst_buf[0..asst_len];
+    try dflash_mod.TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
+
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const want: usize = 16;
+
+    // Serial baseline.
+    var serial: [want]u32 = undefined;
+    {
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+            .skip_lazy_preforward = true,
+        });
+        defer gen.deinit(allocator);
+        var n: usize = 0;
+        while (n < want) {
+            const t = (try gen.next(allocator)) orelse break;
+            serial[n] = t;
+            n += 1;
+        }
+        try testing.expectEqual(want, n);
+    }
+
+    // DFlash arm.
+    {
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
+        defer dm.deinit();
+        try dm.bind(&xfm);
+
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+            .dflash_enabled = true,
+            .dflash = &dm,
+            // This is the numeric DFlash guard, not the economics-gate test:
+            // every emitted token must pass through nextDflash itself.
+            .dflash_min_accepted_per_round = 0,
+        });
+        defer gen.deinit(allocator);
+        try testing.expectEqual(@as(u32, 4), gen.dflash_block_size);
+        // Prefill built context for the whole prompt.
+        try testing.expectEqual(prompt.len, gen.dflash_ctx.?.absLen());
+        try testing.expectEqual(prompt.len, gen.ctx.cache.step);
+
+        var got = std.ArrayList(u32).empty;
+        defer got.deinit(allocator);
+        while (true) {
+            const attempts_before = gen.dflash_attempted;
+            const res = (try gen.nextDflash(allocator)) orelse break;
+            defer allocator.free(res.tokens);
+            try got.appendSlice(allocator, res.tokens);
+            // A real DFlash round commits trunk and assistant context to the
+            // same exact boundary at every accepted count. Falling back here
+            // would make the remaining equality checks compare serial decode
+            // with itself and gut the default-on draft-quantization guard.
+            try testing.expect(gen.dflash_attempted != attempts_before);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+        }
+        try testing.expect(gen.dflash_attempted > 0);
+        try testing.expect(!gen.spec_disabled_runtime);
+        try testing.expectEqual(want, got.items.len);
+        try testing.expectEqual(@as(u32, @intCast(want)), gen.completion_tokens);
+        try testing.expectEqual(want, gen.generated_ids.items.len);
+        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
+    }
 }

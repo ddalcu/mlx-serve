@@ -25,6 +25,7 @@ const vision_mod = @import("vision.zig");
 const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
+const token_mask_mod = @import("token_mask.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
@@ -39,6 +40,8 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const DrafterModel = drafter_mod.DrafterModel;
+const dflash_mod = @import("dflash.zig");
+const DflashModel = dflash_mod.DflashModel;
 const mtp_mod = @import("mtp.zig");
 const MtpModel = mtp_mod.MtpModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
@@ -120,6 +123,10 @@ pub const LoadedModel = struct {
     chat_config: ?*ChatConfig,
     vision_encoder: ?*VisionEncoder,
     drafter: ?*DrafterModel,
+    /// DFlash block-drafter sidecar. Mutually exclusive with `drafter` by the
+    /// loader's config-contract probe; `drafter_path`/`drafter_block_size`
+    /// are shared between the two sidecar kinds.
+    dflash: ?*DflashModel = null,
     /// Echoed in `/v1/models` so the Swift app can show the drafter checkpoint
     /// path; empty when no drafter is loaded. Allocator-owned dupe.
     drafter_path: []const u8,
@@ -150,6 +157,11 @@ pub const LoadedModel = struct {
     /// Metal prefill on a KV-cache hit. Null when --tokenize-cache-entries
     /// is 0 (caller disables for tests / debugging).
     tokenize_cache: ?TokenizeCache = null,
+
+    /// Grammar-mask token-byte table for this model's vocabulary, and the
+    /// lock that serializes its lazy build. See `grammarTokenBytes`.
+    token_bytes: ?token_mask_mod.TokenBytes = null,
+    token_bytes_mutex: std.Io.Mutex = .init,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
@@ -235,6 +247,26 @@ pub const LoadedModel = struct {
     /// (e.g. "LoadFailed", "MissingVisionWeights"). Null otherwise.
     error_name: ?[]const u8,
 
+    /// Token → bytes table backing the JSON grammar mask, built lazily on this
+    /// entry's first schema-constrained request. Its lifetime matches
+    /// `tokenizer` exactly: ids only mean bytes in the vocabulary they were
+    /// decoded from, so a table borrowed from another resident model masks
+    /// the wrong ids. Guarded by `token_bytes_mutex` — connection threads
+    /// build it, not the inference thread.
+    pub fn grammarTokenBytes(
+        self: *LoadedModel,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+    ) !*const token_mask_mod.TokenBytes {
+        self.token_bytes_mutex.lockUncancelable(io);
+        defer self.token_bytes_mutex.unlock(io);
+        if (self.token_bytes) |*tb| return tb;
+        const tok = self.tokenizer orelse return error.NoTokenizer;
+        log.info("[grammar] building token-byte table for {s} (one-time, ~50ms)\n", .{self.id});
+        self.token_bytes = try token_mask_mod.build(gpa, tok);
+        return &self.token_bytes.?;
+    }
+
     /// Free all owned state. Safe to call regardless of `state` — null
     /// model fields are skipped. Mlx-allocating fields are freed in
     /// drafter → vision → transformer → weights order to mirror the
@@ -288,6 +320,11 @@ pub const LoadedModel = struct {
             self.allocator.destroy(d);
             self.drafter = null;
         }
+        if (self.dflash) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
+            self.dflash = null;
+        }
         if (self.vision_encoder) |v| {
             v.deinit();
             self.allocator.destroy(v);
@@ -302,6 +339,12 @@ pub const LoadedModel = struct {
             w.deinit();
             self.allocator.destroy(w);
             self.weights = null;
+        }
+        if (self.token_bytes) |*tb| {
+            // Decoded from `tokenizer`'s vocabulary — same lifetime, freed
+            // first so the table never outlives the ids it describes.
+            tb.deinit();
+            self.token_bytes = null;
         }
         if (self.tokenizer) |tok| {
             tok.deinit();
@@ -386,6 +429,11 @@ pub const LoadedModel = struct {
             d.deinit();
             self.allocator.destroy(d);
             self.drafter = null;
+        }
+        if (self.dflash) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
+            self.dflash = null;
         }
         if (self.vision_encoder) |v| {
             v.deinit();
@@ -669,8 +717,12 @@ pub const ModelRegistry = struct {
     /// Set the default model id used for requests that omit `model` or
     /// pass the literal "mlx-serve". The id must already exist (via
     /// `registerStub`); caller borrows the entry's own `id` slice so the
-    /// pointer is stable for the registry's lifetime.
+    /// pointer is stable for the registry's lifetime. Locked: besides the
+    /// single-threaded boot callers, `/v1/load-model` `"default": true`
+    /// re-points this from conn threads while others read it.
     pub fn setDefault(self: *ModelRegistry, id: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
     }
@@ -681,11 +733,15 @@ pub const ModelRegistry = struct {
     /// basename-derived id differs from the discovered `org/name` id —
     /// two ids for one path would let the same weights load twice.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.peekByPathLocked(path);
+    }
+
+    fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         var trimmed = path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         if (trimmed.len == 0) return null;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             var entry_path: []const u8 = entry_ptr.*.path;
@@ -693,6 +749,30 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
         }
         return null;
+    }
+
+    /// Re-run discovery over the roots the server booted with and absorb NEW
+    /// dirs as `.unloaded` stubs (`POST /v1/models/rescan` — the Model
+    /// Browser downloads models while the server runs, and a boot-only scan
+    /// can't see them). Add-only: an id or path already registered wins
+    /// (first-wins, like boot) and live entries are never re-pointed or
+    /// removed. Returns the number of stubs added. No roots (a `--model`-only
+    /// server) rescans nothing.
+    pub fn rescan(self: *ModelRegistry) !u32 {
+        const roots = if (self.discovery) |d| d.roots else &.{};
+        if (roots.len == 0) return 0;
+        var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
+        defer found.deinit();
+        var added: u32 = 0;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (found.models) |m| {
+            if (self.entries.get(m.id) != null) continue;
+            if (self.peekByPathLocked(m.path) != null) continue;
+            _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
+            added += 1;
+        }
+        return added;
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -755,7 +835,7 @@ pub const ModelRegistry = struct {
                     self.state_cond.waitUncancelable(self.io, &self.mutex);
                     continue;
                 },
-                .error_state => return error.LoadFailed,
+                .error_state => return loadErrorFromName(entry.error_name),
                 .unloaded => return error.NotLoaded,
             }
         }
@@ -984,6 +1064,38 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// Map a stored load-failure name back to the typed error `ensureLoaded`
+    /// surfaces. A memory-preflight refusal keeps its identity so the HTTP
+    /// layer answers with a named 503 instead of the generic "Model load
+    /// failed" 500 (#144); everything else is `LoadFailed` with the name
+    /// readable via `loadErrorNameDupe`.
+    /// `OutOfMemory` counts too: an allocator failure during a load is the same
+    /// actionable thing to the user as the preflight's own refusal, and it
+    /// reached the client as a generic "Model load failed" 500 before
+    /// (2026-08-08). Merge note: this arm came from the branch's
+    /// `scheduler.loadErrorFor`, which this function replaced — the name-based
+    /// half survived the refactor, the second name did not.
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
+        if (name) |n| {
+            if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
+            if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
+        }
+        return error.LoadFailed;
+    }
+
+    test "a memory refusal keeps its own error out to the client" {
+        // Live 2026-08-08: the image engine refused for memory, the name was
+        // freed, and the pane showed a generic "Model load failed" with an
+        // empty log — the one failure the user could have fixed, rendered
+        // unactionable. Both spellings of "out of memory" have to survive.
+        try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("InsufficientMemory"));
+        try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
+        // Everything else stays a load failure — guessing a diagnosis is worse
+        // than reporting the honest generic one.
+        try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
+        try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(null));
+    }
+
     /// Mark an entry as `.error_state` and store `error_name` (duped).
     /// Future `ensureLoaded` calls fail with `error.LoadFailed` until the
     /// entry is reset to `.unloaded` (Phase D may add a retry path).
@@ -993,6 +1105,23 @@ pub const ModelRegistry = struct {
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
         self.state_cond.broadcast(self.io);
+    }
+
+    /// Duped copy of the stored load-failure name for `id` (empty/"mlx-serve"
+    /// route to the default), or null when the entry isn't in `.error_state`.
+    /// Caller frees. Feeds the HTTP "Model load failed: <name>" message (#144).
+    pub fn loadErrorNameDupe(self: *ModelRegistry, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
+        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "mlx-serve"))
+            self.default_id
+        else
+            id_or_empty;
+        if (id.len == 0) return null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.entries.get(id) orelse return null;
+        if (entry.state != .error_state) return null;
+        const name = entry.error_name orelse return null;
+        return alloc.dupe(u8, name) catch null;
     }
 
     /// Snapshot of every entry for `/v1/models`. Sort: default first
@@ -1188,6 +1317,32 @@ test "ModelRegistry: ensureLoaded reports error_state" {
     try testing.expectEqualStrings("MissingVisionWeights", stub.error_name.?);
 }
 
+test "ModelRegistry: memory-refused loads keep their identity, other failures expose their name" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("krea", "/path/to/krea", 1024);
+
+    // #144: a memory-preflight refusal must not collapse into the generic
+    // "Model load failed" 500 — it maps back to the memory error so the HTTP
+    // layer can answer with a named 503.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(stub, "InsufficientMemory");
+    reg.mutex.unlock(reg.io);
+    try testing.expectError(error.InsufficientMemory, reg.ensureLoaded("krea"));
+
+    // Any other failure stays LoadFailed, with the stored name readable for
+    // the "Model load failed: <name>" message.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(stub, "FileNotFound");
+    reg.mutex.unlock(reg.io);
+    try testing.expectError(error.LoadFailed, reg.ensureLoaded("krea"));
+    const name = reg.loadErrorNameDupe(testing.allocator, "krea");
+    defer if (name) |n| testing.allocator.free(n);
+    try testing.expectEqualStrings("FileNotFound", name.?);
+    // Non-error entries have no name to report.
+    try testing.expectEqual(@as(?[]u8, null), reg.loadErrorNameDupe(testing.allocator, "missing"));
+}
+
 test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -1297,6 +1452,42 @@ test "ModelRegistry: peek does not refcount" {
     try testing.expectEqual(lm, peeked);
     try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
     try testing.expectEqual(@as(?*LoadedModel, null), reg.peek("nope"));
+}
+
+/// Attach a decode-capable tokenizer whose vocabulary is `tokens` (id → piece)
+/// to `lm`, the way the real loader hands ownership to the entry.
+fn attachTestTokenizer(lm: *LoadedModel, tokens: []const struct { u32, []const u8 }) !void {
+    const tok = try lm.allocator.create(Tokenizer);
+    tok.* = Tokenizer.initEmptyForTests(lm.allocator, .byte_level_bpe);
+    for (tokens) |t| try tok.id_to_token.put(t[0], t[1]);
+    lm.tokenizer = tok;
+}
+
+test "grammar token-byte table is per MODEL, never a process-wide singleton" {
+    // Two resident models, two vocabularies, the SAME ids meaning different
+    // bytes. A table built for one and handed to the other maps every id to
+    // the wrong bytes, so the JSON grammar mask allows tokens whose real
+    // bytes are off-schema — live 2026-08-11, muse served under LFM2.5's
+    // table answered a `json_object` request with "## Attributes".
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const a = try makeReadyStub(reg, "model-a", 1024);
+    try attachTestTokenizer(a, &.{ .{ 0, "{" }, .{ 1, "##" } });
+    const b = try makeReadyStub(reg, "model-b", 1024);
+    try attachTestTokenizer(b, &.{ .{ 0, "##" }, .{ 1, "{" } });
+
+    const tb_a = try a.grammarTokenBytes(testing.allocator, io);
+    try testing.expectEqualStrings("{", tb_a.bytes[0].?);
+    try testing.expectEqualStrings("##", tb_a.bytes[1].?);
+
+    const tb_b = try b.grammarTokenBytes(testing.allocator, io);
+    try testing.expectEqualStrings("##", tb_b.bytes[0].?);
+    try testing.expectEqualStrings("{", tb_b.bytes[1].?);
+
+    // Cached per entry: a second call hands back the same table, not a rebuild.
+    try testing.expectEqual(tb_b, try b.grammarTokenBytes(testing.allocator, io));
 }
 
 // ── Eviction planner + reservation accounting (oversubscription fix) ──
@@ -1468,4 +1659,36 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     bge.config = null;
     chat.config = null;
     chat2.config = null;
+}
+
+test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // One model present at boot.
+    try tmp.dir.createDirPath(io, "org/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/model.safetensors", .data = "0123" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    try testing.expect(reg.peek("org/first") != null);
+
+    // A second model lands on disk AFTER boot (the Model Browser download).
+    try tmp.dir.createDirPath(io, "org/second");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/second/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/second/transformer.safetensors", .data = "0123" });
+
+    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
+    try testing.expectEqualStrings("minimax_h3", stub.arch_hint);
+    try testing.expectEqual(LoadState.unloaded, stub.state);
+    // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expect(reg.peek("org/first") != null);
 }

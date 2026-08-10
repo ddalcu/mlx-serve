@@ -189,15 +189,27 @@ class APIClient {
     /// Plan 05 Phase G — POST /v1/load-model. Returns the resulting
     /// `ModelInfo` after the load completes (blocks for seconds on a cold
     /// load). Throws if the id is unknown (404) or load fails (500).
-    func loadModel(port: UInt16, id: String, drafterPath: String? = nil) async throws -> ModelInfo {
+    /// The /v1/load-model request body. `setDefault` rides only on a model
+    /// SWITCH: it re-points the server's default (requests that omit `model`,
+    /// the "mlx-serve" alias, /v1/models' default-first sort). A media-gen
+    /// side-load must NOT carry it — it loads BESIDE the chat model, and
+    /// stealing the default would re-route every aliased chat request to a
+    /// model that 400s them.
+    static func loadModelBody(id: String, drafterPath: String?, setDefault: Bool) -> [String: Any] {
+        var body: [String: Any] = ["model": id]
+        if let drafterPath { body["drafter_path"] = drafterPath }
+        if setDefault { body["default"] = true }
+        return body
+    }
+
+    func loadModel(port: UInt16, id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/load-model")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Load can take 10–60 s on a fresh model; raise above the default.
         request.timeoutInterval = 180
-        var body: [String: Any] = ["model": id]
-        if let drafterPath { body["drafter_path"] = drafterPath }
+        let body = Self.loadModelBody(id: id, drafterPath: drafterPath, setDefault: setDefault)
         // withoutEscapingSlashes: `id` may be an absolute path (the
         // auto-downloaded encoder registers by path) — keep it readable in
         // logs. The server unescapes either form.
@@ -219,6 +231,19 @@ class APIClient {
     /// keeps the stub so it can reload). Used by the media-gen
     /// load→generate→unload flow. Idempotent server-side; a non-resident model
     /// returns 200.
+    /// Ask the server to absorb models downloaded after it booted (discovery
+    /// only walks the roots at startup). Add-only and idempotent server-side.
+    func rescanModels(port: UInt16) async throws {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/models/rescan")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        let (_, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.badStatus(code: (response as? HTTPURLResponse)?.statusCode ?? -1, detail: "")
+        }
+    }
+
     func unloadModel(port: UInt16, id: String) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/unload-model")!
         var request = URLRequest(url: url)
@@ -249,7 +274,12 @@ class APIClient {
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
-                    req.timeoutInterval = 900
+                    // Byte-silence timeout, reset by every SSE byte. One H3
+                    // denoise step at large sizes can be silent for ~50 min
+                    // and the VAE decode tail sends nothing (#152/#157), so
+                    // 900 killed the render mid-step. Stop still cancels:
+                    // task cancel → socket close → server peerClosed abort.
+                    req.timeoutInterval = 86_400
                     let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
                     guard code == 200 else {
@@ -347,7 +377,7 @@ class APIClient {
     /// Each field is optional — `nil` = leave it out of the request body and
     /// let the server's default win. Pre-built once at the call site (usually
     /// from `ServerOptions`) and passed through unchanged.
-    struct RequestDefaults {
+    struct RequestDefaults: Equatable {
         var topP: Double? = nil
         var topK: Int? = nil
         var repeatPenalty: Double? = nil
@@ -392,6 +422,7 @@ class APIClient {
         maxTokens: Int = 2048,
         temperature: Double = 0.8,
         enableThinking: Bool = false,
+        reasoningEffort: String? = nil,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
@@ -419,7 +450,8 @@ class APIClient {
                         try await self.performStream(
                             port: port, messages: messages,
                             maxTokens: maxTokens, temperature: temperature,
-                            enableThinking: enableThinking, tools: tools,
+                            enableThinking: enableThinking,
+                            reasoningEffort: reasoningEffort, tools: tools,
                             toolsJSON: toolsJSON,
                             defaults: defaults,
                             modelId: modelId,
@@ -462,6 +494,7 @@ class APIClient {
         maxTokens: Int,
         temperature: Double,
         enableThinking: Bool,
+        reasoningEffort: String? = nil,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
@@ -506,6 +539,7 @@ class APIClient {
             // generation to the remaining context window.
             if maxTokens > 0 { parts.append("\"max_tokens\":\(maxTokens)") }
             if enableThinking { parts.append("\"enable_thinking\":true") }
+            if let v = reasoningEffort { parts.append("\"reasoning_effort\":\"\(v)\"") }
             if let v = defaults.topK { parts.append("\"top_k\":\(v)") }
             if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
             if let v = defaults.presencePenalty { parts.append("\"presence_penalty\":\(v)") }
@@ -526,6 +560,7 @@ class APIClient {
             // maxTokens <= 0 means "Auto": omit so the server pegs to context.
             if maxTokens > 0 { body["max_tokens"] = maxTokens }
             if enableThinking { body["enable_thinking"] = true }
+            if let v = reasoningEffort { body["reasoning_effort"] = v }
             if let v = defaults.topK { body["top_k"] = v }
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }
             if let v = defaults.presencePenalty { body["presence_penalty"] = v }

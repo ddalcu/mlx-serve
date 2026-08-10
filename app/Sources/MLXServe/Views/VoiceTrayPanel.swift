@@ -41,14 +41,16 @@ struct VoiceTrayPanel: View {
 
     // MARK: Header (master toggle)
 
+    /// Shares `TrayFeatureRow` with the Quick Launcher and the sandbox badge —
+    /// three capabilities you switch on, one row shape. The subtitle is what
+    /// the row used to leave to a tooltip nobody hovers.
     private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "waveform")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(voice.isActive ? Color.accentColor : .secondary)
-            Text("Voice")
-                .font(.subheadline.weight(.medium))
-            Spacer()
+        TrayFeatureRow(
+            icon: "waveform",
+            title: "Voice",
+            subtitle: "Hands-free — no window needed",
+            isOn: voice.isActive
+        ) {
             Toggle("", isOn: activeBinding)
                 .labelsHidden()
                 .toggleStyle(.switch)

@@ -135,11 +135,11 @@ final class MediaBundleTests: XCTestCase {
     func testMageFlowDiffusersLayoutReadyWithoutRootConfig() throws {
         let fm = FileManager.default
         let root = NSTemporaryDirectory() + "mageflowtest-\(UUID().uuidString)"
-        let modelDir = (root as NSString).appendingPathComponent("microsoft/Mage-Flow-Turbo")
+        let comp = ImageModelPreset.mageFlowTurbo.bundle.components[0]
+        let modelDir = (root as NSString).appendingPathComponent(comp.repo)
         try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(atPath: root) }
 
-        let comp = ImageModelPreset.mageFlowTurbo.bundle.components[0]
         // Empty dir → not ready.
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
         // The diffusers root marker + all four weight subdirs, plus a real
@@ -305,7 +305,7 @@ final class MediaBundleTests: XCTestCase {
         // Mage-Flow uses the final hidden state — no rebalance UI.
         XCTAssertEqual(p.condWeightCount, 0)
         XCTAssertTrue(ImageModelPreset.all.contains { $0.variant == .mageFlowEditTurbo })
-        XCTAssertEqual(p.repo, "microsoft/Mage-Flow-Edit-Turbo")
+        XCTAssertEqual(p.repo, "mage-flow-community/Mage-Flow-Edit-Turbo")
         // Same diffusers-layout bundle shape as Turbo.
         let b = p.bundle
         XCTAssertEqual(b.components.count, 1)

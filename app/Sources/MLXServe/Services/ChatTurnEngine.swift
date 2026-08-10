@@ -237,6 +237,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// plain chat do NOT share one).
         var temperature: Double? = nil
         var maxTokens: Int? = nil
+        /// The rest of the sampling surface; nil = the user's saved default
+        /// (`ServerOptions`). Applied by `requestDefaults(from:)`.
+        var topP: Double? = nil
+        var topK: Int? = nil
+        var repeatPenalty: Double? = nil
+        var presencePenalty: Double? = nil
+        var reasoningBudget: Int? = nil
+        /// The surface's `reasoning_effort` pick, sent only while thinking is
+        /// on (see `reasoningEffortParam`).
+        var reasoningEffort: ReasoningEffort = .low
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
@@ -262,9 +272,38 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 autoApprove: r.autoApprove,
                 temperature: r.temperatureOverride,
                 maxTokens: r.maxTokensOverride,
+                topP: r.topPOverride,
+                topK: r.topKOverride,
+                repeatPenalty: r.repeatPenaltyOverride,
+                presencePenalty: r.presencePenaltyOverride,
+                reasoningBudget: r.reasoningBudgetOverride,
+                reasoningEffort: r.reasoningEffort,
                 voice: r.voiceOverride,
                 wakePhrase: r.wakePhrase
             )
+        }
+
+        /// The wire value for `reasoning_effort`, gated on the turn's EFFECTIVE
+        /// thinking state: the server reads the field as a thinking opt-in, so
+        /// sending it with the toggle off would silently turn thinking on.
+        func reasoningEffortParam(thinking: Bool) -> String? {
+            thinking ? reasoningEffort.rawValue : nil
+        }
+
+        /// The per-request defaults for this turn: the user's saved sampling
+        /// with the agent's overrides laid on top. An override REPLACES the
+        /// saved value — including with the canonical "off" (top_k 0, repeat
+        /// 1.0, presence 0.0, budget -1), which clears the global rather than
+        /// leaving it standing, mapped to an omitted field exactly as
+        /// `RequestDefaults.from` maps it.
+        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
+            var d = APIClient.RequestDefaults.from(opts)
+            if let v = topP { d.topP = v }
+            if let v = topK { d.topK = v > 0 ? v : nil }
+            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            return d
         }
 
         /// The tools to ADVERTISE: none unless the loop is actually running.
@@ -525,13 +564,15 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
             // Pin the request to the active model (server-resolved default if
             // nil) so hot-switch can finish in-flight requests on the old model.
+            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
-                enableThinking: config.enableThinking || appState.serverOptions.defaultEnableThinking,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                enableThinking: thinking,
+                reasoningEffort: config.reasoningEffortParam(thinking: thinking),
+                defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
             var coalescer = StreamCoalescer()
@@ -551,10 +592,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     break
                 case .truncated(let cause):
                     // Plain chat is a single, always-terminal response — show the
-                    // notice immediately (no agent loop to stack it). Flush any
-                    // buffered text first so the notice lands after it, in order.
+                    // notice immediately (no agent loop to stack it). It rides the
+                    // message as DATA, never content: content is what history
+                    // builders send back, and the old in-content banner taught
+                    // the model its own warning text.
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, truncation: .init(cause: cause, maxTokens: turnMaxTokens(config)))
                 case .done:
                     break
                 }
@@ -814,8 +857,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: Self.agentLoopTemperature),
                 enableThinking: config.enableThinking,
+                reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
 
@@ -884,7 +928,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // (live 2026-08-05, under pi). Every other "length" cause keeps
             // its recovery: the reply was fine and simply ran out of room.
             if TruncationNotice.endsTurn(cause: truncationCause) {
-                appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: .repetitionLoop, maxTokens: turnMaxTokens(config)))
+                appState.updateLastMessage(in: sessionId, truncation: .init(cause: .repetitionLoop, maxTokens: turnMaxTokens(config)))
                 return
             }
 
@@ -991,7 +1035,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // was cut off by the cap, surface the truncation notice exactly
                 // once here — not per iteration in the stream loop above.
                 if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, truncation: .init(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
                 }
                 return
             }
@@ -1296,7 +1340,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runImageTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = ImageGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         // A LAN model picked in the Image pane needs no local download — the
         // hosting Mac has the weights.
         let lanId = LanPick.lanId(s.modelId)
@@ -1327,7 +1371,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runSpeechTool(_ args: [String: String],
                                onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = AudioGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1347,7 +1391,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runMusicTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = MusicGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1363,7 +1407,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runVideoTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = VideoGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: "\(model.approxFirstRunDownloadGB)",
@@ -1479,8 +1523,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// nothink signature without it, so the model stops thinking from turn 2.
     /// Templates that strip history reasoning (Qwen, Gemma) never read it.
     nonisolated static func plainHistoryDict(_ msg: ChatMessage) -> [String: Any] {
-        var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-        if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
+        // `truncationNotice` is a field, so it never rides here by construction;
+        // the strip covers sessions saved when the banner lived IN content.
+        let content = msg.role == .assistant
+            ? TruncationNotice.stripped(from: msg.content) : msg.content
+        var d: [String: Any] = ["role": msg.role.rawValue, "content": content]
+        if msg.role == .assistant && content.isEmpty { d.removeValue(forKey: "content") }
         if msg.role == .assistant, let rc = msg.reasoningContent, !rc.isEmpty {
             d["reasoning_content"] = rc
         }
@@ -1499,9 +1547,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         MultimodalContent.build(text: text, images: images, audio: audio, serverPreprocess: serverPreprocess)
     }
 
-    /// Whether the loaded model wants server-side image preprocessing (Qwen3-VL):
-    /// its `x-mlx-pixels` square format is Gemma-only, so Qwen sends raw images.
     var wantsServerImagePreprocess: Bool {
-        (server.chatModelInfo?.architecture ?? "").hasPrefix("qwen")
+        MultimodalContent.wantsServerPreprocess(architecture: server.chatModelInfo?.architecture ?? "")
     }
 }

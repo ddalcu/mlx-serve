@@ -70,3 +70,9 @@ tests/llmprobe-smoke-results/
 # regenerates them; ~137 MB — never checked in)
 containers/agent-shell-mlxserve/rootfs.tar.gz
 containers/agent-shell-mlxserve/rootfs.tar.gz.sha256
+
+# Local working notes, not project context. The mission log's TOP entry is the
+# session handoff — one file, so two copies of "where things stand" cannot
+# drift apart. Checked-in context stays in CLAUDE.md / app/CLAUDE.md.
+/missionlog.md
+/.mc.json

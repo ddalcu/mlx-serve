@@ -300,6 +300,40 @@ final class H3PlanningTests: XCTestCase {
         XCTAssertEqual(clock.eta(totalSteps: 30)!, 60 * 26, accuracy: 60)
     }
 
+    /// Under the fast recipe most steps cost NOTHING — the engine reuses a
+    /// cached velocity (measured 128 of 200 in a live run) — so the lap
+    /// distribution is bimodal and a MEDIAN lands on one spike or the other
+    /// with nothing in between. Both readings are wrong: while 2 of every 3
+    /// steps are cached the bar sat at 75% saying "about 0 sec left" with
+    /// minutes to go, and where the cadence evens out to 1:1 the same estimate
+    /// flips to a full-cost lap and doubles what is left. What remains is
+    /// (real + skipped) steps at the cadence observed so far, which is the
+    /// AMORTIZED lap.
+    func testFastRecipeCachedStepsNeitherVanishNorDoubleTheEstimate() {
+        // The engine's own `sc_consec < 2` cap: 2 cached steps per real one.
+        var twoOfThree: [Double] = [90]                      // step 0: graph build, discarded
+        for i in 0..<15 { twoOfThree.append(i % 3 == 0 ? 12 : 0.02) }
+        // 14 steps left, 5 of them real work at 12 s.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: twoOfThree, totalSteps: 30)!,
+                       56, accuracy: 12)
+
+        // Late in the schedule the cadence evens out and the median sits on the
+        // knife edge — the same run must not suddenly claim twice the work.
+        var alternating: [Double] = [90]
+        for i in 0..<17 { alternating.append(i % 2 == 0 ? 12 : 0.02) }
+        // 12 steps left, half of them free — 76 s, not the 144 s a full-cost
+        // lap would claim.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: alternating, totalSteps: 30)!,
+                       76, accuracy: 16)
+    }
+
+    /// A sub-second estimate rounds to zero, and "about 0 sec left" on a job
+    /// with work still to do reads as a stuck progress bar.
+    func testASubSecondEstimateNeverRendersAsZero() {
+        XCTAssertEqual(H3TimeEstimate.duration(0.3), "about 1 sec")
+        XCTAssertEqual(H3TimeEstimate.duration(0), "unknown")
+    }
+
     /// After a real run the estimate should stop being someone else's
     /// measurement. One scalar is fitted — the machine factor — because the
     /// SHAPE of the curve is already known and a per-geometry table would need
@@ -331,6 +365,56 @@ final class H3PlanningTests: XCTestCase {
         for _ in 0..<40 { history.record(predictedOnAnchor: predicted, measured: predicted) }
         XCTAssertLessThanOrEqual(history.runs, H3RunHistory.keptRuns)
         XCTAssertEqual(history.speedFactor!, 1.0, accuracy: 0.01)
+    }
+
+    /// The observed lap mean under-prices what is LEFT: the fast recipe's
+    /// cheap cached laps dominate the history while the tail steps always
+    /// refresh at full cost, and the VAE decode after the last step never
+    /// appears in step events at all (live 2026-08-09: "about 77 sec left"
+    /// with minutes to go). The live ETA floors the lap price at the pre-run
+    /// model's own amortized per-step cost and carries the model's
+    /// after-sampling tail.
+    func testLiveEtaFloorsAtTheModelsPerStepPriceAndCarriesTheVaeTail() {
+        // 12 observed laps of 2 s (a heavily cached middle), 10 steps to go.
+        let laps = [30.0] + Array(repeating: 2.0, count: 12)
+        // Floor 0 / tail 0 is byte-identical to the old behavior.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: laps, totalSteps: 23)!,
+                       20.0, accuracy: 0.001)
+        // The model prices a step at 9 s amortized: the promise floors there,
+        // and the VAE tail rides on top.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: laps, totalSteps: 23,
+                                              floorPerStep: 9, tail: 40)!,
+                       130.0, accuracy: 0.001)
+        // A machine running SLOWER than the model keeps its own (higher) mean.
+        let slow = [30.0] + Array(repeating: 12.0, count: 12)
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: slow, totalSteps: 23,
+                                              floorPerStep: 9, tail: 40)!,
+                       160.0, accuracy: 0.001)
+        // Sampling done, decode not: the tail is what is left.
+        let done = Array(repeating: 2.0, count: 24)
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: done, totalSteps: 23,
+                                              floorPerStep: 9, tail: 40)!,
+                       40.0, accuracy: 0.001)
+    }
+
+    /// The live floor and tail ARE the pre-run estimate, decomposed — one
+    /// model, two readouts. If the decomposition drifts from `seconds()` the
+    /// live number stops meaning anything.
+    func testLivePricingIsThePreRunEstimateDecomposed() {
+        let whole = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124,
+                                           steps: 30, fast: true)
+        let p = H3TimeEstimate.livePricing(model: h3, width: 1344, height: 768, frames: 124,
+                                           steps: 30, fast: true, history: H3RunHistory(records: []))
+        XCTAssertEqual(p.perStep * 30 + p.tail, whole, accuracy: 0.001)
+        // Own-history calibration scales both parts, same as `describeBest`.
+        var history = H3RunHistory(records: [])
+        let anchor = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124,
+                                            steps: 30, fast: true, hardware: .anchor)
+        history.record(predictedOnAnchor: anchor, measured: anchor * 2)
+        let calibrated = H3TimeEstimate.livePricing(model: h3, width: 1344, height: 768, frames: 124,
+                                                    steps: 30, fast: true, history: history)
+        XCTAssertEqual(calibrated.perStep * 30 + calibrated.tail,
+                       history.apply(toAnchorSeconds: anchor), accuracy: 0.001)
     }
 
     /// The estimate a user reads is a RANGE with named provenance — a bare

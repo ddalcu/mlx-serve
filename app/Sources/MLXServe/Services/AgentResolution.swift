@@ -33,6 +33,10 @@ struct AppDefaultsSnapshot: Sendable, Equatable {
     /// The app's global voice (engine + value).
     var voice: AgentVoice?
     var wakePhrase: String = WakeWord.defaultPhrase
+    /// The surface's `reasoning_effort` pick (the brain disc's right-click
+    /// menu). Pass-through — agents own their thinking BUDGET instead
+    /// (`reasoningBudget`, which outranks effort server-side).
+    var reasoningEffort: ReasoningEffort = .low
 }
 
 /// Every field decided — no optionals left except the ones that are genuinely
@@ -60,6 +64,14 @@ struct ResolvedAgentSettings: Sendable, Equatable {
     /// every user who never makes an agent. nil = "this path's own default".
     var temperatureOverride: Double?
     var maxTokensOverride: Int?
+    /// The remaining sampling knobs, raw for the same reason. These have no
+    /// decided twin — their app defaults live in `ServerOptions` and are laid
+    /// under them by `TurnConfig.requestDefaults(from:)` at request time.
+    var topPOverride: Double?
+    var topKOverride: Int?
+    var repeatPenaltyOverride: Double?
+    var presencePenaltyOverride: Double?
+    var reasoningBudgetOverride: Int?
     var voice: AgentVoice?
     /// The AGENT's own voice, nil when it didn't pick one.
     ///
@@ -69,6 +81,7 @@ struct ResolvedAgentSettings: Sendable, Equatable {
     /// Settings change from applying. nil = follow Settings, live.
     var voiceOverride: AgentVoice?
     var wakePhrase: String = WakeWord.defaultPhrase
+    var reasoningEffort: ReasoningEffort = .low
 }
 
 enum AgentResolution {
@@ -113,7 +126,8 @@ enum AgentResolution {
                 temperature: defaults.temperature,
                 maxTokens: defaults.maxTokens,
                 voice: defaults.voice,
-                wakePhrase: defaults.wakePhrase
+                wakePhrase: defaults.wakePhrase,
+                reasoningEffort: defaults.reasoningEffort
             )
         }
 
@@ -145,9 +159,15 @@ enum AgentResolution {
             maxTokens: agent.maxTokens ?? defaults.maxTokens,
             temperatureOverride: agent.temperature,
             maxTokensOverride: agent.maxTokens,
+            topPOverride: agent.topP,
+            topKOverride: agent.topK,
+            repeatPenaltyOverride: agent.repeatPenalty,
+            presencePenaltyOverride: agent.presencePenalty,
+            reasoningBudgetOverride: agent.reasoningBudget,
             voice: agent.resolvedVoice ?? defaults.voice,
             voiceOverride: agent.resolvedVoice,
-            wakePhrase: agent.wakePhrase.flatMap(WakeWord.normalizePhrase) ?? defaults.wakePhrase
+            wakePhrase: agent.wakePhrase.flatMap(WakeWord.normalizePhrase) ?? defaults.wakePhrase,
+            reasoningEffort: defaults.reasoningEffort
         )
     }
 }

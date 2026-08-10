@@ -109,6 +109,9 @@ struct VoiceGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @StateObject private var recorder = AudioRecorder()
 
@@ -141,8 +144,9 @@ struct VoiceGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
         readyView
-        .frame(minWidth: 820, minHeight: 600)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -200,7 +204,8 @@ struct VoiceGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 420)
+            // The preview gives way in a small window.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
@@ -286,25 +291,23 @@ struct VoiceGenView: View {
         dictating = false
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in AudioModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(AudioModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                LanModelPickerRows(capability: "audio")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            Text("~\(model.approxRAMGB) GB RAM • zero-shot voice cloning")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: AudioModelPreset.all,
+            onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
+            capability: "audio",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.audioPreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var referenceSection: some View {
@@ -409,7 +412,7 @@ struct VoiceGenView: View {
     private var actionRow: some View {
         VStack(spacing: 8) {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -488,6 +491,15 @@ struct VoiceGenView: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless).help("Reveal in Finder")
+                // The one bridge from the workshop to a conversation. It opens
+                // a NEW chat and switches to it — see
+                // `AppState.sendGeneratedMediaToNewChat`.
+                Button {
+                    appState.sendGeneratedMediaToNewChat(
+                        path: path, prompt: text, kind: .audio)
+                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless)
+                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(16)
@@ -560,7 +572,7 @@ struct VoiceGenView: View {
 
     private func hydrate() {
         let s = AudioGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature
@@ -603,7 +615,7 @@ struct VoiceGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = service.log.joined(separator: "\n")
+        let logText = server.combinedGenLog(own: service.log)
         let alert = NSAlert()
         alert.messageText = "Audio generation log"
         alert.informativeText = logText.isEmpty ? "(no output)" : logText

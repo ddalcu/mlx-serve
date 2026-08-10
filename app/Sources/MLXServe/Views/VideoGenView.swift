@@ -12,6 +12,9 @@ struct VideoGenView: View {
     @EnvironmentObject var service: VideoGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
     /// Height of the prompt editor — dragged by `promptResizeHandle`, sticky.
@@ -76,8 +79,9 @@ struct VideoGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
         readyView
-        .frame(minWidth: 880, minHeight: 660)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -148,7 +152,8 @@ struct VideoGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 460)
+            // The preview gives way in a small window; the player scales.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
@@ -247,26 +252,23 @@ struct VideoGenView: View {
         H3PromptExamples.examples(for: model.promptFormat)
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in VideoModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(VideoModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                LanModelPickerRows(capability: "video")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
-            Text("~\(model.approxRAMGB) GB RAM • Includes audio")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: VideoModelPreset.all,
+            onThisMac: CustomMediaModels.videoPresets(from: server.allModels),
+            capability: "video",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.videoPreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
     }
 
     private var qualitySection: some View {
@@ -370,14 +372,6 @@ struct VideoGenView: View {
     /// Soft hint when the chosen length looks too aggressive for the Mac's
     /// total RAM at the current resolution. Doesn't block — the user might
     /// know better (e.g. they just freed memory).
-    ///
-    /// On H3 it also says the NUMBER and the two ways out, because "may exceed
-    /// your RAM" on a job this long is a shrug: the memory is dominated by the
-    /// fast recipe's step cache, so turning Max quality ON is the low-memory
-    /// mode — backwards from every other quality toggle, and impossible to
-    /// Turbo only counts on a preset that declares it — the state survives
-    /// preset switches (the `firstFrameImageURL` convention), and a stale
-    /// `true` must not shape another backend's requests or estimates.
     private var turboEngaged: Bool { turbo && model.supportsTurbo }
     /// What the server's recipe actually runs: turbo forces it off, so every
     /// plan/estimate call reads THIS, never `!bestQuality` alone.
@@ -425,12 +419,6 @@ struct VideoGenView: View {
     }
 
     /// "about 50 min — estimated for M4 Max", under the Generate button.
-    ///
-    /// H3 only: it is the one backend where the options change the answer by an
-    /// order of magnitude (20 minutes to three hours on the same Mac), so
-    /// "generate and find out" is not an acceptable interface. Recomputed as
-    /// the controls move, which is the whole point — it is how you learn that
-    /// the widescreen canvas costs 2.9x, not 2x.
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         return H3TimeEstimate.describeBest(
@@ -603,10 +591,6 @@ struct VideoGenView: View {
 
     // ── Speech & sound (audio-to-video) ──
     // Attach real speech/audio and the model generates the video AGAINST it:
-    // voices, lip sync and performance follow the clip, and the clip itself
-    // becomes the mp4's soundtrack (guaranteed words — no hoping the joint
-    // model nails quoted dialogue). Two sources: any audio file, or a line
-    // synthesized by the local Qwen3-TTS voice right from this pane.
     @ViewBuilder
     private var speechSection: some View {
         // A backend that GENERATES its soundtrack takes no audio input, so the
@@ -835,10 +819,6 @@ struct VideoGenView: View {
                 .foregroundStyle(.secondary)
             }
             // Steps — more steps = more detail/smoother motion, but slower.
-            // The range and the copy are the PRESET's: the old ones were LTX's
-            // ("runs well from ~8"), shown verbatim on a backend where 8 steps
-            // is below anything we have a verdict on and the fast recipe's
-            // warmup/tail windows cover the whole schedule.
             intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
             Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
@@ -873,8 +853,13 @@ struct VideoGenView: View {
                         // than at Generate: 744 MB discovered 30 seconds into
                         // a job reads as a hang, and this way the Downloads
                         // pane shows it while the user finishes their prompt.
+                        // The off-flip CANCELS an in-flight fetch — without
+                        // that, a briefly-ticked box still downloads 744 MB
+                        // in the background with nothing on screen saying so.
                         if on, turboFetchDecision == .fetch {
                             downloads.startTurboLora(repoId: model.repo)
+                        } else if !on {
+                            downloads.cancelTurboLora(repoId: model.repo)
                         }
                     }
                 if turboFetchDecision == .fetch {
@@ -1090,7 +1075,7 @@ struct VideoGenView: View {
     private var actionRow: some View {
         VStack(spacing: 8) {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -1173,6 +1158,15 @@ struct VideoGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
+                // The one bridge from the workshop to a conversation. It opens
+                // a NEW chat and switches to it — see
+                // `AppState.sendGeneratedMediaToNewChat`.
+                Button {
+                    appState.sendGeneratedMediaToNewChat(
+                        path: path, prompt: prompt, kind: .video)
+                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless)
+                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)
@@ -1196,7 +1190,7 @@ struct VideoGenView: View {
 
     private func hydrate() {
         let s = VideoGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
@@ -1367,7 +1361,7 @@ struct VideoGenView: View {
     }
 
     private func showLogWindow() {
-        let text = service.log.joined(separator: "\n")
+        let text = server.combinedGenLog(own: service.log)
         let alert = NSAlert()
         alert.messageText = "Video generation log"
         alert.informativeText = text.isEmpty ? "(no output)" : text

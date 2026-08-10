@@ -63,8 +63,8 @@ struct ImageQualitySettings: Hashable {
 }
 
 struct ImageModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     let variant: FluxVariant
     /// `ModelConfig` factory name — sets the model architecture (e.g.
     /// "schnell", "dev", "flux2_klein_4b"). Weights themselves are loaded
@@ -74,7 +74,7 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// non-gated — every preset ships with one we've verified is open.
     /// Loaded via `snapshot_download` + `model_path`, so weights download
     /// directly with no HF login or license-accept step.
-    let repo: String
+    var repo: String
     let approxDownloadGB: Int
     let approxRAMGB: Int
     let resolutions: [ResolutionOption]
@@ -214,17 +214,19 @@ struct ImageModelPreset: Identifiable, Hashable {
         .init(width: 512,  height: 2048, label: "512 × 2048 (tall 1:4)"),
     ]
 
-    /// Microsoft Mage-Flow-Turbo — the official MIT diffusers repo (no login /
-    /// license step). Native double-stream flow DiT + Qwen3-VL text encoder +
-    /// DiCo VAE, served by the native `mage_flow` backend (auto-detected from
+    /// Mage-Flow-Turbo — the official MIT diffusers repo (no login / license
+    /// step; Microsoft renamed the org to `mage-flow-community`, old
+    /// `microsoft/` dirs on disk keep working — nothing keys on the org).
+    /// Native double-stream flow DiT + Qwen3-VL text encoder + DiCo VAE,
+    /// served by the native `mage_flow` backend (auto-detected from
     /// `model_index.json`, not `config.json`). Distilled Turbo: 4-step flow
     /// matching, guidance 1.0 (no CFG). Runs bf16 (DiT+encoder) + f32 VAE.
     static let mageFlowTurbo = ImageModelPreset(
-        id: "microsoft/mage-flow-turbo",
+        id: "mage-flow-community/mage-flow-turbo",
         name: "Mage-Flow Turbo (~17 GB)",
         variant: .mageFlowTurbo,
         configName: "mage_flow",
-        repo: "microsoft/Mage-Flow-Turbo",
+        repo: "mage-flow-community/Mage-Flow-Turbo",
         approxDownloadGB: 17,
         approxRAMGB: 16,
         resolutions: mageFlowResolutions,
@@ -248,11 +250,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// guidance 1.0. Same MIT diffusers layout (`model_index.json`), served by
     /// the `mage_flow` backend (the Edit weights light up `supportsEdit`).
     static let mageFlowEditTurbo = ImageModelPreset(
-        id: "microsoft/mage-flow-edit-turbo",
+        id: "mage-flow-community/mage-flow-edit-turbo",
         name: "Mage-Flow Edit Turbo (~17 GB)",
         variant: .mageFlowEditTurbo,
         configName: "mage_flow",
-        repo: "microsoft/Mage-Flow-Edit-Turbo",
+        repo: "mage-flow-community/Mage-Flow-Edit-Turbo",
         approxDownloadGB: 17,
         approxRAMGB: 16,
         resolutions: mageFlowResolutions,
@@ -323,7 +325,6 @@ struct ImageModelPreset: Identifiable, Hashable {
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
         .krea2Turbo,                                   // 15
-        .mageFlowTurbo, .mageFlowEditTurbo,            // 17, 17
     ]
 }
 
@@ -360,9 +361,9 @@ enum VideoBackendKind: String, Hashable {
 }
 
 struct VideoModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let repo: String                          // open HF mirror
+    var id: String
+    var name: String
+    var repo: String                          // open HF mirror
     let approxDownloadGB: Int                 // weights only
     let approxFirstRunDownloadGB: Int         // + Gemma text encoder
     let approxRAMGB: Int
@@ -699,10 +700,10 @@ struct VideoModelPreset: Identifiable, Hashable {
 /// We deliberately don't surface the macOS system voices here — those live in
 /// Voice mode. This panel is neural-only.
 struct AudioModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     /// Open `mlx-community` Qwen3-TTS repo (downloaded via DownloadManager).
-    let repo: String
+    var repo: String
     /// Rough on-disk weight size, GB (first-run download). Shown in the picker.
     let approxDownloadGB: Double
     /// Peak unified-memory footprint, GB — drives the soft RAM gate.
@@ -838,11 +839,11 @@ struct AudioModelPreset: Identifiable, Hashable {
 /// for which the pane shows a "convert locally" hint instead of a Download
 /// button.
 struct Model3DModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
     /// convert-on-device model (no HF pull); any other prefix is a normal repo.
-    let repo: String
+    var repo: String
     /// Peak unified-memory footprint, GB — drives the soft RAM gate. The paint
     /// stage is the peak (shape frees before it loads).
     let approxRAMGB: Int
@@ -873,11 +874,11 @@ struct Model3DModelPreset: Identifiable, Hashable {
 /// ACE-Step music-generation checkpoints (the second audio backend beside
 /// Qwen3-TTS). Same local-convert convention as `Model3DModelPreset`.
 struct MusicModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
     /// convert-on-device model (no HF pull); any other prefix is a normal repo.
-    let repo: String
+    var repo: String
     /// Peak unified-memory footprint, GB — drives the soft RAM gate
     /// (DiT + Qwen3-Embedding text encoder + Oobleck VAE resident together).
     let approxRAMGB: Int

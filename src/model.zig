@@ -10,6 +10,12 @@ pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
 /// scales only) but share the packed-u32 weight layout, so supporting them is
 /// a matter of skipping the biases fetch and passing the right mode string to
 /// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
+/// Upper bound on a vision tower's per-layer type table (muse ships 50).
+pub const MAX_VISION_LAYERS = 64;
+
+/// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
+pub const MUSE_MAX_IMAGE_TOKENS = 4096;
+
 pub const QuantMode = enum {
     affine,
     nvfp4,
@@ -206,6 +212,24 @@ pub const ModelConfig = struct {
     num_attention_heads_per_layer: [128]u32 = @splat(0),
     has_per_layer_heads: bool = false,
 
+    // MuseGlimmer (muse_glimmer): weight-less shared QK RMS-norm with Q scaled
+    // by qk_scale_factor (folded into attnScale — a scalar commutes through
+    // RoPE and QK^T), elementwise sigmoid attention output gate from a
+    // separate self_attn.gate_proj read off the post-input-norm hidden,
+    // RMS-normed embeddings (NO sqrt(hidden) scale), Gemma2-centered sandwich
+    // norms whose POST norms use post_norm_eps while the FINAL norm is
+    // plain-scale (ones-init), logits scaled by output_multiplier before the
+    // tanh softcap, and NoPE on layers whose layer_rope_theta entry is 0
+    // (exactly the full-attention layers in the released checkpoint).
+    qk_scale_factor: f32 = 0.0, // 0 = off
+    output_multiplier: f32 = 0.0, // 0 = off
+    post_norm_eps: f32 = 0.0, // 0 = same as rms_norm_eps
+    final_norm_plain: bool = false, // final norm skips the (1+w) fold
+    qk_norm_weightless: bool = false, // param-free RMS on Q and K heads
+    normed_embeddings: bool = false, // param-free RMS after embedding lookup
+    attn_sigmoid_gate: bool = false, // attn_out *= sigmoid(gate_proj(normed))
+    layer_no_rope: [128]bool = @splat(false),
+
     // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
     // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
     // precompute at model load; the sliding/full split is by isGlobalLayer.
@@ -391,6 +415,16 @@ pub const ModelConfig = struct {
     // 0 means absent: the Qwen processor defaults remain the fallback.
     qv_min_pixels: u32 = 0,
     qv_max_pixels: u32 = 0,
+    // Muse-Glimmer vision (src/muse_vision.zig). Shares the qv_* geometry but
+    // NOT the Qwen ViT: split qkv, learned pos table resampled per image,
+    // window/full attention per layer, and plain 1D text positions (no M-RoPE).
+    muse_vision: bool = false,
+    mv_pos_side: u32 = 0, // learned pos table is pos_side x pos_side
+    mv_projector_hidden: u32 = 0, // vision_adapter width
+    mv_ln_eps: f32 = 1e-5,
+    mv_rope_theta: f64 = 10000.0,
+    mv_max_image_tokens: u32 = 0, // processor cap, in MERGED tokens
+    mv_full_attn: [MAX_VISION_LAYERS]bool = @splat(false),
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -619,6 +653,40 @@ pub const ModelConfig = struct {
         if (!self.isEosToken(106)) self.addEosToken(106);
     }
 
+    /// MuseGlimmer terminators: <|end_of_text|> = 200001 and <|eot|> = 200008
+    /// (the chat template's turn terminator; <|eom|> 200007 is deliberately
+    /// NOT an eos — generation continues across channel segments). Additive +
+    /// dedup-guarded like ensureGemmaTerminators.
+    pub fn ensureMuseTerminators(self: *ModelConfig) void {
+        if (!self.isEosToken(200001)) self.addEosToken(200001);
+        if (!self.isEosToken(200008)) self.addEosToken(200008);
+    }
+
+    /// NoPE layers (muse_glimmer: layer_rope_theta[i] == 0). The released
+    /// checkpoint's NoPE layers are exactly its full-attention layers, but the
+    /// two facts stay independently parsed — layer_types drives masking,
+    /// layer_rope_theta drives rotation.
+    pub fn layerSkipsRope(self: *const ModelConfig, layer_idx: u32) bool {
+        return layer_idx < 128 and self.layer_no_rope[layer_idx];
+    }
+
+    /// Post-attention / post-feedforward norm epsilon (muse_glimmer separates
+    /// it from rms_norm_eps; everyone else shares one value).
+    pub fn postNormEps(self: *const ModelConfig) f32 {
+        return if (self.post_norm_eps > 0) self.post_norm_eps else self.rms_norm_eps;
+    }
+
+    /// SDPA softmax scale for the standard dense forward. MuseGlimmer
+    /// multiplies the unit-RMS Q by qk_scale_factor on top of the standard
+    /// 1/sqrt(head_dim); Gemma 4's QK-norm handles normalization (scale 1.0);
+    /// everything else keys on query_pre_attn_scalar.
+    pub fn attnScale(self: *const ModelConfig) f32 {
+        if (self.qk_scale_factor > 0)
+            return self.qk_scale_factor / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        if (std.mem.eql(u8, self.model_type, "gemma4")) return 1.0;
+        return 1.0 / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
+    }
+
     /// Hy3 (hy_v3) family terminator: <｜hy_eos:opensource｜> = 120025. Real
     /// MLX conversions (ox-ox 2-bit) ship NO eos in config.json and NO
     /// generation_config.json, so without this merge generation never halts.
@@ -650,9 +718,13 @@ pub const ModelConfig = struct {
     /// Opt-in per arch, and only where the vendor documents thinking-on AND
     /// the shipped template agrees — never inferred from "the template mentions
     /// enable_thinking".
-    pub fn defaultEnableThinking(self: *const ModelConfig) bool {
-        _ = self;
-        return false;
+    pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
+        // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
+        // header, so the recipient must stay free and the reasoning is
+        // delivered rather than paid-and-dropped). A plain chat request
+        // defaults to the prompt-committed to=user channel instead
+        // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
+        return has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer");
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -775,6 +847,9 @@ pub fn pickUserTurnPrefix(chat_template: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, chat_template, "<|start_header_id|>") != null) {
         return "<|start_header_id|>user<|end_header_id|>\n\n"; // Llama 3
     }
+    if (std.mem.indexOf(u8, chat_template, "<|start|>user<|message|>") != null) {
+        return "<|start|>user<|message|>"; // Muse-Glimmer (harmony channels)
+    }
     return null;
 }
 
@@ -845,7 +920,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
     // the older preprocessor_config.json layout.
-    if (config.qwen_vision) {
+    if (config.qwen_vision or config.muse_vision) {
         var vision_defaults = VisionProcessorDefaults{};
         const processor_files = [_][]const u8{
             "processor_config.json",
@@ -865,6 +940,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                         vision_defaults.min_pixels = parsed_defaults.min_pixels;
                     if (vision_defaults.max_pixels == null)
                         vision_defaults.max_pixels = parsed_defaults.max_pixels;
+                    if (vision_defaults.max_image_tokens == null)
+                        vision_defaults.max_image_tokens = parsed_defaults.max_image_tokens;
                 } else |_| {}
             } else |_| {}
         }
@@ -876,6 +953,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         }
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
+        config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
     }
 
     return config;
@@ -892,6 +970,8 @@ pub const GenerationDefaults = struct {
 pub const VisionProcessorDefaults = struct {
     min_pixels: ?u32 = null,
     max_pixels: ?u32 = null,
+    /// Muse: the cap is on MERGED tokens, not pixels.
+    max_image_tokens: ?u32 = null,
 };
 
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
@@ -921,6 +1001,7 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
     var defaults = VisionProcessorDefaults{
         .min_pixels = positiveJsonU32(processor.get("min_pixels")),
         .max_pixels = positiveJsonU32(processor.get("max_pixels")),
+        .max_image_tokens = positiveJsonU32(processor.get("max_image_tokens")),
     };
     if (processor.get("size")) |value| {
         if (value == .object) {
@@ -1414,6 +1495,84 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // shouldKeepWeightKey) — never advertise vision for this arch.
         config.has_vision = false;
         config.ensureGemmaTerminators();
+    } else if (std.mem.eql(u8, model_type, "muse_glimmer") or
+        std.mem.eql(u8, model_type, "muse_glimmer_text"))
+    {
+        // Muse-Glimmer-30B (meta-models). Dense GQA trunk (32/2 heads, hd 128)
+        // with Gemma2-style sandwich-norm layers; every 4th layer counted
+        // backward from the last is full-attention AND NoPE (layer_rope_theta
+        // 0), the rest slide at 2048. "muse_glimmer_text" is the flat
+        // text-only sibling (bare "model" prefix, no text_config).
+        config.model_type = "muse_glimmer";
+        config.weight_prefix = if (root.get("text_config") != null) "model.language_model" else "model";
+        config.hidden_act = .silu;
+        config.norm_has_offset = true; // sandwich norms are Gemma2-centered (1+w)…
+        config.final_norm_plain = true; // …but model.norm is plain-scale (ones-init)
+        config.scale_embeddings = false; // embeddings are RMS-normed, not sqrt(hidden)-scaled
+        config.has_pre_ff_norm = true;
+        config.has_qk_norm = false; // no q_norm/k_norm tensors in the checkpoint —
+        config.qk_norm_weightless = true; // shared weight-less RMS on Q and K instead
+        config.normed_embeddings = true;
+        config.attn_sigmoid_gate = true;
+        // Reference-config class defaults, overridden by explicit keys below.
+        config.qk_scale_factor = 3.87;
+        config.output_multiplier = 0.19611613513818404;
+        config.post_norm_eps = 1e-8;
+        if (cfg_obj.get("qk_scale_factor")) |v| config.qk_scale_factor = jsonFloat(v);
+        if (cfg_obj.get("output_multiplier")) |v| config.output_multiplier = jsonFloat(v);
+        if (cfg_obj.get("post_norm_eps")) |v| config.post_norm_eps = jsonFloat(v);
+        // ONE theta for every roped layer: sliding layers read
+        // rope_local_base_freq in the forward, but muse ships its base only as
+        // rope_parameters.rope_theta — without this the Gemma-flavored 10000
+        // default mis-rotates all 39 roped layers (the 2026-08-11 first-turn
+        // repetition-loop root cause; global layers are NoPE so EVERY rotated
+        // layer ran at the wrong base).
+        if (cfg_obj.get("rope_local_base_freq") == null)
+            config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("layer_rope_theta")) |lrt| {
+            if (lrt == .array) {
+                for (lrt.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    config.layer_no_rope[i] = jsonFloat(item) == 0;
+                }
+            }
+        }
+        // Vision tower (src/muse_vision.zig). Muse names its geometry keys its
+        // own way and the window/full pattern is a per-layer list, not a stride.
+        if (root.get("vision_config")) |vc_val| {
+            if (vc_val == .object) {
+                const vc = vc_val.object;
+                config.muse_vision = true;
+                if (vc.get("num_hidden_layers")) |v| { if (v == .integer) config.qv_depth = @intCast(v.integer); }
+                if (vc.get("hidden_size")) |v| { if (v == .integer) config.qv_hidden = @intCast(v.integer); }
+                if (vc.get("num_attention_heads")) |v| { if (v == .integer) config.qv_heads = @intCast(v.integer); }
+                if (vc.get("intermediate_size")) |v| { if (v == .integer) config.qv_intermediate = @intCast(v.integer); }
+                if (vc.get("patch_size")) |v| { if (v == .integer) config.qv_patch = @intCast(v.integer); }
+                if (vc.get("patch_temporal")) |v| { if (v == .integer) config.qv_temporal_patch = @intCast(v.integer); }
+                if (vc.get("merge_size")) |v| { if (v == .integer) config.qv_merge = @intCast(v.integer); }
+                if (vc.get("pos_emb_height")) |v| { if (v == .integer) config.mv_pos_side = @intCast(v.integer); }
+                if (vc.get("layer_norm_eps")) |v| config.mv_ln_eps = jsonFloat(v);
+                if (vc.get("rope_parameters")) |rp| {
+                    if (rp == .object) {
+                        if (rp.object.get("rope_theta")) |v| config.mv_rope_theta = jsonFloat(v);
+                    }
+                }
+                if (vc.get("layer_types")) |lt| {
+                    if (lt == .array) for (lt.array.items, 0..) |item, i| {
+                        if (i >= MAX_VISION_LAYERS) break;
+                        if (item == .string) config.mv_full_attn[i] = std.mem.eql(u8, item.string, "full_attention");
+                    };
+                }
+                if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+                config.qv_out_hidden = config.hidden_size;
+                if (root.get("projector_hidden_size")) |v| { if (v == .integer) config.mv_projector_hidden = @intCast(v.integer); }
+                // The processor wraps the pad run in <|image_start|>/<|image_end|>;
+                // config.json carries neither, so the ids come from the vocab.
+                config.boi_token_id = 200080;
+                config.eoi_token_id = 200081;
+            }
+        }
+        config.ensureMuseTerminators();
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
@@ -2075,10 +2234,12 @@ pub const Weights = struct {
     }
 };
 
-/// The two nestings a text trunk ships under. `parseConfigFromJson` picks
-/// between them from config KEYS; this probe corrects it from the checkpoint.
+/// The generic nestings a text trunk ships under: flat, mlx-community's
+/// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
+/// picks from config KEYS; this probe corrects it from the checkpoint.
 const FLAT_PREFIX = "model";
 const NESTED_PREFIX = "language_model.model";
+const VL_NESTED_PREFIX = "model.language_model";
 
 fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
     var it = weights.map.keyIterator();
@@ -2099,23 +2260,28 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
 /// both directions, so the weights get the last word.
 ///
-/// Conservative by construction: it only ever alternates between those two
-/// prefixes (never an arch with its own — `backbone`, `model.llm`, `""`), and
-/// only when the configured one holds NOTHING, so every checkpoint that
-/// already loaded binds byte-identically.
+/// Conservative by construction: only the generic spellings participate
+/// (never an arch with its own — `backbone`, `model.llm`, `""`), and a swap
+/// happens only when the configured one holds NOTHING, so every checkpoint
+/// that already loaded binds byte-identically. Scan order puts the most
+/// specific spelling first: a `model.language_model.*` checkpoint also
+/// satisfies the bare "model" probe.
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
-    const alt = if (std.mem.eql(u8, config.weight_prefix, FLAT_PREFIX))
-        NESTED_PREFIX
-    else if (std.mem.eql(u8, config.weight_prefix, NESTED_PREFIX))
-        FLAT_PREFIX
-    else
-        return;
+    const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
+    var known = false;
+    for (candidates) |p| {
+        if (std.mem.eql(u8, config.weight_prefix, p)) known = true;
+    }
+    if (!known) return;
 
     if (hasWeightsUnder(weights, config.weight_prefix)) return;
-    if (!hasWeightsUnder(weights, alt)) return;
-
-    log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, alt });
-    config.weight_prefix = alt;
+    for (candidates) |p| {
+        if (std.mem.eql(u8, config.weight_prefix, p)) continue;
+        if (!hasWeightsUnder(weights, p)) continue;
+        log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, p });
+        config.weight_prefix = p;
+        return;
+    }
 }
 
 /// Load all safetensors files from model_dir.
@@ -2347,6 +2513,14 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // pass multiplies by them instead of the decoder's layer_scalar.
     if (std.mem.startsWith(u8, key, "model.encoder.vision_tower.") or
         std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
+    // Muse-Glimmer nests its tower/adapter/projection under "model."; the
+    // mlx-community re-nest drops that prefix (its bare "vision_tower." already
+    // rides the is_vision gate above). Both follow --no-vision.
+    if (!load_vision and (std.mem.startsWith(u8, key, "model.vision_tower.") or
+        std.mem.startsWith(u8, key, "model.vision_adapter.") or
+        std.mem.startsWith(u8, key, "model.vision_projection.") or
+        std.mem.startsWith(u8, key, "vision_adapter.") or
+        std.mem.startsWith(u8, key, "vision_projection."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -2512,6 +2686,40 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
+    // mlx-community/Muse-Glimmer-30B-4bit (live 2026-08-11): meta's config
+    // keeps text_config, so the guess is the VL-original "model.language_model"
+    // — but mlx_lm convert re-nests every text weight under
+    // "language_model.model.*". The third spelling joins the probe.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.lm_head.weight");
+        try put(&w, allocator, "vision_tower.layers.0.norm1.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // Our own mirror layout (meta-original nesting) stays put.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.language_model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    }
+    // Ordering: a "model.language_model.*" checkpoint ALSO matches the bare
+    // "model" probe (the '.' check passes at "model.language_model"), so the
+    // most specific spelling must win the scan.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.language_model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    }
 }
 
 test "applyDsv4ReferenceSampling: the source's wild signature resolves to the reference's temp 0.6" {
@@ -2606,12 +2814,20 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
 }
 
 test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
-    // No arch opts in today — including the families whose templates merely
+    // No prior arch opts in — including the families whose templates merely
     // MENTION enable_thinking, which is not evidence of a thinking-on default.
     for ([_][]const u8{ "qwen3", "qwen3_5_moe", "gemma4", "gemma3_text", "laguna", "deepseek_v4", "inkling_mm_model", "llama", "hy_v3", "lfm2" }) |t| {
         const c = ModelConfig{ .model_type = t };
-        try testing.expect(!c.defaultEnableThinking());
+        try testing.expect(!c.defaultEnableThinking(false));
+        try testing.expect(!c.defaultEnableThinking(true));
     }
+    // muse_glimmer opts in only WITH tools: recipient selection is where its
+    // reasoning earns its keep. A plain chat request defaults to the
+    // prompt-committed to=user channel (chat.noThinkTailSuffix) — a real
+    // skip, so there is nothing to deliver or drop.
+    const muse = ModelConfig{ .model_type = "muse_glimmer" };
+    try testing.expect(!muse.defaultEnableThinking(false));
+    try testing.expect(muse.defaultEnableThinking(true));
 }
 
 test "ModelConfig addEosToken" {
@@ -2914,6 +3130,25 @@ test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
 }
 
+test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nestings" {
+    // Ours nests the tower under `model.`; mlx-community re-nests it bare.
+    // Both spellings ride the same gate --no-vision flips.
+    try testing.expect(!shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.vision_adapter.fc1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.vision_projection.weight", false));
+    try testing.expect(!shouldKeepWeightKey("vision_adapter.fc1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", true));
+    try testing.expect(shouldKeepWeightKey("model.vision_adapter.fc1.weight", true));
+    try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
+    try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
+    try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
+    // Text weights are never touched either way.
+    try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.lm_head.weight", false));
+}
+
 test "ModelConfig parses gemma4_unified text_config" {
     // Gemma 4 12B base ships `model_type: gemma4_unified` with text_config
     // carrying the language tower. The dispatch arm must:
@@ -3117,6 +3352,175 @@ test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_fac
     try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
     // 0.1 * ln(32) + 1 — the same value S's config ships literally.
     try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-6);
+}
+
+test "ModelConfig parses muse_glimmer (Muse-Glimmer-30B): NoPE full layers, qk scale, mixed norm offsets" {
+    // Trimmed but faithful copy of meta-models/Muse-Glimmer-30B config.json.
+    // 8 layers = two sliding/full groups; full attention every 4th layer
+    // counted backward from the last (i%4==3 for 8 layers), and exactly those
+    // layers have layer_rope_theta 0 (NoPE).
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer",
+        \\  "image_token_id": 200092,
+        \\  "text_config": {
+        \\    "model_type": "muse_glimmer_text",
+        \\    "hidden_size": 6656,
+        \\    "intermediate_size": 19968,
+        \\    "num_hidden_layers": 8,
+        \\    "num_attention_heads": 32,
+        \\    "num_key_value_heads": 2,
+        \\    "head_dim": 128,
+        \\    "hidden_activation": "silu",
+        \\    "rms_norm_eps": 1e-05,
+        \\    "post_norm_eps": 1e-08,
+        \\    "qk_scale_factor": 3.87,
+        \\    "output_multiplier": 0.19611613513818404,
+        \\    "final_logit_softcapping": 20.0,
+        \\    "vocab_size": 202048,
+        \\    "max_position_embeddings": 131072,
+        \\    "tie_word_embeddings": false,
+        \\    "bos_token_id": 200000,
+        \\    "eos_token_id": 200001,
+        \\    "sliding_window": 2048,
+        \\    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+        \\                    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\    "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0, 500000.0, 500000.0, 500000.0, 0],
+        \\    "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"}
+        \\  },
+        \\  "vision_config": {"model_type": "muse_glimmer_vision"},
+        \\  "quantization": {"group_size": 64, "bits": 8}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("muse_glimmer", config.model_type);
+    try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 2), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 2048), config.sliding_window);
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.layer_is_global[3]);
+    try testing.expect(config.layer_is_global[7]);
+    try testing.expect(!config.layer_is_global[2]);
+    // NoPE: exactly the full-attention layers skip RoPE (layer_rope_theta 0).
+    try testing.expect(config.layerSkipsRope(3));
+    try testing.expect(config.layerSkipsRope(7));
+    try testing.expect(!config.layerSkipsRope(0));
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_theta, 1e-3);
+    // Sliding layers read rope_local_base_freq in EVERY forward path, and muse
+    // ships ONE theta for all roped layers (rope_parameters.rope_theta) — the
+    // Gemma-flavored 10000 default silently mis-rotated all 39 roped layers
+    // (2026-08-11 first-turn repetition-loop root cause).
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_local_base_freq, 1e-3);
+    // Attention scale folds the post-qk-norm Q multiplier into 1/sqrt(head_dim).
+    try testing.expectApproxEqAbs(@as(f32, 3.87 / 11.313708), config.attnScale(), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.19611613513818404), config.output_multiplier, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 20.0), config.final_logit_softcapping, 1e-6);
+    // Sandwich norms are Gemma2-centered (1+w) at eps 1e-5 / post-norms 1e-8;
+    // the FINAL norm is plain-scale (Gemma4 style, ones-init).
+    try testing.expect(config.norm_has_offset);
+    try testing.expect(config.final_norm_plain);
+    try testing.expectApproxEqAbs(@as(f32, 1e-08), config.postNormEps(), 1e-12);
+    try testing.expect(config.has_pre_ff_norm);
+    // Weight-less shared qk-norm (no q_norm/k_norm tensors in the checkpoint),
+    // RMS-normed embeddings with NO sqrt(hidden) scale, sigmoid attn out gate.
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(config.qk_norm_weightless);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(config.normed_embeddings);
+    try testing.expect(config.attn_sigmoid_gate);
+    try testing.expect(!config.tie_word_embeddings);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    // <|end_of_text|>(200001) from config + <|eot|>(200008), the template's
+    // turn terminator, merged additively.
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expectEqual(@as(u32, 200001), config.eos_token_ids[0]);
+    try testing.expectEqual(@as(u32, 200008), config.eos_token_ids[1]);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "ModelConfig parses the muse_glimmer vision tower (own key spellings, window/full pattern)" {
+    // Trimmed copy of the real vision_config: muse names its geometry keys
+    // differently from Qwen (patch_temporal, merge_size, pos_emb_*), and the
+    // window/full pattern is per-layer, not a stride.
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer",
+        \\  "image_token_id": 200092,
+        \\  "out_hidden_size": 6144,
+        \\  "projector_hidden_size": 4096,
+        \\  "projector_hidden_act": "gelu",
+        \\  "text_config": {"model_type": "muse_glimmer_text", "hidden_size": 6656, "head_dim": 128,
+        \\                  "num_attention_heads": 32, "num_key_value_heads": 2, "rms_norm_eps": 1e-05},
+        \\  "vision_config": {
+        \\    "model_type": "muse_glimmer_vision",
+        \\    "hidden_act": "gelu",
+        \\    "hidden_size": 1536,
+        \\    "intermediate_size": 8960,
+        \\    "layer_norm_eps": 1e-05,
+        \\    "layer_types": ["window_attention", "window_attention", "window_attention", "full_attention",
+        \\                    "window_attention", "full_attention"],
+        \\    "merge_size": 2,
+        \\    "num_attention_heads": 16,
+        \\    "num_hidden_layers": 6,
+        \\    "patch_size": 14,
+        \\    "patch_temporal": 2,
+        \\    "pos_emb_height": 32,
+        \\    "pos_emb_width": 32,
+        \\    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.muse_vision);
+    try testing.expect(config.has_vision);
+    try testing.expect(!config.qwen_vision); // no M-RoPE, no vision_start/end
+    try testing.expectEqual(@as(u32, 6), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1536), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), config.qv_heads);
+    try testing.expectEqual(@as(u32, 96), config.qv_head_dim);
+    try testing.expectEqual(@as(u32, 8960), config.qv_intermediate);
+    try testing.expectEqual(@as(u32, 14), config.qv_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_merge);
+    try testing.expectEqual(@as(u32, 32), config.mv_pos_side);
+    try testing.expectEqual(@as(u32, 4096), config.mv_projector_hidden);
+    // The tower's own output width is the TEXT hidden size — `out_hidden_size`
+    // is the adapter's INPUT (hidden x merge^2), not the spliced width.
+    try testing.expectEqual(@as(u32, 6656), config.qv_out_hidden);
+    try testing.expectApproxEqAbs(@as(f32, 1e-05), config.mv_ln_eps, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 10000.0), config.mv_rope_theta, 1e-6);
+    // Every 4th layer is full attention; the rest window. Read per layer, since
+    // the released 50-layer tower ends on an off-stride full layer.
+    try testing.expect(!config.mv_full_attn[0]);
+    try testing.expect(config.mv_full_attn[3]);
+    try testing.expect(!config.mv_full_attn[4]);
+    try testing.expect(config.mv_full_attn[5]);
+    // muse wraps the pad run with <|image_start|>/<|image_end|>, so the generic
+    // BOI/EOI inserter needs no muse arm.
+    try testing.expectEqual(@as(u32, 200092), config.image_token_id);
+    try testing.expectEqual(@as(u32, 200080), config.boi_token_id);
+    try testing.expectEqual(@as(u32, 200081), config.eoi_token_id);
+}
+
+test "ModelConfig muse_glimmer_text flat sibling collapses onto muse_glimmer with bare prefix" {
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer_text",
+        \\  "hidden_size": 6656,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "vocab_size": 202048,
+        \\  "sliding_window": 2048
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("muse_glimmer", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
 }
 
 test "ModelConfig parses inkling_mm_model (Thinking Machines Inkling Small REAP25)" {

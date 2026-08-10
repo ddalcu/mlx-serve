@@ -276,6 +276,16 @@ echo "→ Code signing..."
 # Fix permissions for signing
 chmod -R u+w "$APP"
 
+# Strip extended attributes before signing. An asset added to
+# Sources/MLXServe/Resources by dragging it out of Finder carries
+# com.apple.FinderInfo and com.apple.quarantine, and codesign refuses the whole
+# bundle with "resource fork, Finder information, or similar detritus not
+# allowed" — three minutes into a build, naming the BINARY rather than the file
+# that actually brought the metadata in. Cleaning the staged bundle fixes the
+# class rather than one asset; `tests/test_resource_xattrs.sh` keeps the
+# checked-in copies clean too, so the failure is caught before a build starts.
+xattr -cr "$APP" 2>/dev/null || true
+
 # Hardened runtime requires a real Team ID — skip it for ad-hoc ("-") signing,
 # otherwise dyld rejects framework loads with "different Team IDs".
 ENTITLEMENTS="$APP_ENTITLEMENTS"

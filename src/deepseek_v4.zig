@@ -3957,7 +3957,7 @@ test "dsv4: dsparkRound greedy-equivalence with serial decode (DSV4_MINI)" {
             var t: u32 = argmaxOf(pl);
             while (n_spec < T) {
                 const n_before = st.n;
-                var round = try dsparkRound(&mdl, allocator, &st, t);
+                var round = try dsparkRound(&mdl, allocator, &st, t, std.math.maxInt(usize));
                 defer round.deinit(allocator);
                 try testing.expectEqual(t, round.tokens[0]);
                 try testing.expect(round.accepted <= mdl.ds_block);
@@ -4086,7 +4086,7 @@ test "dsv4: the confidence gate truncates the block without changing tokens (DSV
     defer emitted.deinit(allocator);
     var guard: usize = 0;
     while (emitted.items.len < T and guard < 32) : (guard += 1) {
-        var round = try dsparkRound(&mdl, allocator, &st, t);
+        var round = try dsparkRound(&mdl, allocator, &st, t, std.math.maxInt(usize));
         defer round.deinit(allocator);
         try testing.expectEqual(@as(u32, 0), round.accepted); // gate shut
         try emitted.appendSlice(allocator, round.tokens);
@@ -4274,7 +4274,7 @@ test "dsv4: dsparkRound FULL-ACCEPT commits the block and leaves serial state (D
     @memset(rigged.logits, 0);
     @memset(rigged.confidence, 0);
     defer rigged.deinit(allocator);
-    var round = try dsparkRoundWith(&mdl, allocator, &st, chain[0], &rigged);
+    var round = try dsparkRoundWith(&mdl, allocator, &st, chain[0], &rigged, B);
     defer round.deinit(allocator);
     try testing.expectEqual(@as(u32, @intCast(B)), round.accepted); // FULL accept
     try testing.expectEqual(@as(usize, B + 1), round.tokens.len);
@@ -4290,6 +4290,21 @@ test "dsv4: dsparkRound FULL-ACCEPT commits the block and leaves serial state (D
         t = argmaxOf(l);
     }
     std.debug.print("dsv4 dsparkRound FULL-ACCEPT: {d}/{d} accepted, {d} serial tail tokens match\n", .{ round.accepted, B, TAIL });
+
+    // Token-budget cap: the same fully-accepted proposal must roll module
+    // state back to the capped prefix and choose its pending token at that
+    // boundary. Slicing round.tokens after return would leave st.n overrun.
+    var capped_st = try initDecodeState(&mdl, allocator);
+    defer deinitDecodeState(&capped_st);
+    const capped_pl = try prefillIntoState(&mdl, allocator, &capped_st, &prefix);
+    defer allocator.free(capped_pl);
+    const capped_entry = capped_st.n;
+    var capped = try dsparkRoundWith(&mdl, allocator, &capped_st, chain[0], &rigged, 2);
+    defer capped.deinit(allocator);
+    try testing.expectEqual(@as(u32, 2), capped.accepted);
+    try testing.expectEqualSlices(u32, chain[0..3], capped.tokens);
+    try testing.expectEqual(chain[3], capped.next_token);
+    try testing.expectEqual(capped_entry + 3, capped_st.n);
 }
 
 // ── incremental decode ─────────────────────────────────────────────────
@@ -8989,13 +9004,13 @@ pub fn dsparkObserve(m: *Dsv4Model, ph: DsparkPhases) void {
 /// pending rings are overwritten in place, so partial-position rollback has
 /// no anchor short of the snapshot). Exit: st = entry + tokens.len positions,
 /// next_token not in state — the entry invariant again.
-pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32) !DsparkRound {
+pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, accepted_cap: usize) !DsparkRound {
     const prof_on = m.ds_prof != null;
     var clk: DsparkClock = if (prof_on) DsparkClock.init() else undefined;
     var draft = try dsparkDraft(m, gpa, st, t1);
     defer draft.deinit(gpa);
     const draft_ns: u64 = if (prof_on) clk.lap() else 0;
-    const round = try dsparkRoundWith(m, gpa, st, t1, &draft);
+    const round = try dsparkRoundWith(m, gpa, st, t1, &draft, accepted_cap);
     if (m.ds_prof != null) {
         var ph = round.phases;
         ph.draft_ns = draft_ns;
@@ -9010,7 +9025,7 @@ pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
 /// only this entry can exercise the no-rollback branch hermetically). Built
 /// ON TOP of the begin/finish split so the greedy and stochastic arms share
 /// one verify seam: begin → host read → argmax accept loop → finish.
-fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, draft: *const DsparkDraft) !DsparkRound {
+fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, draft: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
     var pending = try dsparkBeginWith(m, gpa, st, t1, draft);
     defer pending.deinit();
     const B = pending.b;
@@ -9028,6 +9043,10 @@ fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
         if (am != draft.ids[accepted + 1]) break;
         accepted += 1;
     }
+    // The always-emitted t1 consumes one request-budget token. Cap the draft
+    // prefix before choosing the pending token and before dsparkFinish commits
+    // or rolls module-owned state back to the accepted boundary.
+    accepted = @min(accepted, accepted_cap);
     const nrow = vl[accepted * m.vocab ..][0..m.vocab];
     var next_am: usize = 0;
     for (nrow, 0..) |v, j| {

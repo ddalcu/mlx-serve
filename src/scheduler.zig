@@ -65,6 +65,8 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
+const dflash_mod = @import("dflash.zig");
+const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
 const ChatConfig = chat_mod.ChatConfig;
@@ -107,6 +109,10 @@ pub const LoadParams = struct {
     /// Path to the assistant drafter checkpoint. Empty disables the drafter.
     /// Borrowed; outlive scheduler.
     drafter_dir: []const u8 = "",
+    /// `--no-drafter`: never load a drafter, including one MERGED into the
+    /// checkpoint. `drafter_dir == ""` stopped meaning "off" the moment a
+    /// checkpoint could carry its own, so the opt-out needs its own bit.
+    no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
@@ -221,6 +227,9 @@ pub const SubmitParams = struct {
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
+    /// The server's final resolved thinking mode after request overrides and
+    /// model defaults. DFlash economics key off this, not tool presence.
+    enable_thinking: bool = false,
     sampling: SamplingParams,
     eos_token_ids: []const u32,
     max_tokens: u32,
@@ -228,6 +237,10 @@ pub const SubmitParams = struct {
     enable_pld: bool = false,
     enable_drafter: bool = false,
     drafter: ?*DrafterModel = null,
+    /// DFlash assistant for this model. Rides the SAME `enable_drafter`
+    /// request switch (a model loads at most ONE of drafter/dflash);
+    /// `drafter_block_size` carries the dflash-resolved block size too.
+    dflash: ?*DflashModel = null,
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
     mtp: ?generate_mod.MtpHeadRef = null,
@@ -346,9 +359,11 @@ pub const Slot = struct {
     max_tokens: u32,
     timeout_ns: u64,
     has_tools: bool,
+    enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
     drafter: ?*DrafterModel,
+    dflash: ?*DflashModel,
     drafter_block_size: u32,
     enable_mtp: bool,
     mtp: ?generate_mod.MtpHeadRef,
@@ -513,12 +528,21 @@ pub const Slot = struct {
             .max_tokens = params.max_tokens,
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
+            .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
-            // The external drafter does not yet carry Qwen3-VL M-RoPE
-            // positions. Native Qwen MTP does: its prompt-history KV uses the
-            // explicit image positions and generated text uses offset+delta.
-            .enable_drafter = params.enable_drafter and params.vision_embeddings == null,
+            // Qwen's external drafter does not yet carry M-RoPE positions.
+            // Muse DFlash is different: it consumes captures from the same
+            // vision-conditioned trunk forward and Muse has no M-RoPE table,
+            // so image requests may keep that sidecar armed.
+            .enable_drafter = assistantSidecarEnabledForRequest(
+                params.enable_drafter,
+                params.vision_embeddings != null,
+                params.mrope_pos != null,
+                params.dflash != null,
+                config.muse_vision,
+            ),
             .drafter = params.drafter,
+            .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
             .mtp = params.mtp,
@@ -885,6 +909,10 @@ pub const LoadRequest = struct {
     /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
     model_dir: []const u8,
     drafter_dir: []const u8 = "",
+    /// `--no-drafter`: never load a drafter, including one MERGED into the
+    /// checkpoint. `drafter_dir == ""` stopped meaning "off" the moment a
+    /// checkpoint could carry its own, so the opt-out needs its own bit.
+    no_drafter: bool = false,
     /// SSD weight-streaming for cold-loaded ds4 models (issue #39). The CLI
     /// startup path supplies this via LoadParams; cold-load defaults it off.
     ds4_ssd_streaming: bool = false,
@@ -1019,6 +1047,7 @@ pub const Scheduler = struct {
     weights: ?*Weights,
     vision_encoder: ?*VisionEncoder,
     drafter: ?*DrafterModel,
+    dflash: ?*DflashModel = null,
     drafter_block_size: u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
@@ -1052,6 +1081,19 @@ pub const Scheduler = struct {
     /// survive an on-demand GGUF load, not just the `--model` primary).
     ds4_mtp: bool,
     ds4_dspark: bool,
+    ds4_ssd_streaming: bool,
+    /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
+    /// became load-bearing on this path the moment `dflash.resolveInDirDrafter`
+    /// started probing `<model_dir>/drafter` at load: without it here, a server
+    /// launched with speculation off re-enabled it on every model switched to.
+    /// `drafter_dir` is the launch `--drafter` path and `primary_model_dir` the
+    /// `--model` it belongs to — see `coldLoadDrafterDir` for why it is not
+    /// simply copied across.
+    no_drafter: bool,
+    drafter_dir: []const u8,
+    primary_model_dir: []const u8,
+    draft_block_size: u32,
+    draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1209,6 +1251,12 @@ pub const Scheduler = struct {
             .llama_kv_type_v = params.llama_kv_type_v,
             .ds4_mtp = params.ds4_mtp,
             .ds4_dspark = params.ds4_dspark,
+            .ds4_ssd_streaming = params.ds4_ssd_streaming,
+            .no_drafter = params.no_drafter,
+            .drafter_dir = params.drafter_dir,
+            .primary_model_dir = params.model_dir,
+            .draft_block_size = params.draft_block_size,
+            .draft_block_size_explicit = params.draft_block_size_explicit,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1363,6 +1411,7 @@ pub const Scheduler = struct {
         self.weights = null;
         self.vision_encoder = null;
         self.drafter = null;
+        self.dflash = null;
         self.hot_prefix_cache = null;
         if (self.load_error_name) |n| self.allocator.free(n);
 
@@ -1531,6 +1580,8 @@ pub const Scheduler = struct {
     ///   error.UnknownModelId    — id isn't in the registry.
     ///   error.NoDefaultModel    — id empty AND no default set.
     ///   error.NotEnoughMemory   — would exceed caps and no LRU victim.
+    ///   error.InsufficientMemory — memory preflight refused the load (free
+    ///                             RAM can't hold weights + headroom).
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
@@ -1598,8 +1649,9 @@ pub const Scheduler = struct {
                         continue :wait_loop;
                     },
                     .error_state => {
+                        const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
                         self.registry.mutex.unlock(self.io);
-                        return error.LoadFailed;
+                        return load_err;
                     },
                     .unloaded => break :wait_loop,
                 }
@@ -1653,11 +1705,14 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
-            .drafter_dir = "", // Phase E will wire the load-model API to set this.
+            // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
+            // loads too; the path itself is scoped by `coldLoadDrafterDir`.
+            .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
+            .no_drafter = self.no_drafter,
             .load_vision = coldLoadVision(owned.config.has_vision),
             .warmup_eager = true,
-            .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
-            .draft_block_size_explicit = false,
+            .draft_block_size = self.draft_block_size,
+            .draft_block_size_explicit = self.draft_block_size_explicit,
             .kv_quant_config = self.kv_quant_config,
             // Cold loads get the SAME prefix-cache configuration as the
             // startup model — pre-plumbing these were (1, 0, stride 0),
@@ -1679,6 +1734,7 @@ pub const Scheduler = struct {
             .llama_kv_type_v = self.llama_kv_type_v,
             .ds4_mtp = self.ds4_mtp,
             .ds4_dspark = self.ds4_dspark,
+            .ds4_ssd_streaming = self.ds4_ssd_streaming,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -1704,10 +1760,13 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
 
         if (req.error_name) |name| {
-            self.allocator.free(name);
+            // The failure crosses the thread boundary by NAME — map it back
+            // to a typed error so a memory-preflight refusal surfaces as a
+            // named 503, not the generic "Model load failed" 500 (#144).
+            defer self.allocator.free(name);
             // On success the inference thread took ownership of cpu_state;
             // on failure it didn't, so we still hold it.
-            return error.LoadFailed;
+            return ModelRegistry.loadErrorFromName(name);
         }
 
         // Success — inference thread installed cpu_state onto the entry.
@@ -1726,6 +1785,13 @@ pub const Scheduler = struct {
     /// under registry.mutex.
     pub fn release(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.release(lm);
+    }
+
+    /// Duped stored failure name for the id `ensureLoaded` just refused with
+    /// `error.LoadFailed` — feeds the "Model load failed: <name>" HTTP
+    /// message (#144). Caller frees.
+    pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
+        return self.registry.loadErrorNameDupe(alloc, id_or_empty);
     }
 
     /// Run a media-generation job on the inference thread. Posts `req` to the
@@ -1937,7 +2003,6 @@ fn signalStarted(sch: *Scheduler) void {
     sch.started.store(true, .release);
     sch.started_cond.broadcast(sch.io);
 }
-
 /// Set the load_error_name + flip load_failed. Best-effort dupe; on OOM the
 /// parent still sees `load_failed=true` and surfaces "unknown".
 fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
@@ -2008,6 +2073,12 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
         const stub = try gen_mod.buildStubCpuState(allocator, modality);
         return .{ .config = stub.config, .tok = stub.tok, .chat_config = stub.chat_config };
+    }
+    // A media-typed dir that FAILED its marker check must not fall through to
+    // the text path below: it would glob whatever safetensors are present and
+    // die on the first missing weight. Refuse by name instead (#144 flow).
+    if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
+        return error.IncompleteMediaPack;
     }
 
     const config = try allocator.create(ModelConfig);
@@ -2224,6 +2295,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.transformer = null;
     entry.vision_encoder = null;
     entry.drafter = null;
+    entry.dflash = null;
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
@@ -2254,6 +2326,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.weights = null;
     sch.vision_encoder = null;
     sch.drafter = null;
+    sch.dflash = null;
     sch.hot_prefix_cache = null;
 }
 
@@ -2293,6 +2366,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.transformer = null;
     entry.vision_encoder = null;
     entry.drafter = null;
+    entry.dflash = null;
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
@@ -2328,6 +2402,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.weights = null;
     sch.vision_encoder = null;
     sch.drafter = null;
+    sch.dflash = null;
     sch.hot_prefix_cache = null;
 }
 
@@ -2402,7 +2477,8 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
             @as(f64, @floatFromInt(avail)) / gb,
         });
         if (memInsufficientForLoad(peak, avail)) {
-            log.err("Insufficient memory for this media model: generation peaks at ~{d:.1} GB but only {d:.1} GB is free. Close other models/apps and retry; pass --skip-mem-preflight to override.\n", .{
+            log.err("Insufficient memory for this media model: needs ~{d:.1} GB free ({d:.1} GB for the model plus headroom for warmup buffers) but only {d:.1} GB is available. Unload the chat model or close other apps and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(loadRequirementBytes(peak))) / gb,
                 @as(f64, @floatFromInt(peak)) / gb,
                 @as(f64, @floatFromInt(avail)) / gb,
             });
@@ -2429,6 +2505,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     entry.transformer = null;
     entry.vision_encoder = null;
     entry.drafter = null;
+    entry.dflash = null;
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
@@ -2462,24 +2539,54 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.weights = null;
     sch.vision_encoder = null;
     sch.drafter = null;
+    sch.dflash = null;
     sch.hot_prefix_cache = null;
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
-/// "unknown" by the caller, which then skips the check).
+/// "unknown" by the caller, which then skips the check). Symlinked weights
+/// count (statFile follows links) — an HF hub-cache snapshot is ALL symlinks.
 fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     var it = dir.iterate();
     var total: u64 = 0;
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
         total += @intCast(st.size);
     }
     return total;
+}
+
+test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
+    // A model served straight out of the HuggingFace hub cache is a snapshot
+    // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
+    // 121 GB checkpoint at 0 bytes, and memInsufficientForLoad treats 0 as
+    // "unknown" → the preflight waved the load through into 34 GB of swap.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/abc123", .data = "0123456789abcdef" });
+    try tmp.dir.createDirPath(io, "snapshots/rev");
+    try tmp.dir.symLink(io, "../../blobs/abc123", "snapshots/rev/model.safetensors", .{});
+    // A dangling link (blob pruned) is skipped, never an error…
+    try tmp.dir.symLink(io, "../../blobs/gone", "snapshots/rev/model-00002.safetensors", .{});
+    // …and a symlink to a DIRECTORY must not be summed (statFile follows it).
+    try tmp.dir.symLink(io, "../../blobs", "snapshots/rev/dir.safetensors", .{});
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/snapshots/rev", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(snap);
+
+    try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
 }
 
 /// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk
@@ -2504,9 +2611,74 @@ pub var skip_mem_preflight: bool = false;
 /// hardcode `load_vision = config.has_vision` and silently ignore the flag.
 pub var no_vision_global: bool = false;
 
+/// Which drafter directory a COLD load should use.
+///
+/// `--no-drafter` is a policy — it silences every model, including one whose
+/// own dir ships a sidecar `dflash.resolveInDirDrafter` would otherwise find.
+/// `--drafter <path>`, by contrast, names a sidecar for the checkpoint it was
+/// passed beside: handing it to whatever model is swapped in next would load a
+/// mismatched assistant, so it applies only when the entry being loaded IS the
+/// launch model (which happens on a reload after eviction). Every other model
+/// is served by the in-dir probe.
+pub fn coldLoadDrafterDir(
+    no_drafter: bool,
+    primary_model_dir: []const u8,
+    drafter_dir: []const u8,
+    entry_path: []const u8,
+) []const u8 {
+    if (no_drafter) return "";
+    if (drafter_dir.len == 0) return "";
+    if (!std.mem.eql(u8, primary_model_dir, entry_path)) return "";
+    return drafter_dir;
+}
+
 /// Should a cold load bring up the checkpoint's vision tower?
 pub fn coldLoadVision(has_vision: bool) bool {
     return has_vision and !no_vision_global;
+}
+
+test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to its OWN model" {
+    // `--drafter <path>` names a sidecar for the checkpoint it was passed
+    // with; handing it to whatever model gets swapped in next would load a
+    // mismatched assistant. Other models are served by the in-dir probe.
+    // Reloading the launch model AFTER an eviction must still get it back.
+    try testing.expectEqualStrings("/d", coldLoadDrafterDir(false, "/m", "/d", "/m"));
+    try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "/d", "/other"));
+    // --no-drafter is a policy, not a path: it silences every model, including
+    // one whose own dir ships a sidecar the in-dir probe would find.
+    try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/m"));
+    try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/other"));
+    // No --drafter at launch: nothing to carry, the in-dir probe decides.
+    try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
+}
+
+test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
+    // Three separate rounds of this bug shipped: prefix-cache, then MTP +
+    // llama, then the drafter/ssd group — each time a launch flag reached
+    // only `--model` and the cold path (hot switch, /v1/load-model, first
+    // request naming an unloaded model) quietly used a struct default. The
+    // scan is the class guard: a field retained on the Scheduler for this
+    // purpose that no cold-load assignment mentions is the next round.
+    // Needles are ++-split so this test's own source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    inline for (.{
+        "kv_quant_config",         "prefix_cache_capacity",     "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes", "ssm_checkpoint_stride",     "ssm_checkpoint_max",
+        "mtp_enabled",             "mtp_depth",                 "llama_cache_entries",
+        "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
+        "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
+        "draft_block_size",        "draft_block_size_explicit",
+    }) |field| {
+        const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
+        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
+    }
+    // The drafter path is the one retained setting that must NOT be copied
+    // straight across — it goes through the ownership rule above.
+    const via_rule = "coldLoadDrafterDir(" ++ "self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)";
+    try testing.expect(std.mem.indexOf(u8, src, via_rule) != null);
+    // The stale TODO that stood in for the wiring must be gone.
+    const old = "Phase E will wire the load-model API" ++ " to set this.";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
 test "coldLoadVision honors the process-wide vision opt-out" {
@@ -2554,9 +2726,44 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
     // margin for every model under 48 GB (where it was tuned) and stays inside
     // the measured envelope above it.
+    return avail_bytes < loadRequirementBytes(weights_bytes);
+}
+
+/// Total free memory a load demands: the model's own peak plus the headroom the
+/// guard wants for warmup buffers and a baseline KV cache.
+///
+/// It exists so a REFUSAL can quote the number it actually compared. The media
+/// preflight used to say "generation peaks at ~4.3 GB but only 5.4 GB is free"
+/// — two figures that, read together, say the load should have worked. It was
+/// refused for the headroom, which the sentence never mentioned, so the user
+/// went hunting for a problem that wasn't there (live 2026-08-08). Same class as
+/// the context-overflow 400: a rejection has to state the bar it set.
+pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
     const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
-    return avail_bytes < weights_bytes + headroom;
+    return weights_bytes + headroom;
+}
+
+test "a refusal quotes the number it actually compared" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+
+    // Live report 2026-08-08: FLUX.2-klein 4B refused with "generation peaks at
+    // ~4.3 GB but only 5.4 GB is free" — two numbers that say the load should
+    // have worked. The guard was right (it also wants ~1.5 GB of headroom for
+    // warmup buffers) but the message quoted the PEAK, so the user went looking
+    // for a problem that wasn't there and then tried the same prompt in the
+    // other pane. What a refusal must state is the TOTAL it demanded.
+    const peak: u64 = 4300 * MB;
+    const avail: u64 = 5400 * MB;
+    try std.testing.expect(memInsufficientForLoad(peak, avail));
+    try std.testing.expect(loadRequirementBytes(peak) > avail);
+
+    // The requirement IS the comparison — not a second formula that can drift
+    // from it. At exactly the requirement a load is allowed; a byte under is not.
+    try std.testing.expect(!memInsufficientForLoad(peak, loadRequirementBytes(peak)));
+    try std.testing.expect(memInsufficientForLoad(peak, loadRequirementBytes(peak) - 1));
+    try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB)));
 }
 
 test "the eviction gate bills a media entry its BACKEND peak, never the dir's safetensors sum" {
@@ -2930,13 +3137,77 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(v);
     };
 
-    // Drafter (optional). Loaded only when `drafter_dir` is non-empty.
+    // Assistant sidecar (optional). Loaded only when `drafter_dir` is
+    // non-empty. The sidecar KIND is decided by its config CONTRACT: a
+    // config declaring block_size + mask_token_id + target_layer_ids is a
+    // DFlash block-drafter (any `*_assistant` family); anything else goes
+    // to the Gemma cross-attention drafter loader.
     var drafter_ptr: ?*DrafterModel = null;
-    if (params.drafter_dir.len > 0) {
+    var dflash_ptr: ?*DflashModel = null;
+    // An explicit `--drafter` always wins; otherwise the checkpoint's own
+    // `drafter/` subdir is the sidecar (dflash.resolveInDirDrafter). That is
+    // what makes the drafter a LOAD-time dependency rather than a launch
+    // flag: a hot model switch brings its own, and no pairing table has to
+    // decide which sidecar goes with which checkpoint.
+    const in_dir_drafter: ?[]u8 = if (params.no_drafter or params.drafter_dir.len > 0)
+        null
+    else
+        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir);
+    defer if (in_dir_drafter) |p| sch.allocator.free(p);
+    const drafter_dir: []const u8 = if (params.no_drafter)
+        ""
+    else if (params.drafter_dir.len > 0)
+        params.drafter_dir
+    else
+        in_dir_drafter orelse "";
+    if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
+        const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
+        if (env_off) {
+            log.info("[dflash] sidecar at {s} skipped (MLX_SERVE_DFLASH=0)\n", .{drafter_dir});
+        } else {
+            const d = try sch.allocator.create(DflashModel);
+            d.* = dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
+                sch.allocator.destroy(d);
+                log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
+                return err;
+            };
+            d.bind(xfm_ptr) catch |err| {
+                d.deinit();
+                sch.allocator.destroy(d);
+                log.err(
+                    "DFlash assistant at {s} is incompatible with target: {s}\n" ++
+                        "  (assistant+target must share hidden_size, the mask token and\n" ++
+                        "  target_layer_ids must exist in the target, and the target must\n" ++
+                        "  run the standard dense-attention forward path)\n",
+                    .{ drafter_dir, @errorName(err) },
+                );
+                return err;
+            };
+            dflash_ptr = d;
+            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            sch.drafter_block_size = dflash_mod.resolveBlockSize(
+                d.config.block_size,
+                params.draft_block_size,
+                params.draft_block_size_explicit,
+                wide_lane,
+            );
+            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
+                sch.drafter_block_size,
+                if (params.draft_block_size_explicit)
+                    ", user-clamped"
+                else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+                    ", capped (no wide verify lane)"
+                else
+                    "",
+                wide_lane,
+                d.config.target_layer_ids,
+            });
+        }
+    } else if (drafter_dir.len > 0) {
         const d = try sch.allocator.create(DrafterModel);
-        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), params.drafter_dir) catch |err| {
+        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
             sch.allocator.destroy(d);
-            log.err("Failed to load drafter at {s}: {s}\n", .{ params.drafter_dir, @errorName(err) });
+            log.err("Failed to load drafter at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
             return err;
         };
         d.bind(xfm_ptr) catch |err| {
@@ -2980,6 +3251,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
     errdefer if (drafter_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
+    errdefer if (dflash_ptr) |d| {
         d.deinit();
         sch.allocator.destroy(d);
     };
@@ -3042,11 +3317,20 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.transformer = xfm_ptr;
     entry.vision_encoder = vision_ptr;
     entry.drafter = drafter_ptr;
+    entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = if (mtp_ptr) |h| generate_mod.MtpHeadRef{ .qwen = h } else null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+    // A MERGED drafter has no `--drafter` to echo, so the reported path comes
+    // from what was actually resolved — `drafter_loaded` and `drafter_path`
+    // must not disagree about the same sidecar.
+    if (drafter_path_owned.len == 0 and drafter_dir.len > 0 and
+        (dflash_ptr != null or drafter_ptr != null))
+    {
+        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
+    }
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to
@@ -3148,6 +3432,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.xfm = xfm_ptr;
     sch.vision_encoder = vision_ptr;
     sch.drafter = drafter_ptr;
+    sch.dflash = dflash_ptr;
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
 }
 
@@ -3413,14 +3698,14 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     for (req.images) |img| {
         var emb: mlx.mlx_array = undefined;
         if (img.grid_h > 0) {
-            // Qwen3-VL: pixels hold merge-order pixel_values [N, feat]; the ViT
+            // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
             // produces [1, N/merge², out_hidden].
             const n: usize = @as(usize, img.grid_h) * img.grid_w;
             const feat: usize = (img.pixels.len / 4) / n;
             const shape = [_]c_int{ @intCast(n), @intCast(feat) };
             const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
             defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w) catch |err| {
+            emb = vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w) catch |err| {
                 failParts(sch, req, emb_parts.items, @errorName(err));
                 return;
             };
@@ -3591,9 +3876,17 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     doLoadOnInferenceThread(sch, req) catch |err| {
         log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
         sch.registry.mutex.lockUncancelable(sch.io);
-        // markErrorLocked dupes the error name onto the entry; the
-        // conn thread reads it back from the entry, not from req.
-        sch.registry.markErrorLocked(req.entry, @errorName(err));
+        if (err == error.InsufficientMemory) {
+            // A memory-preflight refusal is transient, not a property of the
+            // checkpoint: the 503 tells the user to free memory and retry, so
+            // the entry must go back to .unloaded — stuck in .error_state the
+            // retry would fail fast until a server restart (#144).
+            sch.registry.markUnloadedLocked(req.entry);
+        } else {
+            // markErrorLocked dupes the error name onto the entry; the
+            // conn thread reads it back from the entry, not from req.
+            sch.registry.markErrorLocked(req.entry, @errorName(err));
+        }
         sch.registry.mutex.unlock(sch.io);
         finishLoadRequest(sch, req, @errorName(err));
         return;
@@ -3688,6 +3981,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.weights = null;
         sch.vision_encoder = null;
         sch.drafter = null;
+        sch.dflash = null;
         sch.hot_prefix_cache = null;
     }
     sch.registry.mutex.lockUncancelable(sch.io);
@@ -3704,6 +3998,10 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     req.done = true;
     req.done_cond.broadcast(sch.io);
     req.done_mu.unlock(sch.io);
+}
+
+fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
+    return context_len == prefix_len;
 }
 
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
@@ -3741,7 +4039,18 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt) catch |err| {
+    // A runtime fallback leaves the dormant assistant context at its last
+    // speculative boundary while serial decode continues growing the trunk.
+    // Only pair the assistant payload with this prefix when both end at the
+    // exact same absolute position; otherwise the next turn must rebuild it.
+    const dflash_commit: ?prefix_cache_mod.DflashCommit = if (gen_ptr.dflash_ctx) |*dc|
+        if (dflashContextCoversPrefix(dc.absLen(), total_len))
+            .{ .cache = &dc.cache, .base_pos = dc.base_pos }
+        else
+            null
+    else
+        null;
+    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4191,6 +4500,20 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
     }
 }
 
+/// Scale the measured M5/block-16 break-even to the effective number of
+/// draft positions. `block_size` includes the always-emitted anchor. Thinking
+/// is the actual resolved request mode; tools are neither necessary nor
+/// sufficient for a reasoning preamble.
+fn dflashGateMinimum(block_size: u32, enable_thinking: bool) f32 {
+    const drafts = block_size -| 1;
+    if (drafts == 0) return 0;
+    const calibrated_min = if (enable_thinking)
+        generate_mod.Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND
+    else
+        generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
+    return calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+}
+
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
@@ -4268,12 +4591,18 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.mtp != null,
         slot.enable_drafter,
         slot.drafter != null,
+        slot.dflash != null,
         slot.enable_pld,
     );
     const use_mtp = wiring.use_mtp;
     const use_drafter = wiring.use_drafter;
+    const use_dflash = wiring.use_dflash;
     const use_pld = wiring.use_pld;
     const dsv4_spec_intent = wiring.native_intent;
+    log.debug("[spec-wiring] mtp={} dflash={} drafter={} pld={} (slot: drafter_flag={} dflash_handle={} drafter_handle={})\n", .{
+        use_mtp,             use_dflash,          use_drafter,          use_pld,
+        slot.enable_drafter, slot.dflash != null, slot.drafter != null,
+    });
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
@@ -4288,12 +4617,28 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // per-request, so prefix matching would reuse stale features.
     var prefill_tokens: []const u32 = slot.full_prompt;
     var hot_matched: u32 = 0;
+    // The DFlash assistant's context rides the prefix cache: a restore
+    // forwards no trunk layers, so without it the assistant starts every
+    // reused turn blind and drafts against nothing. Measured on Muse 4-bit,
+    // 160-token generations: a full-prefix hit cost 92.6% -> 66.5% per-draft
+    // acceptance and 80.2 -> 60.9 tok/s. Adopted by the Generator below.
+    var dflash_restored: ?dflash_mod.DflashCtx = null;
+    errdefer if (dflash_restored) |*dc| dc.deinit();
     // Phase D: per-slot model — pull transformer + prefix cache off the
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
         if (slot.vision_embeddings == null) {
+            // Only build a restore target when this request will actually
+            // draft — a non-dflash turn leaves the payload in the entry for
+            // the next one that does.
+            var dfl_target: ?dflash_mod.DflashCtx = if (use_dflash and slot.dflash != null)
+                dflash_mod.DflashCtx.init(slot.allocator, slot.dflash.?, 0) catch null
+            else
+                null;
+            errdefer if (dfl_target) |*dc| dc.deinit();
+            var dfl_base: usize = 0;
             const lookup = hc.lookupAndRestore(
                 &slot.cache,
                 &slot.moe_seq_offset,
@@ -4301,6 +4646,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
+                if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -4308,6 +4654,18 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
+            }
+            if (dfl_target) |*dc| {
+                // Adopt only a context that lines up EXACTLY with the trunk
+                // cursor — `nextDflash` asserts `absLen() == cache.step`, and
+                // a blind start is always a valid fallback.
+                if (lookup.dflash_base != null and dfl_base + dc.cache.step == hot_matched) {
+                    dc.base_pos = dfl_base;
+                    dflash_restored = dc.*;
+                } else {
+                    dc.deinit();
+                }
+                dfl_target = null;
             }
         }
     }
@@ -4335,6 +4693,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
+            .dflash_enabled = use_dflash,
+            .dflash = if (use_dflash) slot.dflash else null,
+            // The dflash-resolved block rides the shared drafter_block_size.
+            .dflash_block_size = slot.drafter_block_size,
+            // Use the resolved thinking mode and normalize the M5/block-16
+            // calibration to this machine's effective assistant width.
+            .dflash_min_accepted_per_round = dflashGateMinimum(
+                slot.drafter_block_size,
+                slot.enable_thinking,
+            ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
             .mtp_depth = slot.mtp_depth,
@@ -4344,10 +4712,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // exactly prompt_len with t1 NOT in cache. Generator.next's
             // transition shim sync-forwards [t1] on the first decode call.
             // PLD/drafter/MTP init paths already skip preforward unconditionally.
-            .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp,
+            .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            .dflash_ctx_restored = dflash_restored,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
             // when the client disconnects; the chunk loop checks it between
             // chunks so a ghost 40K prefill stops within one chunk.
@@ -4359,6 +4728,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
         },
     );
+    dflash_restored = null; // ownership transferred to the Generator
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
 
@@ -4462,6 +4832,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 pub const SpecInitWiring = struct {
     use_mtp: bool,
     use_drafter: bool,
+    use_dflash: bool,
     use_pld: bool,
     /// The request's spec INTENT, forwarded to the Generator chokepoint for a
     /// module-owned arch that has its OWN draft mode (dsv4 → DSpark). Rides
@@ -4489,32 +4860,71 @@ pub fn specInitWiring(
     has_mtp: bool,
     enable_drafter: bool,
     has_drafter: bool,
+    has_dflash: bool,
     enable_pld: bool,
 ) SpecInitWiring {
     if (owns_module_state) return .{
         // A module-owned arch that CAN rewind its state across a verify runs
-        // its own MTP head like any other target. PLD and the drafter
-        // stay off regardless: the drafter needs a Gemma sidecar, and PLD's
-        // win case is echo-shaped traffic the n-gram gate rarely opens on a
+        // its own MTP head like any other target. PLD and the drafters
+        // stay off regardless: the drafters need a bound sidecar (DflashModel
+        // .bind refuses these archs anyway), and PLD's win case is
+        // echo-shaped traffic the n-gram gate rarely opens on a
         // head this cheap — neither has been measured on this family, and an
         // unmeasured spec mode is worse than none.
         .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
         .use_drafter = false,
+        .use_dflash = false,
         .use_pld = false,
         .native_intent = has_native_draft and enable_mtp,
     };
     const use_mtp = enable_mtp and has_mtp;
-    const use_drafter = !use_mtp and enable_drafter and has_drafter;
+    // enable_drafter is the request-level "assistant sidecar" switch for BOTH
+    // sidecar kinds; the loader guarantees at most one of drafter/dflash is
+    // loaded per model. Priority: MTP > dflash > gemma drafter > PLD.
+    const use_dflash = !use_mtp and enable_drafter and has_dflash;
+    const use_drafter = !use_mtp and !use_dflash and enable_drafter and has_drafter;
     return .{
         .use_mtp = use_mtp,
         .use_drafter = use_drafter,
-        .use_pld = !use_mtp and !use_drafter and enable_pld,
+        .use_dflash = use_dflash,
+        .use_pld = !use_mtp and !use_dflash and !use_drafter and enable_pld,
         .native_intent = false,
     };
 }
 
+/// Resolve the request-level switch shared by the classic external drafter
+/// and DFlash. Vision stays guarded by default: placeholder ids alone do not
+/// tell an external sidecar how to position image tokens. Muse DFlash is the
+/// measured exception because it drafts from captures produced by Muse's own
+/// vision-conditioned trunk and Muse does not use Qwen's M-RoPE table.
+pub fn assistantSidecarEnabledForRequest(
+    requested: bool,
+    has_vision: bool,
+    has_mrope: bool,
+    has_dflash: bool,
+    is_muse_vision: bool,
+) bool {
+    if (!requested) return false;
+    if (!has_vision) return true;
+    return has_dflash and is_muse_vision and !has_mrope;
+}
+
+test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
+    // Text requests keep the existing shared sidecar behavior.
+    try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, false));
+    // A request opt-out always wins.
+    try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, true));
+    // Image requests remain guarded for classic external drafters.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, false));
+    // Muse DFlash consumes vision-conditioned trunk captures and may engage.
+    try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, true));
+    // Qwen's explicit M-RoPE table is never admitted through this exception.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, true));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, false));
+}
+
 /// Which spec mode a decode tick drives for a slot.
-pub const SpecTickMode = enum { dspark, mtp, drafter, pld, regular };
+pub const SpecTickMode = enum { dspark, mtp, dflash, drafter, pld, regular };
 
 /// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
 /// wish; the generator-side values carry what `Generator.initWithOptions`
@@ -4534,12 +4944,14 @@ pub fn specTickMode(
     gen_has_mtp: bool,
     slot_enable_drafter: bool,
     gen_has_drafter: bool,
+    gen_has_dflash: bool,
     slot_enable_pld: bool,
     gen_pld_enabled: bool,
     gen_dspark_enabled: bool,
 ) SpecTickMode {
     if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
     if (slot_enable_mtp and gen_has_mtp) return .mtp;
+    if (slot_enable_drafter and gen_has_dflash) return .dflash;
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
     if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
@@ -4549,6 +4961,28 @@ pub fn specTickMode(
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
+fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    // The Generator has already committed the whole block internally. Publish
+    // it incrementally so streaming, cancellation, EOS and usage all observe
+    // the same per-token boundary. The generator-side cap guarantees max_tokens
+    // cannot land before the returned block ends.
+    for (tokens) |t| {
+        if (slot.cancelled.load(.acquire)) return;
+        if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            finishSlot(sch, slot, "stop");
+            return;
+        }
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+        if (slot.completion_tokens >= slot.max_tokens) {
+            finishSlot(sch, slot, "length");
+            return;
+        }
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
@@ -4580,7 +5014,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         // different diagnosis from one, and the trim is what breaks the chain.
         log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
             gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
-            @tagName(stop.tier),          stop.trim_start,
+            @tagName(stop.tier),         stop.trim_start,
         });
         slot.finish_details = stop.finish_details;
         if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
@@ -4598,6 +5032,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         gen.mtp != null,
         slot.enable_drafter,
         gen.drafter != null,
+        gen.dflash != null,
         slot.enable_pld,
         gen.pld_enabled,
         gen.dspark_enabled,
@@ -4609,20 +5044,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
     if (tick_mode == .mtp) {
@@ -4632,20 +5054,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -4656,20 +5065,18 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
+        return;
+    }
+
+    if (tick_mode == .dflash) {
+        const result = try gen.nextDflash(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
         }
+        defer slot.allocator.free(result.?.tokens);
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -4680,20 +5087,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -4719,6 +5113,75 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     slot.pushTokenWithLogprob(t, lp_take);
     if (t != 0) slot.was_pad_only = false;
     slot.completion_tokens = gen.completion_tokens;
+}
+
+test "all speculative blocks publish through one per-token accounting loop" {
+    // Class guard for block-returning decoders. The Generator has already
+    // advanced by the whole accepted block when the scheduler receives it;
+    // copying that final count while publishing token 1 truncates the stream
+    // and over-reports usage. Every mode must use the shared incremental loop.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runSingleDecodeTick(") orelse return error.MissingDecodeTick;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\n}\n\ntest \"all speculative blocks") orelse return error.MissingDecodeTickEnd;
+    const body = source[start..end];
+    const shared_call = "publishSpeculativeBlock(sch, slot, gen, result.?.tokens);";
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, shared_call));
+    // The one remaining final-count assignment belongs to the scalar regular
+    // path, after every speculative arm. It must never reappear in a block.
+    const final_assign = "slot.completion_tokens = gen.completion_tokens;";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
+    try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
+}
+
+test "DFlash cache payload is committed only when it spans the trunk prefix" {
+    try testing.expect(dflashContextCoversPrefix(128, 128));
+    try testing.expect(!dflashContextCoversPrefix(96, 128));
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "DFlash gate policy follows effective block width and resolved thinking" {
+    // block_size includes the always-emitted anchor, so block 16 has 15 draft
+    // positions and block 7 has 6. The M5 calibration is normalized to that
+    // actual draft width instead of being imposed as an absolute threshold on
+    // machines without the wide verification lane.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false));
+}
+
+test "every server scheduler path forwards resolved thinking to the DFlash gate" {
+    const source = @embedFile("server.zig");
+
+    // All direct streaming submissions, plus the shared non-streaming submit,
+    // must populate the field. Text completions resolve it explicitly false.
+    var submit_pos: usize = 0;
+    var submits: usize = 0;
+    while (std.mem.indexOfPos(u8, source, submit_pos, "sch.submit(.{")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, "});") orelse return error.UnclosedSchedulerSubmit;
+        try testing.expect(std.mem.indexOf(u8, source[start..end], ".enable_thinking =") != null);
+        submits += 1;
+        submit_pos = end + 3;
+    }
+    try testing.expectEqual(@as(usize, 5), submits);
+
+    // Positional calls into the non-streaming wrapper must pass the resolved
+    // value; the raw text-completion path is the sole explicit false arm.
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var calls: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "nonStreamingViaScheduler(") == null) continue;
+        if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
+        calls += 1;
+        try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
+            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+    }
+    try testing.expectEqual(@as(usize, 4), calls);
 }
 
 /// Batched decode kernel for >=2 active slots. All slots must have already
@@ -5236,48 +5699,65 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // got none, so `--pld` drove verify forwards straight through it. The
     // predicate is now per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
     // Args: (owns_module_state, module_spec_rollback, has_native_draft,
-    //        enable_mtp, has_mtp, enable_drafter, has_drafter, enable_pld)
+    //        enable_mtp, has_mtp, enable_drafter, has_drafter, has_dflash,
+    //        enable_pld)
 
     // Plain arch: today's precedence, unchanged.
     {
-        const w = specInitWiring(false, false, false, true, true, true, true, true);
-        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+        const w = specInitWiring(false, false, false, true, true, true, true, false, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     {
-        const w = specInitWiring(false, false, false, true, false, true, true, true);
+        const w = specInitWiring(false, false, false, true, false, true, true, false, true);
         try testing.expect(!w.use_mtp and w.use_drafter and !w.use_pld);
     }
     {
-        const w = specInitWiring(false, false, false, false, false, false, false, true);
+        const w = specInitWiring(false, false, false, false, false, false, false, false, true);
         try testing.expect(!w.use_mtp and !w.use_drafter and w.use_pld and !w.native_intent);
     }
     // A flag with no loaded handle never arms.
     {
-        const w = specInitWiring(false, false, false, true, false, false, false, false);
-        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld);
+        const w = specInitWiring(false, false, false, true, false, false, false, false, false);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+    }
+
+    // DFlash rides the enable_drafter switch: MTP > dflash > drafter > PLD.
+    {
+        const w = specInitWiring(false, false, false, false, false, true, false, true, true);
+        try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
+    }
+    // A loaded MTP head still outranks it.
+    {
+        const w = specInitWiring(false, false, false, true, true, true, false, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
+    }
+    // enable_drafter:false opts BOTH sidecar kinds out.
+    {
+        const w = specInitWiring(false, false, false, false, false, false, false, true, true);
+        try testing.expect(!w.use_dflash and !w.use_drafter and w.use_pld);
     }
 
     // Module-owned with NO rollback and no native draft mode: everything off,
     // and no intent bit either — nothing downstream can arm a draft path.
     {
-        const w = specInitWiring(true, false, false, true, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+        const w = specInitWiring(true, false, false, true, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
 
-    // Module-owned WITH rollback: its own MTP head arms; the two shell
-    // spec modes stay off because neither has been measured on this family.
+    // Module-owned WITH rollback: its own MTP head arms; the shell
+    // spec modes stay off because none has been measured on this family.
     {
-        const w = specInitWiring(true, true, false, true, true, true, true, true);
-        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+        const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     // Rollback capability alone never arms a head that is not loaded.
     {
-        const w = specInitWiring(true, true, false, true, false, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld);
+        const w = specInitWiring(true, true, false, true, false, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
     // ...nor one the request opted out of.
     {
-        const w = specInitWiring(true, true, false, false, true, true, true, true);
+        const w = specInitWiring(true, true, false, false, true, true, true, false, true);
         try testing.expect(!w.use_mtp);
     }
 
@@ -5285,13 +5765,13 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // shell paths stay off, but the request's MTP intent still reaches the
     // Generator chokepoint.
     {
-        const w = specInitWiring(true, false, true, true, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld);
+        const w = specInitWiring(true, false, true, true, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
         try testing.expect(w.native_intent);
     }
     // enable_mtp:false opts out of DSpark; PLD intent alone never arms it.
     {
-        const w = specInitWiring(true, false, true, false, false, false, false, true);
+        const w = specInitWiring(true, false, true, false, false, false, false, false, true);
         try testing.expect(!w.native_intent);
     }
 }
@@ -5302,7 +5782,7 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
     const src = @embedFile("scheduler.zig");
     // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
     // this test's own arms would satisfy.
-    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
+    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_dflash = wiring" ++ ".use_dflash;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
     // The exclusion must come from the shared predicate, not a new arch list.
@@ -5327,36 +5807,45 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
 
     // Slot wants PLD, generator was NOT armed (chokepoint or per-site guard
     // flipped it off) → the tick must run the regular path.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false, false));
     // Slot wants PLD and init armed it → PLD runs.
-    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, false, true, true, false));
     // Generator armed but the slot never asked (stale generator state must
     // not resurrect spec either) → regular.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, true, false));
 
     // mtp/drafter keep their existing both-sides contract.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false, false));
 
     // Priority: MTP > drafter > PLD (the spec-dispatch rule).
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, true, true, true, false));
-    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, true, true, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, true, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, true, true, false));
 
     // DSpark: the generator's post-chokepoint bit AND the slot's MTP flag —
     // the "model's native head" semantics (server defaults it ON for a
     // stage-bearing dsv4; the n-gram gate never touches enable_mtp). It wins
     // over everything (a set mtp/pld generator conjunct alongside dspark is
     // unreachable by the chokepoint's construction, but priority must hold).
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, true));
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, true, true, true));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, false, true, true, true));
     // PLD/drafter intent alone never drives dspark (their flags are
     // prompt-gated — riding them made engagement depend on the n-gram gate).
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, true));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false, true));
     // Generator armed but the request opted enable_mtp off → serial.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, false, true));
     // Slot asked, generator never armed dspark → falls through as before.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false, false));
+
+    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the
+    // gemma drafter, loses to MTP/DSpark. Generator handle alone never
+    // resurrects it, and a dflash generator with the slot flag off stays
+    // regular (the specTickMode both-sides contract).
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
 }

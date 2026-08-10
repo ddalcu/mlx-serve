@@ -2,16 +2,6 @@ import SwiftUI
 
 /// The chat window's model picker: which model this conversation is talking to,
 /// with a status dot, sitting at the LEADING edge of the toolbar.
-///
-/// Leading placement is deliberate. The trailing cluster (voice, settings, the
-/// three mode pills) is at its width budget, and anything runtime-variable added
-/// there re-triggers the » overflow-eviction class — which is also why this
-/// pill's label is width-CAPPED and truncated rather than sized to the model
-/// name. A 60-character Hugging Face repo id must not be able to push the
-/// toolbar around.
-///
-/// Selection goes through `ChatModelSelection`, the same definition the menu-bar
-/// tray uses, so the two pickers cannot disagree about what is loaded.
 struct ChatModelPill: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -21,22 +11,22 @@ struct ChatModelPill: View {
     /// capsule around the model picker, voice and settings together — a second
     /// capsule inside it reads as a button inside a button.
     var showsBackground: Bool = true
+    /// Composer placement: sized and weighted like the rest of that row (which
+    /// is where the picker lives now — it configures the message you are about
+    /// to send, not the window), and it carries the download affordances a
+    /// toolbar pill had no room for.
+    var compact: Bool = false
+
+    @EnvironmentObject private var downloads: DownloadManager
 
     /// Hard cap on the name's width. The pill's size is what keeps it safe in
     /// the toolbar, so this is a contract, not a nicety.
     private static let maxNameWidth: CGFloat = 210
+    /// Tighter cap in the composer row, which has its own budget — see the
+    /// toolbar-eviction note above; the same discipline applies here.
+    private static let compactNameWidth: CGFloat = 150
 
     /// What the PILL shows: the model name without its org.
-    ///
-    /// The org is the half of a Hugging Face id that's identical across most of
-    /// your models, and it was eating the width budget from the left while the
-    /// middle-truncation ate the part that identifies the model
-    /// ("mlx-commun…B-it-qat-4bit"). The MENU keeps full ids — that's where
-    /// you're choosing between them, and two orgs can ship the same name.
-    ///
-    /// A LAN id is `org/model@peer`, so taking the last path component keeps
-    /// the peer; anything without a slash, or ending in one, is left alone
-    /// rather than rendered as an empty pill.
     static func headerName(_ full: String) -> String {
         guard let slash = full.lastIndex(of: "/") else { return full }
         let tail = full[full.index(after: slash)...]
@@ -83,32 +73,90 @@ struct ChatModelPill: View {
         )
     }
 
+    /// A live transfer the CHAT could be waiting on, if any. The pill is where
+    /// the user is already looking when they wonder why nothing answers, so a
+    /// download in flight belongs here rather than only in the browser two
+    /// clicks away — but never a media bundle's transfer: `.values.first` over
+    /// the unordered dictionary picked ANY in-flight download, so a 30 GB
+    /// video pack grew a progress hairline under the chat model's name (and
+    /// suppressed the download-arrow affordance while it ran).
+    static func chatDownload(in downloads: [String: DownloadManager.DownloadState],
+                             mediaRepos: Set<String>) -> DownloadManager.DownloadState? {
+        downloads
+            .filter { $0.value.status == .downloading && !mediaRepos.contains($0.key) }
+            .min { $0.key < $1.key }?  // stable pick when two are running
+            .value
+    }
+
+    private var activeDownload: DownloadManager.DownloadState? {
+        guard server.lanChatModelId == nil else { return nil }
+        return Self.chatDownload(in: downloads.downloads,
+                                 mediaRepos: downloads.mediaBundleRepos)
+    }
+
+    /// True when this Mac has nothing chat-pickable on disk — the state where
+    /// the pill's job is to offer the download, not a list to choose from.
+    private var needsDownload: Bool {
+        server.lanChatModelId == nil && pickableModels.isEmpty && activeDownload == nil
+    }
+
     var body: some View {
         Menu {
             menuContent
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "cpu")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text(Self.headerName(displayName))
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: Self.maxNameWidth, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 6, height: 6)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    // The READABLE name (`ModelDisplayName`). The repo id it is
+                    // built from stays the identity and is still what the menu
+                    // rows carry underneath — this is the label, not a rename.
+                    Text(ModelDisplayName.pretty(displayName))
+                        .font(compact ? .callout.weight(.semibold) : .callout.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth,
+                               alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    if needsDownload {
+                        // Nothing on disk: the one thing to do is get one, so
+                        // say it with the symbol rather than a dot that only
+                        // reports.
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.accentColor)
+                    } else {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 8, height: 8)
+                    }
+                }
+                if let active = activeDownload {
+                    // Deliberately wordless: a hairline that fills. The figures
+                    // live in the browser; here it only has to say "something is
+                    // arriving, that's why it can't answer yet".
+                    ProgressView(value: max(0, min(1, active.fileProgress)))
+                        .progressViewStyle(.linear)
+                        .tint(.green)
+                        .frame(height: 3)
+                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth)
+                }
             }
-            .padding(.horizontal, showsBackground ? 10 : 4)
+            .padding(.horizontal, showsBackground ? 12 : 4)
             .padding(.vertical, 4)
+            // The composer row's own control height, so the pill lines up with
+            // the discs and the send button rather than sitting a few points
+            // shy of them. A FLOOR, not a fixed height: a download adds the
+            // progress hairline under the name and the capsule grows to hold
+            // it, which is the shape in the mockup.
+            .frame(minHeight: compact ? ChatMetrics.composerIconSize : 0)
             .background(showsBackground ? Color.secondary.opacity(0.12) : Color.clear)
-            .clipShape(Capsule())
-            .contentShape(Capsule())
+            .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 999, style: .continuous))
+            .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
@@ -122,7 +170,6 @@ struct ChatModelPill: View {
         let pickable = pickableModels
         if pickable.isEmpty && lanChatModels.isEmpty {
             Text("No chat models downloaded")
-            Divider()
         } else {
             // Same duplicate-name suffixing as the tray: a menu keys its
             // checkmark by row TITLE, so two same-named rows both tick.
@@ -145,10 +192,14 @@ struct ChatModelPill: View {
                     }
                 }
             }
-            Divider()
         }
+        Divider()
         Button("Manage Models…") {
-            AppActivation.openWindow(id: "modelBrowser", using: openWindow)
+            // A MODE of this window now, not a window of its own — so the
+            // picker's "manage" route lands beside the picker rather than on
+            // top of it. AppState.showModels is the one way in, and it is the
+            // LAST row: everything above it is a model you can pick right now.
+            appState.showModels()
         }
     }
 

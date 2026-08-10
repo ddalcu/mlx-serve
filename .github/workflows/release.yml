@@ -5,14 +5,15 @@ on:
     tags:
       - 'v*'
   # PR builds run the FULL packaging pipeline — sign, notarize, DMG — and
-  # upload the result as a workflow artifact. They never tag, never create a
-  # GitHub release, never push Homebrew formulas (step gates below). Fork PRs
-  # skip the whole job (no access to signing secrets — job-level `if`).
+  # upload the result as a workflow artifact. They never tag and never create
+  # a GitHub release (step gates below). The Homebrew formula push lives in
+  # homebrew.yml, fired when a release is published. Fork PRs skip the whole
+  # job (no access to signing secrets — job-level `if`).
   pull_request:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build + test + package only — skip tag, notarize, release, and formula push. Use to verify the workflow on a branch before cutting a real release."
+        description: "Build + test + package only — skip tag, notarize, and release. Use to verify the workflow on a branch before cutting a real release."
         type: boolean
         default: false
 
@@ -303,8 +304,8 @@ jobs:
           # Without the stamp the bundle ships whatever the committed plist
           # happens to say: v26.8.1 shipped an app reporting 26.7.12, so
           # UpdateChecker saw a permanently newer release and installing it
-          # never helped (the new DMG said 26.7.12 too). Stamp the COPY — the
-          # Homebrew step later rebases, which refuses a dirty tree.
+          # never helped (the new DMG said 26.7.12 too). Stamp the COPY —
+          # the committed plist stays clean.
           cp app/Info.plist "$CONTENTS/"
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleVersion ${{ steps.version.outputs.version }}" \
@@ -482,6 +483,9 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # The release is created as a DRAFT; the Homebrew formula push happens in
+      # homebrew.yml when the draft is PUBLISHED — pushing it here advertised a
+      # version whose assets weren't downloadable yet.
       - name: Create Release
         if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
         uses: softprops/action-gh-release@v2
@@ -505,34 +509,3 @@ jobs:
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg
           retention-days: 7
-
-      - name: Update Homebrew formulas
-        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          DMG_SHA=$(shasum -a 256 MLXCore.dmg | awk '{print $1}')
-          CLI_SHA=$(shasum -a 256 mlx-serve-bin-macos-arm64.tar.gz | awk '{print $1}')
-
-          sed -i '' "s/version \".*\"/version \"$VERSION\"/" Casks/mlx-core.rb
-          sed -i '' "s/sha256 \".*\"/sha256 \"$DMG_SHA\"/" Casks/mlx-core.rb
-
-          sed -i '' "s/version \".*\"/version \"$VERSION\"/" Formula/mlx-serve.rb
-          sed -i '' "s/sha256 \".*\"/sha256 \"$CLI_SHA\"/" Formula/mlx-serve.rb
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/mlx-core.rb Formula/mlx-serve.rb
-          git commit -m "brew: update to v$VERSION"
-
-          # Retry with rebase in case main advanced during the build
-          for i in 1 2 3 4 5; do
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "push attempt $i rejected; rebasing on latest main and retrying..."
-            git fetch origin main
-            git rebase origin/main
-            sleep $((i * 2))
-          done
-          echo "failed to push Homebrew formula update after 5 attempts" >&2
-          exit 1

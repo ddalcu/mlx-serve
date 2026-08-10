@@ -8,15 +8,12 @@ import SwiftUI
 /// conversation starts. Media generation, the Model Browser, Tasks and the
 /// coding-agent launcher all lived only in the menu-bar tray, and users
 /// reported not finding any of them.
-///
-/// Pure data so the surfaces are testable: every window id is pinned against
-/// the scene graph in ChatEmptyStateTests, the Tools command menu (the
-/// always-available twin in the menu bar) iterates the SAME `mediaItems`
-/// catalog, and the Code Launcher chip renders the tray Code button's own
-/// `CLILauncherMenuItems` — one list per surface pair, so none can drift.
 enum ChatEmptyState {
     enum Action: Equatable {
         case window(String)   // a Window scene id, opened via AppActivation
+        case models           // switches THIS window to the model browser
+        case tasks            // …and to the Tasks pane
+        case create(GenExperiment)  // …and to one of the media generators
         case mediaMenu        // chip renders as a Menu over `mediaItems`
         case codeLauncher     // chip renders the tray's CLI launcher dropdown
     }
@@ -41,14 +38,23 @@ enum ChatEmptyState {
     /// Tools menu's media section (same array, deliberately).
     static let mediaItems: [Item] = [
         Item(id: "media-image", title: "Image Generation", systemImage: "photo",
-             tint: .purple, action: .window("imageGen")),
+             tint: .purple, action: .create(.image)),
         Item(id: "media-video", title: "Video Generation", systemImage: "film",
-             tint: .indigo, action: .window("videoGen")),
+             tint: .indigo, action: .create(.video)),
         Item(id: "media-audio", title: "Audio & Music", systemImage: "waveform",
-             tint: .pink, action: .window("audioGen")),
+             tint: .pink, action: .create(.audio)),
         Item(id: "media-3d", title: "3D Model", systemImage: "cube",
-             tint: .brown, action: .window("model3dGen")),
+             tint: .brown, action: .create(.model3d)),
     ]
+
+    /// The sidebar's Create rows: the catalogue above minus 3D. A filter, never
+    /// a second list — the chips, the Tools menu and the sidebar must stay one
+    /// catalogue. 3D is deliberately absent from the column (it keeps its chip,
+    /// menu and tray routes): three everyday generators were asked for, and the
+    /// pinned destination block has a height budget.
+    static var sidebarCreateItems: [Item] {
+        mediaItems.filter { $0.action != .create(.model3d) }
+    }
 
     /// The chip row. The Code Launcher is DMG-only — the MAS build can't
     /// detect or launch other apps' CLIs (same gate as the tray's Code
@@ -59,10 +65,10 @@ enum ChatEmptyState {
                  tint: .purple, action: .mediaMenu,
                  help: "Generate images, video, audio, or 3D models"),
             Item(id: "models", title: "Browse Models", systemImage: "magnifyingglass",
-                 tint: .blue, action: .window("modelBrowser"),
+                 tint: .blue, action: .models,
                  help: "Search and download models"),
             Item(id: "tasks", title: "Tasks", systemImage: "clock.badge.checkmark",
-                 tint: .orange, action: .window("tasks"),
+                 tint: .orange, action: .tasks,
                  help: "Scheduled and background agent tasks"),
         ]
         if cliLauncherAvailable {
@@ -121,7 +127,7 @@ struct EmptyStateChipRow: View {
                                 AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
                             })
                     }
-                case .window:
+                case .models, .create, .tasks, .window:
                     Button { open(item) } label: {
                         EmptyStateChipLabel(item: item)
                     }
@@ -155,8 +161,19 @@ struct EmptyStateChipRow: View {
     }
 
     private func open(_ item: ChatEmptyState.Item) {
-        if case .window(let id) = item.action {
+        switch item.action {
+        case .window(let id):
             AppActivation.openWindow(id: id, using: openWindow)
+        case .models:
+            // Not a window — the browser is this window's other mode.
+            appState.showModels()
+        case .tasks:
+            appState.showTasks()
+        case .create(let experiment):
+            // Straight to the Create pane — the same door the Tools menu uses.
+            appState.showCreate(experiment)
+        case .mediaMenu, .codeLauncher:
+            break  // rendered as menus; nothing to open on click
         }
     }
 }

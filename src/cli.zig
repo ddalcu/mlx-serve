@@ -570,7 +570,10 @@ fn isModelDir(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) bool {
     } else |_| {}
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind == .file) return true;
     }
     // A MageFlow repo has neither: every config lives in a component subdir and
     // `model_index.json` is the only signal. An mflux FLUX.2 conversion may
@@ -615,8 +618,9 @@ fn dirBytesOneLevel(io: std.Io, dir: *std.Io.Dir) u64 {
                 defer sub.close(io);
                 var sit = sub.iterate();
                 while (sit.next(io) catch null) |se| {
-                    if (se.kind != .file) continue;
+                    if (se.kind != .file and se.kind != .sym_link) continue;
                     const st = sub.statFile(io, se.name, .{}) catch continue;
+                    if (st.kind != .file) continue;
                     bytes += @intCast(st.size);
                 }
             },

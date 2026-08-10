@@ -108,6 +108,29 @@ final class PerSessionUIStateTests: XCTestCase {
         XCTAssertFalse(back.useMCP, "missing MCP key → off, not a decode failure")
     }
 
+    /// The brain disc's right-click effort pick belongs to the chat, like the
+    /// toggle itself. Absent (every session saved before it existed) and unknown
+    /// (a future build's level) both read as the default, never a decode failure.
+    func testReasoningEffortSurvivesRoundTripAndDefaultsLow() throws {
+        var s = ChatSession(title: "t")
+        s.reasoningEffort = .high
+        let back = try JSONDecoder().decode(ChatSession.self, from: JSONEncoder().encode(s))
+        XCTAssertEqual(back.reasoningEffort, .high, "effort pick is remembered per chat")
+
+        let legacy = """
+        {"id":"\(UUID().uuidString)","title":"old","messages":[],
+         "createdAt":0,"updatedAt":0,"mode":"chat","isExternalBridge":false}
+        """.data(using: .utf8)!
+        XCTAssertEqual(try JSONDecoder().decode(ChatSession.self, from: legacy).reasoningEffort, .low)
+
+        let unknown = """
+        {"id":"\(UUID().uuidString)","title":"old","messages":[],
+         "createdAt":0,"updatedAt":0,"mode":"chat","isExternalBridge":false,
+         "reasoningEffort":"xhigh"}
+        """.data(using: .utf8)!
+        XCTAssertEqual(try JSONDecoder().decode(ChatSession.self, from: unknown).reasoningEffort, .low)
+    }
+
     // MARK: - Which agent a tab is talking to
 
     func testAgentIdSurvivesACodableRoundTrip() throws {
@@ -132,4 +155,9 @@ final class PerSessionUIStateTests: XCTestCase {
     func testNewSessionsStartWithNoAgent() {
         XCTAssertNil(ChatSession().agentId, "the default is still \"None (app defaults)\"")
     }
+
+    // (The composer's create mode — a third instance of this class, with its
+    // progress/held-prompt state view-local — was removed outright: media
+    // chips navigate to the Create pane, and in-chat generation is the agent
+    // tools' job.)
 }

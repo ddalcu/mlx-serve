@@ -50,6 +50,17 @@ final class ComposerModeControlTests: XCTestCase {
         }
     }
 
+    /// The brain disc follows the same idiom: click toggles thinking,
+    /// secondary-click (and press-and-hold) opens the reasoning-effort picker.
+    func testThinkDiscTogglesOnClickAndOffersTheEffortMenuOnRightClick() throws {
+        let source = try chatViewSource()
+        let body = try declaration("thinkToggle", in: source)
+        XCTAssertTrue(body.contains("primaryAction:"),
+                      "the brain disc must toggle thinking on a plain click")
+        XCTAssertTrue(body.contains(".contextMenu {"),
+                      "secondary-click must offer the reasoning-effort picker")
+    }
+
     /// The menus carry the per-tool switches / workspace / marketplace ONLY.
     /// An on/off row there would be a second way to do what one click does,
     /// and two controls for one boolean is how they end up disagreeing.
@@ -234,15 +245,48 @@ final class ComposerModeControlTests: XCTestCase {
                       "model / workspace / voice all live outside the turn")
     }
 
-    func testTheAgentPickerSitsNextToNewChat() throws {
-        let source = try chatViewSource()
-        let sidebar = try XCTUnwrap(source.range(of: "struct ChatSidebar: View {"))
-        let rest = source[sidebar.upperBound...]
-        let body = String(rest[..<(rest.range(of: "\n// MARK:")?.lowerBound ?? rest.endIndex)])
-        XCTAssertTrue(body.contains("newAgentChatMenu"),
-                      "the sidebar owns the agent picker now")
-        XCTAssertTrue(body.contains("startChat(withAgent:"),
-                      "picking an agent starts a chat as that agent")
+    /// Starting a chat AS an agent must remain reachable, wherever the control
+    /// lives.
+    ///
+    /// It has moved three times — composer chip → the sidebar's Agents row →
+    /// beside New Chat → into the agent's own editor, once Agents became a pane
+    /// where everything about an agent lives together. Every move has been one
+    /// edit away from deleting the capability instead of relocating it: taking
+    /// the menu off the Agents row once left `startChat(withAgent:)` with no
+    /// caller anywhere in the UI, and the test passed, because it was pinned to
+    /// a control's coordinates. A session's agent is fixed once the session
+    /// exists (there is no `setAgent`), so this is the only moment it can be
+    /// decided — pin that it is reachable AT ALL, from anywhere.
+    func testStartingAChatAsAnAgentStaysReachable() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let views = try FileManager.default
+            .contentsOfDirectory(at: root.appendingPathComponent("Sources/MLXServe/Views"),
+                                 includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "swift" }
+        let callers = try views.filter {
+            try String(contentsOf: $0, encoding: .utf8).contains("startChat(withAgent:")
+        }
+        XCTAssertFalse(callers.isEmpty, """
+            Nothing in the UI calls startChat(withAgent:) any more. A session's \
+            agent can only be chosen when the session is created, so with no \
+            caller the capability is gone, not moved.
+            """)
+    }
+
+    /// Agents is a DESTINATION, not a menu: every other row in that column
+    /// means "go somewhere", and a row that instead starts a conversation was
+    /// the odd one out — with the editor buried at the bottom of its menu.
+    func testTheAgentsRowIsADestinationNotAMenu() throws {
+        let chat = try chatViewSource()
+        let start = try XCTUnwrap(chat.range(of: "private var agentsRow"))
+        let rest = chat[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    }")?.upperBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("appState.showAgents()"),
+                      "the Agents row opens the Agents pane")
+        XCTAssertFalse(body.contains("Menu {"),
+                       "the Agents row must not open a menu any more")
     }
 
     // MARK: - Content passing under floating chrome
@@ -267,20 +311,103 @@ final class ComposerModeControlTests: XCTestCase {
                                     "both the sidebar and the transcript scroll under floating chrome")
     }
 
-    /// Both columns carry the SYSTEM toolbar material, and the effect needs it:
-    /// with the band hidden there is no bar for `scrollEdgeEffectStyle` to
-    /// attach to, so it drew nothing and transcript text clipped mid-line under
-    /// the model picker (live 2026-07-30). The system material is the
-    /// 100%-width surface; the hand-drawn strip that predated it is the thing
-    /// that must not come back.
-    func testBothColumnsCarryTheSystemToolbarMaterial() throws {
-        let source = try chatViewSource()
-        XCTAssertFalse(source.contains(".toolbarBackground(.hidden, for: .windowToolbar)"), """
-            hiding the band leaves the scroll-edge effect with nothing to attach \
-            to — content then runs straight into the floating controls.
+    /// The toolbar carries no material — and its BAR still exists.
+    ///
+    /// Everything that lived in it moved somewhere it belongs: the model
+    /// picker, the mode discs and the server control to the COMPOSER row (they
+    /// configure the message, or report what you discover by typing), Settings
+    /// to a sidebar destination. What remained was an empty band, so the
+    /// material goes.
+    ///
+    /// The bar does NOT go with it. `.toolbar(.hidden, for: .windowToolbar)`
+    /// removes the bar itself, and the traffic lights and the sidebar-collapse
+    /// button are its residents — hiding it produced a window that could not be
+    /// closed, zoomed, or have its sidebar collapsed (live 2026-08-09). The
+    /// older trap it was chosen to avoid — `scrollEdgeEffectStyle` attached to
+    /// an invisible bar, transcript text clipping mid-line (2026-07-30) — was
+    /// about the floating CLUSTER, which no longer exists; the one surface that
+    /// still needs frosting owns a backdrop of its own instead.
+    func testTheToolbarKeepsItsBarAndLosesItsMaterial() throws {
+        let raw = try chatViewSource()
+        let source = raw
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+
+        XCTAssertFalse(source.contains(".toolbar(.hidden, for: .windowToolbar)"), """
+            Hiding the window toolbar takes the traffic lights and the \
+            sidebar-collapse button with it. Hide its MATERIAL instead.
             """)
-        let visible = source.components(separatedBy: ".toolbarBackground(.visible, for: .windowToolbar)").count - 1
-        XCTAssertEqual(visible, 2, "the sidebar and the detail column must agree — the bar is one surface")
+        let hidden = source.components(separatedBy: ".toolbarBackground(.hidden, for: .windowToolbar)").count - 1
+        XCTAssertEqual(hidden, 2, """
+            Both split views (the chat's two-column and the three-column Tasks / \
+            Agents) must drop the toolbar material — nothing lives in that band.
+            """)
+        XCTAssertFalse(source.contains(".toolbarBackground(.visible"),
+                       "no column should re-assert the material the window no longer needs")
+        XCTAssertFalse(source.contains("private var floatingToolbar"),
+                       "the floating cluster is gone; its controls live in the composer row")
+    }
+
+    /// The hidden material sits on the SPLITS themselves, never on one pane
+    /// inside them. Attached to ChatDetailView it covered only conversation
+    /// mode — switching to Models / Settings / Create brought the default
+    /// toolbar material back and the window chrome flipped per mode, which is
+    /// exactly the "no material now, in every mode" contract broken.
+    func testBothSplitViewsCarryTheHiddenMaterialThemselves() throws {
+        let source = try chatViewSource()
+        func body(of marker: String, until end: String) throws -> String {
+            let afterStart = try XCTUnwrap(source.range(of: marker),
+                                           "marker \(marker) not found").upperBound
+            let tail = source[afterStart...]
+            let stop = try XCTUnwrap(tail.range(of: end),
+                                     "end marker \(end) not found").lowerBound
+            return String(tail[..<stop])
+        }
+        let modifier = ".toolbarBackground(.hidden, for: .windowToolbar)"
+        let three = try body(of: "private var threeColumnSplitView",
+                             until: "private var standardSplitView")
+        XCTAssertTrue(three.contains(modifier),
+                      "the three-column split (Tasks/Agents) must drop the material itself")
+        let standard = try body(of: "private var standardSplitView",
+                                until: "private func createPane")
+        XCTAssertTrue(standard.contains(modifier), """
+            the standard split must drop the material itself — on ChatDetailView \
+            it covers only conversation mode, and Models/Settings/Create regain \
+            the default toolbar band.
+            """)
+    }
+
+    /// The sidebar's pinned destinations rely on the PLATFORM to frost what
+    /// scrolls beneath them — `scrollEdgeEffectStyle`, which needs the
+    /// toolbar's bar to attach to.
+    ///
+    /// They carried a hand-drawn `.regularMaterial` backdrop for exactly as
+    /// long as the bar was hidden outright. With the bar back the backdrop
+    /// goes: a band drawn by hand over a sidebar is the same class as the strip
+    /// that once looked native and swallowed every click in it.
+    func testThePinnedDestinationsRelyOnTheScrollEdgeEffect() throws {
+        let source = try chatViewSource()
+        guard let start = source.range(of: "safeAreaInset(edge: .top)"),
+              let end = source.range(of: "private func sectionHeader",
+                                     range: start.upperBound..<source.endIndex) else {
+            return XCTFail("the sidebar's destination inset moved — update this audit")
+        }
+        let inset = String(source[start.upperBound..<end.lowerBound])
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
+        XCTAssertFalse(inset.contains(".background(.regularMaterial)"), """
+            The destinations block draws its own band again. The toolbar's bar \
+            is back, so the platform's scroll-edge effect has something to \
+            attach to — a hand-drawn strip over a sidebar is the class that \
+            once looked native and ate every click in it.
+            """)
+        XCTAssertFalse(inset.contains(".background(.bar)"),
+                       "`.bar` also draws a separator — the rule removed from the Tasks header")
+        // The effect itself must still be asked for.
+        XCTAssertTrue(source.contains(".scrollEdgeEffectStyle("),
+                      "the sidebar list still needs the native edge effect")
     }
 
     // MARK: - Hover card dismissal

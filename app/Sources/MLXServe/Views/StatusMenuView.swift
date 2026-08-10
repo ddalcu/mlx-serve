@@ -181,175 +181,99 @@ struct StatusMenuView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Text("MLX Core")
-                    .font(.headline)
-                Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                StatusDot(status: server.status)
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 14)
-            .padding(.bottom, 10)
+            header
 
-            Divider().padding(.horizontal, 12)
-
-            // "Update available" banner — hidden until the daily GitHub
-            // releases check finds a newer version. Self-observing subview so
-            // updater phase changes re-render only this row.
+            // "Update available" card — hidden until the daily GitHub releases
+            // check finds a newer version. A self-observing subview so updater
+            // phase changes re-render only this row, which is also why it sits
+            // OUTSIDE the spaced stack below: a subview that renders nothing
+            // still claims a slot, and the section gap would double when there
+            // is no update (i.e. almost always). It carries its own bottom gap.
             UpdateTrayRow(updates: appState.updates)
+                .padding(.horizontal, TrayMetrics.gutter)
 
-            // Server Control
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Server")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(server.status.label)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            // Sections are separated by whitespace and grouped into cards —
+            // the panel used to carry a full-width Divider between every one of
+            // them, which flattened the hierarchy into a stack of equals.
+            VStack(alignment: .leading, spacing: TrayMetrics.sectionSpacing) {
+                serverSection
+
+                if case .running = server.status {
+                    residencySection
                 }
 
-                // Hide drafter checkpoints (they pair with a base model via
-                // the Drafter toggle in Settings) and media / non-chat models
-                // (LTX, bert encoders) — not loadable as the server's primary
-                // chat model. The empty-state check below must use THIS
-                // filtered set, not the raw `localModels` — a Mac with only
-                // media/drafter downloads has a non-empty `localModels` but
-                // nothing the picker can actually offer, which used to render
-                // a broken empty dropdown instead of this message.
-                let pickableModels = appState.localModels.filter { $0.isChatPickable }
+                mediaSection
 
-                // Model picker (or the no-models message) + Settings shortcut
-                // on the same row so the gear lives where the user picks what
-                // to load. The gear renders in BOTH states — with no models
-                // downloaded it is the tray's only route to Settings.
-                HStack(spacing: 6) {
-                    if trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("No models yet")
-                                .font(.caption.weight(.medium))
-                            Text("Download a model below to start chatting.")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                    } else {
-                        Picker("Model", selection: trayModelSelection) {
-                            let pickable = pickableModels
-                            // macOS .menu Pickers key the checkmark by item
-                            // TITLE — two same-named rows (one GGUF, one MLX)
-                            // both rendered selected. Suffix duplicated names
-                            // with the engine tag so titles stay unique.
-                            let dupNames = LocalModel.duplicateNames(in: pickable)
-                            let mlxServe = pickable.filter { $0.source == .mlxServe }
-                            let lmStudio = pickable.filter { $0.source == .lmStudio }
-                            let huggingFace = pickable.filter { $0.source == .huggingFace }
-                            let custom = pickable.filter { $0.source == .custom }
-                            if !mlxServe.isEmpty {
-                                Section("MLX-Serve Models") {
-                                    ForEach(mlxServe) { model in
-                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
-                                    }
-                                }
-                            }
-                            if !lmStudio.isEmpty {
-                                Section("Other Discovered Models") {
-                                    ForEach(lmStudio) { model in
-                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
-                                    }
-                                }
-                            }
-                            if !huggingFace.isEmpty {
-                                Section("Hugging Face Cache") {
-                                    ForEach(huggingFace) { model in
-                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
-                                    }
-                                }
-                            }
-                            if !custom.isEmpty {
-                                Section("Custom Folder") {
-                                    ForEach(custom) { model in
-                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
-                                    }
-                                }
-                            }
-                            // Chat models other Macs share on this network
-                            // (server running with LAN discovery on). Tags are
-                            // "lan:"-prefixed so they can't collide with paths.
-                            let lanChat = server.lanModels(capability: "chat")
-                            if !lanChat.isEmpty {
-                                Section("On Your Network") {
-                                    ForEach(lanChat, id: \.name) { m in
-                                        Text(m.lanDisplayName).tag("lan:" + m.name)
-                                    }
-                                }
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
+                utilitiesSection
 
-                    Button { openSettings() } label: {
-                        Image(systemName: "gear")
-                    }
-                    .buttonStyle(.bordered)
-                    .help("Settings")
-                }
+                featuresSection
+            }
+            .padding(.horizontal, TrayMetrics.gutter)
+            .padding(.bottom, 12)
 
-                if !trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
-                    HStack(spacing: 6) {
-                        let control = ServerControlButtonPresentation(status: server.status)
-                        Button {
-                            server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
-                        } label: {
-                            HStack(spacing: 8) {
-                                if control.showsProgress {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                } else if let systemImageName = control.systemImageName {
-                                    Image(systemName: systemImageName)
-                                }
-                                Text(control.title)
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(control.tint.color)
-                        .disabled(appState.selectedModelPath.isEmpty)
-                        .controlSize(.regular)
-                        .help(control.help)
+            footer
+        }
+        .frame(width: TrayMetrics.width)
+        // Drive ServerManager's /props live-polling from the popover's
+        // visibility: poll on open, idle on close. SwiftUI's MenuBarExtra
+        // (.window style) fires onAppear when the popover shows and
+        // onDisappear when it dismisses — perfect hook for "user is or isn't
+        // looking at the GPU-memory bar".
+        .onAppear { server.setMenuVisible(true) }
+        .onDisappear { server.setMenuVisible(false) }
+    }
 
-                        Button {
-                            openServerLog()
-                        } label: {
-                            Image(systemName: "macwindow.on.rectangle")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
-                        .help("Open Server Log in a separate window (easier copy/paste)")
-                    }
+    // MARK: - Header
 
-                    HStack {
-                        Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                        Spacer()
-                        // Which embedded engine the selected model routes to
-                        // (MLX safetensors, llama.cpp GGUF, or ds4 GGUF).
-                        if let engine = appState.localModels
-                            .first(where: { $0.path == appState.selectedModelPath })?.engine
-                        {
-                            Text(engine.displayName)
-                                .help("Engine the selected model runs on")
-                        }
-                    }
-                    .font(.caption)
+    /// App name + version, the single status chip, and Settings.
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text("MLX Core")
+                .font(.headline)
+            Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 6)
+            TrayStatusChip(status: server.status)
+            Button { openSettings() } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+        }
+        .padding(.horizontal, TrayMetrics.gutter)
+        .padding(.top, 12)
+        .padding(.bottom, 12)
+    }
+
+    // MARK: - Server
+
+    private var hasNoUsableModels: Bool {
+        trayHasNoUsableModels(appState.localModels,
+                              lanChatModelCount: server.lanModels(capability: "chat").count)
+    }
+
+    private var serverSection: some View {
+        VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
+            TraySectionHeader(title: "Server")
+            TrayCard {
+                if hasNoUsableModels {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("No models yet")
+                            .font(.subheadline.weight(.medium))
+                        Text("Download a model below to start chatting.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    modelPicker
+                    serverControls
+                    serverFooterRow
 
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
@@ -361,219 +285,284 @@ struct StatusMenuView: View {
                     }
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+        }
+    }
 
-            // Model Info & Memory (when running)
-            if case .running = server.status {
-                Divider().padding(.horizontal, 12)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    // Model slots — one row per RESIDENT registry entry (chat,
-                    // image/video/audio gen, embeddings), each with an eject
-                    // button that frees its memory. Unloaded stubs are hidden.
-                    let loadedModels = server.allModels.filter(\.loaded)
-                    HStack {
-                        Text(loadedModels.count > 1 ? "Models" : "Model")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    if loadedModels.isEmpty {
-                        Text("None loaded — models load on demand")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                    ForEach(loadedModels, id: \.name) { info in
-                        modelSlotRow(info)
-                    }
-
-                    if let mem = server.memoryInfo {
-                        // Both bars share total physical RAM as the denominator,
-                        // so they're directly comparable and never stuck (the old
-                        // GPU bar used peak×2 → pinned at 50% once active≈peak).
-                        let totalRAM = Int64(ProcessInfo.processInfo.physicalMemory)
-
-                        HStack {
-                            Text("GPU Memory")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(mem.gpuMemoryLabel)
-                                .font(.caption.monospaced())
-                        }
-                        ProgressView(value: mem.gpuFraction(ofTotal: totalRAM))
-                            .tint(.blue)
-
-                        // Available RAM — same calc the model-load pre-flight
-                        // uses (total − wired − compressor), so this can't drift
-                        // from what gates a load. It's reclaimable-available
-                        // (includes evictable file cache), not unused memory.
-                        // Hidden when 0 (older server build that omits the field).
-                        if mem.availableBytes > 0 {
-                            HStack {
-                                Text("Available RAM")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(mem.availableFormatted)
-                                    .font(.caption.monospaced())
-                            }
-                            ProgressView(value: mem.availableFraction(ofTotal: totalRAM))
-                                .tint(.green)
-                        }
-
-                        if totalRAM > 0 {
-                            Text("\(MemoryInfo.format(totalRAM)) total")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
+    /// Hide drafter checkpoints (they pair with a base model via the Drafter
+    /// toggle in Settings) and media / non-chat models (LTX, bert encoders) —
+    /// not loadable as the server's primary chat model. The empty-state check
+    /// must use THIS filtered set, not the raw `localModels` — a Mac with only
+    /// media/drafter downloads has a non-empty `localModels` but nothing the
+    /// picker can actually offer, which used to render a broken empty dropdown
+    /// instead of the "No models yet" message.
+    private var modelPicker: some View {
+        let pickable = appState.localModels.filter { $0.isChatPickable }
+        return Picker("Model", selection: trayModelSelection) {
+            // macOS .menu Pickers key the checkmark by item TITLE — two
+            // same-named rows (one GGUF, one MLX) both rendered selected.
+            // Suffix duplicated names with the engine tag so titles stay unique.
+            let dupNames = LocalModel.duplicateNames(in: pickable)
+            let mlxServe = pickable.filter { $0.source == .mlxServe }
+            let lmStudio = pickable.filter { $0.source == .lmStudio }
+            let huggingFace = pickable.filter { $0.source == .huggingFace }
+            let custom = pickable.filter { $0.source == .custom }
+            if !mlxServe.isEmpty {
+                Section("MLX-Serve Models") {
+                    ForEach(mlxServe) { model in
+                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+            }
+            if !lmStudio.isEmpty {
+                Section("Other Discovered Models") {
+                    ForEach(lmStudio) { model in
+                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                }
+            }
+            if !huggingFace.isEmpty {
+                Section("Hugging Face Cache") {
+                    ForEach(huggingFace) { model in
+                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                }
+            }
+            if !custom.isEmpty {
+                Section("Custom Folder") {
+                    ForEach(custom) { model in
+                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                }
+            }
+            // Chat models other Macs share on this network (server running with
+            // LAN discovery on). Tags are "lan:"-prefixed so they can't collide
+            // with paths.
+            let lanChat = server.lanModels(capability: "chat")
+            if !lanChat.isEmpty {
+                Section("On Your Network") {
+                    ForEach(lanChat, id: \.name) { m in
+                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                    }
+                }
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+    }
 
-                // Endpoints. The Metrics button rides the header row (the
-                // Browse-on-Download-Models pattern) — shown only when the
+    /// The one state-driven action, plus the log window.
+    private var serverControls: some View {
+        let control = ServerControlButtonPresentation(status: server.status)
+        return HStack(spacing: 6) {
+            serverPrimaryButton(control)
+
+            Button {
+                openServerLog()
+            } label: {
+                Image(systemName: "macwindow.on.rectangle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .help("Open Server Log in a separate window (easier copy/paste)")
+        }
+    }
+
+    @ViewBuilder
+    private func serverPrimaryButton(_ control: ServerControlButtonPresentation) -> some View {
+        let button = Button {
+            server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
+        } label: {
+            HStack(spacing: 8) {
+                if control.showsProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if let systemImageName = control.systemImageName {
+                    Image(systemName: systemImageName)
+                }
+                Text(control.title)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .tint(control.tint.color)
+        .disabled(appState.selectedModelPath.isEmpty)
+        .controlSize(.regular)
+        .help(control.help)
+
+        if control.isProminent {
+            button.buttonStyle(.borderedProminent)
+        } else {
+            button.buttonStyle(.bordered)
+        }
+    }
+
+    private var serverFooterRow: some View {
+        HStack {
+            Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+            Spacer()
+            // Which embedded engine the selected model routes to (MLX
+            // safetensors, llama.cpp GGUF, or ds4 GGUF).
+            if let engine = appState.localModels
+                .first(where: { $0.path == appState.selectedModelPath })?.engine
+            {
+                Text(engine.displayName)
+                    .help("Engine the selected model runs on")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    // MARK: - What's resident, and what it costs
+
+    /// Resident model slots and the memory meter in ONE card: "what is loaded"
+    /// and "what that leaves you" are the same question, and the old layout put
+    /// a section header between them.
+    private var residencySection: some View {
+        // Model slots — one row per RESIDENT registry entry (chat,
+        // image/video/audio gen, embeddings), each with an eject button that
+        // frees its memory. Unloaded stubs are hidden.
+        let loadedModels = server.allModels.filter(\.loaded)
+        return VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
+            TraySectionHeader(title: "In Memory",
+                              detail: loadedModels.count > 1 ? "\(loadedModels.count) models" : nil)
+            TrayCard {
+                if loadedModels.isEmpty {
+                    Text("None loaded — models load on demand")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(loadedModels, id: \.name) { info in
+                    modelSlotRow(info)
+                }
+
+                if let mem = server.memoryInfo {
+                    if !loadedModels.isEmpty {
+                        TrayRowSeparator()
+                    }
+                    // Shared meter — the same GPU + Available RAM bars the
+                    // Recommended pane and welcome screen show. Both bars share
+                    // total physical RAM as the denominator.
+                    MemoryMeter(
+                        gpuBytes: mem.activeBytes,
+                        gpuLabel: mem.gpuMemoryLabel,
+                        availableBytes: mem.availableBytes,
+                        totalBytes: Int64(ProcessInfo.processInfo.physicalMemory)
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Media generation
+
+    /// Native media-generation tools. Tiles rather than a row of bordered pills:
+    /// four labelled pills at this width needed `minimumScaleFactor(0.7)` to
+    /// fit, which is a layout admitting it has overflowed.
+    private var mediaSection: some View {
+        VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
+            TraySectionHeader(title: "Media Generation")
+            HStack(spacing: 6) {
+                ForEach(GenExperiment.allCases) { exp in
+                    TrayTile(icon: exp.icon, title: exp.title, help: exp.help) { open(exp) }
+                }
+            }
+        }
+    }
+
+    // MARK: - Utilities (endpoints + downloads)
+
+    /// Two disclosure rows that share one card. Both are "open this when you
+    /// need it" surfaces, and both keep their sibling action button on the
+    /// header row — reaching the Model Browser must not require first expanding
+    /// a curated download list you may not care about. The button is a sibling
+    /// of the disclosure, never nested in its label, so the two targets stay
+    /// distinct.
+    private var utilitiesSection: some View {
+        TrayCard {
+            if case .running = server.status {
+                // The Metrics button rides the header row — shown only when the
                 // server was launched with --metrics (opt-in; see
-                // ServerOptions.enableMetrics). The panel is hosted on the
-                // index page, so it opens root `/`.
-                Divider().padding(.horizontal, 12)
+                // ServerOptions.enableMetrics). The panel is hosted on the index
+                // page, so it opens root `/`.
                 EndpointsSection(
                     baseURL: server.baseURL,
                     showsMetricsButton: appState.serverOptions.enableMetrics
                 )
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+                TrayRowSeparator()
             }
 
-            Divider().padding(.horizontal, 12)
-
-            // Downloads. "Browse" sits on the header row, NOT inside the
-            // disclosure: reaching the Model Browser shouldn't require first
-            // expanding a curated quick-download list you may not care about.
-            // It's a sibling of the disclosure button, not nested in its label,
-            // so the two tap targets stay distinct.
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showDownloads.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.right")
-                                .font(.caption2)
-                                .rotationEffect(.degrees(showDownloads ? 90 : 0))
-                            Text("Download Models")
-                                .font(.subheadline.weight(.medium))
-                            Spacer(minLength: 0)
-                        }
-                        .foregroundStyle(.secondary)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        openModelBrowser()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "magnifyingglass")
-                            Text("Browse")
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Open the Model Browser")
-                }
-
-                if showDownloads {
-                    ModelDownloadView()
-                        .environmentObject(downloads)
-                        .environmentObject(appState)
+            TrayDisclosureHeader(title: "Download Models", isExpanded: $showDownloads) {
+                TrayAccessoryButton(title: "Browse", icon: "magnifyingglass",
+                                    help: "Open the Model Browser") {
+                    openModelBrowser()
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-
-            Divider().padding(.horizontal, 12)
-
-            // Experiments — native media-generation tools (image / audio /
-            // video). Shown inline now that they're built in (no Python, no
-            // accordion); the tiles open their windows directly.
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 4) {
-                    Text("Media Generation")
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
-                }
-                .foregroundStyle(.secondary)
-
-                HStack(spacing: 6) {
-                    ForEach(GenExperiment.allCases) { exp in
-                        genFeatureButton(
-                            icon: exp.icon,
-                            title: exp.title,
-                            help: exp.help,
-                            action: { open(exp) })
-                    }
-                }
-                .padding(.top, 4)
+            if showDownloads {
+                ModelDownloadView()
+                    .environmentObject(downloads)
+                    .environmentObject(appState)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+        }
+    }
 
-            Divider().padding(.horizontal, 12)
+    // MARK: - Always-on features
 
-            // Persistent, window-independent voice assistant — its own row, not
-            // a button. Toggle it on and talk hands-free with no chat window.
+    /// Voice, the Quick Launcher and the Agent Sandbox are the same kind of
+    /// thing — a capability you switch on or step into — so they share one card
+    /// and one row shape (`TrayFeatureRow`). They used to be three sections with
+    /// three different layouts separated by dividers.
+    private var featuresSection: some View {
+        TrayCard {
+            // Persistent, window-independent voice assistant. Toggle it on and
+            // talk hands-free with no chat window.
             VoiceTrayPanel(voice: appState.voice, openAgents: openAgents)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
 
-            Divider().padding(.horizontal, 12)
+            TrayRowSeparator()
 
-            // Quick launcher — Spotlight-style ⌃Space prompt panel, summonable
-            // from any app while MLX Core runs in the tray.
+            // Spotlight-style ⌃Space prompt panel, summonable from any app
+            // while MLX Core runs in the tray.
             QuickLauncherTrayRow()
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-
-            Divider().padding(.horizontal, 12)
 
             // Agent-sandbox badge — visible only while the sandbox is enabled.
-            // Green box = a guest is live; click to open the Sandbox Terminal and
-            // run commands / watch the agent in the isolated Linux VM.
+            // Green box = a guest is live; click to open the Sandbox Terminal
+            // and run commands / watch the agent in the isolated Linux VM.
             if sandbox.isEnabled {
+                TrayRowSeparator()
                 Button {
                     openSandboxTerminal()
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "shippingbox.fill")
-                            .foregroundStyle(sandbox.guestRunning ? Color.green : Color.orange)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Agent Sandbox is on").font(.callout.weight(.medium))
-                            // guestMemoryText is quantized + published only on
-                            // change, so this row doesn't re-render per second.
-                            Text(sandbox.guestRunning
-                                 ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "")
-                                 : "Idle — boots on the first command")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Image(systemName: "terminal").foregroundStyle(.secondary)
+                    TrayFeatureRow(
+                        icon: "shippingbox.fill",
+                        title: "Agent Sandbox",
+                        // guestMemoryText is quantized + published only on
+                        // change, so this row doesn't re-render per second.
+                        subtitle: sandbox.guestRunning
+                            ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "")
+                            : "Idle — boots on the first command",
+                        isOn: true,
+                        tint: sandbox.guestRunning ? .green : .orange
+                    ) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
                     }
-                    .frame(maxWidth: .infinity)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 16).padding(.vertical, 8)
                 .help("Open the Sandbox Terminal")
-
-                Divider().padding(.horizontal, 12)
             }
+        }
+    }
 
-            // Chat, Tasks, Claude Code & Quit
+    // MARK: - Footer
+
+    /// Chat, Tasks, Claude Code & Quit — the panel's exits, on their own bar so
+    /// they read as chrome rather than as one more section.
+    private var footer: some View {
+        VStack(spacing: 0) {
+            Divider()
             HStack(spacing: 8) {
                 Button {
                     openChat()
@@ -636,27 +625,15 @@ struct StatusMenuView: View {
                     Image(systemName: "power")
                 }
                 .buttonStyle(.bordered)
+                .help("Quit MLX Core")
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 6)
-            .padding(.bottom, 14)
+            .padding(.horizontal, TrayMetrics.gutter)
+            .padding(.vertical, 10)
         }
-        .frame(width: 320)
-        // Drive ServerManager's /props live-polling from the popover's
-        // visibility: poll on open, idle on close. SwiftUI's MenuBarExtra
-        // (.window style) fires onAppear when the popover shows and
-        // onDisappear when it dismisses — perfect hook for "user is or isn't
-        // looking at the GPU-memory bar".
-        .onAppear { server.setMenuVisible(true) }
-        .onDisappear { server.setMenuVisible(false) }
+        .background(Color.primary.opacity(0.03))
     }
 
-    /// One button in the secondary "optional Python features" row. Three of
-    /// these share a 320pt-wide popover, so the label is compact: caption font
-    /// (which also shrinks the SF Symbol), tight spacing, small control size,
-    /// and `minimumScaleFactor` as a safety net so a long title scales down
-    /// instead of truncating to "AudioG…".
-    /// Route an experiment tile to its window opener.
+    /// Route a media tile to its window opener.
     private func open(_ exp: GenExperiment) {
         switch exp {
         case .image: openImageGen()
@@ -664,24 +641,6 @@ struct StatusMenuView: View {
         case .audio: openAudioGen()
         case .model3d: openModel3DGen()
         }
-    }
-
-    private func genFeatureButton(
-        icon: String, title: String, help: String, action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: icon)
-                Text(title)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-            }
-            .font(.caption)
-            .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .help(help)
     }
 
     /// The one tray picker drives BOTH selections: a local model path (the
@@ -829,13 +788,16 @@ struct UpdateTrayRow: View {
 
     var body: some View {
         if let update = updates.available {
+            // A tinted card, not a banner with its own divider: it's the one
+            // thing in the panel that wants to be noticed, and tint is how the
+            // rest of the design says "look here".
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
                     Image(systemName: "sparkles")
                         .foregroundStyle(.blue)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("MLX Core v\(update.version) is available")
-                            .font(.callout.weight(.medium))
+                            .font(.subheadline.weight(.medium))
                         if case .failed(let message) = updates.phase {
                             Text(message)
                                 .font(.caption2)
@@ -871,10 +833,20 @@ struct UpdateTrayRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-
-            Divider().padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(TrayMetrics.cardPadding)
+            .background(
+                RoundedRectangle(cornerRadius: TrayMetrics.cardRadius, style: .continuous)
+                    .fill(Color.blue.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TrayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(Color.blue.opacity(0.25), lineWidth: 1)
+            )
+            // The gap to the next section belongs to the card, not to the stack
+            // above — with no update this view renders nothing and costs
+            // nothing. See the call site.
+            .padding(.bottom, TrayMetrics.sectionSpacing)
         }
     }
 }
@@ -899,6 +871,11 @@ struct ServerControlButtonPresentation: Equatable {
     let showsProgress: Bool
     let tint: Tint
     let help: String
+    /// Whether this state earns the panel's ONE filled control. Starting the
+    /// server is the thing to do next when it's down; with it up, the next
+    /// thing is Chat — so "Stop Server" keeps its red as a tinted bezel rather
+    /// than a full-width slab that dominates the state the app lives in.
+    let isProminent: Bool
 
     init(status: ServerStatus) {
         switch status {
@@ -908,18 +885,21 @@ struct ServerControlButtonPresentation: Equatable {
             showsProgress = true
             tint = .loading
             help = "Loading model. Click to stop."
+            isProminent = true
         case .running:
             title = "Stop Server"
             systemImageName = "stop.fill"
             showsProgress = false
             tint = .red
             help = "Stop the running server."
+            isProminent = false
         case .stopped, .error:
             title = "Start Server"
             systemImageName = "play.fill"
             showsProgress = false
             tint = .accent
             help = "Start the selected model."
+            isProminent = true
         }
     }
 }
@@ -990,39 +970,14 @@ struct EndpointsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isExpanded.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        Text("Endpoints")
-                            .font(.subheadline.weight(.medium))
-                        Spacer(minLength: 0)
-                    }
-                    .foregroundStyle(.secondary)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
+            TrayDisclosureHeader(title: "Endpoints", isExpanded: $isExpanded) {
                 if showsMetricsButton {
-                    Button {
+                    TrayAccessoryButton(title: "Metrics", icon: "chart.bar.xaxis",
+                                        help: "Open the live metrics panel in your browser") {
                         if let root = Self.rootURL(baseURL) {
                             NSWorkspace.shared.open(root)
                         }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chart.bar.xaxis")
-                            Text("Metrics")
-                        }
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Open the live metrics panel in your browser")
                 }
             }
 
@@ -1143,16 +1098,6 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
 }
 
 /// Full-window terminal-style view of the live server stderr buffer.
-///
-/// Crucially, the view *pulls* — it owns a `LogPoller` that ticks at 2 Hz
-/// while the window is open and reads `server.currentServerLogSnapshot()`.
-/// `ServerManager` itself does NOT publish the log (see the `logBuffer`
-/// comment there). Result: stderr volume can't slow ChatView's SSE token
-/// loop — those views never re-render due to log activity, regardless of
-/// whether this window is open.
-///
-/// Auto-scroll defaults on; the toggle pins to the user's last interaction
-/// so selecting a region above doesn't get yanked away by new output.
 struct ServerLogWindowView: View {
     @EnvironmentObject var server: ServerManager
     @State private var autoScroll = true
@@ -1162,9 +1107,6 @@ struct ServerLogWindowView: View {
     init() {
         // Closure captures nothing at init — it'll be rebound to `server`
         // on first appear via the environment-object lookup pattern below.
-        // We can't reach `@EnvironmentObject` in init(), so the poller
-        // starts with a placeholder snapshot that returns "" until
-        // `.onAppear` rebinds it through `start(server:)`.
         _poller = StateObject(wrappedValue: LogPoller(interval: 0.5) { "" })
     }
 
@@ -1306,15 +1248,6 @@ struct ServerLogWindowView: View {
 /// AppKit-backed terminal-style log view. Wraps `NSTextView` in an
 /// `NSScrollView` and exposes a SwiftUI-friendly `text` + `autoScroll`
 /// surface.
-///
-/// Why not SwiftUI `Text` in a `ScrollView`? Because SwiftUI `Text`
-/// re-lays-out its entire string on every `@Published` change. At 10 Hz
-/// with a 64 KB monospace block that's enough main-thread work to starve
-/// ChatView's SSE loop when this window is open. `NSTextView` does
-/// incremental `textStorage.append` for the common case (new bytes at the
-/// end of an existing prefix) — a few ms regardless of buffer size — and
-/// only falls back to a full replacement when the in-memory buffer is
-/// trimmed from the head (i.e. the 64 KB cap kicks in).
 struct TerminalLogTextView: NSViewRepresentable {
     let text: String
     let autoScroll: Bool

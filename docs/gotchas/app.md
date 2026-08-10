@@ -320,3 +320,34 @@ and no expectation in between. A `.main`-queued version of the fix fails it.
 server with a model resident: it logs "Shutting down gracefully..." and exits.
 The tray button keeps its explicit `stop()`; it is idempotent, and belt-and-
 braces on the one path users already know works is cheap.
+
+## The truncation banner rode history as assistant prose (2026-08-11)
+
+The live capture behind the muse loop investigation had a second, app-side
+half: `TruncationNotice.text(...)` was APPENDED into `message.content` via
+`updateLastMessage(content:)`, and content is exactly what `plainHistoryDict`
+and `buildAgentHistory` send back. So after one repetition cut, every later
+request carried "⚠️ *Stopped — the model started repeating itself and the
+server cut the reply…*" as something the assistant SAID — the model reads a
+warning about looping, verbatim, every turn, in a chat already primed to
+repeat. Same class as the error-echo rule: our own UI text became the error.
+
+Fix: the notice is a FIELD (`ChatMessage.truncationNotice`, a
+`TruncationNotice.Notice` carrying cause + cap), set by the plain-chat path,
+both agent-loop exits and TestServer, and drawn by `MessageBubble` as a
+footnote under the reply — content never carries it, so history builders
+can't resend it by construction. Sessions saved BEFORE the change still hold
+the banner inside content (the capture does), so both builders scrub it at
+build time with `TruncationNotice.stripped(from:)`; the strip markers derive
+from the legacy `text(...)` string itself, so the two cannot drift apart.
+Decode is tolerant both directions: absent on every old message, and an
+unknown future cause nils the notice instead of failing the whole message.
+
+Relation to PR #147: its diagnosis (doubled banner) was a SERVER wire-shape
+bug — the include_usage chunk restated the ending (docs/gotchas/server-http.md)
+— and its `APIClient.TruncationGate` remains worthwhile hardening for
+third-party backends. Its ChatTurnEngine append-after-stream hunk is
+superseded by the field.
+
+Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
+history builders carry neither field nor legacy text, tolerant decode).

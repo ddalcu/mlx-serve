@@ -143,14 +143,16 @@ echo ""
 echo -e "${YELLOW}Test: Chat completions (non-streaming)${NC}"
 RESP=$(curl -s "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":10,"temperature":0}')
+    -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":300,"temperature":0}')
 assert_contains "response has choices" '"choices"' "$RESP"
 assert_contains "response has usage" '"usage"' "$RESP"
 assert_contains "response has model" '"model"' "$RESP"
 assert_contains "response has finish_reason" '"finish_reason"' "$RESP"
 assert_json_field "has prompt_tokens" '["usage"]["prompt_tokens"]' "$RESP"
 assert_json_field "has completion_tokens" '["usage"]["completion_tokens"]' "$RESP"
-# Content should contain "4"
+# Content should contain "4". The budget is 300, not 10: a thinking-by-default
+# checkpoint (LFM2.5 opens <think> from the template) spends the first tokens
+# reasoning, and a 10-token cut returned its reasoning as the answer.
 CONTENT=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
 assert_contains "answer contains 4" "4" "$CONTENT"
 echo ""

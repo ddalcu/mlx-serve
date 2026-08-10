@@ -23,4 +23,25 @@ final class AppStateUseModelTests: XCTestCase {
         XCTAssertEqual(AppState.useModelStartAction(forStatusBefore: .running), .awaitPendingSwitch)
         XCTAssertEqual(AppState.useModelStartAction(forStatusBefore: .starting), .awaitPendingSwitch)
     }
+
+    /// The `didSet`'s own decision: a RUNNING server is hot-switched in place —
+    /// no restart. The id it loads must be the model's ABSOLUTE PATH: registry
+    /// ids are two-level `org/name`, so a dir basename 404s (register-by-path
+    /// resolves either shape). The old `hotSwitchEnabled` gate is gone — it
+    /// shipped default-off with no UI, so every picker change restarted the
+    /// server for everyone, forever.
+    func testRunningHotSwitchesInPlaceWithTheAbsolutePath() {
+        let path = "/Users/me/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
+        XCTAssertEqual(AppState.modelSwitchAction(forStatus: .running, path: path),
+                       .hotSwitch(id: path))
+    }
+
+    /// Mid-boot the process is still loading the OLD pick — restart with the
+    /// new one. Stopped/error stays untouched: explicit starts
+    /// (`useModelAndAwaitReady`, the launch gate) own that.
+    func testStartingRestartsAndStoppedIsLeftAlone() {
+        XCTAssertEqual(AppState.modelSwitchAction(forStatus: .starting, path: "/x"), .restart)
+        XCTAssertEqual(AppState.modelSwitchAction(forStatus: .stopped, path: "/x"), .leaveStopped)
+        XCTAssertEqual(AppState.modelSwitchAction(forStatus: .error("boom"), path: "/x"), .leaveStopped)
+    }
 }

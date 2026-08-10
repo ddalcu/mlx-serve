@@ -27,9 +27,11 @@ enum AgentAdvancedSummary {
 
         if isSet(agent.modelPath) { parts.append("Model") }
         if isSet(agent.workingDirectory) { parts.append("Workspace") }
-        // One concept in the UI — naming both knobs lengthens the line without
+        // One concept in the UI — naming each knob lengthens the line without
         // adding information.
-        if agent.temperature != nil || agent.maxTokens != nil { parts.append("Sampling") }
+        let sampling: [Any?] = [agent.temperature, agent.maxTokens, agent.topP, agent.topK,
+                                agent.repeatPenalty, agent.presencePenalty, agent.reasoningBudget]
+        if sampling.contains(where: { $0 != nil }) { parts.append("Sampling") }
 
         guard !parts.isEmpty else { return nil }
         // Sentence-style: first item capitalized as written, the rest lowered,

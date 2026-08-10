@@ -32,6 +32,19 @@ Python defaults to `(0.0, inf)` (no dt clipping). `time_step_min`/`time_step_max
 
 Two paths share a verify invariant: `cache.step = prompt_len + tokens_emitted`, t1 NOT in cache on entry, no pending state. Verify input is `[t1, draft[0..m-1]]` length `1+m`; full accept samples `new_t1` from `verify_logits[m]` (bonus prediction); partial accept rolls back via `KVCache.snapshot/restore` + `ssmSnapshot/Restore` and re-forwards `[t1, draft[0..accepted-1]]`. `accepted=0` still re-forwards `[t1]`. Pending correction sampled from *original* `verify_logits[accepted]` (NOT re-forward); index is `accepted` not `accepted-1` — off-by-one silently corrupts output, guarded by `tests/test_pld_equivalence.sh`.
 
+### A speculative token cap belongs before state commit, not in the output loop (2026-08-12)
+
+A review of the DFlash `max_tokens` fix exposed a class bug in every other block-returning decoder. Near a 17-token cap, PLD could return a five-token block after the Generator had already appended the whole block and advanced usage to 20. The scheduler then copied `gen.completion_tokens` while publishing the block's *first* token, immediately saw `>= max_tokens`, and stopped. The client received one token from that return while usage and internal state claimed five. DSpark, MTP, the Gemma drafter, and PLD all had that accounting shape; fixing only DFlash hid four copies of the same defect.
+
+There are two required boundaries, in this order:
+
+1. Every Generator path calls `capAcceptedForTokenBudget` after determining the natural accepted prefix but **before** choosing the pending correction and committing any representation of the round. That includes returned tokens, `generated_ids`, usage, trunk KV/SSM, DFlash captures, MTP history, drafter state, and DSpark's module-owned rings. DSpark is the important non-shell case: the cap is passed into `dsparkRoundWith` / the stochastic accept arm so `dsparkFinish` rolls the module back at the capped boundary. Slicing `round.tokens` afterwards is too late.
+2. The scheduler publishes all five block modes through one `publishSpeculativeBlock` loop. It increments `slot.completion_tokens` once per pushed token and never imports the Generator's already-final whole-block count inside that loop. A source-scan class guard pins both sets: every speculative `next*` function must contain the pre-commit cap, and all five scheduler arms must call the one publisher.
+
+The numeric DFlash equivalence test disables the economics gate with `dflash_min_accepted_per_round = 0`; otherwise it ran only three real DFlash rounds, fell back to serial, and spent most of the test proving serial equals serial. Gate behavior has its own policy tests and the live script now accepts either workload-dependent outcome. If the gate reports `runtime_disabled=true`, the emitted stats must prove `avg_per_round < gate_min`.
+
+That review also found two DFlash lifecycle assumptions that were only true on the original M5/block-16/tool benchmark. The break-even threshold is now normalized by actual draft width: the non-thinking block-16 calibration is 2.0 accepted drafts/round and the thinking calibration is 1.0, each multiplied by `(effective_block_size - 1) / 15`. The request class comes from the server's fully resolved `enable_thinking` value on every streaming and non-streaming surface; `has_tools` is not a reasoning signal. Finally, a sticky runtime fallback grows the trunk with serial decode while the dormant assistant context stays at its last speculative boundary. `commitSlotIfApplicable` therefore stores a DFlash payload only when `dflash_ctx.absLen()` exactly equals `full_prompt.len + generated_ids.len`; a shorter context is omitted so the next request starts blind rather than restoring a mismatched assistant state.
+
 **PLD** (`src/pld_index.zig`, `Generator.nextPld`): model-agnostic n-gram match in `prompt + generated`. CLI `--pld --pld-draft-len 5 --pld-key-len 3`; per-request `enable_pld`. `Generator.initWithOptions` clones prompt to `prompt_ids_owned` (caller-supplied freed before `nextPld`). Stochastic verify: draft as one-hot; `accept_prob = min(1, target_p[draft[i]])`, residual `max(target_p − one_hot, 0)` renormalized — preserves marginal per Leviathan. One-hot built via `pldOneHotRow` (no scatter).
 
 **Drafter** (`src/drafter.zig`, `Generator.nextDrafter`): Gemma 4 only. 4-layer, hidden 256, no K/V projections — cross-attends into target's K/V via layer-type mapping (drafter sliding → target last sliding; drafter full → target last full). Loaded via `--drafter <dir>`. `block_size` auto-detected per target (E2B=2, E4B=4, 26B-A4B=4, 31B=8 — matches vLLM PR #41745) via `recommendedBlockSize`; override with `--draft-block-size`. Input: `concat([target.embed(prev) * sqrt(target.hidden), h_prev], -1)` → drafter hidden 256. Autoregressive within round (`block_size − 1` drafts), constant RoPE offset. Sparse `MaskedEmbedding` LM head (~2048 centroids, top-32 → ~4096 token logits of 262144). Linear weights pre-transposed at load.
@@ -2002,3 +2015,107 @@ times — `nextPld → verifyQmm` being the exact path that segfaulted.
    row's numbers looked ordinary. What gave it away was structural — its log
    was a third the length of every other cell's, and it had no shutdown line.
    Worth checking cell logs for uniformity before trusting a bench row.
+
+## The prefill-chunk cap must read the width the SCORE is contracted at (`prefillScoreHeadDim`)
+
+An arch can score at a different width than it stores values at (an MLA q·k contracting over nope+rope while `head_dim` stays the value width), and `boundedPrefillChunk`'s `<= 128` "fused SDPA covers it" early-out then silently exempts exactly the arch whose composed path materializes the biggest score tensors. `ModelConfig.prefillScoreHeadDim` is the width the cap must read. The two hd-256-MEASURED policy branches (the fused-kernel early return, the 2048 composed cap) stay keyed on 256 EXACTLY; neither generalizes. A new arch scoring wider than it stores adds its arm to `prefillScoreHeadDim`. A cap that trades throughput for reach is the usual expectation; measure before assuming you are paying for it.
+
+## A per-arch spec exclusion written as a hand-rolled conjunct is a list of ONE (2026-08-05)
+
+The dsv4 fixes both named dsv4 IN PLACE — `modelExclusiveDecode` returned `t.dsv4 != null`, and runPrefill spelled `!is_dsv4` on each of the three `use_mtp`/`use_drafter`/`use_pld` lines. A second module-owned arch arrived with the SAME shape (module-owned `Model.state`, `reset = ctx.cache.step == 0`, a 0-layer shell `KVCache` so snapshot/truncate are no-ops) and got neither: two concurrent requests shared one state, and `--pld` drove verify forwards straight through it with nothing to roll back. Both now read ONE predicate — `Transformer.ownsModuleDecodeState()` over the named `module_owned_state_fields`, and `scheduler.specInitWiring` (pure, `owns_module_state` in / the three use_* + a `native_intent` bit for an arch with its OWN draft mode out). Guards: a class scan asserting every `?*<x>_mod.<Y>` field on Transformer is in the list, delegation scans on both call sites, and `specInitWiring`'s table.
+
+Corollary 1 — the exclusion is per-arch CAPABILITY, not ownership (`Transformer.moduleStateSpecRollback`): an arch earns spec modes by shipping per-position state capture plus a rewind, pinned against fresh forwards at EVERY accepted count (bit equality is the wrong bar — a verify projects 1+m rows in one matmul, a reference one at a time, and MLX picks its GEMM by M; assert the error RATIO between correct and off-by-one instead). dsv4 cannot roll back (rings/compressed caches have no per-position capture) and keeps every shell spec mode off; it has DSpark for drafting.
+
+Corollary 2 — a module-owned forward that ignores `ctx.capture_hidden` hands spec decode an EMPTY hidden: `forwardWithCaptureAll` only sets the ctx fields and calls `forwardWith`, so an arch that never reads them silently captures nothing — and the MTP round then drafts from a null handle rather than failing. The fix is the `skip_lm_head` seam: run the trunk without the head, publish last-row + all-rows, project afterwards. (Found on the since-removed ling port; the wiring obligation stands for any new module-owned arch that wants spec decode.)
+
+## Kokoro port: the SineGen no-op, load/layout traps, and the vocab invariant
+
+**Reproducing an upstream NO-OP faithfully means NOT doing it**: the reference adds a random initial phase at SAMPLE 0 then linear-downsamples by 1/300 with `align_corners=False`, which reads position 149.5 — so the offset is never read and the round trip is bit-identical with and without it (verified max abs diff 0.0). This port collapses that identity round trip and works at the frame rate, where adding it is REAL. Cost: waveform cosine 0.477 instead of 0.997. Caught only by measuring the reference's OWN seed-to-seed self-similarity (0.9941–0.9960) instead of accepting "it's a stochastic vocoder" as licence for a loose threshold — a stochastic component excuses thousandths, not halves. Any port that simplifies a reference's resample/round-trip owes that measurement.
+
+**Load/layout traps**: safetensors READ on the CPU stream (mlx `Load` has no GPU impl — uncatchable `[Load::eval_gpu] Not implemented`); a DEPTHWISE `ConvTranspose1d` transposes `{0,2,1}`, NOT `ltx_audio`'s groups=1 `{1,2,0}`; mlx-c has no "build a complex array from two reals" op, so the iSTFT spectrum is `re + im·i` via `mlx_array_new_complex`; `AdaIN1d` declares `affine=True` but the checkpoint ships NO `norm.weight/bias` (loaded `strict=False`), so it is pure instance norm — read the CHECKPOINT, not the reference source.
+
+**Vocab**: Kokoro's vocab includes uppercase ASCII as diphthongs (A I O W Y Q S T), so "no ASCII letters in the phonemes" is a WRONG assertion — `həlˈO` is correct. The real invariant is that every emitted symbol is IN the vocab, because `Vocab.encode` silently DROPS unknowns (an unexpanded number just vanishes from the speech rather than erroring).
+
+## The DFlash assistant's own precision is a per-round read, and the A/B that measures it must not name its arms (2026-08-10)
+
+Shipped DFlash reads the WHOLE assistant every round: one block forward over 5.11 GB of bf16, plus the trunk lm_head twice (draft argmax over `block−1` rows, then the verify's own read of the same 202048×6656 head). Neither read is a fidelity question. The trunk verify is exact whatever the drafts were, so the only thing a lossier draft path can cost is ACCEPTANCE — which is a number you measure, not a risk you argue about.
+
+So both reads got shrunk. `dflash.DflashLinear` is one handle with two arms and one `apply`: dense bf16 pre-transposed to `[in, out]` for a plain matmul (what v1 did), or affine-packed `[out, in]` served by `mlx_quantized_matmul(transpose=true)`. The packed layout is the CHECKPOINT's layout, so quantizing at load REPLACES the dense arm's pre-transpose rather than adding a step — the load does strictly less work and the resident weights halve at 8 bits. Three rules fell out of doing it per weight rather than per model: a sidecar that already ships `.scales` is served as-is at the width `affineParamsFromGeometry` solves from its packed geometry (asking for "dense" must not unpack it — a request for a precision is not a request to re-encode someone else's artifact); a weight whose contraction dim divides neither 64 nor 32 stays dense on its own (`quantGroupFor`), because affine group sizes are 32/64/128 and a model-wide yes/no would refuse a whole sidecar over one odd projection; and `bits == 0` is the dense discriminator, never a probe of the scales handle.
+
+The draft-only lm_head is the MTP trick, unchanged: re-encode the trunk head once at bind, project drafts through it, leave verification on the trunk's. Two things it taught. `mtp.requantizeRows` already had the chunking discipline (dequantize a row chunk, requantize, eval, concatenate — never materialize the whole 2.5 GB dense head), so the right move was extending it with a DENSE-source arm rather than writing a second requantizer in dflash.zig; a chunking policy that exists twice drifts. And the resolvers that name a head's true params dereference the scales handle, so the DENSE arm has to be decided BEFORE calling one — `computeQuantParams` on a dense head's null scales is not a wrong answer, it is `expected a non-empty mlx_array` from mlx-c and a dead test binary. mtp's own `buildDraftHead` returns early on exactly that check; the dflash copy computed the params first and crashed, which is the same bug the early return was hiding.
+
+**The measurement lesson is the durable one.** Load-time quantization is a BOOT decision, so the arms cannot share a boot, and the first cut of the harness gave each boot a prompt nonce that named its arm (`[r1 dense t0.0] …`) to defeat the prefix cache. Every arm then diverged from every other on every prompt — because the model is always-thinking and restates the instruction, so one differing byte in the prompt re-rolls the entire generation. That does not merely add noise: it means the arms are not running the same work, the tok/s columns are comparing different token streams, the acceptance columns are comparing different content, and the greedy-identity check that should PROVE the drafts never leak into the output instead reports 18/18 divergent for a reason that has nothing to do with the change. A nonce must vary by REP and be identical across arms; a fresh boot starts with an empty prefix cache anyway, so the nonce is only ever defeating within-boot reuse. Same class as "an A/B arm is proven by ENGAGEMENT lines in its own log, never its launch env": a harness that cannot tell you the arms did the same work cannot tell you which arm was faster.
+
+## DFlash perf round 3: the block is a GPU decision, and it was worth 2x (2026-08-10)
+
+DFlash shipped at the assistant's config block of 16 and was worth 1.01x on a
+4-bit Muse trunk. `MLX_SERVE_DFLASH_TRACE=1` (added for this; it inserts eval
+barriers, so a traced round is slower than a real one) split the round at block
+16: verify 151 ms, assistant 14.2, draft head 10.2, append 1.1, scheduler gap
+0.01 — against a 35.8 ms serial step. The verify reads the same weights as a
+serial step and cost 4.2 of them, because it ran 16 rows wide. That is also why
+halving the trunk never moved it: compute-bound, not read-bound.
+
+MLX picks a transposed-qmm kernel by `get_qmv_batch_limit(K, N)` (10 on these
+shapes) — below it the weight-reuse `qmv`, at/above it a 32x32-tiled
+`qmm_splitk` that wastes half a tile at width 16. Our split-K lane covers M 2..7
+and the NAX m16 tile covers M 8..16 on G17 only, so 8..16 on a G16 has no lane
+at all. Whole-forward µbench per width (`MLX_SERVE_VERIFY_WIDTH_UBENCH=1`, one
+eval per BATCH of launches — a per-launch barrier is ~0.14 ms of sync here,
+more than the whole kv projection), calibrated against the live 35.8 at M=1:
+
+```
+ M    1     2     3     4     5     6     7     8    10    16
+ms  33.0  35.9  34.9  38.5  42.9  47.0  55.7  84.4 138.1 138.4
+```
+
+Live, serial reference in the same boot: block 16 → 0.92x, 8 → 1.16x, 7 → 1.43x,
+6 → 1.79x, **5 → 1.97x**, 4 → 1.81x, 3 → 1.77x. The default now caps at
+`NO_WIDE_LANE_BLOCK_CAP` when `wideVerifyLaneAvailable()` is false. Not a
+monotone win — a smaller block drafts fewer tokens, so 3 is worse than 5.
+
+**The assistant context has to ride the prefix cache.** A restore forwards no
+trunk layers, so it produces no `capture_layers` output, so `DflashCtx` started
+empty on every reused prefix — 92.6% → 66.5% per-draft and 80.2 → 60.9 tok/s on
+a full-prefix hit, i.e. multi-turn paid for the cache twice. Fixed by
+snapshotting it onto the entry (`prefix_cache.DflashSnap`), bytes folded into
+`kv_bytes`; hits now report cold-identical acceptance. Cheap to get right
+because it is DRAFT-side — every failure path (no payload, disk tier, misaligned
+base) returns `dflash_base = null` and starts blind rather than erroring. The
+adopt gate is `base + step == matched` EXACTLY, since `nextDflash` asserts it.
+
+### Levers measured and closed
+
+| lever | verdict |
+|---|---|
+| draft-only 3-bit lm_head | **OFF.** A win at block 16 (10 ms of 175), a loss at block 5 (under 2 ms of ~60): 55.4 tok/s / 2.19 accepted per round vs 57.8 / 2.37 on the trunk head. Re-measure every draft-side lossy default after the round cost moves. |
+| cross-round pre-draft | **Dead.** Traced scheduler gap is 0.01 ms; nothing to overlap. |
+| prefill capture cost | **Free.** −5.2% / +2.3% / +0.3% at 1128 / 5525 / 16185 prompt tokens. |
+| adaptive block size | **Declined.** The spread that justified it (creative peaked at 3, echo at 5) was an artifact of the 3-bit head; with it fixed every class peaks at 5. |
+| assistant micro-opts | **Not worth pricing.** Halving its weight read outright (`QUANT_BITS=4`) is no faster at identical acceptance. |
+| wider split-K tile (bn 8) | **5-8% slower** at every width, though the activation-traffic arithmetic says it should halve the dominant read — the x rows are 66 KB and never left cache. Kept behind `MLX_SERVE_VQMM_BN`. |
+| k_parts | Shipped 2 is optimal (1: 42.5, 2: 42.4, 4: 44.5, 8: 49.0 ms). |
+
+The split-K lane itself is worth +34% live on dflash and ~0 on serial — the
+right shape for a verify-width kernel.
+
+### Sampled drafts: clean theory, negative measurement
+
+Greedy drafts accept through a one-hot q, so acceptance is `p(argmax q)`, which
+a temperature-flattened target row should deflate. It does not. Greedy: temp 0 →
+1.98x / 55.1% per-draft, temp 0.7 → 1.98x / **57.7%**. Drawing each draft from
+the request's own filtered distribution and accepting through the full Leviathan
+ratio is exact and a LOSS: 1.87x / 54.5%. Sampled acceptance is `1 − TV(p, q)`,
+so matching the proposal only wins when q is close to p in SHAPE — this
+5-layer sidecar picks the right top token far more often than it gets the tail
+right. Left behind `MLX_SERVE_DFLASH_SAMPLED_DRAFTS=1`, default off.
+
+Two lessons. **A single boot is not a measurement at temperature**: the first
+run read 49.3% at 0.7 and looked like a clean 13% penalty; a second boot of the
+same build read 54.0%. Sampled cells fork their own content and swing ~10% run
+to run. And building the proposal for all m rows at once made `applyTopK` the
+first caller ever handed more than one row — it used axis-less `mlx_topk`, which
+FLATTENS, so the loudest row's cutoff masked the rest to -inf and softmax
+returned NaN. Correct-by-accident for every `[1, V]` caller before it. A
+reduction helper that has only ever seen one row cannot reveal an axis bug, and
+"only ever seen one row" is a property of the CALLERS.

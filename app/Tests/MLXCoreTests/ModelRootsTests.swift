@@ -29,6 +29,25 @@ final class ModelRootsTests: XCTestCase {
         return p
     }
 
+    /// A model in the custom scan folder (or LM Studio's) is served by the
+    /// server, so the app's "is it on disk?" reads must find it there too —
+    /// reading only `ownedRoots` is how a pack in the custom folder got a
+    /// Download bar over a copy already being served. Writes/deletes stay on
+    /// `ownedRoots`, so the custom folder must NOT appear there.
+    func testReadRootsCoverEveryServedFolderButOwnedRootsStayNarrow() {
+        let dest = tempDir("dest"), custom = tempDir("custom"), lms = tempDir("lms")
+        var roots = ModelRoots(defaults: defaults)
+        roots.configuredDownloadRoot = dest
+        roots.customRoot = custom
+        let read = roots.readRoots(lmStudioRoot: lms)
+        XCTAssertEqual(read, roots.scanRoots(lmStudioRoot: lms))
+        XCTAssertEqual(read.first, dest)
+        XCTAssertTrue(read.contains(custom))
+        XCTAssertTrue(read.contains(lms))
+        XCTAssertFalse(roots.ownedRoots.contains(custom))
+        XCTAssertFalse(roots.ownedRoots.contains(lms))
+    }
+
     // MARK: - The download destination
 
     /// With nothing configured the destination is exactly what it has always
@@ -105,6 +124,21 @@ final class ModelRootsTests: XCTestCase {
         XCTAssertEqual(all.first, dest)
         XCTAssertTrue(all.contains(builtIn),
                       "models downloaded before the move must stay visible")
+    }
+
+    /// The roots the APP ITSELF reads and deletes from — destination first,
+    /// built-in second. Unlike `scanRoots` this is not existence-filtered (a
+    /// read against a missing folder just finds nothing) and never includes
+    /// LM Studio / custom folders, which are other tools' trees the app must
+    /// not delete into.
+    func testOwnedRootsKeepTheBuiltInFolderAfterTheDestinationMoves() {
+        var roots = ModelRoots(defaults: defaults)
+        XCTAssertEqual(roots.ownedRoots, [ModelRoots.builtInRoot])
+
+        let dest = tempDir("dest")
+        roots.configuredDownloadRoot = dest
+        XCTAssertEqual(roots.ownedRoots, [dest, ModelRoots.builtInRoot],
+                       "the pre-move library must stay readable, destination's copy winning")
     }
 
     /// De-duped, and never a folder that isn't there: each entry becomes a
@@ -200,6 +234,31 @@ final class ModelRootsTests: XCTestCase {
         XCTAssertEqual(ServerManager.launchModelDirs(selectedModel: model, roots: [lib + "/"]), [lib + "/"])
         // No selection at all is just the library.
         XCTAssertEqual(ServerManager.launchModelDirs(selectedModel: "", roots: [lib]), [lib])
+    }
+
+    /// An HF-cache GGUF quant is a `<quant>.gguf` SYMLINK to an extensionless
+    /// blob (`blobs/<sha256>`). The server routes GGUF by the `.gguf`
+    /// extension, so resolving the leaf symlink hands it the blob path, which
+    /// falls through to the MLX directory loader and dies `error: NotDir`
+    /// (issue #158). The launch path must keep the symlink's own name; the
+    /// filesystem follows the link at open time.
+    func testAnHFCacheGgufSymlinkKeepsItsExtensionInTheLaunchPath() {
+        let repo = tempDir("hub") + "/models--unsloth--Qwen3.5-4B-GGUF"
+        let blobs = repo + "/blobs"
+        let snap = repo + "/snapshots/abc123"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: blobs, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: snap, withIntermediateDirectories: true)
+        let blob = blobs + "/00fe7986ff5f6b46"
+        fm.createFile(atPath: blob, contents: Data("GGUF".utf8))
+        let link = snap + "/Qwen3.5-4B-Q4_K_M.gguf"
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: "../../blobs/00fe7986ff5f6b46")
+
+        XCTAssertEqual(ServerManager.launchModelPath(link), link)
+        // A safetensors model dir (the MLX case) passes through unchanged too.
+        let dir = tempDir("lib") + "/org/model"
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        XCTAssertEqual(ServerManager.launchModelPath(dir), dir)
     }
 
     /// The extra folder can never push the list past what the server accepts —

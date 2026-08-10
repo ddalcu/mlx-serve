@@ -223,6 +223,25 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertEqual(parsed?["drafter_path"] as? String, drafterPath)
     }
 
+    /// A model SWITCH must re-point the server's default (`"default": true`) —
+    /// otherwise requests that omit `model` (the "mlx-serve" alias: Claude Code
+    /// launcher env, curl users) keep hitting the OLD model, and /v1/models
+    /// keeps sorting the old default first, which is exactly what the app's own
+    /// pill/tray read back. A media-gen side-load must NOT carry the flag: it
+    /// loads BESIDE the chat model and stealing the default would re-route
+    /// every aliased chat request to a model that 400s them.
+    func testLoadModelBodyCarriesDefaultOnlyWhenSwitching() {
+        let path = "/Users/me/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
+        let switchBody = APIClient.loadModelBody(id: path, drafterPath: nil, setDefault: true)
+        XCTAssertEqual(switchBody["model"] as? String, path)
+        XCTAssertEqual(switchBody["default"] as? Bool, true)
+        XCTAssertNil(switchBody["drafter_path"])
+
+        let sideLoad = APIClient.loadModelBody(id: path, drafterPath: "/d/gemma-drafter", setDefault: false)
+        XCTAssertNil(sideLoad["default"])
+        XCTAssertEqual(sideLoad["drafter_path"] as? String, "/d/gemma-drafter")
+    }
+
     func testLoadModelRequestOmitsDrafterWhenNil() throws {
         // When drafterPath is nil, we don't emit the field so older servers
         // don't choke parsing an unknown key.

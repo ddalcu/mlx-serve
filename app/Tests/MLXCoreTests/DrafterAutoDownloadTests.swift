@@ -56,6 +56,16 @@ final class DrafterAutoDownloadTests: XCTestCase {
         }
     }
 
+    func testMuseGlimmerPairsWithItsDFlashAssistant() {
+        for repo in ["ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit", "meta-models/Muse-Glimmer-30B"] {
+            XCTAssertEqual(DownloadManager.companionDrafterRepo(forRepoId: repo),
+                           "meta-models/Muse-Glimmer-30B-assistant",
+                           "\(repo) must pull the DFlash assistant")
+        }
+        // The assistant must not pull itself.
+        XCTAssertNil(DownloadManager.companionDrafterRepo(forRepoId: "meta-models/Muse-Glimmer-30B-assistant"))
+    }
+
     func testTheMoeGemmaHasNoCompanionDrafter() {
         for repo in ["mlx-community/gemma-4-26b-a4b-it-4bit", "mlx-community/gemma-4-26b-a4b-it-8bit"] {
             XCTAssertNil(DownloadManager.companionDrafterRepo(forRepoId: repo),

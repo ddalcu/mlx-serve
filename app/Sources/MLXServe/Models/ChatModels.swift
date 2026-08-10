@@ -1,5 +1,14 @@
 import Foundation
 
+/// How hard the model thinks while the Think toggle is on — the wire's own
+/// `reasoning_effort` values. Picked from the brain disc's right-click menu,
+/// per session like the toggle itself.
+enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendable {
+    case low, medium, high
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+}
+
 struct ChatSession: Identifiable, Codable {
     let id: UUID
     var title: String
@@ -28,19 +37,18 @@ struct ChatSession: Identifiable, Codable {
     /// across tab switches and relaunches — `mode` already does the same for the
     /// Agent toggle. See PerSessionUIStateTests.
     var enableThinking: Bool
+    /// The brain disc's right-click pick: `reasoning_effort` for this chat's
+    /// turns while thinking is on.
+    var reasoningEffort: ReasoningEffort
     var useMCP: Bool
+    // The composer's create mode (`createMode`) is retired: sessions saved by
+    // builds that had it simply carry a key this decoder no longer asks for.
     /// The agent (persona) this tab is talking to; nil = none, i.e. the app's own
     /// defaults and today's behavior. Per-session like the toggles above — the
     /// detail view is REUSED across tabs, so an app-wide "active agent" would
     /// leak between conversations. Switching applies to subsequent turns only.
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
-    ///
-    /// Stored as raw strings rather than `AgentToolKind` so a tool retired in a
-    /// later build leaves an unrecognized name on disk instead of failing the
-    /// whole session's decode — `disabledToolKinds` drops what it can't resolve.
-    /// Subtractive only: it can take away what the agent already allowed, never
-    /// grant what it forbids (see `AgentResolution.resolve`).
     var disabledTools: [String]
 
     init(title: String = "New Chat") {
@@ -55,6 +63,7 @@ struct ChatSession: Identifiable, Codable {
         self.taskRunId = nil
         self.isExternalBridge = false
         self.enableThinking = false
+        self.reasoningEffort = .low
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
@@ -69,6 +78,7 @@ struct ChatSession: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
+        case reasoningEffort
     }
 
     init(from decoder: Decoder) throws {
@@ -84,6 +94,10 @@ struct ChatSession: Identifiable, Codable {
         // Backfill: sessions saved before the per-session Think/MCP toggles
         // existed come back with the keys absent → default both off.
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
+        // Absent (older builds) and unknown (a future build's level) both read
+        // as the default rather than failing the whole session's decode.
+        reasoningEffort = (try c.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            .flatMap(ReasoningEffort.init(rawValue:)) ?? .low
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
         // Absent (every session saved before agents existed) → no agent → the
         // app defaults, unchanged on upgrade.
@@ -166,15 +180,6 @@ struct ChatImage: Identifiable, Codable, Equatable {
 }
 
 /// A generated media file attached to a message BY REFERENCE.
-///
-/// Images ride `ChatMessage.images` as JPEG bytes, which is fine for a picture
-/// but not for the rest: a 30 s track is tens of MB and a 4 s clip more, and
-/// `chat-history.json` would carry every one of them forever. So audio and video
-/// are a path into the same `~/.mlx-serve/generations` tree the tray windows
-/// write to — the file the service already produced, not a second copy.
-///
-/// The file can go away (the user empties that folder), so every renderer treats
-/// a missing path as a normal state rather than assuming it resolves.
 struct ChatMediaRef: Codable, Equatable, Identifiable {
     enum Kind: String, Codable { case image, audio, video }
 
@@ -243,6 +248,11 @@ struct ChatMessage: Identifiable, Codable {
     // prompt overflowed) instead of the old `[Error: …]` text, which read as
     // something the model itself had said.
     var errorNotice: ChatErrorNotice? = nil
+    // Set when the reply was cut (max_tokens / repetition loop). Rendered as a
+    // footnote under the bubble, NEVER appended into `content` — content rides
+    // back to the model as history, and the old in-content banner taught it
+    // the warning text. Absent forever on messages saved before the field.
+    var truncationNotice: TruncationNotice.Notice? = nil
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -265,7 +275,7 @@ struct ChatMessage: Identifiable, Codable {
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
         case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
-        case errorNotice, media
+        case errorNotice, media, truncationNotice
     }
 
     init(from decoder: Decoder) throws {
@@ -291,6 +301,8 @@ struct ChatMessage: Identifiable, Codable {
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
         processHandles = try c.decodeIfPresent([String].self, forKey: .processHandles)
         errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
+        // Tolerant: a cause this build doesn't know must not fail the message.
+        truncationNotice = (try? c.decodeIfPresent(TruncationNotice.Notice.self, forKey: .truncationNotice)) ?? nil
     }
 }
 
@@ -718,6 +730,10 @@ struct LocalModel: Identifiable, Hashable {
     /// discovery emits one `LocalModel` per file and `path` points at the file.
     /// nil for MLX checkpoints, whose `path` is the directory.
     var quantFile: String? = nil
+    /// The quant's menu label as `GgufQuant.groupQuants` resolved it — which is
+    /// the only place that can see the SIBLINGS, and so the only place that can
+    /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
+    var quantLabel: String? = nil
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
@@ -825,7 +841,7 @@ struct LocalModel: Identifiable, Hashable {
     /// `name` has to stay the repo name because filters and grouping key off it.
     var displayLabel: String {
         guard let quantFile else { return name }
-        return "\(name) · \(DownloadManager.quantLabel(forFilename: quantFile))"
+        return "\(name) · \(quantLabel ?? DownloadManager.quantLabel(forFilename: quantFile))"
     }
 
     /// Display labels shared by more than one model. macOS `.menu` Pickers key
@@ -928,12 +944,6 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // speculative decode (~1.1–1.4× decode on agent/code workloads).
     GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
     // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
-    // Our own mixed 2/3/8-bit safetensors mirror, so it takes the plain repo
-    // download path; it replaced the `antirez/deepseek-v4-gguf` IQ2XXS entry
-    // that the embedded ds4 engine served (same model, one engine fewer in the
-    // way, but 118 GB instead of 87 — the 96 GB tier no longer has a DeepSeek
-    // entry here). The id keeps its "dsv4" token: that is what the tray filter
-    // reads.
     GemmaModelOption(
         id: "dsv4-flash-mlx",
         displayName: "DeepSeek-V4-Flash (MLX native)",
@@ -942,10 +952,6 @@ let gemmaModelOptions: [GemmaModelOption] = [
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
-    // The imatrix-calibrated 2-bit build (mlx-community oQ2e): the FULL
-    // 192-expert model with attention/router/shared-expert/embeddings kept at
-    // 8-bit, ~84 GB — so a 128 GB Mac loads it WITH real context headroom
-    // (the older ~110 GB mixed build loaded but left almost none). No MTP head.
     GemmaModelOption(
         id: "hy3-oq2e",
         displayName: "Hunyuan 3 295B-A21B (2-bit)",

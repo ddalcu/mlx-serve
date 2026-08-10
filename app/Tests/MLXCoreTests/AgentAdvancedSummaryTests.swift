@@ -61,6 +61,22 @@ final class AgentAdvancedSummaryTests: XCTestCase {
         XCTAssertEqual(summary(agent), "Sampling")
     }
 
+    func testEverySamplingKnobCountsTowardTheSummary() {
+        // Each knob alone must light the row — a set-but-unnamed override is
+        // exactly the hidden-setting hazard the summary exists to prevent.
+        for mutate in [
+            { (a: inout Agent) in a.topP = 0.8 },
+            { (a: inout Agent) in a.topK = 40 },
+            { (a: inout Agent) in a.repeatPenalty = 1.1 },
+            { (a: inout Agent) in a.presencePenalty = 0.5 },
+            { (a: inout Agent) in a.reasoningBudget = 1024 },
+        ] {
+            var agent = plainAgent()
+            mutate(&agent)
+            XCTAssertEqual(summary(agent), "Sampling")
+        }
+    }
+
     func testAreasAreListedInTheOrderTheSectionsAppear() {
         var agent = plainAgent()
         agent.capabilities = AgentCapabilities(tools: true, mcp: false, web: true)

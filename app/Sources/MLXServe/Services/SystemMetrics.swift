@@ -3,16 +3,6 @@ import Foundation
 import IOKit
 
 /// Host telemetry read straight from the kernel — no subprocesses.
-///
-/// Two groups:
-///  * GPU utilization + memory pressure (IOKit/Mach, the same APIs as
-///    `status.zig`), moved here out of `ChatView`.
-///  * In-process replacements for the three binaries the app used to spawn:
-///    `/usr/sbin/lsof`, `/bin/ps` and `/usr/bin/vm_stat`. None is reachable
-///    from inside the App Sandbox container, and each spawn is a host escape
-///    from the Agent Sandbox. These call the same kernel interfaces the tools
-///    themselves use — `libproc` (what lsof reads) and `host_statistics64`
-///    (what vm_stat prints) — so the results match.
 enum SystemMetrics {
 
     // MARK: - GPU / memory pressure
@@ -61,10 +51,6 @@ enum SystemMetrics {
     // MARK: - Memory (was: /usr/bin/vm_stat)
 
     /// Free + inactive bytes: pages reclaimable without paging out.
-    ///
-    /// `vm_stat` prints `Pages free` as `free_count - speculative_count`, not
-    /// `free_count` — speculative pages are listed on their own line. Matching
-    /// that keeps the number identical to what the tool reported.
     static func availableBytes() -> UInt64 {
         var stats = vm_statistics64_data_t()
         var count = mach_msg_type_number_t(
@@ -80,6 +66,53 @@ enum SystemMetrics {
         let free = UInt64(stats.free_count) &- UInt64(stats.speculative_count)
         let inactive = UInt64(stats.inactive_count)
         return (free &+ inactive) &* UInt64(vm_kernel_page_size)
+    }
+
+    /// Bytes available for a NEW large allocation (a model load), using the
+    /// SAME formula as the server's pre-flight (`status.zig` `computeAvailableBytes`):
+    /// total minus the non-reclaimable resident set — wired + compressed +
+    /// anonymous, less reclaimable purgeable. This matches the "Available RAM"
+    /// the tray shows from a running server, so the meter reads the same with or
+    /// without one (the tray prefers the live server value when present).
+    static func availableForModelBytes() -> UInt64 {
+        var totalMem: UInt64 = 0
+        var len = MemoryLayout<UInt64>.size
+        guard sysctlbyname("hw.memsize", &totalMem, &len, nil, 0) == 0, totalMem > 0 else { return 0 }
+
+        var pageSize: vm_size_t = 0
+        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS, pageSize > 0 else { return 0 }
+
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<Int32>.size)
+        let result = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+
+        return computeAvailableForModel(
+            totalBytes: totalMem,
+            wirePages: UInt64(stats.wire_count),
+            compressorPages: UInt64(stats.compressor_page_count),
+            internalPages: UInt64(stats.internal_page_count),
+            purgeablePages: UInt64(stats.purgeable_count),
+            pageSize: UInt64(pageSize)
+        )
+    }
+
+    /// Pure counterpart of `availableForModelBytes` — the exact arithmetic of
+    /// `status.zig`'s `computeAvailableBytes`, so it's unit-tested without the
+    /// live Mach call. Purgeable is reclaimable, so it's excluded from the
+    /// resident anon set (saturating, never underflowing). Returns 0 on a bad
+    /// query or when used ≥ total.
+    static func computeAvailableForModel(totalBytes: UInt64, wirePages: UInt64,
+                                         compressorPages: UInt64, internalPages: UInt64,
+                                         purgeablePages: UInt64, pageSize: UInt64) -> UInt64 {
+        let residentAnon = internalPages >= purgeablePages ? internalPages - purgeablePages : 0
+        let usedBytes = (wirePages + compressorPages + residentAnon) &* pageSize
+        if totalBytes == 0 || usedBytes >= totalBytes { return 0 }
+        return totalBytes - usedBytes
     }
 
     // MARK: - Process identity (was: /bin/ps -o comm=)
@@ -123,10 +156,6 @@ enum SystemMetrics {
     // MARK: - Listening sockets (was: /usr/sbin/lsof -nP -iTCP:<port> -sTCP:LISTEN -t)
 
     /// PIDs with a TCP socket in LISTEN state bound to `port`.
-    ///
-    /// Processes we can't introspect (other users, or restricted by the
-    /// sandbox) return no fd list and are skipped — the same practical result
-    /// as unprivileged `lsof`.
     static func pidsListening(onTCPPort port: UInt16) -> [pid_t] {
         var found: [pid_t] = []
         for pid in allPids() where pid > 0 {

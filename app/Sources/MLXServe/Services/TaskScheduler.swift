@@ -610,7 +610,7 @@ final class TaskScheduler: ObservableObject {
     /// Make sure the server is running with the right model before a run:
     /// - server stopped → start it with the task's pinned model (or the selected one);
     /// - server running a *different* model than the task pins → switch to it
-    ///   (hot-swap when enabled, else restart);
+    ///   (hot-swap in place, restart only as the fallback);
     /// - server already running the right model → proceed.
     private func ensureServerReady(modelPath: String?) async -> Bool {
         if appState.server.status == .running {
@@ -628,16 +628,22 @@ final class TaskScheduler: ObservableObject {
     }
 
     /// Switch the running server to `path`, mirroring AppState's picker: hot-swap
-    /// in place when enabled, falling back to a restart (and on stopped servers).
+    /// in place (absolute path + `setDefault`, `AppState.modelSwitchAction`),
+    /// falling back to a restart (and on stopped/mid-boot servers).
     private func switchModel(to path: String) async -> Bool {
-        if appState.hotSwitchEnabled {
+        if case .hotSwitch(let id) = AppState.modelSwitchAction(forStatus: appState.server.status, path: path) {
             do {
-                let id = (path as NSString).lastPathComponent
-                let drafter = appState.downloads.recommendedDrafterFromPath(path)?.url.path
-                _ = try await appState.server.loadModel(id: id, drafterPath: drafter)
+                // Through DrafterPairing like the picker's own switch — a raw
+                // disk read here would re-enable a drafter the user turned off.
+                let drafter = DrafterPairing.decide(
+                    modelPath: path,
+                    optedOut: appState.serverOptions.drafterOptOut,
+                    onDiskPath: appState.downloads.recommendedDrafterFromPath(path)?.url.path)
+                _ = try await appState.server.loadModel(
+                    id: id, drafterPath: drafter.isEmpty ? nil : drafter, setDefault: true)
                 return true
             } catch {
-                // Hot-swap failed (e.g. model not under --model-dir) — restart.
+                // Hot-swap failed (unsupported arch, memory 503) — restart.
             }
         }
         appState.server.stop()

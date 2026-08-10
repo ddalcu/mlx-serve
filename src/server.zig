@@ -9,10 +9,10 @@ const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const muse_vision = @import("muse_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
-const token_mask_mod = @import("token_mask.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -77,6 +77,32 @@ pub var g_lan: ?*lan_mod.Lan = null;
 pub var g_lan_share_spec: ?[]const u8 = null;
 pub var g_lan_name: ?[]const u8 = null;
 pub var g_lan_discover: bool = false;
+
+/// Should boot print the open-bind warning? True only when serve mode is about
+/// to listen on a non-loopback address the user never chose: no explicit
+/// `--host` (the default is still 0.0.0.0) and no `--lan-share` (which needs
+/// the wide bind). A future release flips the default to 127.0.0.1 — at which
+/// point the host check silences this without a code change.
+pub fn shouldWarnOpenBind(host_explicit: bool, lan_share: bool, host: []const u8) bool {
+    if (host_explicit or lan_share) return false;
+    return !(std.mem.startsWith(u8, host, "127.") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.eql(u8, host, "localhost"));
+}
+
+test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
+    // Default bind (0.0.0.0, nobody asked) → warn: a first-launch user is
+    // serving whatever network the laptop joins.
+    try std.testing.expect(shouldWarnOpenBind(false, false, "0.0.0.0"));
+    // Someone who CHOSE the bind is not nagged — explicit --host (any value)…
+    try std.testing.expect(!shouldWarnOpenBind(true, false, "0.0.0.0"));
+    // …or --lan-share, which needs the wide bind by design.
+    try std.testing.expect(!shouldWarnOpenBind(false, true, "0.0.0.0"));
+    // Loopback defaults never warn (the future 127.0.0.1 default).
+    try std.testing.expect(!shouldWarnOpenBind(false, false, "127.0.0.1"));
+    try std.testing.expect(!shouldWarnOpenBind(false, false, "localhost"));
+    try std.testing.expect(!shouldWarnOpenBind(false, false, "::1"));
+}
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
@@ -628,6 +654,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/load-model",
     "/v1/messages",
     "/v1/models",
+    "/v1/models/rescan",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
@@ -640,6 +667,28 @@ fn routeExists(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, "/v1/responses/")) return true;
     for (ROUTE_PATHS) |p| if (std.mem.eql(u8, path, p)) return true;
     return false;
+}
+
+pub const max_request_bytes: usize = 64 * 1024 * 1024;
+pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+
+/// Per-route request-body cap. Media bodies are base64 payloads — a single
+/// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
+/// reference images approach 500 MB (issue #151) — while no JSON chat body
+/// has any business near 64 MB.
+pub fn maxRequestBytesFor(path: []const u8) usize {
+    for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
+        if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
+    return max_request_bytes;
+}
+
+/// The 413 names BOTH numbers it compared (context-overflow-400 class): a
+/// refusal that only names the cap reads as "this should have worked".
+fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
+    const mb = 1024 * 1024;
+    return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds this endpoint's {d} MB limit", .{
+        (got + mb - 1) / mb, cap / mb,
+    }) catch "Request body too large";
 }
 
 /// The requested model id from a request body of EITHER shape.
@@ -888,29 +937,6 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 /// Port the HTTP server is bound to. Used by the landing page's curl
 /// example so users can copy-paste a working command.
 var global_port: u16 = 0;
-
-/// Tokenizer-vocabulary byte table for grammar-constrained sampling. Built
-/// lazily on the first JSON-schema request and reused for the lifetime of the
-/// server. Single-threaded inference path means no synchronization is needed.
-var global_token_bytes: ?token_mask_mod.TokenBytes = null;
-var global_token_bytes_gpa: ?std.mem.Allocator = null;
-
-fn getOrBuildTokenBytes(gpa: std.mem.Allocator, tok: *const Tokenizer) !*const token_mask_mod.TokenBytes {
-    if (global_token_bytes) |*tb| return tb;
-    log.info("[grammar] building token-byte table for vocab (one-time, ~50ms)\n", .{});
-    const built = try token_mask_mod.build(gpa, tok);
-    global_token_bytes = built;
-    global_token_bytes_gpa = gpa;
-    return &global_token_bytes.?;
-}
-
-fn deinitGlobalTokenBytes() void {
-    if (global_token_bytes) |*tb| {
-        tb.deinit();
-        global_token_bytes = null;
-        global_token_bytes_gpa = null;
-    }
-}
 
 /// Decode a slice of token IDs to bytes, routing through the ds4 engine when
 /// the loaded model is GGUF-backed (no MLX tokenizer in that case). Used by
@@ -1339,7 +1365,9 @@ pub fn serve(
     if (server_config.default_enable_pld) {
         log.info("PLD speculative decoding: ENABLED (draft_len={d}, key_len={d}; default for new requests)\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     }
-    if (scheduler.drafter != null) {
+    if (scheduler.dflash != null) {
+        log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
+    } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
     if (server_config.default_force_mtp) {
@@ -1450,7 +1478,6 @@ pub fn serve(
     }
 
     deinitGlobalResponseStore();
-    deinitGlobalTokenBytes();
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -1539,9 +1566,20 @@ fn handleConnection(
     // Phase 2: Allocate buffer for full request and read remaining body
     const cl = content_length orelse 0;
     const total_size = header_end_pos + cl;
-    const max_request_size = 64 * 1024 * 1024; // 64MB hard limit
+    // The cap is per ROUTE, so peek the path off the request line we already
+    // have — media bodies carry base64 frames and dwarf any JSON chat body.
+    const req_path = blk: {
+        const line_end = std.mem.indexOf(u8, hdr_buf[0..header_end_pos], "\r\n") orelse break :blk "";
+        var it = std.mem.splitScalar(u8, hdr_buf[0..line_end], ' ');
+        _ = it.next();
+        break :blk it.next() orelse "";
+    };
+    const max_request_size = maxRequestBytesFor(req_path);
     if (total_size > max_request_size) {
-        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Request body too large (max 64MB)", 413);
+        var msg_buf: [128]u8 = undefined;
+        const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
+        log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
+        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
         return;
     }
 
@@ -1710,6 +1748,12 @@ fn handleConnection(
         try handleUnloadModelStrict(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
+        // Absorb models downloaded AFTER boot (the Model Browser pulls while
+        // the server runs; discovery only walks the roots at startup).
+        try handleModelsRescan(allocator, stream);
+        return;
+    }
 
     // ── Ollama-compatible API (/api/*): endpoints that must not trigger a
     //    model load (version/tags/ps/show/pull/unsupported) are handled
@@ -1799,6 +1843,18 @@ fn handleConnection(
             }
         }
     }
+    // An endpoint that doesn't exist is a 404, and it must cost NOTHING to say
+    // so. Resolution runs ahead of dispatch, so this has to be answered here
+    // rather than inside one of `ensureLoaded`'s error arms: with a resolvable
+    // `model` in the body, resolution SUCCEEDS — cold-loading the checkpoint —
+    // and the unknown path only 404s afterwards. `POST /v1/load` (the route is
+    // /v1/load-model) cost 2m42s and 121 GB resident for a typo, and the same
+    // one-liner pins the box for anyone who sends it. Placed below the LAN
+    // proxy so a `<id>@<peer>` hop is unchanged, and above every load.
+    if (!routeExists(path)) {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
+        return;
+    }
     const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -1816,15 +1872,6 @@ fn handleConnection(
                 try handlePropsNoModel(allocator, stream);
                 return;
             }
-            // An endpoint that doesn't exist is a 404 whether or not a model is
-            // loaded. Resolution runs ahead of dispatch, so without this an
-            // unknown path never reaches the chain's own 404 and reports "no
-            // model" — which reads to any endpoint-probing client as a
-            // catch-all server that implements everything.
-            if (!routeExists(path)) {
-                try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
-                return;
-            }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
@@ -1832,8 +1879,12 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
             return;
         },
+        error.InsufficientMemory => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
+            return;
+        },
         error.LoadFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+            try sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
             return;
         },
         error.Shutdown => {
@@ -3080,7 +3131,7 @@ fn renderModelEntry(
         try mods.append(allocator, ']');
 
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
-        const drafter_loaded = entry.drafter != null;
+        const drafter_loaded = entry.drafter != null or entry.dflash != null;
         const mtp_loaded = entry.mtp != null;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
@@ -3347,6 +3398,24 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     if (body.len > 0) try stream.writeAll(body);
 }
 
+/// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
+/// new dirs (add-only; `ModelRegistry.rescan`). Answers `{"added":N}`.
+fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
+    const registry = global_registry orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        return;
+    };
+    const added = registry.rescan() catch |err| {
+        log.warn("/v1/models/rescan failed: {s}\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "Model rescan failed", 500);
+        return;
+    };
+    if (added > 0) log.info("[registry] rescan added {d} model(s)\n", .{added});
+    const body = try std.fmt.allocPrint(allocator, "{{\"added\":{d}}}", .{added});
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
 /// Plan 05 Phase E: `POST /v1/load-model`. Renders a status payload for the
 /// resolved-and-loaded `lm` (the dispatcher already called
 /// `scheduler.ensureLoaded` against the body's `model` field, so the load
@@ -3365,6 +3434,11 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // scanner slice would read "\/Users\/…" — missing the absolute-path
     // branch below and 404ing on the mangled id (live failure 2026-06-12).
     var requested_id: []const u8 = "";
+    // `"default": true` — promote the loaded model to the server default
+    // (requests that omit `model` / the "mlx-serve" alias, and /v1/models'
+    // default-first sort). Explicit opt-in: the app's model SWITCH sends it;
+    // media-gen side-loads must never steal the chat default.
+    var make_default = false;
     var parsed_body: ?std.json.Parsed(std.json.Value) = null;
     defer if (parsed_body) |*p| p.deinit();
     if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
@@ -3372,6 +3446,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         if (parsed.value == .object) {
             if (parsed.value.object.get("model")) |m| {
                 if (m == .string) requested_id = m.string;
+            }
+            if (parsed.value.object.get("default")) |d| {
+                if (d == .bool) make_default = d.bool;
             }
         }
     } else |_| {
@@ -3414,6 +3491,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
                 try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model at that path has an unsupported quantization mode", 400);
                 return;
             },
+            error.IncompleteMediaPack => {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model at that path is an incomplete media pack (weights still downloading, or a partial copy)", 400);
+                return;
+            },
             else => return err,
         };
     }
@@ -3430,8 +3511,12 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
             return;
         },
+        error.InsufficientMemory => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
+            return;
+        },
         error.LoadFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+            try sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
             return;
         },
         else => {
@@ -3446,6 +3531,14 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         },
     };
     defer scheduler.release(lm);
+    // Promotion happens only past ensureLoaded's error switch: a load that
+    // FAILED must never steal the default from a model that answers.
+    if (make_default) {
+        if (global_registry) |registry| {
+            registry.setDefault(lm.id) catch {};
+            log.info("[registry] default model -> {s} (load-model request)\n", .{lm.id});
+        }
+    }
     const config = lm.config orelse {
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_not_ready", "Loaded model has no parsed config", 500);
         return;
@@ -3457,7 +3550,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
-    const drafter_loaded = lm.drafter != null;
+    const drafter_loaded = lm.drafter != null or lm.dflash != null;
     const drafter_path_json = if (drafter_loaded)
         try jsonEscape(allocator, lm.drafter_path)
     else
@@ -4621,7 +4714,7 @@ fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget);
-    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
+    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -4683,12 +4776,12 @@ fn handleChatCompletions(
     // requests default to ON unless the target is MoE (where verify-forward
     // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
     // overrides either way.
-    const lm_default_enable_drafter: bool = lm.drafter != null and !config.isMoe();
+    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
         lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null) {
+    if (enable_drafter and lm.drafter == null and lm.dflash == null) {
         enable_drafter = false; // no drafter loaded; quietly fall through
     }
     if (enable_drafter and logprobs_n > 0) {
@@ -4865,7 +4958,7 @@ fn handleChatCompletions(
         if (has_tools) {
             log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
         } else {
-            const tb = try getOrBuildTokenBytes(allocator, tok);
+            const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
                 sampling.constraint = &sc.constraint;
@@ -5027,8 +5120,8 @@ fn handleCompletions(
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
-        (lm.drafter != null and !config.isMoe());
-    if (enable_drafter and lm.drafter == null) enable_drafter = false;
+        (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
+    if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
     if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
@@ -5139,10 +5232,10 @@ fn handleNonStreamingCompletion(
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
     const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and lm.drafter != null and sampling.constraint == null;
+    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -5229,7 +5322,7 @@ fn handleStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -5244,6 +5337,7 @@ fn handleStreamingCompletion(
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
         .has_tools = false,
+        .enable_thinking = false,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -5251,6 +5345,7 @@ fn handleStreamingCompletion(
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
+        .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
@@ -5391,23 +5486,30 @@ fn handleStreamingCompletion(
     const total_prompt = ts.prompt_tokens;
 
     if (!client_gone) {
-        const usage_str = if (include_usage) blk: {
-            break :blk try std.fmt.allocPrint(allocator,
-                \\,"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
-            , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
-        } else try std.fmt.allocPrint(allocator, "", .{});
-        defer allocator.free(usage_str);
-
         const final_lp = (try lps.take()) orelse "null";
         const final_chunk = try std.fmt.allocPrint(allocator,
-            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]{s}}}
-        , .{ cmpl_id, created_ts, model_name, final_lp, finish_reason, finishDetailsField(finish_reason, ts.finish_details), usage_str });
+            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]}}
+        , .{ cmpl_id, created_ts, model_name, final_lp, finish_reason, finishDetailsField(finish_reason, ts.finish_details) });
         defer allocator.free(final_chunk);
 
         logHttpSseData(final_chunk);
         try stream.writeAllNoFlush("data: ");
         try stream.writeAllNoFlush(final_chunk);
         try stream.writeAllNoFlush("\n\n");
+
+        // Usage rides its own empty-choices chunk (OpenAI's stream_options
+        // shape) — never the finish chunk, so the ending is stated once.
+        if (include_usage) {
+            const usage_chunk = try std.fmt.allocPrint(allocator,
+                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+            , .{ cmpl_id, created_ts, model_name, total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+            defer allocator.free(usage_chunk);
+            logHttpSseData(usage_chunk);
+            try stream.writeAllNoFlush("data: ");
+            try stream.writeAllNoFlush(usage_chunk);
+            try stream.writeAllNoFlush("\n\n");
+        }
+
         logHttpSseData("[DONE]");
         try stream.writeAll("data: [DONE]\n\n");
     }
@@ -5440,6 +5542,7 @@ fn nonStreamingViaScheduler(
     eos_token_ids: []const u32,
     cached_tokens: u32,
     has_tools: bool,
+    enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
@@ -5461,13 +5564,15 @@ fn nonStreamingViaScheduler(
         .full_prompt = full_prompt,
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
+        .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = timeout_ns,
         .enable_pld = enable_pld,
-        .enable_drafter = enable_drafter and lm.drafter != null,
+        .enable_drafter = enable_drafter and (lm.drafter != null or lm.dflash != null),
         .drafter = if (enable_drafter) lm.drafter else null,
+        .dflash = if (enable_drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .enable_mtp = enable_mtp and mtpCapable(lm),
         .mtp = if (enable_mtp) lm.mtp else null,
@@ -5597,7 +5702,7 @@ fn handleNonStreamingGeneration(
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
     const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and lm.drafter != null and sampling.constraint == null;
+    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
     // Transfer vision ownership into the slot via the scheduler.
@@ -5606,7 +5711,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -5638,7 +5743,11 @@ fn handleNonStreamingGeneration(
     if (normalized_text) |n| final_text = n;
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
-    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
+    // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
+    // never paid-for-and-dropped — thinking-off is enforced on the PROMPT side
+    // (chat.noThinkTailSuffix commits the channel), so any reasoning that
+    // still shows up here is real work the client gets to see.
+    const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
 
     // Apply reasoning budget: truncate reasoning by token count
     // For non-streaming, we truncate after generation since we can't interrupt mid-generation
@@ -5705,10 +5814,11 @@ fn handleNonStreamingGeneration(
             }
             try tc_buf.appendSlice(allocator, "]");
 
-            // Extract reasoning_content if thinking is enabled
+            // Reasoning is delivered whenever the model produced it — the
+            // request's thinking flag shaped the prompt, not the delivery.
             var tc_reasoning_json: []const u8 = "";
             var tc_reasoning_allocated = false;
-            if (enable_thinking) {
+            {
                 const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
                 if (tc_think_split.reasoning_content) |reasoning| {
                     const escaped_reasoning = try jsonEscape(allocator, reasoning);
@@ -5755,9 +5865,11 @@ fn handleNonStreamingGeneration(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
-    // Split thinking content from response
-    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, opens_think);
-    const content_text = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
+    // Split thinking content from response. Always the think-capable split:
+    // whatever reasoning was generated ships as reasoning_content, never
+    // stripped (tokens we discarded still counted against tok/s).
+    const think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
+    const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
     const escaped_text = escaped.slice;
@@ -5778,12 +5890,13 @@ fn handleNonStreamingGeneration(
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
 
-    // Build reasoning_content field if thinking is enabled and reasoning exists
+    // Build reasoning_content whenever reasoning exists — delivery does not
+    // key on the request's thinking flag.
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
     var usage_details_json: []const u8 = "";
     var usage_details_allocated = false;
-    if (enable_thinking) {
+    {
         // Use budget-truncated reasoning if available, otherwise use full reasoning
         const reasoning_text = if (budget_truncated_reasoning) |tr| tr else think_split.reasoning_content;
         if (reasoning_text) |reasoning| {
@@ -6177,14 +6290,14 @@ fn handleStreamingGeneration(
     // visible answer (live 2026-08-04). Families that gate the opener on
     // enable_thinking render the closed signature and stay false here.
     const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
-    const opens_think = enable_thinking and prompt_opened_think;
+    const opens_think = prompt_opened_think;
 
     // Pick the speculative-decoding mode (regular / PLD / drafter). The
     // per-token state machine below is driven by `StreamingTokenStream`,
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -6206,6 +6319,7 @@ fn handleStreamingGeneration(
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
         .has_tools = has_tools,
+        .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -6213,6 +6327,7 @@ fn handleStreamingGeneration(
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
+        .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
@@ -6280,7 +6395,11 @@ fn handleStreamingGeneration(
 
     // Thinking state for real-time streaming of reasoning_content vs content
     // Supports both <think>...</think> and Gemma 4's <|channel>thought\n...<channel|>
-    var in_think_block = enable_thinking; // starts true when thinking enabled (model outputs <think> first)
+    // Starts true when thinking is enabled (model outputs <think> first) OR
+    // the prompt itself opened a think block: generated reasoning is always
+    // DELIVERED as reasoning_content, never paid-for-and-dropped. Thinking-off
+    // is enforced prompt-side (chat.noThinkTailSuffix commits the channel).
+    var in_think_block = enable_thinking or prompt_opened_think;
     var think_closed = false; // a complete think block was already split+emitted this stream
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     defer think_buf.deinit(allocator);
@@ -6291,6 +6410,10 @@ fn handleStreamingGeneration(
     // opener — the template must have injected one", which is the very case
     // that has to be told apart at the end-of-stream flush below.
     var saw_think_open = false;
+    // Muse-Glimmer: dropping a segment header in the plain arm — <|start|>
+    // arms it, <|message|> disarms; the role+recipient text between them is
+    // ordinary tokens that must never reach the client as content.
+    var muse_skip_header = false;
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
@@ -6425,7 +6548,7 @@ fn handleStreamingGeneration(
                         // A reasoning BUDGET keeps the old buffering: capping what
                         // the client is allowed to see cannot be reconciled with
                         // having already sent it.
-                        if (enable_thinking and reasoning_budget < 0) {
+                        if (reasoning_budget < 0) {
                             const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
                             if (so_far.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
@@ -6437,7 +6560,7 @@ fn handleStreamingGeneration(
                     },
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
-                        const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
+                        const split = chat_mod.splitThinkBlock(buf, true, opens_think);
                         // The thought's tokens never reach the client, so their
                         // entries must not ride the content chunk below — the
                         // reasoning emitters above deliberately do not drain.
@@ -6451,11 +6574,9 @@ fn handleStreamingGeneration(
                         text_buf.clearRetainingCapacity();
                         think_scan.reset();
                         think_closed = true;
-                        if (enable_thinking) {
-                            if (split.reasoning_content) |rc| {
-                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
-                                }
+                        if (split.reasoning_content) |rc| {
+                            if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                             }
                         }
                         // Block done and `text_buf` was just cleared — a thought
@@ -6479,48 +6600,13 @@ fn handleStreamingGeneration(
                 }
             }
             // Otherwise keep buffering — tool call may be in progress
-        } else if (!enable_thinking and prompt_opened_think and !think_closed) {
-            // Thinking OFF, but the TEMPLATE opened a think block anyway.
-            // LFM2.5 renders `…assistant\n<think>` unconditionally (no
-            // enable_thinking branch exists in it), so the model always
-            // reasons and the opener never appears in the OUTPUT — this
-            // stream used to fall through to the plain-content arm below and
-            // deliver the entire chain-of-thought as the answer (live
-            // 2026-08-04; non-streaming was always correct because the
-            // `</think>` is present by the time the text is split).
-            //
-            // Deliberately its OWN arm rather than a widened condition on the
-            // reasoning arm below: that one EMITS reasoning_content, and with
-            // thinking off the block must be DROPPED. Nothing here can run
-            // when thinking is on, so the reasoning path is untouched.
-            //
-            // Only the `</think>` family is checked for the close because
-            // `promptTailOpensThink` only matches `<think`-family OPENERS —
-            // Gemma's `<|channel>thought` never sets the flag, so this arm is
-            // unreachable for it. Pinned by "promptTailOpensThink does not
-            // match Gemma's channel opener": extend that detection and this
-            // close check needs `<channel|>` too, or a channel-family model
-            // would hold its whole turn waiting for a tag that never arrives.
-            defer allocator.free(token_text);
-            try think_buf.appendSlice(allocator, token_text);
-            if (chat_mod.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
-                const after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n \t\r");
-                think_closed = true;
-                in_think_block = false;
-                if (after.len > 0) {
-                    // The dropped block's tokens are not content — their
-                    // entries must not ride this chunk.
-                    lps.skipToContent(think_buf.items, after);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = after }, null, null, null, .{ .logprobs_json = try lps.take() });
-                } else {
-                    lps.dropPending();
-                }
-                think_buf.clearRetainingCapacity();
-            }
-            // No close tag yet (or the generation was cut inside the block):
-            // emit nothing. A truncated thought is never content.
-        } else if (enable_thinking and in_think_block) {
-            // Inside <think> block — stream as reasoning_content with </think> detection
+        } else if (in_think_block) {
+            // Inside <think> block — stream as reasoning_content with </think>
+            // detection. Also covers thinking-off + template-opened (LFM2.5
+            // renders `…assistant\n<think>` unconditionally, live 2026-08-04):
+            // the block used to be buffered and DROPPED there; now it streams
+            // as reasoning_content like any other thought — generated tokens
+            // are always delivered.
             defer allocator.free(token_text);
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
@@ -6553,6 +6639,28 @@ fn handleStreamingGeneration(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
+                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .self_opened) {
+                    // Muse-Glimmer reasoning segment (` to=self<|message|>`) —
+                    // closes at <|eom|>. The direct-answer header
+                    // (` to=user<|message|>`) is handled by the close matcher
+                    // below (immediate close, empty reasoning), and .growing
+                    // deliberately falls through to wait for more tokens.
+                    const skip = switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
+                        .self_opened => |hl| hl,
+                        else => unreachable,
+                    };
+                    saw_think_open = true;
+                    think_close_tag = "<|eom|>";
+                    var skip2 = skip;
+                    while (skip2 < think_buf.items.len and think_buf.items[skip2] == '\n') skip2 += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip2..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
+                    // Muse header still arriving token by token — wait before
+                    // deciding, or the ` to=self` text leaks as reasoning.
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     // Gemma 4 think format — switch close tag
                     saw_think_open = true;
@@ -6610,7 +6718,22 @@ fn handleStreamingGeneration(
                 break :blk_i null;
             };
             const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
+            // Muse: a resolved non-self header is a DIRECT answer — close at 0
+            // with empty reasoning (the header bytes are the "tag"); a
+            // reasoning segment closes at its <|eom|> (gated on the muse
+            // opener having latched think_close_tag).
+            const muse_close: ?struct { pos: usize, len: usize } = blk_m: {
+                switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
+                    .direct => |hl| break :blk_m .{ .pos = 0, .len = hl },
+                    else => {},
+                }
+                if (std.mem.eql(u8, think_close_tag, "<|eom|>")) {
+                    if (std.mem.indexOf(u8, think_buf.items, "<|eom|>")) |p| break :blk_m .{ .pos = p, .len = "<|eom|>".len };
+                }
+                break :blk_m null;
+            };
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
@@ -6636,6 +6759,17 @@ fn handleStreamingGeneration(
                 if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
                 if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
                 if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
+                // Strip a muse next-segment header (<|start|>assistant
+                // to=user<|message|>). A header still ARRIVING (start marker,
+                // no message marker yet) arms the plain-arm skip instead —
+                // its remaining tokens drop until <|message|> passes.
+                if (chat_mod.museContentHeaderSkip(content_after)) |hl| {
+                    content_after = content_after[hl..];
+                } else if (std.mem.startsWith(u8, content_after, "<|start|>")) {
+                    muse_skip_header = true;
+                    content_after = "";
+                }
+                if (std.mem.indexOf(u8, content_after, "<|eot|>")) |et| content_after = content_after[0..et];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     // The reasoning above this point never reaches the client,
@@ -6667,6 +6801,13 @@ fn handleStreamingGeneration(
             }
         } else {
             defer allocator.free(token_text);
+            // Muse segment-header skip: everything between <|start|> and
+            // <|message|> is the role+recipient header, never content.
+            const was_skipping = muse_skip_header;
+            muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
+            if (was_skipping or muse_skip_header) {
+                continue;
+            }
             // Skip Gemma 4 channel tags that leak after thinking blocks
             if (chat_mod.isChannelMarkerToken(token_text)) {
                 continue;
@@ -6688,7 +6829,7 @@ fn handleStreamingGeneration(
     }
 
     // Flush any remaining think buffer
-    if (!client_gone and enable_thinking and think_buf.items.len > 0) {
+    if (!client_gone and think_buf.items.len > 0) {
         // No close tag arrived. Reasoning ONLY with positive evidence a block
         // was open — the prompt injected the opener, or the model emitted one.
         // `in_think_block` alone is not that evidence: it STARTS true whenever
@@ -6737,8 +6878,9 @@ fn handleStreamingGeneration(
                 allocator.free(tool_calls);
             }
 
-            // Emit reasoning_content before tool calls if thinking is enabled
-            if (enable_thinking) {
+            // Emit reasoning_content before tool calls — whatever the model
+            // generated is delivered, thinking flag or not.
+            {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -6783,8 +6925,14 @@ fn handleStreamingGeneration(
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
-            // No tool calls found — flush buffered tokens as content
-            if (enable_thinking) {
+            // No tool calls found — flush buffered tokens, splitting thinking
+            // from content. Runs regardless of the request's thinking flag:
+            // reasoning the model produced ships as reasoning_content, and
+            // split.content already passes trimLeakedToolMarkup, so unparsed
+            // wreckage that held the buffer (markers the tokenizer split
+            // across tokens — live 2026-08-01, DSV4 `<` then `｜DSML｜`) is
+            // still cut once, at the end.
+            {
                 // Concatenate all buffered tokens and split thinking from content
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
@@ -6826,25 +6974,6 @@ fn handleStreamingGeneration(
                     // client never received.
                     lps.dropPending();
                 }
-            } else {
-                // Thinking off: the held tail flushes verbatim. It was held
-                // BECAUSE it looked like a tool call, and nothing parsed — so
-                // the markers in it are unparsed wreckage. Concatenate and cut
-                // once (a per-token loop cannot see a marker the tokenizer
-                // split across tokens: live 2026-08-01, DSV4 emitted `<` then
-                // `｜DSML｜` and both went out as visible content).
-                var flush_text = std.ArrayList(u8).empty;
-                defer flush_text.deinit(allocator);
-                for (token_texts.items) |t| {
-                    try flush_text.appendSlice(allocator, t);
-                }
-                const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
-                if (visible.len > 0) {
-                    lps.skipToContent(flush_text.items, visible);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = visible }, null, null, null, .{ .logprobs_json = try lps.take() });
-                } else {
-                    lps.dropPending();
-                }
             }
         }
     }
@@ -6856,13 +6985,17 @@ fn handleStreamingGeneration(
 
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
+        // OpenAI ships this chunk with an EMPTY choices array — restating
+        // finish_reason/finish_details here made every per-event client render
+        // the ending twice (PR #147's doubled truncation banner). Pending
+        // logprobs all drained on the final chunk above.
         if (include_usage) {
             const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
             defer allocator.free(usage_json);
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
             const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, usage_json, timings_opt, .{ .logprobs_json = try lps.take() });
+            try sendSSEUsageChunk(allocator, stream, chat_id, model_name, usage_json, timings_opt);
         }
 
         // Done sentinel
@@ -7116,6 +7249,35 @@ fn sendSSEChunk(
     defer allocator.free(chunk);
 
     // Write as SSE event
+    logHttpSseData(chunk);
+    try stream.writeAllNoFlush("data: ");
+    try stream.writeAllNoFlush(chunk);
+    try stream.writeAllNoFlush("\n\n");
+    try stream.flush();
+}
+
+/// The `stream_options.include_usage` chunk: OpenAI's shape is an EMPTY
+/// `choices` array beside the usage object — no delta, no finish_reason, no
+/// logprobs (all per-choice fields; the final chunk already carried them).
+fn sendSSEUsageChunk(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    chat_id: i64,
+    model_name: []const u8,
+    usage_json: []const u8,
+    timings_json: ?[]const u8,
+) !void {
+    var timings_tail_buf = std.ArrayList(u8).empty;
+    defer timings_tail_buf.deinit(allocator);
+    if (timings_json) |t| {
+        try timings_tail_buf.appendSlice(allocator, ",\"timings\":");
+        try timings_tail_buf.appendSlice(allocator, t);
+    }
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{s}{s}}}
+    , .{ chat_id, nowSecs(stream.io), model_name, usage_json, timings_tail_buf.items });
+    defer allocator.free(chunk);
+
     logHttpSseData(chunk);
     try stream.writeAllNoFlush("data: ");
     try stream.writeAllNoFlush(chunk);
@@ -7643,6 +7805,23 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
 }
 
+test "the route-existence 404 is answered BEFORE the model is resolved" {
+    // A path we do not serve must cost nothing. Resolution ran first, so
+    // `POST /v1/load` (the real route is /v1/load-model) with a `model` field
+    // cold-loaded that model and THEN 404'd — 2m42s and 121 GB resident for a
+    // typo, and a one-line way for any client to pin the box. The existence
+    // answer has to precede `ensureLoaded`, not sit in one of its error arms.
+    const src = @embedFile("server.zig");
+    const gate = "if (!routeExists(" ++ "path)) {";
+    const resolve = "scheduler.ensureLoaded(" ++ "requested_model_id)";
+    const gate_at = std.mem.indexOf(u8, src, gate) orelse return error.GateMissing;
+    const resolve_at = std.mem.indexOf(u8, src, resolve) orelse return error.ResolveMissing;
+    try std.testing.expect(gate_at < resolve_at);
+    // Exactly one gate — a second copy in an error arm is a second answer to
+    // a question that has one.
+    try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
+}
+
 test "routeExists answers endpoint existence without consulting the model" {
     // Whether a path EXISTS has nothing to do with which models are loaded, but
     // model resolution runs ahead of dispatch — so on a headless boot (`--serve
@@ -7745,8 +7924,10 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
         }
         i = line_end;
     }
-    // Zeroes would pass the loops vacuously — both shapes must exist.
-    try std.testing.expect(content_emitters >= 10);
+    // Zeroes would pass the loops vacuously — both shapes must exist. (The
+    // include_usage chunk consolidation — the ending ships on exactly ONE
+    // chunk — took content emitters from 10 to 9.)
+    try std.testing.expect(content_emitters >= 9);
     try std.testing.expect(reasoning_emitters >= 5);
 
     // The boundary itself: a content chunk emitted after a think block has to
@@ -7917,9 +8098,39 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 /// STATIC cap, so on an idle server with nothing loaded there is nothing to
 /// retry after (#126). The counts are knowable only server-side and go to the
 /// log; what the client needs is the knob.
+///
+/// ONE gate reaches this arm: the resident-model budget with no evictable
+/// LRU victim (scheduler's `planEvictionsLocked` refusal). The free-memory
+/// PREFLIGHT refuses as `error.InsufficientMemory` and gets its own message
+/// below (#144) — blaming free memory here sends a user quitting apps when
+/// the fix is unloading a model or moving the cap.
 pub const not_enough_memory_message =
-    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model could be evicted. " ++
-    "Raise or disable the cap with --max-resident-mem <size>|0 (the server log names the estimate and the current cap).";
+    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model can be evicted. " ++
+    "Unload the model you are chatting with (tray > Models > eject), " ++
+    "or raise or disable the cap with --max-resident-mem <size>|0. " ++
+    "The server log names the exact figures and the current cap.";
+
+/// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
+/// headroom) is distinct from the resident-budget gate above and has a
+/// different knob. Counts go to the log (#126); the client gets the remedy.
+pub const insufficient_free_memory_message =
+    "Not enough free memory to load model: weights + warmup headroom exceed what is currently available. " ++
+    "Close other apps or models and retry (the server log names the peak estimate and available memory), or pass --skip-mem-preflight to override.";
+
+/// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
+/// every on-demand load failure — the inference thread's error name was
+/// dropped at the thread boundary. The registry keeps it; echo it.
+fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8) !void {
+    if (sched.loadErrorName(allocator, id)) |name| {
+        defer allocator.free(name);
+        if (std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch null) |msg| {
+            defer allocator.free(msg);
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
+            return;
+        }
+    }
+    try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+}
 
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
@@ -8520,7 +8731,7 @@ fn processVisionImages(
             const shape = [_]c_int{ @intCast(n), @intCast(feat) };
             const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
             defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = try vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w);
+            emb = try vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w);
         } else {
             const h: c_int = @intCast(img.height);
             const w: c_int = @intCast(img.width);
@@ -8762,33 +8973,64 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
-    if (!config.qwen_vision) return .{};
+    if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
-        .qwen = true,
+        .mode = if (config.muse_vision) .muse else .qwen,
         .patch = config.qv_patch,
         .tps = config.qv_temporal_patch,
         .merge = config.qv_merge,
         .min_pixels = config.qv_min_pixels,
         .max_pixels = config.qv_max_pixels,
+        .max_tokens = config.mv_max_image_tokens,
     };
 }
 
-test "visionPreprocFromConfig threads Qwen processor bounds" {
-    const config = model_mod.ModelConfig{
+test "visionPreprocFromConfig threads each tower's processor bounds" {
+    const qwen = visionPreprocFromConfig(&.{
         .qwen_vision = true,
         .qv_patch = 14,
         .qv_temporal_patch = 2,
         .qv_merge = 2,
         .qv_min_pixels = 65536,
         .qv_max_pixels = 16777216,
-    };
-    const vp = visionPreprocFromConfig(&config);
-    try std.testing.expect(vp.qwen);
-    try std.testing.expectEqual(@as(u32, 14), vp.patch);
-    try std.testing.expectEqual(@as(u32, 2), vp.tps);
-    try std.testing.expectEqual(@as(u32, 2), vp.merge);
-    try std.testing.expectEqual(@as(u32, 65536), vp.min_pixels);
-    try std.testing.expectEqual(@as(u32, 16777216), vp.max_pixels);
+    });
+    try std.testing.expectEqual(.qwen, qwen.mode);
+    try std.testing.expectEqual(@as(u32, 14), qwen.patch);
+    try std.testing.expectEqual(@as(u32, 2), qwen.tps);
+    try std.testing.expectEqual(@as(u32, 2), qwen.merge);
+    try std.testing.expectEqual(@as(u32, 65536), qwen.min_pixels);
+    try std.testing.expectEqual(@as(u32, 16777216), qwen.max_pixels);
+
+    // muse caps on MERGED tokens instead of pixels, and must not be routed
+    // through the Qwen resize (different algorithm, different patch order).
+    const muse = visionPreprocFromConfig(&.{
+        .muse_vision = true,
+        .qv_patch = 14,
+        .qv_temporal_patch = 2,
+        .qv_merge = 2,
+        .mv_max_image_tokens = 4096,
+    });
+    try std.testing.expectEqual(.muse, muse.mode);
+    try std.testing.expectEqual(@as(u32, 4096), muse.max_tokens);
+    try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
+}
+
+test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
+    // Live crash 2026-08-11: the app preprocesses images into Gemma's square
+    // `x-mlx-pixels` buffer unless it recognises the arch, so Muse-Glimmer got
+    // one. That buffer carries NO patch grid, so the encode routed to the SigLIP
+    // `forward` — whose weights are null sentinels on a patch-grid encoder —
+    // and killed the server. The original image is unrecoverable from it (already
+    // resized and normalized), so the only honest answer is to refuse the block.
+    const url = "data:image/x-mlx-pixels;base64,AAAAAM3MzD3NzEw+mpmZPs3MzD4AAAA/mpkZPzMzMz/NzEw/ZmZmPwAAgD/NzIw/";
+    const gemma = parseImageUrlContent(std.testing.allocator, url, .{}) orelse return error.GemmaMustAccept;
+    defer std.testing.allocator.free(gemma.pixels);
+    try std.testing.expectEqual(@as(u32, 2), gemma.width);
+    try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
+
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen } }) |vp| {
+        try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
+    }
 }
 
 fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
@@ -8803,7 +9045,15 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
 
     const mime = url[0..sep];
     if (std.mem.eql(u8, mime, "data:image/x-mlx-pixels")) {
-        // Already preprocessed float32 CHW pixels
+        // Already preprocessed float32 CHW pixels — a GEMMA format. It carries
+        // no patch grid and the source image cannot be recovered from it, so a
+        // patch-grid tower has to refuse rather than hand a gridless buffer to
+        // an encoder that has no SigLIP weights.
+        if (vp.mode != .gemma) {
+            log.warn("Dropping x-mlx-pixels image: {s} needs server-side preprocessing (send the encoded image instead)\n", .{@tagName(vp.mode)});
+            allocator.free(raw_buf);
+            return null;
+        }
         const n_pixels = raw_buf.len / 4;
         const per_channel = n_pixels / 3;
         const side = std.math.sqrt(per_channel);
@@ -8885,11 +9135,12 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const src_w: u32 = @intCast(w);
     const src_h: u32 = @intCast(h);
 
-    // Qwen3-VL: smart-resize to a multiple of patch·merge within [min,max] pixels,
-    // normalize (x/255−0.5)/0.5, then emit the processor's merge-order pixel_values
-    // [N, C·tps·ps·ps]. The encoder is QwenVision; `grid_h/grid_w` carry the full
-    // patch grid (token count = (gh/merge)·(gw/merge)).
-    if (vp.qwen) {
+    // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
+    // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
+    // processor's pixel_values. `grid_h/grid_w` carry the full patch grid;
+    // token count = (gh/merge)·(gw/merge). Qwen bounds the PIXEL area, muse the
+    // merged-token count, and their patch orders differ — see muse_vision.zig.
+    if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         if (factor == 0 or vp.tps == 0) return null;
         const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
@@ -8897,7 +9148,10 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             vp.max_pixels
         else
             @max(qwen_vision.MAX_PIXELS, min_pixels);
-        const rs = qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels);
+        const rs = if (vp.mode == .muse)
+            muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS)
+        else
+            qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels);
         const rh = rs.h;
         const rw = rs.w;
         const C: u32 = 3;
@@ -8910,7 +9164,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        qwen_vision.resizeRgbBicubicNormalizedChw(
+        qwen_vision.resizeRgbNormalizedChw(
             allocator,
             chw,
             px[0..source_len],
@@ -8918,12 +9172,16 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             src_w,
             rh,
             rw,
+            if (vp.mode == .muse) .lanczos else .bicubic,
         ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @alignCast(@ptrCast(pv_bytes.ptr)))[0 .. n * feat];
-        qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
-        log.info("  Decoded {d}x{d} image → Qwen grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
+        if (vp.mode == .muse)
+            muse_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps)
+        else
+            qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
+        log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, if (vp.mode == .muse) "Muse" else "Qwen", gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
         return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
     }
 
@@ -9494,8 +9752,14 @@ fn handleAnthropicMessages(
         }
     }
 
-    // Thinking config
-    var enable_thinking = false;
+    // Thinking config. An absent `thinking` object consults the arch default
+    // (muse+tools delivers its always-on reasoning as thinking blocks rather
+    // than paying for it and discarding it); a PRESENT object decides
+    // explicitly, exactly as before.
+    var enable_thinking = if (root.get("thinking") == null)
+        config.defaultEnableThinking(root.get("tools") != null)
+    else
+        false;
     var reasoning_budget: i32 = server_config.default_reasoning_budget;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
@@ -9527,7 +9791,7 @@ fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter: bool = lm.drafter != null and !config.isMoe();
+    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
@@ -9690,7 +9954,7 @@ fn handleAnthropicNonStreaming(
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
     const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
@@ -9704,7 +9968,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -9747,7 +10011,9 @@ fn handleAnthropicNonStreaming(
     // to parseToolCallsForRequest below. Cutting the markup first would make a
     // real call unparseable. The visible text block is cut at emission instead
     // (`chat_mod.trimLeakedToolMarkup`), which is where the leak matters.
-    if (enable_thinking) {
+    // Reasoning the model generated is always delivered as a thinking block —
+    // the request's thinking flag shaped the prompt, never the delivery.
+    {
         const think_split = chat_mod.splitThinkBlockKeepingMarkup(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
@@ -9776,12 +10042,8 @@ fn handleAnthropicNonStreaming(
             defer allocator.free(thinking_block);
             try content.appendSlice(allocator, thinking_block);
             block_count += 1;
-            final_text = think_split.content;
-        } else {
-            final_text = chat_mod.stripThinkBlockKeepingMarkup(final_text);
         }
-    } else {
-        final_text = chat_mod.stripThinkBlockKeepingMarkup(final_text);
+        final_text = think_split.content;
     }
 
     // Check for tool calls
@@ -9927,7 +10189,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -9945,6 +10207,7 @@ fn handleAnthropicStreaming(
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
         .has_tools = has_tools,
+        .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -9952,6 +10215,7 @@ fn handleAnthropicStreaming(
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
+        .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
@@ -9993,7 +10257,6 @@ fn handleAnthropicStreaming(
     var block_index: u32 = 0;
     var text_block_open = false;
     var thinking_block_open = false;
-    var in_think_block = enable_thinking;
     // Template-opened think (Qwen 3.5/3.6 render `…assistant\n<think>\n` into
     // the generation prompt): the output's thinking carries NO opener tag.
     // Needed up front by the tools branch — by the time the close tag is the
@@ -10001,11 +10264,16 @@ fn handleAnthropicStreaming(
     // See the streaming chat site for why the prompt fact is NOT ANDed with
     // enable_thinking (LFM2.5's unconditional pre-opened `<think>`).
     const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
-    const opens_think = enable_thinking and prompt_opened_think;
+    const opens_think = prompt_opened_think;
+    // Prompt-opened reasoning is DELIVERED as thinking blocks even when the
+    // request didn't ask for thinking — generated tokens are never dropped.
+    var in_think_block = enable_thinking or prompt_opened_think;
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
+    // Muse-Glimmer plain-arm segment-header skip (<|start|>…<|message|>).
+    var muse_skip_header = false;
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>";
@@ -10127,19 +10395,18 @@ fn handleAnthropicStreaming(
                     },
                     .split_think => {
                         // Complete think block — split once: thinking block
-                        // first, then the visible remainder as text.
-                        const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
-                        if (enable_thinking) {
-                            if (split.reasoning_content) |rc| {
-                                const sd = try std.fmt.allocPrint(allocator,
-                                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                                , .{block_index});
-                                defer allocator.free(sd);
-                                try sendAnthropicEvent(stream, "content_block_start", sd);
-                                try emitAnthropicThinkingDelta(allocator, stream, block_index, rc);
-                                try closeAnthropicThinkingBlock(allocator, stream, block_index);
-                                block_index += 1;
-                            }
+                        // first, then the visible remainder as text. Reasoning
+                        // ships regardless of the request's thinking flag.
+                        const split = chat_mod.splitThinkBlock(buf, true, opens_think);
+                        if (split.reasoning_content) |rc| {
+                            const sd = try std.fmt.allocPrint(allocator,
+                                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                            , .{block_index});
+                            defer allocator.free(sd);
+                            try sendAnthropicEvent(stream, "content_block_start", sd);
+                            try emitAnthropicThinkingDelta(allocator, stream, block_index, rc);
+                            try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                            block_index += 1;
                         }
                         if (split.content.len > 0) {
                             if (!text_block_open) {
@@ -10179,8 +10446,10 @@ fn handleAnthropicStreaming(
                     },
                 }
             }
-        } else if (enable_thinking and in_think_block) {
-            // Thinking block handling
+        } else if (in_think_block) {
+            // Thinking block handling. Also covers thinking-off +
+            // template-opened (LFM2.5 class): the block streams as thinking
+            // deltas instead of being paid for and dropped.
             defer allocator.free(token_text);
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
@@ -10237,6 +10506,32 @@ fn handleAnthropicStreaming(
                         try sendAnthropicEvent(stream, "content_block_start", sd);
                         thinking_block_open = true;
                     }
+                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .self_opened) {
+                    // Muse-Glimmer reasoning segment (` to=self<|message|>`) —
+                    // closes at <|eom|>. The direct-answer header closes via
+                    // the muse arm in the close matcher below.
+                    const mskip = switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
+                        .self_opened => |hl| hl,
+                        else => unreachable,
+                    };
+                    think_close_tag = "<|eom|>";
+                    var skip: usize = mskip;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
+                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
+                    // Muse header still arriving token by token — wait.
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
                     // Partial prefix of `<|channel>thought` — wait for more tokens.
                 } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
@@ -10287,7 +10582,21 @@ fn handleAnthropicStreaming(
                 break :blk_i null;
             };
             const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
+            // Muse: a resolved non-self header is a DIRECT answer — close at 0
+            // with empty reasoning; a reasoning segment closes at its <|eom|>
+            // (gated on the muse opener having latched think_close_tag).
+            const muse_close: ?struct { pos: usize, len: usize } = blk_m: {
+                switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
+                    .direct => |hl| break :blk_m .{ .pos = 0, .len = hl },
+                    else => {},
+                }
+                if (std.mem.eql(u8, think_close_tag, "<|eom|>")) {
+                    if (std.mem.indexOf(u8, think_buf.items, "<|eom|>")) |p| break :blk_m .{ .pos = p, .len = "<|eom|>".len };
+                }
+                break :blk_m null;
+            };
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
@@ -10312,6 +10621,15 @@ fn handleAnthropicStreaming(
                 if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
                 if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
                 if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
+                // Muse next-segment header: strip when complete, arm the
+                // plain-arm skip when still arriving.
+                if (chat_mod.museContentHeaderSkip(content_after)) |hl| {
+                    content_after = content_after[hl..];
+                } else if (std.mem.startsWith(u8, content_after, "<|start|>")) {
+                    muse_skip_header = true;
+                    content_after = "";
+                }
+                if (std.mem.indexOf(u8, content_after, "<|eot|>")) |et| content_after = content_after[0..et];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     if (!text_block_open) {
@@ -10344,6 +10662,10 @@ fn handleAnthropicStreaming(
         } else {
             // Regular content token
             defer allocator.free(token_text);
+            // Muse segment-header skip: <|start|>…<|message|> is never content.
+            const was_skipping = muse_skip_header;
+            muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
+            if (was_skipping or muse_skip_header) continue;
             if (chat_mod.isChannelMarkerToken(token_text)) continue;
             if (!text_block_open) {
                 const sd = try std.fmt.allocPrint(allocator,
@@ -10368,7 +10690,7 @@ fn handleAnthropicStreaming(
     }
 
     // Flush remaining think buffer
-    if (!client_gone and enable_thinking and thinking_block_open and think_buf.items.len > 0) {
+    if (!client_gone and thinking_block_open and think_buf.items.len > 0) {
         try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
     }
     if (!client_gone and thinking_block_open) {
@@ -10415,11 +10737,12 @@ fn handleAnthropicStreaming(
                 text_block_open = false;
             }
 
-            // Emit thinking from buffered text if needed. Once the in-loop
-            // split already emitted it, the remaining buffer has no
-            // template-opened semantics — passing `opens_think` unguarded
-            // would misfile the visible tail as reasoning.
-            if (enable_thinking) {
+            // Emit thinking from buffered text if present — delivery does not
+            // key on the request's thinking flag. Once the in-loop split
+            // already emitted it, the remaining buffer has no template-opened
+            // semantics — passing `opens_think` unguarded would misfile the
+            // visible tail as reasoning.
+            {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
@@ -10464,8 +10787,11 @@ fn handleAnthropicStreaming(
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
-            // No tool calls — flush buffered tokens
-            if (enable_thinking) {
+            // No tool calls — flush buffered tokens, splitting thinking from
+            // content regardless of the request's thinking flag (split.content
+            // passes trimLeakedToolMarkup, so the unparsed-markup cut the old
+            // thinking-off arm did still happens).
+            {
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
                 for (token_texts.items) |t| try full_text.appendSlice(allocator, t);
@@ -10493,25 +10819,6 @@ fn handleAnthropicStreaming(
                         text_block_open = true;
                     }
                     try emitAnthropicTextDelta(allocator, stream, block_index, think_split.content);
-                }
-            } else {
-                // Same cut as the chat-completions flush: the held tail is
-                // unparsed tool markup, and a marker can be split across
-                // tokens, so concatenate before cutting.
-                var flush_text = std.ArrayList(u8).empty;
-                defer flush_text.deinit(allocator);
-                for (token_texts.items) |t| try flush_text.appendSlice(allocator, t);
-                const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
-                if (visible.len > 0) {
-                    if (!text_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
-                        text_block_open = true;
-                    }
-                    try emitAnthropicTextDelta(allocator, stream, block_index, visible);
                 }
             }
         }
@@ -11082,7 +11389,7 @@ fn handleResponses(
         if (active_has_tools) {
             log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
         } else {
-            const tb = try getOrBuildTokenBytes(allocator, tok);
+            const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
                 sampling.constraint = &sc.constraint;
@@ -11204,12 +11511,12 @@ fn handleResponses(
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter_resp: bool = lm.drafter != null and !config.isMoe();
+    const lm_default_enable_drafter_resp: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
         lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.drafter == null) enable_drafter_resp = false;
+    if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
     if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -11239,7 +11546,7 @@ fn handleResponses(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -11257,6 +11564,7 @@ fn handleResponses(
             .full_prompt = prompt_ids,
             .cached_tokens = 0,
             .has_tools = active_has_tools,
+            .enable_thinking = enable_thinking,
             .sampling = sampling,
             .eos_token_ids = eos_slice,
             .max_tokens = effective_max_tokens,
@@ -11264,6 +11572,7 @@ fn handleResponses(
             .enable_pld = stream_mode == .pld,
             .enable_drafter = stream_mode == .drafter,
             .drafter = if (stream_mode == .drafter) lm.drafter else null,
+            .dflash = if (stream_mode == .drafter) lm.dflash else null,
             .drafter_block_size = lm.drafter_block_size,
             .enable_mtp = stream_mode == .mtp,
             .mtp = if (stream_mode == .mtp) lm.mtp else null,
@@ -11287,7 +11596,10 @@ fn handleResponses(
         var utf8_carry_len: u8 = 0;
         var stopped = false;
         var client_gone = false;
-        var in_think_block = enable_thinking;
+        // Prompt-opened thinking streams as reasoning even when the request
+        // asked for thinking off — generated reasoning is delivered, never
+        // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
+        var in_think_block = enable_thinking or promptOpensThink(allocator, lm, tok, prompt_ids);
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
@@ -11538,7 +11850,7 @@ fn handleResponses(
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
         const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
         const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
@@ -11546,7 +11858,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -11574,9 +11886,12 @@ fn handleResponses(
     if (normalized_text) |n| final_text = n;
 
     // ── split thinking & tool calls ──
-    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids));
-    const reasoning_text: ?[]const u8 = if (enable_thinking) think_split.reasoning_content else null;
-    const visible_text: []const u8 = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
+    // Reasoning the model actually generated is always delivered — the
+    // request's thinking flag shaped the PROMPT (chat.noThinkTailSuffix),
+    // never the delivery.
+    const think_split = chat_mod.splitThinkBlock(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+    const reasoning_text: ?[]const u8 = think_split.reasoning_content;
+    const visible_text: []const u8 = think_split.content;
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools) {
@@ -14702,6 +15017,11 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const m = not_enough_memory_message;
     try testing.expect(std.mem.indexOf(u8, m, "--max-resident-mem") != null);
     try testing.expect(std.mem.indexOf(u8, m, "retry after current requests") == null);
+    // Only the resident-budget gate raises NotEnoughMemory; the free-memory
+    // preflight has its own arm (insufficient_free_memory_message). Blaming
+    // free memory here sends the user quitting apps when the fix is the cap.
+    try testing.expect(std.mem.indexOf(u8, m, "free memory") == null);
+    try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
 
     const src = @embedFile("server.zig");
     const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";
@@ -14982,4 +15302,27 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     // A token straddling the boundary belongs to content — it put bytes there.
     const mid = contentTokenRange(allocator, &tok, &token_ids, full, full[("<think>\nBecause.\n</thi").len..]);
     try std.testing.expectEqual(@as(usize, 2), mid.start);
+}
+
+test "request body cap is per route: media bodies are base64 frame payloads" {
+    // Issue #151: ONE ref2va reference video is ~100 MB of base64 JPEG frames,
+    // three of them plus full-res ref images can approach 500 MB — while no
+    // JSON chat body has any business near 64 MB.
+    for ([_][]const u8{
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/video/generations",
+        "/v1/audio/speech",
+        "/v1/audio/music-generations",
+        "/v1/3d/generations",
+    }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
+        try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+}
+
+test "the 413 names both counts it compared" {
+    var buf: [128]u8 = undefined;
+    const msg = payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "98 MB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "64 MB") != null);
 }

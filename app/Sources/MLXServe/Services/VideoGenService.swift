@@ -147,6 +147,17 @@ final class VideoGenService: ObservableObject {
                 // knows what this machine is doing right now. A three-hour job
                 // with a bar and no number is indistinguishable from a hang.
                 var clock = H3StepClock()
+                // Floor + tail for the live number (H3 only; LTX keeps the
+                // plain lap mean — its laps are near-uniform and it has no
+                // pre-run model to floor against). `fast` is effectiveFast:
+                // turbo forces the server recipe off, never !bestQuality alone.
+                let pricing: (perStep: Double, tail: Double) =
+                    request.model.backend == .minimaxH3
+                    ? H3TimeEstimate.livePricing(model: request.model,
+                                                 width: request.width, height: request.height,
+                                                 frames: request.numFrames, steps: steps,
+                                                 fast: !request.bestQuality && !request.turbo)
+                    : (0, 0)
                 let startedAt = ProcessInfo.processInfo.systemUptime
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/video/generations", json: body) {
@@ -157,7 +168,9 @@ final class VideoGenService: ObservableObject {
                         let stage = ev["stage"] as? String ?? "Generating"
                         clock.observe(step: step)
                         var message = "\(stage)…"
-                        if let eta = clock.eta(totalSteps: max(total, 1)), eta > 0 {
+                        if let eta = clock.eta(totalSteps: max(total, 1),
+                                               floorPerStep: pricing.perStep, tail: pricing.tail),
+                           eta > 0 {
                             message += " \(H3TimeEstimate.duration(eta)) left"
                         }
                         setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)

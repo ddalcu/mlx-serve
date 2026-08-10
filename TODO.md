@@ -7,6 +7,7 @@
 * Stretch: DSpark/EAGLE3-class trained drafter (ARahim3/mlx-dspark) — needs a per-target trained 5-layer backbone (none exists for Qwen3.6-27B)
 * M5 Nax
 * P2P
+* Distributed inference between mlx-serve peers: wire mlx_distributed_* (already in mlx-c pin, ring backend over TCP/TB), lan.zig discovery builds the hostfile, pipeline-parallel layer shards first (rank 0 keeps HTTP/scheduler; spec/prefix-cache/batching off for sharded models); win case = models too big for one box
 * Launch code via cli
 * DSV4 prefill attention: hd-512 flash kernel with in-kernel sinks + block-skip pre-pass (reference in `lib/ds4/metal/flash_attn.metal`); post-sorted-gather prefill is ~all attention-side. Related A/Bs from the mxfp4 branch: direct-RHS dequant-in-kernel GEMM for the 32-2048 M band, tiny_pair_mv at verify width (C≈5, untested — the −2.5% MOE_GATEUP number was M=1).
 * DSV4 back-pocket: w2 3→4-bit requant (~+11 GB at g128); weak case after imatrix calibration, only if decode becomes kernel-bound.

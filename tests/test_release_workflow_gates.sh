@@ -49,9 +49,13 @@ def step_if(name):
 rel_if = step_if("Create Release")
 check("pull_request" in rel_if and "!=" in rel_if,
       "Create Release gated off for pull_request")
-brew_if = step_if("Update Homebrew formulas")
-check("pull_request" in brew_if and "!=" in brew_if,
-      "Homebrew formula push gated off for pull_request")
+# The formula push lives in homebrew.yml, triggered by the draft -> published
+# transition — pushing it from the build job advertised a version whose assets
+# were still locked behind the unpublished draft (checked below).
+check(not any("Update Homebrew formulas" in n for n in steps),
+      "release.yml no longer pushes Homebrew formulas")
+check("Formula/mlx-serve.rb" not in open(".github/workflows/release.yml").read(),
+      "release.yml never touches the formula files")
 check("workflow_dispatch" in step_if("Create tag (manual dispatch)"),
       "tag creation restricted to workflow_dispatch")
 
@@ -106,8 +110,7 @@ check(any("CFBundleShortVersionString" in l for l in stamp)
 check(stamp and all("steps.version.outputs.version" in l for l in stamp),
       "Info.plist stamp uses the CI-computed version")
 
-# Stamp the bundle COPY, never the repo file: the Homebrew step later runs
-# `git rebase origin/main`, which refuses to run against a dirty tree.
+# Stamp the bundle COPY, never the repo file — the committed plist stays clean.
 check(stamp and all('"$CONTENTS/Info.plist"' in l for l in stamp),
       "stamp targets the bundle copy, not the repo's app/Info.plist")
 
@@ -147,6 +150,31 @@ for name, text in (("release.yml CLI tarball + app bundle", wf_text),
 # Two copies in release.yml: one per artifact (tarball and .app).
 check(wf_text.count("LICENSE-APACHE-2.0") >= 2,
       "release.yml packages the licenses into BOTH the tarball and the .app")
+
+# ── Homebrew push timing: the release is created as a DRAFT, so its assets
+# are not downloadable until it is published. The formula push must fire on
+# the publish transition ONLY — any other trigger reintroduces the window
+# where `brew upgrade` advertises a version nobody can download.
+bwf = yaml.safe_load(open(".github/workflows/homebrew.yml"))
+btriggers = bwf.get("on", bwf.get(True, {}))
+check(list(btriggers) == ["release"],
+      "homebrew.yml triggers on the release event only")
+check(btriggers.get("release", {}).get("types") == ["published"],
+      "homebrew.yml fires only when a release is PUBLISHED")
+
+bjob = bwf["jobs"]["update-formulas"]
+check("prerelease" in str(bjob.get("if", "")),
+      "pre-releases never reach brew")
+
+bsteps = bjob["steps"]
+checkout = next((s for s in bsteps
+                 if s.get("uses", "").startswith("actions/checkout")), {})
+check(checkout.get("with", {}).get("ref") == "main",
+      "formula commit lands on main, not the release tag checkout")
+
+bruns = " ".join(str(s.get("run", "")) for s in bsteps)
+for f in ("Formula/mlx-serve.rb", "Casks/mlx-core.rb"):
+    check(f in bruns, f"homebrew.yml updates {f}")
 
 sys.exit(FAIL)
 EOF

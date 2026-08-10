@@ -880,6 +880,7 @@ pub const Engine = struct {
         // 4. Euler denoise. text mask is all-valid ⇒ null (no additive mask).
         // Update in f32, store back in the latent (bf16) dtype — `_mage_flow_euler_step`.
         for (0..n_steps) |i| {
+            if (progress) |p| if (p.cancelled()) return error.Cancelled;
             const v = try self.dit.forward(img, txt, sigmas[i], 1, lat_h, lat_w, null);
             defer _ = mlx.mlx_array_free(v);
             const img_f = try astype(img, .float32, s);
@@ -1051,7 +1052,9 @@ fn denoiseEditLoop(dit: *const Dit, txt: mlx.mlx_array, noise: mlx.mlx_array, re
     const HW = lat_h * lat_w;
     var target = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&target, noise));
+    errdefer _ = mlx.mlx_array_free(target);
     for (0..sigmas.len - 1) |i| {
+        if (progress) |p| if (p.cancelled()) return error.Cancelled;
         const model_input = try concat(&.{ target, ref_latents }, 1, s); // [1, n_images*HW, 128]
         defer _ = mlx.mlx_array_free(model_input);
         const v_full = try dit.forward(model_input, txt, sigmas[i], n_images, lat_h, lat_w, null);

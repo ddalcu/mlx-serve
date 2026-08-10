@@ -1,11 +1,6 @@
 import Foundation
 
 /// The two first-run decisions, as pure data.
-///
-/// Both surfaces they drive are awkward to test directly — the welcome window
-/// is a bare `NSHostingView` outside the SwiftUI Scene graph, and the chat gate
-/// is a sheet over a window — so the DECISION lives here and each view stays a
-/// thin renderer of it. Same shape as `ChatModeToggles`/`ModelUseState`.
 
 // MARK: - What a launch opens
 
@@ -28,27 +23,48 @@ enum LaunchDecision: Equatable {
         welcomeSuppressed ? .openChat : .showWelcome
     }
 
+    /// Constant, and that IS the point: the welcome is a SHEET on the chat
+    /// window now, and a sheet with no host window is a screen nobody can see.
+    /// `.showWelcome` used to skip opening Chat — the welcome floated over an
+    /// empty desktop and every exit had to remember to open one.
+    var opensChatWindow: Bool { true }
+
+    var presentsWelcome: Bool { self == .showWelcome }
+
     /// UserDefaults key behind `welcomeSuppressed`. Absent ⇒ false ⇒ the
     /// welcome shows, which is the pre-existing behaviour on every launch.
     static let suppressDefaultsKey = "suppressWelcomeWindow"
+}
+
+// MARK: - Leaving the welcome window
+
+/// Every way out of the welcome window, and what each one leaves on screen.
+enum WelcomeExit: CaseIterable, Equatable {
+    /// The footer's primary button.
+    case startChatting
+    /// A model row's Get/Use control, once the model is loaded.
+    case useModel
+    /// "Browse all models" in the Run-models panel.
+    case browseModels
+
+    /// Deliberately constant: it is the invariant, and a test asserts it over
+    /// `allCases` so a new exit can't opt out by forgetting.
+    var opensChat: Bool { true }
+
+    var opensModelBrowser: Bool { self == .browseModels }
+
+    /// Also constant. It used to be load-bearing against the dead end above:
+    /// the welcome floated over everything, so anything it opened was
+    /// invisible until it closed. As a SHEET on the chat window the dead end
+    /// is unbuildable — whatever dismisses it, a composer is what's behind it —
+    /// so this is now simply what "leaving" means.
+    var closesWelcome: Bool { true }
 }
 
 // MARK: - The chat gate
 
 /// Whether the chat window must block on "you need a model first", and what
 /// that block says.
-///
-/// The condition is a CHAT-CAPABLE model, not "any model": someone whose only
-/// download is an image backend has a full `~/.mlx-serve/models` and still
-/// cannot send a message. `localModels` already covers LM Studio's folder and
-/// the Hugging Face hub cache (`DownloadManager.discoverLocalModels`), so
-/// anyone who arrived with models never sees the sheet — and because it's
-/// `@Published`, the sheet clears itself the moment a download lands.
-///
-/// LAN-discovered chat models count as usable, same as `trayHasNoUsableModels`:
-/// a Mac with nothing downloaded can still chat on a peer's model, and a gate
-/// that blocked it would lock the user out of a conversation they can already
-/// have.
 enum ChatGateState: Equatable {
     /// A chat model is available — no sheet.
     case hidden

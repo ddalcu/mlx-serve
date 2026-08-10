@@ -35,7 +35,8 @@ extension AppState {
                                autoApprove: Bool = false,
                                workingDirectory: String? = nil,
                                modelPath: String? = nil,
-                               disabledTools: Set<AgentToolKind> = []) -> ResolvedAgentSettings {
+                               disabledTools: Set<AgentToolKind> = [],
+                               reasoningEffort: ReasoningEffort = .low) -> ResolvedAgentSettings {
         let defaults = AppDefaultsSnapshot(
             toolsEnabled: toolsEnabled,
             mcpEnabled: mcpEnabled,
@@ -52,7 +53,8 @@ extension AppState {
             temperature: serverOptions.defaultTemperature,
             maxTokens: maxTokens,
             voice: globalVoice,
-            wakePhrase: WakeWord.normalizePhrase(serverOptions.wakePhrase) ?? WakeWord.defaultPhrase)
+            wakePhrase: WakeWord.normalizePhrase(serverOptions.wakePhrase) ?? WakeWord.defaultPhrase,
+            reasoningEffort: reasoningEffort)
         return AgentResolution.resolve(agent: agents.agent(id: agentId), defaults: defaults)
     }
 

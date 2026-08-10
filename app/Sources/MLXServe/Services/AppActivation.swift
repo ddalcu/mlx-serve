@@ -10,23 +10,6 @@ protocol AppActivating: AnyObject {
 }
 
 /// Brings this `LSUIElement` app properly forward before it presents UI.
-///
-/// THE RULE: flip to `.regular` **before** the window or panel is presented,
-/// then activate. Never the other way round.
-///
-/// Why it matters: an accessory app that isn't active has NO key window. So a
-/// window opened while `.accessory` is ordered on screen but never becomes key —
-/// no blinking caret, no first responder, the title bar half-lit. And
-/// `ActivationPolicyManager` can't rescue it, because the only thing it listens
-/// for (`didBecomeKeyNotification`) cannot fire until the app is active. The
-/// window therefore sits semi-focused until the user clicks or types, which
-/// finally activates the app, which finally fires the notification, which
-/// finally flips the policy — the "if I start typing it gets activated" symptom.
-/// A modal `NSOpenPanel` presented from an inactive accessory app fails the same
-/// way: it opens behind/unfocused and won't take clicks until you fight with it.
-///
-/// `openAndFocus` used to do `openWindow(id:)` → `activate()` with the policy
-/// still `.accessory`, which is the inverted order.
 @MainActor
 enum AppActivation {
 
@@ -66,14 +49,7 @@ enum AppActivation {
     static func windowTitle(for id: String) -> String {
         switch id {
         case "chat":         return "MLX Core"
-        case "modelBrowser": return "Model Browser"
-        case "imageGen":     return "Image Generation"
-        case "videoGen":     return "Video Generation"
-        case "audioGen":     return "Audio Generation"
-        case "model3dGen":   return "3D Generation"
-        case "settings":     return "Settings"
         case "serverLog":    return "Server Log"
-        case "tasks":        return "Tasks"
         // Base title only — a live session retitles to "pi — MLX Sandbox";
         // the identifier fallback in windowMatches covers that state.
         case "sandboxTerminal": return "MLX Sandbox"
@@ -82,12 +58,6 @@ enum AppActivation {
     }
 
     /// Is this NSWindow the one scene `id` opens?
-    ///
-    /// Title alone is NOT enough: `ChatView` sets `.navigationTitle("")`, so the
-    /// chat window — the one users open most — has an EMPTY `NSWindow.title` and
-    /// never matched the old `title == "MLX Core"` lookup, which meant the raise
-    /// silently did nothing for it. Fall back to the scene identifier, and match
-    /// nothing at all rather than grab an unrelated window.
     static func windowMatches(id: String, title: String, identifier: String?) -> Bool {
         if !title.isEmpty, title == windowTitle(for: id) { return true }
         if let identifier, identifier.localizedCaseInsensitiveContains(id) { return true }
@@ -117,10 +87,6 @@ enum AppActivation {
 
     /// Run a file picker modally, focused. The ONLY way the app runs a panel
     /// modally (pinned by `AppActivationTests.testNoRawPanelPresentation`).
-    ///
-    /// `ActivationPolicyManager` deliberately doesn't count panels as user
-    /// windows (the quick launcher is a panel), so it won't flip the policy for
-    /// us — this must.
     @discardableResult
     static func runModal(_ panel: NSSavePanel) -> NSApplication.ModalResponse {
         focus()

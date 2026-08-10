@@ -245,6 +245,10 @@
       margin-left: 2px;
     }
 
+    /* assets/version.js fills this from the latest GitHub release; until it
+       does (or if the call fails) there is nothing to show, so show nothing. */
+    .nav-ver:empty { display: none; }
+
     .nav-dl {
       font-size: 12.5px; font-weight: 600; color: var(--white) !important;
       background: var(--text-primary); padding: 6px 14px; border-radius: 100px;
@@ -1216,6 +1220,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
+      <span class="nav-ver"></span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -2254,6 +2259,7 @@
     }
 
   </script>
+  <script src="assets/version.js"></script>
   <script src="assets/perf-chart.js"></script>
 
 </body>

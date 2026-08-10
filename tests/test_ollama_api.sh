@@ -87,7 +87,11 @@ assert "data:" not in "".join(lines), "SSE framing leaked into NDJSON"
 PY
 
 # ── 6. Ollama-style name resolution: short/tagged name routes (or falls back) ──
-C=$(api /api/chat -X POST -d '{"model":"qwen3.5:latest","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"temperature":0,"num_predict":16}}' | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d["message"]["content"])>0)' 2>/dev/null)
+# The bar is that the name RESOLVED and the model generated — not that the
+# reply is non-empty: a thinking-by-default checkpoint spends the whole
+# num_predict budget inside <think> and answers with "" (checkpoint
+# expectation class).
+C=$(api /api/chat -X POST -d '{"model":"qwen3.5:latest","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"temperature":0,"num_predict":16}}' | python3 -c 'import sys,json;d=json.load(sys.stdin);print("error" not in d and "message" in d and d["eval_count"]>0)' 2>/dev/null)
 [ "$C" = "True" ] && ok "tagged model name accepted (qwen3.5:latest)" || bad "tagged model name"
 
 # ── 7. done_reason length via options.num_predict ──

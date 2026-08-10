@@ -75,6 +75,37 @@ struct ModelRoots {
         return Self.existingDirectory(raw)
     }
 
+    /// The folders the app ITSELF downloads into — destination first, then the
+    /// built-in root every install started with. `scanRoots` is what the SERVER
+    /// scans; this is what the app's own reads ("is this repo on disk?",
+    /// discovery, delete) must check. Reading only the destination is how
+    /// moving it made the pre-move library vanish from the picker while
+    /// `/v1/models`, which scans both, kept serving it. Not existence-filtered
+    /// (a read against a missing folder just finds nothing), and never LM
+    /// Studio / custom folders — other tools' trees the app must not delete
+    /// into.
+    var ownedRoots: [String] {
+        let dest = downloadRoot
+        return dest == Self.builtInRoot ? [dest] : [dest, Self.builtInRoot]
+    }
+
+    /// The folders the app READS when asking "is this repo on disk?" — the
+    /// same list the server scans, in the same first-wins order. A pack in ANY
+    /// served folder must not be offered as a download (live 2026-08-09: a
+    /// Mage-Flow pack in the custom scan folder showed a Download bar, and
+    /// Generate could not resolve its dir). Only WRITES, cancel cleanup and
+    /// deletes stay on `ownedRoots` — the extra folders are the user's or
+    /// another tool's trees the app must not delete into.
+    func readRoots(lmStudioRoot: String?) -> [String] {
+        scanRoots(lmStudioRoot: lmStudioRoot)
+    }
+
+    /// Static convenience for read sites without a DownloadManager instance
+    /// (ServerManager's resolver, the voice-clone disk check).
+    static func readRoots() -> [String] {
+        ModelRoots().readRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+    }
+
     /// Every folder to scan, in the order the server should take them:
     /// download destination first, because `--model-dir` is first-wins on a
     /// repeated model id and the folder we write into holds the live copy.

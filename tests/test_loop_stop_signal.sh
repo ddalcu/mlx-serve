@@ -105,12 +105,36 @@ print("verdict", "trimmed" if reps <= 4 else "carries the loop")
 PY
 grep -q "^verdict trimmed$" "$LOG.trim"; check "the degenerate tail is cut from the non-streaming body ($(grep '^reps' "$LOG.trim"))" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
-# ── 2. chat, streaming: signal on the final chunk ────────────────────────
+# ── 2. chat, streaming: signal on the final chunk, ONCE ──────────────────
+# The include_usage chunk used to RESTATE finish_reason + finish_details
+# beside the usage object (OpenAI ships that chunk with "choices": []), so
+# every per-event client rendered the ending twice — PR #147's doubled
+# truncation banner. Three assertions: the signal is present, it appears on
+# EXACTLY one chunk, and the usage chunk carries an empty choices array.
 echo "[2/6] /v1/chat/completions streaming"
 curl -sN "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
-  | grep -c '"finish_details":{"type":"repetition_loop"}' > "$LOG.stream"
+  > "$LOG.rawstream"
+grep -c '"finish_details":{"type":"repetition_loop"}' "$LOG.rawstream" > "$LOG.stream"
 [ "$(cat "$LOG.stream")" -ge 1 ]; check "the final chunk carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+[ "$(cat "$LOG.stream")" -eq 1 ]; check "finish_details appears on exactly ONE chunk" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+python3 - "$LOG.rawstream" <<'PY' > "$LOG.usage"
+import json, sys
+finish, usage_ok = 0, None
+for line in open(sys.argv[1]):
+    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+        continue
+    c = json.loads(line[6:])
+    for ch in c.get("choices", []):
+        if ch.get("finish_reason") is not None:
+            finish += 1
+    if isinstance(c.get("usage"), dict) and "prompt_tokens" in c["usage"]:
+        usage_ok = (c.get("choices") == [])
+print("finish_chunks", finish)
+print("usage_choices_empty", usage_ok)
+PY
+grep -q "^finish_chunks 1$" "$LOG.usage"; check "finish_reason appears on exactly ONE chunk" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+grep -q "^usage_choices_empty True$" "$LOG.usage"; check "the usage chunk ships \"choices\":[]" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 3. completions, non-streaming ────────────────────────────────────────
 echo "[3/6] /v1/completions non-streaming"
@@ -120,11 +144,26 @@ curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/js
 [ "$(cat "$LOG.cmpl")" -ge 1 ]; check "completions carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 4. completions, streaming ────────────────────────────────────────────
+# Same usage-chunk contract as chat: with include_usage the usage rides its
+# own empty-choices chunk, never the finish chunk.
 echo "[4/6] /v1/completions streaming"
 curl -sN "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0,\"stream\":true}" \
-  | grep -c '"finish_details":{"type":"repetition_loop"}' > "$LOG.cmplstream"
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
+  > "$LOG.rawcmpl"
+grep -c '"finish_details":{"type":"repetition_loop"}' "$LOG.rawcmpl" > "$LOG.cmplstream"
 [ "$(cat "$LOG.cmplstream")" -ge 1 ]; check "the completions final chunk carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+python3 - "$LOG.rawcmpl" <<'PY' > "$LOG.cmplusage"
+import json, sys
+usage_ok = None
+for line in open(sys.argv[1]):
+    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+        continue
+    c = json.loads(line[6:])
+    if isinstance(c.get("usage"), dict) and "prompt_tokens" in c["usage"]:
+        usage_ok = (c.get("choices") == [])
+print("usage_choices_empty", usage_ok)
+PY
+grep -q "^usage_choices_empty True$" "$LOG.cmplusage"; check "the completions usage chunk ships \"choices\":[]" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 5. an ORDINARY response must be byte-unchanged ───────────────────────
 echo "[5/6] a normal answer says nothing new"

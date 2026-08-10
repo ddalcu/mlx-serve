@@ -12,6 +12,15 @@ enum ChatMetrics {
     /// transcript content, context monitor, composer row.
     static let gutter: CGFloat = 16
 
+    /// The reading measure — the width the transcript AND the composer are
+    /// capped at, centred in whatever the window gives them.
+    static let contentMaxWidth: CGFloat = 740
+
+    /// Between turns in the transcript. Wider than the old 12: with the column
+    /// capped, vertical rhythm is what separates one turn from the next — the
+    /// window's edges no longer do it.
+    static let transcriptSpacing: CGFloat = 18
+
     /// Inner padding + radius of a message bubble (and the tool-call card,
     /// which is styled as one).
     static let bubblePaddingH: CGFloat = 14
@@ -34,17 +43,22 @@ enum ChatMetrics {
 
     /// Exact height of BOTH controls in the sidebar's bottom row (New Chat +
     /// the agent menu).
-    ///
-    /// They are `.plain` buttons drawing their own background — the same shape
-    /// as the composer's discs — precisely so this number is the height. Don't
-    /// put them back on `.buttonStyle(.bordered)`: a bordered control keeps its
-    /// INTRINSIC size and merely centers inside whatever frame it's given, so
-    /// its height can only be steered indirectly through the label, and a text
-    /// label and a bare glyph never land on the same number. Measured through
-    /// the accessibility API while both sat inside 28pt frames: New Chat 24pt,
-    /// the menu 17pt.
     static let sidebarButtonHeight: CGFloat = 28
     static let sidebarButtonCornerRadius: CGFloat = 6
+
+    /// The transcript's reading size.
+    static let transcriptFontSize: CGFloat = 16
+    /// Fenced/inline code inside the transcript. Monospaced digits and glyphs
+    /// run wide, so matching the prose size makes code look larger than the
+    /// sentence around it.
+    static let transcriptCodeFontSize: CGFloat = 14
+
+    /// Panel edge → row edge. Every row in the sidebar reads it, so the
+    /// destinations and the conversations are the same width by construction.
+    static let sidebarGutter: CGFloat = 8
+    /// Row edge → label. The icon of a destination and the title of a chat both
+    /// start here, which is what makes the column read as one list.
+    static let sidebarRowInset: CGFloat = 8
 
     // The Think / Agent / MCP capsules that used to live in the window toolbar
     // had their own `togglePill*` geometry here. They are icon-only composer

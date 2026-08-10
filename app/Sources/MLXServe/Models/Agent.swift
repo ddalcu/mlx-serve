@@ -49,6 +49,15 @@ struct Agent: Identifiable, Codable, Equatable {
     var enableThinking: Bool?
     var temperature: Double?
     var maxTokens: Int?
+    /// The rest of the sampling surface, mirroring the app's saved defaults
+    /// (Settings ▸ Sampling). Each is the same knob the request layer already
+    /// sends; the canonical "off" values (top_k 0, repeat 1.0, presence 0.0,
+    /// budget -1) mean the same thing here they mean there.
+    var topP: Double?
+    var topK: Int?
+    var repeatPenalty: Double?
+    var presencePenalty: Double?
+    var reasoningBudget: Int?
 
     init(id: UUID = UUID(),
          name: String,
@@ -66,7 +75,12 @@ struct Agent: Identifiable, Codable, Equatable {
          autoApproveTools: Bool? = nil,
          enableThinking: Bool? = nil,
          temperature: Double? = nil,
-         maxTokens: Int? = nil) {
+         maxTokens: Int? = nil,
+         topP: Double? = nil,
+         topK: Int? = nil,
+         repeatPenalty: Double? = nil,
+         presencePenalty: Double? = nil,
+         reasoningBudget: Int? = nil) {
         self.id = id
         self.name = name
         self.brief = brief
@@ -84,6 +98,11 @@ struct Agent: Identifiable, Codable, Equatable {
         self.enableThinking = enableThinking
         self.temperature = temperature
         self.maxTokens = maxTokens
+        self.topP = topP
+        self.topK = topK
+        self.repeatPenalty = repeatPenalty
+        self.presencePenalty = presencePenalty
+        self.reasoningBudget = reasoningBudget
     }
 
     /// The agent a finished `AgentWriter.Draft` becomes. The symbol is guessed
@@ -114,6 +133,7 @@ struct Agent: Identifiable, Codable, Equatable {
         case id, name, brief, systemPrompt, symbol, voiceID, createdAt
         case isBuiltIn, wakePhrase, voice, workingDirectory, modelPath, capabilities
         case autoApproveTools, enableThinking, temperature, maxTokens
+        case topP, topK, repeatPenalty, presencePenalty, reasoningBudget
         /// iPhone-only spelling of the Web capability.
         case canSearchWeb
     }
@@ -146,6 +166,11 @@ struct Agent: Identifiable, Codable, Equatable {
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking)
         temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)
         maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens)
+        topP = try c.decodeIfPresent(Double.self, forKey: .topP)
+        topK = try c.decodeIfPresent(Int.self, forKey: .topK)
+        repeatPenalty = try c.decodeIfPresent(Double.self, forKey: .repeatPenalty)
+        presencePenalty = try c.decodeIfPresent(Double.self, forKey: .presencePenalty)
+        reasoningBudget = try c.decodeIfPresent(Int.self, forKey: .reasoningBudget)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -167,8 +192,49 @@ struct Agent: Identifiable, Codable, Equatable {
         try c.encodeIfPresent(enableThinking, forKey: .enableThinking)
         try c.encodeIfPresent(temperature, forKey: .temperature)
         try c.encodeIfPresent(maxTokens, forKey: .maxTokens)
+        try c.encodeIfPresent(topP, forKey: .topP)
+        try c.encodeIfPresent(topK, forKey: .topK)
+        try c.encodeIfPresent(repeatPenalty, forKey: .repeatPenalty)
+        try c.encodeIfPresent(presencePenalty, forKey: .presencePenalty)
+        try c.encodeIfPresent(reasoningBudget, forKey: .reasoningBudget)
         // Written for the phone's benefit, read back into `capabilities.web`.
         try c.encode(capabilities.web, forKey: .canSearchWeb)
+    }
+}
+
+/// The editor's reasoning-budget choices, in the server's own `reasoning_effort`
+/// denominations (`effortBudget`: low 512 / medium 2048 / high 8192; unlimited
+/// = -1). Stored as TOKENS in `Agent.reasoningBudget` so the wire stays
+/// `reasoning_budget` — sending `reasoning_effort` would also flip thinking
+/// on/off, which the Capabilities tri-state owns.
+enum AgentReasoningEffort: CaseIterable {
+    case low, medium, high, unlimited
+
+    var budgetTokens: Int {
+        switch self {
+        case .low: return 512
+        case .medium: return 2048
+        case .high: return 8192
+        case .unlimited: return -1
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        case .unlimited: return "Unlimited"
+        }
+    }
+
+    /// The level a token count reads as: any negative is unlimited, anything
+    /// else snaps to the closest finite level — older builds stored raw
+    /// numbers, and the app default can be any preset.
+    static func nearest(to budget: Int) -> AgentReasoningEffort {
+        guard budget >= 0 else { return .unlimited }
+        let finite: [AgentReasoningEffort] = [.low, .medium, .high]
+        return finite.min { abs($0.budgetTokens - budget) < abs($1.budgetTokens - budget) } ?? .high
     }
 }
 

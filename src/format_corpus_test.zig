@@ -2,7 +2,7 @@
 //!
 //! A table of REAL captured model outputs (plus a few minimal synthetic
 //! variants of real failures) run through the pure post-processing layer:
-//! `chat.splitThinkBlock` / `chat.stripThinkBlock` / `chat.parseToolCalls` —
+//! `chat.splitThinkBlock` / `chat.parseToolCalls` —
 //! and back through the INPUT layer (`chat.serializeMessagesJson`), since
 //! every output re-enters the next request's history.
 //! No model weights, no server — runs in CI on every `zig build test`.
@@ -44,7 +44,8 @@ const Expect = struct {
     family: []const u8,
     name: []const u8,
     raw: []const u8,
-    /// Request had thinking enabled (selects splitThinkBlock vs stripThinkBlock).
+    /// Request had thinking enabled. Documentation of the original capture —
+    /// the server splits (and delivers reasoning) either way.
     thinking: bool = false,
     /// Generation prompt ended with a template-injected think opener
     /// (Qwen 3.5/3.6 render `…assistant\n<think>\n`).
@@ -214,7 +215,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "might also want",
     },
     .{
-        // Same tail behavior with thinking OFF → stripThinkBlock path.
+        // Same tail behavior with thinking OFF (same split path).
         .family = "gemma4",
         .name = "trailing <|channel>thought opener never leaks (thinking off)",
         .raw = "Here is the design.\n<|channel>thought\nI should now write the file",
@@ -450,7 +451,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "check the directory once more",
     },
     .{
-        // Same shape, thinking OFF → stripThinkBlock path must also cut at
+        // Same shape, thinking OFF — the split must also cut at
         // the first unclosed opener.
         .family = "gemma4",
         .name = "multiple unclosed thought openers stripped (thinking off)",
@@ -473,7 +474,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "Let me plan the answer.",
     },
     .{
-        // Same shape, thinking OFF → stripThinkBlock path. THIS is the exact
+        // Same shape, thinking OFF. THIS is the exact
         // form captured live: visible content was the literal `<|channel>thought\n`.
         .family = "gemma4",
         .name = "re-opened thought opener right after close never leaks (thinking off)",
@@ -507,7 +508,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "Find the file.",
     },
     .{
-        // Same shape, thinking OFF → stripThinkBlock path.
+        // Same shape, thinking OFF (same split path).
         .family = "gemma4",
         .name = "trailing <channel|> close-marker spam never leaks (thinking off)",
         .raw = "Reasoning about the file.\n<channel|>running glob\n\n" ++
@@ -1414,6 +1415,68 @@ const corpus = [_]Expect{
         .no_tool_calls = true,
         .content_contains = "get_weather(city='Paris')",
     },
+
+    // ── Muse-Glimmer (muse_glimmer, meta-models Muse-Glimmer-30B) ──────────
+    // Harmony-style channel segments after the prompt's bare
+    // `<|start|>assistant`: ` to=self<|message|>R<|eom|>` then
+    // `<|start|>assistant to=user<|message|>C` or a to=<fn> ATEM tool block.
+    .{
+        .family = "muse_glimmer",
+        .name = "self reasoning + user content channels split cleanly",
+        .raw = " to=self<|message|>2+2 is 4; answer plainly.<|eom|><|start|>assistant to=user<|message|>4",
+        .thinking = true,
+        .content_exact = "4",
+        .reasoning_contains = "answer plainly",
+    },
+    .{
+        .family = "muse_glimmer",
+        .name = "direct to=user answer strips the header",
+        .raw = " to=user<|message|>Hello! How can I help?",
+        .thinking = true,
+        .content_exact = "Hello! How can I help?",
+    },
+    .{
+        // Length-truncated mid-thought: reasoning, never content.
+        .family = "muse_glimmer",
+        .name = "truncated self segment stays out of content",
+        .raw = " to=self<|message|>The user is asking for a Python function that",
+        .thinking = true,
+        .content_exact = "",
+        .reasoning_contains = "Python function",
+    },
+    .{
+        // ATEM tool call after reasoning; bool spelled bare + schema agrees.
+        .family = "muse_glimmer",
+        .name = "ATEM tool call after thinking",
+        .raw = " to=self<|message|>Need the weather; call get_weather.<|eom|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n<atem:parameter name=\"celsius\">true</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
+        .thinking = true,
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+        .reasoning_contains = "call get_weather",
+    },
+    .{
+        // Truncation inside an argument VALUE: NAME + completed params only.
+        .family = "muse_glimmer",
+        .name = "truncated ATEM value salvages name, drops the fragment",
+        .raw = " to=write<|message|><atem:function_calls>\n<atem:invoke name=\"write\">\n<atem:parameter name=\"path\">novel.txt</atem:parameter>\n<atem:parameter name=\"content\">Chapter 1. It was a dark and",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // Prose about the ATEM syntax with no invoke marker is not a call.
+        .family = "muse_glimmer",
+        .name = "prose mentioning atem syntax is not a tool call",
+        .raw = " to=user<|message|>Tools are invoked with an atem:function_calls block.",
+        .no_tool_calls = true,
+        .content_contains = "atem:function_calls block",
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -1427,6 +1490,9 @@ const leak_tags = [_][]const u8{
     "<|content_invoke_tool_json|>",
     // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
     "<｜DSML｜",
+    // Muse-Glimmer channel markers (each a single special token). The
+    // `assistant to=` header TEXT between them is covered by the split tests.
+    "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
@@ -1434,7 +1500,7 @@ const leak_tags = [_][]const u8{
 /// out here so the guard fails if the cut list is narrowed.
 const reasoning_leak_tags = [_][]const u8{
     "<｜DSML｜",  "<|tool_call", "<tool_call",
-    "<tool_calls:", "<|content_invoke_tool_json|>",
+    "<tool_calls:", "<|content_invoke_tool_json|>", "<atem:",
 };
 
 fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {
@@ -1583,10 +1649,11 @@ test "format corpus: recorded model outputs across families" {
         }
 
         // ── Visible content / reasoning split (server's no-tool-call path). ──
-        const split: chat.ThinkSplit = if (entry.thinking)
-            chat.splitThinkBlock(raw, true, entry.opened_by_template)
-        else
-            .{ .reasoning_content = null, .content = chat.stripThinkBlock(raw) };
+        // ONE path for both thinking flags: the server always splits and
+        // DELIVERS whatever reasoning the model generated (thinking-off is
+        // enforced prompt-side via chat.noThinkTailSuffix, never by dropping
+        // generated tokens). `entry.thinking` documents the original request.
+        const split: chat.ThinkSplit = chat.splitThinkBlock(raw, true, entry.opened_by_template);
         // When tool calls parsed, the server emits NO content from this text.
         const content: []const u8 = if (calls != null) "" else split.content;
 
@@ -1670,6 +1737,20 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
                     const e = p + "<|end_message|>".len;
                     if (best == null or e < best.?) best = e;
                 }
+            }
+            // Muse: a to=self segment closes at <|eom|>; a resolved non-self
+            // header IS the close (immediate split, empty reasoning).
+            switch (chat.museThinkOpenerAt(entry.raw)) {
+                .self_opened => {
+                    if (std.mem.indexOf(u8, entry.raw, "<|eom|>")) |p| {
+                        const e = p + "<|eom|>".len;
+                        if (best == null or e < best.?) best = e;
+                    }
+                },
+                .direct => |hl| {
+                    if (best == null or hl < best.?) best = hl;
+                },
+                else => {},
             }
             break :blk best;
         };

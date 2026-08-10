@@ -16,6 +16,9 @@
 #       - iproute2                    : ss, ip (modern net tooling; the sandbox init uses `ip link`)
 #       - less                        : pager expected by git log / man
 #       - nano                        : small everyday editor (vim is heavier; skipped)
+#       - xz-utils                    : tar.xz is the default compression for half the
+#                                       ecosystem's release tarballs (node, hermes's
+#                                       managed Node — issue #150); tar shells out to xz
 #       - dropbear-bin                : sshd for the Sandbox terminal's agent CLI sessions
 #                                       (mlx-serve's /.vz-init starts `dropbear -R -s -p 22`;
 #                                       -bin only = no init scripts, ~500 KB). The app PROBES
@@ -30,6 +33,12 @@ ARG NODE_TAG=24-trixie-slim
 # Stage 1: source of a known-good Node.js + npm (same Debian base = ABI match)
 ##############################################################################
 FROM node:${NODE_TAG} AS nodesrc
+# npm: track latest. node:24 bundles npm 11.16.0, inside the 11.10-11.16 band
+# hermes's installer rejects (those npms ignore min-release-age-exclude; issue
+# #150) — with a current npm the baked Node passes hermes's toolchain check and
+# it skips downloading its own managed Node. Upgraded HERE, not in the final
+# image, so the node_modules COPY below carries no dead old-npm lower layer.
+RUN npm install -g --no-fund --no-audit npm@latest
 
 ##############################################################################
 # Stage 2: strip the Node binary (binutils lives only here, never shipped)
@@ -90,6 +99,7 @@ RUN apt-get update \
         iproute2 \
         less \
         nano \
+        xz-utils \
         dropbear-bin \
  && rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED \
  && apt-get clean \
@@ -132,6 +142,7 @@ RUN node --version && npm --version && python3 --version && python3 -m pip --ver
  && command -v killall && command -v pstree \
  && command -v lsof \
  && { ss --version || ip -V; } \
+ && xz --version \
  && command -v dropbear \
  && test ! -e /usr/lib/python3.*/EXTERNALLY-MANAGED  # pip must be unblocked
 

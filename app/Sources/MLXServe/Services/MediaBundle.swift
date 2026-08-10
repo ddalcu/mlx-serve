@@ -411,19 +411,19 @@ extension MusicModelPreset {
 /// modalities instead of four near-duplicate views. `Model3DModelPreset`
 /// deliberately does NOT conform — the Media tab covers exactly the four
 /// modalities the user asked for; 3D stays its own thing for now.
-protocol MediaModelPreset: Identifiable, Hashable where ID == String {
+/// What every media preset — INCLUDING 3D — can say about its cost. Split out
+/// of `MediaModelPreset` so a Create pane's picker can rank all five catalogues
+/// (`MediaModelPicks`) without dragging 3D into the Model Browser's Media tab,
+/// which is what conforming it to the fuller protocol below would do.
+protocol MediaModelSizing: Identifiable where ID == String {
     var name: String { get }
-    var bundle: MediaBundle { get }
-    /// Plain-English explanation shown under the model in the Media pane —
-    /// the same idea as `RecommendedModelPick.blurb`.
-    var description: String { get }
     /// Peak unified-memory footprint, GB — already the full RAM-needed
     /// figure (not raw weight size), unlike `RecommendedModelPick.sizeGB`,
     /// so `meetsSystemRequirements` below needs no extra overhead multiplier.
     var approxRAMGB: Int { get }
 }
 
-extension MediaModelPreset {
+extension MediaModelSizing {
     /// Whether this Mac's physical RAM covers what the model needs. A soft
     /// signal for the UI (show a warning, never a download/use gate) — same
     /// "warn, don't block" policy as `RecommendedModelPick.meetsSystemRequirements`
@@ -433,7 +433,16 @@ extension MediaModelPreset {
     }
 }
 
+protocol MediaModelPreset: MediaModelSizing, Hashable {
+    var bundle: MediaBundle { get }
+    /// Plain-English explanation shown under the model in the Media pane —
+    /// the same idea as `RecommendedModelPick.blurb`.
+    var description: String { get }
+}
+
 extension ImageModelPreset: MediaModelPreset {}
 extension AudioModelPreset: MediaModelPreset {}
 extension VideoModelPreset: MediaModelPreset {}
 extension MusicModelPreset: MediaModelPreset {}
+// Sizing only — see `MediaModelSizing`: 3D stays out of the Media tab.
+extension Model3DModelPreset: MediaModelSizing {}

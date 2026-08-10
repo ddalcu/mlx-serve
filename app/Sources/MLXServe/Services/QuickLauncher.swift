@@ -235,6 +235,11 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
     /// (see the task-notification deep-link).
     func openInChat() {
         if let sessionId { appState.activeChatId = sessionId }
+        // The chat window may be sitting on another pane (Models, Create…) —
+        // "Open in chat" means the transcript, so switch the mode explicitly.
+        // (Setting activeChatId alone does not: the sidebar deliberately has
+        // no blanket onChange, because deleteSession's fallback also moves it.)
+        appState.showConversation()
         appState.pendingChatOpenTick += 1
         hide()
     }

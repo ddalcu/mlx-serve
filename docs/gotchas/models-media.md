@@ -799,3 +799,120 @@ Result: Mistral went from *cannot load* to **99.5% engine conformance**
 field you have not shape-checked is a crash, not a graceful miss. Any new
 tokenizer_config/config reader owes both shapes — or an explicit switch whose
 `else` returns null.
+
+## An adapter's alpha lives wherever its exporter put it (`lora.fileAlphaScale`, 2026-08-06)
+
+A LoRA's net strength is alpha/rank, and four real community files ship four conventions — a kohya per-module `.alpha` TENSOR, a PEFT JSON document inside one `lora_adapter_metadata` metadata string (`transformer.lora_alpha`/`transformer.r`), flat `lora_alpha`+`lora_rank`|`r` pairs, kohya's `ss_network_alpha`/`ss_network_dim` — plus files declaring none at all (alpha baked into the weights, 1.0 is correct). Reading only the tensor ran every PEFT export at 1.0 = rank/alpha = **8x too strong** for the common 4/32 pairing, which renders PURE STATIC. Resolution order is nested-JSON > flat > `ss_*` > none, per-module tensor still WINS (more specific), and a non-finite/non-positive alpha or rank is DECLINED — a scale we had to guess at is the bug. The resolved scale is logged per file (`[lora] <file>: scale …`) so a wrong one is visible instead of silent; `lora_scales` stays a MULTIPLIER on top of it.
+
+**The test lesson is the bigger half**: `test_multi_lora.sh`'s 56 checks were all green through this — its exact stacking maths (`d+d == 2d` byte-for-byte, zero-B transparency, order independence) is satisfied by noise, and a second real adapter passed only by being weak enough to survive 8x. Renders now go through `tests/lora_noise.py` (mean abs difference of horizontally adjacent pixels, bar 20: real 4-8, static 43-50) and `tests/test_real_loras.sh` runs published adapters on all four backends asserting scale + attach counts + usable output. A guard that asks "did the bytes change?" must be paired with one that LOOKS.
+
+## A sampler must never draw a RESERVED special (`tokenizer.reservedOutputIds`)
+
+`<|fim_hole|>`-class FIM markers can be EMITTED at temp 0 by a checkpoint whose distribution collapses. Per-model mask = `special: true` added tokens MINUS EOS ids MINUS specials whose text appears in the chat template source (thinking/tool/role markers ride each model's own template; no template ⇒ off, so fallback-formatted models are untouched). The legit-output set is DERIVED, never hardcoded. Built once at load (`generate.installSuppressMask`, `[suppress]` engagement log, `MLX_SERVE_SUPPRESS_RESERVED=0`), sized to the LOGITS dim (`unpadded_vocab_size` when set — inkling), riding `SamplingParams.suppress_mask` through the `initWithOptions` chokepoint into BOTH samplers + both stochastic-verify filters (`mlx_where` + -inf, fully lazy, no host sync; the batched tick reads `gen.sampling`, not `slot.sampling`). Logprobs stay the RAW distribution — under suppression rank 1 may differ from the emitted token BY DESIGN (the field reports the model; the mask is policy).
+
+## The degenerate-tail loop guard needs a LONG-period tier (dsv4, 2026-08-02)
+
+A two-sentence ~58-token cycle repeated 26x sailed through the 8-token scan; `loopStopReason` also fires on periods 9..64 at 10 exact reps (`isDegenerateTailLoopRange` — long periods demand fewer reps: identical long lines in real code repeat a handful of times, not ten).
+
+## A tiled decoder's tiles are not slices of an untiled pass (H3 visual VAE)
+
+`create_token_ids` maps each axis to `(arange(0.5,n)/n)*2-1`, so a 256-px tile's coordinates differ from that region's coordinates in a full-canvas pass — tiling is SEMANTIC, not a memory optimization. `minimax_h3_vae.decode` refuses above the 256-px tile extent (`fitsSingleTile` → `error.TilingUnsupported`) rather than silently decoding untiled and producing off-distribution output that looks like a quality problem. Same reason its TEMPORAL chunking (5-token chunks, 2 overlap, 3-frame pre-pad drop, 5-frame cross-fade) cannot be collapsed into one pass: the VAE was trained on 17-frame clips.
+
+## An oracle that cannot execute the reference must say so (H3 DiT parity)
+
+The reference block calls comfy_kitchen CUDA kernels that do not run on a Mac, so `tests/dump_minimax_h3_fixtures.py` is a TRANSCRIPTION and its header states that a green test proves agreement with an independently written implementation, not with the reference. Where the reference CAN run (`dump_minimax_h3_layout.py` — pure layout/schedule math) it is executed directly, with import stubs that RAISE on attribute access so no golden value can be produced by a mock. Prefer executing the reference; when you cannot, say which one you built.
+
+## A permutation-invariant checksum cannot see a permutation (H3 layout fixture)
+
+The per-axis position SUM passes unchanged when the two stereo channels' pinned `w` coordinates are swapped. Pair any column checksum with a row-index-WEIGHTED one (`pos_weighted`) — found by doing red-on-revert properly rather than by inspection.
+
+## An incomplete media pack reads as a model everywhere and dies in the text loader (live 2026-08-08)
+
+The Video pane's Turbo-adapter fetch wrote to the DESTINATION root while the 4-bit H3 pack lived in another owned root, creating `models-dl/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit/` holding only config.json + tokenizer files + `turbo_lora.safetensors` (0.7 GB). That fragment carries a valid `minimax_h3` config.json, so: (1) server discovery registered it as a model, and first-wins across `--model-dir` roots SHADOWED both complete copies in later roots; (2) the app's `resolveModelDir` walks the same order and resolved it too, so a plain Generate — Turbo unchecked — loaded it; (3) `gen.detectModality` correctly declined it (missing `transformer.safetensors`) but the loader then fell through to the MLX TEXT path, globbed the lora as an LM, and hit `MISSING WEIGHT: model.embed_tokens.weight` → `log.err` + `unreachable` → dead process. Nothing heals the fragment: readiness is checked across ALL owned roots, the pack reads complete elsewhere, so no download is ever offered for the fragment dir.
+
+The class is bigger than the fragment: EVERY H3/LTX pack download holds a valid config.json for the tens of minutes its big weights are still `.partial`, and an interrupted pull stays that way — a boot (or `/v1/models/rescan`) during that window registers a landmine.
+
+Four-part fix, each half load-bearing:
+- `model_discovery.requiredMediaMarker` is the ONE completeness table (`gen.requiredMarkerFor` DELEGATES — gen can import discovery, not the reverse); discovery skips marker-missing media dirs like any half-pulled download, and `probeModelDir` (register-by-path) answers `error.IncompleteMediaPack` → a named 400.
+- The scheduler's preload refuses a media-typed dir that failed its marker BY NAME instead of falling through to the text loader — by-path loads never see discovery, and `unreachable` on a missing weight means one stale dir kills the server.
+- `startTurboLora` downloads INTO the pack's resolved dir (`download(destDirOverride:)`) — an adapter's whole point is to sit beside weights that already exist.
+- The Turbo toggle's off-flip cancels an in-flight fetch via `cancelTurboLora`, which is surgical (drops the one file's `.partial` + sidecar) and a NO-OP with nothing running — the generic `cancel(_:)` no-task fallback wipes the repo's whole download dir, which for an adapter fetch is a live 40-69 GB pack.
+
+Guards: `discovery skips an incomplete media pack` + `probeModelDir refuses…` (model_discovery.zig), `incompleteMediaDir` (gen.zig), `tests/test_model_rescan.sh` (incl. server-survives-the-refused-load), `TurboLoraFetchTargetTests`.
+
+## A directory-entry filter that skips symlinks measures an HF-cache model at ZERO (live 2026-08-09)
+
+A first-launch user loaded `DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw` (121 GB) straight out of the HuggingFace hub cache and the machine went 34 GB into swap within a minute. The log had already said why nothing stopped it: `[preflight] weights ~0.00 GB, available 71.19 GB`. A hub-cache snapshot dir holds SYMLINKS into `../../blobs`; entry iteration reports them as `.sym_link`, and every server-side size sum filtered `if (entry.kind != .file) continue;` — so every weight file measured zero, and `memInsufficientForLoad` deliberately treats 0 as "unknown → allow" (a failed memory query must never block a load).
+
+The class was every size sum, not just the preflight: `scheduler.modelDiskBytes` (the preflight), discovery's `bytes_on_disk` loops in `tryAddModel`/`sumComponentWeights`/`probeModelDir` (feeding `/v1/models`, the app's RAM column, and `scheduler.gateEstimateBytes` — the #126 admission/eviction gate, which also passed at ~0), `gen.sumSafetensorsIn` (media residency), and cli's `list` size loop + GGUF classification. The app was INNOCENT: `DownloadManager` already resolves symlinks for sizes and deliberately scans the hub cache as a read-only root — it is what hands the server these snapshot paths.
+
+Fix: every entry filter also accepts `.sym_link` and stats through it (`Dir.statFile` FOLLOWS symlinks by default — all stat-RESULT checks already worked), plus a post-stat `st.kind == .file` check so a symlink-to-directory can't be summed; dangling links hit the existing `catch continue`. Zero now means a genuinely weightless dir, so the allow-on-zero semantic stands. Guards: `modelDiskBytes follows HF-cache symlinks` (scheduler.zig), `discovery measures a SYMLINKED (HF hub cache) model dir's real bytes` (model_discovery.zig).
+
+Same report, second item: the CLI bound `0.0.0.0` by default, putting a first-launch server on whatever network the laptop joins. Kept (the app and Agent Sandbox need wide binds they set EXPLICITLY) but serve mode now warns when the bind is non-loopback and nobody chose it — no `--host`, no `--lan-share` (`server.shouldWarnOpenBind`); the default flips to 127.0.0.1 in a future release, at which point the helper's host check silences the warning without a code change.
+
+## A combined Split regex hides the digit rule inside an alternation (muse "8 4" echo, 2026-08-10)
+
+First live boot of Muse-Glimmer-30B echoed "What is 8 4 * 3 / 2?" for a prompt
+containing "84" — the DSV4 echo-precision class on a new spelling. The
+tokenizer ships the Llama-3-style COMBINED Split regex: case-classed word
+branches with an attached `(?i:'s|'t|'re|'ve|'m|'ll|'d)` contraction group,
+`\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n/]*`, and the usual whitespace tail —
+all alternatives of ONE pattern. `digitGroupFromPreTokenizer`'s deliberate
+exact-match (`regex == "\p{N}{1,3}"`) never fires on it, so the model was
+served per-digit numbers.
+
+The fix is a grammar, not a wider digit match: `Tokenizer.pretok_style =
+.llama3` (selected by `llama3StyleFromSplitRegex` — contraction group AND the
+{1,3} digit branch present) runs `llama3PreTokenize`: greedy upper-class run
+then greedy lower-class run per word (reproduces the regex's backtracking for
+disjoint ASCII classes; non-ASCII letters are treated caseless — both classes
+— which coincides on every reachable match END except mid-word case
+transitions in non-Latin cased scripts, a documented gap), attached (?i)
+contractions, {1,3} digit groups, marks riding with punct, and `/` joining
+the punct tail.
+
+Two verification traps burned time:
+
+- HF ENCODE output is not pre-token boundaries. "cat's" encodes as
+  `cat` + `'s` and "don't" as one token — both have the contraction ATTACHED
+  at the pre-token level; the visible splits are BPE-internal merges. Pin the
+  pre-tokenizer against the raw regex `findall` (python `regex` module), and
+  end-to-end ids against HF `tokenizers`.
+- The live tell was subtle: generation was coherent (the model still solved
+  the math) — only the echo spelled the number with spaces. Cross-check
+  `/tokenize` vs HF at bring-up, per the standing rule; it found 8/8 diverse
+  cases byte-identical after the fix.
+
+## A config default only ONE family wants is a silent per-arch trap: muse rope base (first-turn repetition loops, 2026-08-11)
+
+pi on Muse-Glimmer-30B looped in the thinking channel on its FIRST turn — restated the user's
+request ~11 times until `[loop-stop]` cut it (54 cuts in one day's app-server log). The
+discrimination matrix (`~/claude-tmp/muse-loop/matrix.tsv`, fixture = the exact captured pi
+request) exonerated everything else one arm at a time: loops at temp 0 DETERMINISTICALLY (so
+not sampling), with `--no-drafter` (PLD-only — not spec), on 4bit AND 8bit AND the upstream
+bf16 under `--no-decode-attn-quant` (not quant), on the byte-identical HF-rendered prompt fed
+raw through `/v1/completions` (not our chat render), with 0/1673 token-id diffs vs HF
+tokenizers (not the pretokenizer). The decisive arm: the SAME upstream bf16 trunk under
+mlx-lm (PR #1710, key-surgery remap) continued CLEAN where our runtime looped — greedy
+divergence at ~token 13, ours doubling a phrase inside the request echo.
+
+Root cause: every forward path picks the RoPE base as
+`if (is_global) cfg.rope_theta else cfg.rope_local_base_freq`, and `rope_local_base_freq`
+defaults to Gemma-3's 10000. Muse ships ONE theta (500000) for all roped layers — as
+`text_config.rope_parameters.rope_theta`, which the generic parse lands in `rope_theta`
+only — and its global layers are NoPE, so **every rotated layer ran at base 10000 instead of
+500000**. Wrong positional geometry: short-range copying survives (the echo), mid-range
+coherence collapses into restart loops. Fix: the muse arch block sets
+`rope_local_base_freq = rope_theta` when the key is absent (model.zig). The bf16 greedy
+continuation then tracks mlx-lm's (319-char shared prefix, wording-level bf16 noise after),
+and the incident config went 0/6.
+
+Class lessons: (1) a per-layer-TYPE config knob with a family-flavored default must be pinned
+by the arch's config test for EVERY layer type the forward distinguishes — the muse test
+asserted `rope_theta` and never `rope_local_base_freq`, exactly the value the sliding layers
+read; (2) "coherent for N tokens then degenerates into loops, deterministic at greedy" is a
+POSITIONAL-ENCODING symptom signature, not a sampling one; (3) an unmerged reference port
+(mlx-lm PR) is still a usable oracle once weights + token ids are proven identical — behavior
+divergence then isolates the runtime. Guards: the `rope_local_base_freq == 500000` assertion
+in the muse config test (red on revert) + `tests/test_muse_repetition.sh` (replays the real
+capture; exits 1 on any `finish_details.type == "repetition_loop"`).

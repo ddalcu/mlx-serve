@@ -1,0 +1,90 @@
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -800,6 +800,11 @@
+ 	/* Propagate syncfs() to server */
+ 	unsigned int sync_fs:1;
+ 
++	/* Force an owner-read bit onto file/dir create modes (virtiofs on
++	   macOS hosts: the unprivileged host-side server re-opens the file it
++	   just created, so a mode-000 create comes back EACCES) */
++	unsigned int clamp_owner_read:1;
++
+ 	/* Initialize security xattrs when creating a new inode */
+ 	unsigned int init_security:1;
+ 
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1458,6 +1458,7 @@
+ 	fc->delete_stale = true;
+ 	fc->auto_submounts = true;
+ 	fc->sync_fs = true;
++	fc->clamp_owner_read = true;
+ 
+ 	/* Tell FUSE to split requests that exceed the virtqueue's size */
+ 	fc->max_pages_limit = min_t(unsigned int, fc->max_pages_limit,
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -604,6 +604,28 @@
+ }
+ 
+ /*
++ * Apple's Virtualization.framework virtiofs device runs host-side as an
++ * unprivileged process, so an inode whose mode lacks the owner-read bit is
++ * a black hole for the guest: create fails EACCES (GNU tar's
++ * dangling-symlink placeholders and dpkg's .dpkg-new staging files, both
++ * mode 000, hit this), and an existing one can't be stat'ed, opened,
++ * chmod'ed back or even unlinked — only readdir still shows the name.
++ * Guarantee owner-read on every mode we send (creates AND chmod);
++ * directories get owner-rwx, since the host also needs write+search on a
++ * directory to create or look up children in it.  Gated per-connection
++ * (clamp_owner_read), set only by virtiofs.
++ */
++static umode_t fuse_clamp_create_mode(struct fuse_conn *fc, umode_t mode,
++				      bool isdir)
++{
++	if (!fc->clamp_owner_read || (mode & S_IRUSR))
++		return mode;
++	if (!isdir && !S_ISREG(mode))
++		return mode; /* symlinks / device nodes / fifos: leave untouched */
++	return mode | (isdir ? S_IRWXU : S_IRUSR);
++}
++
++/*
+  * Atomic create+open operation
+  *
+  * If the filesystem doesn't support this, then fall back to separate
+@@ -640,6 +662,7 @@
+ 
+ 	if (!fm->fc->dont_mask)
+ 		mode &= ~current_umask();
++	mode = fuse_clamp_create_mode(fm->fc, mode, false);
+ 
+ 	flags &= ~O_NOCTTY;
+ 	memset(&inarg, 0, sizeof(inarg));
+@@ -849,6 +872,7 @@
+ 
+ 	if (!fm->fc->dont_mask)
+ 		mode &= ~current_umask();
++	mode = fuse_clamp_create_mode(fm->fc, mode, false);
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.mode = mode;
+@@ -895,6 +919,7 @@
+ 
+ 	if (!fm->fc->dont_mask)
+ 		mode &= ~current_umask();
++	mode = fuse_clamp_create_mode(fm->fc, mode, true);
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.mode = mode;
+@@ -1717,7 +1742,9 @@
+ 	unsigned ivalid = iattr->ia_valid;
+ 
+ 	if (ivalid & ATTR_MODE)
+-		arg->valid |= FATTR_MODE,   arg->mode = iattr->ia_mode;
++		arg->valid |= FATTR_MODE,
++		arg->mode = fuse_clamp_create_mode(fc, iattr->ia_mode,
++						   S_ISDIR(iattr->ia_mode));
+ 	if (ivalid & ATTR_UID)
+ 		arg->valid |= FATTR_UID,    arg->uid = from_kuid(fc->user_ns, iattr->ia_uid);
+ 	if (ivalid & ATTR_GID)

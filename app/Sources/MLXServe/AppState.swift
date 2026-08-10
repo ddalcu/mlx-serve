@@ -32,59 +32,71 @@ class AppState: ObservableObject {
             // something the user went shopping for. `drafterOptOut` is what
             // makes an explicit off stick.
             syncDrafterPairing()
-            // Plan 05 Phase G — when hot-switch is enabled AND the server is
-            // already running, ask the server to load the new model in-place
-            // instead of restarting. Falls back to restart on failure (404
-            // because the new path isn't in --model-dir, 503 if out of
-            // memory, etc.). Restart path remains the default for clients
-            // that don't opt in.
-            if (server.status == .running || server.status == .starting) {
-                if hotSwitchEnabled, server.status == .running {
-                    let id = (selectedModelPath as NSString).lastPathComponent
-                    // The decision `syncDrafterPairing()` just made, not a
-                    // second read of the disk: a hot-switch that ignores the
-                    // user's off switch loads a drafter the restart path
-                    // wouldn't, and only one of the two would be reproducible.
-                    let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
-                    let mgr = server
-                    // Tracked so `useModelAndAwaitReady` can await this exact
-                    // switch — hot-switch never moves `server.status` off
-                    // `.running` (the process itself never restarts), so
-                    // polling status alone can't tell "old model still
-                    // resident" from "new model resident".
-                    pendingModelLoadTask = Task { @MainActor in
-                        do {
-                            _ = try await mgr.loadModel(id: id, drafterPath: drafterPath)
-                        } catch {
-                            // Hot-switch failed (likely 404 if the model isn't
-                            // under --model-dir on the running server). Fall
-                            // back to a full restart so the user's choice still
-                            // takes effect.
-                            print("[AppState] hot-switch failed (\(error)) — falling back to restart")
-                            mgr.stop()
-                            mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
-                        }
+            switch Self.modelSwitchAction(forStatus: server.status, path: selectedModelPath) {
+            case .hotSwitch(let id):
+                // The decision `syncDrafterPairing()` just made, not a
+                // second read of the disk: a hot-switch that ignores the
+                // user's off switch loads a drafter the restart path
+                // wouldn't, and only one of the two would be reproducible.
+                let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
+                let mgr = server
+                // Tracked so `useModelAndAwaitReady` can await this exact
+                // switch — hot-switch never moves `server.status` off
+                // `.running` (the process itself never restarts), so
+                // polling status alone can't tell "old model still
+                // resident" from "new model resident".
+                pendingModelLoadTask = Task { @MainActor in
+                    do {
+                        _ = try await mgr.loadModel(id: id, drafterPath: drafterPath, setDefault: true)
+                    } catch {
+                        // Register-by-path failed (unsupported arch, partial
+                        // download) or the load 503'd (memory) — a full
+                        // restart with only the new model is the net.
+                        print("[AppState] hot-switch failed (\(error)) — falling back to restart")
+                        mgr.stop()
+                        mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
                     }
-                } else {
-                    pendingModelLoadTask = nil
-                    server.stop()
-                    server.start(modelPath: selectedModelPath, options: serverOptions)
                 }
-            } else {
+            case .restart:
+                pendingModelLoadTask = nil
+                server.stop()
+                server.start(modelPath: selectedModelPath, options: serverOptions)
+            case .leaveStopped:
                 pendingModelLoadTask = nil
             }
+        }
+    }
+
+    /// How `selectedModelPath`'s `didSet` makes the server serve the new pick.
+    /// A RUNNING server is hot-switched in place via /v1/load-model — no
+    /// restart. The id is the model's ABSOLUTE PATH, never the dir basename:
+    /// registry ids are two-level `org/name`, so a basename 404s, while
+    /// register-by-path resolves either shape (and models outside every
+    /// `--model-dir`). `setDefault` rides along so the server re-points the
+    /// "mlx-serve" alias and /v1/models' default-first sort — without it a
+    /// hot-load leaves every aliased request on the OLD model.
+    /// (The old `hotSwitchEnabled` gate shipped default-off with no UI, so
+    /// every picker change restarted the server, for everyone, forever.)
+    enum ModelSwitchAction: Equatable {
+        case hotSwitch(id: String)
+        /// Mid-boot: the process is still loading the OLD pick — restart
+        /// with the new one.
+        case restart
+        /// Stopped/error: nothing to switch; explicit starts
+        /// (`useModelAndAwaitReady`, the launch gate) own that.
+        case leaveStopped
+    }
+
+    nonisolated static func modelSwitchAction(forStatus status: ServerStatus, path: String) -> ModelSwitchAction {
+        switch status {
+        case .running: return .hotSwitch(id: path)
+        case .starting: return .restart
+        case .stopped, .error: return .leaveStopped
         }
     }
     /// Set only while a hot-switch triggered by `selectedModelPath`'s `didSet`
     /// is in flight — see `useModelAndAwaitReady`.
     private var pendingModelLoadTask: Task<Void, Never>?
-    /// Plan 05 Phase G — when true, model picker changes call /v1/load-model
-    /// on the running server instead of restarting. Falls back to restart on
-    /// failure. Defaults off so existing behavior is unchanged for users who
-    /// haven't opted in.
-    @Published var hotSwitchEnabled: Bool {
-        didSet { UserDefaults.standard.set(hotSwitchEnabled, forKey: "hotSwitchEnabled") }
-    }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
     /// Sidebar selection (multi-select). Bind the sidebar List to this set so
@@ -198,20 +210,115 @@ class AppState: ObservableObject {
     }
     /// "Open the chat window" for callers that can't reach SwiftUI's
     /// `openWindow`: the quick launcher's "Open in chat" (a non-activating
-    /// NSPanel) and the welcome window (a bare `NSHostingView` outside the
-    /// Scene graph). The menu-bar label observes it — the label is always
-    /// installed, so this works with no window open, same bridge as the
-    /// task-notification deep-link. An Int tick so every bump fires onChange,
-    /// no reset dance. ONE bridge for both callers rather than a second
-    /// near-identical tick: they want the same window.
+    /// NSPanel) and the launch path. The menu-bar label observes it — the label
+    /// is always installed, so this works with no window open, same bridge as
+    /// the task-notification deep-link. An Int tick so every bump fires
+    /// onChange, no reset dance. ONE bridge for both callers rather than a
+    /// second near-identical tick: they want the same window.
     @Published var pendingChatOpenTick = 0
 
-    /// Bumped by the welcome window's "Browse Models" nudge (shown when no
-    /// chat model is downloaded yet) — the welcome window is a bare
-    /// `NSHostingView` outside the SwiftUI Scene graph, so it can't reach
-    /// `openWindow` itself. Same always-present-menu-bar-label bridge as
-    /// `pendingChatOpenTick`.
-    @Published var pendingModelBrowserOpenTick = 0
+    /// Is the welcome screen up? It is a SHEET on the chat window (see
+    /// `LaunchDecision`), so this is a flag the scene binds rather than a
+    /// window somebody has to remember to close — which is what it was, with
+    /// its own `NSHostingView` inheriting no environment and a `.floating`
+    /// level that could leave it over an empty desktop.
+    @Published var showWelcome = false
+    /// What the welcome screen should say about this Mac's library, sampled at
+    /// launch. Held beside the flag because the sheet's content is built by the
+    /// scene, which has no business re-deriving it.
+    @Published var welcomeHasChatModels = false
+
+    /// What the chat window's detail column is showing: the transcript, or the
+    /// model browser (`ChatWorkspace`). App-level rather than view-local
+    /// because the surfaces that ask for the browser live OUTSIDE that window —
+    /// the tray popover, the welcome screen, the Tools menu.
+    @Published var chatWorkspace: ChatWorkspace = .conversation
+    /// The task showing in the Tasks pane's detail column. App-level because the
+    /// list and the detail are SEPARATE columns of the chat window's own
+    /// `NavigationSplitView` — neither can own the other's state.
+    @Published var selectedTaskId: UUID?
+
+    /// Show the model browser — the ONE way in.
+    func showModels(_ section: ModelBrowserSection = .recommended) {
+        chatWorkspace = .models(section)
+        pendingChatOpenTick += 1
+    }
+
+    /// Show the Tasks pane — the one way in, same shape as `showModels()`.
+    func showTasks() {
+        chatWorkspace = .tasks
+        pendingChatOpenTick += 1
+    }
+
+    /// Show the Agents pane. The standalone Agents window still exists for the
+    /// composer's "Edit Agent…" deep link; this is the sidebar's route.
+    func showAgents() {
+        chatWorkspace = .agents
+        pendingChatOpenTick += 1
+    }
+
+    /// Show Settings in the content area — the ONE way in: the sidebar's row
+    /// and the menu bar's ⌘, both land here (the Settings Window scene is
+    /// gone; a second surface showing the same form is how the two drift).
+    func showSettings() {
+        chatWorkspace = .settings
+        pendingChatOpenTick += 1
+    }
+
+    /// Switch the browser's section. Deliberately a NO-OP outside the models
+    /// pane: this is the section bar's setter, and a section bar that could
+    /// also ENTER the pane would be a second door in — one that doesn't bring
+    /// the window forward. Entering is `showModels()`, and only `showModels()`.
+    func selectModelSection(_ section: ModelBrowserSection) {
+        guard chatWorkspace.isModels else { return }
+        chatWorkspace = .models(section)
+    }
+
+    /// Show a media generator — the ONE way in, same shape as `showModels()`.
+    /// The four used to be four `Window` scenes; they are pages of this window
+    /// now, so a request has to both pick the page and bring the window up.
+    func showCreate(_ experiment: GenExperiment = .image) {
+        chatWorkspace = .create(experiment)
+        pendingChatOpenTick += 1
+    }
+
+    /// Switch generator page. A no-op outside create mode, for the same reason
+    /// `selectModelSection` is: the page list must not be a second door in.
+    func selectCreatePage(_ experiment: GenExperiment) {
+        guard chatWorkspace.isCreate else { return }
+        chatWorkspace = .create(experiment)
+    }
+
+    /// "Send to Chat" on a Create-pane result: open a NEW conversation holding
+    /// it, and switch to Chats so the user SEES where it went.
+    @discardableResult
+    func sendGeneratedMediaToNewChat(path: String, prompt: String,
+                                     kind: ChatMediaRef.Kind) -> UUID {
+        let sessionId = newChatSession(agentId: defaultAgentId)
+        if let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) {
+            chatSessions[idx].messages.append(
+                GeneratedMediaHandoff.message(path: path, prompt: prompt, kind: kind))
+            saveChatHistory()
+        }
+        showConversation()
+        return sessionId
+    }
+
+    /// Back to the transcript. Selecting a conversation does this too — the
+    /// sidebar's mode switcher is the visible version of it.
+    func showConversation() {
+        chatWorkspace = .conversation
+    }
+
+    /// Show the CONVERSATION and bring the window up — the tray's Chat button
+    /// and any other outside-the-window caller. `showConversation()` alone is
+    /// for switches made INSIDE the window; from the tray it left the window
+    /// parked on whatever pane it was showing, so "Chat" just focused Models
+    /// (live report 2026-08-09). Same door shape as `showModels()`.
+    func showChat() {
+        showConversation()
+        pendingChatOpenTick += 1
+    }
 
     /// Owns the global hotkey + floating panel. App-level like the voice
     /// controller so it works with every window closed.
@@ -255,7 +362,6 @@ class AppState: ObservableObject {
         // users who never touched the toggle get it turned on, which is the
         // intent.
         self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
-        self.hotSwitchEnabled = UserDefaults.standard.bool(forKey: "hotSwitchEnabled")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated
@@ -322,26 +428,25 @@ class AppState: ObservableObject {
         // ⌘Tab-selectable; menu-bar-only → back to accessory.
         ActivationPolicyManager.shared.start()
 
-        // The welcome window is the app's intro / quick-start screen and hosts
+        // The welcome screen is the app's intro / quick-start screen and hosts
         // the CLI install button, so it shows on every launch — unless the user
         // ticked "Don't show this again", in which case the launch goes
-        // straight to Chat (`LaunchDecision`). Either way the user ends up in
-        // front of a composer rather than looking at an empty desktop.
+        // straight to Chat (`LaunchDecision`).
+        //
+        // The chat window opens in BOTH branches: the welcome is a SHEET on it,
+        // and a sheet with no host window is a screen nobody can see. That is
+        // also why the user can no longer end up in front of nothing — whatever
+        // dismisses the sheet, a composer is what was already behind it.
         let suppressed = UserDefaults.standard.bool(forKey: LaunchDecision.suppressDefaultsKey)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             let hasChat = self.localModels.contains(where: \.isChatPickable)
-            switch LaunchDecision.resolve(welcomeSuppressed: suppressed, hasChatModels: hasChat) {
-            case .openChat:
-                self.pendingChatOpenTick += 1
-            case .showWelcome:
-                Self.showWelcomeWindow(
-                    appState: self,
-                    hasChatModels: hasChat,
-                    onDismiss: { Self._welcomeWindow?.close() },
-                    onOpenModelBrowser: { self.pendingModelBrowserOpenTick += 1 },
-                    onOpenChat: { self.pendingChatOpenTick += 1 }
-                )
+            let decision = LaunchDecision.resolve(welcomeSuppressed: suppressed,
+                                                  hasChatModels: hasChat)
+            if decision.opensChatWindow { self.pendingChatOpenTick += 1 }
+            if decision.presentsWelcome {
+                self.welcomeHasChatModels = hasChat
+                self.showWelcome = true
             }
         }
 
@@ -431,11 +536,6 @@ class AppState: ObservableObject {
     /// The model list changed (a download landed): fill in a pairing that
     /// wasn't possible a moment ago — downloading a Gemma 4 fetches its drafter
     /// too, and it finishes after the model is already selected.
-    ///
-    /// Only ever ADDS. Clearing belongs to the model switch: this runs on every
-    /// refresh (1 Hz while a download is in flight), and a user who deliberately
-    /// switched a drafter on where we don't recommend one — the MoE caution in
-    /// Settings — must not have a background rescan take it away.
     private func adoptNewlyAvailableDrafter() {
         guard serverOptions.drafterPath.isEmpty, !serverOptions.drafterOptOut else { return }
         let paired = DrafterPairing.decide(
@@ -506,7 +606,10 @@ class AppState: ObservableObject {
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
     func newChatSession(agentId: UUID? = nil) -> UUID {
-        var session = ChatSession()
+        // An agent's thread is called "New agent" until it has something to be
+        // named after — the sidebar lists it under Agents, where "New Chat"
+        // would describe the wrong thing.
+        var session = ChatSession(title: ChatSessionTitle.placeholder(hasAgent: agentId != nil))
         // Seed the new tab's MCP toggle from the global default so a user who
         // generally runs with MCP on keeps it; Think/Tools start off. Each tab
         // then remembers its own choice (ChatSession.useMCP/enableThinking).
@@ -522,12 +625,6 @@ class AppState: ObservableObject {
     /// fresh one. Every agent keeps its OWN conversation, so speaking to Chef
     /// continues Chef's thread instead of talking into whatever tab was open (and
     /// instead of quietly rebranding that tab as Chef).
-    ///
-    /// An ACTIVE thread of the same agent wins over a more recently touched one —
-    /// the user opened that one deliberately. Task-run and Telegram-bridge
-    /// sessions are never adopted: they're hidden/transient vehicles (and task
-    /// runs now carry an `agentId` too), so a turn landing in one would corrupt a
-    /// run or write into a read-only mirror. Pure → `AgentSessionThreadTests`.
     nonisolated static func sessionForAgent(_ agentId: UUID?,
                                            sessions: [ChatSession],
                                            activeId: UUID?) -> UUID? {
@@ -641,22 +738,17 @@ class AppState: ObservableObject {
         guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
         chatSessions[idx].messages.append(message)
         chatSessions[idx].updatedAt = Date()
-        // Auto-title from first user message
-        if chatSessions[idx].title == "New Chat",
+        // Auto-title from the first user message. The gate is "is this still a
+        // placeholder", NOT one spelled-out literal: an agent thread starts as
+        // "New agent", and a literal compare would leave it that way forever.
+        if ChatSessionTitle.isPlaceholder(chatSessions[idx].title),
            message.role == .user,
-           !message.content.isEmpty {
-            let title = String(message.content.prefix(40))
-            chatSessions[idx].title = title + (message.content.count > 40 ? "..." : "")
+           let title = ChatSessionTitle.derived(fromFirstMessage: message.content) {
+            chatSessions[idx].title = title
         }
     }
 
     /// Drop one message from a conversation.
-    ///
-    /// It leaves the history the model sees, not just the view — pruning a bad
-    /// turn so the next request isn't built on it is the whole point. Any
-    /// HIDDEN tool-result messages belonging to the same assistant turn go with
-    /// it: a tool result whose call is gone is an orphan the model can only be
-    /// confused by, and it is invisible, so nothing would ever clean it up.
     func deleteMessage(in sessionId: UUID, messageId: UUID) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
@@ -685,11 +777,12 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
-    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, truncation: TruncationNotice.Notice? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
         let mIdx = chatSessions[sIdx].messages.count - 1
         if let content { chatSessions[sIdx].messages[mIdx].content += content }
+        if let truncation { chatSessions[sIdx].messages[mIdx].truncationNotice = truncation }
         if let usage {
             chatSessions[sIdx].messages[mIdx].promptTokens = usage.promptTokens
             chatSessions[sIdx].messages[mIdx].completionTokens = usage.completionTokens
@@ -744,48 +837,9 @@ class AppState: ObservableObject {
         activeChatId = chatSessions.first?.id
     }
 
-    // MARK: - Welcome Window
-
-    private static func showWelcomeWindow(
-        appState: AppState,
-        hasChatModels: Bool,
-        onDismiss: @escaping () -> Void,
-        onOpenModelBrowser: @escaping () -> Void,
-        onOpenChat: @escaping () -> Void
-    ) {
-        // This is an NSHostingView, so it inherits NO environment — the starter
-        // card's `@EnvironmentObject`s have to be handed to it explicitly or
-        // SwiftUI traps the first time the card renders.
-        let view = WelcomeView(onDismiss: onDismiss,
-                               hasChatModels: hasChatModels,
-                               onOpenModelBrowser: onOpenModelBrowser,
-                               onOpenChat: onOpenChat)
-            .environmentObject(appState)
-            .environmentObject(appState.downloads)
-        let hostingView = NSHostingView(rootView: view)
-
-        // Let SwiftUI compute the intrinsic size
-        let fittingSize = hostingView.fittingSize
-        hostingView.frame = NSRect(origin: .zero, size: fittingSize)
-
-        let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: fittingSize),
-            styleMask: [.titled, .closable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = hostingView
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.isMovableByWindowBackground = true
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        _welcomeWindow = window
-    }
-
-    private static var _welcomeWindow: NSWindow?
+    // The welcome screen is a SHEET on the chat window (`showWelcome`,
+    // presented by the chat scene) — it was a hand-built `NSWindow` around an
+    // `NSHostingView` here, which is why it inherited no environment (every
+    // object the starter card reads had to be passed in by hand or SwiftUI
+    // trapped at first render) and why it could float over an empty desktop.
 }

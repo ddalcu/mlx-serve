@@ -42,6 +42,11 @@ final class AgentStoreTests: XCTestCase {
         a.enableThinking = true
         a.temperature = 0.3
         a.maxTokens = 777
+        a.topP = 0.9
+        a.topK = 40
+        a.repeatPenalty = 1.1
+        a.presencePenalty = 0.5
+        a.reasoningBudget = 2048
 
         let store = AgentStore(rootDir: root)
         store.add(a)

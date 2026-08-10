@@ -1,5 +1,94 @@
 # Changelog
 
+## v26.8.5 — Muse-Glimmer 
+
+### Highlights
+
+- **Meta's Muse-Glimmer-30B runs on your Mac.** Chat, tools and thinking all work, with 4-bit and 8-bit ddalcu builds on the Hub with DFlash built in (up to **75 tok/s on M4Max**).
+- **Speculative decoding you don't have to set up.** A model can carry its own draft companion, and the server picks it up whenever that model loads. Muse-Glimmer decodes about twice as fast with it.
+- **Thinking got quicker and more visible.** Thinking off no longer waits on a hidden reasoning pass, thinking that does happen is shown instead of thrown away, and you can pick how hard the model thinks right in the composer.
+
+### Muse-Glimmer
+
+- The 30B model runs natively, its chat and tool format handled end to end. Vision isn't served yet.
+- Ships with its own draft companion, so it's fast out of the box.
+- Expect between 30-75 tok/s on 4-bit, and 16-52 tok/s on 8-bit on M4Max
+
+### Drafters that ship with the model
+
+- A model folder can include a `drafter/` companion; the server loads it with the model, and switching models keeps the speedup. `--no-drafter` turns it off.
+- The draft size adapts to your Mac, and reused conversations keep their speedup instead of restarting it cold.
+- https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit
+- https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit
+
+### Thinking
+
+- Thinking off means no thinking: the reply starts right away instead of after an invisible reasoning pass — on Muse-Glimmer that pass was half a minute of silence.
+- Right-click the thinking icon to pick the effort; click still toggles it. Tool chats keep thinking by default, plain chats skip it, and the "thinking with Tools" warning is gone.
+
+### Fixes
+
+- The "stopped repeating itself" notice showed twice on a cut reply and could be sent back to the model as chat text. It now shows once, under the reply, and never reaches the model (#147) thanks @justinluque for your PR.
+- GGUF models downloaded with the Hugging Face CLI load again (#158).
+- Big video renders no longer get cancelled after 15 minutes of quiet work (#152, #157).
+- Fix bugs related to model hot swap / changing models.
+- Homebrew now learns about a release when it's published, not while it's still a draft, so `brew upgrade` can't offer a version whose download isn't up yet.
+
+## v26.8.4 — One window, your own media models, hot model switching
+
+### Highlights
+
+- **The app is one window now.** Models, Tasks, Settings and the media generators live inside the chat window as modes instead of scattered windows, behind a three-column layout with a proper Agents section in the sidebar.
+- **Switch chat models without restarting.** Picking a model in the app loads it into the running server and makes it the default, instead of tearing the server down and booting it again.
+- **Bring your own media models.** The image, video, voice, music and 3D panes list checkpoints you added yourself, and the Model Browser downloads community packs of those families.
+- **The Agent Sandbox is a normal Linux.** `apt-get install` works, and the agent CLIs that failed to install now install.
+- **Agents can pin their own sampling.** Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens per agent.
+
+### One-window app
+
+- One window, three columns: sidebar, content, detail. Models, Tasks, Settings and the media generators became chat modes rather than separate windows, and the persistent toolbar is gone — titles and create buttons moved into the native navigation bar.
+- The sidebar has a dedicated **Agents** section, and the agent editor was rebuilt: real cards instead of a cramped form, proper naming, threading and capabilities.
+- The welcome screen is a sheet on the chat window instead of a floating window, and creating a model-backed chat has its own Create pane with a single-row model picker.
+
+### Model switching without a restart
+
+- Changing the chat model used to restart the server. It now loads into the running one and takes over as the default, so requests that omit a model — the Claude Code launcher, plain `curl` — reach the model you just picked.
+- Over the API this is `POST /v1/load-model` with `"default": true`. Without the flag a model loads alongside the current one and the default is untouched, which is what media generation uses so it can never steal the chat model.
+- Known gap: Gemma 4 hot-loaded this way runs without its drafter speedup companion until the next restart.
+
+### Use your own media models
+
+- The media panes list anything in your model folders with a family the server can run, under **On This Mac** — with that family's settings and controls.
+- The Model Browser offers community packs of those families. A repo's layout is checked against the family's converted shape before the Download button appears, so only packs that will actually load are offered, and they download as a full bundle.
+- Models downloaded while the server runs appear without a restart (`POST /v1/models/rescan`), and the app calls it after every download.
+- Mage-Flow moved to the `mage-flow-community` org; the bf16 build left the built-in list and shows under On This Mac if you have it.
+
+### Agent Sandbox
+
+- `apt-get install` works. Apple's file sharing made any file created without an owner-read bit unreachable from inside the guest, which broke every package install and the Node extract in the agent CLI installers. The sandbox now ships a patched kernel that fixes it, plus `xz-utils` and a newer npm baked in.
+- Agents no longer crash on launch on an M4. The old guest kernel advertised a CPU feature the chip does not have, and anything probing it — OpenSSL, Go binaries — died instantly.
+- The sandbox gets up to 4 GB of RAM instead of 1 GB, which is what killed new version of Hermes. It is committed lazily, so idle sandboxes stay small.
+
+### Agents pin their own sampling
+
+- Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens in the agent editor (#135).
+- Each is an override: App default follows Settings, a set value wins for that agent's turns, and an off value (top-k 0, repeat penalty 1.0) clears your global default for that agent.
+
+### Fixes
+
+- Generating a video from reference clips no longer fails with "Request body too large" (#151). Reference media rides as base64, so one clip alone is around 100 MB; the limit is per endpoint now — 512 MB for media, 64 MB elsewhere — and a refusal names both numbers.
+- "Model load failed" now says why (#144). A load refused by the memory check comes back as a clear not-enough-free-memory error you can retry after closing other apps; any other failure names its reason.
+- Picking a download folder no longer hides the models you already have, and a media pack in an extra model folder no longer shows a Download button for a copy already on disk. Every folder the server scans is checked; deleting stays limited to the app's own folders.
+- Models served from the HuggingFace cache no longer slip past the memory check. Those folders store weights as symlinks and every size scan skipped them, so a 121 GB model measured as 0 bytes and swapped the machine.
+- The Gemma 4 QAT speed-up companion loads again instead of crashing the model (#109). Quantized companion checkpoints are unpacked at load; the forward pass expects plain weights.
+- The MiniMax-H3 time estimate stopped swinging and the live "time left" stopped under-promising: cheap cached steps were pricing the expensive closing ones, and the video decode after the last step was not counted at all, so "2 min left" could take 4.
+- Long code blocks no longer make the chat stutter while a reply streams in.
+- GGUF repos that ship the same quant for several releases label each file with its build (`0731` and so on), so the new DeepSeek files are tellable from the old ones in the quant picker.
+- `--model-dir` is repeatable, and `~/.mlx-serve/models` is always served even when you set a custom download location.
+- Starting the server without `--host` now warns that it is reachable from the network you are on, since the default bind is still `0.0.0.0`. Pass `--host 127.0.0.1` to keep it local; a future version will make that the default.
+- Hybrid models (LFM2.5, Nemotron-H) leaked a little memory on every load and unload.
+- Internal docs reorganized and compacted.
+
 ## v26.8.3 — MiniMax-H3 references and Turbo, stacked LoRAs, model folders
 
 ### MiniMax-H3: references, Turbo, longer clips

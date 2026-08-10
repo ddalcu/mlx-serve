@@ -515,10 +515,56 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     return owned;
 }
 
+/// Like `ownWeight`, but a QUANTIZED weight (packed u32 + `.scales` sibling)
+/// is dequantized to dense bf16 at load — the drafter's forward is plain bf16
+/// matmuls, so a packed weight crashes the first one (issue #109). Params
+/// re-solve per weight from the packed geometry against the KNOWN in-dim,
+/// since QAT checkpoints mix bit widths per layer.
+fn ownWeightDense(w: *const Weights, key: []const u8, in_dim: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const suffix = ".weight";
+    if (!std.mem.endsWith(u8, key, suffix)) return ownWeight(w, key);
+    const base = key[0 .. key.len - suffix.len];
+    var sibling_buf: [256]u8 = undefined;
+    const scales = w.get(try std.fmt.bufPrint(&sibling_buf, "{s}.scales", .{base})) orelse
+        return ownWeight(w, key);
+
+    const raw = w.get(key) orelse {
+        log.err("[drafter] MISSING WEIGHT: {s}\n", .{key});
+        return error.MissingDrafterWeight;
+    };
+    if (mlx.mlx_array_dtype(scales) == .uint8) {
+        // fp-mode (mxfp/nvfp) scales would silently mis-dequantize as affine.
+        log.err("[drafter] non-affine quantized drafter checkpoint not supported ({s})\n", .{key});
+        return error.UnsupportedDrafterQuant;
+    }
+    const qp = transformer_mod.affineParamsFromGeometry(raw, scales, in_dim) orelse {
+        log.err("[drafter] unsupported quantized geometry for {s} (in_dim={d})\n", .{ key, in_dim });
+        return error.UnsupportedDrafterQuant;
+    };
+    const biases = w.get(try std.fmt.bufPrint(&sibling_buf, "{s}.biases", .{base})) orelse mlx.mlx_array_new();
+
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_dequantize(
+        &out,
+        raw,
+        scales,
+        biases,
+        mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(qp.bits)),
+        qp.mode.cstr(),
+        .{}, // global_scale
+        .{ .value = .bfloat16, .has_value = true },
+        s,
+    ));
+    return out;
+}
+
 /// Pre-transpose a 2-D weight stored as `[out, in]` to `[in, out]` so
 /// `mlx_matmul(y, x, w_t)` computes `y = x @ w.T`. Frees the input array.
-fn ownAndTranspose2D(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx.mlx_array {
-    const raw = try ownWeight(w, key);
+/// `in_dim` is the weight's LOGICAL input dim, for the quantized-checkpoint
+/// dequant in `ownWeightDense`.
+fn ownAndTranspose2D(w: *const Weights, key: []const u8, in_dim: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const raw = try ownWeightDense(w, key, in_dim, s);
     defer _ = mlx.mlx_array_free(raw);
     var transposed = mlx.mlx_array_new();
     const perm = [_]c_int{ 1, 0 };
@@ -545,14 +591,18 @@ pub fn loadDrafter(
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
 
+    if (weights.get("pre_projection.scales") != null) {
+        log.info("[drafter] quantized checkpoint — dequantizing to bf16\n", .{});
+    }
+
     // Globals — embed/norm don't need transposing (used in matmul-as-take and rmsnorm).
-    const embed_w = try ownWeight(&weights, "model.embed_tokens.weight");
+    const embed_w = try ownWeightDense(&weights, "model.embed_tokens.weight", cfg.hidden_size, s);
     errdefer _ = mlx.mlx_array_free(embed_w);
     const norm_w = try ownWeight(&weights, "model.norm.weight");
     errdefer _ = mlx.mlx_array_free(norm_w);
-    const pre_proj_w_t = try ownAndTranspose2D(&weights, "pre_projection.weight", s);
+    const pre_proj_w_t = try ownAndTranspose2D(&weights, "pre_projection.weight", 2 * cfg.backbone_hidden_size, s);
     errdefer _ = mlx.mlx_array_free(pre_proj_w_t);
-    const post_proj_w_t = try ownAndTranspose2D(&weights, "post_projection.weight", s);
+    const post_proj_w_t = try ownAndTranspose2D(&weights, "post_projection.weight", cfg.hidden_size, s);
     errdefer _ = mlx.mlx_array_free(post_proj_w_t);
 
     const layers = try allocator.alloc(DrafterLayer, cfg.num_hidden_layers);
@@ -590,12 +640,12 @@ pub fn loadDrafter(
             .post_attn_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.post_attention_layernorm.weight", .{li})),
             .pre_ff_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{li})),
             .post_ff_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{li})),
-            .q_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_proj.weight", .{li}), s),
+            .q_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_proj.weight", .{li}), cfg.hidden_size, s),
             .q_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_norm.weight", .{li})),
-            .o_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}), s),
-            .gate_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}), s),
-            .up_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.up_proj.weight", .{li}), s),
-            .down_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.down_proj.weight", .{li}), s),
+            .o_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}), cfg.num_attention_heads * layer_hd, s),
+            .gate_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}), cfg.hidden_size, s),
+            .up_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.up_proj.weight", .{li}), cfg.hidden_size, s),
+            .down_w_t = try ownAndTranspose2D(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.down_proj.weight", .{li}), cfg.intermediate_size, s),
             .layer_scalar = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.layer_scalar", .{li})),
         };
         layers_inited += 1;
@@ -612,7 +662,7 @@ pub fn loadDrafter(
             log.err("[drafter] invalid centroid config: num_centroids={d}, vocab_size={d}\n", .{ cfg.num_centroids, cfg.vocab_size });
             return error.InvalidCentroidConfig;
         }
-        const centroids_w_t = try ownAndTranspose2D(&weights, "masked_embedding.centroids.weight", s);
+        const centroids_w_t = try ownAndTranspose2D(&weights, "masked_embedding.centroids.weight", cfg.hidden_size, s);
         errdefer _ = mlx.mlx_array_free(centroids_w_t);
 
         const ordering_raw = try ownWeight(&weights, "masked_embedding.token_ordering");
@@ -1497,6 +1547,167 @@ test "drafter: embedTableRow handles dense bf16 and mixed-quant target tables (b
     const qvals = mlx.mlx_array_data_float32(emb_q_f32).?;
     try testing.expect(@abs(qvals[0] - 3.0) < 0.1); // 8-bit quant is near-lossless here
     try testing.expect(@abs(qvals[10] - 3.10) < 0.1);
+}
+
+test "drafter: loadDrafter dequantizes a QAT-quantized checkpoint to dense bf16 (issue #109)" {
+    // A QAT-4bit drafter ships packed-u32 weights + .scales/.biases siblings.
+    // The loader must hand back DENSE bf16 — feeding the packed weight to the
+    // drafter's plain matmuls was a boot crash (matmul shape mismatch,
+    // issue #109; only the bf16 drafter worked).
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // hidden 64, backbone 128 (pre_proj in = 256), 1 sliding layer,
+    // 2 heads x hd 32, inter 128, vocab 64 — every quantized in-dim % 32 == 0.
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+    \\{
+    \\  "model_type": "gemma4_assistant",
+    \\  "backbone_hidden_size": 128,
+    \\  "tie_word_embeddings": true,
+    \\  "text_config": {
+    \\    "hidden_size": 64,
+    \\    "intermediate_size": 128,
+    \\    "num_hidden_layers": 1,
+    \\    "num_attention_heads": 2,
+    \\    "head_dim": 32,
+    \\    "sliding_window": 64,
+    \\    "vocab_size": 64,
+    \\    "rms_norm_eps": 1e-6,
+    \\    "layer_types": ["sliding_attention"]
+    \\  }
+    \\}
+    });
+
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+
+        const H = struct {
+            fn bf16Arr(rows: usize, cols: usize, st: mlx.mlx_stream) !mlx.mlx_array {
+                const total = rows * @max(cols, 1);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 13)) * 0.1 - 0.6;
+                const shape2 = [_]c_int{ @intCast(rows), @intCast(cols) };
+                const shape1 = [_]c_int{@intCast(rows)};
+                const f32_arr = if (cols > 0)
+                    mlx.mlx_array_new_data(data.ptr, &shape2, 2, .float32)
+                else
+                    mlx.mlx_array_new_data(data.ptr, &shape1, 1, .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                return bf;
+            }
+            fn putDense(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, rows: usize, cols: usize, st: mlx.mlx_stream) !void {
+                const bf = try bf16Arr(rows, cols, st);
+                defer _ = mlx.mlx_array_free(bf);
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+            fn putQuant(m: mlx.mlx_map_string_to_array, base: []const u8, rows: usize, cols: usize, st: mlx.mlx_stream) !void {
+                const bf = try bf16Arr(rows, cols, st);
+                defer _ = mlx.mlx_array_free(bf);
+                var triple = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(triple);
+                try mlx.check(mlx.mlx_quantize(&triple, bf, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, st));
+                const parts = [_][]const u8{ "weight", "scales", "biases" };
+                for (parts, 0..) |part, i| {
+                    var arr = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(arr);
+                    try mlx.check(mlx.mlx_vector_array_get(&arr, triple, i));
+                    try mlx.check(mlx.mlx_array_eval(arr));
+                    const key = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}.{s}", .{ base, part }, 0);
+                    defer std.testing.allocator.free(key);
+                    _ = mlx.mlx_map_string_to_array_insert(m, key.ptr, arr);
+                }
+            }
+        };
+
+        try H.putQuant(map, "model.embed_tokens", 64, 64, s);
+        try H.putQuant(map, "pre_projection", 64, 256, s);
+        try H.putQuant(map, "post_projection", 128, 64, s);
+        try H.putQuant(map, "model.layers.0.self_attn.q_proj", 64, 64, s);
+        try H.putQuant(map, "model.layers.0.self_attn.o_proj", 64, 64, s);
+        try H.putQuant(map, "model.layers.0.mlp.gate_proj", 128, 64, s);
+        try H.putQuant(map, "model.layers.0.mlp.up_proj", 128, 64, s);
+        try H.putQuant(map, "model.layers.0.mlp.down_proj", 64, 128, s);
+        try H.putDense(map, "model.norm.weight", 64, 0, s);
+        try H.putDense(map, "model.layers.0.input_layernorm.weight", 64, 0, s);
+        try H.putDense(map, "model.layers.0.post_attention_layernorm.weight", 64, 0, s);
+        try H.putDense(map, "model.layers.0.pre_feedforward_layernorm.weight", 64, 0, s);
+        try H.putDense(map, "model.layers.0.post_feedforward_layernorm.weight", 64, 0, s);
+        try H.putDense(map, "model.layers.0.self_attn.q_norm.weight", 32, 0, s);
+        try H.putDense(map, "model.layers.0.layer_scalar", 1, 0, s);
+
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    var d = try loadDrafter(io, allocator, s, dir_path);
+    defer d.deinit();
+
+    // Every weight must be dense bf16 at its LOGICAL shape, not packed u32.
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(d.embed_w));
+    const emb_shape = mlx.getShape(d.embed_w);
+    try testing.expectEqual(@as(c_int, 64), emb_shape[0]);
+    try testing.expectEqual(@as(c_int, 64), emb_shape[1]);
+
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(d.pre_proj_w_t));
+    const pp_shape = mlx.getShape(d.pre_proj_w_t);
+    try testing.expectEqual(@as(c_int, 256), pp_shape[0]);
+    try testing.expectEqual(@as(c_int, 64), pp_shape[1]);
+
+    const down_shape = mlx.getShape(d.layers[0].down_w_t);
+    try testing.expectEqual(@as(c_int, 128), down_shape[0]);
+    try testing.expectEqual(@as(c_int, 64), down_shape[1]);
+
+    // Values: the loaded pre_proj must equal the reference dequant of the
+    // saved triple (transposed). Re-read the file so no fixture state has to
+    // outlive the save block.
+    var ref_weights = try model_mod.loadWeightsSingleFile(allocator, st_path);
+    defer ref_weights.deinit();
+    const rw = ref_weights.get("pre_projection.weight").?;
+    const rs = ref_weights.get("pre_projection.scales").?;
+    const rb = ref_weights.get("pre_projection.biases").?;
+    var ref_deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_deq);
+    try mlx.check(mlx.mlx_dequantize(&ref_deq, rw, rs, rb, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, .{ .value = .bfloat16, .has_value = true }, s));
+    var ref_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_f32);
+    try mlx.check(mlx.mlx_astype(&ref_f32, ref_deq, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(ref_f32));
+    const ref_vals = mlx.mlx_array_data_float32(ref_f32).?;
+
+    // Flat-reshape the transposed loaded weight before the raw data read
+    // (reshape materializes row-major; a transposed view's pointer lies).
+    var got_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_f32);
+    try mlx.check(mlx.mlx_astype(&got_f32, d.pre_proj_w_t, .float32, s));
+    var got_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_flat);
+    const flat_shape = [_]c_int{256 * 64};
+    try mlx.check(mlx.mlx_reshape(&got_flat, got_f32, &flat_shape, 1, s));
+    try mlx.check(mlx.mlx_array_eval(got_flat));
+    const got_vals = mlx.mlx_array_data_float32(got_flat).?;
+    for (0..64) |r| {
+        for (0..256) |c| {
+            // ref is [64, 256]; loaded is transposed [256, 64].
+            try testing.expect(@abs(ref_vals[r * 256 + c] - got_vals[c * 64 + r]) < 1e-3);
+        }
+    }
 }
 
 test "DrafterConfig parses gemma-4-E4B drafter config.json shape" {

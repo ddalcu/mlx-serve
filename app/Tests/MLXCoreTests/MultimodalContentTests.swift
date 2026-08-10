@@ -53,6 +53,21 @@ final class MultimodalContentTests: XCTestCase {
         XCTAssertTrue(url!.hasPrefix("data:image/jpeg;base64,"))
     }
 
+    func testOnlyGemmaGetsThePreprocessedPixelFormat() {
+        // `x-mlx-pixels` is Gemma's square CHW buffer and nothing else can read
+        // it. Gating on a family ALLOWLIST ("qwen") sent it to Muse-Glimmer the
+        // day muse vision landed, and the server died dereferencing SigLIP
+        // weights a patch-grid encoder does not have. The list has to name the
+        // ONE arch the format belongs to, so a new vision arch defaults to
+        // server-side preprocessing instead of to the crash.
+        for arch in ["gemma3", "gemma4", "gemma4_text"] {
+            XCTAssertFalse(MultimodalContent.wantsServerPreprocess(architecture: arch), arch)
+        }
+        for arch in ["muse_glimmer", "qwen3_5_moe", "qwen3_vl", "lfm2-vl", "", "something_new"] {
+            XCTAssertTrue(MultimodalContent.wantsServerPreprocess(architecture: arch), arch)
+        }
+    }
+
     func testAudioEmitsInputAudioBlockWithRawPcm() {
         let pcm = Data([0, 0, 0, 0, 0, 0, 0, 0]) // 2 float32 samples
         let clip = ChatAudio(name: "voice.wav", pcm: pcm)

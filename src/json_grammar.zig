@@ -666,6 +666,12 @@ fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
         },
         .after_value => {
             if (byte == ',') {
+                // A comma promises another key. With additionalProperties off
+                // and every declared property seen there is none, and the
+                // expect_key state it leads to has no legal byte at all — an
+                // empty mask, which the sampler cannot express. Reject here so
+                // `}` stays the only way out.
+                if (!schema.obj_additional and allPropertiesSeen(schema, o.seen)) return .reject;
                 o.phase = .expect_key;
                 g.top().sub = .{ .in_object = o };
                 return .consumed;
@@ -678,6 +684,16 @@ fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
             return .reject;
         },
     }
+}
+
+/// Every declared property already used. With `additionalProperties:false`
+/// this is the point where no further key can be opened. Bitmask compare, not
+/// a loop: `stepObject` runs once per candidate TOKEN per generated token
+/// inside `buildMask`, so anything here is on the mask-build hot path.
+fn allPropertiesSeen(schema: *const Node, seen: u64) bool {
+    const n = @min(schema.obj_properties.len, 64);
+    const all: u64 = if (n == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+    return (seen & all) == all;
 }
 
 const PropertyMatchResult = struct {
@@ -1010,6 +1026,45 @@ test "allowedBytes after { restricts to property prefixes" {
     try testing.expect(mask.contains('n')); // start of "name"
     try testing.expect(mask.contains('a')); // start of "age"
     try testing.expect(!mask.contains('z'));
+}
+
+test "no comma after the last property when additionalProperties is false" {
+    // The mask is the only thing standing between the model and off-schema
+    // output, so a state it can enter must always have a legal next byte. With
+    // every declared property seen and `additionalProperties:false`, a comma
+    // leads to expect_key where NOTHING is legal — the mask comes back empty,
+    // argmax over an all-(-inf) row picks id 0, and the resulting byte kills
+    // the grammar (live 2026-08-11: `"!__employee_id__"` spliced into an
+    // otherwise conforming object once enforcement switched off).
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    for ("{\"name\":\"a\",\"age\":1") |b| try testing.expect(try g.acceptByte(b));
+
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains('}'));
+    try testing.expect(!mask.contains(','));
+    try testing.expect(!try g.acceptByte(','));
+}
+
+test "comma still allowed while a property remains unseen" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    for ("{\"name\":\"a\"") |b| try testing.expect(try g.acceptByte(b));
+
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains(','));
+    // `}` is not: `age` is required and still unseen.
+    try testing.expect(!mask.contains('}'));
 }
 
 test "snapshot/restore roundtrip" {

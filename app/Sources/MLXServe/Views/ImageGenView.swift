@@ -5,16 +5,13 @@ import UniformTypeIdentifiers
 /// Image generation window — native FLUX.2, Krea-2-Turbo and Mage-Flow (no
 /// Python). The model picker lists every `ImageModelPreset`; the server
 /// auto-routes to the right image backend by the model's `model_type`.
-///
-/// UI layering: a Quality picker drives steps (hidden where the schedule is
-/// distillation-fixed), a Resolution picker pins to model-trained buckets, and
-/// Advanced lets the user override individual fields. Every control in Advanced
-/// is gated on a preset capability flag — the pane shows nothing this backend
-/// would ignore or reject.
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
     @State private var showAdvanced: Bool = false
@@ -61,8 +58,10 @@ struct ImageGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor: this is a PAGE of the chat window now, and a
+        // root minimum wider than the detail column overflows it and clips
+        // both edges. Small windows shrink the preview side instead.
         readyView
-        .frame(minWidth: 880, minHeight: 640)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -107,7 +106,9 @@ struct ImageGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 460)
+            // The preview is what gives way in a small window — the generated
+            // image scales to fit; the controls column keeps its form floor.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
@@ -285,26 +286,23 @@ struct ImageGenView: View {
         }
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in ImageModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(ImageModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                LanModelPickerRows(capability: "image")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
-            Text(lanModel.map { "Runs on \(LanPick.peer(of: $0)) over your network — nothing to download." } ?? "~\(model.approxRAMGB) GB RAM")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: ImageModelPreset.all,
+            onThisMac: CustomMediaModels.imagePresets(from: server.allModels),
+            capability: "image",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.imagePreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
     }
 
     @ViewBuilder
@@ -593,8 +591,11 @@ struct ImageGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
+            // Progress only — the Download BUTTON lives on the model row above
+            // (`MediaModelChooser`). Two buttons stacked here, one to fetch and
+            // one to run, was the pane's most confusing moment.
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -670,6 +671,15 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
+                // The one bridge from the workshop to a conversation. It opens
+                // a NEW chat and switches to it — see
+                // `AppState.sendGeneratedMediaToNewChat`.
+                Button {
+                    appState.sendGeneratedMediaToNewChat(
+                        path: path, prompt: prompt, kind: .image)
+                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless)
+                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)
@@ -697,7 +707,7 @@ struct ImageGenView: View {
     /// writes trigger doesn't reapply preset defaults over them.
     private func hydrate() {
         let s = ImageGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
@@ -785,7 +795,7 @@ struct ImageGenView: View {
     }
 
     private func showLogWindow() {
-        let text = service.log.joined(separator: "\n")
+        let text = server.combinedGenLog(own: service.log)
         let alert = NSAlert()
         alert.messageText = "Image generation log"
         alert.informativeText = text.isEmpty ? "(no output)" : text

@@ -15,23 +15,61 @@ enum TruncationNotice {
     /// without it, a repetition loop reads as an output limit nobody set (live
     /// 2026-08-05: a pi session shown "maximum output token limit" with two
     /// thirds of its context free and no max_tokens on either side).
-    enum Cause: Equatable {
+    enum Cause: String, Codable, Equatable {
         case maxTokens
         case repetitionLoop
     }
 
-    /// The user-facing banner. The max-tokens text names the cap that was hit
-    /// and the two ways out; the loop text must NOT mention a cap, because
+    /// The notice as DATA on a message (`ChatMessage.truncationNotice`): the
+    /// transcript renders it as a footnote under the bubble, and because it
+    /// never touches `content`, the history builders cannot send it back to
+    /// the model — the error-echo class, closed structurally (the old
+    /// append-into-content banner rode back as assistant prose every turn).
+    struct Notice: Codable, Equatable {
+        let cause: Cause
+        let maxTokens: Int
+
+        /// Footnote text, ⚠️ included; plain (rendered as a styled view).
+        var text: String { "⚠️ " + TruncationNotice.footnote(cause: cause, maxTokens: maxTokens) }
+    }
+
+    /// The user-facing sentence. The max-tokens text names the cap that was
+    /// hit and the two ways out; the loop text must NOT mention a cap, because
     /// naming one sends people to raise a setting that was never the problem
     /// (same rule as `ChatErrorNotice` keeping a diagnosis it can't support out
     /// of the card).
-    static func text(cause: Cause, maxTokens: Int) -> String {
+    static func footnote(cause: Cause, maxTokens: Int) -> String {
         switch cause {
         case .maxTokens:
-            return "\n\n⚠️ *Output truncated — max tokens (\(maxTokens)) reached. Try breaking the task into smaller steps, or raise “max tokens” in Settings.*"
+            return "Output truncated — max tokens (\(maxTokens)) reached. Try breaking the task into smaller steps, or raise “max tokens” in Settings."
         case .repetitionLoop:
-            return "\n\n⚠️ *Stopped — the model started repeating itself and the server cut the reply. Try rephrasing, or ask for a smaller piece of the task.*"
+            return "Stopped — the model started repeating itself and the server cut the reply. Try rephrasing, or ask for a smaller piece of the task."
         }
+    }
+
+    /// The LEGACY in-content banner shape — builds before 2026-08-11 appended
+    /// this to `message.content`. Kept as the one source of truth for
+    /// `stripped(from:)`, which scrubs it out of saved sessions at history
+    /// build time.
+    static func text(cause: Cause, maxTokens: Int) -> String {
+        "\n\n⚠️ *\(footnote(cause: cause, maxTokens: maxTokens))*"
+    }
+
+    /// Removes a legacy banner an older build appended INTO content, so
+    /// history rebuilt from sessions saved before the notice became data
+    /// stops teaching the model the warning text. The banner was always
+    /// appended at the end of the turn, so everything from its marker on is
+    /// cut. Markers derive from `text(...)` — they cannot drift from it.
+    static func stripped(from content: String) -> String {
+        let loopMarker = text(cause: .repetitionLoop, maxTokens: 0)   // no cap interpolated — fixed string
+        let capFull = text(cause: .maxTokens, maxTokens: 0)
+        let capMarker = String(capFull[..<capFull.range(of: "(0")!.lowerBound])
+        for marker in [loopMarker, capMarker] {
+            if let r = content.range(of: marker) {
+                return String(content[..<r.lowerBound])
+            }
+        }
+        return content
     }
 
     /// Whether to surface the notice now. True only when the turn is ending (no
