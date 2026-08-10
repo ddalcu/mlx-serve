@@ -80,8 +80,10 @@ struct VideoGenView: View {
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
     /// True while a drag carrying a file hovers the first-frame section —
-    /// drives that section's dashed-border highlight (see ImageGenView).
+    /// drives that section's dashed-border highlight (see `MediaDropTarget`).
     @State private var isDropTargeted: Bool = false
+    /// The same, for the ref2va References section, which is its own target.
+    @State private var isRefDropTargeted: Bool = false
 
     var body: some View {
         // No window-sized floor — see ImageGenView: pages shrink their
@@ -485,17 +487,11 @@ struct VideoGenView: View {
                     .frame(maxWidth: .infinity)
             }
         }
-        .padding(6)
-        // Drops land on this section rather than the whole window; contentShape
-        // makes the gaps between rows hit-testable so a drop there doesn't fall
-        // through to the ScrollView behind.
-        .contentShape(RoundedRectangle(cornerRadius: 8))
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { handleImageDrop($0) }
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
-                .opacity(isDropTargeted ? 1 : 0)
-                .allowsHitTesting(false)
+        // One image slot, so a drop REPLACES whatever is there — same as
+        // picking again. Drops land on this section rather than the whole
+        // window; see `MediaDropTarget`.
+        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { firstFrameImageURL = url }
         }
     }
 
@@ -515,6 +511,9 @@ struct VideoGenView: View {
                         .foregroundStyle(.secondary)
                 }
                 Text("Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1> — the numbering is per type, in the order below.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Drag files in — each one joins the list for its own type.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -551,6 +550,20 @@ struct VideoGenView: View {
                     // this is a real time cost, not a quality knob.
                     .help("How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step.")
                 }
+            }
+            // ONE target for the whole section rather than three: the lists are
+            // rows a few points tall, and which list a file belongs to is
+            // already knowable from the file itself. `H3RefDrop` spends the
+            // per-type caps and the combined budget the Add buttons follow.
+            .mediaDropAnyKind(limit: H3RefLimits.remaining(perType: H3RefLimits.total,
+                                                           current: 0,
+                                                           totalAttached: refFilesAttached),
+                              isTargeted: $isRefDropTargeted) { urls in
+                let routed = H3RefDrop.route(urls, images: refImageURLs,
+                                             videos: refVideoURLs, audios: refAudioURLs)
+                refImageURLs = routed.images
+                refVideoURLs = routed.videos
+                refAudioURLs = routed.audios
             }
         }
     }
@@ -1053,27 +1066,6 @@ struct VideoGenView: View {
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
             firstFrameImageURL = url
         }
-    }
-
-    /// Entry point for `.onDrop`: only one image slot exists on this pane
-    /// (the first frame), so unlike ImageGen's source/reference routing this
-    /// is just "the dropped image becomes — or replaces — the first frame."
-    /// Item providers resolve asynchronously off the UI thread, so the
-    /// actual assignment happens back on the main actor.
-    private func handleImageDrop(_ providers: [NSItemProvider]) -> Bool {
-        let candidates = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
-        guard let provider = candidates.first else { return false }
-        provider.loadObject(ofClass: URL.self) { url, _ in
-            guard let url, Self.isImageFile(url) else { return }
-            DispatchQueue.main.async { firstFrameImageURL = url }
-        }
-        return true
-    }
-
-    /// Same extension allow-list as ImageGenView's drop handling.
-    private static func isImageFile(_ url: URL) -> Bool {
-        let ext = url.pathExtension.lowercased()
-        return ["png", "jpg", "jpeg", "heic", "heif", "webp", "tiff", "tif", "gif", "bmp"].contains(ext)
     }
 
     /// Labeled slider for a `Double` setting, with a live value readout on the

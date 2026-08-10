@@ -1,0 +1,225 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+/// Drag-and-drop file input for the Create panes, in ONE place.
+///
+/// Every gen pane already had a picker button; a drop target is the same
+/// question asked with the mouse, and the two must never disagree about what
+/// they accept. So the allow-lists live here rather than beside each picker,
+/// and the panes hand this modifier the slot's remaining ROOM instead of each
+/// re-deriving a cap. What a picker never had to answer — several files at
+/// once, arriving out of order — is `MediaDrop`/`H3RefDrop` below.
+enum MediaDropKind {
+    case image, video, audio
+
+    /// Mirrors the matching picker's `allowedContentTypes`, widened to the
+    /// spellings the same decoder opens anyway (an `NSImage` reads webp/tiff;
+    /// AVFoundation reads m4a/aiff). Kept as extensions, not UTTypes, because
+    /// a drop hands us a plain file URL and this is the one thing we can read
+    /// from it without touching the disk.
+    var extensions: Set<String> {
+        switch self {
+        case .image: ["png", "jpg", "jpeg", "heic", "heif", "webp", "tiff", "tif", "gif", "bmp"]
+        case .video: ["mov", "mp4", "m4v"]
+        case .audio: ["wav", "mp3", "m4a", "aac", "aiff", "aif", "caf", "flac"]
+        }
+    }
+
+    func accepts(_ url: URL) -> Bool {
+        extensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// Which list a mixed drop belongs to, or nil for a file no pane wants.
+    static func of(_ url: URL) -> MediaDropKind? {
+        [.image, .video, .audio].first { $0.accepts(url) }
+    }
+}
+
+enum MediaDrop {
+    /// Turns the raw per-provider results into the files a slot will take.
+    ///
+    /// `slots` is positional — one entry per provider, in the order the user
+    /// dropped them, `nil` where a provider failed to resolve. That is the
+    /// whole point: providers resolve asynchronously and independently, so
+    /// appending as each finishes puts them in a RACE order, and the
+    /// reference lists are numbered (`<Picture 2>` is a contract with the
+    /// model, per type, in list order). A hole is skipped without shifting
+    /// its neighbours; over the cap the earliest files win.
+    static func accepted(_ slots: [URL?], as kind: MediaDropKind, limit: Int) -> [URL] {
+        guard limit > 0 else { return [] }
+        return Array(slots.compactMap { $0 }.filter { kind.accepts($0) }.prefix(limit))
+    }
+}
+
+/// Where a dropped image lands on the Image pane, which is the one pane with
+/// two destinations. Kept pure and out of the view so the routing can be read
+/// (and tested) on its own.
+enum ImageDropPlacement {
+    /// Priority: fill the empty source first, then references while editing a
+    /// backend that takes them; otherwise the drop REPLACES the source, since
+    /// variation mode has a single image slot and silently discarding the file
+    /// would look like the drop missed. A full reference list drops the extra
+    /// file and leaves the source alone — replacing a source the user chose
+    /// because their reference list happened to be full is the surprise.
+    static func place(_ urls: [URL], source: URL?, editing: Bool,
+                      supportsReferences: Bool, refs: [URL],
+                      refLimit: Int) -> (source: URL?, refs: [URL]) {
+        var source = source
+        var refs = refs
+        for url in urls {
+            if source == nil {
+                source = url
+            } else if editing && supportsReferences {
+                if refs.count < refLimit { refs.append(url) }
+            } else {
+                source = url
+            }
+        }
+        return (source, refs)
+    }
+}
+
+/// Splits one drop across the H3 reference lists. The section is a single
+/// target — three separate ones would make attaching a clip a game of hitting
+/// the right 20pt row — so the file's own type picks its list, under both that
+/// type's cap and the combined budget the Add buttons already respect.
+enum H3RefDrop {
+    static func route(_ urls: [URL], images: [URL], videos: [URL],
+                      audios: [URL]) -> (images: [URL], videos: [URL], audios: [URL]) {
+        var images = images, videos = videos, audios = audios
+        for url in urls {
+            guard let kind = MediaDropKind.of(url) else { continue }
+            let attached = images.count + videos.count + audios.count
+            switch kind {
+            case .image:
+                if H3RefLimits.remaining(perType: H3RefLimits.images, current: images.count,
+                                         totalAttached: attached) > 0 { images.append(url) }
+            case .video:
+                if H3RefLimits.remaining(perType: H3RefLimits.videos, current: videos.count,
+                                         totalAttached: attached) > 0 { videos.append(url) }
+            case .audio:
+                if H3RefLimits.remaining(perType: H3RefLimits.audios, current: audios.count,
+                                         totalAttached: attached) > 0 { audios.append(url) }
+            }
+        }
+        return (images, videos, audios)
+    }
+}
+
+// MARK: - The view side
+
+/// Collects a drop's providers and delivers them ONCE, in drop order.
+private enum MediaDropLoader {
+    /// Boxed so the escaping per-provider callbacks can fill their own slot
+    /// without capturing a `var` across threads.
+    private final class Slots: @unchecked Sendable {
+        private let lock = NSLock()
+        private var urls: [URL?]
+        init(count: Int) { urls = .init(repeating: nil, count: count) }
+        func set(_ url: URL?, at i: Int) { lock.lock(); urls[i] = url; lock.unlock() }
+        var all: [URL?] { lock.lock(); defer { lock.unlock() }; return urls }
+    }
+
+    /// Returns whether the drop is worth accepting at all — SwiftUI uses it to
+    /// animate the file in or bounce it back, so a full slot bounces rather
+    /// than swallowing the file and doing nothing.
+    static func load(_ providers: [NSItemProvider], kind: MediaDropKind?, limit: Int,
+                     completion: @escaping ([URL]) -> Void) -> Bool {
+        let files = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+        guard !files.isEmpty, limit > 0 else { return false }
+        let slots = Slots(count: files.count)
+        let group = DispatchGroup()
+        for (i, provider) in files.enumerated() {
+            group.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                slots.set(url, at: i)
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            // A nil kind means the caller sorts the types itself (the H3
+            // references section); it still wants the drop order and the cap.
+            let resolved = slots.all.compactMap { $0 }
+            let urls = kind.map { MediaDrop.accepted(slots.all, as: $0, limit: limit) }
+                ?? Array(resolved.prefix(limit))
+            guard !urls.isEmpty else { return }
+            completion(urls)
+        }
+        return true
+    }
+}
+
+private struct MediaDropModifier: ViewModifier {
+    let kind: MediaDropKind?
+    let limit: Int
+    @Binding var isTargeted: Bool
+    let onURLs: ([URL]) -> Void
+
+    private static let cornerRadius: CGFloat = 8
+
+    func body(content: Content) -> some View {
+        content
+            .padding(6)
+            // Without contentShape the gaps between rows aren't hit-testable
+            // and a drop there falls through to the ScrollView behind — which
+            // is most of a section made of small rows.
+            .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
+            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+                MediaDropLoader.load(providers, kind: kind, limit: limit, completion: onURLs)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: Self.cornerRadius)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    .opacity(isTargeted ? 1 : 0)
+                    .allowsHitTesting(false)
+            }
+    }
+}
+
+extension View {
+    /// Makes this section a drop target for `kind`, highlighted while a drag
+    /// is over it. `limit` is the slot's REMAINING room (1 for a single-image
+    /// slot, since a drop there replaces).
+    func mediaDrop(_ kind: MediaDropKind, limit: Int = 1, isTargeted: Binding<Bool>,
+                   onURLs: @escaping ([URL]) -> Void) -> some View {
+        modifier(MediaDropModifier(kind: kind, limit: limit, isTargeted: isTargeted, onURLs: onURLs))
+    }
+
+    /// Mixed-type variant: every file is handed over and the caller routes by
+    /// type (`H3RefDrop`).
+    func mediaDropAnyKind(limit: Int, isTargeted: Binding<Bool>,
+                          onURLs: @escaping ([URL]) -> Void) -> some View {
+        modifier(MediaDropModifier(kind: nil, limit: limit, isTargeted: isTargeted, onURLs: onURLs))
+    }
+}
+
+/// The empty state's target: something to see and aim at, rather than a bare
+/// button inside an invisible drop region.
+struct MediaDropWell: View {
+    let title: String
+    let systemImage: String
+    let isTargeted: Bool
+    let action: () -> Void
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Button(title, action: action)
+                .buttonStyle(.link)
+                .font(.caption)
+            Text("or drag one here")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 84)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(isTargeted ? 0.12 : 0.06))
+        )
+    }
+}

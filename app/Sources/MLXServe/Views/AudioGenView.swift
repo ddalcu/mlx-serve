@@ -126,6 +126,9 @@ struct VoiceGenView: View {
     @State private var showAdvanced: Bool = false
 
     @State private var refError: String? = nil
+    /// True while a drag carrying a file hovers the reference-voice section —
+    /// drives its dashed-border highlight (see `MediaDropTarget`).
+    @State private var isDropTargeted: Bool = false
     /// Dictation into the text editor: the voice-mode recognizer emits one
     /// finalized utterance per silence gap; each is appended via `Dictation`.
     /// Created lazily on first use — never at launch (audio-graph TCC rule).
@@ -366,13 +369,19 @@ struct VoiceGenView: View {
                         .font(.caption)
                 }
             } else {
-                Text("Pick or record ~\(model.recommendedRefSeconds) seconds of the voice to clone. Without a reference, the model's default voice is used.")
+                Text("Pick, record or drag in ~\(model.recommendedRefSeconds) seconds of the voice to clone. Without a reference, the model's default voice is used.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
             if let err = refError {
                 Text(err).font(.caption2).foregroundStyle(.orange)
             }
+        }
+        // One clip slot, so a drop replaces what's there. Routed through
+        // `acceptReference` so a dropped file is transcoded exactly like a
+        // picked one — see `MediaDropTarget`.
+        .mediaDrop(.audio, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { acceptReference(url) }
         }
     }
 
@@ -526,6 +535,15 @@ struct VoiceGenView: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        acceptReference(url)
+    }
+
+    /// The one way a FILE becomes the reference clip, whether it was picked or
+    /// dropped: a dropped file gets the same 24 kHz mono transcode, and a
+    /// transcode failure the same visible reason rather than a file that
+    /// silently doesn't attach.
+    private func acceptReference(_ url: URL) {
+        refError = nil
         do {
             refAudioURL = try AudioReference.normalizedReferenceWav(fromFile: url)
         } catch {
