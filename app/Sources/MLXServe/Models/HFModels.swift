@@ -27,6 +27,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "hy_v3",      // …and/or the model_type verbatim (some tag only that)
     "laguna",     // poolside Laguna S 2.1 — repos tag "laguna" and/or "laguna-s-2.1"
     "inkling",    // Thinking Machines Inkling Small — repos tag "inkling" and/or "inkling_mm_model"
+    "muse",       // meta-models Muse-Glimmer-30B — repos tag "muse_glimmer" (and *_text)
 ]
 
 /// model_type values from config.json that the Zig server can load.

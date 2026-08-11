@@ -882,3 +882,37 @@ Two verification traps burned time:
   the math) — only the echo spelled the number with spaces. Cross-check
   `/tokenize` vs HF at bring-up, per the standing rule; it found 8/8 diverse
   cases byte-identical after the fix.
+
+## A config default only ONE family wants is a silent per-arch trap: muse rope base (first-turn repetition loops, 2026-08-11)
+
+pi on Muse-Glimmer-30B looped in the thinking channel on its FIRST turn — restated the user's
+request ~11 times until `[loop-stop]` cut it (54 cuts in one day's app-server log). The
+discrimination matrix (`~/claude-tmp/muse-loop/matrix.tsv`, fixture = the exact captured pi
+request) exonerated everything else one arm at a time: loops at temp 0 DETERMINISTICALLY (so
+not sampling), with `--no-drafter` (PLD-only — not spec), on 4bit AND 8bit AND the upstream
+bf16 under `--no-decode-attn-quant` (not quant), on the byte-identical HF-rendered prompt fed
+raw through `/v1/completions` (not our chat render), with 0/1673 token-id diffs vs HF
+tokenizers (not the pretokenizer). The decisive arm: the SAME upstream bf16 trunk under
+mlx-lm (PR #1710, key-surgery remap) continued CLEAN where our runtime looped — greedy
+divergence at ~token 13, ours doubling a phrase inside the request echo.
+
+Root cause: every forward path picks the RoPE base as
+`if (is_global) cfg.rope_theta else cfg.rope_local_base_freq`, and `rope_local_base_freq`
+defaults to Gemma-3's 10000. Muse ships ONE theta (500000) for all roped layers — as
+`text_config.rope_parameters.rope_theta`, which the generic parse lands in `rope_theta`
+only — and its global layers are NoPE, so **every rotated layer ran at base 10000 instead of
+500000**. Wrong positional geometry: short-range copying survives (the echo), mid-range
+coherence collapses into restart loops. Fix: the muse arch block sets
+`rope_local_base_freq = rope_theta` when the key is absent (model.zig). The bf16 greedy
+continuation then tracks mlx-lm's (319-char shared prefix, wording-level bf16 noise after),
+and the incident config went 0/6.
+
+Class lessons: (1) a per-layer-TYPE config knob with a family-flavored default must be pinned
+by the arch's config test for EVERY layer type the forward distinguishes — the muse test
+asserted `rope_theta` and never `rope_local_base_freq`, exactly the value the sliding layers
+read; (2) "coherent for N tokens then degenerates into loops, deterministic at greedy" is a
+POSITIONAL-ENCODING symptom signature, not a sampling one; (3) an unmerged reference port
+(mlx-lm PR) is still a usable oracle once weights + token ids are proven identical — behavior
+divergence then isolates the runtime. Guards: the `rope_local_base_freq == 500000` assertion
+in the muse config test (red on revert) + `tests/test_muse_repetition.sh` (replays the real
+capture; exits 1 on any `finish_details.type == "repetition_loop"`).

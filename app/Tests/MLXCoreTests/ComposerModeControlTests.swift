@@ -50,6 +50,17 @@ final class ComposerModeControlTests: XCTestCase {
         }
     }
 
+    /// The brain disc follows the same idiom: click toggles thinking,
+    /// secondary-click (and press-and-hold) opens the reasoning-effort picker.
+    func testThinkDiscTogglesOnClickAndOffersTheEffortMenuOnRightClick() throws {
+        let source = try chatViewSource()
+        let body = try declaration("thinkToggle", in: source)
+        XCTAssertTrue(body.contains("primaryAction:"),
+                      "the brain disc must toggle thinking on a plain click")
+        XCTAssertTrue(body.contains(".contextMenu {"),
+                      "secondary-click must offer the reasoning-effort picker")
+    }
+
     /// The menus carry the per-tool switches / workspace / marketplace ONLY.
     /// An on/off row there would be a second way to do what one click does,
     /// and two controls for one boolean is how they end up disagreeing.

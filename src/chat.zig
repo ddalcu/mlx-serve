@@ -488,6 +488,20 @@ fn renderChatTemplate(
         }
     }
 
+    // Muse (harmony convention): reasoning belongs to the CURRENT turn only.
+    // The app round-trips `reasoning_content` on assistant history, and this
+    // template renders it as a to=self segment — so one bad chain (a loop-cut
+    // tail) would replay in the prompt on every later turn. Drop it on
+    // assistant messages before the last user message; tool rounds after it
+    // keep theirs. Families whose templates NEED history reasoning (laguna,
+    // inkling) are untouched — same sniff `noThinkTailSuffix` uses.
+    if (std.mem.indexOf(u8, tpl, "reasoning_strength") != null) {
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        if (try dropPriorTurnReasoning(fallback_arena.?.allocator(), effective_messages)) |stripped| {
+            effective_messages = stripped;
+        }
+    }
+
     // Serialize messages to JSON — Gemma 4 templates handle role:"tool" natively
     // (producing <|turn>tool in the rendered output). No transformation needed.
     const messages_json = try serializeMessagesJson(allocator, effective_messages);
@@ -521,7 +535,12 @@ fn renderChatTemplate(
 
     if (result_ptr) |ptr| {
         defer jinja_c.jinja_str_free(ptr);
-        return try collapseDoubledThinkTags(allocator, std.mem.span(ptr));
+        const collapsed = try collapseDoubledThinkTags(allocator, std.mem.span(ptr));
+        if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
+            defer allocator.free(collapsed);
+            return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
+        }
+        return collapsed;
     }
 
     // WARN, not debug: a failed render silently swaps the prompt into
@@ -533,6 +552,32 @@ fn renderChatTemplate(
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
     }
     return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+}
+
+/// Null `reasoning_content` on assistant messages BEFORE the last user
+/// message (harmony convention: prior-turn analysis is dropped from the
+/// prompt; the current turn's tool rounds keep theirs). Returns null when
+/// nothing would change, so the common no-history-reasoning case allocates
+/// nothing.
+fn dropPriorTurnReasoning(arena: std.mem.Allocator, messages: []const Message) !?[]const Message {
+    var last_user: ?usize = null;
+    for (messages, 0..) |m, i| {
+        if (std.mem.eql(u8, m.role, "user")) last_user = i;
+    }
+    const cut = last_user orelse return null;
+    var any = false;
+    for (messages[0..cut]) |m| {
+        if (std.mem.eql(u8, m.role, "assistant") and m.reasoning_content != null) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return null;
+    const out = try arena.dupe(Message, messages);
+    for (out[0..cut]) |*m| {
+        if (std.mem.eql(u8, m.role, "assistant")) m.reasoning_content = null;
+    }
+    return out;
 }
 
 /// DSV4's chat template emits `</think></think>` between every user→assistant
@@ -1035,7 +1080,7 @@ fn fallbackFormatChat(
 /// them closed (seen live from the 26B GGUF via pi). Everything from the
 /// first such opener onward is dangling thought; cutting at the LAST opener
 /// instead leaks the earlier raw tags into visible content. A pos-0 opener is
-/// reported too: callers (stripThinkBlock / stripTrailingThinkOpen) strip
+/// reported too: callers (the split arms / stripTrailingThinkOpen) strip
 /// their leading CLOSED block first, so an unclosed opener at the start of the
 /// remainder is a genuine dangling re-open (`…<channel|>\n<|channel>thought\n`,
 /// 2026-06-19 live) — excluding it leaked the bare opener into content.
@@ -1262,24 +1307,10 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
-/// Strip `<think>...</think>` or `<|channel>thought\n...<channel|>` block from model output.
-pub fn stripThinkBlock(text: []const u8) []const u8 {
-    return trimLeakedToolMarkup(stripThinkBlockKeepingMarkup(text));
-}
-
-/// The strip WITHOUT the leaked-markup cut — for the one caller that feeds the
-/// result back to `parseToolCalls` (the /v1/messages non-streaming path).
-pub fn stripThinkBlockKeepingMarkup(text: []const u8) []const u8 {
-    // Muse / Inkling message channels: same arms as splitThinkBlock (content only).
-    if (splitMuseChannels(text)) |split| return split.content;
-    if (splitInklingChannels(text)) |split| return split.content;
-    const base = stripThinkBlockLeading(text);
-    const trimmed = if (lastUnclosedThinkOpen(base)) |o|
-        std.mem.trimEnd(u8, base[0..o.pos], "\n ")
-    else
-        base;
-    return trimTrailingThinkClosers(trimmed);
-}
+// NOTE: there is deliberately NO strip-think helper anymore. Reasoning the
+// model generated is ALWAYS delivered (reasoning_content / thinking blocks) —
+// thinking-off is enforced on the PROMPT side (`noThinkTailSuffix`), so every
+// delivery site takes `splitThinkBlock(text, true, …)` and ships both halves.
 
 /// Trim trailing think/channel/tool CLOSE markers (and surrounding whitespace)
 /// from visible content. A close marker is never valid at the tail of content —
@@ -1308,27 +1339,13 @@ fn trimTrailingThinkClosers(content: []const u8) []const u8 {
 }
 
 /// Truncate a trailing unclosed thought opener (and its dangling thought)
-/// out of visible content. Used by the split/strip paths after the leading
-/// block has been handled.
+/// out of visible content. Used by the split arms after the leading block has
+/// been handled.
 fn stripTrailingThinkOpen(content: []const u8) []const u8 {
     if (lastUnclosedThinkOpen(content)) |o| {
         return std.mem.trimEnd(u8, content[0..o.pos], "\n ");
     }
     return content;
-}
-
-fn stripThinkBlockLeading(text: []const u8) []const u8 {
-    // Gemma 4 style: <|channel>thought\n...<channel|>
-    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
-        return std.mem.trimStart(u8, text[end + 10 ..], "\n ");
-    }
-    // Standard style: <think>...</think> (or the Hy3-suffixed variant)
-    if (indexOfThinkCloseTag(text, 0)) |c| {
-        return std.mem.trimStart(u8, text[c.pos + c.len ..], "\n ");
-    }
-    if (thinkOpenTagLenAt(text) != null) return text[0..0];
-    if (std.mem.startsWith(u8, text, "<|channel>thought")) return text[0..0];
-    return text;
 }
 
 pub const ThinkSplit = struct {
@@ -1467,6 +1484,19 @@ fn splitMuseChannels(text: []const u8) ?ThinkSplit {
                 if (content == null) content = std.mem.trim(u8, s.body, "\n ");
             } else {
                 if (tool_body == null) tool_body = s.body;
+            }
+        } else if (seg_start == 0) {
+            // Headerless first segment: a prompt-committed `to=user<|message|>`
+            // header puts the model's first bytes straight into BODY. Claim it
+            // as content — but never text that still reads as a (truncated)
+            // recipient header.
+            var body = text[0..seg_end];
+            if (std.mem.indexOf(u8, body, MUSE_EOM_TAG)) |e| body = body[0..e];
+            if (std.mem.indexOf(u8, body, MUSE_EOT_TAG)) |e| body = body[0..e];
+            const c = std.mem.trim(u8, body, "\n ");
+            if (c.len > 0 and museThinkOpenerAt(body) == .not_muse) {
+                routed = true;
+                content = c;
             }
         }
         seg_start = next orelse break;
@@ -1630,6 +1660,28 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
     return endsWithThinkOpenTag(trimmed) != null;
 }
 
+/// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
+/// Thinking-off on an always-thinking template otherwise means generating the
+/// whole reasoning pass and discarding it — the prompt-side commit is what
+/// makes thinking-off a real skip.
+///   • Muse: the generation prompt ends bare `<|start|>assistant`; spending
+///     the header (` to=user<|message|>`, byte-exactly what the template
+///     renders for history content turns) makes `to=self` unreachable. Never
+///     with tools — a tool call is a `to=<fn>` header.
+///   • Unconditional think opener (LFM2.5 class): close the block the
+///     template opened. Thinking-off Qwen-style renders end CLOSED and never
+///     match; no tools gate — tool calls ride outside the think block.
+fn noThinkTailSuffix(tpl: []const u8, rendered: []const u8, enable_thinking: bool, has_tools: bool) ?[]const u8 {
+    if (enable_thinking) return null;
+    if (!has_tools and std.mem.indexOf(u8, tpl, "reasoning_strength") != null and
+        std.mem.endsWith(u8, rendered, "<|start|>assistant"))
+    {
+        return " to=user<|message|>";
+    }
+    if (promptTailOpensThink(rendered[rendered.len -| 64 ..])) return "</think>";
+    return null;
+}
+
 /// Split model output into reasoning_content and content.
 /// Handles both `<think>...</think>` and Gemma 4's `<|channel>thought\n...<channel|>`.
 /// `opened_by_template`: the generation prompt ended with a template-injected
@@ -1786,7 +1838,7 @@ fn skipContentChannelTag(text: []const u8, start: usize) usize {
 /// where the raw pair leaked verbatim into the visible text block. This pass
 /// rewrites such output to `<|channel>thought\n{all thought text}<channel|>
 /// {all content}` so every downstream consumer (splitThinkBlock,
-/// stripThinkBlock, parseToolCalls) handles it unchanged.
+/// parseToolCalls) handles it unchanged.
 ///
 /// Returns null when no rewrite is needed (zero or one LEADING closed block —
 /// the overwhelmingly common case, zero-cost). An unclosed trailing opener is
@@ -1826,7 +1878,7 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
         const close_tag: []const u8 = if (o.is_think_style) "</think>" else "<channel|>";
         const close_pos = std.mem.indexOfPos(u8, text, o.after, close_tag) orelse {
             // Unclosed trailing opener — leave verbatim for the trailing-strip
-            // logic in splitThinkBlock/stripThinkBlock.
+            // logic in splitThinkBlock.
             try content_parts.append(allocator, text[pos..]);
             break;
         };
@@ -5555,14 +5607,14 @@ test "collapseDoubledThinkTags handles multiple separated doublings" {
     try testing.expectEqualStrings("A</think>B</think>C", out);
 }
 
-test "stripThinkBlock removes think tags" {
-    try testing.expectEqualStrings("Hello", stripThinkBlock("<think>reasoning</think>Hello"));
-    try testing.expectEqualStrings("Hello", stripThinkBlock("<think>reasoning</think>\nHello"));
-    try testing.expectEqualStrings("Hello", stripThinkBlock("<think>reasoning</think>\n\nHello"));
+test "split content: think tags never reach content" {
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>Hello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>\nHello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>\n\nHello", true, false).content);
 }
 
-test "stripThinkBlock returns empty for open think tag" {
-    try testing.expectEqualStrings("", stripThinkBlock("<think>still thinking..."));
+test "split content: empty for open think tag (truncated thought is never content)" {
+    try testing.expectEqualStrings("", splitThinkBlock("<think>still thinking...", true, false).content);
 }
 
 test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload, not a block close" {
@@ -5577,7 +5629,7 @@ test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload
     const in_thought = "<think>let me try <tool_call>read</tool_call> hmm</think>The answer is 4.";
     const c = indexOfThinkCloseTag(in_thought, 0) orelse return error.MissingClose;
     try testing.expectEqualStrings("The answer is 4.", in_thought[c.pos + c.len ..]);
-    try testing.expectEqualStrings("The answer is 4.", stripThinkBlock(in_thought));
+    try testing.expectEqualStrings("The answer is 4.", splitThinkBlock(in_thought, true, false).content);
 
     // An opener that NEVER closes is leaked markup, not a payload container:
     // the close still ends the block, and trimLeakedToolMarkup takes the tail.
@@ -5589,8 +5641,8 @@ test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload
     try testing.expect(indexOfThinkCloseTag("<think>r</think>a<tool_call>x</tool_call>", 0).?.pos == 8);
 }
 
-test "stripThinkBlock returns text when no think tags" {
-    try testing.expectEqualStrings("Hello world", stripThinkBlock("Hello world"));
+test "split content: text without think tags passes through" {
+    try testing.expectEqualStrings("Hello world", splitThinkBlock("Hello world", true, false).content);
 }
 
 test "splitThinkBlock with complete think block" {
@@ -7024,10 +7076,10 @@ test "parseToolCalls Hermes format" {
     try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
 }
 
-test "stripThinkBlock Gemma 4 channel tags" {
-    try testing.expectEqualStrings("Hello", stripThinkBlock("<|channel>thought\nreasoning here<channel|>Hello"));
-    try testing.expectEqualStrings("Hello", stripThinkBlock("<|channel>thought\nreasoning<channel|>\nHello"));
-    try testing.expectEqualStrings("", stripThinkBlock("<|channel>thought\nstill thinking..."));
+test "split content: Gemma 4 channel tags never reach content" {
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<|channel>thought\nreasoning here<channel|>Hello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<|channel>thought\nreasoning<channel|>\nHello", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock("<|channel>thought\nstill thinking...", true, false).content);
 }
 
 test "splitThinkBlock Gemma 4 channel tags" {
@@ -7094,12 +7146,12 @@ test "splitThinkBlock trailing unclosed thought opener does not leak (Gemma 12B 
     }
 }
 
-test "stripThinkBlock trailing unclosed thought opener does not leak" {
-    // Thinking-off path: the visible text must be truncated at a trailing
-    // unclosed opener (the tag and dangling thought are never content).
-    try testing.expectEqualStrings("Here is the design.", stripThinkBlock("Here is the design.\n<|channel>thought"));
-    try testing.expectEqualStrings("Here is the design.", stripThinkBlock("Here is the design.\n<|channel>thought\nI should now write"));
-    try testing.expectEqualStrings("Done.", stripThinkBlock("Done.\n<think>hmm"));
+test "split content: trailing unclosed thought opener does not leak" {
+    // The visible text must be truncated at a trailing unclosed opener (the
+    // tag and dangling thought are reasoning, never content).
+    try testing.expectEqualStrings("Here is the design.", splitThinkBlock("Here is the design.\n<|channel>thought", true, false).content);
+    try testing.expectEqualStrings("Here is the design.", splitThinkBlock("Here is the design.\n<|channel>thought\nI should now write", true, false).content);
+    try testing.expectEqualStrings("Done.", splitThinkBlock("Done.\n<think>hmm", true, false).content);
 }
 
 test "trimLeakedToolMarkup cuts at the first unparsed tool-call opener" {
@@ -7188,12 +7240,12 @@ test "splitThinkBlock re-opened thought opener right after close does not leak" 
     }
 }
 
-test "stripThinkBlock re-opened thought opener right after close does not leak" {
-    // Thinking-off path of the same regression — this is the exact form that
-    // reached chat-history.json (`<|channel>thought\n` as the whole content).
-    try testing.expectEqualStrings("", stripThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n"));
-    try testing.expectEqualStrings("Ready.", stripThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n"));
-    try testing.expectEqualStrings("", stripThinkBlock("<think>plan</think>\n<think>"));
+test "split content: re-opened thought opener right after close does not leak" {
+    // Same regression, content side — this is the exact form that reached
+    // chat-history.json (`<|channel>thought\n` as the whole content).
+    try testing.expectEqualStrings("", splitThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false).content);
+    try testing.expectEqualStrings("Ready.", splitThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock("<think>plan</think>\n<think>", true, false).content);
 }
 
 test "parseToolCalls Gemma 4 format" {
@@ -10206,41 +10258,41 @@ test "parseToolCalls: NO path emits invalid JSON args (final safety net)" {
     }
 }
 
-test "stripThinkBlock removes trailing <channel|> close-marker spam (degenerate model output)" {
+test "split content: trailing <channel|> close-marker spam never leaks (degenerate model output)" {
     // Live soak capture (record 2151, a Gemma reasoning variant): the model emitted
     // reasoning, one <channel|> close, a scrap of content, then SPAMMED 16 more bare
-    // <channel|> close markers. The leading strip cut at the FIRST close, and the
-    // trailing-strip only handles unclosed OPENERS — so the 16 stray CLOSE markers
+    // <channel|> close markers. The leading cut takes the FIRST close, and the
+    // trailing-open cut only handles unclosed OPENERS — so the 16 stray CLOSE markers
     // leaked into visible content. A close marker is never valid at the tail of
-    // content; strip trailing closers (and openers) so <channel|> can't leak.
+    // content; trailing closers (and openers) are trimmed so <channel|> can't leak.
     const text = "Reasoning here about the file.\n<channel|>`glob` `./game.js`\n\n" ++
         "<channel|><channel|><channel|><channel|><channel|>";
-    const content = stripThinkBlock(text);
+    const content = splitThinkBlock(text, true, false).content;
     try testing.expect(std.mem.indexOf(u8, content, "<channel|>") == null);
     // The scrap of real content before the spam survives.
     try testing.expect(std.mem.indexOf(u8, content, "glob") != null);
 }
 
-test "stripThinkBlock removes trailing </think> close spam too" {
+test "split content: trailing </think> close spam never leaks" {
     const text = "<think>plan</think>The answer.</think></think></think>";
-    const content = stripThinkBlock(text);
+    const content = splitThinkBlock(text, true, false).content;
     try testing.expect(std.mem.indexOf(u8, content, "</think>") == null);
     try testing.expect(std.mem.indexOf(u8, content, "The answer.") != null);
 }
 
-test "stripThinkBlock removes orphan Gemma <tool_call|> close from content (no-tag-leak)" {
+test "split content: orphan Gemma <tool_call|> close never leaks (no-tag-leak)" {
     // Live 2026-07-16 soak (gemma-4-26B-A4B-it-qat-4bit, tools present, a "no
     // tools needed" probe at temp 0.7): the model degenerated into a bare
     // 1-token <tool_call|> CLOSE with NO <|tool_call> opener, so parseToolCalls
     // found no call and the orphan control token leaked as the ENTIRE visible
     // content (server response content == "<tool_call|>"). A tool CLOSE marker is
     // never valid at the tail of content — same class as the <channel|> spam.
-    // parseToolCalls already extracted any real call before this strip runs, so
+    // parseToolCalls already extracted any real call before this split runs, so
     // any residual <tool_call|> here is orphan by construction.
-    try testing.expectEqualStrings("", stripThinkBlock("<tool_call|>"));
-    try testing.expectEqualStrings("Sure.", stripThinkBlock("Sure.<tool_call|>"));
+    try testing.expectEqualStrings("", splitThinkBlock("<tool_call|>", true, false).content);
+    try testing.expectEqualStrings("Sure.", splitThinkBlock("Sure.<tool_call|>", true, false).content);
     // Legit prose (no control token) is untouched.
-    try testing.expectEqualStrings("2 + 2 = 4", stripThinkBlock("2 + 2 = 4"));
+    try testing.expectEqualStrings("2 + 2 = 4", splitThinkBlock("2 + 2 = 4", true, false).content);
 }
 
 test "splitThinkBlock content never keeps trailing channel close spam" {
@@ -10264,7 +10316,6 @@ test "hy3 think: literal suffixed opener + close" {
     const split = splitThinkBlock(out, true, false);
     try testing.expectEqualStrings("hmm", split.reasoning_content.?);
     try testing.expectEqualStrings("Answer.", split.content);
-    try testing.expectEqualStrings("Answer.", stripThinkBlock(out));
 }
 
 test "hy3 think: trailing suffixed close spam trimmed from content" {
@@ -10612,8 +10663,11 @@ test "renderChatTemplate: muse_glimmer shipped template renders byte-identical t
     // meta-models/Muse-Glimmer-30B ships; muse_render_reference.txt is python
     // jinja2's render of the exact message set below (regenerate with the
     // script in the fixture header if either changes). Byte equality pins:
-    // <|start|>role<|message|>…<|eot|> framing, reasoning as a to=self
-    // <|eom|> segment, tool calls as to=<fn> ATEM blocks with dict arguments
+    // <|start|>role<|message|>…<|eot|> framing, PRIOR-turn reasoning dropped
+    // before the template runs (harmony convention — the reference is jinja2's
+    // render of the message set with that field already nulled; the
+    // current-turn keep arm is pinned by the drops-PRIOR-turn test below),
+    // tool calls as to=<fn> ATEM blocks with dict arguments
     // (string params RAW, bools bare), tool results as
     // "<|start|>tool <name><|message|><tool_output …>", the namespaced tool
     // catalog + "# Valid recipients" line, and the bare "<|start|>assistant"
@@ -10647,6 +10701,133 @@ test "renderChatTemplate: muse_glimmer shipped template renders byte-identical t
     const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
     defer allocator.free(rendered);
     try testing.expectEqualStrings(expected, rendered);
+}
+
+test "renderChatTemplate: muse thinking-off no-tools commits the to=user channel" {
+    // Thinking off must SKIP the reasoning pass, not generate-and-discard it:
+    // spending the recipient header in the prompt makes a `to=self` segment
+    // unreachable. Tools stay bare — a tool call is a `to=<fn>` header.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.endsWith(u8, off, "<|start|>assistant to=user<|message|>"));
+
+    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    defer allocator.free(on);
+    try testing.expect(std.mem.endsWith(u8, on, "<|start|>assistant"));
+
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
+    ;
+    const off_tools = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+    defer allocator.free(off_tools);
+    try testing.expect(std.mem.endsWith(u8, off_tools, "<|start|>assistant"));
+}
+
+test "renderChatTemplate: thinking-off closes a template-opened think block (LFM2.5 class)" {
+    // LFM2.5's template opens `<think>` unconditionally; thinking-off used to
+    // mean generating the whole reasoning pass and discarding it. Closing the
+    // block in the prompt skips it. Thinking ON keeps the opener untouched.
+    const allocator = testing.allocator;
+    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n<think>{%- endif -%}";
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "",
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.endsWith(u8, off, "<think></think>"));
+
+    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    defer allocator.free(on);
+    try testing.expect(std.mem.endsWith(u8, on, "<think>"));
+}
+
+test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current tool round's" {
+    // Harmony (muse's format ancestor) drops analysis from turns before the
+    // last user message. Without that, the app's reasoning round-trip renders
+    // every old chain — a loop-cut tail included — as a to=self history
+    // segment the model reads back on every later turn (live 2026-08-10: one
+    // repetition-primed turn poisoned the rest of the chat).
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    // Prior turn: assistant reasoning BEFORE the last user message → dropped;
+    // its content survives.
+    const prior = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "hello there", .reasoning_content = "waffling chain" },
+        .{ .role = "user", .content = "and again?" },
+    };
+    const r1 = try renderChatTemplate(allocator, &prior, &config, null, null, true, null);
+    defer allocator.free(r1);
+    try testing.expect(std.mem.indexOf(u8, r1, "to=self") == null);
+    try testing.expect(std.mem.indexOf(u8, r1, "waffling chain") == null);
+    try testing.expect(std.mem.indexOf(u8, r1, "hello there") != null);
+
+    // Current turn: a tool round AFTER the last user message keeps its chain —
+    // that is where the model needs it.
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "weather.get", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "call_1", .name = "weather.get", .arguments = "{\"city\": \"Paris\"}" }};
+    const current = [_]Message{
+        .{ .role = "user", .content = "weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
+        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
+    };
+    const r2 = try renderChatTemplate(allocator, &current, &config, tools_json, null, true, null);
+    defer allocator.free(r2);
+    try testing.expect(std.mem.indexOf(u8, r2, "<|start|>assistant to=self<|message|>Need the weather tool.<|eom|>") != null);
+
+    // A non-muse template that persists history reasoning (laguna class) is
+    // untouched — the round-trip rule stays per-family.
+    const generic_tpl = "{%- for m in messages -%}{%- if m.get('reasoning_content') -%}<think>{{ m['reasoning_content'] }}</think>{%- endif -%}{{ m['role'] }}: {{ m['content'] }}\n{%- endfor -%}";
+    var generic = ChatConfig{
+        .chat_template = generic_tpl,
+        .bos_token = "",
+        .eos_token = "",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const r3 = try renderChatTemplate(allocator, &prior, &generic, null, null, true, null);
+    defer allocator.free(r3);
+    try testing.expect(std.mem.indexOf(u8, r3, "<think>waffling chain</think>") != null);
+}
+
+test "splitMuseChannels: headerless first segment (prompt-committed header) is content" {
+    // With `to=user<|message|>` committed in the prompt, the model's first
+    // bytes are BODY. If it then re-opens a segment, the leading text must
+    // survive as content, not vanish.
+    const split = splitMuseChannels("answer<|eom|><|start|>assistant to=self<|message|>notes").?;
+    try testing.expectEqualStrings("answer", split.content);
+    try testing.expectEqualStrings("notes", split.reasoning_content.?);
+    // A truncated bare header is still never content.
+    const hdr = splitMuseChannels(" to=self<|eom|><|start|>assistant to=user<|message|>hi").?;
+    try testing.expectEqualStrings("hi", hdr.content);
+    try testing.expect(hdr.reasoning_content == null);
 }
 
 test "splitMuseChannels: to=self reasoning + to=user content, headers stripped" {

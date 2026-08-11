@@ -6,8 +6,9 @@
 #       ./tests/test_muse_glimmer.sh
 #
 # Pins the live surface end-to-end: tokenizer digit grouping (the "8 4" echo
-# class), channel split (to=self reasoning / to=user content), an ATEM tool
-# round (call → typed args → result → answer), and streaming delta
+# class), channel split (to=self reasoning / to=user content), the committed
+# to=user channel on silent no-tools requests (no reasoning pass at all), an
+# ATEM tool round (call → typed args → result → answer), and streaming delta
 # cleanliness (no channel markers or ` to=` header fragments in content).
 # Complements the hermetic layers: the byte-pinned render test, the muse
 # format-corpus entries, and the channel/ATEM/pretokenizer unit tests.
@@ -74,15 +75,29 @@ check_absent() { # name, got, forbidden-substring
 TOK=$(curl -s "$BASE/tokenize" -H 'Content-Type: application/json' -d '{"content": "What is 84?"}')
 check "[1] digit grouping (84 = one token)" "$TOK" "6601"
 
-# [2] Non-streaming chat: reasoning and content split; the INVARIANT is the
-# split, the model's exact words are a checkpoint expectation.
+# [2] Non-streaming chat with thinking ON (explicit opt-in — the default for a
+# no-tools request is now the committed to=user channel): reasoning and content
+# split; the INVARIANT is the split, the model's exact words are a checkpoint
+# expectation.
 R=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
-  "model": "mlx-serve", "stream": false, "max_tokens": 250,
+  "model": "mlx-serve", "stream": false, "max_tokens": 250, "enable_thinking": true,
   "messages": [{"role": "user", "content": "What is 84 * 3 / 2? Answer briefly."}]}')
 check "[2] answer content carries 126" "$R" "126"
 check "[2] reasoning_content present" "$R" "reasoning_content"
 check_absent "[2] no channel markers in body" "$R" "<|message|>"
 check_absent "[2] no header text in body" "$R" "to=user"
+
+# [2b] SILENT no-tools request: the prompt commits ` to=user<|message|>`, so no
+# reasoning pass runs at all — content only, no reasoning_content, and the
+# first visible token arrives without a hidden thinking pass in front of it.
+# An explicit enable_thinking:false lands on the same committed-channel path.
+RB=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+  "model": "mlx-serve", "stream": false, "max_tokens": 250,
+  "messages": [{"role": "user", "content": "What is 84 * 3 / 2? Answer briefly."}]}')
+check "[2b] answer content carries 126" "$RB" "126"
+check_absent "[2b] no reasoning_content (channel committed in prompt)" "$RB" "reasoning_content"
+check_absent "[2b] no channel markers in body" "$RB" "<|message|>"
+check_absent "[2b] no header text in body" "$RB" "to=user"
 
 # [3] ATEM tool call: name + typed args.
 T=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{

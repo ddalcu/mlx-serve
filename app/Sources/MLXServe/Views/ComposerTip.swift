@@ -38,7 +38,7 @@ struct ComposerTip: Equatable {
     static func thinking(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(title: "Thinking · \(state(isOn))",
                     body: agent.map(locked)
-                        ?? "Reasoning trace before the answer. Click to turn it \(opposite(isOn)).")
+                        ?? "Reasoning trace before the answer. Click to turn it \(opposite(isOn)); right-click to set effort.")
     }
 
     static func tools(isOn: Bool, workspace: String?, lockedBy agent: String? = nil) -> ComposerTip {

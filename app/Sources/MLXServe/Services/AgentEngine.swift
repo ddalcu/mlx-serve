@@ -173,7 +173,7 @@ enum AgentEngine {
         // Emit pinned first assistant response (the plan) if it fell outside.
         if needsPinAssistant, let idx = firstAssistantIdx {
             let msg = allMessages[idx]
-            var content = msg.content
+            var content = TruncationNotice.stripped(from: msg.content)
                 .replacingOccurrences(of: "<pad>", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if content.count > 500 {
@@ -223,7 +223,7 @@ enum AgentEngine {
             // Assistant messages with tool_calls
             if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
                 var dict: [String: Any] = ["role": "assistant"]
-                let content = msg.content
+                let content = TruncationNotice.stripped(from: msg.content)
                     .replacingOccurrences(of: "<pad>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 dict["content"] = content.isEmpty ? "" : content
@@ -250,7 +250,10 @@ enum AgentEngine {
 
             // Regular messages
             if msg.role == .assistant && msg.content.isEmpty { continue }
-            var content = msg.content
+            // Legacy in-content truncation banners (pre-notice-as-data saves)
+            // must not ride back as assistant prose.
+            var content = (msg.role == .assistant
+                ? TruncationNotice.stripped(from: msg.content) : msg.content)
                 .replacingOccurrences(of: "<pad>", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if msg.role == .assistant && content.count > 500 {

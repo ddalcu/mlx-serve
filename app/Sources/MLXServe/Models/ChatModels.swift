@@ -1,5 +1,14 @@
 import Foundation
 
+/// How hard the model thinks while the Think toggle is on — the wire's own
+/// `reasoning_effort` values. Picked from the brain disc's right-click menu,
+/// per session like the toggle itself.
+enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendable {
+    case low, medium, high
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+}
+
 struct ChatSession: Identifiable, Codable {
     let id: UUID
     var title: String
@@ -28,6 +37,9 @@ struct ChatSession: Identifiable, Codable {
     /// across tab switches and relaunches — `mode` already does the same for the
     /// Agent toggle. See PerSessionUIStateTests.
     var enableThinking: Bool
+    /// The brain disc's right-click pick: `reasoning_effort` for this chat's
+    /// turns while thinking is on.
+    var reasoningEffort: ReasoningEffort
     var useMCP: Bool
     // The composer's create mode (`createMode`) is retired: sessions saved by
     // builds that had it simply carry a key this decoder no longer asks for.
@@ -51,6 +63,7 @@ struct ChatSession: Identifiable, Codable {
         self.taskRunId = nil
         self.isExternalBridge = false
         self.enableThinking = false
+        self.reasoningEffort = .low
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
@@ -65,6 +78,7 @@ struct ChatSession: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
+        case reasoningEffort
     }
 
     init(from decoder: Decoder) throws {
@@ -80,6 +94,10 @@ struct ChatSession: Identifiable, Codable {
         // Backfill: sessions saved before the per-session Think/MCP toggles
         // existed come back with the keys absent → default both off.
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
+        // Absent (older builds) and unknown (a future build's level) both read
+        // as the default rather than failing the whole session's decode.
+        reasoningEffort = (try c.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            .flatMap(ReasoningEffort.init(rawValue:)) ?? .low
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
         // Absent (every session saved before agents existed) → no agent → the
         // app defaults, unchanged on upgrade.
@@ -230,6 +248,11 @@ struct ChatMessage: Identifiable, Codable {
     // prompt overflowed) instead of the old `[Error: …]` text, which read as
     // something the model itself had said.
     var errorNotice: ChatErrorNotice? = nil
+    // Set when the reply was cut (max_tokens / repetition loop). Rendered as a
+    // footnote under the bubble, NEVER appended into `content` — content rides
+    // back to the model as history, and the old in-content banner taught it
+    // the warning text. Absent forever on messages saved before the field.
+    var truncationNotice: TruncationNotice.Notice? = nil
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -252,7 +275,7 @@ struct ChatMessage: Identifiable, Codable {
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
         case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
-        case errorNotice, media
+        case errorNotice, media, truncationNotice
     }
 
     init(from decoder: Decoder) throws {
@@ -278,6 +301,8 @@ struct ChatMessage: Identifiable, Codable {
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
         processHandles = try c.decodeIfPresent([String].self, forKey: .processHandles)
         errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
+        // Tolerant: a cause this build doesn't know must not fail the message.
+        truncationNotice = (try? c.decodeIfPresent(TruncationNotice.Notice.self, forKey: .truncationNotice)) ?? nil
     }
 }
 

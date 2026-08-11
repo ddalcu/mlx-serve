@@ -517,3 +517,109 @@ tool-call `arguments` are dict-shaped — `serializeMessagesJson`'s
 object-passthrough covers it — and the template renders through our jinja.cpp
 byte-identical to python jinja2 (pinned test), so no transcription template
 was needed for this family.
+
+## Thinking-off enforced in the prompt; reasoning always delivered (2026-08-11)
+
+The class: an always-thinking template makes "thinking off" a lie. Muse's
+generation prompt ends with a bare `<|start|>assistant`, so the model opens a
+`to=self` reasoning segment on every turn; LFM2.5's template renders
+`…assistant\n<think>` unconditionally. A thinking-off request on either family
+used to generate the ENTIRE reasoning pass and then strip it — the client paid
+the full latency (time-to-first-visible-token included a hidden thinking pass)
+and saw nothing. Worse than showing it on every axis: slower perceived tok/s,
+less information, same bill.
+
+Two-part fix, and the parts compose:
+
+1. **Prevent the reasoning in the PROMPT** (`chat.noThinkTailSuffix`, applied
+   at the one jinja-success return in `renderChatTemplate`, so every surface —
+   chat/completions, /v1/messages, /v1/responses, ollama, REPL, llama-engine —
+   inherits it). Muse arm: thinking off + NO tools + template reads
+   `reasoning_strength` + render ends `<|start|>assistant` → append
+   ` to=user<|message|>`, byte-exactly the header the template renders for
+   history content turns. The recipient header is spent, `to=self` is
+   unreachable, no reasoning tokens are ever generated. Never with tools — a
+   tool call is a `to=<fn>` header, so the recipient must stay free. Think arm:
+   thinking off + the render's tail still opens a think block
+   (`promptTailOpensThink`) → append `</think>`. Qwen-style templates render a
+   CLOSED block when thinking is off, so the arm self-limits to unconditional
+   openers (LFM2.5 class).
+
+2. **Deliver whatever reasoning still gets generated** (tools present,
+   explicit thinking-off with tools, fallback renders, models that think
+   unprompted). Every delivery site now splits via
+   `splitThinkBlock(text, true, prompt_opened_think)` and ships
+   `reasoning_content`/thinking blocks whenever the split finds reasoning —
+   the request's thinking flag shapes the PROMPT, never the delivery. The
+   `stripThinkBlock` family is DELETED; its leak-guard tests were ported to
+   assert the same invariants on the split's content side. Streaming: the
+   thinking-off drop arm is gone — `in_think_block` starts from
+   `enable_thinking or prompt_opened_think` and the reasoning arm streams the
+   block incrementally.
+
+Defaults that ride on it: muse's `defaultEnableThinking` became
+tools-conditional (`has_tools` — recipient selection is where its reasoning
+earns its keep; a silent no-tools request gets the committed channel), and
+`/v1/messages` consults the arch default when the `thinking` param is absent
+instead of hardcoding off — muse+tools under Claude Code streams thinking
+blocks instead of paying for an invisible reasoning pass every turn.
+
+Two structural traps found on the way:
+
+- `splitMuseChannels` dropped the WHOLE ANSWER when the header was
+  prompt-committed and the model later re-opened a segment: the headerless
+  first segment ("answer`<|eom|><|start|>assistant to=self<|message|>`notes")
+  contained no `<|message|>`, so no arm claimed it and content resolved to
+  `""`. The fix claims leading text before the first `<|start|>` as content —
+  gated on `museThinkOpenerAt(body) == .not_muse` over the eom/eot-CUT body,
+  because the raw chunk's `<|eom|>` byte breaks the recipient grammar and
+  makes a truncated bare header (" to=self<|eom|>…") read as prose.
+- The rule "a truncated header is never content" and the rule "a committed
+  header's body is content" meet exactly there; classify the CUT body, not the
+  raw chunk.
+
+Guards: renderChatTemplate tail-commit tests (muse three-way: off/on/tools;
+LFM-style opener close), the headerless-first-segment split test, the
+tools-conditional `defaultEnableThinking` test, corpus harness runs ONE split
+path for both thinking flags, `tests/test_muse_glimmer.sh` [2] (explicit
+opt-in) + [2b] (silent request: content, NO reasoning_content).
+
+## Muse renders round-tripped reasoning as HISTORY, so one cut loop poisoned every later turn (2026-08-11)
+
+The capture (`~/.mlx-serve/chat-history.json` + app log port 11234): a
+repetition-primed chat (the user asked for the same JFK paragraph ×4 — the
+spec-gate's own read was `ngram-score=0.642` against a 0.010 threshold) hit
+its first thinking-on turn and muse waffle-looped in `to=self` ("Maybe the
+user wants… Could be…"). The loop guard worked (`[loop-stop] … after 809
+tokens tier=long_cycle`). The DAMAGE was the aftermath: the app round-trips
+`reasoning_content` on assistant history (the laguna nothink rule — correct,
+per-family), and muse's template renders that field as a full
+`<|start|>assistant to=self<|message|>…<|eom|>` history segment. So the next
+turn's prompt contained the 160-token loop tail verbatim, the model read its
+own loop, and "it starts repeating itself" became a property of the CHAT, not
+the turn. Replay data: the same 7-message context loops 2-of-3 at the app's
+temp 0.7 AND at temp 0 (Meta ships `do_sample: false`) — the loop is the
+model's continuation of a repetition-primed context; the echo is what made it
+permanent.
+
+Fix (`chat.dropPriorTurnReasoning`, applied in `renderChatTemplate` under the
+same `reasoning_strength` template sniff `noThinkTailSuffix` uses): harmony —
+muse's format ancestor — DROPS analysis from prior turns and keeps it only
+after the last user message. Assistant messages BEFORE the last user message
+get `reasoning_content` nulled before serialization; messages after it (the
+current turn's tool rounds, where the model needs its own chain) keep theirs.
+laguna/inkling are untouched — their templates NEED history reasoning, and
+the round-trip rule stays per-family. The byte-parity fixture
+(`muse_render_reference.txt`) was regenerated minus the prior-turn `to=self`
+segment — the template's reasoning arm is a pure local insertion, so removing
+the segment IS jinja2's render of the preprocessed message set.
+
+Live signature if it regresses: turn-8 prompt tokens GROW by the prior turn's
+reasoning length. The wire check that pinned it: the same turn-8 request with
+a 3,591-char round-tripped chain and an 11-char one must render byte-identical
+prompts (measured: 5371 chars / 1203 tokens both ways).
+
+Guards: `renderChatTemplate: muse drops PRIOR-turn reasoning…` (drop arm,
+current-turn keep arm, non-muse keep arm), the regenerated byte-parity
+fixture. App-side twin (banner-in-content): `docs/gotchas/app.md` + the
+`TruncationNotice` data-not-content rule in app/CLAUDE.md.

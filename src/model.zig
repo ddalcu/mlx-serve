@@ -702,11 +702,13 @@ pub const ModelConfig = struct {
     /// Opt-in per arch, and only where the vendor documents thinking-on AND
     /// the shipped template agrees — never inferred from "the template mentions
     /// enable_thinking".
-    pub fn defaultEnableThinking(self: *const ModelConfig) bool {
-        // muse_glimmer has no thinking-off switch — the model always opens a
-        // `to=self` reasoning segment, so default to delivering it as
-        // reasoning_content rather than silently dropping it.
-        return std.mem.eql(u8, self.model_type, "muse_glimmer");
+    pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
+        // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
+        // header, so the recipient must stay free and the reasoning is
+        // delivered rather than paid-and-dropped). A plain chat request
+        // defaults to the prompt-committed to=user channel instead
+        // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
+        return has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer");
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -1494,6 +1496,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("qk_scale_factor")) |v| config.qk_scale_factor = jsonFloat(v);
         if (cfg_obj.get("output_multiplier")) |v| config.output_multiplier = jsonFloat(v);
         if (cfg_obj.get("post_norm_eps")) |v| config.post_norm_eps = jsonFloat(v);
+        // ONE theta for every roped layer: sliding layers read
+        // rope_local_base_freq in the forward, but muse ships its base only as
+        // rope_parameters.rope_theta — without this the Gemma-flavored 10000
+        // default mis-rotates all 39 roped layers (the 2026-08-11 first-turn
+        // repetition-loop root cause; global layers are NoPE so EVERY rotated
+        // layer ran at the wrong base).
+        if (cfg_obj.get("rope_local_base_freq") == null)
+            config.rope_local_base_freq = config.rope_theta;
         if (cfg_obj.get("layer_rope_theta")) |lrt| {
             if (lrt == .array) {
                 for (lrt.array.items, 0..) |item, i| {
@@ -2167,10 +2177,12 @@ pub const Weights = struct {
     }
 };
 
-/// The two nestings a text trunk ships under. `parseConfigFromJson` picks
-/// between them from config KEYS; this probe corrects it from the checkpoint.
+/// The generic nestings a text trunk ships under: flat, mlx-community's
+/// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
+/// picks from config KEYS; this probe corrects it from the checkpoint.
 const FLAT_PREFIX = "model";
 const NESTED_PREFIX = "language_model.model";
+const VL_NESTED_PREFIX = "model.language_model";
 
 fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
     var it = weights.map.keyIterator();
@@ -2191,23 +2203,28 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
 /// both directions, so the weights get the last word.
 ///
-/// Conservative by construction: it only ever alternates between those two
-/// prefixes (never an arch with its own — `backbone`, `model.llm`, `""`), and
-/// only when the configured one holds NOTHING, so every checkpoint that
-/// already loaded binds byte-identically.
+/// Conservative by construction: only the generic spellings participate
+/// (never an arch with its own — `backbone`, `model.llm`, `""`), and a swap
+/// happens only when the configured one holds NOTHING, so every checkpoint
+/// that already loaded binds byte-identically. Scan order puts the most
+/// specific spelling first: a `model.language_model.*` checkpoint also
+/// satisfies the bare "model" probe.
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
-    const alt = if (std.mem.eql(u8, config.weight_prefix, FLAT_PREFIX))
-        NESTED_PREFIX
-    else if (std.mem.eql(u8, config.weight_prefix, NESTED_PREFIX))
-        FLAT_PREFIX
-    else
-        return;
+    const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
+    var known = false;
+    for (candidates) |p| {
+        if (std.mem.eql(u8, config.weight_prefix, p)) known = true;
+    }
+    if (!known) return;
 
     if (hasWeightsUnder(weights, config.weight_prefix)) return;
-    if (!hasWeightsUnder(weights, alt)) return;
-
-    log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, alt });
-    config.weight_prefix = alt;
+    for (candidates) |p| {
+        if (std.mem.eql(u8, config.weight_prefix, p)) continue;
+        if (!hasWeightsUnder(weights, p)) continue;
+        log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, p });
+        config.weight_prefix = p;
+        return;
+    }
 }
 
 /// Load all safetensors files from model_dir.
@@ -2441,9 +2458,12 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
     // Muse-Glimmer's vision tower/adapter/projection are not wired yet —
     // always drop so a text load doesn't carry ~2 GB of dead tower weights.
+    // Bare "vision_adapter." is the mlx-community re-nest of the same tower
+    // (their bare "vision_tower." already rides the is_vision gate above).
     if (std.mem.startsWith(u8, key, "model.vision_tower.") or
         std.mem.startsWith(u8, key, "model.vision_adapter.") or
-        std.mem.startsWith(u8, key, "model.vision_projection.")) return false;
+        std.mem.startsWith(u8, key, "model.vision_projection.") or
+        std.mem.startsWith(u8, key, "vision_adapter.")) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -2609,6 +2629,40 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
+    // mlx-community/Muse-Glimmer-30B-4bit (live 2026-08-11): meta's config
+    // keeps text_config, so the guess is the VL-original "model.language_model"
+    // — but mlx_lm convert re-nests every text weight under
+    // "language_model.model.*". The third spelling joins the probe.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.lm_head.weight");
+        try put(&w, allocator, "vision_tower.layers.0.norm1.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // Our own mirror layout (meta-original nesting) stays put.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.language_model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    }
+    // Ordering: a "model.language_model.*" checkpoint ALSO matches the bare
+    // "model" probe (the '.' check passes at "model.language_model"), so the
+    // most specific spelling must win the scan.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.language_model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    }
 }
 
 test "applyDsv4ReferenceSampling: the source's wild signature resolves to the reference's temp 0.6" {
@@ -2707,12 +2761,16 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     // MENTION enable_thinking, which is not evidence of a thinking-on default.
     for ([_][]const u8{ "qwen3", "qwen3_5_moe", "gemma4", "gemma3_text", "laguna", "deepseek_v4", "inkling_mm_model", "llama", "hy_v3", "lfm2" }) |t| {
         const c = ModelConfig{ .model_type = t };
-        try testing.expect(!c.defaultEnableThinking());
+        try testing.expect(!c.defaultEnableThinking(false));
+        try testing.expect(!c.defaultEnableThinking(true));
     }
-    // muse_glimmer opts IN: its template has no thinking-off switch and the
-    // model always opens a to=self reasoning segment.
+    // muse_glimmer opts in only WITH tools: recipient selection is where its
+    // reasoning earns its keep. A plain chat request defaults to the
+    // prompt-committed to=user channel (chat.noThinkTailSuffix) — a real
+    // skip, so there is nothing to deliver or drop.
     const muse = ModelConfig{ .model_type = "muse_glimmer" };
-    try testing.expect(muse.defaultEnableThinking());
+    try testing.expect(!muse.defaultEnableThinking(false));
+    try testing.expect(muse.defaultEnableThinking(true));
 }
 
 test "ModelConfig addEosToken" {
@@ -3015,6 +3073,21 @@ test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
 }
 
+test "shouldKeepWeightKey drops Muse-Glimmer vision in both nestings (text-only v1)" {
+    // Meta-original nesting (our mirrors) and the mlx-community re-nest
+    // (bare vision_tower./vision_adapter., no vision_projection) both carry
+    // the unwired tower — a text load keeps neither.
+    try testing.expect(!shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.vision_adapter.fc1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.vision_projection.weight", false));
+    try testing.expect(!shouldKeepWeightKey("vision_adapter.fc1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", false));
+    // The text trunk keys survive in both spellings.
+    try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.lm_head.weight", false));
+}
+
 test "ModelConfig parses gemma4_unified text_config" {
     // Gemma 4 12B base ships `model_type: gemma4_unified` with text_config
     // carrying the language tower. The dispatch arm must:
@@ -3275,6 +3348,11 @@ test "ModelConfig parses muse_glimmer (Muse-Glimmer-30B): NoPE full layers, qk s
     try testing.expect(config.layerSkipsRope(7));
     try testing.expect(!config.layerSkipsRope(0));
     try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_theta, 1e-3);
+    // Sliding layers read rope_local_base_freq in EVERY forward path, and muse
+    // ships ONE theta for all roped layers (rope_parameters.rope_theta) — the
+    // Gemma-flavored 10000 default silently mis-rotated all 39 roped layers
+    // (2026-08-11 first-turn repetition-loop root cause).
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_local_base_freq, 1e-3);
     // Attention scale folds the post-qk-norm Q multiplier into 1/sqrt(head_dim).
     try testing.expectApproxEqAbs(@as(f32, 3.87 / 11.313708), config.attnScale(), 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.19611613513818404), config.output_multiplier, 1e-9);

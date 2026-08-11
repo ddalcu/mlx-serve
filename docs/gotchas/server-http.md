@@ -907,3 +907,30 @@ line that mentions `lm.drafter != null` without a `dflash` sibling on the
 same line ("every server-side drafter-loaded gate also consults lm.dflash").
 Same class as the dsv4 PLD-dispatch hole: the wiring that matters is not
 where the flag is PARSED but every site that re-derives it.
+
+## The usage chunk restated the ending, and every per-event client rendered it twice (PR #147, 2026-08-11)
+
+OpenAI's `stream_options.include_usage` contract: the usage-carrying chunk
+ships `"choices": []`. Ours re-sent `finish_reason` + `finish_details` beside
+the usage object — a second "the reply ended, here's why" event. Any client
+that acts per event acted twice: the app appended its truncation banner once
+per event carrying a truncation cause, so one loop cut rendered TWO "⚠️
+Stopped — the model started repeating itself" banners (PR #147's report; its
+`TruncationGate` stays as defense-in-depth against other backends that
+restate).
+
+Fix: chat streaming's include_usage chunk goes through a dedicated
+`sendSSEUsageChunk` — `"choices":[]`, `usage` + `timings` only, no delta, no
+finish, no logprobs (all per-choice fields; the final chunk already carried
+them, and the pending-logprobs drain lives there alone now). The completions
+streaming path had usage riding the finish chunk itself — same deviation, one
+event — and now emits the same empty-choices usage chunk after its final
+chunk. Blast radius checked: the ollama sink returns early on an empty
+choices array and reads usage off the root before that check; the app and the
+console both read `usage`/`timings` from the chunk root; `test_timings.sh`
+keys on the usage object, not choices.
+
+The finish event is now stated on exactly ONE chunk of every stream. Guards:
+`tests/test_loop_stop_signal.sh` [2] (finish_details AND finish_reason
+exactly once, usage chunk `"choices":[]`) and [4] (completions usage chunk
+shape) — all four red on the pre-fix build.

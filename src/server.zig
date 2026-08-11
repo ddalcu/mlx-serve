@@ -4735,7 +4735,7 @@ fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget);
-    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
+    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -5506,23 +5506,30 @@ fn handleStreamingCompletion(
     const total_prompt = ts.prompt_tokens;
 
     if (!client_gone) {
-        const usage_str = if (include_usage) blk: {
-            break :blk try std.fmt.allocPrint(allocator,
-                \\,"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
-            , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
-        } else try std.fmt.allocPrint(allocator, "", .{});
-        defer allocator.free(usage_str);
-
         const final_lp = (try lps.take()) orelse "null";
         const final_chunk = try std.fmt.allocPrint(allocator,
-            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]{s}}}
-        , .{ cmpl_id, created_ts, model_name, final_lp, finish_reason, finishDetailsField(finish_reason, ts.finish_details), usage_str });
+            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]}}
+        , .{ cmpl_id, created_ts, model_name, final_lp, finish_reason, finishDetailsField(finish_reason, ts.finish_details) });
         defer allocator.free(final_chunk);
 
         logHttpSseData(final_chunk);
         try stream.writeAllNoFlush("data: ");
         try stream.writeAllNoFlush(final_chunk);
         try stream.writeAllNoFlush("\n\n");
+
+        // Usage rides its own empty-choices chunk (OpenAI's stream_options
+        // shape) — never the finish chunk, so the ending is stated once.
+        if (include_usage) {
+            const usage_chunk = try std.fmt.allocPrint(allocator,
+                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+            , .{ cmpl_id, created_ts, model_name, total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+            defer allocator.free(usage_chunk);
+            logHttpSseData(usage_chunk);
+            try stream.writeAllNoFlush("data: ");
+            try stream.writeAllNoFlush(usage_chunk);
+            try stream.writeAllNoFlush("\n\n");
+        }
+
         logHttpSseData("[DONE]");
         try stream.writeAll("data: [DONE]\n\n");
     }
@@ -5754,7 +5761,11 @@ fn handleNonStreamingGeneration(
     if (normalized_text) |n| final_text = n;
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
-    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
+    // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
+    // never paid-for-and-dropped — thinking-off is enforced on the PROMPT side
+    // (chat.noThinkTailSuffix commits the channel), so any reasoning that
+    // still shows up here is real work the client gets to see.
+    const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
 
     // Apply reasoning budget: truncate reasoning by token count
     // For non-streaming, we truncate after generation since we can't interrupt mid-generation
@@ -5821,10 +5832,11 @@ fn handleNonStreamingGeneration(
             }
             try tc_buf.appendSlice(allocator, "]");
 
-            // Extract reasoning_content if thinking is enabled
+            // Reasoning is delivered whenever the model produced it — the
+            // request's thinking flag shaped the prompt, not the delivery.
             var tc_reasoning_json: []const u8 = "";
             var tc_reasoning_allocated = false;
-            if (enable_thinking) {
+            {
                 const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
                 if (tc_think_split.reasoning_content) |reasoning| {
                     const escaped_reasoning = try jsonEscape(allocator, reasoning);
@@ -5871,9 +5883,11 @@ fn handleNonStreamingGeneration(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
-    // Split thinking content from response
-    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, opens_think);
-    const content_text = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
+    // Split thinking content from response. Always the think-capable split:
+    // whatever reasoning was generated ships as reasoning_content, never
+    // stripped (tokens we discarded still counted against tok/s).
+    const think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
+    const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
     const escaped_text = escaped.slice;
@@ -5894,12 +5908,13 @@ fn handleNonStreamingGeneration(
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
 
-    // Build reasoning_content field if thinking is enabled and reasoning exists
+    // Build reasoning_content whenever reasoning exists — delivery does not
+    // key on the request's thinking flag.
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
     var usage_details_json: []const u8 = "";
     var usage_details_allocated = false;
-    if (enable_thinking) {
+    {
         // Use budget-truncated reasoning if available, otherwise use full reasoning
         const reasoning_text = if (budget_truncated_reasoning) |tr| tr else think_split.reasoning_content;
         if (reasoning_text) |reasoning| {
@@ -6293,7 +6308,7 @@ fn handleStreamingGeneration(
     // visible answer (live 2026-08-04). Families that gate the opener on
     // enable_thinking render the closed signature and stay false here.
     const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
-    const opens_think = enable_thinking and prompt_opened_think;
+    const opens_think = prompt_opened_think;
 
     // Pick the speculative-decoding mode (regular / PLD / drafter). The
     // per-token state machine below is driven by `StreamingTokenStream`,
@@ -6397,7 +6412,11 @@ fn handleStreamingGeneration(
 
     // Thinking state for real-time streaming of reasoning_content vs content
     // Supports both <think>...</think> and Gemma 4's <|channel>thought\n...<channel|>
-    var in_think_block = enable_thinking; // starts true when thinking enabled (model outputs <think> first)
+    // Starts true when thinking is enabled (model outputs <think> first) OR
+    // the prompt itself opened a think block: generated reasoning is always
+    // DELIVERED as reasoning_content, never paid-for-and-dropped. Thinking-off
+    // is enforced prompt-side (chat.noThinkTailSuffix commits the channel).
+    var in_think_block = enable_thinking or prompt_opened_think;
     var think_closed = false; // a complete think block was already split+emitted this stream
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     defer think_buf.deinit(allocator);
@@ -6546,7 +6565,7 @@ fn handleStreamingGeneration(
                         // A reasoning BUDGET keeps the old buffering: capping what
                         // the client is allowed to see cannot be reconciled with
                         // having already sent it.
-                        if (enable_thinking and reasoning_budget < 0) {
+                        if (reasoning_budget < 0) {
                             const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
                             if (so_far.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
@@ -6558,7 +6577,7 @@ fn handleStreamingGeneration(
                     },
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
-                        const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
+                        const split = chat_mod.splitThinkBlock(buf, true, opens_think);
                         // The thought's tokens never reach the client, so their
                         // entries must not ride the content chunk below — the
                         // reasoning emitters above deliberately do not drain.
@@ -6572,11 +6591,9 @@ fn handleStreamingGeneration(
                         text_buf.clearRetainingCapacity();
                         think_scan.reset();
                         think_closed = true;
-                        if (enable_thinking) {
-                            if (split.reasoning_content) |rc| {
-                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
-                                }
+                        if (split.reasoning_content) |rc| {
+                            if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                             }
                         }
                         // Block done and `text_buf` was just cleared — a thought
@@ -6600,48 +6617,13 @@ fn handleStreamingGeneration(
                 }
             }
             // Otherwise keep buffering — tool call may be in progress
-        } else if (!enable_thinking and prompt_opened_think and !think_closed) {
-            // Thinking OFF, but the TEMPLATE opened a think block anyway.
-            // LFM2.5 renders `…assistant\n<think>` unconditionally (no
-            // enable_thinking branch exists in it), so the model always
-            // reasons and the opener never appears in the OUTPUT — this
-            // stream used to fall through to the plain-content arm below and
-            // deliver the entire chain-of-thought as the answer (live
-            // 2026-08-04; non-streaming was always correct because the
-            // `</think>` is present by the time the text is split).
-            //
-            // Deliberately its OWN arm rather than a widened condition on the
-            // reasoning arm below: that one EMITS reasoning_content, and with
-            // thinking off the block must be DROPPED. Nothing here can run
-            // when thinking is on, so the reasoning path is untouched.
-            //
-            // Only the `</think>` family is checked for the close because
-            // `promptTailOpensThink` only matches `<think`-family OPENERS —
-            // Gemma's `<|channel>thought` never sets the flag, so this arm is
-            // unreachable for it. Pinned by "promptTailOpensThink does not
-            // match Gemma's channel opener": extend that detection and this
-            // close check needs `<channel|>` too, or a channel-family model
-            // would hold its whole turn waiting for a tag that never arrives.
-            defer allocator.free(token_text);
-            try think_buf.appendSlice(allocator, token_text);
-            if (chat_mod.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
-                const after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n \t\r");
-                think_closed = true;
-                in_think_block = false;
-                if (after.len > 0) {
-                    // The dropped block's tokens are not content — their
-                    // entries must not ride this chunk.
-                    lps.skipToContent(think_buf.items, after);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = after }, null, null, null, .{ .logprobs_json = try lps.take() });
-                } else {
-                    lps.dropPending();
-                }
-                think_buf.clearRetainingCapacity();
-            }
-            // No close tag yet (or the generation was cut inside the block):
-            // emit nothing. A truncated thought is never content.
-        } else if (enable_thinking and in_think_block) {
-            // Inside <think> block — stream as reasoning_content with </think> detection
+        } else if (in_think_block) {
+            // Inside <think> block — stream as reasoning_content with </think>
+            // detection. Also covers thinking-off + template-opened (LFM2.5
+            // renders `…assistant\n<think>` unconditionally, live 2026-08-04):
+            // the block used to be buffered and DROPPED there; now it streams
+            // as reasoning_content like any other thought — generated tokens
+            // are always delivered.
             defer allocator.free(token_text);
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
@@ -6864,7 +6846,7 @@ fn handleStreamingGeneration(
     }
 
     // Flush any remaining think buffer
-    if (!client_gone and enable_thinking and think_buf.items.len > 0) {
+    if (!client_gone and think_buf.items.len > 0) {
         // No close tag arrived. Reasoning ONLY with positive evidence a block
         // was open — the prompt injected the opener, or the model emitted one.
         // `in_think_block` alone is not that evidence: it STARTS true whenever
@@ -6913,8 +6895,9 @@ fn handleStreamingGeneration(
                 allocator.free(tool_calls);
             }
 
-            // Emit reasoning_content before tool calls if thinking is enabled
-            if (enable_thinking) {
+            // Emit reasoning_content before tool calls — whatever the model
+            // generated is delivered, thinking flag or not.
+            {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -6959,8 +6942,14 @@ fn handleStreamingGeneration(
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
-            // No tool calls found — flush buffered tokens as content
-            if (enable_thinking) {
+            // No tool calls found — flush buffered tokens, splitting thinking
+            // from content. Runs regardless of the request's thinking flag:
+            // reasoning the model produced ships as reasoning_content, and
+            // split.content already passes trimLeakedToolMarkup, so unparsed
+            // wreckage that held the buffer (markers the tokenizer split
+            // across tokens — live 2026-08-01, DSV4 `<` then `｜DSML｜`) is
+            // still cut once, at the end.
+            {
                 // Concatenate all buffered tokens and split thinking from content
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
@@ -7002,25 +6991,6 @@ fn handleStreamingGeneration(
                     // client never received.
                     lps.dropPending();
                 }
-            } else {
-                // Thinking off: the held tail flushes verbatim. It was held
-                // BECAUSE it looked like a tool call, and nothing parsed — so
-                // the markers in it are unparsed wreckage. Concatenate and cut
-                // once (a per-token loop cannot see a marker the tokenizer
-                // split across tokens: live 2026-08-01, DSV4 emitted `<` then
-                // `｜DSML｜` and both went out as visible content).
-                var flush_text = std.ArrayList(u8).empty;
-                defer flush_text.deinit(allocator);
-                for (token_texts.items) |t| {
-                    try flush_text.appendSlice(allocator, t);
-                }
-                const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
-                if (visible.len > 0) {
-                    lps.skipToContent(flush_text.items, visible);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = visible }, null, null, null, .{ .logprobs_json = try lps.take() });
-                } else {
-                    lps.dropPending();
-                }
             }
         }
     }
@@ -7032,13 +7002,17 @@ fn handleStreamingGeneration(
 
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
+        // OpenAI ships this chunk with an EMPTY choices array — restating
+        // finish_reason/finish_details here made every per-event client render
+        // the ending twice (PR #147's doubled truncation banner). Pending
+        // logprobs all drained on the final chunk above.
         if (include_usage) {
             const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
             defer allocator.free(usage_json);
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
             const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, usage_json, timings_opt, .{ .logprobs_json = try lps.take() });
+            try sendSSEUsageChunk(allocator, stream, chat_id, model_name, usage_json, timings_opt);
         }
 
         // Done sentinel
@@ -7292,6 +7266,35 @@ fn sendSSEChunk(
     defer allocator.free(chunk);
 
     // Write as SSE event
+    logHttpSseData(chunk);
+    try stream.writeAllNoFlush("data: ");
+    try stream.writeAllNoFlush(chunk);
+    try stream.writeAllNoFlush("\n\n");
+    try stream.flush();
+}
+
+/// The `stream_options.include_usage` chunk: OpenAI's shape is an EMPTY
+/// `choices` array beside the usage object — no delta, no finish_reason, no
+/// logprobs (all per-choice fields; the final chunk already carried them).
+fn sendSSEUsageChunk(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    chat_id: i64,
+    model_name: []const u8,
+    usage_json: []const u8,
+    timings_json: ?[]const u8,
+) !void {
+    var timings_tail_buf = std.ArrayList(u8).empty;
+    defer timings_tail_buf.deinit(allocator);
+    if (timings_json) |t| {
+        try timings_tail_buf.appendSlice(allocator, ",\"timings\":");
+        try timings_tail_buf.appendSlice(allocator, t);
+    }
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{s}{s}}}
+    , .{ chat_id, nowSecs(stream.io), model_name, usage_json, timings_tail_buf.items });
+    defer allocator.free(chunk);
+
     logHttpSseData(chunk);
     try stream.writeAllNoFlush("data: ");
     try stream.writeAllNoFlush(chunk);
@@ -7921,8 +7924,10 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
         }
         i = line_end;
     }
-    // Zeroes would pass the loops vacuously — both shapes must exist.
-    try std.testing.expect(content_emitters >= 10);
+    // Zeroes would pass the loops vacuously — both shapes must exist. (The
+    // include_usage chunk consolidation — the ending ships on exactly ONE
+    // chunk — took content emitters from 10 to 9.)
+    try std.testing.expect(content_emitters >= 9);
     try std.testing.expect(reasoning_emitters >= 5);
 
     // The boundary itself: a content chunk emitted after a think block has to
@@ -9700,8 +9705,14 @@ fn handleAnthropicMessages(
         }
     }
 
-    // Thinking config
-    var enable_thinking = false;
+    // Thinking config. An absent `thinking` object consults the arch default
+    // (muse+tools delivers its always-on reasoning as thinking blocks rather
+    // than paying for it and discarding it); a PRESENT object decides
+    // explicitly, exactly as before.
+    var enable_thinking = if (root.get("thinking") == null)
+        config.defaultEnableThinking(root.get("tools") != null)
+    else
+        false;
     var reasoning_budget: i32 = server_config.default_reasoning_budget;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
@@ -9845,7 +9856,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -9870,7 +9881,6 @@ fn handleAnthropicNonStreaming(
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
-    enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
     enable_pld: bool,
@@ -9953,7 +9963,9 @@ fn handleAnthropicNonStreaming(
     // to parseToolCallsForRequest below. Cutting the markup first would make a
     // real call unparseable. The visible text block is cut at emission instead
     // (`chat_mod.trimLeakedToolMarkup`), which is where the leak matters.
-    if (enable_thinking) {
+    // Reasoning the model generated is always delivered as a thinking block —
+    // the request's thinking flag shaped the prompt, never the delivery.
+    {
         const think_split = chat_mod.splitThinkBlockKeepingMarkup(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
@@ -9982,12 +9994,8 @@ fn handleAnthropicNonStreaming(
             defer allocator.free(thinking_block);
             try content.appendSlice(allocator, thinking_block);
             block_count += 1;
-            final_text = think_split.content;
-        } else {
-            final_text = chat_mod.stripThinkBlockKeepingMarkup(final_text);
         }
-    } else {
-        final_text = chat_mod.stripThinkBlockKeepingMarkup(final_text);
+        final_text = think_split.content;
     }
 
     // Check for tool calls
@@ -10200,7 +10208,6 @@ fn handleAnthropicStreaming(
     var block_index: u32 = 0;
     var text_block_open = false;
     var thinking_block_open = false;
-    var in_think_block = enable_thinking;
     // Template-opened think (Qwen 3.5/3.6 render `…assistant\n<think>\n` into
     // the generation prompt): the output's thinking carries NO opener tag.
     // Needed up front by the tools branch — by the time the close tag is the
@@ -10208,7 +10215,10 @@ fn handleAnthropicStreaming(
     // See the streaming chat site for why the prompt fact is NOT ANDed with
     // enable_thinking (LFM2.5's unconditional pre-opened `<think>`).
     const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
-    const opens_think = enable_thinking and prompt_opened_think;
+    const opens_think = prompt_opened_think;
+    // Prompt-opened reasoning is DELIVERED as thinking blocks even when the
+    // request didn't ask for thinking — generated tokens are never dropped.
+    var in_think_block = enable_thinking or prompt_opened_think;
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
@@ -10336,19 +10346,18 @@ fn handleAnthropicStreaming(
                     },
                     .split_think => {
                         // Complete think block — split once: thinking block
-                        // first, then the visible remainder as text.
-                        const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
-                        if (enable_thinking) {
-                            if (split.reasoning_content) |rc| {
-                                const sd = try std.fmt.allocPrint(allocator,
-                                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                                , .{block_index});
-                                defer allocator.free(sd);
-                                try sendAnthropicEvent(stream, "content_block_start", sd);
-                                try emitAnthropicThinkingDelta(allocator, stream, block_index, rc);
-                                try closeAnthropicThinkingBlock(allocator, stream, block_index);
-                                block_index += 1;
-                            }
+                        // first, then the visible remainder as text. Reasoning
+                        // ships regardless of the request's thinking flag.
+                        const split = chat_mod.splitThinkBlock(buf, true, opens_think);
+                        if (split.reasoning_content) |rc| {
+                            const sd = try std.fmt.allocPrint(allocator,
+                                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                            , .{block_index});
+                            defer allocator.free(sd);
+                            try sendAnthropicEvent(stream, "content_block_start", sd);
+                            try emitAnthropicThinkingDelta(allocator, stream, block_index, rc);
+                            try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                            block_index += 1;
                         }
                         if (split.content.len > 0) {
                             if (!text_block_open) {
@@ -10388,8 +10397,10 @@ fn handleAnthropicStreaming(
                     },
                 }
             }
-        } else if (enable_thinking and in_think_block) {
-            // Thinking block handling
+        } else if (in_think_block) {
+            // Thinking block handling. Also covers thinking-off +
+            // template-opened (LFM2.5 class): the block streams as thinking
+            // deltas instead of being paid for and dropped.
             defer allocator.free(token_text);
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
@@ -10630,7 +10641,7 @@ fn handleAnthropicStreaming(
     }
 
     // Flush remaining think buffer
-    if (!client_gone and enable_thinking and thinking_block_open and think_buf.items.len > 0) {
+    if (!client_gone and thinking_block_open and think_buf.items.len > 0) {
         try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
     }
     if (!client_gone and thinking_block_open) {
@@ -10677,11 +10688,12 @@ fn handleAnthropicStreaming(
                 text_block_open = false;
             }
 
-            // Emit thinking from buffered text if needed. Once the in-loop
-            // split already emitted it, the remaining buffer has no
-            // template-opened semantics — passing `opens_think` unguarded
-            // would misfile the visible tail as reasoning.
-            if (enable_thinking) {
+            // Emit thinking from buffered text if present — delivery does not
+            // key on the request's thinking flag. Once the in-loop split
+            // already emitted it, the remaining buffer has no template-opened
+            // semantics — passing `opens_think` unguarded would misfile the
+            // visible tail as reasoning.
+            {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
@@ -10726,8 +10738,11 @@ fn handleAnthropicStreaming(
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
-            // No tool calls — flush buffered tokens
-            if (enable_thinking) {
+            // No tool calls — flush buffered tokens, splitting thinking from
+            // content regardless of the request's thinking flag (split.content
+            // passes trimLeakedToolMarkup, so the unparsed-markup cut the old
+            // thinking-off arm did still happens).
+            {
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
                 for (token_texts.items) |t| try full_text.appendSlice(allocator, t);
@@ -10755,25 +10770,6 @@ fn handleAnthropicStreaming(
                         text_block_open = true;
                     }
                     try emitAnthropicTextDelta(allocator, stream, block_index, think_split.content);
-                }
-            } else {
-                // Same cut as the chat-completions flush: the held tail is
-                // unparsed tool markup, and a marker can be split across
-                // tokens, so concatenate before cutting.
-                var flush_text = std.ArrayList(u8).empty;
-                defer flush_text.deinit(allocator);
-                for (token_texts.items) |t| try flush_text.appendSlice(allocator, t);
-                const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
-                if (visible.len > 0) {
-                    if (!text_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
-                        text_block_open = true;
-                    }
-                    try emitAnthropicTextDelta(allocator, stream, block_index, visible);
                 }
             }
         }
@@ -11550,7 +11546,10 @@ fn handleResponses(
         var utf8_carry_len: u8 = 0;
         var stopped = false;
         var client_gone = false;
-        var in_think_block = enable_thinking;
+        // Prompt-opened thinking streams as reasoning even when the request
+        // asked for thinking off — generated reasoning is delivered, never
+        // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
+        var in_think_block = enable_thinking or promptOpensThink(allocator, lm, tok, prompt_ids);
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
@@ -11837,9 +11836,12 @@ fn handleResponses(
     if (normalized_text) |n| final_text = n;
 
     // ── split thinking & tool calls ──
-    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids));
-    const reasoning_text: ?[]const u8 = if (enable_thinking) think_split.reasoning_content else null;
-    const visible_text: []const u8 = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
+    // Reasoning the model actually generated is always delivered — the
+    // request's thinking flag shaped the PROMPT (chat.noThinkTailSuffix),
+    // never the delivery.
+    const think_split = chat_mod.splitThinkBlock(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+    const reasoning_text: ?[]const u8 = think_split.reasoning_content;
+    const visible_text: []const u8 = think_split.content;
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools) {

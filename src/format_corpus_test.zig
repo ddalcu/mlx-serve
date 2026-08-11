@@ -2,7 +2,7 @@
 //!
 //! A table of REAL captured model outputs (plus a few minimal synthetic
 //! variants of real failures) run through the pure post-processing layer:
-//! `chat.splitThinkBlock` / `chat.stripThinkBlock` / `chat.parseToolCalls` —
+//! `chat.splitThinkBlock` / `chat.parseToolCalls` —
 //! and back through the INPUT layer (`chat.serializeMessagesJson`), since
 //! every output re-enters the next request's history.
 //! No model weights, no server — runs in CI on every `zig build test`.
@@ -44,7 +44,8 @@ const Expect = struct {
     family: []const u8,
     name: []const u8,
     raw: []const u8,
-    /// Request had thinking enabled (selects splitThinkBlock vs stripThinkBlock).
+    /// Request had thinking enabled. Documentation of the original capture —
+    /// the server splits (and delivers reasoning) either way.
     thinking: bool = false,
     /// Generation prompt ended with a template-injected think opener
     /// (Qwen 3.5/3.6 render `…assistant\n<think>\n`).
@@ -214,7 +215,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "might also want",
     },
     .{
-        // Same tail behavior with thinking OFF → stripThinkBlock path.
+        // Same tail behavior with thinking OFF (same split path).
         .family = "gemma4",
         .name = "trailing <|channel>thought opener never leaks (thinking off)",
         .raw = "Here is the design.\n<|channel>thought\nI should now write the file",
@@ -450,7 +451,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "check the directory once more",
     },
     .{
-        // Same shape, thinking OFF → stripThinkBlock path must also cut at
+        // Same shape, thinking OFF — the split must also cut at
         // the first unclosed opener.
         .family = "gemma4",
         .name = "multiple unclosed thought openers stripped (thinking off)",
@@ -473,7 +474,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "Let me plan the answer.",
     },
     .{
-        // Same shape, thinking OFF → stripThinkBlock path. THIS is the exact
+        // Same shape, thinking OFF. THIS is the exact
         // form captured live: visible content was the literal `<|channel>thought\n`.
         .family = "gemma4",
         .name = "re-opened thought opener right after close never leaks (thinking off)",
@@ -507,7 +508,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "Find the file.",
     },
     .{
-        // Same shape, thinking OFF → stripThinkBlock path.
+        // Same shape, thinking OFF (same split path).
         .family = "gemma4",
         .name = "trailing <channel|> close-marker spam never leaks (thinking off)",
         .raw = "Reasoning about the file.\n<channel|>running glob\n\n" ++
@@ -1648,10 +1649,11 @@ test "format corpus: recorded model outputs across families" {
         }
 
         // ── Visible content / reasoning split (server's no-tool-call path). ──
-        const split: chat.ThinkSplit = if (entry.thinking)
-            chat.splitThinkBlock(raw, true, entry.opened_by_template)
-        else
-            .{ .reasoning_content = null, .content = chat.stripThinkBlock(raw) };
+        // ONE path for both thinking flags: the server always splits and
+        // DELIVERS whatever reasoning the model generated (thinking-off is
+        // enforced prompt-side via chat.noThinkTailSuffix, never by dropping
+        // generated tokens). `entry.thinking` documents the original request.
+        const split: chat.ThinkSplit = chat.splitThinkBlock(raw, true, entry.opened_by_template);
         // When tool calls parsed, the server emits NO content from this text.
         const content: []const u8 = if (calls != null) "" else split.content;
 

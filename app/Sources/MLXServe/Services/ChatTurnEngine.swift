@@ -244,6 +244,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var repeatPenalty: Double? = nil
         var presencePenalty: Double? = nil
         var reasoningBudget: Int? = nil
+        /// The surface's `reasoning_effort` pick, sent only while thinking is
+        /// on (see `reasoningEffortParam`).
+        var reasoningEffort: ReasoningEffort = .low
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
@@ -274,9 +277,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 repeatPenalty: r.repeatPenaltyOverride,
                 presencePenalty: r.presencePenaltyOverride,
                 reasoningBudget: r.reasoningBudgetOverride,
+                reasoningEffort: r.reasoningEffort,
                 voice: r.voiceOverride,
                 wakePhrase: r.wakePhrase
             )
+        }
+
+        /// The wire value for `reasoning_effort`, gated on the turn's EFFECTIVE
+        /// thinking state: the server reads the field as a thinking opt-in, so
+        /// sending it with the toggle off would silently turn thinking on.
+        func reasoningEffortParam(thinking: Bool) -> String? {
+            thinking ? reasoningEffort.rawValue : nil
         }
 
         /// The per-request defaults for this turn: the user's saved sampling
@@ -535,12 +546,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
             // Pin the request to the active model (server-resolved default if
             // nil) so hot-switch can finish in-flight requests on the old model.
+            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
-                enableThinking: config.enableThinking || appState.serverOptions.defaultEnableThinking,
+                enableThinking: thinking,
+                reasoningEffort: config.reasoningEffortParam(thinking: thinking),
                 defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
@@ -561,10 +574,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     break
                 case .truncated(let cause):
                     // Plain chat is a single, always-terminal response — show the
-                    // notice immediately (no agent loop to stack it). Flush any
-                    // buffered text first so the notice lands after it, in order.
+                    // notice immediately (no agent loop to stack it). It rides the
+                    // message as DATA, never content: content is what history
+                    // builders send back, and the old in-content banner taught
+                    // the model its own warning text.
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, truncation: .init(cause: cause, maxTokens: turnMaxTokens(config)))
                 case .done:
                     break
                 }
@@ -824,6 +839,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: Self.agentLoopTemperature),
                 enableThinking: config.enableThinking,
+                reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
                 defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
@@ -894,7 +910,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // (live 2026-08-05, under pi). Every other "length" cause keeps
             // its recovery: the reply was fine and simply ran out of room.
             if TruncationNotice.endsTurn(cause: truncationCause) {
-                appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: .repetitionLoop, maxTokens: turnMaxTokens(config)))
+                appState.updateLastMessage(in: sessionId, truncation: .init(cause: .repetitionLoop, maxTokens: turnMaxTokens(config)))
                 return
             }
 
@@ -1001,7 +1017,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // was cut off by the cap, surface the truncation notice exactly
                 // once here — not per iteration in the stream loop above.
                 if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, truncation: .init(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
                 }
                 return
             }
@@ -1489,8 +1505,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// nothink signature without it, so the model stops thinking from turn 2.
     /// Templates that strip history reasoning (Qwen, Gemma) never read it.
     nonisolated static func plainHistoryDict(_ msg: ChatMessage) -> [String: Any] {
-        var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-        if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
+        // `truncationNotice` is a field, so it never rides here by construction;
+        // the strip covers sessions saved when the banner lived IN content.
+        let content = msg.role == .assistant
+            ? TruncationNotice.stripped(from: msg.content) : msg.content
+        var d: [String: Any] = ["role": msg.role.rawValue, "content": content]
+        if msg.role == .assistant && content.isEmpty { d.removeValue(forKey: "content") }
         if msg.role == .assistant, let rc = msg.reasoningContent, !rc.isEmpty {
             d["reasoning_content"] = rc
         }

@@ -660,6 +660,32 @@ final class HFModelQuantGateTests: XCTestCase {
         // Lockstep with the model_type gate the local (downloaded) rows use.
         XCTAssertTrue(supportedModelTypes.contains("laguna"))
     }
+
+    func testMuseGlimmerIsSupportedArchitecture() {
+        // meta-models Muse-Glimmer-30B (config.json model_type=muse_glimmer) is
+        // served by the MLX engine — same class as hy_v3/laguna: the model_type
+        // gate learned it, the HF tag gate never did. Tags verified live
+        // 2026-08-11: our 8-bit mirror carries ["mlx", "muse_glimmer", ...] and
+        // upstream carries ["transformers", "muse_glimmer", ...] — no
+        // gemma/qwen/llama prefix anywhere.
+        let m = mlx(id: "ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit",
+                    tags: ["mlx", "safetensors", "muse_glimmer", "mlx-serve",
+                           "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "muse_glimmer is served (supportedModelTypes + Zig supported_model_types) — the HF tag gate must accept it")
+        XCTAssertNil(m.incompatibleReason)
+        // Upstream is tagged image-text-to-text (vision weights ship but are
+        // dropped at load) — that pipeline tag is already compatible, so the
+        // row must come through clean there too.
+        let upstream = HFModel(id: "meta-models/Muse-Glimmer-30B", downloads: 1, likes: 1,
+                               lastModified: nil,
+                               tags: ["transformers", "safetensors", "muse_glimmer",
+                                      "image-text-to-text", "conversational"],
+                               safetensors: nil, pipelineTag: "image-text-to-text")
+        XCTAssertNil(upstream.incompatibleReason)
+        // Lockstep with the model_type gate the local (downloaded) rows use.
+        XCTAssertTrue(supportedModelTypes.contains("muse_glimmer"))
+    }
 }
 
 // MARK: - HFModel.quantization label parsing

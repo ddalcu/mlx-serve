@@ -422,6 +422,7 @@ class APIClient {
         maxTokens: Int = 2048,
         temperature: Double = 0.8,
         enableThinking: Bool = false,
+        reasoningEffort: String? = nil,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
@@ -449,7 +450,8 @@ class APIClient {
                         try await self.performStream(
                             port: port, messages: messages,
                             maxTokens: maxTokens, temperature: temperature,
-                            enableThinking: enableThinking, tools: tools,
+                            enableThinking: enableThinking,
+                            reasoningEffort: reasoningEffort, tools: tools,
                             toolsJSON: toolsJSON,
                             defaults: defaults,
                             modelId: modelId,
@@ -492,6 +494,7 @@ class APIClient {
         maxTokens: Int,
         temperature: Double,
         enableThinking: Bool,
+        reasoningEffort: String? = nil,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
@@ -536,6 +539,7 @@ class APIClient {
             // generation to the remaining context window.
             if maxTokens > 0 { parts.append("\"max_tokens\":\(maxTokens)") }
             if enableThinking { parts.append("\"enable_thinking\":true") }
+            if let v = reasoningEffort { parts.append("\"reasoning_effort\":\"\(v)\"") }
             if let v = defaults.topK { parts.append("\"top_k\":\(v)") }
             if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
             if let v = defaults.presencePenalty { parts.append("\"presence_penalty\":\(v)") }
@@ -556,6 +560,7 @@ class APIClient {
             // maxTokens <= 0 means "Auto": omit so the server pegs to context.
             if maxTokens > 0 { body["max_tokens"] = maxTokens }
             if enableThinking { body["enable_thinking"] = true }
+            if let v = reasoningEffort { body["reasoning_effort"] = v }
             if let v = defaults.topK { body["top_k"] = v }
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }
             if let v = defaults.presencePenalty { body["presence_penalty"] = v }

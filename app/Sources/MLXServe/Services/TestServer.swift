@@ -546,7 +546,7 @@ class TestServer {
                         receivedToolCalls = calls
                     case .truncated(let cause):
                         maxTokensHit = true
-                        appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: 0))
+                        appState.updateLastMessage(in: sessionId, truncation: .init(cause: cause, maxTokens: 0))
                     case .done:
                         break
                     }

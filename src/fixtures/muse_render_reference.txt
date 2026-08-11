@@ -34,7 +34,7 @@ that can span
 </atem:invoke>
 </atem:function_calls>
 
-# Valid recipients: "self", "weather.*", "user".<|eot|><|start|>user<|message|>What's the weather in Paris?<|eot|><|start|>assistant to=self<|message|>Need the weather tool.<|eom|><|start|>assistant to=weather.get<|message|><atem:function_calls>
+# Valid recipients: "self", "weather.*", "user".<|eot|><|start|>user<|message|>What's the weather in Paris?<|eot|><|start|>assistant to=weather.get<|message|><atem:function_calls>
 <atem:invoke name="weather.get">
 <atem:parameter name="city">Paris</atem:parameter>
 <atem:parameter name="detailed">false</atem:parameter>

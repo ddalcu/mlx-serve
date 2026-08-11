@@ -54,6 +54,25 @@ final class AgentTurnConfigTests: XCTestCase {
         XCTAssertNil(config.reasoningBudget)
     }
 
+    // MARK: - Reasoning effort (the brain disc's right-click pick)
+
+    func testReasoningEffortRidesResolutionIntoTheTurnAndDefaultsLow() {
+        XCTAssertEqual(ChatTurnEngine.TurnConfig.from(resolved { _ in }).reasoningEffort, .low)
+        var d = AppDefaultsSnapshot()
+        d.reasoningEffort = .high
+        let r = AgentResolution.resolve(agent: nil, defaults: d)
+        XCTAssertEqual(ChatTurnEngine.TurnConfig.from(r).reasoningEffort, .high)
+    }
+
+    func testReasoningEffortIsOnlySentWhileThinkingIsOn() {
+        // The server reads `reasoning_effort` as a thinking OPT-IN, so sending
+        // it with the toggle off would silently turn thinking on.
+        var config = ChatTurnEngine.TurnConfig.from(resolved { _ in })
+        config.reasoningEffort = .medium
+        XCTAssertEqual(config.reasoningEffortParam(thinking: true), "medium")
+        XCTAssertNil(config.reasoningEffortParam(thinking: false))
+    }
+
     // MARK: - Request defaults (the agent's sampling laid over the user's)
 
     func testRequestDefaultsWithoutOverridesMatchTheGlobalBuild() {

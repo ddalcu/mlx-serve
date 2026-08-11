@@ -943,10 +943,10 @@ struct ChatDetailView: View {
     // toggle — so each chat tab remembers its own Think/Agent/MCP choice instead
     // of leaking the active tab's value into the reused ChatDetailView.
     @State private var enableThinking = false
+    @State private var reasoningEffort = ReasoningEffort.low
     @State private var isAgentMode = false
     @State private var mcpMode = false
     @State private var showMCPMarketplace = false
-    @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
     // Follow-the-newest-line. The decision core is pure (`ChatScrollState`,
     // pinned by ChatScrollTests); the model holds it in a class so per-frame
@@ -1004,6 +1004,7 @@ struct ChatDetailView: View {
         guard !isExternalBridgeSession else { return }
         isAgentMode = session?.mode == .agent
         enableThinking = session?.enableThinking ?? false
+        reasoningEffort = session?.reasoningEffort ?? .low
         mcpMode = session?.useMCP ?? false
     }
 
@@ -1162,6 +1163,8 @@ struct ChatDetailView: View {
         }
     }
 
+    /// One brain: CLICK flips thinking, secondary-click picks the reasoning
+    /// effort — same idiom as the wrench.
     private var thinkToggle: some View {
         Group {
             if let owner = toolbarToggles.thinkingLockedBy {
@@ -1170,28 +1173,42 @@ struct ChatDetailView: View {
                 } label: {
                     modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue, lockedBy: owner)
                 }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-            } else {
+            } else if isExternalBridgeSession {
+                // Telegram session: write the shared config so the toggle stays
+                // in sync with Settings and the bridge reads it live. No effort
+                // menu — the bridge sends the plain boolean.
                 Button {
-                    if isExternalBridgeSession {
-                        // Telegram session: write the shared config so the toggle
-                        // stays in sync with Settings and the bridge reads it live.
-                        appState.serverOptions.telegram.enableThinking.toggle()
-                    } else if !enableThinking && isAgentMode {
-                        showThinkingInAgentConfirm = true
-                    } else {
-                        enableThinking.toggle()
-                    }
+                    appState.serverOptions.telegram.enableThinking.toggle()
                 } label: {
                     modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
                 }
-                .buttonStyle(.plain)
+            } else {
+                Menu {
+                    reasoningEffortMenu
+                } label: {
+                    modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
+                } primaryAction: {
+                    enableThinking.toggle()
+                }
+                .contextMenu { reasoningEffortMenu }
             }
         }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
         .composerTip(.thinking(isOn: toolbarToggles.thinking,
                                lockedBy: toolbarToggles.thinkingLockedBy))
+    }
+
+    /// The brain disc's secondary-click menu: how hard the model thinks while
+    /// the toggle is on (`reasoning_effort`).
+    @ViewBuilder private var reasoningEffortMenu: some View {
+        Picker("Reasoning", selection: $reasoningEffort) {
+            ForEach(ReasoningEffort.allCases) { effort in
+                Text(effort.label).tag(effort)
+            }
+        }
+        .pickerStyle(.inline)
     }
 
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
@@ -1224,8 +1241,8 @@ struct ChatDetailView: View {
     }
 
     /// Flip the tool loop for this chat. Shared by the wrench click and the
-    /// pre-send intent nudge, so the approval re-arm and the thinking auto-off
-    /// can't apply on one path and not the other.
+    /// pre-send intent nudge, so the approval re-arm can't apply on one path
+    /// and not the other.
     private func setToolsEnabled(_ on: Bool) {
         // The agent decides this one — the disc offers no primary action while
         // locked, but the pre-send nudge calls in here too.
@@ -1241,9 +1258,6 @@ struct ChatDetailView: View {
         // "Always allow this session" decays here — for THIS tab only; other
         // tabs keep their decision.
         if !on { toolAllowList.rearm(sessionId) }
-        // Thinking + tool-calling loops degrade quality on most local models —
-        // auto-off when entering Agent mode.
-        if on { enableThinking = false }
     }
 
     // MARK: Per-chat tool switches
@@ -1648,12 +1662,6 @@ struct ChatDetailView: View {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
         }
-        .alert("Enable thinking with Tools on?", isPresented: $showThinkingInAgentConfirm) {
-            Button("Cancel", role: .cancel) { }
-            Button("Enable anyway") { enableThinking = true }
-        } message: {
-            Text("Thinking is not recommended with Tools on — most local models tool-call more reliably without it. Do you still want to enable it?")
-        }
         // Typed-turn approvals only. Voice turns approve through the
         // controller's own `pendingApproval`, rendered inline next to the orb
         // (and in the tray) — never through this sheet.
@@ -1726,6 +1734,11 @@ struct ChatDetailView: View {
             guard !isExternalBridgeSession,
                   let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
             appState.chatSessions[idx].enableThinking = newValue
+        }
+        .onChange(of: reasoningEffort) { _, newValue in
+            guard !isExternalBridgeSession,
+                  let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+            appState.chatSessions[idx].reasoningEffort = newValue
         }
         .onChange(of: mcpMode) { _, newValue in
             guard !isExternalBridgeSession,
@@ -2345,13 +2358,11 @@ struct ChatDetailView: View {
         return nil
     }
 
-    /// Enable the mode the nudge suggested, mirroring the toolbar toggles'
-    /// side effects (turning Agent on clears Thinking).
+    /// Enable the mode the nudge suggested.
     private func enableForPrompt(_ prompt: IntentPrompt) {
         switch prompt {
         case .agent:
             isAgentMode = true
-            enableThinking = false
         case .mcp:
             mcpMode = true
         }
@@ -2379,7 +2390,8 @@ struct ChatDetailView: View {
             thinkingEnabled: enableThinking,
             autoApprove: false,
             workingDirectory: session?.workingDirectory,
-            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []))
+            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []),
+            reasoningEffort: reasoningEffort)
         let config = ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
         chatEngine.runTurn(sessionId: sessionId, userText: text,
@@ -2692,6 +2704,19 @@ struct MessageBubble: View {
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: isBare ? 0 : ChatMetrics.bubbleCornerRadius))
                     .frame(maxWidth: .infinity, alignment: isBare ? .leading : .trailing)
+                }
+
+                // A cut reply's notice: DATA on the message, drawn as a footnote
+                // under the bubble — never appended into content, which rides
+                // back to the model as history.
+                if let notice = message.truncationNotice, !message.isStreaming {
+                    Text(notice.text)
+                        .font(.callout)
+                        .italic()
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
+                        .padding(.top, 2)
                 }
 
                 // Where the answer came from, above the footer — the provenance

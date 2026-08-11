@@ -735,11 +735,12 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
-    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, truncation: TruncationNotice.Notice? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
         let mIdx = chatSessions[sIdx].messages.count - 1
         if let content { chatSessions[sIdx].messages[mIdx].content += content }
+        if let truncation { chatSessions[sIdx].messages[mIdx].truncationNotice = truncation }
         if let usage {
             chatSessions[sIdx].messages[mIdx].promptTokens = usage.promptTokens
             chatSessions[sIdx].messages[mIdx].completionTokens = usage.completionTokens

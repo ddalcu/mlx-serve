@@ -44,7 +44,7 @@ const leak_tags = [_][]const u8{
 };
 
 /// Tags the server ALWAYS strips via dedicated think-block logic
-/// (splitThinkBlock/stripThinkBlock), independent of tool parsing — a leak here
+/// (splitThinkBlock), independent of tool parsing — a leak here
 /// is a HARD bug.
 const hard_leak_tags = [_][]const u8{
     "<think>", "</think>", "<|channel>", "<channel|>",
@@ -114,8 +114,9 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         };
 
         if (calls == null) {
-            // Nothing parsed as a call ⇒ the text is shown to the user.
-            const content = chat.stripThinkBlock(text);
+            // Nothing parsed as a call ⇒ the text is shown to the user
+            // (content side of the always-delivered split, same as the server).
+            const content = chat.splitThinkBlock(text, true, false).content;
             // Legitimate output has AT MOST ONE close marker per style per turn
             // (one thought block). The strip logic guarantees no leak for that.
             // A model that emits ≥2 bare closes with no matching structure is

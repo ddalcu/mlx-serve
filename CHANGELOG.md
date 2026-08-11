@@ -2,13 +2,32 @@
 
 ## v26.8.5 — Muse-Glimmer, and drafters that ship with the model
 
-- **Meta's Muse-Glimmer-30B runs natively.** The 30B dense model loads and serves text, tools and thinking, with its Harmony channels and ATEM tool tags handled end to end. 4-bit and 8-bit conversions are on the Hub. Vision weights ship in the checkpoint but are not served yet.
-- **Speculative decoding you don't have to configure.** A model can now carry its own block-drafter in a `drafter/` folder, and the server loads it when the model loads — so switching models keeps the speedup instead of quietly dropping back to serial decode until the next restart. `--no-drafter` turns it off.
-- **A new block-drafter that drafts a whole block per pass.** One assistant forward proposes the next several tokens and the model verifies them together. On Muse-Glimmer it accepts about 72% of drafted tokens, just under 3 tokens committed per round.
-- **The draft block sizes itself to your Mac.** The verify width a machine can run is a hardware property, so the server measures what it has and caps the block accordingly rather than shipping one number that is wrong on half the fleet.
-- **Speculation survives a cache hit.** Reused conversation prefixes keep the drafter's context, instead of restarting it blind and losing acceptance on exactly the multi-turn chats that benefit most.
-- **GGUF models from the Hugging Face CLI cache load again.** The hub cache stores each `<quant>.gguf` as a symlink to an extensionless blob, and the app resolved the link before launching the server — which routes GGUF by the `.gguf` extension, so the blob path hit the safetensors loader and the server died with `error: NotDir` (#158). The app now passes the symlink's own path and lets the filesystem follow it.
-- **Big video renders no longer die at 15 minutes.** A single MiniMax-H3 denoise step at large sizes can run silent for close to an hour, and the app's own client gave up after 15 minutes of stream silence and cancelled the job (#152, #157). The app now waits out long silent stretches; Stop still cancels immediately.
+### Highlights
+
+- **Meta's Muse-Glimmer-30B runs on your Mac.** Chat, tools and thinking all work, with 4-bit and 8-bit ddalcu builds on the Hub with DSpark built in (up to 70 tok/s on M4Max).
+- **Speculative decoding you don't have to set up.** A model can carry its own draft companion, and the server picks it up whenever that model loads. Muse-Glimmer decodes about twice as fast with it.
+- **Thinking got quicker and more visible.** Thinking off no longer waits on a hidden reasoning pass, thinking that does happen is shown instead of thrown away, and you can pick how hard the model thinks right in the composer.
+
+### Muse-Glimmer
+
+- The 30B model runs natively, its chat and tool format handled end to end. Vision isn't served yet.
+- Ships with its own draft companion, so it's fast out of the box.
+
+### Drafters that ship with the model
+
+- A model folder can include a `drafter/` companion; the server loads it with the model, and switching models keeps the speedup. `--no-drafter` turns it off.
+- The draft size adapts to your Mac, and reused conversations keep their speedup instead of restarting it cold.
+
+### Thinking
+
+- Thinking off means no thinking: the reply starts right away instead of after an invisible reasoning pass — on Muse-Glimmer that pass was half a minute of silence.
+- Right-click the thinking icon to pick the effort; click still toggles it. Tool chats keep thinking by default, plain chats skip it, and the "thinking with Tools" warning is gone.
+
+### Fixes
+
+- The "stopped repeating itself" notice showed twice on a cut reply and could be sent back to the model as chat text. It now shows once, under the reply, and never reaches the model (#147) thanks @justinluque for your PR.
+- GGUF models downloaded with the Hugging Face CLI load again (#158).
+- Big video renders no longer get cancelled after 15 minutes of quiet work (#152, #157).
 
 ---
 

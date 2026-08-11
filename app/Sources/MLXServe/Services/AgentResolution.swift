@@ -33,6 +33,10 @@ struct AppDefaultsSnapshot: Sendable, Equatable {
     /// The app's global voice (engine + value).
     var voice: AgentVoice?
     var wakePhrase: String = WakeWord.defaultPhrase
+    /// The surface's `reasoning_effort` pick (the brain disc's right-click
+    /// menu). Pass-through — agents own their thinking BUDGET instead
+    /// (`reasoningBudget`, which outranks effort server-side).
+    var reasoningEffort: ReasoningEffort = .low
 }
 
 /// Every field decided — no optionals left except the ones that are genuinely
@@ -77,6 +81,7 @@ struct ResolvedAgentSettings: Sendable, Equatable {
     /// Settings change from applying. nil = follow Settings, live.
     var voiceOverride: AgentVoice?
     var wakePhrase: String = WakeWord.defaultPhrase
+    var reasoningEffort: ReasoningEffort = .low
 }
 
 enum AgentResolution {
@@ -121,7 +126,8 @@ enum AgentResolution {
                 temperature: defaults.temperature,
                 maxTokens: defaults.maxTokens,
                 voice: defaults.voice,
-                wakePhrase: defaults.wakePhrase
+                wakePhrase: defaults.wakePhrase,
+                reasoningEffort: defaults.reasoningEffort
             )
         }
 
@@ -160,7 +166,8 @@ enum AgentResolution {
             reasoningBudgetOverride: agent.reasoningBudget,
             voice: agent.resolvedVoice ?? defaults.voice,
             voiceOverride: agent.resolvedVoice,
-            wakePhrase: agent.wakePhrase.flatMap(WakeWord.normalizePhrase) ?? defaults.wakePhrase
+            wakePhrase: agent.wakePhrase.flatMap(WakeWord.normalizePhrase) ?? defaults.wakePhrase,
+            reasoningEffort: defaults.reasoningEffort
         )
     }
 }
