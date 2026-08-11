@@ -36,7 +36,10 @@ if [ -n "${MUSE_TEST_DRAFTER:-}" ]; then
     DRAFTER_ARGS=(--drafter "$MUSE_TEST_DRAFTER")
 fi
 
-"$BIN" --model "$MODEL" "${DRAFTER_ARGS[@]}" --serve --host 127.0.0.1 --port "$PORT" > "$LOG" 2>&1 &
+# macOS ships bash 3.2, where "${arr[@]}" on an EMPTY array under `set -u` is
+# an unbound-variable error — so the no-drafter path died before the server
+# even booted. The +expansion form yields nothing when unset instead.
+"$BIN" --model "$MODEL" ${DRAFTER_ARGS[@]+"${DRAFTER_ARGS[@]}"} --serve --host 127.0.0.1 --port "$PORT" > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT

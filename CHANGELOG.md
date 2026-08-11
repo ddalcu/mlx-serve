@@ -1,5 +1,17 @@
 # Changelog
 
+## v26.8.5 — Muse-Glimmer, and drafters that ship with the model
+
+- **Meta's Muse-Glimmer-30B runs natively.** The 30B dense model loads and serves text, tools and thinking, with its Harmony channels and ATEM tool tags handled end to end. 4-bit and 8-bit conversions are on the Hub. Vision weights ship in the checkpoint but are not served yet.
+- **Speculative decoding you don't have to configure.** A model can now carry its own block-drafter in a `drafter/` folder, and the server loads it when the model loads — so switching models keeps the speedup instead of quietly dropping back to serial decode until the next restart. `--no-drafter` turns it off.
+- **A new block-drafter that drafts a whole block per pass.** One assistant forward proposes the next several tokens and the model verifies them together. On Muse-Glimmer it accepts about 72% of drafted tokens, just under 3 tokens committed per round.
+- **The draft block sizes itself to your Mac.** The verify width a machine can run is a hardware property, so the server measures what it has and caps the block accordingly rather than shipping one number that is wrong on half the fleet.
+- **Speculation survives a cache hit.** Reused conversation prefixes keep the drafter's context, instead of restarting it blind and losing acceptance on exactly the multi-turn chats that benefit most.
+- **GGUF models from the Hugging Face CLI cache load again.** The hub cache stores each `<quant>.gguf` as a symlink to an extensionless blob, and the app resolved the link before launching the server — which routes GGUF by the `.gguf` extension, so the blob path hit the safetensors loader and the server died with `error: NotDir` (#158). The app now passes the symlink's own path and lets the filesystem follow it.
+- **Big video renders no longer die at 15 minutes.** A single MiniMax-H3 denoise step at large sizes can run silent for close to an hour, and the app's own client gave up after 15 minutes of stream silence and cancelled the job (#152, #157). The app now waits out long silent stretches; Stop still cancels immediately.
+
+---
+
 ## v26.8.4 — One window, your own media models, hot model switching
 
 ### Highlights

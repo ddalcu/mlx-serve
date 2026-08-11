@@ -99,8 +99,7 @@ class ServerManager: ObservableObject {
     func start(modelPath: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
 
-        // Resolve symlinks for the model path
-        let resolvedModel = (modelPath as NSString).resolvingSymlinksInPath
+        let resolvedModel = Self.launchModelPath(modelPath)
         currentModelPath = resolvedModel
 
         var args = ["--model", resolvedModel]
@@ -716,6 +715,15 @@ class ServerManager: ObservableObject {
     /// a private copy of `DownloadManager`'s string, and two copies of a path
     /// the user can now change is one that gets missed.
     nonisolated static var modelsRoot: String { ModelRoots().downloadRoot }
+
+    /// The `--model` spelling of the selected model path. Standardizes (`~`,
+    /// `..`, `//`) but NEVER follows symlinks: an HF-cache GGUF quant is a
+    /// `<quant>.gguf` symlink to an extensionless `blobs/<sha256>` file, and
+    /// the server routes GGUF by the `.gguf` extension — the resolved blob
+    /// path fell through to the MLX directory loader and died `NotDir` (#158).
+    nonisolated static func launchModelPath(_ selected: String) -> String {
+        (selected as NSString).standardizingPath
+    }
 
     /// Every `--model-dir` a launch should carry: all configured library
     /// folders, plus the selected model's own parent when it lives outside all

@@ -274,7 +274,12 @@ class APIClient {
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
-                    req.timeoutInterval = 900
+                    // Byte-silence timeout, reset by every SSE byte. One H3
+                    // denoise step at large sizes can be silent for ~50 min
+                    // and the VAE decode tail sends nothing (#152/#157), so
+                    // 900 killed the render mid-step. Stop still cancels:
+                    // task cancel → socket close → server peerClosed abort.
+                    req.timeoutInterval = 86_400
                     let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
                     guard code == 200 else {

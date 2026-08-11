@@ -236,6 +236,31 @@ final class ModelRootsTests: XCTestCase {
         XCTAssertEqual(ServerManager.launchModelDirs(selectedModel: "", roots: [lib]), [lib])
     }
 
+    /// An HF-cache GGUF quant is a `<quant>.gguf` SYMLINK to an extensionless
+    /// blob (`blobs/<sha256>`). The server routes GGUF by the `.gguf`
+    /// extension, so resolving the leaf symlink hands it the blob path, which
+    /// falls through to the MLX directory loader and dies `error: NotDir`
+    /// (issue #158). The launch path must keep the symlink's own name; the
+    /// filesystem follows the link at open time.
+    func testAnHFCacheGgufSymlinkKeepsItsExtensionInTheLaunchPath() {
+        let repo = tempDir("hub") + "/models--unsloth--Qwen3.5-4B-GGUF"
+        let blobs = repo + "/blobs"
+        let snap = repo + "/snapshots/abc123"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: blobs, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: snap, withIntermediateDirectories: true)
+        let blob = blobs + "/00fe7986ff5f6b46"
+        fm.createFile(atPath: blob, contents: Data("GGUF".utf8))
+        let link = snap + "/Qwen3.5-4B-Q4_K_M.gguf"
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: "../../blobs/00fe7986ff5f6b46")
+
+        XCTAssertEqual(ServerManager.launchModelPath(link), link)
+        // A safetensors model dir (the MLX case) passes through unchanged too.
+        let dir = tempDir("lib") + "/org/model"
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        XCTAssertEqual(ServerManager.launchModelPath(dir), dir)
+    }
+
     /// The extra folder can never push the list past what the server accepts —
     /// `main.zig` EXITS on the ninth `--model-dir`, so an over-long list is a
     /// server that does not start.
