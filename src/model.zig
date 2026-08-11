@@ -10,6 +10,12 @@ pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
 /// scales only) but share the packed-u32 weight layout, so supporting them is
 /// a matter of skipping the biases fetch and passing the right mode string to
 /// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
+/// Upper bound on a vision tower's per-layer type table (muse ships 50).
+pub const MAX_VISION_LAYERS = 64;
+
+/// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
+pub const MUSE_MAX_IMAGE_TOKENS = 4096;
+
 pub const QuantMode = enum {
     affine,
     nvfp4,
@@ -409,6 +415,16 @@ pub const ModelConfig = struct {
     // 0 means absent: the Qwen processor defaults remain the fallback.
     qv_min_pixels: u32 = 0,
     qv_max_pixels: u32 = 0,
+    // Muse-Glimmer vision (src/muse_vision.zig). Shares the qv_* geometry but
+    // NOT the Qwen ViT: split qkv, learned pos table resampled per image,
+    // window/full attention per layer, and plain 1D text positions (no M-RoPE).
+    muse_vision: bool = false,
+    mv_pos_side: u32 = 0, // learned pos table is pos_side x pos_side
+    mv_projector_hidden: u32 = 0, // vision_adapter width
+    mv_ln_eps: f32 = 1e-5,
+    mv_rope_theta: f64 = 10000.0,
+    mv_max_image_tokens: u32 = 0, // processor cap, in MERGED tokens
+    mv_full_attn: [MAX_VISION_LAYERS]bool = @splat(false),
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -831,6 +847,9 @@ pub fn pickUserTurnPrefix(chat_template: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, chat_template, "<|start_header_id|>") != null) {
         return "<|start_header_id|>user<|end_header_id|>\n\n"; // Llama 3
     }
+    if (std.mem.indexOf(u8, chat_template, "<|start|>user<|message|>") != null) {
+        return "<|start|>user<|message|>"; // Muse-Glimmer (harmony channels)
+    }
     return null;
 }
 
@@ -901,7 +920,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
     // the older preprocessor_config.json layout.
-    if (config.qwen_vision) {
+    if (config.qwen_vision or config.muse_vision) {
         var vision_defaults = VisionProcessorDefaults{};
         const processor_files = [_][]const u8{
             "processor_config.json",
@@ -921,6 +940,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                         vision_defaults.min_pixels = parsed_defaults.min_pixels;
                     if (vision_defaults.max_pixels == null)
                         vision_defaults.max_pixels = parsed_defaults.max_pixels;
+                    if (vision_defaults.max_image_tokens == null)
+                        vision_defaults.max_image_tokens = parsed_defaults.max_image_tokens;
                 } else |_| {}
             } else |_| {}
         }
@@ -932,6 +953,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         }
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
+        config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
     }
 
     return config;
@@ -948,6 +970,8 @@ pub const GenerationDefaults = struct {
 pub const VisionProcessorDefaults = struct {
     min_pixels: ?u32 = null,
     max_pixels: ?u32 = null,
+    /// Muse: the cap is on MERGED tokens, not pixels.
+    max_image_tokens: ?u32 = null,
 };
 
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
@@ -977,6 +1001,7 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
     var defaults = VisionProcessorDefaults{
         .min_pixels = positiveJsonU32(processor.get("min_pixels")),
         .max_pixels = positiveJsonU32(processor.get("max_pixels")),
+        .max_image_tokens = positiveJsonU32(processor.get("max_image_tokens")),
     };
     if (processor.get("size")) |value| {
         if (value == .object) {
@@ -1512,9 +1537,41 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
             }
         }
-        // Vision tower/adapter/projection are not wired in v1 — weights are
-        // dropped at load (shouldKeepWeightKey); never advertise vision.
-        config.has_vision = false;
+        // Vision tower (src/muse_vision.zig). Muse names its geometry keys its
+        // own way and the window/full pattern is a per-layer list, not a stride.
+        if (root.get("vision_config")) |vc_val| {
+            if (vc_val == .object) {
+                const vc = vc_val.object;
+                config.muse_vision = true;
+                if (vc.get("num_hidden_layers")) |v| { if (v == .integer) config.qv_depth = @intCast(v.integer); }
+                if (vc.get("hidden_size")) |v| { if (v == .integer) config.qv_hidden = @intCast(v.integer); }
+                if (vc.get("num_attention_heads")) |v| { if (v == .integer) config.qv_heads = @intCast(v.integer); }
+                if (vc.get("intermediate_size")) |v| { if (v == .integer) config.qv_intermediate = @intCast(v.integer); }
+                if (vc.get("patch_size")) |v| { if (v == .integer) config.qv_patch = @intCast(v.integer); }
+                if (vc.get("patch_temporal")) |v| { if (v == .integer) config.qv_temporal_patch = @intCast(v.integer); }
+                if (vc.get("merge_size")) |v| { if (v == .integer) config.qv_merge = @intCast(v.integer); }
+                if (vc.get("pos_emb_height")) |v| { if (v == .integer) config.mv_pos_side = @intCast(v.integer); }
+                if (vc.get("layer_norm_eps")) |v| config.mv_ln_eps = jsonFloat(v);
+                if (vc.get("rope_parameters")) |rp| {
+                    if (rp == .object) {
+                        if (rp.object.get("rope_theta")) |v| config.mv_rope_theta = jsonFloat(v);
+                    }
+                }
+                if (vc.get("layer_types")) |lt| {
+                    if (lt == .array) for (lt.array.items, 0..) |item, i| {
+                        if (i >= MAX_VISION_LAYERS) break;
+                        if (item == .string) config.mv_full_attn[i] = std.mem.eql(u8, item.string, "full_attention");
+                    };
+                }
+                if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+                config.qv_out_hidden = config.hidden_size;
+                if (root.get("projector_hidden_size")) |v| { if (v == .integer) config.mv_projector_hidden = @intCast(v.integer); }
+                // The processor wraps the pad run in <|image_start|>/<|image_end|>;
+                // config.json carries neither, so the ids come from the vocab.
+                config.boi_token_id = 200080;
+                config.eoi_token_id = 200081;
+            }
+        }
         config.ensureMuseTerminators();
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
@@ -2456,14 +2513,14 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // pass multiplies by them instead of the decoder's layer_scalar.
     if (std.mem.startsWith(u8, key, "model.encoder.vision_tower.") or
         std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
-    // Muse-Glimmer's vision tower/adapter/projection are not wired yet —
-    // always drop so a text load doesn't carry ~2 GB of dead tower weights.
-    // Bare "vision_adapter." is the mlx-community re-nest of the same tower
-    // (their bare "vision_tower." already rides the is_vision gate above).
-    if (std.mem.startsWith(u8, key, "model.vision_tower.") or
+    // Muse-Glimmer nests its tower/adapter/projection under "model."; the
+    // mlx-community re-nest drops that prefix (its bare "vision_tower." already
+    // rides the is_vision gate above). Both follow --no-vision.
+    if (!load_vision and (std.mem.startsWith(u8, key, "model.vision_tower.") or
         std.mem.startsWith(u8, key, "model.vision_adapter.") or
         std.mem.startsWith(u8, key, "model.vision_projection.") or
-        std.mem.startsWith(u8, key, "vision_adapter.")) return false;
+        std.mem.startsWith(u8, key, "vision_adapter.") or
+        std.mem.startsWith(u8, key, "vision_projection."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -3073,16 +3130,20 @@ test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
 }
 
-test "shouldKeepWeightKey drops Muse-Glimmer vision in both nestings (text-only v1)" {
-    // Meta-original nesting (our mirrors) and the mlx-community re-nest
-    // (bare vision_tower./vision_adapter., no vision_projection) both carry
-    // the unwired tower — a text load keeps neither.
+test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nestings" {
+    // Ours nests the tower under `model.`; mlx-community re-nests it bare.
+    // Both spellings ride the same gate --no-vision flips.
     try testing.expect(!shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", false));
     try testing.expect(!shouldKeepWeightKey("model.vision_adapter.fc1.weight", false));
     try testing.expect(!shouldKeepWeightKey("model.vision_projection.weight", false));
     try testing.expect(!shouldKeepWeightKey("vision_adapter.fc1.weight", false));
     try testing.expect(!shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", false));
-    // The text trunk keys survive in both spellings.
+    try testing.expect(shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", true));
+    try testing.expect(shouldKeepWeightKey("model.vision_adapter.fc1.weight", true));
+    try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
+    try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
+    try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
+    // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.lm_head.weight", false));
@@ -3378,6 +3439,70 @@ test "ModelConfig parses muse_glimmer (Muse-Glimmer-30B): NoPE full layers, qk s
     try testing.expectEqual(@as(u32, 200001), config.eos_token_ids[0]);
     try testing.expectEqual(@as(u32, 200008), config.eos_token_ids[1]);
     try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "ModelConfig parses the muse_glimmer vision tower (own key spellings, window/full pattern)" {
+    // Trimmed copy of the real vision_config: muse names its geometry keys
+    // differently from Qwen (patch_temporal, merge_size, pos_emb_*), and the
+    // window/full pattern is per-layer, not a stride.
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer",
+        \\  "image_token_id": 200092,
+        \\  "out_hidden_size": 6144,
+        \\  "projector_hidden_size": 4096,
+        \\  "projector_hidden_act": "gelu",
+        \\  "text_config": {"model_type": "muse_glimmer_text", "hidden_size": 6656, "head_dim": 128,
+        \\                  "num_attention_heads": 32, "num_key_value_heads": 2, "rms_norm_eps": 1e-05},
+        \\  "vision_config": {
+        \\    "model_type": "muse_glimmer_vision",
+        \\    "hidden_act": "gelu",
+        \\    "hidden_size": 1536,
+        \\    "intermediate_size": 8960,
+        \\    "layer_norm_eps": 1e-05,
+        \\    "layer_types": ["window_attention", "window_attention", "window_attention", "full_attention",
+        \\                    "window_attention", "full_attention"],
+        \\    "merge_size": 2,
+        \\    "num_attention_heads": 16,
+        \\    "num_hidden_layers": 6,
+        \\    "patch_size": 14,
+        \\    "patch_temporal": 2,
+        \\    "pos_emb_height": 32,
+        \\    "pos_emb_width": 32,
+        \\    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.muse_vision);
+    try testing.expect(config.has_vision);
+    try testing.expect(!config.qwen_vision); // no M-RoPE, no vision_start/end
+    try testing.expectEqual(@as(u32, 6), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1536), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), config.qv_heads);
+    try testing.expectEqual(@as(u32, 96), config.qv_head_dim);
+    try testing.expectEqual(@as(u32, 8960), config.qv_intermediate);
+    try testing.expectEqual(@as(u32, 14), config.qv_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_merge);
+    try testing.expectEqual(@as(u32, 32), config.mv_pos_side);
+    try testing.expectEqual(@as(u32, 4096), config.mv_projector_hidden);
+    // The tower's own output width is the TEXT hidden size — `out_hidden_size`
+    // is the adapter's INPUT (hidden x merge^2), not the spliced width.
+    try testing.expectEqual(@as(u32, 6656), config.qv_out_hidden);
+    try testing.expectApproxEqAbs(@as(f32, 1e-05), config.mv_ln_eps, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 10000.0), config.mv_rope_theta, 1e-6);
+    // Every 4th layer is full attention; the rest window. Read per layer, since
+    // the released 50-layer tower ends on an off-stride full layer.
+    try testing.expect(!config.mv_full_attn[0]);
+    try testing.expect(config.mv_full_attn[3]);
+    try testing.expect(!config.mv_full_attn[4]);
+    try testing.expect(config.mv_full_attn[5]);
+    // muse wraps the pad run with <|image_start|>/<|image_end|>, so the generic
+    // BOI/EOI inserter needs no muse arm.
+    try testing.expectEqual(@as(u32, 200092), config.image_token_id);
+    try testing.expectEqual(@as(u32, 200080), config.boi_token_id);
+    try testing.expectEqual(@as(u32, 200081), config.eoi_token_id);
 }
 
 test "ModelConfig muse_glimmer_text flat sibling collapses onto muse_glimmer with bare prefix" {

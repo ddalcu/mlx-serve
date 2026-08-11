@@ -1529,9 +1529,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         MultimodalContent.build(text: text, images: images, audio: audio, serverPreprocess: serverPreprocess)
     }
 
-    /// Whether the loaded model wants server-side image preprocessing (Qwen3-VL):
-    /// its `x-mlx-pixels` square format is Gemma-only, so Qwen sends raw images.
     var wantsServerImagePreprocess: Bool {
-        (server.chatModelInfo?.architecture ?? "").hasPrefix("qwen")
+        MultimodalContent.wantsServerPreprocess(architecture: server.chatModelInfo?.architecture ?? "")
     }
 }

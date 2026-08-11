@@ -66,15 +66,42 @@ pub fn smartResizeDefault(height: u32, width: u32) Resized {
     return smartResizeImage(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS);
 }
 
-/// Keys bicubic kernel (a = -0.5), matching Pillow's BICUBIC filter.
-fn bicubicWeight(distance: f64) f64 {
-    const x = @abs(distance);
-    if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
-    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
-    return 0.0;
+/// Resampling kernels, matching Pillow's. Qwen's processor asks for BICUBIC,
+/// Muse-Glimmer's for LANCZOS.
+pub const Filter = enum {
+    bicubic,
+    lanczos,
+
+    fn support(self: Filter) f64 {
+        return switch (self) {
+            .bicubic => 2.0,
+            .lanczos => 3.0,
+        };
+    }
+
+    /// Keys bicubic (a = -0.5) / Lanczos-3.
+    fn weight(self: Filter, distance: f64) f64 {
+        const x = @abs(distance);
+        switch (self) {
+            .bicubic => {
+                if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
+                if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+                return 0.0;
+            },
+            .lanczos => {
+                if (x >= 3.0) return 0.0;
+                return sinc(x) * sinc(x / 3.0);
+            },
+        }
+    }
+};
+
+fn sinc(x: f64) f64 {
+    if (x == 0.0) return 1.0;
+    const t = x * std.math.pi;
+    return @sin(t) / t;
 }
 
-const BICUBIC_SUPPORT: f64 = 2.0;
 const RESAMPLE_PRECISION_BITS: u6 = 22;
 const RESAMPLE_PRECISION_SCALE: f64 = @floatFromInt(@as(i64, 1) << RESAMPLE_PRECISION_BITS);
 const RESAMPLE_ROUNDING_BIAS: i64 = @as(i64, 1) << (RESAMPLE_PRECISION_BITS - 1);
@@ -103,12 +130,13 @@ fn buildResampleCoefficients(
     allocator: std.mem.Allocator,
     input_len: usize,
     output_len: usize,
+    filter: Filter,
 ) !ResampleCoefficients {
     if (input_len == 0 or output_len == 0) return error.InvalidImageDimensions;
 
     const scale = @as(f64, @floatFromInt(input_len)) / @as(f64, @floatFromInt(output_len));
     const filter_scale = @max(scale, 1.0);
-    const support = BICUBIC_SUPPORT * filter_scale;
+    const support = filter.support() * filter_scale;
     const kernel_size: usize = @intFromFloat(@ceil(support) * 2.0 + 1.0);
     const weights_len = try std.math.mul(usize, output_len, kernel_size);
 
@@ -136,7 +164,7 @@ fn buildResampleCoefficients(
         var total: f64 = 0.0;
         for (0..count) |input_offset| {
             const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
-            total += bicubicWeight((source_center - center) * inverse_filter_scale);
+            total += filter.weight((source_center - center) * inverse_filter_scale);
         }
         if (total == 0.0) return error.InvalidResampleCoefficients;
 
@@ -145,7 +173,7 @@ fn buildResampleCoefficients(
         const row = weights[output_index * kernel_size ..][0..count];
         for (row, 0..) |*weight, input_offset| {
             const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
-            const value = bicubicWeight((source_center - center) * inverse_filter_scale);
+            const value = filter.weight((source_center - center) * inverse_filter_scale);
             const scaled = value / total * RESAMPLE_PRECISION_SCALE;
             weight.* = @intFromFloat(if (scaled < 0.0) scaled - 0.5 else scaled + 0.5);
         }
@@ -164,9 +192,6 @@ fn normalizeQwenPixel(value: u8) f32 {
     return @as(f32, @floatFromInt(value)) / 127.5 - 1.0;
 }
 
-/// Pillow-compatible bicubic resize of interleaved RGB, followed by Qwen's
-/// float32 CHW normalization (mean/std 0.5). Each separable pass is quantized
-/// to uint8, matching the reference processor's `PIL.Image.resize` boundary.
 pub fn resizeRgbBicubicNormalizedChw(
     allocator: std.mem.Allocator,
     dst: []f32,
@@ -175,6 +200,22 @@ pub fn resizeRgbBicubicNormalizedChw(
     source_w: u32,
     target_h: u32,
     target_w: u32,
+) !void {
+    return resizeRgbNormalizedChw(allocator, dst, rgb, source_h, source_w, target_h, target_w, .bicubic);
+}
+
+/// Pillow-compatible resize of interleaved RGB, followed by float32 CHW
+/// normalization (mean/std 0.5 — both processors use it). Each separable pass
+/// is quantized to uint8, matching the reference's `PIL.Image.resize` boundary.
+pub fn resizeRgbNormalizedChw(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    rgb: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+    filter: Filter,
 ) !void {
     const source_plane: usize = @as(usize, source_h) * source_w;
     const target_plane: usize = @as(usize, target_h) * target_w;
@@ -190,7 +231,7 @@ pub fn resizeRgbBicubicNormalizedChw(
         const buffer = try allocator.alloc(u8, horizontal_len);
         horizontal_owned = buffer;
 
-        var coefficients = try buildResampleCoefficients(allocator, source_w, target_w);
+        var coefficients = try buildResampleCoefficients(allocator, source_w, target_w, filter);
         defer coefficients.deinit(allocator);
         for (0..source_h) |y| {
             for (0..target_w) |x| {
@@ -210,7 +251,7 @@ pub fn resizeRgbBicubicNormalizedChw(
     } else rgb;
 
     if (target_h != source_h) {
-        var coefficients = try buildResampleCoefficients(allocator, source_h, target_h);
+        var coefficients = try buildResampleCoefficients(allocator, source_h, target_h, filter);
         defer coefficients.deinit(allocator);
         for (0..target_h) |y| {
             const bound = coefficients.bounds[y];

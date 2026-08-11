@@ -6,6 +6,15 @@ import Foundation
 /// `ImagePreprocessor.preprocess`), and audio is emitted straight from the
 /// decoded PCM the server expects.
 enum MultimodalContent {
+    /// Whether the server should do the image preprocessing for this model.
+    /// `x-mlx-pixels` is Gemma's square CHW format and ONLY Gemma can read it,
+    /// so it is an allowlist of one: every other vision arch (Qwen3-VL,
+    /// Muse-Glimmer, whatever lands next) gets the encoded image and runs its
+    /// own resize + patchify server-side.
+    static func wantsServerPreprocess(architecture: String) -> Bool {
+        !architecture.hasPrefix("gemma")
+    }
+
     /// Returns a content-blocks array suitable for a `{"role":"user","content":[...]}`
     /// message. Images become `image_url` blocks (preprocessed pixels when the
     /// preprocessor succeeds, JPEG data-URL otherwise); audio becomes

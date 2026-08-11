@@ -3597,14 +3597,14 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     for (req.images) |img| {
         var emb: mlx.mlx_array = undefined;
         if (img.grid_h > 0) {
-            // Qwen3-VL: pixels hold merge-order pixel_values [N, feat]; the ViT
+            // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
             // produces [1, N/merge², out_hidden].
             const n: usize = @as(usize, img.grid_h) * img.grid_w;
             const feat: usize = (img.pixels.len / 4) / n;
             const shape = [_]c_int{ @intCast(n), @intCast(feat) };
             const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
             defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w) catch |err| {
+            emb = vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w) catch |err| {
                 failParts(sch, req, emb_parts.items, @errorName(err));
                 return;
             };

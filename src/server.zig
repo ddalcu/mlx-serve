@@ -9,6 +9,7 @@ const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const muse_vision = @import("muse_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -8731,7 +8732,7 @@ fn processVisionImages(
             const shape = [_]c_int{ @intCast(n), @intCast(feat) };
             const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
             defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = try vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w);
+            emb = try vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w);
         } else {
             const h: c_int = @intCast(img.height);
             const w: c_int = @intCast(img.width);
@@ -8973,33 +8974,64 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
-    if (!config.qwen_vision) return .{};
+    if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
-        .qwen = true,
+        .mode = if (config.muse_vision) .muse else .qwen,
         .patch = config.qv_patch,
         .tps = config.qv_temporal_patch,
         .merge = config.qv_merge,
         .min_pixels = config.qv_min_pixels,
         .max_pixels = config.qv_max_pixels,
+        .max_tokens = config.mv_max_image_tokens,
     };
 }
 
-test "visionPreprocFromConfig threads Qwen processor bounds" {
-    const config = model_mod.ModelConfig{
+test "visionPreprocFromConfig threads each tower's processor bounds" {
+    const qwen = visionPreprocFromConfig(&.{
         .qwen_vision = true,
         .qv_patch = 14,
         .qv_temporal_patch = 2,
         .qv_merge = 2,
         .qv_min_pixels = 65536,
         .qv_max_pixels = 16777216,
-    };
-    const vp = visionPreprocFromConfig(&config);
-    try std.testing.expect(vp.qwen);
-    try std.testing.expectEqual(@as(u32, 14), vp.patch);
-    try std.testing.expectEqual(@as(u32, 2), vp.tps);
-    try std.testing.expectEqual(@as(u32, 2), vp.merge);
-    try std.testing.expectEqual(@as(u32, 65536), vp.min_pixels);
-    try std.testing.expectEqual(@as(u32, 16777216), vp.max_pixels);
+    });
+    try std.testing.expectEqual(.qwen, qwen.mode);
+    try std.testing.expectEqual(@as(u32, 14), qwen.patch);
+    try std.testing.expectEqual(@as(u32, 2), qwen.tps);
+    try std.testing.expectEqual(@as(u32, 2), qwen.merge);
+    try std.testing.expectEqual(@as(u32, 65536), qwen.min_pixels);
+    try std.testing.expectEqual(@as(u32, 16777216), qwen.max_pixels);
+
+    // muse caps on MERGED tokens instead of pixels, and must not be routed
+    // through the Qwen resize (different algorithm, different patch order).
+    const muse = visionPreprocFromConfig(&.{
+        .muse_vision = true,
+        .qv_patch = 14,
+        .qv_temporal_patch = 2,
+        .qv_merge = 2,
+        .mv_max_image_tokens = 4096,
+    });
+    try std.testing.expectEqual(.muse, muse.mode);
+    try std.testing.expectEqual(@as(u32, 4096), muse.max_tokens);
+    try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
+}
+
+test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
+    // Live crash 2026-08-11: the app preprocesses images into Gemma's square
+    // `x-mlx-pixels` buffer unless it recognises the arch, so Muse-Glimmer got
+    // one. That buffer carries NO patch grid, so the encode routed to the SigLIP
+    // `forward` — whose weights are null sentinels on a patch-grid encoder —
+    // and killed the server. The original image is unrecoverable from it (already
+    // resized and normalized), so the only honest answer is to refuse the block.
+    const url = "data:image/x-mlx-pixels;base64,AAAAAM3MzD3NzEw+mpmZPs3MzD4AAAA/mpkZPzMzMz/NzEw/ZmZmPwAAgD/NzIw/";
+    const gemma = parseImageUrlContent(std.testing.allocator, url, .{}) orelse return error.GemmaMustAccept;
+    defer std.testing.allocator.free(gemma.pixels);
+    try std.testing.expectEqual(@as(u32, 2), gemma.width);
+    try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
+
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen } }) |vp| {
+        try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
+    }
 }
 
 fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
@@ -9014,7 +9046,15 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
 
     const mime = url[0..sep];
     if (std.mem.eql(u8, mime, "data:image/x-mlx-pixels")) {
-        // Already preprocessed float32 CHW pixels
+        // Already preprocessed float32 CHW pixels — a GEMMA format. It carries
+        // no patch grid and the source image cannot be recovered from it, so a
+        // patch-grid tower has to refuse rather than hand a gridless buffer to
+        // an encoder that has no SigLIP weights.
+        if (vp.mode != .gemma) {
+            log.warn("Dropping x-mlx-pixels image: {s} needs server-side preprocessing (send the encoded image instead)\n", .{@tagName(vp.mode)});
+            allocator.free(raw_buf);
+            return null;
+        }
         const n_pixels = raw_buf.len / 4;
         const per_channel = n_pixels / 3;
         const side = std.math.sqrt(per_channel);
@@ -9096,11 +9136,12 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const src_w: u32 = @intCast(w);
     const src_h: u32 = @intCast(h);
 
-    // Qwen3-VL: smart-resize to a multiple of patch·merge within [min,max] pixels,
-    // normalize (x/255−0.5)/0.5, then emit the processor's merge-order pixel_values
-    // [N, C·tps·ps·ps]. The encoder is QwenVision; `grid_h/grid_w` carry the full
-    // patch grid (token count = (gh/merge)·(gw/merge)).
-    if (vp.qwen) {
+    // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
+    // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
+    // processor's pixel_values. `grid_h/grid_w` carry the full patch grid;
+    // token count = (gh/merge)·(gw/merge). Qwen bounds the PIXEL area, muse the
+    // merged-token count, and their patch orders differ — see muse_vision.zig.
+    if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         if (factor == 0 or vp.tps == 0) return null;
         const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
@@ -9108,7 +9149,10 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             vp.max_pixels
         else
             @max(qwen_vision.MAX_PIXELS, min_pixels);
-        const rs = qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels);
+        const rs = if (vp.mode == .muse)
+            muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS)
+        else
+            qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels);
         const rh = rs.h;
         const rw = rs.w;
         const C: u32 = 3;
@@ -9121,7 +9165,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        qwen_vision.resizeRgbBicubicNormalizedChw(
+        qwen_vision.resizeRgbNormalizedChw(
             allocator,
             chw,
             px[0..source_len],
@@ -9129,12 +9173,16 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             src_w,
             rh,
             rw,
+            if (vp.mode == .muse) .lanczos else .bicubic,
         ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @alignCast(@ptrCast(pv_bytes.ptr)))[0 .. n * feat];
-        qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
-        log.info("  Decoded {d}x{d} image → Qwen grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
+        if (vp.mode == .muse)
+            muse_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps)
+        else
+            qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
+        log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, if (vp.mode == .muse) "Muse" else "Qwen", gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
         return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
     }
 

@@ -30,12 +30,16 @@ pub const ImageData = struct {
 /// config. Threaded into `parseImageUrlContent`/`decodeImageToPixels` so decode
 /// stays race-safe (no global state) under `--max-concurrent ≥ 2`.
 pub const VisionPreproc = struct {
-    qwen: bool = false,
+    /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
+    /// or one of the patch-grid towers (each with its own resize + patch order).
+    mode: enum { gemma, qwen, muse } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
     min_pixels: u32 = 0,
     max_pixels: u32 = 0,
+    /// muse: the resize cap is on MERGED tokens, not pixels.
+    max_tokens: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.

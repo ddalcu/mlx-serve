@@ -13,6 +13,7 @@ test {
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
+    _ = @import("muse_vision.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
