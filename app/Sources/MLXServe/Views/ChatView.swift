@@ -2059,7 +2059,17 @@ struct ChatDetailView: View {
                           isFocused: $inputFocused,
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
-                          onSend: { sendMessage() })
+                          onSend: { sendMessage() },
+                          // Escape stops the reply being written. Handled here
+                          // rather than as a hidden `.cancelAction` button so
+                          // the edit bubble and the approval sheet keep the key
+                          // while they are up (ComposerKey.onEscape).
+                          onCancel: {
+                              switch ComposerKey.onEscape(isGenerating: composerState == .generatingHere) {
+                              case .stop: stopGeneration(); return true
+                              case .pass: return false
+                              }
+                          })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
             .disabled(server.status != .running)
@@ -2134,7 +2144,7 @@ struct ChatDetailView: View {
 
         Button {
             if composerState == .generatingHere {
-                chatEngine.stop(sessionId: sessionId)
+                stopGeneration()
             } else {
                 sendMessage()
             }
@@ -2704,6 +2714,13 @@ struct ChatDetailView: View {
             && (session?.messages.contains { $0.role == .user } ?? false)
     }
 
+    /// Stop this chat's turn. The ONE call both the composer's stop disc and
+    /// Escape make — per-session, because other tabs may be generating and
+    /// neither control may reach across.
+    private func stopGeneration() {
+        chatEngine.stop(sessionId: sessionId)
+    }
+
     private func regenerateLastResponse() {
         guard canRegenerate else { return }
         chatEngine.regenerate(sessionId: sessionId, config: buildTurnConfig(),
@@ -3153,7 +3170,10 @@ struct MessageBubble: View {
                               measuredHeight: $editHeight,
                               maxLines: 12,
                               isIdle: ComposerKey.editCanSubmit(editDraft),
-                              onSend: { commitEdit() })
+                              onSend: { commitEdit() },
+                              // Belt and braces: the Cancel button's key
+                              // equivalent claims Escape first while this is up.
+                              onCancel: { cancelEdit(); return true })
                 .frame(height: max(ChatMetrics.composerMinHeight, editHeight))
                 .padding(8)
                 .background(Color(nsColor: .controlBackgroundColor)) // Distinct surface fill
@@ -4230,10 +4250,27 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 enum ComposerReturnAction: Equatable { case send, newline, ignore }
 
+/// What an Escape keypress does in the composer. `.pass` hands the key back to
+/// AppKit rather than swallowing it — with no turn to stop, Escape still has
+/// its platform meaning here.
+enum ComposerEscapeAction: Equatable { case stop, pass }
+
 enum ComposerKey {
     static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
         if shift { return .newline }
         return isIdle ? .send : .ignore
+    }
+
+    /// Escape stops the reply being written, and does nothing otherwise.
+    ///
+    /// This runs from `cancelOperation(_:)` — the RESPONDER CHAIN — not from a
+    /// `.keyboardShortcut(.cancelAction)`. Key equivalents are offered the
+    /// keystroke first, so the edit bubble's Cancel and the tool-approval
+    /// sheet's Deny keep Escape whenever they are on screen, and the composer
+    /// only sees it when neither is. That ordering is the whole reason this
+    /// is not a hidden button like ⌘R regenerate.
+    static func onEscape(isGenerating: Bool) -> ComposerEscapeAction {
+        isGenerating ? .stop : .pass
     }
 
     /// Whether an in-place message edit is submittable — the ONE gate the Save
@@ -4260,6 +4297,9 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var onSend: () -> Void
+    /// Escape, from the responder chain. Defaults to nothing so a field that
+    /// has no use for the key leaves it to AppKit.
+    var onCancel: () -> Bool = { false }
 
     /// Read from the SAME constants the placeholder overlay reads — the two
     /// are related only by arithmetic nobody's type system checks.
@@ -4332,6 +4372,11 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            // Escape. Reached only when no `.cancelAction` key equivalent is on
+            // screen to claim it first — see ComposerKey.onEscape.
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                return parent.onCancel()
+            }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
             switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle) {

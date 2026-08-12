@@ -133,38 +133,11 @@ final class DialogDefaultActionTests: XCTestCase {
         var label: String { String(header.prefix(60)).replacingOccurrences(of: "\n", with: " ") }
     }
 
-    /// Replace comments with spaces, leaving string literals (and every offset)
-    /// intact. Without this the scan trips over prose about `.alert(` — there
-    /// is a comment in SandboxTerminalView that says exactly that.
+    /// Comments stripped — without this the scan trips over prose about
+    /// `.alert(`, and there is a comment in SandboxTerminalView that says
+    /// exactly that. Shared with the other source scans (`SourceScan`).
     static func strippingComments(_ source: String) -> String {
-        var out = ""
-        out.reserveCapacity(source.count)
-        var chars = Array(source)
-        var i = 0
-        var inString = false, inLine = false, inBlock = false
-        while i < chars.count {
-            let c = chars[i]
-            let next: Character? = i + 1 < chars.count ? chars[i + 1] : nil
-            if inLine {
-                if c == "\n" { inLine = false; out.append(c) } else { out.append(" ") }
-            } else if inBlock {
-                if c == "*", next == "/" { inBlock = false; out += "  "; i += 2; continue }
-                out.append(c == "\n" ? c : " ")
-            } else if inString {
-                out.append(c)
-                if c == "\\" , next != nil { out.append(next!); i += 2; continue }
-                if c == "\"" { inString = false }
-            } else if c == "/", next == "/" {
-                inLine = true; out += "  "; i += 2; continue
-            } else if c == "/", next == "*" {
-                inBlock = true; out += "  "; i += 2; continue
-            } else {
-                if c == "\"" { inString = true }
-                out.append(c)
-            }
-            i += 1
-        }
-        return out
+        SourceScan.strippingComments(source)
     }
 
     /// Every `.alert(…) { … }` / `.confirmationDialog(…) { … }` in a file, with
