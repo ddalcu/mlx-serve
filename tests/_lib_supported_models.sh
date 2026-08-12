@@ -26,6 +26,7 @@ supported = {
     "qwen3_next",
     "llama", "mistral",
     "nemotron_h", "bert",
+    "bailing_hybrid",
 }
 # lfm2 is a prefix match — any model_type starting with 'lfm2' is supported.
 out = []
