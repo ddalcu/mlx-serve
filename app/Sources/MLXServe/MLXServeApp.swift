@@ -217,6 +217,16 @@ struct MLXCoreApp: App {
                         _ = appState.newChatSession()
                     }
                     .keyboardShortcut("n", modifiers: [.command])
+
+                    // ⌘⌫, Finder's own "move to trash". A MENU command rather
+                    // than a key handler on the sidebar: `.onDeleteCommand`
+                    // there only fires while that view is first responder, and
+                    // a ScrollView of plain Buttons never is — see the note in
+                    // `ChatSidebar.conversationsSidebar`. It also makes the
+                    // shortcut discoverable, which a bare key never was.
+                    Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
+                        .keyboardShortcut(.delete, modifiers: [.command])
+                        .disabled(appState.chatDeletionTarget == nil)
                 }
             CommandMenu("Agent") {
                 Button("Agents…") { openAndFocus("agents") }

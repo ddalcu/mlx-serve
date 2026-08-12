@@ -102,6 +102,11 @@ class AppState: ObservableObject {
     /// Sidebar selection (multi-select). Bind the sidebar List to this set so
     /// macOS-style multi-selection (Cmd/Shift click, drag) works naturally.
     @Published var sidebarSelection: Set<UUID> = []
+    /// Chats waiting on the delete confirmation. It lives out here rather than
+    /// in the sidebar because the File menu's ⌘⌫ has to reach it too, and two
+    /// confirmations for one decision is how they start disagreeing; the
+    /// sidebar owns the single dialog that presents it.
+    @Published var pendingChatDeletion: Set<UUID>?
     /// Set when a task notification is tapped — the Tasks window observes this to
     /// focus the relevant task, then clears it.
     @Published var pendingTaskDeepLink: UUID?
@@ -656,33 +661,44 @@ class AppState: ObservableObject {
         return newChatSession(agentId: agentId)
     }
 
-    func deleteSession(_ id: UUID) {
-        // Kill any background processes this session started before dropping it —
-        // otherwise they'd survive untracked for the rest of the app's life.
-        processRegistry.killSession(id)
-        documentIndexes[id]?.cancel()
-        documentIndexes.removeValue(forKey: id)
-        // Drop the session's security-scoped bookmarks with it — a deleted chat
-        // must not keep durable access to the folders it was granted.
-        SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
-        SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
-        chatSessions.removeAll { $0.id == id }
-        // Stop the in-flight turn if it belonged to this session — otherwise
-        // it ghost-runs invisibly with no Stop control anywhere, and no server
-        // restart can clear it. The sweep is per turn: only the deleted chat's
-        // turn stops. See ChatTurnEngine.stopIfOrphaned / TurnLedger.orphaned.
-        chatEngine.stopIfOrphaned()
-        if activeChatId == id {
-            activeChatId = chatSessions.first?.id
-        }
-        saveChatHistory()
+    /// What the File menu's Delete Chat (⌘⌫) would act on, and nil when that
+    /// is nothing — the menu item reads this to disable itself rather than
+    /// offer a command that does nothing when you pick it.
+    var chatDeletionTarget: Set<UUID>? {
+        SidebarDeleteConfirm.target(selection: sidebarSelection, activeChatId: activeChatId)
     }
 
-    /// Bulk-delete a set of sessions (used by the sidebar's multi-select).
-    /// Keeps the same cleanup invariants as deleteSession(_:): stop any
-    /// session-owned processes, remove attached indexes/bookmarks and
-    /// security-scoped access, then drop the session objects. Finally, if the
-    /// active chat was deleted, adopt the first visible session.
+    /// The File menu's Delete Chat (⌘⌫). A menu command, NOT a key handler:
+    /// the sidebar's conversation column is a ScrollView of plain Buttons, so
+    /// nothing there ever becomes first responder and a bare `.onDeleteCommand`
+    /// never fired. Routed through the same rule every delete control reads, so
+    /// the keyboard cannot become the one path that skips the confirmation.
+    func requestChatDeletionFromMenu() {
+        guard let ids = chatDeletionTarget else { return }
+        if SidebarDeleteConfirm.required(count: ids.count, keyboard: true) {
+            pendingChatDeletion = ids
+        } else {
+            deleteSessions(ids)
+        }
+    }
+
+    /// Delete one session. Deliberately the bulk path with a set of one rather
+    /// than its own copy of the body: the two DID drift — one fell back to
+    /// `chatSessions.first`, the other to `visibleChatSessions.first` — so a
+    /// single delete could land you on a hidden session the sidebar has no row
+    /// for.
+    func deleteSession(_ id: UUID) {
+        deleteSessions([id])
+    }
+
+    /// Delete a set of sessions — the ONE deletion path, whether the sidebar's
+    /// multi-select asked or a single row did. Kill any background processes
+    /// those sessions started (otherwise they survive untracked for the rest of
+    /// the app's life), drop attached indexes and the security-scoped bookmarks
+    /// (a deleted chat must not keep durable access to folders it was granted),
+    /// then drop the session objects. If the active chat was among them, adopt
+    /// the first VISIBLE session — a hidden one is a transcript the sidebar
+    /// cannot point at.
     func deleteSessions(_ ids: Set<UUID>) {
         guard !ids.isEmpty else { return }
         for id in ids {
@@ -693,15 +709,19 @@ class AppState: ObservableObject {
             SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
         }
         chatSessions.removeAll { ids.contains($0.id) }
-        // Stop any orphaned turns left running.
+        // Stop the in-flight turns that belonged to these sessions — otherwise
+        // they ghost-run invisibly with no Stop control anywhere, and no server
+        // restart can clear them. The sweep is per turn: only the deleted
+        // chats' turns stop. See ChatTurnEngine.stopIfOrphaned / TurnLedger.orphaned.
         chatEngine.stopIfOrphaned()
-        // If the active chat was deleted, pick the first visible one (keeps
-        // sidebar and detail column consistent with filters).
         if let active = activeChatId, ids.contains(active) {
             activeChatId = visibleChatSessions.first?.id
         }
         // Remove deleted ids from the sidebar selection so UI state stays sane.
         sidebarSelection.subtract(ids)
+        // A pending confirmation naming chats that are already gone would ask
+        // about nothing (or, worse, re-present after the deletion it asked for).
+        pendingChatDeletion = nil
         saveChatHistory()
     }
 

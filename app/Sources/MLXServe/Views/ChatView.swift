@@ -644,6 +644,35 @@ enum SidebarMultiSelect {
     }
 }
 
+/// Which deletions stop and ask first. Pure, and beside `SidebarMultiSelect`
+/// for the same reason — the rule is worth pinning, and there is nothing to
+/// see on screen until you have already lost the conversations.
+enum SidebarDeleteConfirm {
+    /// ⌘⌫ ALWAYS asks: the key names no row, so its target is implicit — every
+    /// selected row, or, with nothing selected, whichever chat you happen to be
+    /// reading. And any BULK delete asks whichever control started it, because
+    /// N conversations go on one action and nothing undoes it. A single
+    /// deliberate delete on a named row (the row's ✕, its context menu) still
+    /// goes straight through, as it always has.
+    static func required(count: Int, keyboard: Bool) -> Bool {
+        count > 0 && (keyboard || count > 1)
+    }
+
+    /// What ⌘⌫ acts on: the sidebar's selection, or — with nothing selected —
+    /// the chat being read. Nil when there is nothing to delete, which is also
+    /// what disables the menu item, since a command that does nothing when you
+    /// pick it is the dead-control class.
+    static func target(selection: Set<UUID>, activeChatId: UUID?) -> Set<UUID>? {
+        let ids = selection.isEmpty ? (activeChatId.map { Set([$0]) } ?? []) : selection
+        return ids.isEmpty ? nil : ids
+    }
+
+    /// The count is the thing to check before agreeing, so it is in the title.
+    static func title(count: Int) -> String {
+        count == 1 ? "Delete this chat?" : "Delete \(count) chats?"
+    }
+}
+
 // MARK: - Sidebar
 
 struct ChatSidebar: View {
@@ -707,7 +736,6 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
         }
-        .listStyle(.sidebar)
         .onAppear {
             // The rows READ the selection to decide their highlight, so it has
             // to be primed: `activeChatId` is usually set long before this panel
@@ -722,21 +750,21 @@ struct ChatSidebar: View {
         // must not leave ids in the selection that no longer name a chat — a
         // stale one would be counted by the context menu's "Delete N Chats" and
         // handed straight back to `deleteSessions` by ⌫.
-        .onChange(of: appState.visibleChatSessions.count) { _ in
+        .onChange(of: appState.visibleChatSessions.count) { _, _ in
             let live = Set(appState.visibleChatSessions.map(\.id))
             if !appState.sidebarSelection.isSubset(of: live) {
                 appState.sidebarSelection.formIntersection(live)
             }
             if let anchor = selectionAnchor, !live.contains(anchor) { selectionAnchor = nil }
         }
-        .onChange(of: appState.sidebarSelection) { newSelection in
+        .onChange(of: appState.sidebarSelection) { _, newSelection in
             // When the sidebar's selection becomes a single id, make that the
             // active chat so the detail column follows the user's intent.
             if newSelection.count == 1, let id = newSelection.first {
                 if appState.activeChatId != id { appState.activeChatId = id }
             }
         }
-        .onChange(of: appState.activeChatId) { newActive in
+        .onChange(of: appState.activeChatId) { _, newActive in
             // Keep the sidebar selection in sync when other parts of the app
             // change the active chat (open-from-tray, quick launcher, etc.).
             // Only COLLAPSE it when the new active chat isn't already IN it:
@@ -754,13 +782,31 @@ struct ChatSidebar: View {
                 selectionAnchor = id
             }
         }
-        .onDeleteCommand {
-            // Delete either the explicit sidebar selection, or fall back to the
-            // active chat when nothing is selected in the sidebar.
-            let toDelete: Set<UUID> = appState.sidebarSelection.isEmpty
-                ? (appState.activeChatId.map { Set([$0]) } ?? Set())
-                : appState.sidebarSelection
-            deleteChats(toDelete)
+        // NO `.onDeleteCommand`: it only fires while its view is in the
+        // responder chain, which is why it is List API — a `List(selection:)`
+        // becomes first responder when you click a row. This column stopped
+        // being a List (see above) and its rows are `.buttonStyle(.plain)`
+        // Buttons, which take no focus under macOS's default keyboard
+        // navigation, so the modifier sat here reading like a working ⌫ and
+        // never once ran. The keyboard route is the File menu's Delete Chat
+        // (⌘⌫, Finder's own shortcut), which is a menu command and therefore
+        // needs no focus at all — and being IN a menu, it is also visible.
+        //
+        // The dialog it raises is the one every delete control shares, so its
+        // state lives on AppState where the menu command can reach it.
+        .confirmationDialog(
+            SidebarDeleteConfirm.title(count: appState.pendingChatDeletion?.count ?? 1),
+            isPresented: Binding(get: { appState.pendingChatDeletion != nil },
+                                 set: { if !$0 { appState.pendingChatDeletion = nil } }),
+            presenting: appState.pendingChatDeletion
+        ) { ids in
+            Button("Delete", role: .destructive) {
+                deleteChats(ids)
+                appState.pendingChatDeletion = nil
+            }
+            Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
+        } message: { _ in
+            Text("This can't be undone.")
         }
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
@@ -890,6 +936,19 @@ struct ChatSidebar: View {
         }
     }
 
+    /// Every control that deletes conversations comes through here, so which
+    /// ones ask first is `SidebarDeleteConfirm`'s decision and not a per-button
+    /// habit. `keyboard` is what separates ⌘⌫ — which names no row — from a
+    /// click on one.
+    private func requestDeleteChats(_ ids: Set<UUID>, keyboard: Bool) {
+        guard !ids.isEmpty else { return }
+        if SidebarDeleteConfirm.required(count: ids.count, keyboard: keyboard) {
+            appState.pendingChatDeletion = ids
+        } else {
+            deleteChats(ids)
+        }
+    }
+
     /// Delete a set of conversations and leave the panel's own state consistent
     /// — the ids go out of the selection and the anchor FIRST, so nothing that
     /// reads them (the ⌫ handler, the context menu's count) can name a chat that
@@ -1004,7 +1063,7 @@ struct ChatSidebar: View {
         .overlay(alignment: .trailing) {
             if hoveredSessionId == session.id {
                 Button {
-                    deleteChats([session.id])
+                    requestDeleteChats([session.id], keyboard: false)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 14))
@@ -1025,11 +1084,11 @@ struct ChatSidebar: View {
             if appState.sidebarSelection.count > 1,
                appState.sidebarSelection.contains(session.id) {
                 Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
-                    deleteChats(appState.sidebarSelection)
+                    requestDeleteChats(appState.sidebarSelection, keyboard: false)
                 }
             } else {
                 Button("Delete", role: .destructive) {
-                    deleteChats([session.id])
+                    requestDeleteChats([session.id], keyboard: false)
                 }
             }
         }
@@ -1114,6 +1173,8 @@ struct ChatSidebar: View {
 
 }
 
+// MARK: - Chat Detail
+
 struct ChatDetailView: View {
     let sessionId: UUID
     @EnvironmentObject var appState: AppState
@@ -1127,7 +1188,6 @@ struct ChatDetailView: View {
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
-    @State private var isNearBottom: Bool = true
     // The three toolbar toggles mirror the visible session's persisted state
     // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
     // the session on appear AND on every `sessionId` change, and written back on
@@ -1580,7 +1640,6 @@ struct ChatDetailView: View {
     /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
     /// nested in here shares space unevenly with the body's own trailing one,
     /// which is what pinned the whole group to the bottom of the window.
-
     private var emptyState: some View {
         VStack(spacing: 8) {
             // Plain SF Pro, one solid colour. It was `design: .rounded` under a
@@ -2600,6 +2659,10 @@ struct ChatDetailView: View {
                            images: attachedImages, audio: attachedAudio,
                            config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
+        // Your own message always wins: sending from halfway up the history used
+        // to leave you exactly there, because auto-follow was off and nothing
+        // else scrolled.
+        applyScroll(.userSentMessage)
     }
 
     /// The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
@@ -2632,9 +2695,11 @@ struct ChatDetailView: View {
 
     private func regenerateLastResponse() {
         guard canRegenerate else { return }
-        isNearBottom = true
         chatEngine.regenerate(sessionId: sessionId, config: buildTurnConfig(),
                                approval: { await requestToolApproval($0) })
+        // Same rule as a fresh send: the reply you just asked for is the thing
+        // to be looking at, wherever in the history the request came from.
+        applyScroll(.userSentMessage)
     }
 
     /// Edit a past user message in place, then resend it: everything from
@@ -2650,15 +2715,13 @@ struct ChatDetailView: View {
         else { return }
         let images = msgs[idx].images
         let audio = msgs[idx].audio
-        isNearBottom = true
         appState.truncateMessages(in: sessionId, keepingFirst: idx)
         chatEngine.runTurn(sessionId: sessionId, userText: trimmed,
                            images: images, audio: audio,
                            config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
-        // Your own message always wins: sending from halfway up the history used
-        // to leave you exactly there, because auto-follow was off and nothing
-        // else scrolled.
+        // An edit is started from wherever that message sits, which is by
+        // definition not the bottom — follow the resend down to it.
         applyScroll(.userSentMessage)
     }
 
@@ -2830,6 +2893,26 @@ struct GeneratingIndicator: View {
 
 // MARK: - Message Bubble
 
+/// Attaches double-click-to-edit, or attaches NOTHING at all.
+///
+/// A `nil` action must leave the view untouched rather than install a gesture
+/// that does nothing: this one is `highPriorityGesture`, so merely EXISTING is
+/// enough to beat `textSelection`'s own double-click-to-select-word. A
+/// no-op-inside-the-closure version therefore reads as "double-click stopped
+/// selecting words" on exactly the messages nobody can edit.
+private struct DoubleClickToEdit: ViewModifier {
+    let action: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let action {
+            content.highPriorityGesture(TapGesture(count: 2).onEnded { _ in action() })
+        } else {
+            content
+        }
+    }
+}
+
 struct MessageBubble: View {
     let message: ChatMessage
     /// Pages a web search backed this reply with. Empty for every reply that
@@ -2943,15 +3026,15 @@ struct MessageBubble: View {
                 }
 
                 // Content.
-                //
-                // Only the USER gets a bubble. An assistant reply is the page's
-                // main content — long, formatted, full of code blocks and
-                // tables — and boxing it wastes the column's width and fights
-                // every block that wants the full measure. A tool-call summary
-                // keeps its card so it still reads as machinery, not prose.
                 if isEditing, onEdit != nil {
                     editingContent
                 } else if !message.content.isEmpty || message.isStreaming {
+                    // Only the USER gets a bubble (`isBare` below). An assistant
+                    // reply is the page's main content — long, formatted, full
+                    // of code blocks and tables — and boxing it wastes the
+                    // column's width and fights every block that wants the full
+                    // measure. A tool-call summary keeps its card so it still
+                    // reads as machinery, not prose.
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
@@ -2981,13 +3064,15 @@ struct MessageBubble: View {
                     // gesture hierarchy and never sees the second click, so
                     // double-click silently did nothing. `highPriorityGesture`
                     // makes this the one that wins.
-                    .highPriorityGesture(
-                        TapGesture(count: 2).onEnded {
-                            if onEdit != nil {
-                                startEditing()
-                            }
-                        }
-                    )
+                    //
+                    // Which is exactly why the `onEdit` test is on the MODIFIER
+                    // and not inside the closure: a message with no edit action
+                    // (every assistant reply, every read-only surface) would
+                    // otherwise still install a winning gesture that beats
+                    // text selection and then does nothing — killing
+                    // double-click-to-select-a-word on the replies, which is
+                    // most of what anyone selects.
+                    .modifier(DoubleClickToEdit(action: onEdit == nil ? nil : { startEditing() }))
                     .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
                     .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
                     .background(bubbleBackground)
