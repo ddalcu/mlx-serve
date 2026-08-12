@@ -1282,7 +1282,7 @@ pub fn main(init: std.process.Init) !void {
         // Transformer's own legacy cache to match.
         if (kv_quant_config.scheme != .off) {
             xfm.cache.deinit();
-            xfm.cache = try transformer_mod.KVCache.initWithConfigAndHeadDim(allocator, config.num_hidden_layers, kv_quant_config, config.head_dim);
+            xfm.cache = try transformer_mod.KVCache.initWithConfigAndHeadDim(allocator, config.num_hidden_layers, kv_quant_config, config.kvCacheKeyHeadDim());
         }
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
