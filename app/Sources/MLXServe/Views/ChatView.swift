@@ -755,34 +755,65 @@ struct ChatSidebar: View {
         conversationsSidebar
     }
 
-    /// ⌘1…⌘9 — jump to the row wearing that number.
+    /// ⌘1…⌘9 jumps to the row wearing that number; ⌃⌘1…⌃⌘9 ranges to it from
+    /// where you are, selecting everything in between.
     ///
     /// Zero-size hidden buttons, the same idiom as ⌘R regenerate: they need
     /// THIS view's session list, and a key equivalent works wherever focus is,
     /// including while the composer's text view has it.
+    ///
+    /// **Ranging is ⌃⌘, not the ⇧⌘ every macOS list uses, because macOS took
+    /// those digits first**: ⇧⌘3/4/5 are screen capture and ⇧⌘6 grabs the
+    /// Touch Bar, all system-level, so they never reach an app — four of the
+    /// nine ranged silently and the other five worked, which is worse than a
+    /// shortcut that is simply somewhere else. Control is the replacement
+    /// rather than Option because it is the one modifier that does not rewrite
+    /// the character its key produces (⌥4 is ¢), so key-equivalent matching
+    /// stays boring. ⌃ alone would collide with Mission Control's
+    /// switch-to-desktop-N; with ⌘ it does not.
     private var quickSwitchShortcuts: some View {
         ForEach(1...ChatQuickSwitch.maxSlots, id: \.self) { slot in
-            Button {
-                guard let id = ChatQuickSwitch.id(forSlot: slot, in: appState.visibleChatSessions,
-                                                  numbering: numberedRows)
-                else { return }
-                jumpToChat(id)
-            } label: { EmptyView() }
-                .keyboardShortcut(KeyEquivalent(Character("\(slot)")), modifiers: .command)
-                .frame(width: 0, height: 0)
-                .opacity(0)
+            let key = KeyEquivalent(Character("\(slot)"))
+            Group {
+                Button { quickSwitch(to: slot, extend: false) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: .command)
+                Button { quickSwitch(to: slot, extend: true) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: [.command, .control])
+            }
+            .frame(width: 0, height: 0)
+            .opacity(0)
         }
     }
 
-    /// Go to a chat by number. Not `selectRow`: that one reads the CURRENT
-    /// event's modifier flags to decide between replacing, extending and
-    /// ranging a selection — and the event here always has ⌘ down, which would
-    /// make every jump toggle the row into a multi-selection instead.
-    private func jumpToChat(_ id: UUID) {
+    /// Go to a numbered chat, or range to it. Not `selectRow`: that one reads
+    /// the CURRENT event's modifier flags, and the event behind these always
+    /// has ⌘ down — every jump would toggle the row into a multi-selection
+    /// instead of going to it. The flags are stated explicitly instead, and the
+    /// decision itself is `ChatQuickSwitch.outcome`.
+    private func quickSwitch(to slot: Int, extend: Bool) {
+        guard let outcome = ChatQuickSwitch.outcome(
+            slot: slot,
+            sessions: appState.visibleChatSessions,
+            numbering: numberedRows,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            extend: extend)
+        else { return }
+        apply(outcome)
+    }
+
+    /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
+    /// same reason `selectRow` does it in that order.
+    private func apply(_ outcome: SidebarMultiSelect.Outcome) {
         appState.showConversation()
-        selectionAnchor = id
-        appState.sidebarSelection = [id]
-        if appState.activeChatId != id { appState.activeChatId = id }
+        selectionAnchor = outcome.anchor
+        if appState.sidebarSelection != outcome.selection {
+            appState.sidebarSelection = outcome.selection
+        }
+        if let target = outcome.activate, appState.activeChatId != target {
+            appState.activeChatId = target
+        }
     }
 
     private var conversationsSidebar: some View {
@@ -1078,14 +1109,7 @@ struct ChatSidebar: View {
             active: appState.activeChatId,
             command: flags.contains(.command),
             shift: flags.contains(.shift))
-        appState.showConversation()
-        selectionAnchor = outcome.anchor
-        if appState.sidebarSelection != outcome.selection {
-            appState.sidebarSelection = outcome.selection
-        }
-        if let target = outcome.activate, appState.activeChatId != target {
-            appState.activeChatId = target
-        }
+        apply(outcome)
     }
 
     /// Every control that deletes conversations comes through here, so which

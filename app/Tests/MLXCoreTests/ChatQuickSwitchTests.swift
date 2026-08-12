@@ -165,6 +165,85 @@ final class ChatQuickSwitchTests: XCTestCase {
         XCTAssertEqual(ChatQuickSwitch.id(forSlot: 2, in: rows, numbering: nil), rows[1].id)
     }
 
+    // MARK: - ⇧⌘<digit>: range from where you are to the numbered row
+
+    /// The composition both shortcut families run through. Two different lists
+    /// are in play and mixing them up is the whole hazard: the DIGIT resolves
+    /// against the numbered (visible) rows, while the RANGE runs over the full
+    /// list — everything between the two ends is selected, including rows
+    /// scrolled under the frost that never wore a badge.
+    private func outcome(slot: Int, sessions: [ChatSession], numbering: Set<UUID>? = nil,
+                         selection: Set<UUID> = [], anchor: UUID? = nil, active: UUID? = nil,
+                         extend: Bool) -> SidebarMultiSelect.Outcome? {
+        ChatQuickSwitch.outcome(slot: slot, sessions: sessions, numbering: numbering,
+                                selection: selection, anchor: anchor, active: active,
+                                extend: extend)
+    }
+
+    func testShiftRangesFromTheCurrentConversationToTheNumberedRow() {
+        let rows = (0..<6).map { _ in session() }
+        let result = outcome(slot: 4, sessions: rows, active: rows[0].id, extend: true)
+
+        XCTAssertEqual(result?.selection, Set(rows[0...3].map(\.id)))
+        XCTAssertEqual(result?.activate, rows[3].id, "you also move to the row you ranged to")
+    }
+
+    func testTheRangeCrossesRowsThatHaveNoBadge() {
+        // Rows 0…2 are behind the frost, so only 3… are numbered. Ranging from
+        // the active chat at row 0 to ⌘2 (= row 4) must still select 0…4:
+        // a selection is a contiguous run of the LIST, not of the badges.
+        let rows = (0..<8).map { _ in session() }
+        let visible = Set(rows[3...].map(\.id))
+
+        XCTAssertEqual(ChatQuickSwitch.id(forSlot: 2, in: rows, numbering: visible), rows[4].id)
+        let result = outcome(slot: 2, sessions: rows, numbering: visible,
+                             active: rows[0].id, extend: true)
+        XCTAssertEqual(result?.selection, Set(rows[0...4].map(\.id)))
+    }
+
+    func testRangingBackwardsWorksTheSame() {
+        let rows = (0..<6).map { _ in session() }
+        let result = outcome(slot: 2, sessions: rows, anchor: rows[4].id, active: rows[4].id,
+                             extend: true)
+        XCTAssertEqual(result?.selection, Set(rows[1...4].map(\.id)))
+    }
+
+    func testTheAnchorOutranksTheActiveChat() {
+        // Same rule as shift-clicking in the panel: repeated ranges re-range
+        // from ONE origin instead of accumulating. After a previous range the
+        // anchor is that origin, and the active chat is where it ended.
+        let rows = (0..<8).map { _ in session() }
+        let result = outcome(slot: 6, sessions: rows, anchor: rows[1].id, active: rows[4].id,
+                             extend: true)
+        XCTAssertEqual(result?.selection, Set(rows[1...5].map(\.id)))
+        XCTAssertEqual(result?.anchor, rows[1].id, "the origin stays put")
+    }
+
+    func testWithNoAnchorAndNoActiveChatShiftJustGoesThere() {
+        // Nothing to range FROM. Selecting the target alone beats doing
+        // nothing, which would read as the shortcut being broken.
+        let rows = (0..<4).map { _ in session() }
+        let result = outcome(slot: 3, sessions: rows, extend: true)
+        XCTAssertEqual(result?.selection, [rows[2].id])
+        XCTAssertEqual(result?.activate, rows[2].id)
+    }
+
+    func testWithoutShiftItIsAPlainJump() {
+        // ⌘<digit> replaces the selection even when several rows are selected.
+        let rows = (0..<5).map { _ in session() }
+        let result = outcome(slot: 2, sessions: rows,
+                             selection: Set(rows.map(\.id)), anchor: rows[0].id,
+                             active: rows[0].id, extend: false)
+        XCTAssertEqual(result?.selection, [rows[1].id])
+        XCTAssertEqual(result?.anchor, rows[1].id, "a plain jump re-anchors, so the NEXT shift ranges from here")
+    }
+
+    func testADigitWithNoRowDoesNothingEitherWay() {
+        let rows = [session(), session()]
+        XCTAssertNil(outcome(slot: 7, sessions: rows, active: rows[0].id, extend: true))
+        XCTAssertNil(outcome(slot: 7, sessions: rows, active: rows[0].id, extend: false))
+    }
+
     // MARK: - Wiring
 
     func testTheSidebarDrawsBadgesAndBindsEveryDigit() {
@@ -181,10 +260,14 @@ final class ChatQuickSwitchTests: XCTestCase {
         XCTAssertEqual(ChatQuickSwitch.maxSlots, 9, "⌘0 is not a slot and there is no ⌘10")
         XCTAssertTrue(source.contains("ForEach(1...ChatQuickSwitch.maxSlots"),
                       "the shortcuts must be generated over maxSlots, the same cap slot(for:) applies")
-        XCTAssertTrue(source.contains("keyboardShortcut(KeyEquivalent"),
-                      "each generated row needs a ⌘-digit key equivalent")
-        XCTAssertTrue(source.contains("ChatQuickSwitch.id(forSlot:"),
-                      "a digit must resolve through the same ordering the badge was drawn from")
+        XCTAssertTrue(source.contains("keyboardShortcut(key, modifiers: .command)"),
+                      "each slot needs its ⌘-digit key equivalent")
+        XCTAssertTrue(source.contains("keyboardShortcut(key, modifiers: [.command, .control])"),
+                      "each slot needs its ⌃⌘-digit key equivalent — same digit, ranging instead of jumping")
+
+        XCTAssertTrue(source.contains("ChatQuickSwitch.outcome("),
+                      "both shortcut families must go through the one decision, which resolves the "
+                      + "digit against the same numbering the badge was drawn from")
 
         // Badge and shortcut must read the SAME visibility set. If only one of
         // them filters, ⌘3 goes to a different row than the one wearing 3 —
@@ -192,6 +275,7 @@ final class ChatQuickSwitchTests: XCTestCase {
         XCTAssertEqual(SourceScan.count("numbering: numberedRows", in: source), 2,
                        "both the badge and the ⌘-digit lookup pass the visible set")
     }
+
 
     func testTheRowProbeIsGatedOnTheCommandKey() {
         // A GeometryReader on every row is a preference write per row per

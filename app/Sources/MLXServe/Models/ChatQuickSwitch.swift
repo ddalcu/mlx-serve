@@ -61,4 +61,44 @@ enum ChatQuickSwitch {
         guard slot <= rows.count else { return nil }
         return rows[slot - 1].id
     }
+
+    /// What ⌘\<digit\> and ⇧⌘\<digit\> do, as one decision.
+    ///
+    /// TWO lists are in play and keeping them apart is the point of this
+    /// function existing. The digit resolves against the NUMBERED rows — the
+    /// ones in the clear, wearing badges. The range then runs over the FULL
+    /// list, so ⇧⌘ selects every conversation between the two ends including
+    /// the ones scrolled under the frost that never wore a number: a selection
+    /// is a contiguous run of the list, not of the badges.
+    ///
+    /// Ranging is `SidebarMultiSelect.click(shift:)` verbatim rather than a
+    /// second range rule, so the keyboard and a shift-click cannot disagree —
+    /// including the part where the anchor stays put and repeated ranges
+    /// re-range from one origin. `active` is the fallback origin: before
+    /// anything has been clicked, "from the current conversation" is what the
+    /// user means.
+    ///
+    /// - Returns: nil when no row wears that number — the shortcut does
+    ///   nothing rather than guessing at a neighbour.
+    static func outcome(slot: Int,
+                        sessions: [ChatSession],
+                        numbering: Set<UUID>?,
+                        selection: Set<UUID>,
+                        anchor: UUID?,
+                        active: UUID?,
+                        extend: Bool) -> SidebarMultiSelect.Outcome? {
+        guard let target = id(forSlot: slot, in: sessions, numbering: numbering) else { return nil }
+        return SidebarMultiSelect.click(
+            target,
+            ordered: ordered(sessions).map(\.id),
+            selection: selection,
+            anchor: anchor ?? active,
+            active: active,
+            // Never `command`: ⌘ is physically down for every one of these, but
+            // the gesture being described is a plain click or a shift-click.
+            // Passing it through would make ⌘\<digit\> TOGGLE the row into a
+            // multi-selection instead of going to it.
+            command: false,
+            shift: extend)
+    }
 }
