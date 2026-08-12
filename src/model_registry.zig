@@ -25,6 +25,7 @@ const vision_mod = @import("vision.zig");
 const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
+const token_mask_mod = @import("token_mask.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
@@ -157,6 +158,11 @@ pub const LoadedModel = struct {
     /// is 0 (caller disables for tests / debugging).
     tokenize_cache: ?TokenizeCache = null,
 
+    /// Grammar-mask token-byte table for this model's vocabulary, and the
+    /// lock that serializes its lazy build. See `grammarTokenBytes`.
+    token_bytes: ?token_mask_mod.TokenBytes = null,
+    token_bytes_mutex: std.Io.Mutex = .init,
+
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
     /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
@@ -241,6 +247,26 @@ pub const LoadedModel = struct {
     /// (e.g. "LoadFailed", "MissingVisionWeights"). Null otherwise.
     error_name: ?[]const u8,
 
+    /// Token → bytes table backing the JSON grammar mask, built lazily on this
+    /// entry's first schema-constrained request. Its lifetime matches
+    /// `tokenizer` exactly: ids only mean bytes in the vocabulary they were
+    /// decoded from, so a table borrowed from another resident model masks
+    /// the wrong ids. Guarded by `token_bytes_mutex` — connection threads
+    /// build it, not the inference thread.
+    pub fn grammarTokenBytes(
+        self: *LoadedModel,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+    ) !*const token_mask_mod.TokenBytes {
+        self.token_bytes_mutex.lockUncancelable(io);
+        defer self.token_bytes_mutex.unlock(io);
+        if (self.token_bytes) |*tb| return tb;
+        const tok = self.tokenizer orelse return error.NoTokenizer;
+        log.info("[grammar] building token-byte table for {s} (one-time, ~50ms)\n", .{self.id});
+        self.token_bytes = try token_mask_mod.build(gpa, tok);
+        return &self.token_bytes.?;
+    }
+
     /// Free all owned state. Safe to call regardless of `state` — null
     /// model fields are skipped. Mlx-allocating fields are freed in
     /// drafter → vision → transformer → weights order to mirror the
@@ -313,6 +339,12 @@ pub const LoadedModel = struct {
             w.deinit();
             self.allocator.destroy(w);
             self.weights = null;
+        }
+        if (self.token_bytes) |*tb| {
+            // Decoded from `tokenizer`'s vocabulary — same lifetime, freed
+            // first so the table never outlives the ids it describes.
+            tb.deinit();
+            self.token_bytes = null;
         }
         if (self.tokenizer) |tok| {
             tok.deinit();
@@ -1420,6 +1452,42 @@ test "ModelRegistry: peek does not refcount" {
     try testing.expectEqual(lm, peeked);
     try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
     try testing.expectEqual(@as(?*LoadedModel, null), reg.peek("nope"));
+}
+
+/// Attach a decode-capable tokenizer whose vocabulary is `tokens` (id → piece)
+/// to `lm`, the way the real loader hands ownership to the entry.
+fn attachTestTokenizer(lm: *LoadedModel, tokens: []const struct { u32, []const u8 }) !void {
+    const tok = try lm.allocator.create(Tokenizer);
+    tok.* = Tokenizer.initEmptyForTests(lm.allocator, .byte_level_bpe);
+    for (tokens) |t| try tok.id_to_token.put(t[0], t[1]);
+    lm.tokenizer = tok;
+}
+
+test "grammar token-byte table is per MODEL, never a process-wide singleton" {
+    // Two resident models, two vocabularies, the SAME ids meaning different
+    // bytes. A table built for one and handed to the other maps every id to
+    // the wrong bytes, so the JSON grammar mask allows tokens whose real
+    // bytes are off-schema — live 2026-08-11, muse served under LFM2.5's
+    // table answered a `json_object` request with "## Attributes".
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const a = try makeReadyStub(reg, "model-a", 1024);
+    try attachTestTokenizer(a, &.{ .{ 0, "{" }, .{ 1, "##" } });
+    const b = try makeReadyStub(reg, "model-b", 1024);
+    try attachTestTokenizer(b, &.{ .{ 0, "##" }, .{ 1, "{" } });
+
+    const tb_a = try a.grammarTokenBytes(testing.allocator, io);
+    try testing.expectEqualStrings("{", tb_a.bytes[0].?);
+    try testing.expectEqualStrings("##", tb_a.bytes[1].?);
+
+    const tb_b = try b.grammarTokenBytes(testing.allocator, io);
+    try testing.expectEqualStrings("##", tb_b.bytes[0].?);
+    try testing.expectEqualStrings("{", tb_b.bytes[1].?);
+
+    // Cached per entry: a second call hands back the same table, not a rebuild.
+    try testing.expectEqual(tb_b, try b.grammarTokenBytes(testing.allocator, io));
 }
 
 // ── Eviction planner + reservation accounting (oversubscription fix) ──

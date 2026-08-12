@@ -934,3 +934,166 @@ The finish event is now stated on exactly ONE chunk of every stream. Guards:
 `tests/test_loop_stop_signal.sh` [2] (finish_details AND finish_reason
 exactly once, usage chunk `"choices":[]`) and [4] (completions usage chunk
 shape) — all four red on the pre-fix build.
+
+## JSON mode answered "## Attributes": the grammar mask was built from another model's vocabulary (2026-08-11)
+
+llmprobe against two different models on the same box:
+
+```
+✗ chat/completions: JSON mode
+    → not valid JSON: #(tr)
+✗ responses: JSON mode
+    → not valid JSON: 郑重(郑重)
+✗ chat/completions: structured outputs (json_schema strict)
+    → not JSON: <<<<<<< Vcc
+```
+
+Streaming the failing request showed the model in a two-token cycle — `##`,
+` Attributes`, `##`, ` Attributes` — under a `json_object` constraint that
+should have allowed exactly `{` and whitespace at position 0. The server had
+logged `[grammar] enforcing JSON schema`, so the constraint was installed and
+the spec-decode gates (which all key on `sampling.constraint == null`) had
+correctly stayed off. `/tokenize` + `/detokenize` round-tripped every id
+involved, so the tokenizer was fine too.
+
+The mask size in the log was the tell. Muse-Glimmer's vocabulary is 202048;
+its request logged `mask=125017b` — LFM2.5's. `getOrBuildTokenBytes` was:
+
+```zig
+var global_token_bytes: ?token_mask_mod.TokenBytes = null;
+fn getOrBuildTokenBytes(gpa, tok) !*const TokenBytes {
+    if (global_token_bytes) |*tb| return tb;   // keyed on NOTHING
+    ...
+}
+```
+
+— "built lazily on the first JSON-schema request and reused for the lifetime
+of the server", written when a process served one model. The multi-model
+registry and hot model switching made that comment false without touching the
+line: whichever model served the first constrained request owned the table,
+and every other model masked its logits against a foreign vocabulary. Ids are
+only bytes in the vocabulary they were decoded from, so the mask let through
+tokens whose real bytes are off-schema, `acceptByte` then rejected the bytes
+it got back, the grammar went dead, and the mask fell open to the whole vocab
+— free-running output under a constraint the client was told was enforced.
+
+Which model works and which breaks is decided by request order, so the same
+build passes for one caller and fails for the next.
+
+Fix: the table lives on `LoadedModel` (`grammarTokenBytes`, guarded by a
+per-entry mutex, freed immediately before the `tokenizer` it was decoded
+from), beside `prefix_cache` and `tokenize_cache` — the same per-model
+ownership the tokenizer itself already had. Both call sites pass `lm`; the
+singleton and its shutdown hook are gone. The build line now names the model,
+which is the assertion the integration guard reads: a shared table logs
+exactly one build.
+
+Guards: `tests/test_json_mode_multi_model.sh` (two resident models, A then B
+then A, both surfaces, plus one build line per id) and a `model_registry`
+unit test that hands two entries different vocabularies. Both red on revert —
+the shell guard reproduces the reported symptom verbatim (`[`, `[\n {common`).
+
+## An empty grammar mask is not a constraint (same session)
+
+With the vocabularies straightened out, `tests/test_json_schema_enforcement.sh`
+still went 0/6, on a different failure: a conforming object with one extra
+key spliced in — `{"name":"Mira Chen","age":34,"email":"...","!__employee_id__":null}`
+— against a schema with `additionalProperties:false`.
+
+The log named it: `sampled token 0 produced byte 0x21 that was rejected`.
+Token 0 is what argmax returns when every logit is `-inf`, i.e. when the mask
+was all false. `stepObject`'s `.after_value` accepted `,` unconditionally,
+which lands in `.expect_key`, where — every declared property seen and
+`additionalProperties:false` — no byte is legal. The sampler cannot express
+"nothing", so it drew id 0, whose bytes failed `acceptByte`, which switched
+enforcement off for the rest of the generation. One unreachable state, and
+the schema stopped applying entirely.
+
+Two fixes, both load-bearing: `stepObject` rejects the comma when
+`allPropertiesSeen` and additional properties are off, so `}` is the only way
+out; and `nextConstrained` treats a zero-count mask as a bug it names in the
+log before degrading, instead of sampling through it. The prompt-side
+instruction had been carrying these cases — that is why an
+`additionalProperties` violation read as a model-quality problem.
+
+## `--no-drafter` did not survive a model switch, and two flags before it didn't either (2026-08-11)
+
+Audit prompted by the grammar-mask singleton above: same shape, different
+state. `ensureLoaded`'s cold-load path builds its own `LoadRequest` — a second
+construction site next to main.zig's boot `LoadParams` — and anything it
+omits takes the struct default. The comments in that function already record
+two prior rounds: prefix-cache settings ("silently crippled warm reuse after
+every model switch") and the MTP + llama group. A third had accumulated:
+
+- `--no-drafter` — the consequential one. `dflash.resolveInDirDrafter` probes
+  `<model_dir>/drafter` at load, and both muse mirrors ship that subdir, so a
+  server launched with speculation off re-enabled it on every model switched
+  to. This flag was inert on the cold path until the in-dir probe landed; the
+  dflash change made it load-bearing and nothing wired it.
+- `--draft-block-size N` — fell back to `DEFAULT_BLOCK_SIZE` with
+  `explicit=false`, so `resolveBlockSize` re-derived from config/hardware
+  instead of honoring the clamp.
+- `--ssd-streaming` — set only in the boot params, so a ds4/GGUF model loaded
+  later ran without it, and got the MTP sidecar that flag suppresses.
+- `--drafter <path>` — the standing `"Phase E will wire the load-model API to
+  set this"` TODO.
+
+Fix: five fields retained on `Scheduler`, re-applied in the cold-load request
+— except the drafter PATH, which is deliberately not propagated. `--drafter`
+names a sidecar for the checkpoint it was passed beside; handing it to
+whatever model is swapped in next loads a mismatched assistant. So
+`coldLoadDrafterDir(no_drafter, primary_model_dir, drafter_dir, entry_path)`
+applies it only when the entry IS the launch model — which is what makes a
+reload-after-eviction get its drafter back — and leaves every other model to
+the in-dir probe. `--no-drafter` is a policy and silences all of them.
+
+The class guard is the source scan, not the behaviour test: every field
+retained on the Scheduler for this purpose must appear as
+`.<field> = self.<field>,` in the cold-load request, so the NEXT flag someone
+adds is caught rather than the three that already were. The behaviour test
+(`tests/test_cold_load_launch_flags.sh`) proves the wiring reaches a live
+server without needing a real 2.5 GB sidecar: the scratch drafter is a
+config.json declaring the contract and nothing else, so the probing arm fails
+its load loudly and the `--no-drafter` arm says nothing at all.
+
+## A typo'd URL cost 121 GB and two minutes: the 404 ran after the load (2026-08-11)
+
+Driving a hot-switch test by hand, `POST /v1/load` — the route is
+`/v1/load-model`. The reply was the correct 404. It arrived 2 minutes 42
+seconds later, and the server log showed the full DeepSeek-V4 checkpoint
+resident at 120.67 GB.
+
+Dispatch resolves the request's model before it dispatches, and the
+existence check lived inside `ensureLoaded`'s `error.NoDefaultModel` arm:
+
+```zig
+const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
+    error.NoDefaultModel => {
+        if (!routeExists(path)) { ...404...; return; }   // only on THIS arm
+```
+
+That covers exactly one case — an unknown path on a server with nothing to
+load. When the body names a model the registry can resolve, `ensureLoaded`
+does not fail: it succeeds, cold-loading the checkpoint, and the unknown path
+404s afterwards on the dispatch chain's own fallthrough. The comment above
+`ROUTE_PATHS` had the principle right ("one question has to be answerable
+BEFORE a model is resolved") — the implementation only answered it when there
+was no model to resolve. The rule is an ordering claim, and it was enforced
+as an error arm.
+
+`curl -d '{"model":"<anything big>"}' http://host/v1/anything` is therefore a
+one-line way to pin the box, no auth surface required (`--api-key` exempts
+loopback, and the gate that would refuse this is downstream of the load).
+
+Fix: one unconditional `if (!routeExists(path))` above `ensureLoaded`, below
+the LAN proxy block so an `<id>@<peer>` hop is unchanged, and the copy in the
+error arm deleted — a question with one answer gets one gate.
+
+This had also been propping up `tests/test_cold_load_launch_flags.sh`, written
+the same session: it posted to `/v1/load` with `curl -sf`, so the 404 was
+swallowed and the cold load happened as a SIDE EFFECT of the bug. Red-on-revert
+still passed, so the wiring it guards was genuinely proven — but the test would
+have gone silently vacuous the moment this was fixed. It now posts to
+`/v1/load-model`, checks the HTTP status, and asserts the clone reached `ready`
+in the arm whose evidence is a MISSING log line. A silent arm has to prove it
+did the work.
