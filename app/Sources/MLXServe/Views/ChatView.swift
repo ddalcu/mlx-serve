@@ -1289,6 +1289,10 @@ struct ChatSidebar: View {
                 .help("Delete chat")
             }
         }
+        .transition(.asymmetric(
+        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(1.2)),
+        removal: .opacity.animation(.easeOut(duration: 0.15))))
+        .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
         .onHover { isHovered in
             hoveredSessionId = isHovered ? session.id : nil
         }
