@@ -86,10 +86,29 @@ if [ -n "$ATTEMPTS" ] && [ "$ATTEMPTS" -gt 0 ]; then
 else
     bad "spec-stats mode=dflash attempts>0" "$(grep spec-stats "$LOG" | tail -3)"
 fi
-if echo "$STATS" | grep -q "runtime_disabled=true"; then
-    ok "low-yield prose falls back to serial decode"
+if GATE_STATE=$(python3 - "$STATS" <<'PY'
+import re, sys
+line = sys.argv[1]
+def field(name):
+    match = re.search(rf"\b{name}=([0-9.]+)", line)
+    if not match:
+        raise SystemExit(f"missing {name}: {line}")
+    return float(match.group(1))
+avg = field("avg_per_round")
+gate = field("gate_min")
+disabled = "runtime_disabled=true" in line
+if disabled and not avg < gate:
+    raise SystemExit(f"disabled despite avg_per_round={avg} >= gate_min={gate}")
+print(("disabled" if disabled else "engaged") + f" avg={avg:.2f} gate={gate:.2f}")
+PY
+); then
+    case "$GATE_STATE" in
+        disabled*) ok "DFlash gate disabled only below its resolved threshold ($GATE_STATE)" ;;
+        engaged*)  ok "DFlash remained engaged for this prose sample ($GATE_STATE)" ;;
+        *)         bad "DFlash gate reported a known state" "$GATE_STATE" "$STATS" ;;
+    esac
 else
-    bad "low-yield prose falls back to serial decode" "$STATS"
+    bad "DFlash gate stats obey the disable invariant" "$STATS"
 fi
 
 # [5] Greedy equivalence over the exact 30-token window (reasoning+content).

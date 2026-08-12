@@ -665,6 +665,31 @@ test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
 }
 
+test "every speculative decoder caps accepted drafts before commit" {
+    // Class guard: every speculative path commits an always-emitted anchor
+    // plus zero or more accepted drafts. A new/forgotten arm must cap that
+    // accepted prefix before it mutates generated ids, KV/module state, or
+    // usage. Output-only clipping in the scheduler is already too late.
+    const source = @embedFile("generate.zig");
+    const names = [_][]const u8{
+        "nextDspark",
+        "nextPld",
+        "nextDrafter",
+        "nextDflash",
+        "nextMtp",
+    };
+    for (names) |name| {
+        const signature = try std.fmt.allocPrint(testing.allocator, "    pub fn {s}", .{name});
+        defer testing.allocator.free(signature);
+        const start = std.mem.indexOf(u8, source, signature) orelse return error.MissingSpecDecoder;
+        const end = std.mem.indexOfPos(u8, source, start + signature.len, "\n    pub ") orelse source.len;
+        if (std.mem.indexOf(u8, source[start..end], "capAcceptedForTokenBudget(") == null) {
+            std.debug.print("{s} does not cap accepted drafts before commit\n", .{name});
+            return error.UncappedSpecDecoder;
+        }
+    }
+}
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -795,9 +820,9 @@ pub const Generator = struct {
     /// Effective block size (assistant config, clamped by --draft-block-size).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
-    /// Request-class break-even yield. Tool requests get a lower early
-    /// threshold because their reasoning preamble measured low before the
-    /// structured ATEM payload lifted whole-request yield sharply.
+    /// Request-class break-even yield, normalized by the scheduler to the
+    /// effective draft width. Thinking requests use the lower calibration
+    /// because their less-predictable reasoning preamble pays back later.
     dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
@@ -988,7 +1013,7 @@ pub const Generator = struct {
     // workloads accepting 62-86% remain above it as well.
     pub const DFLASH_GATE_WARMUP: u64 = 3;
     pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
-    pub const DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
+    pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
 
     pub fn dflashGateWarmup() u64 {
         const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
@@ -1134,11 +1159,12 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
                     avg_per_round,
+                    self.dflash_min_accepted_per_round,
                     per_draft_pct,
                     self.dflash_block_size,
                     if (self.spec_disabled_runtime) "true" else "false",
@@ -1233,9 +1259,9 @@ pub const Generator = struct {
         /// Effective DFlash block size (loader-resolved: assistant config
         /// clamped by --draft-block-size). 0 → the assistant config's value.
         dflash_block_size: u32 = 0,
-        /// Accepted drafts/round required after warmup. Scheduler lowers this
-        /// for tool-bearing requests whose structured tail pays after a less
-        /// predictable reasoning preamble.
+        /// Accepted drafts/round required after warmup. Scheduler scales the
+        /// M5/block-16 calibration to the effective draft width and lowers it
+        /// for requests whose resolved mode has thinking enabled.
         dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
         /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
@@ -2421,10 +2447,15 @@ pub const Generator = struct {
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         const mdl = self.xfm.dsv4.?;
         const t1 = self.next_token_id;
+        const accepted_cap = capAcceptedForTokenBudget(
+            std.math.maxInt(u32),
+            self.completion_tokens,
+            self.max_tokens,
+        );
         var round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mdl, t1)
+            try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
         else
-            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1);
+            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
         errdefer round.deinit(allocator);
         // dsparkRound advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
@@ -2451,7 +2482,7 @@ pub const Generator = struct {
     /// (the toy-vocab exactness test's invariant), and the correction always
     /// derives from the ORIGINAL verify logits at the acceptance point — the
     /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32) !dsv4_mod.DsparkRound {
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32, accepted_cap: u32) !dsv4_mod.DsparkRound {
         const s = self.xfm.s;
         var pending = try dsv4_mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
         defer pending.deinit();
@@ -2520,6 +2551,9 @@ pub const Generator = struct {
                 if (u >= accept_prob) break;
                 accepted += 1;
             }
+            // Pick the correction at the request-budget boundary and let
+            // dsparkFinish roll module-owned state back to that same point.
+            accepted = @min(accepted, accepted_cap);
             try mlx.check(mlx.mlx_array_eval(bg.corr_samples));
             const corr = mlx.mlx_array_data_int32(bg.corr_samples) orelse return error.MlxArrayDataNull;
             next_token = @intCast(corr[accepted]);
@@ -2839,6 +2873,11 @@ pub const Generator = struct {
                 accepted += 1;
             }
         }
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
         const full_accept = accepted == m;
 
         // ── Phase 6: Sample new_t1 from per_pos_logits[accepted] ──
@@ -3296,6 +3335,12 @@ pub const Generator = struct {
                 accepted += 1;
             }
         }
+
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
 
         // Sample the next pending token from the verify output at position
         // `accepted`:
@@ -3759,9 +3804,9 @@ pub const Generator = struct {
     }
 
     /// DFlash runtime economics gate. Sticky within the request: once a
-    /// three-round sample proves the block-parallel path yields fewer than two
-    /// accepted drafts per paid verify, subsequent ticks use the regular
-    /// pipelined decoder through `nextDflash`'s entry fallback.
+    /// three-round sample proves the block-parallel path yields less than its
+    /// width-normalized request-class threshold, subsequent ticks use the
+    /// regular pipelined decoder through `nextDflash`'s entry fallback.
     fn checkDflashRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
         if (!dflashGateShouldDisable(
@@ -4662,6 +4707,12 @@ pub const Generator = struct {
                 accepted += 1;
             }
         }
+
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
 
         const next_pending: u32 = blk: {
             if (stochastic) {
@@ -8487,11 +8538,11 @@ test "Generator.dflashGateShouldDisable uses accepted yield across block widths"
     try testing.expect(!Generator.dflashGateShouldDisable(3, 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
     try testing.expect(!Generator.dflashGateShouldDisable(3, 45, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
 
-    // Tool-call preambles recovered from ~1.4 early to 4.4 whole-request;
-    // the request-class threshold keeps that path alive while still cutting
-    // off a truly non-yielding tool request.
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 4, Generator.DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(3, 2, Generator.DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND));
+    // Thinking preambles recovered from ~1.4 early to 4.4 whole-request; the
+    // resolved-mode threshold keeps that path alive while still cutting off
+    // a truly non-yielding reasoning request.
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 4, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(3, 2, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
 }
 
 test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
@@ -10678,6 +10729,9 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
             .dflash_enabled = true,
             .dflash = &dm,
+            // This is the numeric DFlash guard, not the economics-gate test:
+            // every emitted token must pass through nextDflash itself.
+            .dflash_min_accepted_per_round = 0,
         });
         defer gen.deinit(allocator);
         try testing.expectEqual(@as(u32, 4), gen.dflash_block_size);
@@ -10692,24 +10746,16 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
             const res = (try gen.nextDflash(allocator)) orelse break;
             defer allocator.free(res.tokens);
             try got.appendSlice(allocator, res.tokens);
-            if (gen.dflash_attempted != attempts_before) {
-                // A real DFlash round commits trunk and assistant context to
-                // the same exact boundary at every accepted count.
-                try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
-                try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
-            } else {
-                // After the economic gate trips, nextDflash delegates to the
-                // regular lazy decoder. Its pipeline intentionally forwards
-                // one token ahead; the dormant assistant context stays at the
-                // last speculative boundary because the gate is sticky.
-                try testing.expect(gen.spec_disabled_runtime);
-                const committed = prompt.len + gen.generated_ids.items.len;
-                try testing.expect(gen.ctx.cache.step >= committed);
-                try testing.expect(gen.ctx.cache.step <= committed + 1);
-                try testing.expect(gen.dflash_ctx.?.absLen() <= gen.ctx.cache.step);
-            }
+            // A real DFlash round commits trunk and assistant context to the
+            // same exact boundary at every accepted count. Falling back here
+            // would make the remaining equality checks compare serial decode
+            // with itself and gut the default-on draft-quantization guard.
+            try testing.expect(gen.dflash_attempted != attempts_before);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
         }
         try testing.expect(gen.dflash_attempted > 0);
+        try testing.expect(!gen.spec_disabled_runtime);
         try testing.expectEqual(want, got.items.len);
         try testing.expectEqual(@as(u32, @intCast(want)), gen.completion_tokens);
         try testing.expectEqual(want, gen.generated_ids.items.len);

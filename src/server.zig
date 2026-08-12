@@ -5235,7 +5235,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -5337,6 +5337,7 @@ fn handleStreamingCompletion(
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
         .has_tools = false,
+        .enable_thinking = false,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -5541,6 +5542,7 @@ fn nonStreamingViaScheduler(
     eos_token_ids: []const u32,
     cached_tokens: u32,
     has_tools: bool,
+    enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
@@ -5562,6 +5564,7 @@ fn nonStreamingViaScheduler(
         .full_prompt = full_prompt,
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
+        .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -5708,7 +5711,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -6316,6 +6319,7 @@ fn handleStreamingGeneration(
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
         .has_tools = has_tools,
+        .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -9899,7 +9903,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -9924,6 +9928,7 @@ fn handleAnthropicNonStreaming(
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
+    enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
     enable_pld: bool,
@@ -9963,7 +9968,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -10202,6 +10207,7 @@ fn handleAnthropicStreaming(
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
         .has_tools = has_tools,
+        .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
@@ -11558,6 +11564,7 @@ fn handleResponses(
             .full_prompt = prompt_ids,
             .cached_tokens = 0,
             .has_tools = active_has_tools,
+            .enable_thinking = enable_thinking,
             .sampling = sampling,
             .eos_token_ids = eos_slice,
             .max_tokens = effective_max_tokens,
@@ -11851,7 +11858,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };

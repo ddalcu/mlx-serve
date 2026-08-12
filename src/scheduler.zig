@@ -227,6 +227,9 @@ pub const SubmitParams = struct {
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
+    /// The server's final resolved thinking mode after request overrides and
+    /// model defaults. DFlash economics key off this, not tool presence.
+    enable_thinking: bool = false,
     sampling: SamplingParams,
     eos_token_ids: []const u32,
     max_tokens: u32,
@@ -356,6 +359,7 @@ pub const Slot = struct {
     max_tokens: u32,
     timeout_ns: u64,
     has_tools: bool,
+    enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
     drafter: ?*DrafterModel,
@@ -524,6 +528,7 @@ pub const Slot = struct {
             .max_tokens = params.max_tokens,
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
+            .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
             // Qwen's external drafter does not yet carry M-RoPE positions.
             // Muse DFlash is different: it consumes captures from the same
@@ -3995,6 +4000,10 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     req.done_mu.unlock(sch.io);
 }
 
+fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
+    return context_len == prefix_len;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -4030,11 +4039,15 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
-    // The assistant context grew with every committed token this turn, so it
-    // covers exactly the same span as the trunk snapshot — store it beside
-    // the KV so the next reuse of this prefix drafts with real context.
+    // A runtime fallback leaves the dormant assistant context at its last
+    // speculative boundary while serial decode continues growing the trunk.
+    // Only pair the assistant payload with this prefix when both end at the
+    // exact same absolute position; otherwise the next turn must rebuild it.
     const dflash_commit: ?prefix_cache_mod.DflashCommit = if (gen_ptr.dflash_ctx) |*dc|
-        .{ .cache = &dc.cache, .base_pos = dc.base_pos }
+        if (dflashContextCoversPrefix(dc.absLen(), total_len))
+            .{ .cache = &dc.cache, .base_pos = dc.base_pos }
+        else
+            null
     else
         null;
     hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit) catch |err| {
@@ -4487,6 +4500,20 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
     }
 }
 
+/// Scale the measured M5/block-16 break-even to the effective number of
+/// draft positions. `block_size` includes the always-emitted anchor. Thinking
+/// is the actual resolved request mode; tools are neither necessary nor
+/// sufficient for a reasoning preamble.
+fn dflashGateMinimum(block_size: u32, enable_thinking: bool) f32 {
+    const drafts = block_size -| 1;
+    if (drafts == 0) return 0;
+    const calibrated_min = if (enable_thinking)
+        generate_mod.Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND
+    else
+        generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
+    return calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+}
+
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
@@ -4670,14 +4697,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dflash = if (use_dflash) slot.dflash else null,
             // The dflash-resolved block rides the shared drafter_block_size.
             .dflash_block_size = slot.drafter_block_size,
-            // Tool-bearing requests commonly spend their first few rounds in
-            // a low-yield reasoning preamble before the structured ATEM call
-            // becomes highly predictable. Preserve that measured recovery;
-            // prose and vision use the stricter general break-even boundary.
-            .dflash_min_accepted_per_round = if (slot.has_tools)
-                generate_mod.Generator.DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND
-            else
-                generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+            // Use the resolved thinking mode and normalize the M5/block-16
+            // calibration to this machine's effective assistant width.
+            .dflash_min_accepted_per_round = dflashGateMinimum(
+                slot.drafter_block_size,
+                slot.enable_thinking,
+            ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
             .mtp_depth = slot.mtp_depth,
@@ -4936,6 +4961,28 @@ pub fn specTickMode(
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
+fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    // The Generator has already committed the whole block internally. Publish
+    // it incrementally so streaming, cancellation, EOS and usage all observe
+    // the same per-token boundary. The generator-side cap guarantees max_tokens
+    // cannot land before the returned block ends.
+    for (tokens) |t| {
+        if (slot.cancelled.load(.acquire)) return;
+        if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            finishSlot(sch, slot, "stop");
+            return;
+        }
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+        if (slot.completion_tokens >= slot.max_tokens) {
+            finishSlot(sch, slot, "length");
+            return;
+        }
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
@@ -4997,20 +5044,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
     if (tick_mode == .mtp) {
@@ -5020,20 +5054,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5044,20 +5065,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5068,25 +5076,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            // `nextDflash` advances the Generator by the whole committed
-            // block before returning it. Publish progress one token at a time
-            // so a final block that lands exactly on max_tokens is streamed
-            // in full instead of stopping after its first token.
-            slot.completion_tokens += 1;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
-        std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5097,20 +5087,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5136,6 +5113,75 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     slot.pushTokenWithLogprob(t, lp_take);
     if (t != 0) slot.was_pad_only = false;
     slot.completion_tokens = gen.completion_tokens;
+}
+
+test "all speculative blocks publish through one per-token accounting loop" {
+    // Class guard for block-returning decoders. The Generator has already
+    // advanced by the whole accepted block when the scheduler receives it;
+    // copying that final count while publishing token 1 truncates the stream
+    // and over-reports usage. Every mode must use the shared incremental loop.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runSingleDecodeTick(") orelse return error.MissingDecodeTick;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\n}\n\ntest \"all speculative blocks") orelse return error.MissingDecodeTickEnd;
+    const body = source[start..end];
+    const shared_call = "publishSpeculativeBlock(sch, slot, gen, result.?.tokens);";
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, shared_call));
+    // The one remaining final-count assignment belongs to the scalar regular
+    // path, after every speculative arm. It must never reappear in a block.
+    const final_assign = "slot.completion_tokens = gen.completion_tokens;";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
+    try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
+}
+
+test "DFlash cache payload is committed only when it spans the trunk prefix" {
+    try testing.expect(dflashContextCoversPrefix(128, 128));
+    try testing.expect(!dflashContextCoversPrefix(96, 128));
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "DFlash gate policy follows effective block width and resolved thinking" {
+    // block_size includes the always-emitted anchor, so block 16 has 15 draft
+    // positions and block 7 has 6. The M5 calibration is normalized to that
+    // actual draft width instead of being imposed as an absolute threshold on
+    // machines without the wide verification lane.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false));
+}
+
+test "every server scheduler path forwards resolved thinking to the DFlash gate" {
+    const source = @embedFile("server.zig");
+
+    // All direct streaming submissions, plus the shared non-streaming submit,
+    // must populate the field. Text completions resolve it explicitly false.
+    var submit_pos: usize = 0;
+    var submits: usize = 0;
+    while (std.mem.indexOfPos(u8, source, submit_pos, "sch.submit(.{")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, "});") orelse return error.UnclosedSchedulerSubmit;
+        try testing.expect(std.mem.indexOf(u8, source[start..end], ".enable_thinking =") != null);
+        submits += 1;
+        submit_pos = end + 3;
+    }
+    try testing.expectEqual(@as(usize, 5), submits);
+
+    // Positional calls into the non-streaming wrapper must pass the resolved
+    // value; the raw text-completion path is the sole explicit false arm.
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var calls: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "nonStreamingViaScheduler(") == null) continue;
+        if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
+        calls += 1;
+        try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
+            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+    }
+    try testing.expectEqual(@as(usize, 4), calls);
 }
 
 /// Batched decode kernel for >=2 active slots. All slots must have already
