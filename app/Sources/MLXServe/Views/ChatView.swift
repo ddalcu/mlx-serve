@@ -2939,6 +2939,11 @@ struct MessageBubble: View {
     @State private var thinkingExpanded = false
     @State private var isEditing = false
     @State private var editDraft = ""
+    /// The edit field is the composer's field (`GrowingTextEditor`), so it
+    /// needs the composer's two bindings: where the caret is, and how tall the
+    /// text has grown.
+    @State private var editFocused = false
+    @State private var editHeight: CGFloat = 0
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -3124,12 +3129,21 @@ struct MessageBubble: View {
     /// pre-filled with the message's current text, Cancel / Save beneath it.
     /// Save hands the new text to `onEdit`, which drops this message and
     /// everything after it and resubmits — same shape as a fresh send.
+    ///
+    /// It is the COMPOSER's field, not a `TextEditor`. Editing a message is a
+    /// send, so it answers the keyboard like one: Return submits, Shift+Return
+    /// breaks the line — `ComposerKey.onReturn` decides for both, and
+    /// `editCanSubmit` is the same gate that dims Save, so the key and the
+    /// button can never disagree about whether this draft can go.
     private var editingContent: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            TextEditor(text: $editDraft)
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 44, maxHeight: 220)
+            GrowingTextEditor(text: $editDraft,
+                              isFocused: $editFocused,
+                              measuredHeight: $editHeight,
+                              maxLines: 12,
+                              isIdle: ComposerKey.editCanSubmit(editDraft),
+                              onSend: { commitEdit() })
+                .frame(height: max(ChatMetrics.composerMinHeight, editHeight))
                 .padding(8)
                 .background(Color(nsColor: .controlBackgroundColor)) // Distinct surface fill
                 .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -3138,16 +3152,16 @@ struct MessageBubble: View {
                         .stroke(Color.accentColor.opacity(0.6), lineWidth: 1.5) // Glowing outline
                 )
                 .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
-            
+
             HStack(spacing: 8) {
                 Button("Cancel") { cancelEdit() }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .keyboardShortcut(.cancelAction)
-                
+
                 Button("Save") { commitEdit() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(editDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!ComposerKey.editCanSubmit(editDraft))
             }
             .font(.caption)
         }
@@ -3158,16 +3172,23 @@ struct MessageBubble: View {
     private func startEditing() {
         editDraft = message.content
         isEditing = true
+        // Put the caret in the field the edit just opened — otherwise Return
+        // is typed at whatever still holds focus (the composer below), which
+        // sends a NEW message instead of the edit.
+        editFocused = true
     }
 
     private func cancelEdit() {
         isEditing = false
+        editFocused = false
         editDraft = ""
     }
 
     private func commitEdit() {
+        guard ComposerKey.editCanSubmit(editDraft) else { return }
         let text = editDraft
         isEditing = false
+        editFocused = false
         onEdit?(text)
     }
 
@@ -4202,6 +4223,15 @@ enum ComposerKey {
     static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
         if shift { return .newline }
         return isIdle ? .send : .ignore
+    }
+
+    /// Whether an in-place message edit is submittable — the ONE gate the Save
+    /// button and the Return key both read. A resubmit drops the old reply and
+    /// everything after it, so a blanked draft must not be able to spend that:
+    /// the edit field feeds this to `onReturn`'s `isIdle`, which turns a bare
+    /// Return on nothing into `.ignore` rather than a send.
+    static func editCanSubmit(_ draft: String) -> Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
