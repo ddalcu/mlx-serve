@@ -363,6 +363,7 @@ private struct ResetDefaultsFooter: View {
                     Button("Reset", role: .destructive) {
                         appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
                     }
+                    .keyboardShortcut(.defaultAction)
                     Button("Cancel", role: .cancel) { }
                 } message: {
                     Text(helpText)
@@ -2252,6 +2253,7 @@ private struct SandboxSectionContent: View {
                         resetting = false
                     }
                 }
+                .keyboardShortcut(.defaultAction)
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("""

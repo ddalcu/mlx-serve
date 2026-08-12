@@ -804,6 +804,12 @@ struct ChatSidebar: View {
                 deleteChats(ids)
                 appState.pendingChatDeletion = nil
             }
+            // Return deletes. The dialog is the second time you have said so
+            // (a menu command or a row's Delete raised it), and reaching for
+            // the trackpad to confirm a decision already made is the whole
+            // reason this asked to be a keyboard app. Escape still cancels —
+            // AppKit gives the `.cancel` role that for free.
+            .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
         } message: { _ in
             Text("This can't be undone.")
@@ -1986,6 +1992,11 @@ struct ChatDetailView: View {
                 pendingIntentPrompt = nil
                 proceedSend()
             }
+            // The nudge exists to recommend this one, so it is what Return
+            // takes. "Send Anyway" stays a deliberate click — it also
+            // suppresses the suggestion for the rest of the chat, which is
+            // not something to hand to a reflex.
+            .keyboardShortcut(.defaultAction)
             Button("Send Anyway") {
                 intentSuppress.suppress(prompt, for: sessionId)
                 pendingIntentPrompt = nil

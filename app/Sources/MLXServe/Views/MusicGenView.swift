@@ -67,6 +67,7 @@ struct MusicGenView: View {
         .alert("Save style prompt", isPresented: $showSaveStyle) {
             TextField("Name", text: $saveTitle)
             Button("Save") { library.saveStyle(title: saveTitle, body: prompt) }
+                .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Give this style a name to reuse it from the Examples menu.")
@@ -74,6 +75,7 @@ struct MusicGenView: View {
         .alert("Save lyrics", isPresented: $showSaveLyrics) {
             TextField("Name", text: $saveTitle)
             Button("Save") { library.saveLyrics(title: saveTitle, body: lyrics) }
+                .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Give these lyrics a name to reuse them from the Examples menu.")
