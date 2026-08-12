@@ -754,6 +754,50 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Start a regeneration's revision list on the message just appended,
+    /// carrying the reply that is being replaced.
+    ///
+    /// `regenerate` truncates the transcript back to the last user message, so
+    /// the old reply is destroyed before the new one streams. Capturing it here
+    /// is what makes the pager possible at all.
+    func seedRevisions(in sessionId: UUID, from prior: ChatMessage) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.indices.last,
+              chatSessions[sIdx].messages[mIdx].role == .assistant else { return }
+        let priorRevision = MessageRevision(content: prior.content,
+                                            reasoningContent: prior.reasoningContent)
+        chatSessions[sIdx].messages[mIdx].revisions = MessageRevisions.seeding(
+            prior: priorRevision,
+            existing: prior.revisions)
+    }
+
+    /// Record a finished reply as the newest version. A no-op unless a
+    /// regeneration seeded the list, so an ordinary turn is untouched.
+    func commitRevision(in sessionId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.indices.last,
+              chatSessions[sIdx].messages[mIdx].role == .assistant else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        guard !msg.revisions.isEmpty else { return }
+        let finished = MessageRevision(content: msg.content, reasoningContent: msg.reasoningContent)
+        let result = MessageRevisions.committing(finished, into: msg.revisions)
+        chatSessions[sIdx].messages[mIdx].revisions = result.revisions
+        chatSessions[sIdx].messages[mIdx].activeRevision = result.index
+    }
+
+    /// Show a different version of a reply. `content` is what every reader
+    /// uses, so switching writes the selected version into it.
+    func selectRevision(in sessionId: UUID, messageId: UUID, index: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        guard index >= 0, index < msg.revisions.count else { return }
+        chatSessions[sIdx].messages[mIdx].activeRevision = index
+        chatSessions[sIdx].messages[mIdx].content = msg.revisions[index].content
+        chatSessions[sIdx].messages[mIdx].reasoningContent = msg.revisions[index].reasoningContent
+    }
+
     /// Drop the "this reply was cut short" footnote from the last message.
     ///
     /// Called when a continuation starts: the notice is a statement about the

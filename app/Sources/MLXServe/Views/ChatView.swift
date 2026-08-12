@@ -1931,7 +1931,12 @@ struct ChatDetailView: View {
                                     // append the text to a different bubble.
                                     onContinue: (m.id == session?.messages.last?.id && canContinue)
                                         ? { continueReply() }
-                                        : nil)
+                                        : nil,
+                                    onSelectRevision: { index in
+                                        appState.selectRevision(in: sessionId,
+                                                                messageId: m.id,
+                                                                index: index)
+                                    })
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -3198,6 +3203,8 @@ struct MessageBubble: View {
     /// Hand this reply back to the model to finish. Present only on the last
     /// message, and only when it is continuable (`ContinueReply.isEligible`).
     var onContinue: (() -> Void)?
+    /// Show a different generated version of this reply.
+    var onSelectRevision: ((Int) -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
@@ -3495,6 +3502,31 @@ struct MessageBubble: View {
             }
 
             Spacer(minLength: 8)
+
+            // Which version of this reply you are reading. Left of the actions
+            // because it is a statement about the text above it, not another
+            // thing to do to it — and it only exists once there is a choice.
+            if MessageRevisions.isPagerVisible(message.revisions) {
+                HStack(spacing: 1) {
+                    footerButton("chevron.left", help: "Previous version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: -1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
+                    Text(MessageRevisions.label(index: message.activeRevision,
+                                                count: message.revisions.count))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    footerButton("chevron.right", help: "Next version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: 1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoForward(index: message.activeRevision,
+                                                             count: message.revisions.count))
+                }
+            }
 
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }

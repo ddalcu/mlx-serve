@@ -351,6 +351,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// the orphaned streaming bubble.
     private func appendErrorNotice(_ error: Error, to sessionId: UUID) {
         appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.commitRevision(in: sessionId)
         var msg = ChatMessage(role: .assistant, content: "")
         msg.isStreaming = false
         msg.failedRetry = true
@@ -418,6 +419,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgressSessionId = nil
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.commitRevision(in: sessionId)
         appState.saveChatHistory()
         publishTurnState()
     }
@@ -482,9 +484,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         let text = msgs[lastUserIdx].content
         let images = msgs[lastUserIdx].images
         let audio = msgs[lastUserIdx].audio
+        // The reply about to be destroyed. `truncateMessages` drops everything
+        // from the last user turn onward, so this is the only moment it can be
+        // captured — and a regeneration that silently threw away a better first
+        // answer is the whole reason the pager exists.
+        let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
         appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
         runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
                 config: config, approval: approval)
+        // After runTurn: the streaming placeholder is appended synchronously,
+        // so the message this seeds is the one the new reply streams into.
+        if let replaced { appState.seedRevisions(in: sessionId, from: replaced) }
     }
 
     /// Extend the reply at the end of the transcript instead of answering
@@ -653,6 +663,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             appendErrorNotice(error, to: sessionId)
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.commitRevision(in: sessionId)
         appState.saveChatHistory()
         endTurn(sessionId: sessionId, token: token)
     }
@@ -954,6 +965,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 throw CancellationError()
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.commitRevision(in: sessionId)
 
             // A repetition-loop cut ENDS the turn, ahead of every recovery path
             // below. The loop's text is already in the transcript — a streamed
