@@ -64,6 +64,21 @@ enum MessageRevisions {
         return prior.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? [] : [prior]
     }
 
+    /// Write an in-place edit into the version currently being read.
+    ///
+    /// Without this, editing a reply that has a pager loses the edit the moment
+    /// you step away and back — stepping reloads `content` from the stored
+    /// revision, which would still hold the text before the edit. An unpaged
+    /// reply has nothing to sync and keeps its empty list.
+    static func applyingEdit(_ text: String,
+                             to revisions: [MessageRevision],
+                             at index: Int) -> [MessageRevision] {
+        guard index >= 0, index < revisions.count else { return revisions }
+        var next = revisions
+        next[index].content = text
+        return next
+    }
+
     /// Record a freshly finished reply as the newest version and select it.
     ///
     /// Only meaningful when a regeneration seeded the list — an ordinary first

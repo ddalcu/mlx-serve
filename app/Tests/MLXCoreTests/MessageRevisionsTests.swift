@@ -107,3 +107,59 @@ final class MessageRevisionsTests: XCTestCase {
         XCTAssertEqual(index, 1)
     }
 }
+
+/// Editing the model's own reply — putting words in its mouth, then letting it
+/// carry on from them.
+final class EditAssistantReplyTests: XCTestCase {
+
+    private func rev(_ s: String) -> MessageRevision { MessageRevision(content: s) }
+
+    func testAnEditIsWrittenIntoTheVersionBeingRead() {
+        // Otherwise: edit version 2, step to 1, step back — and the edit is
+        // gone, because stepping reloads content from the stored revision.
+        let updated = MessageRevisions.applyingEdit("edited",
+                                                    to: [rev("first"), rev("second")],
+                                                    at: 1)
+        XCTAssertEqual(updated.map(\.content), ["first", "edited"])
+    }
+
+    func testTheOtherVersionsAreUntouched() {
+        let updated = MessageRevisions.applyingEdit("edited",
+                                                    to: [rev("first"), rev("second"), rev("third")],
+                                                    at: 0)
+        XCTAssertEqual(updated.map(\.content), ["edited", "second", "third"])
+    }
+
+    func testAPlainReplyHasNoVersionsToSync() {
+        // The ordinary case: no regeneration ever happened, so the edit lives
+        // in `content` alone and the list stays empty.
+        XCTAssertTrue(MessageRevisions.applyingEdit("edited", to: [], at: 0).isEmpty)
+    }
+
+    func testAnOutOfRangeIndexChangesNothing() {
+        let existing = [rev("first")]
+        XCTAssertEqual(MessageRevisions.applyingEdit("edited", to: existing, at: 4), existing)
+        XCTAssertEqual(MessageRevisions.applyingEdit("edited", to: existing, at: -1), existing)
+    }
+
+    /// Regression guard for the fix in bf5846b: `onEdit` drives BOTH the
+    /// context menu and a `highPriorityGesture` double-click, and that gesture
+    /// beats `textSelection`'s own double-click-to-select-a-word. Making the
+    /// model's replies editable must not take word selection away from them —
+    /// which is most of what anyone selects in a transcript.
+    func testDoubleClickToEditStaysOffTheModelsReplies() {
+        let source = SourceScan.source("Views/ChatView.swift", from: #filePath)
+        // The APPLICATION site, not the type's declaration — and matched on
+        // the bare name, since the argument may wrap onto its own line.
+        guard let range = source.range(of: ".modifier(DoubleClickToEdit(") else {
+            return XCTFail("the double-click modifier is no longer applied")
+        }
+        let call = String(source[range.lowerBound...].prefix(200))
+        // Either spelling of the same gate — what must not happen is the
+        // modifier going back to keying on `onEdit` alone, which is now
+        // non-nil for the model's replies too.
+        XCTAssertTrue(call.contains("message.role"),
+                      "double-click may only open an edit on the USER's own message; "
+                      + "assistant replies keep double-click-to-select-a-word. Got: \(call.prefix(120))")
+    }
+}

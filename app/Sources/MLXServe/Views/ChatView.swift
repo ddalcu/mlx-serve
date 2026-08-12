@@ -1919,9 +1919,25 @@ struct ChatDetailView: View {
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
                                     },
-                                    onEdit: (m.role == .user && session?.isExternalBridge != true)
-                                        ? { newText in editAndResend(messageId: m.id, newText: newText) }
-                                        : nil,
+                                    // Both roles are editable, and they mean
+                                    // different things. Editing YOUR message
+                                    // is a re-ask: the turns after it answered
+                                    // something you no longer said, so they go
+                                    // and it resubmits. Editing the MODEL's is
+                                    // putting words in its mouth — that turn
+                                    // already happened, and the point is to
+                                    // steer what comes next (Continue, or the
+                                    // following turn), so nothing is dropped
+                                    // and nothing re-runs.
+                                    onEdit: session?.isExternalBridge == true ? nil : { newText in
+                                        if m.role == .user {
+                                            editAndResend(messageId: m.id, newText: newText)
+                                        } else {
+                                            appState.editAssistantMessage(in: sessionId,
+                                                                          messageId: m.id,
+                                                                          newText: newText)
+                                        }
+                                    },
                                     onRegenerate: (m.role == .assistant && m.id == lastAssistantMessageId)
                                         ? { regenerateLastResponse() }
                                         : nil,
@@ -3347,7 +3363,12 @@ struct MessageBubble: View {
                     // text selection and then does nothing — killing
                     // double-click-to-select-a-word on the replies, which is
                     // most of what anyone selects.
-                    .modifier(DoubleClickToEdit(action: onEdit == nil ? nil : { startEditing() }))
+                    // …and why the model's replies are excluded even though they
+                    // ARE editable now: the gesture wins over text selection,
+                    // and an assistant reply is prose people select words in.
+                    // Its edit is reached from the context menu instead.
+                    .modifier(DoubleClickToEdit(
+                        action: (onEdit == nil || message.role != .user) ? nil : { startEditing() }))
                     .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
                     .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
                     .background(bubbleBackground)
@@ -3384,7 +3405,9 @@ struct MessageBubble: View {
         .contextMenu {
             Button("Copy Message") { copyMessage() }
             if onEdit != nil {
-                Button("Edit Message") { startEditing() }
+                // Named for what it DOES: editing your own message re-asks the
+                // question, editing the model's rewrites what it said.
+                Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
             }
             if onRegenerate != nil {
                 Button("Regenerate") { onRegenerate?() }
@@ -3530,6 +3553,15 @@ struct MessageBubble: View {
 
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                // The model's replies are editable but have no double-click
+                // route into it (that gesture belongs to selecting a word), so
+                // without this the only way in is a context menu nobody thinks
+                // to open on a paragraph.
+                if onEdit != nil, message.role == .assistant {
+                    footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
+                        startEditing()
+                    }
+                }
                 // Continue sits BEFORE regenerate: they are the two answers to
                 // "this reply isn't what I need", and the non-destructive one
                 // goes first — regenerate throws the reply away.

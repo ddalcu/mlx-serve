@@ -785,6 +785,29 @@ class AppState: ObservableObject {
         chatSessions[sIdx].messages[mIdx].activeRevision = result.index
     }
 
+    /// Rewrite the model's own reply in place.
+    ///
+    /// Unlike editing YOUR message — which drops everything after it and
+    /// resubmits, because the conversation past that point answered something
+    /// you no longer said — editing a reply changes only that reply. It is
+    /// putting words in the model's mouth: the turn already happened, and the
+    /// point is to steer what comes NEXT (Continue, or the following turn),
+    /// not to re-run it. Deleting the rest of the thread would take the choice
+    /// away; the messages after it are still there to delete by hand.
+    func editAssistantMessage(in sessionId: UUID, messageId: UUID, newText: String) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        chatSessions[sIdx].messages[mIdx].content = newText
+        chatSessions[sIdx].messages[mIdx].revisions =
+            MessageRevisions.applyingEdit(newText, to: msg.revisions, at: msg.activeRevision)
+        // The notice described the text that was there. It is not that text
+        // any more, and an edited reply is not a truncated one.
+        chatSessions[sIdx].messages[mIdx].truncationNotice = nil
+        chatSessions[sIdx].updatedAt = Date()
+    }
+
     /// Show a different version of a reply. `content` is what every reader
     /// uses, so switching writes the selected version into it.
     func selectRevision(in sessionId: UUID, messageId: UUID, index: Int) {
