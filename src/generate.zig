@@ -649,6 +649,22 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
     return step -| last_clear >= interval;
 }
 
+/// Number of accepted draft tokens that may accompany the always-committed
+/// anchor token without crossing the request's output-token ceiling.
+pub fn capAcceptedForTokenBudget(accepted: u32, completion: u32, max_tokens: u32) u32 {
+    const remaining = max_tokens -| completion;
+    if (remaining <= 1) return 0;
+    return @min(accepted, remaining - 1);
+}
+
+test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
+    try std.testing.expectEqual(@as(u32, 15), capAcceptedForTokenBudget(15, 0, 400));
+    try std.testing.expectEqual(@as(u32, 2), capAcceptedForTokenBudget(15, 397, 400));
+    try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 399, 400));
+    try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 400, 400));
+    try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
+}
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -779,6 +795,10 @@ pub const Generator = struct {
     /// Effective block size (assistant config, clamped by --draft-block-size).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
+    /// Request-class break-even yield. Tool requests get a lower early
+    /// threshold because their reasoning preamble measured low before the
+    /// structured ATEM payload lifted whole-request yield sharply.
+    dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
@@ -892,7 +912,7 @@ pub const Generator = struct {
     // Set to true mid-request when the per-request acceptance rate
     // (`*_accepted_tokens / *_attempted`) falls below
     // `RUNTIME_GATE_MIN_RATE` after `RUNTIME_GATE_WARMUP` attempts. When set,
-    // both `nextPld` and `nextDrafter` short-circuit to `next()` for the
+    // `nextPld`, `nextDrafter`, and `nextDflash` short-circuit to `next()` for the
     // remainder of the request — the prompt-time gate could not foresee that
     // the workload's *runtime* draft acceptance rate wasn't paying for the
     // per-step verify overhead. The flag is sticky for the rest of the
@@ -956,6 +976,31 @@ pub const Generator = struct {
         const rate = @as(f32, @floatFromInt(accepted)) /
             @as(f32, @floatFromInt(drafts_proposed));
         return rate < RUNTIME_GATE_MIN_PER_DRAFT_RATE;
+    }
+
+    // DFlash has different economics from sequential-token drafters: one
+    // assistant call proposes the whole block and the M5 NAX verify lane makes
+    // wide blocks cheap. Per-draft percentage therefore penalizes block 16
+    // even when it is decisively profitable. The stable cross-width signal is
+    // accepted drafts per verify round. M5 Muse sweeps put code/tool traffic at
+    // 4.4-15.0 accepted/round and the regressing prose/vision class at
+    // 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
+    // workloads accepting 62-86% remain above it as well.
+    pub const DFLASH_GATE_WARMUP: u64 = 3;
+    pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
+    pub const DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
+
+    pub fn dflashGateWarmup() u64 {
+        const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
+        if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
+        return @intCast(n);
+    }
+
+    pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {
+        if (attempted < dflashGateWarmup()) return false;
+        const avg = @as(f32, @floatFromInt(accepted)) /
+            @as(f32, @floatFromInt(attempted));
+        return avg < min_avg;
     }
 
     // ── PLD yield gate (cold-path economics) ──
@@ -1188,6 +1233,10 @@ pub const Generator = struct {
         /// Effective DFlash block size (loader-resolved: assistant config
         /// clamped by --draft-block-size). 0 → the assistant config's value.
         dflash_block_size: u32 = 0,
+        /// Accepted drafts/round required after warmup. Scheduler lowers this
+        /// for tool-bearing requests whose structured tail pays after a less
+        /// predictable reasoning preamble.
+        dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
         /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
         /// history KV cache chunk-by-chunk (full-hidden capture) and the
@@ -1998,6 +2047,7 @@ pub const Generator = struct {
                     options.dflash.?.config.block_size
                 else
                     0,
+                .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
@@ -3387,6 +3437,12 @@ pub const Generator = struct {
         std.debug.assert(self.dflash_ctx != null);
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+            return null;
+        }
+
         if (self.spec_disabled_runtime) {
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
@@ -3596,6 +3652,17 @@ pub const Generator = struct {
             }
         }
 
+        // A speculative verify may accept the whole block even when only a
+        // few output positions remain. Cap the accepted prefix BEFORE cache
+        // and assistant-context commit so every representation of the turn —
+        // returned tokens, generated_ids, usage, KV and DFlash context — ends
+        // at exactly max_tokens.
+        accepted = capAcceptedForTokenBudget(
+            accepted,
+            self.completion_tokens,
+            self.max_tokens,
+        );
+
         const next_pending: u32 = blk: {
             if (stochastic) {
                 const correction_logits = per_pos_logits.?[accepted];
@@ -3674,6 +3741,11 @@ pub const Generator = struct {
         self.dflash_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
+        self.checkDflashRuntimeGate();
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
 
         if (tracing) {
             self.dflashTraceRoundEnd(accepted);
@@ -3684,6 +3756,26 @@ pub const Generator = struct {
             .tokens = tokens,
             .accepted_tokens = accepted,
         };
+    }
+
+    /// DFlash runtime economics gate. Sticky within the request: once a
+    /// three-round sample proves the block-parallel path yields fewer than two
+    /// accepted drafts per paid verify, subsequent ticks use the regular
+    /// pipelined decoder through `nextDflash`'s entry fallback.
+    fn checkDflashRuntimeGate(self: *Generator) void {
+        if (self.spec_disabled_runtime) return;
+        if (!dflashGateShouldDisable(
+            self.dflash_attempted,
+            self.dflash_accepted_tokens,
+            self.dflash_min_accepted_per_round,
+        )) return;
+        const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
+            @as(f32, @floatFromInt(self.dflash_attempted));
+        log.info(
+            "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts)\n",
+            .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted },
+        );
+        self.spec_disabled_runtime = true;
     }
 
     /// Runtime acceptance gate for the drafter: after warmup, if the per-draft
@@ -8376,6 +8468,32 @@ test "Generator.runtimeGateShouldDisable handles drafts_per_round=0" {
     try testing.expect(!Generator.runtimeGateShouldDisable(100, 0, 0));
 }
 
+test "Generator.dflashGateShouldDisable uses accepted yield across block widths" {
+    // Never decide from fewer than the DFlash warmup number of paid verifies.
+    try testing.expect(!Generator.dflashGateShouldDisable(
+        Generator.DFLASH_GATE_WARMUP - 1,
+        0,
+        Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+    ));
+
+    // Muse prose/vision measured 1.0-1.5 accepted drafts per round at both
+    // block 8 and block 16: that class loses to serial and must fall back.
+    try testing.expect(Generator.dflashGateShouldDisable(3, 3, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(3, 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+
+    // Exactly two is the strict break-even boundary; code/tool traffic at
+    // 4.4+ and echo traffic near a full block remain on DFlash.
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 6, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 45, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+
+    // Tool-call preambles recovered from ~1.4 early to 4.4 whole-request;
+    // the request-class threshold keeps that path alive while still cutting
+    // off a truly non-yielding tool request.
+    try testing.expect(!Generator.dflashGateShouldDisable(3, 4, Generator.DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(3, 2, Generator.DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND));
+}
+
 test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
     // The 2026-06-10 baseline regression: PLD forced on for a creative essay
     // prompt where the n-gram lookup almost never matches. The per-draft gate
@@ -10536,7 +10654,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
     {
         var xfm = try Transformer.init(io, allocator, config, &weights);
         defer xfm.deinit();
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 32, greedy, &.{}, .{
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
             .skip_lazy_preforward = true,
         });
         defer gen.deinit(allocator);
@@ -10557,7 +10675,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         defer dm.deinit();
         try dm.bind(&xfm);
 
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 32, greedy, &.{}, .{
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
             .dflash_enabled = true,
             .dflash = &dm,
         });
@@ -10569,17 +10687,32 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
 
         var got = std.ArrayList(u32).empty;
         defer got.deinit(allocator);
-        while (got.items.len < want) {
+        while (true) {
+            const attempts_before = gen.dflash_attempted;
             const res = (try gen.nextDflash(allocator)) orelse break;
             defer allocator.free(res.tokens);
             try got.appendSlice(allocator, res.tokens);
-            // Invariants after every round, at whatever accepted count the
-            // round produced.
-            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
-            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+            if (gen.dflash_attempted != attempts_before) {
+                // A real DFlash round commits trunk and assistant context to
+                // the same exact boundary at every accepted count.
+                try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+                try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+            } else {
+                // After the economic gate trips, nextDflash delegates to the
+                // regular lazy decoder. Its pipeline intentionally forwards
+                // one token ahead; the dormant assistant context stays at the
+                // last speculative boundary because the gate is sticky.
+                try testing.expect(gen.spec_disabled_runtime);
+                const committed = prompt.len + gen.generated_ids.items.len;
+                try testing.expect(gen.ctx.cache.step >= committed);
+                try testing.expect(gen.ctx.cache.step <= committed + 1);
+                try testing.expect(gen.dflash_ctx.?.absLen() <= gen.ctx.cache.step);
+            }
         }
         try testing.expect(gen.dflash_attempted > 0);
-        try testing.expect(got.items.len >= want);
-        for (serial, got.items[0..want]) |a, b| try testing.expectEqual(a, b);
+        try testing.expectEqual(want, got.items.len);
+        try testing.expectEqual(@as(u32, @intCast(want)), gen.completion_tokens);
+        try testing.expectEqual(want, gen.generated_ids.items.len);
+        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
 }

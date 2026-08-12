@@ -525,10 +525,17 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_pld = params.enable_pld,
-            // The external drafter does not yet carry Qwen3-VL M-RoPE
-            // positions. Native Qwen MTP does: its prompt-history KV uses the
-            // explicit image positions and generated text uses offset+delta.
-            .enable_drafter = params.enable_drafter and params.vision_embeddings == null,
+            // Qwen's external drafter does not yet carry M-RoPE positions.
+            // Muse DFlash is different: it consumes captures from the same
+            // vision-conditioned trunk forward and Muse has no M-RoPE table,
+            // so image requests may keep that sidecar armed.
+            .enable_drafter = assistantSidecarEnabledForRequest(
+                params.enable_drafter,
+                params.vision_embeddings != null,
+                params.mrope_pos != null,
+                params.dflash != null,
+                config.muse_vision,
+            ),
             .drafter = params.drafter,
             .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
@@ -2650,12 +2657,12 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config", "prefix_cache_capacity", "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes", "ssm_checkpoint_stride", "ssm_checkpoint_max",
-        "mtp_enabled",     "mtp_depth",              "llama_cache_entries",
-        "llama_kv_type_k", "llama_kv_type_v",        "ds4_mtp",
-        "ds4_dspark",      "ds4_ssd_streaming",      "no_drafter",
-        "draft_block_size", "draft_block_size_explicit",
+        "kv_quant_config",         "prefix_cache_capacity",     "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes", "ssm_checkpoint_stride",     "ssm_checkpoint_max",
+        "mtp_enabled",             "mtp_depth",                 "llama_cache_entries",
+        "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
+        "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
+        "draft_block_size",        "draft_block_size_explicit",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3179,7 +3186,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.draft_block_size_explicit,
                 wide_lane,
             );
-            log.info("DFlash drafter ready (block_size={d}{s}, targets={any}).\n", .{
+            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
                 sch.drafter_block_size,
                 if (params.draft_block_size_explicit)
                     ", user-clamped"
@@ -3187,6 +3194,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     ", capped (no wide verify lane)"
                 else
                     "",
+                wide_lane,
                 d.config.target_layer_ids,
             });
         }
@@ -4565,7 +4573,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const use_pld = wiring.use_pld;
     const dsv4_spec_intent = wiring.native_intent;
     log.debug("[spec-wiring] mtp={} dflash={} drafter={} pld={} (slot: drafter_flag={} dflash_handle={} drafter_handle={})\n", .{
-        use_mtp, use_dflash, use_drafter, use_pld,
+        use_mtp,             use_dflash,          use_drafter,          use_pld,
         slot.enable_drafter, slot.dflash != null, slot.drafter != null,
     });
 
@@ -4662,6 +4670,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dflash = if (use_dflash) slot.dflash else null,
             // The dflash-resolved block rides the shared drafter_block_size.
             .dflash_block_size = slot.drafter_block_size,
+            // Tool-bearing requests commonly spend their first few rounds in
+            // a low-yield reasoning preamble before the structured ATEM call
+            // becomes highly predictable. Preserve that measured recovery;
+            // prose and vision use the stricter general break-even boundary.
+            .dflash_min_accepted_per_round = if (slot.has_tools)
+                generate_mod.Generator.DFLASH_TOOL_GATE_MIN_ACCEPTED_PER_ROUND
+            else
+                generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
             .mtp_depth = slot.mtp_depth,
@@ -4851,6 +4867,37 @@ pub fn specInitWiring(
     };
 }
 
+/// Resolve the request-level switch shared by the classic external drafter
+/// and DFlash. Vision stays guarded by default: placeholder ids alone do not
+/// tell an external sidecar how to position image tokens. Muse DFlash is the
+/// measured exception because it drafts from captures produced by Muse's own
+/// vision-conditioned trunk and Muse does not use Qwen's M-RoPE table.
+pub fn assistantSidecarEnabledForRequest(
+    requested: bool,
+    has_vision: bool,
+    has_mrope: bool,
+    has_dflash: bool,
+    is_muse_vision: bool,
+) bool {
+    if (!requested) return false;
+    if (!has_vision) return true;
+    return has_dflash and is_muse_vision and !has_mrope;
+}
+
+test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
+    // Text requests keep the existing shared sidecar behavior.
+    try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, false));
+    // A request opt-out always wins.
+    try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, true));
+    // Image requests remain guarded for classic external drafters.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, false));
+    // Muse DFlash consumes vision-conditioned trunk captures and may engage.
+    try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, true));
+    // Qwen's explicit M-RoPE table is never admitted through this exception.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, true));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, false));
+}
+
 /// Which spec mode a decode tick drives for a slot.
 pub const SpecTickMode = enum { dspark, mtp, dflash, drafter, pld, regular };
 
@@ -4920,7 +4967,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         // different diagnosis from one, and the trim is what breaks the chain.
         log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
             gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
-            @tagName(stop.tier),          stop.trim_start,
+            @tagName(stop.tier),         stop.trim_start,
         });
         slot.finish_details = stop.finish_details;
         if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
@@ -5028,13 +5075,18 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
                 return;
             }
             slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
+            // `nextDflash` advances the Generator by the whole committed
+            // block before returning it. Publish progress one token at a time
+            // so a final block that lands exactly on max_tokens is streamed
+            // in full instead of stopping after its first token.
+            slot.completion_tokens += 1;
             if (t != 0) slot.was_pad_only = false;
             if (slot.completion_tokens >= slot.max_tokens) {
                 finishSlot(sch, slot, "length");
                 return;
             }
         }
+        std.debug.assert(slot.completion_tokens == gen.completion_tokens);
         return;
     }
 
@@ -5751,4 +5803,3 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
 }
-

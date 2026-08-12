@@ -42,6 +42,11 @@ EOF
 OAI_TEXT=$(echo "$OAI" | python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
 echo "  -> $OAI_TEXT"
 echo "$OAI_TEXT" | grep -qiE "house|home|building" || { echo "  FAIL: expected 'house'"; FAIL=1; }
+if [ -f "$MODEL/drafter/config.json" ]; then
+  grep -qE "\[spec-stats\] mode=dflash attempts=[1-9][0-9]*" "$LOG" \
+    && echo "  OK: Muse vision kept DFlash engaged" \
+    || { echo "  FAIL: Muse vision silently disabled DFlash"; grep -E "spec-wiring|spec-stats" "$LOG" | tail -5; FAIL=1; }
+fi
 
 echo "== token accounting (the splice depends on it) =="
 # 730x487 → smart_resize 756x504 → grid 54x36 patches → (54/2)*(36/2) = 486 pads,

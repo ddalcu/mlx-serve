@@ -86,20 +86,21 @@ if [ -n "$ATTEMPTS" ] && [ "$ATTEMPTS" -gt 0 ]; then
 else
     bad "spec-stats mode=dflash attempts>0" "$(grep spec-stats "$LOG" | tail -3)"
 fi
+if echo "$STATS" | grep -q "runtime_disabled=true"; then
+    ok "low-yield prose falls back to serial decode"
+else
+    bad "low-yield prose falls back to serial decode" "$STATS"
+fi
 
-# [5] Greedy equivalence over the first-30-tokens window (reasoning+content).
-# A dflash round commits whole blocks, so the ON arm can end a few tokens past
-# max_tokens — compare the COMMON PREFIX (the divergence signal), and require
-# it to be substantial so a short degenerate answer can't vacuously pass.
+# [5] Greedy equivalence over the exact 30-token window (reasoning+content).
 if python3 - "$ON" "$OFF" <<'PY'
 import sys
 on, off = sys.argv[1], sys.argv[2]
-n = min(len(on), len(off))
-assert n >= 80, f"window too short: {n}"
-assert on[:n] == off[:n], f"diverged within the window:\n--- on ---\n{on[:n]}\n--- off ---\n{off[:n]}"
+assert min(len(on), len(off)) >= 80, "window too short"
+assert on == off, f"diverged within the exact token window:\n--- on ---\n{on}\n--- off ---\n{off}"
 PY
 then
-    ok "greedy dflash-on == dflash-off (byte-equal common prefix)"
+    ok "greedy dflash-on == dflash-off (byte-equal exact window)"
 else
     bad "greedy dflash-on == dflash-off" "--- on ---" "$(echo "$ON" | head -c 300)" "--- off ---" "$(echo "$OFF" | head -c 300)"
 fi
@@ -113,7 +114,65 @@ else
     bad "enable_drafter:false opted out" "saw $N_STATS mode=dflash lines (expected 2)"
 fi
 
-# [7] Tools still parse with the drafter engaged.
+# [7] A final accepted block is clipped to the request budget. This checks the
+# externally visible accounting; the hermetic Zig test also pins returned ids,
+# generated_ids, trunk KV and assistant context to the same exact boundary.
+CAP=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+    "model": "mlx-serve",
+    "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
+    "temperature": 0.0,
+    "max_tokens": 17
+}')
+if echo "$CAP" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+assert r["usage"]["completion_tokens"] == 17, r.get("usage")
+assert r["choices"][0]["finish_reason"] == "length", r["choices"][0]
+' 2>/dev/null; then
+    ok "DFlash output clips exactly at max_tokens=17"
+else
+    bad "DFlash output clips exactly at max_tokens=17" "$(echo "$CAP" | head -c 500)"
+fi
+
+CAP_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+    "model": "mlx-serve",
+    "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
+    "temperature": 0.0,
+    "max_tokens": 17,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+}')
+if python3 - "$CAP" "$CAP_STREAM" <<'PY'
+import json, sys
+whole = json.loads(sys.argv[1])
+msg = whole["choices"][0]["message"]
+expected = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+pieces = []
+usage = None
+for line in sys.argv[2].splitlines():
+    if not line.startswith("data: "):
+        continue
+    data = line[6:]
+    if data == "[DONE]":
+        continue
+    event = json.loads(data)
+    if event.get("usage"):
+        usage = event["usage"]
+    choices = event.get("choices") or []
+    if choices:
+        delta = choices[0].get("delta") or {}
+        pieces.append((delta.get("reasoning_content") or "") + (delta.get("content") or ""))
+actual = "".join(pieces)
+assert actual == expected, (expected, actual)
+assert usage and usage["completion_tokens"] == 17, usage
+PY
+then
+    ok "stream publishes the complete clipped DFlash block"
+else
+    bad "stream publishes the complete clipped DFlash block" "$(echo "$CAP_STREAM" | tail -c 800)"
+fi
+
+# [8] Tools still parse with the drafter engaged.
 TOOLS=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
     "model": "mlx-serve",
     "messages": [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}],
@@ -135,7 +194,7 @@ else
     bad "tool call parses with dflash engaged" "$(echo "$TOOLS" | head -c 400)"
 fi
 
-# [8] Weight-precision levers ENGAGED, read off the boot log — both are
+# [9] Weight-precision levers ENGAGED, read off the boot log — both are
 # load-time decisions, so there is no same-boot A/B for them; the numeric
 # guard is the hermetic greedy-equivalence test, which runs default-on.
 WLINE=$(grep -o "weights=[^ ]*-bit/gs[0-9]*" "$LOG" | head -1)
@@ -158,7 +217,7 @@ fi
 BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
 if echo "$BLINE" | grep -q "capped (no wide verify lane"; then
     ok "block capped on a machine with no wide verify lane ($BLINE)"
-elif grep -q "available=true" "$LOG" && echo "$BLINE" | grep -q "block_size=16"; then
+elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=16"; then
     ok "wide verify lane present, checkpoint block kept ($BLINE)"
 else
     bad "block resolves against the machine's verify lanes" "$BLINE"
