@@ -5933,7 +5933,16 @@ pub const Generator = struct {
         const constraint = self.sampling.constraint.?;
         const s = self.xfm.s;
 
-        _ = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        if (allowed == 0) {
+            // No legal token: every logit would be -inf and argmax over that
+            // row returns id 0, whose bytes then fail `acceptByte` and switch
+            // enforcement off anyway — one garbage token later, and with the
+            // grammar bug reported as model output. Say so and degrade here.
+            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+            constraint.grammar.dead = true;
+            @memset(constraint.mask_buf, true);
+        }
 
         // Also allow every stop-id the generator recognises once the grammar is
         // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,

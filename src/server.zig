@@ -13,7 +13,6 @@ const muse_vision = @import("muse_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
-const token_mask_mod = @import("token_mask.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -939,29 +938,6 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 /// example so users can copy-paste a working command.
 var global_port: u16 = 0;
 
-/// Tokenizer-vocabulary byte table for grammar-constrained sampling. Built
-/// lazily on the first JSON-schema request and reused for the lifetime of the
-/// server. Single-threaded inference path means no synchronization is needed.
-var global_token_bytes: ?token_mask_mod.TokenBytes = null;
-var global_token_bytes_gpa: ?std.mem.Allocator = null;
-
-fn getOrBuildTokenBytes(gpa: std.mem.Allocator, tok: *const Tokenizer) !*const token_mask_mod.TokenBytes {
-    if (global_token_bytes) |*tb| return tb;
-    log.info("[grammar] building token-byte table for vocab (one-time, ~50ms)\n", .{});
-    const built = try token_mask_mod.build(gpa, tok);
-    global_token_bytes = built;
-    global_token_bytes_gpa = gpa;
-    return &global_token_bytes.?;
-}
-
-fn deinitGlobalTokenBytes() void {
-    if (global_token_bytes) |*tb| {
-        tb.deinit();
-        global_token_bytes = null;
-        global_token_bytes_gpa = null;
-    }
-}
-
 /// Decode a slice of token IDs to bytes, routing through the ds4 engine when
 /// the loaded model is GGUF-backed (no MLX tokenizer in that case). Used by
 /// the request handlers' streaming + final-decode paths so a single call
@@ -1502,7 +1478,6 @@ pub fn serve(
     }
 
     deinitGlobalResponseStore();
-    deinitGlobalTokenBytes();
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -1868,6 +1843,18 @@ fn handleConnection(
             }
         }
     }
+    // An endpoint that doesn't exist is a 404, and it must cost NOTHING to say
+    // so. Resolution runs ahead of dispatch, so this has to be answered here
+    // rather than inside one of `ensureLoaded`'s error arms: with a resolvable
+    // `model` in the body, resolution SUCCEEDS — cold-loading the checkpoint —
+    // and the unknown path only 404s afterwards. `POST /v1/load` (the route is
+    // /v1/load-model) cost 2m42s and 121 GB resident for a typo, and the same
+    // one-liner pins the box for anyone who sends it. Placed below the LAN
+    // proxy so a `<id>@<peer>` hop is unchanged, and above every load.
+    if (!routeExists(path)) {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
+        return;
+    }
     const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -1883,15 +1870,6 @@ fn handleConnection(
             // the app's tray polls it, and a 503 here read as "0 MB".
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
                 try handlePropsNoModel(allocator, stream);
-                return;
-            }
-            // An endpoint that doesn't exist is a 404 whether or not a model is
-            // loaded. Resolution runs ahead of dispatch, so without this an
-            // unknown path never reaches the chain's own 404 and reports "no
-            // model" — which reads to any endpoint-probing client as a
-            // catch-all server that implements everything.
-            if (!routeExists(path)) {
-                try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
                 return;
             }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
@@ -4980,7 +4958,7 @@ fn handleChatCompletions(
         if (has_tools) {
             log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
         } else {
-            const tb = try getOrBuildTokenBytes(allocator, tok);
+            const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
                 sampling.constraint = &sc.constraint;
@@ -7821,6 +7799,23 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "the route-existence 404 is answered BEFORE the model is resolved" {
+    // A path we do not serve must cost nothing. Resolution ran first, so
+    // `POST /v1/load` (the real route is /v1/load-model) with a `model` field
+    // cold-loaded that model and THEN 404'd — 2m42s and 121 GB resident for a
+    // typo, and a one-line way for any client to pin the box. The existence
+    // answer has to precede `ensureLoaded`, not sit in one of its error arms.
+    const src = @embedFile("server.zig");
+    const gate = "if (!routeExists(" ++ "path)) {";
+    const resolve = "scheduler.ensureLoaded(" ++ "requested_model_id)";
+    const gate_at = std.mem.indexOf(u8, src, gate) orelse return error.GateMissing;
+    const resolve_at = std.mem.indexOf(u8, src, resolve) orelse return error.ResolveMissing;
+    try std.testing.expect(gate_at < resolve_at);
+    // Exactly one gate — a second copy in an error arm is a second answer to
+    // a question that has one.
+    try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
 }
 
 test "routeExists answers endpoint existence without consulting the model" {
@@ -11388,7 +11383,7 @@ fn handleResponses(
         if (active_has_tools) {
             log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
         } else {
-            const tb = try getOrBuildTokenBytes(allocator, tok);
+            const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
                 sampling.constraint = &sc.constraint;

@@ -1069,6 +1069,19 @@ pub const Scheduler = struct {
     /// survive an on-demand GGUF load, not just the `--model` primary).
     ds4_mtp: bool,
     ds4_dspark: bool,
+    ds4_ssd_streaming: bool,
+    /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
+    /// became load-bearing on this path the moment `dflash.resolveInDirDrafter`
+    /// started probing `<model_dir>/drafter` at load: without it here, a server
+    /// launched with speculation off re-enabled it on every model switched to.
+    /// `drafter_dir` is the launch `--drafter` path and `primary_model_dir` the
+    /// `--model` it belongs to — see `coldLoadDrafterDir` for why it is not
+    /// simply copied across.
+    no_drafter: bool,
+    drafter_dir: []const u8,
+    primary_model_dir: []const u8,
+    draft_block_size: u32,
+    draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1226,6 +1239,12 @@ pub const Scheduler = struct {
             .llama_kv_type_v = params.llama_kv_type_v,
             .ds4_mtp = params.ds4_mtp,
             .ds4_dspark = params.ds4_dspark,
+            .ds4_ssd_streaming = params.ds4_ssd_streaming,
+            .no_drafter = params.no_drafter,
+            .drafter_dir = params.drafter_dir,
+            .primary_model_dir = params.model_dir,
+            .draft_block_size = params.draft_block_size,
+            .draft_block_size_explicit = params.draft_block_size_explicit,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1674,11 +1693,14 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
-            .drafter_dir = "", // Phase E will wire the load-model API to set this.
+            // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
+            // loads too; the path itself is scoped by `coldLoadDrafterDir`.
+            .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
+            .no_drafter = self.no_drafter,
             .load_vision = coldLoadVision(owned.config.has_vision),
             .warmup_eager = true,
-            .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
-            .draft_block_size_explicit = false,
+            .draft_block_size = self.draft_block_size,
+            .draft_block_size_explicit = self.draft_block_size_explicit,
             .kv_quant_config = self.kv_quant_config,
             // Cold loads get the SAME prefix-cache configuration as the
             // startup model — pre-plumbing these were (1, 0, stride 0),
@@ -1700,6 +1722,7 @@ pub const Scheduler = struct {
             .llama_kv_type_v = self.llama_kv_type_v,
             .ds4_mtp = self.ds4_mtp,
             .ds4_dspark = self.ds4_dspark,
+            .ds4_ssd_streaming = self.ds4_ssd_streaming,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -2576,9 +2599,74 @@ pub var skip_mem_preflight: bool = false;
 /// hardcode `load_vision = config.has_vision` and silently ignore the flag.
 pub var no_vision_global: bool = false;
 
+/// Which drafter directory a COLD load should use.
+///
+/// `--no-drafter` is a policy — it silences every model, including one whose
+/// own dir ships a sidecar `dflash.resolveInDirDrafter` would otherwise find.
+/// `--drafter <path>`, by contrast, names a sidecar for the checkpoint it was
+/// passed beside: handing it to whatever model is swapped in next would load a
+/// mismatched assistant, so it applies only when the entry being loaded IS the
+/// launch model (which happens on a reload after eviction). Every other model
+/// is served by the in-dir probe.
+pub fn coldLoadDrafterDir(
+    no_drafter: bool,
+    primary_model_dir: []const u8,
+    drafter_dir: []const u8,
+    entry_path: []const u8,
+) []const u8 {
+    if (no_drafter) return "";
+    if (drafter_dir.len == 0) return "";
+    if (!std.mem.eql(u8, primary_model_dir, entry_path)) return "";
+    return drafter_dir;
+}
+
 /// Should a cold load bring up the checkpoint's vision tower?
 pub fn coldLoadVision(has_vision: bool) bool {
     return has_vision and !no_vision_global;
+}
+
+test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to its OWN model" {
+    // `--drafter <path>` names a sidecar for the checkpoint it was passed
+    // with; handing it to whatever model gets swapped in next would load a
+    // mismatched assistant. Other models are served by the in-dir probe.
+    // Reloading the launch model AFTER an eviction must still get it back.
+    try testing.expectEqualStrings("/d", coldLoadDrafterDir(false, "/m", "/d", "/m"));
+    try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "/d", "/other"));
+    // --no-drafter is a policy, not a path: it silences every model, including
+    // one whose own dir ships a sidecar the in-dir probe would find.
+    try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/m"));
+    try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/other"));
+    // No --drafter at launch: nothing to carry, the in-dir probe decides.
+    try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
+}
+
+test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
+    // Three separate rounds of this bug shipped: prefix-cache, then MTP +
+    // llama, then the drafter/ssd group — each time a launch flag reached
+    // only `--model` and the cold path (hot switch, /v1/load-model, first
+    // request naming an unloaded model) quietly used a struct default. The
+    // scan is the class guard: a field retained on the Scheduler for this
+    // purpose that no cold-load assignment mentions is the next round.
+    // Needles are ++-split so this test's own source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    inline for (.{
+        "kv_quant_config", "prefix_cache_capacity", "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes", "ssm_checkpoint_stride", "ssm_checkpoint_max",
+        "mtp_enabled",     "mtp_depth",              "llama_cache_entries",
+        "llama_kv_type_k", "llama_kv_type_v",        "ds4_mtp",
+        "ds4_dspark",      "ds4_ssd_streaming",      "no_drafter",
+        "draft_block_size", "draft_block_size_explicit",
+    }) |field| {
+        const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
+        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
+    }
+    // The drafter path is the one retained setting that must NOT be copied
+    // straight across — it goes through the ownership rule above.
+    const via_rule = "coldLoadDrafterDir(" ++ "self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)";
+    try testing.expect(std.mem.indexOf(u8, src, via_rule) != null);
+    // The stale TODO that stood in for the wiring must be gone.
+    const old = "Phase E will wire the load-model API" ++ " to set this.";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
 test "coldLoadVision honors the process-wide vision opt-out" {

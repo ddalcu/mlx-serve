@@ -28,7 +28,8 @@
 - The "stopped repeating itself" notice showed twice on a cut reply and could be sent back to the model as chat text. It now shows once, under the reply, and never reaches the model (#147) thanks @justinluque for your PR.
 - GGUF models downloaded with the Hugging Face CLI load again (#158).
 - Big video renders no longer get cancelled after 15 minutes of quiet work (#152, #157).
-
+- Fix bugs related to model hot swap / changing.
+ 
 ---
 
 ## v26.8.4 — One window, your own media models, hot model switching
