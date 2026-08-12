@@ -690,9 +690,41 @@ struct ChatSidebar: View {
     /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
     /// shared menu body, which needs it.
     @StateObject private var cliDetector = CLILauncher()
+    /// Holding ⌘ numbers the conversation rows. A modifier held down is STATE,
+    /// which SwiftUI does not report outside a hovered view — see the monitor.
+    @StateObject private var modifiers = ModifierKeyMonitor()
 
     var body: some View {
         conversationsSidebar
+    }
+
+    /// ⌘1…⌘9 — jump to the row wearing that number.
+    ///
+    /// Zero-size hidden buttons, the same idiom as ⌘R regenerate: they need
+    /// THIS view's session list, and a key equivalent works wherever focus is,
+    /// including while the composer's text view has it.
+    private var quickSwitchShortcuts: some View {
+        ForEach(1...ChatQuickSwitch.maxSlots, id: \.self) { slot in
+            Button {
+                guard let id = ChatQuickSwitch.id(forSlot: slot, in: appState.visibleChatSessions)
+                else { return }
+                jumpToChat(id)
+            } label: { EmptyView() }
+                .keyboardShortcut(KeyEquivalent(Character("\(slot)")), modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+        }
+    }
+
+    /// Go to a chat by number. Not `selectRow`: that one reads the CURRENT
+    /// event's modifier flags to decide between replacing, extending and
+    /// ranging a selection — and the event here always has ⌘ down, which would
+    /// make every jump toggle the row into a multi-selection instead.
+    private func jumpToChat(_ id: UUID) {
+        appState.showConversation()
+        selectionAnchor = id
+        appState.sidebarSelection = [id]
+        if appState.activeChatId != id { appState.activeChatId = id }
     }
 
     private var conversationsSidebar: some View {
@@ -814,6 +846,10 @@ struct ChatSidebar: View {
         } message: { _ in
             Text("This can't be undone.")
         }
+        // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
+        // they address THIS view's conversation list; hidden in a background so
+        // they cost no layout.
+        .background(quickSwitchShortcuts)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -1066,8 +1102,31 @@ struct ChatSidebar: View {
         // A real Button laid OVER the row, never a tap gesture around one: an
         // overlay is hit-tested first, so its clicks reach it rather than the
         // row underneath, and the row keeps its whole area clickable.
+        //
+        // The badge and the delete button share this one reserved slot, and the
+        // badge WINS while ⌘ is down: they would otherwise draw on top of each
+        // other on the hovered row, which is exactly the row the pointer is on
+        // whenever anyone reads a number. ⌘-click is also how a second row
+        // joins the selection, so the pointer is regularly here with ⌘ held —
+        // and the ✕ is one pixel away from a click meaning "delete this".
         .overlay(alignment: .trailing) {
-            if hoveredSessionId == session.id {
+            if modifiers.commandHeld, let slot = ChatQuickSwitch.slot(for: session.id,
+                                                                      in: appState.visibleChatSessions) {
+                Text("\(slot)")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.primary.opacity(0.08))
+                    )
+                    .padding(.trailing, ChatMetrics.sidebarRowInset)
+                    // Decoration: it must never eat the click that selects the
+                    // row it is drawn on.
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            } else if hoveredSessionId == session.id {
                 Button {
                     requestDeleteChats([session.id], keyboard: false)
                 } label: {
