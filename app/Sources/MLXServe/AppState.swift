@@ -754,6 +754,17 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Drop the "this reply was cut short" footnote from the last message.
+    ///
+    /// Called when a continuation starts: the notice is a statement about the
+    /// reply, and the reply is about to stop being cut. Leaving it would put
+    /// "Stopped — hit the output limit" under a paragraph that carried on.
+    func clearTruncationNotice(in sessionId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.indices.last else { return }
+        chatSessions[sIdx].messages[mIdx].truncationNotice = nil
+    }
+
     func appendMessage(to sessionId: UUID, message: ChatMessage) {
         guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
         chatSessions[idx].messages.append(message)

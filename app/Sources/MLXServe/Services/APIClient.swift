@@ -427,7 +427,11 @@ class APIClient {
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
         retryPolicy: RetryPolicy = .default,
-        modelId: String? = nil
+        modelId: String? = nil,
+        /// Extend the trailing assistant message rather than answering after
+        /// it. The server needs this stated: a trailing assistant message is
+        /// ordinary history on this endpoint unless the request says otherwise.
+        continueFinalMessage: Bool = false
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             // Cancellation plumbing: AsyncThrowingStream does NOT propagate
@@ -455,6 +459,7 @@ class APIClient {
                             toolsJSON: toolsJSON,
                             defaults: defaults,
                             modelId: modelId,
+                            continueFinalMessage: continueFinalMessage,
                             continuation: continuation
                         )
                         return  // success
@@ -499,6 +504,7 @@ class APIClient {
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
         modelId: String? = nil,
+        continueFinalMessage: Bool = false,
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
@@ -560,6 +566,7 @@ class APIClient {
             // maxTokens <= 0 means "Auto": omit so the server pegs to context.
             if maxTokens > 0 { body["max_tokens"] = maxTokens }
             if enableThinking { body["enable_thinking"] = true }
+            if continueFinalMessage { body["continue_final_message"] = true }
             if let v = reasoningEffort { body["reasoning_effort"] = v }
             if let v = defaults.topK { body["top_k"] = v }
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }

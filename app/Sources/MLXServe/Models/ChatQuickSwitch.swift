@@ -102,3 +102,29 @@ enum ChatQuickSwitch {
             shift: extend)
     }
 }
+
+/// Whether the reply at the end of a transcript can be handed back to the
+/// model to finish.
+///
+/// A continuation streams into the LAST message, so every refusal here is a
+/// message that would be the wrong target — caught as a disabled button rather
+/// than discovered as text landing in the wrong bubble.
+enum ContinueReply {
+    static func isEligible(_ messages: [ChatMessage],
+                           serverRunning: Bool,
+                           busy: Bool) -> Bool {
+        guard serverRunning, !busy, let last = messages.last else { return false }
+        guard last.role == .assistant else { return false }
+        // Already being written.
+        guard !last.isStreaming else { return false }
+        // Machinery and our own error cards are not the model's prose: a
+        // tool-call summary has no sentence to finish, and continuing an error
+        // notice asks the model to complete OUR sentence about a failure.
+        guard !last.isAgentSummary, !last.failedRetry, last.errorNotice == nil else { return false }
+        guard last.toolCalls == nil || last.toolCalls?.isEmpty == true else { return false }
+        // The server trims a prefill of trailing whitespace and renders an
+        // ordinary turn if nothing is left, so an empty reply would make the
+        // button quietly do something other than what it says.
+        return !last.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}

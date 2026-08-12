@@ -1924,6 +1924,13 @@ struct ChatDetailView: View {
                                         : nil,
                                     onRegenerate: (m.role == .assistant && m.id == lastAssistantMessageId)
                                         ? { regenerateLastResponse() }
+                                        : nil,
+                                    // Only the last message: a continuation
+                                    // streams into the END of the transcript,
+                                    // so offering it on an earlier reply would
+                                    // append the text to a different bubble.
+                                    onContinue: (m.id == session?.messages.last?.id && canContinue)
+                                        ? { continueReply() }
                                         : nil)
                                 .id(m.id)
                             case .toolCall(let call, let results):
@@ -2922,6 +2929,23 @@ struct ChatDetailView: View {
             && (session?.messages.contains { $0.role == .user } ?? false)
     }
 
+    /// Whether the reply at the end of this transcript can be finished off.
+    private var canContinue: Bool {
+        ContinueReply.isEligible(session?.messages ?? [],
+                                 serverRunning: server.status == .running,
+                                 busy: composerState != .idle)
+    }
+
+    /// Hand the last reply back to the model to finish. Same turn config as a
+    /// send, so the continuation runs under the settings that produced it.
+    private func continueReply() {
+        guard canContinue else { return }
+        chatEngine.continueReply(sessionId: sessionId, config: buildTurnConfig())
+        // The text lands at the END of a reply already on screen, so follow it
+        // down the same way a fresh send does.
+        applyScroll(.userSentMessage)
+    }
+
     /// Stop this chat's turn. The ONE call both the composer's stop disc and
     /// Escape make — per-session, because other tabs may be generating and
     /// neither control may reach across.
@@ -3171,6 +3195,9 @@ struct MessageBubble: View {
     /// the caller decides that, so the bubble itself doesn't need to know its
     /// position in the transcript.
     var onRegenerate: (() -> Void)?
+    /// Hand this reply back to the model to finish. Present only on the last
+    /// message, and only when it is continuable (`ContinueReply.isEligible`).
+    var onContinue: (() -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
@@ -3471,6 +3498,16 @@ struct MessageBubble: View {
 
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                // Continue sits BEFORE regenerate: they are the two answers to
+                // "this reply isn't what I need", and the non-destructive one
+                // goes first — regenerate throws the reply away.
+                if let onContinue {
+                    footerButton("text.append",
+                                 help: message.truncationNotice != nil
+                                     ? "Finish this reply — it was cut short"
+                                     : "Keep writing from where this left off",
+                                 action: onContinue)
+                }
                 if let onRegenerate {
                     footerButton("arrow.clockwise", help: "Regenerate this reply (⌘R)",
                                  action: onRegenerate)

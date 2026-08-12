@@ -487,15 +487,41 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 config: config, approval: approval)
     }
 
+    /// Extend the reply at the end of the transcript instead of answering
+    /// after it — the model is handed its own unfinished text and resumes.
+    ///
+    /// Deliberately NOT routed through `runTurn`: that appends a user message
+    /// and a fresh placeholder, which is exactly what a continuation must not
+    /// do. It also never takes the agent path — a tool loop mid-reply would
+    /// have to splice a call into text the user has already read.
+    func continueReply(sessionId: UUID, config: TurnConfig) {
+        guard ContinueReply.isEligible(session(sessionId)?.messages ?? [],
+                                       serverRunning: server.status == .running,
+                                       busy: composerState(for: sessionId) != .idle)
+        else { return }
+        stop(sessionId: sessionId)
+        let token = ledger.begin(session: sessionId)
+        publishTurnState()
+        runPlainTurn(sessionId: sessionId, text: "", images: nil, audio: nil,
+                     config: config, token: token, continuing: true)
+    }
+
     // MARK: - Plain chat
 
+    /// - Parameter continuing: extend the reply already at the end of the
+    ///   transcript instead of answering after it. No user message is added and
+    ///   no placeholder is appended — the trailing assistant message IS the
+    ///   placeholder, and the server is told to treat it as a prefill.
     private func runPlainTurn(sessionId: UUID, text: String,
                               images: [ChatImage]?, audio: [ChatAudio]?,
-                              config: TurnConfig, token: UUID) {
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = images
-        userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+                              config: TurnConfig, token: UUID,
+                              continuing: Bool = false) {
+        if !continuing {
+            var userMsg = ChatMessage(role: .user, content: text)
+            userMsg.images = images
+            userMsg.audio = audio
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
 
@@ -543,21 +569,31 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
 
         // Streaming placeholder for the UI — appended AFTER the request body is
-        // built so it doesn't show up in the prompt.
-        var assistantMsg = ChatMessage(role: .assistant, content: "")
-        assistantMsg.isStreaming = true
-        appState.appendMessage(to: sessionId, message: assistantMsg)
+        // built so it doesn't show up in the prompt. A continuation has one
+        // already: the reply being extended. Appending a second would stream
+        // the rest of the sentence into a NEW bubble under the one it belongs
+        // to, and `updateLastMessage` (which appends) writes to the last
+        // message either way, so reusing it needs no other change.
+        if continuing {
+            // The notice said the reply was cut. It is being un-cut.
+            appState.clearTruncationNotice(in: sessionId)
+            appState.updateLastMessage(in: sessionId, streaming: true)
+        } else {
+            var assistantMsg = ChatMessage(role: .assistant, content: "")
+            assistantMsg.isStreaming = true
+            appState.appendMessage(to: sessionId, message: assistantMsg)
+        }
 
         tasks[sessionId] = Task { [weak self] in
             await self?.streamPlainResponse(api: api, sessionId: sessionId,
                                             messages: messagesArray, config: config,
-                                            token: token)
+                                            token: token, continuing: continuing)
         }
     }
 
     private func streamPlainResponse(api: APIClient, sessionId: UUID,
                                      messages: [[String: Any]], config: TurnConfig,
-                                     token: UUID) async {
+                                     token: UUID, continuing: Bool = false) async {
         do {
             // A media-first server runs headless (no default model) — hot-load
             // the selected chat model once so the request below resolves.
@@ -573,7 +609,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
                 defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId
+                modelId: server.chatModelId,
+                continueFinalMessage: continuing
             )
             var coalescer = StreamCoalescer()
             beginLiveTokenCount(for: sessionId)
