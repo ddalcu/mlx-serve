@@ -92,6 +92,79 @@ final class ChatQuickSwitchTests: XCTestCase {
         XCTAssertTrue(ChatQuickSwitch.ordered([]).isEmpty)
     }
 
+    // MARK: - Only the rows in the clear get a number
+
+    func testNumbersSkipRowsHiddenBehindTheFrostedBlock() {
+        // The list scrolls UNDER the pinned destinations, so a scrolled sidebar
+        // had ⌘1…⌘5 behind glass and the first row you could read was 6. The
+        // rows in the clear get 1, 2, 3…
+        let rows = (0..<8).map { _ in session() }
+        let visible = Set(rows[3...].map(\.id))          // first three are under the blur
+
+        XCTAssertNil(ChatQuickSwitch.slot(for: rows[0].id, in: rows, numbering: visible))
+        XCTAssertNil(ChatQuickSwitch.slot(for: rows[2].id, in: rows, numbering: visible))
+        XCTAssertEqual(ChatQuickSwitch.slot(for: rows[3].id, in: rows, numbering: visible), 1)
+        XCTAssertEqual(ChatQuickSwitch.slot(for: rows[4].id, in: rows, numbering: visible), 2)
+    }
+
+    func testTheFilterKeepsTheSidebarsOrderNotTheSetsOrder() {
+        // A Set has no order — the numbering must still run agents-then-chats,
+        // top to bottom, or the badges count in an order nothing on screen has.
+        let chat = session(title: "dolphins")
+        let agentThread = session(agent: UUID(), title: "Dinner plans")
+        let sessions = [chat, agentThread]
+        let visible: Set<UUID> = [chat.id, agentThread.id]
+
+        XCTAssertEqual(ChatQuickSwitch.slot(for: agentThread.id, in: sessions, numbering: visible), 1)
+        XCTAssertEqual(ChatQuickSwitch.slot(for: chat.id, in: sessions, numbering: visible), 2)
+    }
+
+    func testADigitLandsOnTheRowShowingIt() {
+        // The invariant that matters: badge and shortcut read ONE list, so a
+        // digit can never reach a row other than the one wearing that number.
+        let rows = (0..<9).map { _ in session() }
+        let visible = Set(rows[2...6].map(\.id))
+        for row in rows {
+            guard let slot = ChatQuickSwitch.slot(for: row.id, in: rows, numbering: visible) else { continue }
+            XCTAssertEqual(ChatQuickSwitch.id(forSlot: slot, in: rows, numbering: visible), row.id)
+        }
+    }
+
+    func testNineVisibleRowsDeepInTheListAllGetNumbers() {
+        // Scrolled far down: the numbers follow the window, not the top of the
+        // list, so all nine are usable wherever you are.
+        let rows = (0..<40).map { _ in session() }
+        let visible = Set(rows[20..<29].map(\.id))
+        XCTAssertEqual(ChatQuickSwitch.slot(for: rows[20].id, in: rows, numbering: visible), 1)
+        XCTAssertEqual(ChatQuickSwitch.slot(for: rows[28].id, in: rows, numbering: visible), 9)
+        XCTAssertEqual(ChatQuickSwitch.id(forSlot: 9, in: rows, numbering: visible), rows[28].id)
+    }
+
+    func testMoreThanNineVisibleRowsStillStopAtNine() {
+        let rows = (0..<20).map { _ in session() }
+        let visible = Set(rows.map(\.id))
+        XCTAssertEqual(ChatQuickSwitch.slot(for: rows[8].id, in: rows, numbering: visible), 9)
+        XCTAssertNil(ChatQuickSwitch.slot(for: rows[9].id, in: rows, numbering: visible))
+    }
+
+    func testNothingVisibleMeansNoNumbers() {
+        // An EMPTY set says what it means. Falling back to numbering
+        // everything here would put badges back under the glass.
+        let rows = [session(), session()]
+        XCTAssertNil(ChatQuickSwitch.slot(for: rows[0].id, in: rows, numbering: []))
+        XCTAssertNil(ChatQuickSwitch.id(forSlot: 1, in: rows, numbering: []))
+    }
+
+    func testNoVisibilityInformationNumbersEverything() {
+        // nil is not "nothing visible" — it is "nobody has measured yet",
+        // which is the state before the first layout reports. Numbering from
+        // the top is the honest answer there, and it is exactly the behaviour
+        // of a sidebar with no overlay at all.
+        let rows = [session(), session()]
+        XCTAssertEqual(ChatQuickSwitch.slot(for: rows[0].id, in: rows, numbering: nil), 1)
+        XCTAssertEqual(ChatQuickSwitch.id(forSlot: 2, in: rows, numbering: nil), rows[1].id)
+    }
+
     // MARK: - Wiring
 
     func testTheSidebarDrawsBadgesAndBindsEveryDigit() {
@@ -112,6 +185,27 @@ final class ChatQuickSwitchTests: XCTestCase {
                       "each generated row needs a ⌘-digit key equivalent")
         XCTAssertTrue(source.contains("ChatQuickSwitch.id(forSlot:"),
                       "a digit must resolve through the same ordering the badge was drawn from")
+
+        // Badge and shortcut must read the SAME visibility set. If only one of
+        // them filters, ⌘3 goes to a different row than the one wearing 3 —
+        // silently, and only when the sidebar is scrolled.
+        XCTAssertEqual(SourceScan.count("numbering: numberedRows", in: source), 2,
+                       "both the badge and the ⌘-digit lookup pass the visible set")
+    }
+
+    func testTheRowProbeIsGatedOnTheCommandKey() {
+        // A GeometryReader on every row is a preference write per row per
+        // scroll frame. Outside ⌘-held nothing reads the answer, so nothing
+        // should be measuring.
+        let source = SourceScan.source("Views/ChatView.swift", from: #filePath)
+        // `key:` pins this to the PUBLISHER — the plain type name also appears
+        // on the reader and on the declaration.
+        guard let probe = source.range(of: "key: SidebarRowSpansKey.self") else {
+            return XCTFail("the row probe is gone")
+        }
+        let before = String(source[..<probe.lowerBound].suffix(400))
+        XCTAssertTrue(before.contains("modifiers.commandHeld"),
+                      "the row geometry probe must be attached only while ⌘ is down")
     }
 
     func testTheBadgeIsGatedOnTheCommandKey() {

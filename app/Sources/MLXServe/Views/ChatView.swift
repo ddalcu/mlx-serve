@@ -675,6 +675,39 @@ enum SidebarDeleteConfirm {
 
 // MARK: - Sidebar
 
+/// Where one conversation row sits vertically, in global coordinates.
+struct SidebarRowSpan: Equatable {
+    let top: CGFloat
+    let bottom: CGFloat
+}
+
+/// Every measured row, so the quick-switch can number only the ones in the
+/// clear. Published per row and merged on the way up.
+struct SidebarRowSpansKey: PreferenceKey {
+    static let defaultValue: [UUID: SidebarRowSpan] = [:]
+    static func reduce(value: inout [UUID: SidebarRowSpan],
+                       nextValue: () -> [UUID: SidebarRowSpan]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// The bottom edge of the frosted destination block — rows above this line are
+/// behind glass.
+struct SidebarClearBandTopKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The bottom edge of the panel — rows below this line are off the fold.
+struct SidebarClearBandBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
     /// Observed directly — AppState forwards objectWillChange only for the
@@ -693,6 +726,30 @@ struct ChatSidebar: View {
     /// Holding ⌘ numbers the conversation rows. A modifier held down is STATE,
     /// which SwiftUI does not report outside a hovered view — see the monitor.
     @StateObject private var modifiers = ModifierKeyMonitor()
+    /// Where the frosted destination block ENDS, and where the panel ends, in
+    /// global coordinates — the band a conversation row has to sit inside to be
+    /// readable. Measured rather than derived from the inset's height: the
+    /// block's contents vary (the Create list, the download badge), so the one
+    /// number that cannot go stale is the one the block reports itself.
+    @State private var clearBandTop: CGFloat = 0
+    @State private var clearBandBottom: CGFloat = 0
+    /// Each conversation row's vertical extent, reported only while ⌘ is down.
+    @State private var rowSpans: [UUID: SidebarRowSpan] = [:]
+
+    /// The rows a number may land on: those fully clear of the frosted block
+    /// and inside the panel. `nil` means "not measured" — before the first
+    /// layout after ⌘ goes down — and numbers everything, which is the old
+    /// behaviour rather than a sidebar of blank rows for one frame.
+    private var numberedRows: Set<UUID>? {
+        guard modifiers.commandHeld else { return nil }
+        guard clearBandBottom > clearBandTop, !rowSpans.isEmpty else { return nil }
+        return Set(rowSpans.filter {
+            // Fully inside the band. A half-clipped row wearing a number reads
+            // as an answer to "which one is 3?" that you then have to scroll to
+            // check.
+            $0.value.top >= clearBandTop - 0.5 && $0.value.bottom <= clearBandBottom + 0.5
+        }.keys)
+    }
 
     var body: some View {
         conversationsSidebar
@@ -706,7 +763,8 @@ struct ChatSidebar: View {
     private var quickSwitchShortcuts: some View {
         ForEach(1...ChatQuickSwitch.maxSlots, id: \.self) { slot in
             Button {
-                guard let id = ChatQuickSwitch.id(forSlot: slot, in: appState.visibleChatSessions)
+                guard let id = ChatQuickSwitch.id(forSlot: slot, in: appState.visibleChatSessions,
+                                                  numbering: numberedRows)
                 else { return }
                 jumpToChat(id)
             } label: { EmptyView() }
@@ -933,10 +991,62 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.top, 10)
             .padding(.bottom, 8)
+            // Where the frost ENDS. This block is what conversation rows scroll
+            // under, so its own bottom edge is the line between "readable" and
+            // "behind glass" — no constant to keep in step with its contents.
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: SidebarClearBandTopKey.self,
+                                           value: proxy.frame(in: .global).maxY)
+                }
+            }
             // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
             // has something to attach to again and the platform frosts what
             // scrolls beneath this block.
         }
+        // The panel's own bottom edge closes the band. Applied OUTSIDE the
+        // safeAreaInset so it measures the whole column, and so the three
+        // readers below are ancestors of the block that publishes the top edge
+        // — a preference only travels up.
+        .background {
+            GeometryReader { proxy in
+                let frame = proxy.frame(in: .global)
+                Color.clear
+                    .preference(key: SidebarClearBandBottomKey.self,
+                                value: frame.maxY - proxy.safeAreaInsets.bottom)
+                    // The SAME edge the destination block publishes, derived a
+                    // second way: a `safeAreaInset` is what the top inset here
+                    // is made of. Belt and braces because the block's own
+                    // measurement has to travel up out of the inset's content
+                    // to be seen at all — and the key reduces by `max`, so
+                    // whichever mechanism reports is the one that decides, and
+                    // if both do they are measuring the same line anyway.
+                    .preference(key: SidebarClearBandTopKey.self,
+                                value: frame.minY + proxy.safeAreaInsets.top)
+            }
+        }
+        .onPreferenceChange(SidebarClearBandTopKey.self) { value in
+            applyMeasurement(value, to: $clearBandTop)
+        }
+        .onPreferenceChange(SidebarClearBandBottomKey.self) { value in
+            applyMeasurement(value, to: $clearBandBottom)
+        }
+        .onPreferenceChange(SidebarRowSpansKey.self) { value in
+            guard rowSpans != value else { return }
+            // Async for the same reason the transcript's scroll correction is
+            // (issue #136): a geometry-driven write that lands inside the
+            // layout flush re-enters layout, and under a scroll it does so
+            // every frame. One turn later it coalesces instead.
+            DispatchQueue.main.async { rowSpans = value }
+        }
+    }
+
+    /// Store a measured edge, ignoring sub-pixel noise. The equality gate is
+    /// load-bearing, not an optimisation: a write per layout would re-enter
+    /// layout and never settle.
+    private func applyMeasurement(_ value: CGFloat, to binding: Binding<CGFloat>) {
+        guard abs(binding.wrappedValue - value) > 0.5 else { return }
+        DispatchQueue.main.async { binding.wrappedValue = value }
     }
 
     // MARK: Selection
@@ -1089,6 +1199,20 @@ struct ChatSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Where this row sits, so the numbering can skip whatever is under the
+        // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+        // a preference write per row per scroll frame, and outside this
+        // transient mode nothing reads the answer.
+        .background {
+            if modifiers.commandHeld {
+                GeometryReader { proxy in
+                    let frame = proxy.frame(in: .global)
+                    Color.clear.preference(
+                        key: SidebarRowSpansKey.self,
+                        value: [session.id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
+                }
+            }
+        }
         // One meaning for gray in this panel, and one SHAPE: the fill rides the
         // row's own content inside the stack's gutter, exactly as a
         // destination's `.background` does. (It was a `listRowBackground` once,
@@ -1111,7 +1235,8 @@ struct ChatSidebar: View {
         // and the ✕ is one pixel away from a click meaning "delete this".
         .overlay(alignment: .trailing) {
             if modifiers.commandHeld, let slot = ChatQuickSwitch.slot(for: session.id,
-                                                                      in: appState.visibleChatSessions) {
+                                                                      in: appState.visibleChatSessions,
+                                                                      numbering: numberedRows) {
                 Text("\(slot)")
                     .font(.caption2.weight(.semibold).monospacedDigit())
                     .foregroundStyle(.secondary)
