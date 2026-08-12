@@ -32,8 +32,7 @@
 - GGUF models downloaded with the Hugging Face CLI load again (#158).
 - Big video renders no longer get cancelled after 15 minutes of quiet work (#152, #157).
 - Fix bugs related to model hot swap / changing models.
- 
----
+- Homebrew now learns about a release when it's published, not while it's still a draft, so `brew upgrade` can't offer a version whose download isn't up yet.
 
 ## v26.8.4 — One window, your own media models, hot model switching
 
