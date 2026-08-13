@@ -329,6 +329,12 @@ pub fn main(init: std.process.Init) !void {
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
 
+    // An MLX error is uncatchable and kills the process; mlx-c's default
+    // handler prints it to STDOUT and never touches the log file. Install ours
+    // here, above every subcommand branch, so the documented post-mortem file
+    // records the reason instead of just stopping.
+    server_mod.installMlxErrorHandler();
+
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
