@@ -99,6 +99,66 @@ final class ComposerInputTests: XCTestCase {
         XCTAssertFalse(ComposerIntent.wantsMCP("what time is it", serverNames: []))
     }
 
+    // MARK: - ComposerIntent.nudge (the whole pre-send decision, in one place)
+
+    private func nudge(_ text: String,
+                       onlyWhenAsked: Bool = false,
+                       toolsOn: Bool = false, toolsLocked: Bool = false,
+                       mcpOn: Bool = false, mcpLocked: Bool = false,
+                       servers: [String] = [],
+                       suppressed: SessionIntentSuppression = SessionIntentSuppression(),
+                       session: UUID = UUID()) -> IntentPrompt? {
+        ComposerIntent.nudge(for: text, onlyToolsWhenAsked: onlyWhenAsked,
+                             toolsOn: toolsOn, toolsLocked: toolsLocked,
+                             mcpOn: mcpOn, mcpLocked: mcpLocked,
+                             enabledServers: servers, suppressed: suppressed,
+                             sessionId: session)
+    }
+
+    func testNudgeOffersToolsForAnAgenticMessage() {
+        XCTAssertEqual(nudge("make me a website"), .agent)
+    }
+
+    /// A named server is the more specific signal, so MCP wins the tie.
+    func testNudgeOffersMCPAheadOfToolsWhenAServerIsNamed() {
+        XCTAssertEqual(nudge("create a linear ticket for this", servers: ["linear"]), .mcp)
+    }
+
+    func testNudgeIsSilentWhenTheModeIsAlreadyOnOrLockedOrDeclined() {
+        XCTAssertNil(nudge("make me a website", toolsOn: true))
+        XCTAssertNil(nudge("make me a website", toolsLocked: true),
+                     "offering a mode the tab's agent decides is a dead offer")
+        XCTAssertNil(nudge("check my github issues", mcpOn: true, servers: ["github"]))
+        XCTAssertNil(nudge("check my github issues", mcpLocked: true, servers: ["github"]))
+
+        let chat = UUID()
+        var declined = SessionIntentSuppression()
+        declined.suppress(.agent, for: chat)
+        XCTAssertNil(nudge("make me a website", suppressed: declined, session: chat))
+        // …but only for the chat that declined it.
+        XCTAssertEqual(nudge("make me a website", suppressed: declined, session: UUID()), .agent)
+    }
+
+    /// MCP needs a server to name — with none enabled there is nothing to turn on.
+    func testNudgeNeverOffersMCPWithNoEnabledServers() {
+        XCTAssertNil(nudge("use the mcp server", servers: []))
+    }
+
+    // MARK: - "Only use tools when I ask" (Settings ▸ Agent)
+
+    /// The whole point of the setting: tools are opt-in, so the composer never
+    /// interrupts a send to offer them. Both nudges go quiet, and the
+    /// per-message detection is bypassed entirely.
+    func testToolOptInSettingSilencesEveryNudge() {
+        XCTAssertNil(nudge("make me a website", onlyWhenAsked: true))
+        XCTAssertNil(nudge("npm install react", onlyWhenAsked: true))
+        XCTAssertNil(nudge("check my github issues", onlyWhenAsked: true, servers: ["github"]),
+                     "the MCP nudge is the same interruption — the setting covers it too")
+        // Sanity: the same messages DO nudge with the setting off.
+        XCTAssertEqual(nudge("make me a website"), .agent)
+        XCTAssertEqual(nudge("check my github issues", servers: ["github"]), .mcp)
+    }
+
     // MARK: - SessionIntentSuppression (stop nagging per chat, keyed by session)
 
     func testSuppressionIsPerPromptAndPerSession() {

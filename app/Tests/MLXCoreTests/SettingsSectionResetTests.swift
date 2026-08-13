@@ -49,7 +49,7 @@ final class SettingsSectionResetTests: XCTestCase {
         o.perRequestEnablePLD = .on; o.perRequestEnableDrafter = .off
         o.telegram.enabled = true; o.telegram.botToken = "123:secret"
         o.telegram.allowedChatIds = [42]; o.telegram.agentMode = true
-        o.sandbox.enabled = true
+        o.sandbox.enabled = true; o.toolsOnlyWhenAsked = true
         o.voiceClonePath = "/tmp/clip.wav"; o.voiceCloneEnabled = false
         o.voiceCloneLabel = "My clip"; o.wakePhrase = "hey robot"
         return o

@@ -246,6 +246,17 @@ struct ServerOptions: Codable, Equatable {
     /// toggling it must never prompt a server restart.
     var sandbox: SandboxConfig = SandboxConfig()
 
+    // MARK: Tool opt-in (app-level — NOT a server-launch flag, NOT per-request)
+    /// ON = tools are strictly opt-in: the composer never interrupts a send to
+    /// offer Tools or MCP, so the model only gets tools in a chat where the
+    /// wrench (or the tab's agent) turned them on. OFF (default, the shipped
+    /// behavior) keeps the pre-send nudge that spots an agentic-looking message
+    /// and asks first. Read by `ComposerIntent.nudge`, which is the ONE place
+    /// the decision is made — app-side only, so like `sandbox` it is excluded
+    /// from `serverLaunchEquals` and `toCLIArgs`: flipping it never prompts a
+    /// server restart.
+    var toolsOnlyWhenAsked: Bool = false
+
     // MARK: Voice clone (app-level — NOT a server-launch flag, NOT per-request)
     /// Absolute path to the normalized voice-clone reference clip (24 kHz mono
     /// WAV) that hands-free voice mode speaks with, via Qwen3-TTS zero-shot
@@ -826,6 +837,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnableDrafter) { perRequestEnableDrafter = v }
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
         if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .toolsOnlyWhenAsked) { toolsOnlyWhenAsked = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }

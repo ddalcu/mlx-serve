@@ -2401,23 +2401,19 @@ struct ChatDetailView: View {
         return out
     }
 
-    /// Decide whether to nudge before sending. MCP takes priority over Agent
-    /// because a named server is the more specific signal; both are gated on the
-    /// matching mode being off and the suggestion not already declined this chat.
+    /// Decide whether to nudge before sending. The RULE is pure
+    /// (`ComposerIntent.nudge` — MCP over Agent, never a mode that is on, locked
+    /// by the tab's agent, or already declined here, and nothing at all when the
+    /// user has set tools to opt-in); this only gathers what it reads.
     private func detectIntentPrompt(for text: String) -> IntentPrompt? {
         let toggles = toolbarToggles
-        let servers = enabledMCPServerNames()
-        if !mcpMode, toggles.mcpLockedBy == nil, !servers.isEmpty,
-           !intentSuppress.isSuppressed(.mcp, for: sessionId),
-           ComposerIntent.wantsMCP(text, serverNames: servers) {
-            return .mcp
-        }
-        if !isAgentMode, toggles.toolsLockedBy == nil,
-           !intentSuppress.isSuppressed(.agent, for: sessionId),
-           ComposerIntent.wantsAgent(text) {
-            return .agent
-        }
-        return nil
+        return ComposerIntent.nudge(
+            for: text,
+            onlyToolsWhenAsked: appState.serverOptions.toolsOnlyWhenAsked,
+            toolsOn: isAgentMode, toolsLocked: toggles.toolsLockedBy != nil,
+            mcpOn: mcpMode, mcpLocked: toggles.mcpLockedBy != nil,
+            enabledServers: enabledMCPServerNames(),
+            suppressed: intentSuppress, sessionId: sessionId)
     }
 
     /// Enable the mode the nudge suggested.
