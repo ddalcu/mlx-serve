@@ -1274,7 +1274,11 @@ struct ChatSidebar: View {
                     // Decoration: it must never eat the click that selects the
                     // row it is drawn on.
                     .allowsHitTesting(false)
-                    .transition(.opacity)
+                    .transition(AnyTransition.asymmetric(
+                        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
+                        removal: .opacity.animation(.easeOut(duration: 0.15))
+                     ))
+                    .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
             } else if hoveredSessionId == session.id {
                 Button {
                     requestDeleteChats([session.id], keyboard: false)
@@ -1289,10 +1293,6 @@ struct ChatSidebar: View {
                 .help("Delete chat")
             }
         }
-        .transition(.asymmetric(
-        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(1.2)),
-        removal: .opacity.animation(.easeOut(duration: 0.15))))
-        .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
         .onHover { isHovered in
             hoveredSessionId = isHovered ? session.id : nil
         }
