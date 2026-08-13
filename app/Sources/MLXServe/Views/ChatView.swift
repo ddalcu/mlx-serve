@@ -635,6 +635,23 @@ enum SidebarMultiSelect {
         return Outcome(selection: next, anchor: id, activate: activate)
     }
 
+    /// What the selection becomes when the composer takes the keyboard, or nil
+    /// when it already says that.
+    ///
+    /// Typing is a statement that you are working in ONE conversation. Without
+    /// this the multi-selection stayed lit behind the field, and since a
+    /// multi-selection outranks focus for ⌘⌫ (`ChatDeleteShortcut.route`) the
+    /// chord kept raising a delete dialog mid-message — two rules each reading
+    /// a true fact and disagreeing about which one meant "the user is deleting
+    /// chats". The chat you are typing IN is the survivor: its transcript is
+    /// the one on screen above the field.
+    ///
+    /// Nil rather than an equal set, so a focus event that changes nothing does
+    /// not publish.
+    static func focusingComposer(in sessionId: UUID, selection: Set<UUID>) -> Set<UUID>? {
+        selection == [sessionId] ? nil : [sessionId]
+    }
+
     private static func nearest(to id: UUID, in ordered: [UUID], within set: Set<UUID>) -> UUID? {
         guard let origin = ordered.firstIndex(of: id) else { return set.first }
         return ordered.enumerated()
@@ -2364,6 +2381,18 @@ struct ChatDetailView: View {
         }
         .onChange(of: composerState) { _, state in
             if state == .idle { inputFocused = true }
+        }
+        // The keyboard arriving in the composer collapses the sidebar selection
+        // to this chat. Keyed on the focus MIRROR rather than on the click, so
+        // it covers every way the field ends up holding the keyboard — and the
+        // rule is what keeps ⌘⌫ from raising a delete dialog mid-message with
+        // several chats still lit behind the field.
+        .onChange(of: inputFocused) { _, focused in
+            guard focused,
+                  let collapsed = SidebarMultiSelect.focusingComposer(
+                      in: sessionId, selection: appState.sidebarSelection)
+            else { return }
+            appState.sidebarSelection = collapsed
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from

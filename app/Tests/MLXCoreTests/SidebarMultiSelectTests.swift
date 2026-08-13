@@ -136,6 +136,55 @@ final class SidebarMultiSelectTests: XCTestCase {
         let out = click(a, selection: [a, b, d], anchor: a, active: a, command: true)
         XCTAssertEqual(out.activate, b)
     }
+
+    // MARK: - Typing collapses the selection
+
+    /// Clicking into the composer is a statement that you are working in ONE
+    /// conversation. Without that, a multi-selection stayed lit behind the
+    /// field you were typing in — and since a multi-selection outranks focus
+    /// for ⌘⌫ (`ChatDeleteShortcut.route`), the chord kept raising a delete
+    /// dialog mid-message: the two rules each read a true fact and disagreed
+    /// about which one meant "the user is deleting chats".
+    func testTakingTheKeyboardIntoTheComposerCollapsesTheSelection() {
+        let typing = UUID(), other1 = UUID(), other2 = UUID()
+        XCTAssertEqual(
+            SidebarMultiSelect.focusingComposer(in: typing, selection: [typing, other1, other2]),
+            [typing])
+    }
+
+    /// The collapse keeps the chat you are IN, never the anchor or the first
+    /// of the set — you are typing into that one, and its transcript is on
+    /// screen above the field.
+    func testTheChatYouAreTypingInIsTheOneThatSurvives() {
+        let typing = UUID(), other = UUID()
+        XCTAssertEqual(SidebarMultiSelect.focusingComposer(in: typing, selection: [other]),
+                       [typing])
+    }
+
+    /// Nothing to do — and it must say so rather than write an equal set back,
+    /// which publishes a change on every focus event for no reason.
+    func testASelectionThatAlreadyNamesOnlyThatChatIsLeftAlone() {
+        let typing = UUID()
+        XCTAssertNil(SidebarMultiSelect.focusingComposer(in: typing, selection: [typing]))
+    }
+
+    func testAnEmptySelectionBecomesTheChatYouAreTypingIn() {
+        let typing = UUID()
+        XCTAssertEqual(SidebarMultiSelect.focusingComposer(in: typing, selection: []), [typing])
+    }
+
+    /// The rule needs a caller, and the caller has to be the composer's own
+    /// focus mirror — that is the one signal that means "the keyboard is in
+    /// the field now", whether it got there by a click or by a finished turn
+    /// handing it back.
+    func testTheComposerCollapsesTheSelectionWhenItTakesTheKeyboard() throws {
+        let source = SourceScan.source("Views/ChatView.swift", from: #filePath)
+        XCTAssertTrue(source.contains("SidebarMultiSelect.focusingComposer"), """
+            nothing collapses the sidebar selection when the composer takes \
+            the keyboard, so ⌘⌫ still raises a delete dialog while typing with \
+            several chats selected.
+            """)
+    }
 }
 
 /// Which deletions stop and ask first.
