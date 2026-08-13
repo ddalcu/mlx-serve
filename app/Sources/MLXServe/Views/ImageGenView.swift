@@ -271,10 +271,13 @@ struct ImageGenView: View {
         // and because the section GROWS once a source is set, the target grows
         // to cover the thumbnail and reference rows — which is exactly where a
         // later drop is aimed. `ImageDropPlacement` decides which slot it
-        // lands in; the room is the source slot plus whatever the reference
-        // list has left, so a full pane bounces the file instead of
-        // swallowing it.
-        .mediaDrop(.image, limit: 1 + max(0, maxRefImages - refImageURLs.count),
+        // lands in, and states the ROOM it has for one — so a pane with
+        // nothing left to fill bounces the file instead of swallowing it.
+        .mediaDrop(.image,
+                   limit: ImageDropPlacement.room(source: initImageURL,
+                                                  editing: effectiveEditMode,
+                                                  refs: refImageURLs.count,
+                                                  refLimit: maxRefImages),
                    isTargeted: $isDropTargeted) { placeDroppedImages($0) }
     }
 
@@ -580,7 +583,6 @@ struct ImageGenView: View {
     private func placeDroppedImages(_ urls: [URL]) {
         let placed = ImageDropPlacement.place(
             urls, source: initImageURL, editing: effectiveEditMode,
-            supportsReferences: model.supportsReferenceEdit,
             refs: refImageURLs, refLimit: maxRefImages)
         initImageURL = placed.source
         refImageURLs = placed.refs

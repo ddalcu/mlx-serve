@@ -472,19 +472,12 @@ struct VideoGenView: View {
                     .help("Clear first frame")
                 }
             } else {
-                Button {
-                    chooseFirstFrameImage()
-                } label: {
-                    Label("Choose image...", systemImage: "photo.on.rectangle.angled")
-                        .font(.caption)
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help("Select an image to use as the first frame of the video.")
-                Text("or drag an image here")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
+                // The same well the Image and 3D panes' empty states draw —
+                // one shape for "a picture goes here" across the four panes.
+                MediaDropWell(title: "Choose image...",
+                              systemImage: "photo.on.rectangle.angled",
+                              isTargeted: isDropTargeted) { chooseFirstFrameImage() }
+                    .help("Select an image to use as the first frame of the video.")
             }
         }
         // One image slot, so a drop REPLACES whatever is there — same as

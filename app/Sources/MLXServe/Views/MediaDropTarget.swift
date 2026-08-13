@@ -26,6 +26,23 @@ enum MediaDropKind {
         }
     }
 
+    /// The same allow-list said in UTTypes, for the drop target's own `of:`.
+    /// The extension check below runs after the providers RESOLVE, which is
+    /// after SwiftUI has already animated the file in — so a type the pane
+    /// can't use has to be refused here or a dropped `.txt` lights the border,
+    /// flies home and does nothing. Every accepted extension conforms to one
+    /// of these (pinned by `MediaDropTests`).
+    var contentTypes: [UTType] {
+        switch self {
+        case .image: [.image]
+        case .video: [.movie]
+        case .audio: [.audio]
+        }
+    }
+
+    /// What a mixed target (the H3 references section) advertises.
+    static let allContentTypes: [UTType] = [.image, .movie, .audio]
+
     func accepts(_ url: URL) -> Bool {
         extensions.contains(url.pathExtension.lowercased())
     }
@@ -56,24 +73,43 @@ enum MediaDrop {
 /// two destinations. Kept pure and out of the view so the routing can be read
 /// (and tested) on its own.
 enum ImageDropPlacement {
-    /// Priority: fill the empty source first, then references while editing a
-    /// backend that takes them; otherwise the drop REPLACES the source, since
-    /// variation mode has a single image slot and silently discarding the file
-    /// would look like the drop missed. A full reference list drops the extra
-    /// file and leaves the source alone — replacing a source the user chose
-    /// because their reference list happened to be full is the surprise.
+    /// How many files this pane can actually take, which is what the target
+    /// advertises to SwiftUI — the drop animates in on the strength of it, so
+    /// a number bigger than `place` can use is a file swallowed with the
+    /// accept animation playing. Zero bounces, which is the honest answer for
+    /// a pane with a source AND a full reference list: the user has to remove
+    /// one first, same as the Add button disappearing at the cap.
+    static func room(source: URL?, editing: Bool, refs: Int, refLimit: Int) -> Int {
+        // Variation is ONE slot whether it is empty or being replaced. The
+        // reference list is not part of that budget — it isn't even shown.
+        guard editing else { return 1 }
+        return (source == nil ? 1 : 0) + max(0, refLimit - refs)
+    }
+
+    /// Priority: fill the empty source first, then references while editing;
+    /// otherwise the drop REPLACES the source, since variation mode has a
+    /// single image slot and silently discarding the file would look like the
+    /// drop missed. A full reference list drops the extra file and leaves the
+    /// source alone — replacing a source the user chose because their
+    /// reference list happened to be full is the surprise.
+    ///
+    /// `editing` means `effectiveEditMode`, which already includes the
+    /// backend's `supportsReferenceEdit`.
     static func place(_ urls: [URL], source: URL?, editing: Bool,
-                      supportsReferences: Bool, refs: [URL],
-                      refLimit: Int) -> (source: URL?, refs: [URL]) {
+                      refs: [URL], refLimit: Int) -> (source: URL?, refs: [URL]) {
+        guard let first = urls.first else { return (source, refs) }
+        // One slot, so the FIRST file wins and the rest have nowhere to go —
+        // replacing the source once per file kept the LAST of a multi-file
+        // drop, which reads as the pane choosing a file at random. `room`
+        // caps the drop at one anyway; this keeps the two from disagreeing.
+        guard editing else { return (first, refs) }
         var source = source
         var refs = refs
         for url in urls {
             if source == nil {
                 source = url
-            } else if editing && supportsReferences {
-                if refs.count < refLimit { refs.append(url) }
-            } else {
-                source = url
+            } else if refs.count < refLimit {
+                refs.append(url)
             }
         }
         return (source, refs)
@@ -167,7 +203,13 @@ private struct MediaDropModifier: ViewModifier {
             // and a drop there falls through to the ScrollView behind — which
             // is most of a section made of small rows.
             .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
-            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+            // Typed rather than `[.fileURL]`: the extension check can only run
+            // once the providers have RESOLVED, by which point the drop has
+            // been accepted and animated in. Naming the types here is what
+            // bounces a file the pane has no use for, before it lights the
+            // border — the same thing the chat composer's drop does.
+            .onDrop(of: kind?.contentTypes ?? MediaDropKind.allContentTypes,
+                    isTargeted: $isTargeted) { providers in
                 MediaDropLoader.load(providers, kind: kind, limit: limit, completion: onURLs)
             }
             .overlay {
