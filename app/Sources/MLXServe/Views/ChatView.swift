@@ -1442,6 +1442,13 @@ struct ChatDetailView: View {
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
+    /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
+    /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
+    /// walk left running would resume in someone else's conversation. Stale
+    /// indexes are harmless by construction (`ComposerHistory` treats one that
+    /// no longer names an entry as no walk at all), but resetting on the switch
+    /// is what makes the first ↑ in a new tab mean what it says.
+    @State private var composerWalk = ComposerHistory.Walk.idle
     // The three toolbar toggles mirror the visible session's persisted state
     // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
     // the session on appear AND on every `sessionId` change, and written back on
@@ -1992,7 +1999,18 @@ struct ChatDetailView: View {
                                         appState.selectRevision(in: sessionId,
                                                                 messageId: m.id,
                                                                 index: index)
-                                    })
+                                    },
+                                    // Branch here. Offered on both roles and at
+                                    // any depth — unlike Continue and
+                                    // Regenerate, which act on the END of the
+                                    // transcript, a fork is a statement about
+                                    // this message. A task run or a bridge
+                                    // mirror can be branched INTO an ordinary
+                                    // chat, so no read-only gate: nothing about
+                                    // the source is changed.
+                                    onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
+                                        ? { appState.forkSession(sessionId, from: m.id) }
+                                        : nil)
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -2322,6 +2340,11 @@ struct ChatDetailView: View {
             // unpinned at whatever offset the previous conversation's content
             // happened to leave behind.
             applyScroll(.transcriptShown)
+            // A history walk belongs to ONE conversation. Stale indexes are
+            // harmless (ComposerHistory reads a mismatched draft as no walk),
+            // but the first ↑ in the newly-visible tab has to mean "the last
+            // thing I said HERE".
+            composerWalk = .idle
         }
     }
 
@@ -2345,6 +2368,9 @@ struct ChatDetailView: View {
                               case .stop: stopGeneration(); return true
                               case .pass: return false
                               }
+                          },
+                          onArrow: { direction, caretAtStart, caretAtEnd in
+                              recallHistory(direction, caretAtStart: caretAtStart, caretAtEnd: caretAtEnd)
                           })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
@@ -2899,6 +2925,10 @@ struct ChatDetailView: View {
             pendingIntentPrompt = prompt
             return
         }
+        // Sending ends any history walk: the composer is about to empty for a
+        // different reason, and a live walk would make the next ↑ resume from
+        // wherever the last one left off rather than from what was just sent.
+        composerWalk = .idle
         proceedSend()
     }
 
@@ -3005,6 +3035,31 @@ struct ChatDetailView: View {
         // The text lands at the END of a reply already on screen, so follow it
         // down the same way a fresh send does.
         applyScroll(.userSentMessage)
+    }
+
+    /// ↑ / ↓ in the composer: bring back an earlier message of your own.
+    ///
+    /// The rule is `ComposerHistory`, which decides from the draft, the caret
+    /// position and where the walk currently sits — everything here does is
+    /// feed it this chat's history and write the answer back. Returning false
+    /// hands the key to AppKit, which is what makes the arrows still move the
+    /// caret inside a draft.
+    private func recallHistory(_ direction: ComposerHistory.Direction,
+                               caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
+        let entries = ComposerHistory.entries(session?.messages ?? [])
+        let action = direction == .up
+            ? ComposerHistory.up(draft: inputText, caretAtStart: caretAtStart,
+                                 walk: composerWalk, entries: entries)
+            : ComposerHistory.down(draft: inputText, caretAtEnd: caretAtEnd,
+                                   walk: composerWalk, entries: entries)
+        switch action {
+        case .pass:
+            return false
+        case .recall(let text, let walk):
+            inputText = text
+            composerWalk = walk
+            return true
+        }
     }
 
     /// Stop this chat's turn. The ONE call both the composer's stop disc and
@@ -3261,6 +3316,10 @@ struct MessageBubble: View {
     var onContinue: (() -> Void)?
     /// Show a different generated version of this reply.
     var onSelectRevision: ((Int) -> Void)?
+    /// Branch the conversation here: everything up to this message becomes a
+    /// new chat and this one is left alone. nil when there would be nothing to
+    /// fork (`ChatFork.isForkable`) or on a read-only surface.
+    var onFork: (() -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
@@ -3451,6 +3510,12 @@ struct MessageBubble: View {
             }
             if onRegenerate != nil {
                 Button("Regenerate") { onRegenerate?() }
+            }
+            if let onFork {
+                // Between the two destructive answers and Delete: a fork keeps
+                // BOTH branches, so it belongs next to the ones that don't.
+                Divider()
+                Button("Branch Chat From Here", action: onFork)
             }
             if onDelete != nil {
                 Button("Delete Message", role: .destructive) { onDelete?() }
@@ -4649,6 +4714,12 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     /// Escape, from the responder chain. Defaults to nothing so a field that
     /// has no use for the key leaves it to AppKit.
     var onCancel: () -> Bool = { false }
+    /// ↑ / ↓, with WHERE THE CARET IS — the composer recalls earlier messages,
+    /// but only from the edge of the text, so the keys keep moving the caret
+    /// inside a multi-line draft (`ComposerHistory`). Returning false hands the
+    /// key back to AppKit. Defaults to nothing: the in-place message editor has
+    /// no history to walk.
+    var onArrow: (ComposerHistory.Direction, _ caretAtStart: Bool, _ caretAtEnd: Bool) -> Bool = { _, _, _ in false }
 
     /// Read from the SAME constants the placeholder overlay reads — the two
     /// are related only by arithmetic nobody's type system checks.
@@ -4699,6 +4770,11 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         // in-progress edit at the same value.
         if tv.string != text {
             tv.string = text
+            // Caret to the END of whatever was just put in the field. Setting
+            // `string` collapses the selection to the front, which after a
+            // history recall means typing lands BEFORE the recalled message and
+            // ↓ (which arms at the end) can never walk back out of it.
+            tv.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
             context.coordinator.recomputeHeight()
         }
         let enabled = context.environment.isEnabled
@@ -4725,6 +4801,22 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
             // screen to claim it first — see ComposerKey.onEscape.
             if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 return parent.onCancel()
+            }
+            // ↑ / ↓ recall earlier messages, but the caret position is what
+            // decides — a draft is regularly several lines tall, and swallowing
+            // the arrows inside one would make it uneditable. The rule needs
+            // both edges, so both are measured here rather than inferred: the
+            // caret is at the start and the end simultaneously in an empty
+            // field, which is the state the walk arms from.
+            if commandSelector == #selector(NSResponder.moveUp(_:))
+                || commandSelector == #selector(NSResponder.moveDown(_:)) {
+                let selection = textView.selectedRange()
+                let length = (textView.string as NSString).length
+                let collapsed = selection.length == 0
+                return parent.onArrow(
+                    commandSelector == #selector(NSResponder.moveUp(_:)) ? .up : .down,
+                    collapsed && selection.location == 0,
+                    collapsed && selection.location == length)
             }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
