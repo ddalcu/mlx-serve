@@ -21,6 +21,26 @@ pub const FlaggedSpecial = struct { id: u32, content: []const u8 };
 /// regardless of what produced it (a collapsed distribution can rank one top-5 at a
 /// degenerate position); the substring rule errs toward exemption, which can
 /// only ever keep a token reachable.
+/// Specials a model legitimately EMITS but that no template ever RENDERS.
+///
+/// `reservedOutputIds` derives legitimacy from presence in the chat template,
+/// which is right for every marker that appears on both sides of the
+/// conversation (role markers, think tags, tool wrappers) — the model emits
+/// what it was shown. An output-only marker breaks that symmetry: it exists
+/// purely in generated text, so the template cannot vouch for it and the
+/// derivation files it as reserved. Masking one does not merely drop it; the
+/// model substitutes whatever it can still draw, and a malformed structure is
+/// worse than a missing token.
+///
+/// Kept to markers that are unambiguous across families, since this is the one
+/// place the derivation is overridden by name.
+fn isOutputOnlySpecial(content: []const u8) bool {
+    // harmony (gpt_oss): declares a tool call's argument content type inside
+    // the header the MODEL writes — `to=functions.x <|constrain|>json`. The
+    // template renders tool calls only when replaying history, and omits it.
+    return std.mem.eql(u8, content, "<|constrain|>");
+}
+
 pub fn reservedOutputIds(
     allocator: std.mem.Allocator,
     flagged: []const FlaggedSpecial,
@@ -35,6 +55,7 @@ pub fn reservedOutputIds(
             if (sp.id == e) continue :outer;
         }
         if (std.mem.indexOf(u8, template_source, sp.content) != null) continue;
+        if (isOutputOnlySpecial(sp.content)) continue;
         try out.append(allocator, sp.id);
     }
     return out.toOwnedSlice(allocator);
@@ -2146,6 +2167,32 @@ test "parseMergePair handles both array and space-joined-string formats" {
         defer p.deinit();
         try testing.expect(parseMergePair(p.value) == null);
     }
+}
+
+test "reservedOutputIds: an OUTPUT-ONLY special is legit output the template cannot vouch for" {
+    // Live 2026-08-12, gpt-oss-20b. Harmony declares a tool call's argument
+    // content type INSIDE the segment header the model generates:
+    //   ...to=functions.get_weather <|constrain|>json<|message|>{...}<|call|>
+    // The chat template renders tool calls only for HISTORY, and that rendering
+    // omits <|constrain|> entirely — so the token appears nowhere in the
+    // template source and the template-presence derivation filed it as
+    // reserved. Masked, the model substituted the nearest thing it could still
+    // draw and produced `to=functions.get_weather <|channel|>commentary 1.0`,
+    // a malformed header that sent it into a repetition loop.
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 200003, .content = "<|constrain|>" },
+        .{ .id = 200005, .content = "<|channel|>" },
+        .{ .id = 200013, .content = "<|reserved_200013|>" },
+    };
+    // A harmony template: mentions <|channel|>, never <|constrain|>.
+    const template = "<|start|>assistant<|channel|>final<|message|>{{ content }}";
+    const eos = [_]u32{200002};
+    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    defer alloc.free(ids);
+    // Only the genuinely-reserved slot is suppressed.
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(u32, 200013), ids[0]);
 }
 
 test "reservedOutputIds: specials minus template markers minus eos" {

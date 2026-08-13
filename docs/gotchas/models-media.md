@@ -1440,3 +1440,50 @@ MTP acceptance unchanged (36 engagement lines, 74–95% per-draft). At 6 or 8 bi
 scales are meaningless — the codes are a different alphabet — and the shapes still
 MATCH (group size decides scale geometry, not width), so a wrong graft would load and
 produce garbage rather than erroring.
+
+## gpt-oss: `.bias` and `.biases` in the same checkpoint (2026-08-12)
+
+`mlx-community/gpt-oss-20b-MXFP4-Q8` ships both spellings on the same
+projection, layer 0 included:
+
+    model.layers.0.self_attn.q_proj.bias      [n_heads*head_dim]   additive Linear bias
+    model.layers.0.self_attn.q_proj.biases    [out, groups]        affine zero-points
+    model.layers.0.mlp.router.bias            [num_experts]        additive
+    model.layers.0.mlp.router.biases          [out, groups]        affine zero-points
+
+Our loader helpers are all named around `.biases` (`getLayerBias(…,
+"self_attn.o_proj.biases", &config)`), so any suffix-matching shortcut mixes
+them. The shapes differ, so the lucky case is a load-time error; the unlucky one
+is a wrong-rank tensor reaching `gather_qmm`.
+
+It is sharper on the expert banks. gpt-oss quantizes experts as mxfp4, and the
+fp modes store NO zero-points at all — so `mlp.experts.gate_proj.biases` does
+not exist, and `mlp.experts.gate_proj.bias` (the additive `[E, inter]` SwitchGLU
+bias) is the only bias-ish tensor on the bank. A loader that reaches for
+"whatever bias is there" binds the additive one into the quantizer slot.
+
+Both suffixes stay spelled out in full at every binding site, with the comment
+saying why.
+
+Two other loading notes from the same bring-up:
+
+- **`getLayerWeight` is `unreachable` on a miss, and gpt-oss has no QK norm.**
+  The shared full-attention binding fetched `self_attn.q_norm.weight`
+  unconditionally, which would have killed the process on load rather than
+  reporting anything. It now demands the weight only when `config.has_qk_norm`
+  — an arch that DECLARES qk-norm must ship it (a missing weight there is a
+  broken checkpoint), one that declares it off may omit it.
+- **The config lies about its activation.** `hidden_act: "silu"` is in every
+  gpt-oss config.json and the reference never reads it; the real activation is
+  the clamped SwiGLU keyed on `swiglu_limit`. Same class as reading a config
+  field an arch's reference deliberately ignores (laguna's YaRN mscale).
+- **Its YaRN mscale is COMPUTED, not read.** The config ships no
+  `attention_factor` at all, so the value is mlx-lm's YarnRoPE default,
+  0.1·ln(factor)+1 = 1.3466 at factor 32. Laguna precedent — but dsv4 is the
+  identical config shape with the OPPOSITE answer (its reference applies no
+  mscale), so this stays a per-arch decision, never a generic default.
+- **One theta for both layer types.** gpt-oss builds a single rope and hands it
+  to sliding and full layers alike, so `rope_local_base_freq` is set to
+  `rope_theta`. Leaving it at the Gemma-flavored 10000 default would mis-base
+  every sliding layer — the muse first-turn-repetition class, which presents as
+  deterministic "coherent, then loops".
