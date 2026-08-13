@@ -2084,6 +2084,13 @@ pub fn prefillHeadDimFused(head_dim: u32) bool {
     return head_dim <= 128 or (head_dim == 256 and fused256CausalMode() == .all);
 }
 
+/// Shortest query block the fused hd-256 kernel accepts. Below it MLX's
+/// sdpa_vector wins (see the decline in fusedSdpa256Prefill), which also means
+/// the kernel is NOT the thing band-masking a spec-verify block —
+/// `slidingViewFor` reads the same constant so the trim predicate and the
+/// decline can never drift.
+pub const FUSED256_MIN_Q_LEN: c_int = 16;
+
 /// Try the fused hd-256 flash prefill kernel (msv_attn_p256). Returns null
 /// when a precondition doesn't hold — the caller falls back to the composed
 /// path. `window` > 0 adds the sliding-band mask (Gemma local layers,
@@ -2122,7 +2129,7 @@ pub fn fusedSdpa256Prefill(
     // verify is seq 1+depth, up to 9 at the NAX depth-8 cap — with causal
     // fused default-on the floor must clear it). 16 matches oMLX's
     // _MIN_ROUTE_Q_LEN; genuine prefill chunks are always far above it.
-    if (qs[2] < 16) return null;
+    if (qs[2] < FUSED256_MIN_Q_LEN) return null;
     if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
@@ -2371,6 +2378,90 @@ fn freeKVEntry(e: *KVCacheEntry) void {
     _ = mlx.mlx_array_free(e.key_biases_view);
     _ = mlx.mlx_array_free(e.value_scales_view);
     _ = mlx.mlx_array_free(e.value_biases_view);
+}
+
+/// "No width bound" for `slidingTailSpan`. A 32-wide cap used to keep prefill
+/// chunks out while the mask pairing was unproven; with `band_in_kernel` now
+/// gating the only consumer that reads ABSOLUTE positions and every other
+/// consumer deriving its query offset as `kv_len - q_len`, width needs no
+/// bound — and wide chunks are the only multi-token forward a serial arch
+/// (laguna, inkling) ever does.
+pub const SLIDING_TRIM_UNBOUNDED: usize = std.math.maxInt(usize);
+
+/// How many TAIL KV entries a forward of `q_len` queries needs from a SLIDING
+/// layer. The last query reaches back `window`; the first of the block reaches
+/// back `window + q_len - 1`, so the block's union is that many entries.
+/// Returns 0 — meaning "hand back the whole cache, no trim" — when the layer
+/// does not slide or the block is wider than `max_width`.
+///
+/// This is what makes a spec verify cost what a decode step costs on a sliding
+/// layer: at width 1 it has always returned `window`, but a block-wide verify
+/// used to fall through untrimmed and read the ENTIRE cache on every sliding
+/// layer, so a 3:1 local:global model paid full attention on 75% of its layers
+/// once past the window (measured: muse-glimmer verify 51 -> 140 ms from 0.6k
+/// to 17.6k ctx, turning DFlash from 2.28x into 0.74x).
+pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
+    if (window == 0 or q_len == 0 or q_len > max_width) return 0;
+    return window + @as(u32, @intCast(q_len)) - 1;
+}
+
+/// Kill switch for the block-width half of the trim (MLX_SERVE_SLIDING_BLOCK_TRIM=0
+/// pins every multi-token forward back to the untrimmed view). Decode-width
+/// trimming is unconditional and predates this.
+var sliding_block_trim_cached: ?bool = null;
+pub fn slidingBlockTrimEnabled() bool {
+    if (sliding_block_trim_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_SLIDING_BLOCK_TRIM");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    sliding_block_trim_cached = on;
+    return on;
+}
+
+/// What a sliding layer's K/V view looks like for THIS forward: the `max_kv`
+/// to hand `KVCache.update`, the length the view will actually have, and
+/// whether the fused hd-256 kernel is the thing doing the band masking.
+///
+/// ONE chokepoint for the policy — every arch path asks it rather than
+/// re-deriving the predicate, which is how the standard and MoE paths drifted
+/// apart in the first place.
+pub const SlidingView = struct {
+    /// `max_kv` for `KVCache.update`; 0 = hand back the whole cache.
+    span: u32,
+    /// The K/V length a sliding layer will see. EVERY mask builder must be
+    /// handed this, not `total_kv`: they derive the query offset relatively
+    /// (`offset_val = kv_len - q_len`), so a trimmed view with the trimmed
+    /// length is correct and a trimmed view with the full length is not.
+    kv_len: c_int,
+    /// The fused hd-256 kernel masks the band in-kernel off ABSOLUTE positions
+    /// (`q_off = kL - qL`, `(row_pos - col) >= SW`), so a trimmed view would
+    /// shift its band. When true the trim is declined AND the explicit mask
+    /// build is skipped — the same predicate decides both.
+    band_in_kernel: bool,
+};
+
+var sliding_block_trim_logged: bool = false; // one-shot log guard
+pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) SlidingView {
+    // Keyed on the kernel's OWN floor: it declines everything below
+    // FUSED256_MIN_Q_LEN, so a spec-verify block (4-8 wide) is never
+    // band-masked in-kernel and is free to take the trim. The predicate used
+    // to say `seq_len >= 2`, which declined the trim for exactly those blocks
+    // and then fell through to the explicit-mask path anyway — gemma got
+    // nothing from the trim at all.
+    const band = fused256Enabled() and cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN;
+    const width: usize = if (band or !slidingBlockTrimEnabled()) 1 else SLIDING_TRIM_UNBOUNDED;
+    const span: u32 = if (cfg.has_sliding_window)
+        slidingTailSpan(cfg.sliding_window, @intCast(seq_len), width)
+    else
+        0;
+    const kv_len: c_int = if (span > 0) @min(total_kv, @as(c_int, @intCast(span))) else total_kv;
+    // One-shot: an A/B arm is proven by an engagement line in its own log, not
+    // by the env it was launched with. Fires only when the BLOCK half of the
+    // trim did something — decode has always trimmed to the window.
+    if (!sliding_block_trim_logged and span > cfg.sliding_window and kv_len < total_kv) {
+        sliding_block_trim_logged = true;
+        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d} (MLX_SERVE_SLIDING_BLOCK_TRIM=0 restores the untrimmed view)\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
+    }
+    return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };
 }
 
 pub const KVCache = struct {
@@ -2647,8 +2738,13 @@ pub const KVCache = struct {
 
         // 7. Build views for all 6 buffers.
         const total: c_int = @intCast(entry.offset);
-        const is_decode = new_len == 1;
-        const view_start: c_int = if (is_decode and max_seq > 0 and entry.offset > max_seq)
+        // `max_seq` is the TAIL SPAN this forward needs, not the raw window:
+        // the caller sizes it with `slidingTailSpan` so a block-wide verify
+        // gets `window + q_len - 1` and decode still gets `window`. 0 = keep
+        // the whole cache. Honored at EVERY width — the old `new_len == 1`
+        // gate is what silently made every spec verify read the full cache on
+        // sliding layers.
+        const view_start: c_int = if (max_seq > 0 and entry.offset > max_seq)
             total - @as(c_int, @intCast(max_seq))
         else
             0;
@@ -2779,8 +2875,13 @@ pub const KVCache = struct {
         //    This saves 2 C API calls per layer per token (84 calls/token for 42-layer models).
         const buf_cap = bufferCapacity(entry.keys);
         const total: c_int = @intCast(entry.offset);
-        const is_decode = new_len == 1;
-        const view_start: c_int = if (is_decode and max_seq > 0 and entry.offset > max_seq)
+        // `max_seq` is the TAIL SPAN this forward needs, not the raw window:
+        // the caller sizes it with `slidingTailSpan` so a block-wide verify
+        // gets `window + q_len - 1` and decode still gets `window`. 0 = keep
+        // the whole cache. Honored at EVERY width — the old `new_len == 1`
+        // gate is what silently made every spec verify read the full cache on
+        // sliding layers.
+        const view_start: c_int = if (max_seq > 0 and entry.offset > max_seq)
             total - @as(c_int, @intCast(max_seq))
         else
             0;
@@ -4029,6 +4130,23 @@ pub const ForwardCtx = struct {
     /// refuses non-standard-path targets so this can never be silently
     /// ignored on an engaged path.
     capture_layers: ?*CaptureLayers = null,
+    /// An additive attention term composed into the standard PREFILL path's
+    /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
+    /// "causal"-mode layer swaps to an array mask carrying this verbatim, so
+    /// a term that only masked padding would drop causality on the
+    /// full-attention layers. Sliding layers ADD it to their band mask.
+    ///
+    /// Entries must be FINITE (the reference's -1e9, not -inf): a left-padded
+    /// prompt has query rows whose every visible key is padding, and an
+    /// all -inf row softmaxes to NaN.
+    ///
+    /// Set only by the LTX text encoder (`ltx_video.gemmaCapture4`), whose
+    /// prompts are left-padded to a fixed width the reference masks out. Null
+    /// everywhere else — and null is what keeps the fused prefill kernels,
+    /// which mask from geometry alone and cannot carry an extra term, on
+    /// their normal path. One-shot forwards only: a chunked prefill would
+    /// need a per-chunk slice of it.
+    prefill_mask_add: ?mlx.mlx_array = null,
     /// PLD spec-decode: when true, the GatedDeltaNet trunk records per-position
     /// SSM/conv state during the verify forward (see `SSMCacheEntry.spec_*`),
     /// so partial-accept rollback needs no re-forward. Set only by `nextPld`
@@ -4063,9 +4181,11 @@ pub const ForwardCtx = struct {
     /// ENCODER layer scalar instead of the decoder's. Set by the diffusion
     /// runner for prompt prefill and committed-canvas re-encode passes.
     use_encoder_scalars: bool = false,
-    /// DiffusionGemma encoder pass: the encoder only exists to fill the KV
-    /// cache — skip the 262K-vocab lm_head projection and return the
-    /// post-final-norm hidden instead of logits (caller frees either way).
+    /// Return the post-final-norm hidden instead of logits (caller frees
+    /// either way), skipping the 262K-vocab lm_head projection. Set by the
+    /// DiffusionGemma encoder pass (which exists only to fill the KV cache)
+    /// and by the LTX text encoder (which wants the residual stream, not a
+    /// next token).
     skip_lm_head: bool = false,
     /// Set by the Generator when this request consumes ONLY the argmax of
     /// the logits (greedy or top-1 sampling, no logit-modifying penalties,
@@ -6647,7 +6767,7 @@ pub const Transformer = struct {
         return reshaped;
     }
 
-    fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    pub fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const raw = try self.rawEmbedding(token_ids);
 
         // MuseGlimmer: weight-less RMS norm on the looked-up embeddings (the
@@ -7790,22 +7910,43 @@ pub const Transformer = struct {
         var local_decode_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_decode_mask);
 
+        // Sliding layers only need the tail their queries can reach: decode
+        // gets the window, a block-wide forward `window + q_len - 1`. See
+        // slidingViewFor for the policy (including when the fused hd-256
+        // kernel owns the band and the trim is declined).
+        const sliding = slidingViewFor(cfg, total_kv, seq_len);
+        const sliding_span = sliding.span;
+        const sliding_kv_len = sliding.kv_len;
+        // An extra additive term has to reach the scores, and the fused band
+        // kernel masks from geometry alone — so pads bring the band back to
+        // an explicit array. `prefill_mask_add` is null on every serving path.
+        const band_in_kernel = sliding.band_in_kernel and ctx.prefill_mask_add == null;
+
         if (cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
             if (is_prefill) {
-                // During prefill, K has all total_kv entries (no windowing in views).
                 // The sliding window mask limits attention scope. Skipped when
                 // the fused hd-256 kernel band-masks in-kernel — the
                 // [1,1,chunk,total_kv] mask is itself GBs at long context; the
                 // "array" arm lazily builds it if a per-call check declines.
-                if (!(fused256Enabled() and cfg.head_dim == 256 and seq_len >= 2)) {
-                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                if (!band_in_kernel) {
+                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding_kv_len, sw);
                 }
             }
             if (!is_prefill and total_kv > sw) {
                 // During decode, K view has min(total_kv, sw) entries.
                 const local_kv_len: c_int = @min(total_kv, sw);
                 local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
+            }
+        }
+
+        // Sliding layers need the band AND the caller's term; build the sum
+        // once (it is layer-independent) rather than per layer.
+        var banded_extra_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(banded_extra_mask);
+        if (ctx.prefill_mask_add) |extra| {
+            if (is_prefill and cfg.has_sliding_window and local_prefill_mask.ctx != null) {
+                try mlx.check(mlx.mlx_add(&banded_extra_mask, local_prefill_mask, extra, self.s));
             }
         }
 
@@ -7989,7 +8130,7 @@ pub const Transformer = struct {
                 }
 
                 // Update KV cache
-                const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
+                const max_kv: u32 = if (is_global) 0 else sliding_span;
                 kv_view = try ctx.cache.update(li, own_k_rope, own_v_t, self.s, max_kv);
                 full_k = kv_view.k;
                 full_v = kv_view.v;
@@ -8024,6 +8165,24 @@ pub const Transformer = struct {
                 }
             }
 
+            // Caller-supplied additive term (LTX text encoder's left-padding).
+            // "causal" carries no array, so it becomes one — which is why the
+            // term is required to be causal itself.
+            if (ctx.prefill_mask_add) |extra| {
+                if (is_prefill) {
+                    if (std.mem.eql(u8, sel_mode, "array")) {
+                        // The band build is eager whenever a term is present
+                        // (`band_in_kernel` is forced off above), so the sum
+                        // exists — but a null mlx_array reaching SDPA kills the
+                        // request, and dropping the band is the survivable half.
+                        sel_mask = if (banded_extra_mask.ctx != null) banded_extra_mask else extra;
+                    } else {
+                        sel_mode = "array";
+                        sel_mask = extra;
+                    }
+                }
+            }
+
             // Fused-attn opt-in: consume the cache's quant triples directly
             // via mlx_quantized_matmul. Only when the request opts in AND
             // `kvAttnFusedEligible` passes (scheme .affine with triples,
@@ -8038,7 +8197,7 @@ pub const Transformer = struct {
                 // null array into the composed path is the empty-mlx_array
                 // request-kill this exact live failure produced.
                 if (std.mem.eql(u8, sel_mode, "array") and sel_mask.ctx == null) {
-                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, @intCast(cfg.sliding_window));
+                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding_kv_len, @intCast(cfg.sliding_window));
                     sel_mask = local_prefill_mask;
                 }
                 // Decode width rides the packed-read kernel; verify widths
@@ -8070,7 +8229,11 @@ pub const Transformer = struct {
                 }
             } else if (std.mem.eql(u8, sel_mode, "array")) {
                 var fused_done = false;
-                if (is_prefill and cfg.has_sliding_window) {
+                // `prefill_mask_add` declines the fused band: it masks from
+                // geometry and would drop the caller's term (and, on a
+                // full-attention layer that this term just moved off "causal",
+                // would band-mask a layer that has no band at all).
+                if (is_prefill and cfg.has_sliding_window and ctx.prefill_mask_add == null) {
                     // Sliding-window prefill: the band mask runs in-kernel.
                     if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
                         _ = mlx.mlx_array_free(attn_out);
@@ -8084,7 +8247,11 @@ pub const Transformer = struct {
                         // kernel was expected to cover this layer but a
                         // per-call precondition declined — build it now (and
                         // keep it for the remaining layers).
-                        local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, @intCast(cfg.sliding_window));
+                        // Same trimmed length as the eager build: this arm
+                        // is only reachable when the band was expected
+                        // in-kernel, which is also when the trim declines, but
+                        // reading ONE variable keeps them from drifting.
+                        local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding_kv_len, @intCast(cfg.sliding_window));
                         sel_mask = local_prefill_mask;
                     }
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", sel_mask, .{ .ctx = null }, self.s));
@@ -8786,12 +8953,15 @@ pub const Transformer = struct {
         if ((is_gemma4 or is_laguna) and cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
+            const sliding = slidingViewFor(cfg, total_kv, seq_len);
             if (is_prefill) {
                 // Skipped when the fused hd-256 kernel band-masks in-kernel
-                // (the mask itself is chunk x total_kv — GBs at long ctx);
-                // gemma4MoeAttnWith lazily builds it if a call declines.
-                if (!(fused256Enabled() and cfg.head_dim == 256 and seq_len >= 2)) {
-                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                // (the mask itself is chunk x kv_len — GBs at long ctx);
+                // gemma4MoeAttnWith/lagunaAttnWith lazily build it if a call
+                // declines. Built at the TRIMMED length, which is what the
+                // attn fns hand SDPA.
+                if (!sliding.band_in_kernel) {
+                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                 }
             }
             if (!is_prefill and total_kv > sw) {
@@ -10777,9 +10947,13 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(v_t);
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
 
-        // KV cache: sliding layers trim to the window on DECODE (prefill keeps
-        // the full buffer; the mask handles scope), full layers keep everything.
-        const max_kv: u32 = if (is_full) 0 else cfg.sliding_window;
+        // KV cache: sliding layers read only the tail their queries reach
+        // (`window + q_len - 1`), full layers keep everything. Laguna is
+        // serial, so its multi-token forwards are prefill CHUNKS — at chunk
+        // 2048 / window 512 that is where both the KV read and the mask
+        // collapse. Every mask below is built at `sliding.kv_len` to match.
+        const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
+        const max_kv: u32 = if (is_full) 0 else sliding.span;
         var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
         defer kv_view.deinit();
         const full_k = kv_view.k;
@@ -10807,7 +10981,7 @@ pub const Transformer = struct {
                     f_mode = "causal";
                 } else if (is_prefill) {
                     if (local_prefill_mask.ctx == null) {
-                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                     }
                     f_mode = "array";
                     f_mask = local_prefill_mask.*;
@@ -10845,7 +11019,7 @@ pub const Transformer = struct {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
                 } else if (is_prefill) {
                     if (local_prefill_mask.ctx == null) {
-                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                     }
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, self.s));
                 } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
@@ -11011,10 +11185,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(v_t);
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
 
-        // KV cache: full history; sliding-layer DECODE reads the last-window
-        // view (the mask handles prefill scope).
+        // KV cache: sliding layers read only the tail their queries reach.
+        // Nothing else here changes — inklingRelBias and inklingCombineMask
+        // already take `kv_len` off the view and `kv_start = total_kv - kv_len`,
+        // so they are correct for any trim; they simply never got one. Inkling
+        // is serial, so the width that matters is the prefill chunk.
         const total_kv: c_int = offset + seq_len;
-        const max_kv: u32 = if (!is_prefill and !is_global and cfg.has_sliding_window) cfg.sliding_window else 0;
+        const sliding = slidingViewFor(cfg, total_kv, seq_len);
+        const max_kv: u32 = if (is_global) 0 else sliding.span;
         var kv_view = try cache.update(layer, k_t, v_t, self.s, max_kv);
         defer kv_view.deinit();
         const kv_len: c_int = mlx.getShape(kv_view.k)[2];
@@ -11179,8 +11357,13 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(k_rope);
         try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, rope_scale, offset, rope_freqs, self.s));
 
-        // Update KV cache (trim to sliding window for local layers)
-        const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
+        // Update KV cache: local layers read only the tail their queries
+        // reach (`window + q_len - 1`), so a spec-verify block stops paying
+        // full attention on every sliding layer. The masks below are built at
+        // `sliding.kv_len` to match; when the fused hd-256 kernel owns the
+        // band it declines the trim and `sliding.kv_len == total_kv`.
+        const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
+        const max_kv: u32 = if (is_global) 0 else sliding.span;
         var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
         defer kv_view.deinit();
         const full_k = kv_view.k;
@@ -11227,7 +11410,7 @@ pub const Transformer = struct {
                     if (local_prefill_mask.ctx == null) {
                         // Eager build was skipped for the fused path but this
                         // call declined — build once, cache for later layers.
-                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                     }
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, self.s));
                 }
@@ -17835,6 +18018,140 @@ fn testKV(seq_len: usize, s: mlx.mlx_stream) mlx.mlx_array {
     var arr = mlx.mlx_array_new();
     _ = mlx.mlx_zeros(&arr, &shape, 4, .float32, s);
     return arr;
+}
+
+test "slidingTailSpan covers the whole block, not just the last query" {
+    // Decode width: unchanged, exactly the window.
+    try testing.expectEqual(@as(u32, 2048), slidingTailSpan(2048, 1, SLIDING_TRIM_UNBOUNDED));
+    // A block of q queries needs window + q - 1 tail entries: the FIRST query
+    // in the block reaches back furthest.
+    try testing.expectEqual(@as(u32, 2052), slidingTailSpan(2048, 5, SLIDING_TRIM_UNBOUNDED));
+    try testing.expectEqual(@as(u32, 2063), slidingTailSpan(2048, 16, SLIDING_TRIM_UNBOUNDED));
+    // A PREFILL CHUNK is not special-cased any more: the old 32-wide cap kept
+    // laguna and inkling — serial archs whose only multi-token forward IS a
+    // chunk — from ever taking the trim.
+    try testing.expectEqual(@as(u32, 2080), slidingTailSpan(2048, 33, SLIDING_TRIM_UNBOUNDED));
+    try testing.expectEqual(@as(u32, 2559), slidingTailSpan(512, 2048, SLIDING_TRIM_UNBOUNDED));
+    // Non-sliding layer and empty forward still decline.
+    try testing.expectEqual(@as(u32, 0), slidingTailSpan(0, 5, SLIDING_TRIM_UNBOUNDED));
+    try testing.expectEqual(@as(u32, 0), slidingTailSpan(2048, 0, SLIDING_TRIM_UNBOUNDED));
+    // max_width 1 is how the policy pins a forward to decode-only trimming.
+    try testing.expectEqual(@as(u32, 4), slidingTailSpan(4, 1, 1));
+    try testing.expectEqual(@as(u32, 0), slidingTailSpan(4, 2, 1));
+}
+
+test "slidingViewFor declines the trim only where the fused kernel really bands" {
+    var cfg = ModelConfig{};
+    cfg.has_sliding_window = true;
+    cfg.sliding_window = 512;
+
+    // hd 256 with the fused kernel on. The kernel declines everything below
+    // FUSED256_MIN_Q_LEN, so a spec-verify block is NOT band-masked in-kernel
+    // and must take the trim — the predicate used to say `seq_len >= 2`, which
+    // handed gemma nothing at exactly the widths spec decode runs at.
+    cfg.head_dim = 256;
+    fused256_override = true;
+    defer fused256_override = null;
+    {
+        const decode = slidingViewFor(&cfg, 20000, 1);
+        try testing.expect(!decode.band_in_kernel);
+        try testing.expectEqual(@as(u32, 512), decode.span);
+        try testing.expectEqual(@as(c_int, 512), decode.kv_len);
+
+        const verify = slidingViewFor(&cfg, 20000, 8);
+        try testing.expect(!verify.band_in_kernel);
+        try testing.expectEqual(@as(u32, 519), verify.span);
+        try testing.expectEqual(@as(c_int, 519), verify.kv_len);
+
+        // At the kernel's floor and above, the band IS in-kernel: it derives
+        // absolute positions from the K length, so the view stays WHOLE
+        // (span 0) and any mask built for it is built at total_kv.
+        const chunk = slidingViewFor(&cfg, 20000, FUSED256_MIN_Q_LEN);
+        try testing.expect(chunk.band_in_kernel);
+        try testing.expectEqual(@as(u32, 0), chunk.span);
+        try testing.expectEqual(@as(c_int, 20000), chunk.kv_len);
+    }
+
+    // hd 128 (laguna, inkling): no fused kernel, so even a wide prefill chunk
+    // trims — that is the whole win on a serial arch.
+    cfg.head_dim = 128;
+    {
+        const chunk = slidingViewFor(&cfg, 32768, 2048);
+        try testing.expect(!chunk.band_in_kernel);
+        try testing.expectEqual(@as(u32, 2559), chunk.span);
+        try testing.expectEqual(@as(c_int, 2559), chunk.kv_len);
+    }
+
+    // A cache shorter than the span is not trimmed, and the reported kv_len is
+    // what the view will actually be — masks are built from it.
+    {
+        const short = slidingViewFor(&cfg, 300, 8);
+        try testing.expectEqual(@as(c_int, 300), short.kv_len);
+    }
+
+    // Non-sliding config: no trim, kv_len is the whole cache.
+    cfg.has_sliding_window = false;
+    {
+        const full = slidingViewFor(&cfg, 20000, 8);
+        try testing.expectEqual(@as(u32, 0), full.span);
+        try testing.expectEqual(@as(c_int, 20000), full.kv_len);
+    }
+}
+
+test "FUSED256_MIN_Q_LEN is the single source for the decline and the band predicate" {
+    // These two drifted once already — the kernel declined below 16 while the
+    // trim predicate said 2 — and the cost was silent: gemma declined the trim
+    // at every spec-verify width and then fell through to the explicit-mask
+    // path anyway. Needles are assembled at comptime so this test's own source
+    // cannot satisfy the scan.
+    const src = @embedFile("transformer.zig");
+    const name = "FUSED256_" ++ "MIN_Q_LEN";
+    // The kernel's own decline reads the constant...
+    try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < " ++ name ++ ") return null;") != null);
+    // ...and so does the trim policy in slidingViewFor.
+    try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ name) != null);
+    // Neither may respell the floor as a literal.
+    try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < 1" ++ "6)") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ "2") == null);
+}
+
+test "KVCache trims the tail view for a BLOCK-wide update, not just decode" {
+    // The spec-verify shape: a block of queries lands at the tail of a cache
+    // already longer than the window. Before the block trim, `new_len > 1`
+    // fell through with view_start 0 and the layer read the ENTIRE cache.
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+
+    // 10 prefill positions, untrimmed (a wide chunk keeps the full view).
+    {
+        const k = testKV(10, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(10, s);
+        defer _ = mlx.mlx_array_free(v);
+        var dv = try cache.update(0, k, v, s, 0);
+        dv.deinit();
+    }
+    try testing.expectEqual(@as(usize, 10), cache.entries[0].offset);
+
+    // Now a 3-wide verify block against a window of 4 → span 4 + 3 - 1 = 6.
+    const span = slidingTailSpan(4, 3, SLIDING_TRIM_UNBOUNDED);
+    try testing.expectEqual(@as(u32, 6), span);
+    {
+        const k = testKV(3, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(3, s);
+        defer _ = mlx.mlx_array_free(v);
+        var dv = try cache.update(0, k, v, s, span);
+        defer dv.deinit();
+        const view_shape = mlx.getShape(dv.k);
+        try testing.expectEqual(@as(c_int, 6), view_shape[2]);
+        const v_shape = mlx.getShape(dv.v);
+        try testing.expectEqual(@as(c_int, 6), v_shape[2]);
+    }
+    // Absolute bookkeeping is untouched by the view trim.
+    try testing.expectEqual(@as(usize, 13), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 13), cache.step);
 }
 
 test "KVCache sliding window views return last max_seq entries" {

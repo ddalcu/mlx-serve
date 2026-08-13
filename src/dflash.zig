@@ -1332,6 +1332,12 @@ pub const TinyFix = struct {
 
     // Tiny llama trunk: vocab 128, hidden 64, 4 layers, 4 q / 2 kv heads,
     // hd 16, inter 128, tied embeddings.
+    // The trunk SLIDES at 8 on purpose: the greedy-equivalence test runs a
+    // 12-token prompt out to 16 tokens, so every decode step and every verify
+    // block sits past the window. That makes serial (width 1, view trimmed to
+    // the window) vs dflash (width 4, trimmed to window + 3) the pairing guard
+    // for `slidingTailSpan` and the relative mask offsets — a wrong trim or a
+    // mask built against the untrimmed length diverges the two streams.
     pub const TRUNK_CONFIG =
         \\{
         \\  "model_type": "llama",
@@ -1345,6 +1351,7 @@ pub const TinyFix = struct {
         \\  "rms_norm_eps": 1e-5,
         \\  "rope_theta": 10000.0,
         \\  "tie_word_embeddings": true,
+        \\  "sliding_window": 8,
         \\  "max_position_embeddings": 2048,
         \\  "torch_dtype": "bfloat16"
         \\}

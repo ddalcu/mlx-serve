@@ -436,6 +436,15 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// The frame model is not that: rounding 22.8 up to 26 costs a 32 GB Mac
     /// the 4-bit pack it exists for. 0 falls back to `approxRAMGB`.
     var stagedPeakGB: Double = 0
+    /// The pack carries its OWN text encoder. LTX 2.3 borrows the shared
+    /// `mlx-community/gemma-3-12b-it-4bit` download (also a chat model, so it
+    /// is a separate bundle component); 2.5 ships a Lightricks fine-tune of
+    /// Gemma-4-12B in its own subdirectory, which the server resolves from
+    /// inside the pack rather than from `~/.mlx-serve/models`. Declared,
+    /// because it decides the download bundle's SHAPE — a 2.5 pack that also
+    /// pulled the shared encoder would fetch 8 GB it never opens, and one
+    /// that didn't ship its own would generate against the wrong encoder.
+    var shipsOwnTextEncoder: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -469,12 +478,23 @@ struct VideoModelPreset: Identifiable, Hashable {
         return frameOptions.first(where: { $0 >= needed }) ?? cap
     }
 
-    /// LTX-2.3 trained resolutions. README default is 480×704 (portrait).
+    /// LTX trained resolutions, every edge divisible by **64**.
+    ///
+    /// Not cosmetic: the Quality and Super Quality tiers run two-stage
+    /// pipelines whose first stage is HALF resolution, and the latent grid is
+    /// /32 — so a full-resolution edge that is only /32 leaves stage 1 on a
+    /// fractional grid and the server refuses it by name. The list used to
+    /// carry 704×480 and 480×704 (and defaulted to one of them), so picking
+    /// Quality on a fresh install was an immediate 400.
+    ///
+    /// 448 replaces 480 as the short edge: it is the nearest /64 value, so the
+    /// two landscape/portrait pairs keep their place in the list. Pinned by
+    /// `testEveryLtxResolutionSurvivesTheTwoStagePipelines`.
     private static let ltxResolutions: [ResolutionOption] = [
-        .init(width: 704,  height: 480, label: "704 × 480 (landscape 3:2)"),
-        .init(width: 480,  height: 704, label: "480 × 704 (portrait 3:4) — default"),
-        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2)"),
+        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2) — default"),
         .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)"),
+        .init(width: 704,  height: 448, label: "704 × 448 (landscape 14:9)"),
+        .init(width: 448,  height: 704, label: "448 × 704 (portrait 9:14)"),
     ]
 
     /// LTX-2.3 frame ladder — every valid `8N+1` count from 9 up to
@@ -514,6 +534,41 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use."
+        )
+    }()
+
+    /// LTX-2.5 (August 2026). The DiT is 2.3's key template minus the 96
+    /// video-FF biases plus one `keyframes_abs_pos_embedding`, and the
+    /// connector, both VAEs, the vocoder and both upscalers re-ship
+    /// byte-identical — so every resolution, frame and quality number here is
+    /// deliberately 2.3's. What changed is the text encoder: a Lightricks
+    /// fine-tune of Gemma-4-12B, shipped INSIDE the pack, which is why this
+    /// one pulls nothing extra on first run.
+    static let ltx25Q4: VideoModelPreset = {
+        let cap = 193
+        return VideoModelPreset(
+            id: "ddalcu/LTX-2.5-MLX-Serve-4bit",
+            name: "LTX-Video 2.5 Q4 (with audio, ~36 GB)",
+            repo: "ddalcu/LTX-2.5-MLX-Serve-4bit",
+            // Self-contained: the ~6.7 GB encoder is part of the pack, so the
+            // first-run figure is the same number rather than +8 GB.
+            approxDownloadGB: 36,
+            approxFirstRunDownloadGB: 36,
+            approxRAMGB: 24,
+            resolutions: ltxResolutions,
+            defaultResolution: ltxResolutions[0],
+            fps: 24,
+            qualityProfiles: [
+                .fast:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 49),
+                .good:         .init(mode: .oneStage,   steps: 12, cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
+                .quality:      .init(mode: .twoStage,   steps: 30, cfgScale: 3.0, stgScale: 1.0, numFrames: 97),
+                .superQuality: .init(mode: .twoStageHQ, steps: 15, cfgScale: 3.0, stgScale: 0.0, numFrames: 97),
+            ],
+            defaultQuality: .good,
+            maxFrames: cap,
+            frameOptions: frameLadder(maxFrames: cap),
+            description: "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use.",
+            shipsOwnTextEncoder: true
         )
     }()
 
@@ -687,7 +742,7 @@ struct VideoModelPreset: Identifiable, Hashable {
         supportsReferences: true
     )
 
-    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA]
+    static let all: [VideoModelPreset] = [.ltx25Q4, .ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)

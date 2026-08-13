@@ -10823,6 +10823,35 @@ test "renderChatTemplate: muse thinking-off no-tools commits the to=user channel
     try testing.expect(std.mem.endsWith(u8, off_tools, "<|start|>assistant"));
 }
 
+test "renderChatTemplate: muse template dedups a client-supplied reasoning directive" {
+    // Upstream a4e59da (#35): a system prompt already carrying a "Reasoning
+    // effort/strength" line used to get the template's own "Reasoning
+    // strength: high." appended after it — two conflicting directives, ours
+    // stomping the client's. The template now normalizes the spelling and
+    // skips its own line. Rendered through OUR jinja.cpp because the fix
+    // rides the `replace`/`lower` filters and the `in` operator — a silently
+    // no-op filter keeps the duplicate while the render still succeeds.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "Be terse.\nReasoning effort: low." },
+        .{ .role = "user", .content = "hi" },
+    };
+    const r = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+    defer allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "Reasoning strength: low.") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "Reasoning effort") == null);
+    const first = std.mem.indexOf(u8, r, "Reasoning strength").?;
+    try testing.expect(std.mem.indexOfPos(u8, r, first + 1, "Reasoning strength") == null);
+}
+
 test "renderChatTemplate: thinking-off closes a template-opened think block (LFM2.5 class)" {
     // LFM2.5's template opens `<think>` unconditionally; thinking-off used to
     // mean generating the whole reasoning pass and discarding it. Closing the

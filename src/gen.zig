@@ -883,7 +883,14 @@ fn dirHasConfig(dir: []const u8) bool {
     return true;
 }
 
-const LTX_PAD_LEN: usize = 256; // gemma left-pad length
+// The reference's `TOKENIZER_MAX_LENGTH` (ltx_core/text_encoders/gemma/
+// gemma_assets.py), for 2.3 and 2.5 alike. `LTXGemmaTokenizer` DEFAULTS to 256,
+// but no caller uses that default — `build_gemma_tokenizer` passes 1024, and the
+// encoder's own docstring says "the tokenizer pads every prompt to max_length
+// (1024)". We shipped 256 from the 2.3 port onwards, which left the connector
+// tiling its 128 learnable registers over 2 slots instead of 8 and gave the DiT
+// a quarter of the text rows it was trained to cross-attend to.
+const LTX_PAD_LEN: usize = 1024; // gemma left-pad length
 const LTX_PAD_ID: i32 = 0; // gemma <pad>
 const LTX_GEMMA_BOS: i32 = 2; // <bos>
 
@@ -892,7 +899,7 @@ const LTX_GEMMA_BOS: i32 = 2; // <bos>
 // scrambled subtitle-like captions into the frame; these terms steer CFG away
 // from that. The audio tail (lip sync, muted/distorted voice, background
 // noise, dialogue terms) is load-bearing for speech when audio CFG runs; if
-// the whole thing ever exceeds LTX_PAD_LEN (~229 tokens today, 256 budget),
+// the whole thing ever exceeds LTX_PAD_LEN (~229 tokens today, 1024 budget),
 // ltxPadWithBos left-truncates and keeps that tail.
 const LTX_NEGATIVE_PROMPT =
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, " ++
@@ -1065,6 +1072,10 @@ pub const LtxVideoEngine = struct {
     tok: tok_mod.Tokenizer,
     gemma_dir: []u8,
     model_dir: []u8,
+    /// Which LTX release this pack is, read from its own config.json at load.
+    /// It decides the text encoder (2.5 ships its own, in-pack) and the two
+    /// DiT-side differences; the geometry is shared.
+    ltx_cfg: ltx.LtxConfig = .{},
     // Runtime LoRA state (mirrors ImageEngine): the Stack owns the adapter
     // arrays the transformer Component's `lora` pointer reads through, so it
     // must live until the next detach (clearLora).
@@ -1082,9 +1093,10 @@ pub const LtxVideoEngine = struct {
         self.lora_stack = null;
         self.lora_matched = 0;
 
-        self.gemma_dir = try resolveGemmaDir(io, allocator);
+        self.ltx_cfg = ltx.loadLtxConfig(io, allocator, model_dir);
+        self.gemma_dir = try resolveGemmaDir(io, allocator, model_dir, self.ltx_cfg.version);
         errdefer allocator.free(self.gemma_dir);
-        log.info("[video] gemma text encoder: {s}\n", .{self.gemma_dir});
+        log.info("[video] LTX {s} — gemma text encoder: {s}\n", .{ @tagName(self.ltx_cfg.version), self.gemma_dir });
         self.model_dir = try allocator.dupe(u8, model_dir);
         errdefer allocator.free(self.model_dir);
 
@@ -1657,13 +1669,26 @@ const LTX_GEMMA_REPO_DIR = "mlx-community/gemma-3-12b-it-4bit";
 /// owns downloads. `$LTX_GEMMA_DIR` stays as an explicit override (tests /
 /// custom installs). A candidate is accepted only if it has a `config.json`,
 /// so a partial download never gets handed back.
-fn resolveGemmaDir(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+fn resolveGemmaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, version: ltx.LtxVersion) ![]u8 {
     if (std.c.getenv("LTX_GEMMA_DIR")) |env| {
         const e = std.mem.span(env);
         // A relative override would feed openFileAbsolute's assert downstream
         // (ReleaseFast UB) — ignore it loudly instead.
         if (e.len > 0 and std.fs.path.isAbsolute(e)) return allocator.dupe(u8, e);
         if (e.len > 0) log.warn("[video] ignoring non-absolute LTX_GEMMA_DIR: {s}\n", .{e});
+    }
+    // 2.5 ships a FINE-TUNED encoder inside the pack, so the pack is
+    // self-contained and there is no shared repo to fall back to: a 2.5 pack
+    // whose subdir is missing is incomplete, not a 2.3 pack.
+    if (version.textEncoderSubdir()) |sub| {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, sub });
+        errdefer allocator.free(dir);
+        const cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{dir}, 0);
+        defer allocator.free(cfg);
+        if (fileExists(io, cfg)) return dir;
+        allocator.free(dir);
+        log.err("[video] LTX 2.5 pack is missing its text encoder ({s}/{s})\n", .{ model_dir, sub });
+        return error.NoGemmaDir;
     }
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoGemmaDir);
     if (!std.fs.path.isAbsolute(home)) return error.NoGemmaDir;
@@ -3084,7 +3109,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             // Run the schedule the loaded variant was trained for; the request
             // never forces a swap here (dev-only bundles keep working).
             const distilled = engine.transformer_variant == .distilled;
-            break :blk ltx.generateVideoFrames(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, &engine.vae, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
         .two_stage, .two_stage_hq => blk: {
             engine.ensureTransformer(.dev) catch |err| break :blk err;
@@ -3097,7 +3122,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = Stage2Swap.swap,
             };
-            break :blk ltx.generateVideoFramesTwoStage(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
         if (err == error.Cancelled) {
@@ -4411,6 +4436,19 @@ test "a2vidMuxSampleCount trims to video duration and never exceeds the clip" {
     try testing.expectEqual(@as(usize, 0), a2vidMuxSampleCount(100, 2, 48000, 97, 0.0));
 }
 
+// The connector fills the padded region by TILING its 128 learnable registers
+// (`ltx_video.connectorTransform`: `num_tiles = T / num_reg`, integer division).
+// A pad length that is not a whole number of tiles silently drops the remainder
+// — the text embeddings come out short and nothing errors. 1024 is also the
+// reference's own `TOKENIZER_MAX_LENGTH`; 256 was ours, and it gave the DiT a
+// quarter of the text rows the connector was trained against.
+test "LTX pad length is the reference's 1024 and a whole number of register tiles" {
+    try std.testing.expectEqual(@as(usize, 1024), LTX_PAD_LEN);
+    const registers: usize = 128; // connector.*.learnable_registers rows
+    try std.testing.expectEqual(@as(usize, 0), LTX_PAD_LEN % registers);
+    try std.testing.expectEqual(@as(usize, 8), LTX_PAD_LEN / registers);
+}
+
 test "LTX negative prompt keeps the reference audio negatives (speech guidance)" {
     // The audio tail of the reference DEFAULT_NEGATIVE_PROMPT does real work
     // for dialogue: with audio CFG active (two-stage, ap.cfg=7.0) these terms
@@ -4836,6 +4874,16 @@ test "LTX bills ONE transformer variant, plus the text encoder its dir cannot se
     try std.testing.expect(ltxPeakBytes(dir_sum - variant, 0, gemma) > dir_sum - variant);
     // A missing/unfound encoder dir contributes nothing rather than guessing.
     try std.testing.expectEqual(dir_sum - variant, ltxPeakBytes(dir_sum, variant, 0));
+
+    // LTX 2.5 ships its text encoder INSIDE the pack, and `sumSafetensorsIn`
+    // recurses one level — so `dir_sum` already carries it. It is resident
+    // only while the engine is (loaded per generation, freed on return), so
+    // the peak is still sum-minus-spare and the encoder must NOT also ride in
+    // as a stage: that bills 6.8 GiB twice and refuses loads that fit.
+    const te_in_pack: u64 = 6_800 * MB;
+    const sum_25: u64 = dir_sum + te_in_pack;
+    try std.testing.expectEqual(sum_25 - variant, ltxPeakBytes(sum_25, variant, 0));
+    try std.testing.expect(ltxPeakBytes(sum_25, variant, te_in_pack) > sum_25 - variant);
 }
 
 test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {

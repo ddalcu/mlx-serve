@@ -4,10 +4,12 @@ import AVKit
 import AVFoundation
 import UniformTypeIdentifiers
 
-/// Video generation window — LTX-Video 2.3, run natively by the mlx-serve server.
-/// Uses the same Quality / Resolution preset shape as ImageGen, plus a
-/// Frames dropdown clamped to LTX's `8N+1` ladder and the user's RAM
-/// budget.
+/// Video generation window — LTX-Video (2.3 / 2.5) and MiniMax-H3, run
+/// natively by the mlx-serve server. Uses the same Quality / Resolution preset
+/// shape as ImageGen, plus a Frames slider clamped to LTX's `8N+1` ladder and
+/// the user's RAM budget. Which controls are offered is decided by the
+/// preset's declared capabilities, never by its id — the two LTX releases
+/// share every one of them.
 struct VideoGenView: View {
     @EnvironmentObject var service: VideoGenService
     @EnvironmentObject var server: ServerManager

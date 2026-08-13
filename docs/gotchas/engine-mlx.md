@@ -6,7 +6,7 @@ Full histories: live failures, measurements, diagnosis ladders, dead ends. The d
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 
 ### Sliding window KV cache
-Gemma 4 E4B (512-token window) keeps full buffer — no trimming. Prefill returns all entries (Q/K dim match); decode views return last `sw`. Mask handles attention scope. Matches mlx-lm `RotatingKVCache`.
+Gemma 4 E4B (512-token window) keeps full BUFFER — nothing is ever dropped. What is trimmed is the VIEW handed to attention: `slidingViewFor` sizes it to the tail this forward can reach. Matches mlx-lm `RotatingKVCache` on the buffer; see "The sliding trim was decode-only for every arch" below for the view.
 
 ### Hot-cache restore must CLAMP the cache offset to the matched length, never trust the snapshot length (offset-drift / mask-crash class)
 The `offset` passed to a forward drives BOTH the RoPE positions (`mlx_fast_rope(..., offset, ...)`) and the attention mask width (`total_kv = offset + seq_len`). The KV buffer that mask attends to has length `entry.offset + new_len` (the CACHE's own offset). These two offsets MUST stay equal — if they drift, RoPE positions are wrong AND (on Gemma sliding-window layers, which build an explicit `"array"` mask via `createSlidingWindowMask(seq_len, total_kv, sw)`) the mask can't broadcast against the KV, crashing the whole process with `MLX error: [broadcast_shapes] Shapes (1,1,Q,total_kv) and (1,H,Q,buf_len) cannot be broadcast`. Other archs take SDPA's `"causal"` fast path (no explicit mask) so they only suffer the silent RoPE drift, not the crash.
@@ -2119,3 +2119,82 @@ FLATTENS, so the loudest row's cutoff masked the rest to -inf and softmax
 returned NaN. Correct-by-accident for every `[1, V]` caller before it. A
 reduction helper that has only ever seen one row cannot reveal an axis bug, and
 "only ever seen one row" is a property of the CALLERS.
+
+### The sliding trim was decode-only for every arch, and its guard predicate had drifted
+
+`KVCache.updateDense`/`updateAffine` computed the trimmed view start under
+`is_decode = new_len == 1`. Single-token decode got the last `sliding_window`
+entries; **every other forward fell through with `view_start = 0` and read the
+entire cache on every sliding layer**. That is every spec-verify block and every
+prefill chunk. On muse-glimmer, which slides 39 of 52 layers, verify went 51 ms
+at 0.6k to 140 ms at 17.6k and DFlash turned from a 2.28x win into a 0.74x
+LOSS — the drafter was making things slower the longer the conversation got.
+
+The fix is one line of arithmetic: a block of `q_len` queries needs
+`window + q_len - 1` tail entries, because the FIRST query of the block reaches
+back furthest, not the last. Decode is the `q_len == 1` case of the same
+formula, which is why it looked correct for so long.
+
+**Why trimming the view is safe at all.** Every consumer of the K view derives
+its query offset RELATIVELY: `createCausalMask`/`createSlidingWindowMask` use
+`offset_val = kv_len - q_len`, the fused hd-256 kernel uses `q_off = kL - qL`
+with the band test `(row_pos - col) >= SW`, and `inklingAttnWith` already read
+`kv_len` off the view shape and threaded `kv_start = total_kv - kv_len` into its
+bias and mask. So a trimmed view is correct **provided the mask is built at the
+trimmed length**. Hand a trimmed view a mask sized at `total_kv` and it does not
+crash — it attends to the wrong slice and the output silently changes. That
+pairing is the whole contract, which is why the guard is per-arch greedy
+byte-identity rather than a shape assertion.
+
+**The band exception, and the predicate that had drifted off it.** The one
+consumer reading ABSOLUTE positions is the fused hd-256 kernel when it
+band-masks in-kernel, so `band_in_kernel` declines the trim. That predicate
+tested `seq_len >= 2` — but `fusedSdpa256Prefill` declines everything below 16
+(`FUSED256_MIN_Q_LEN`, matching oMLX's `_MIN_ROUTE_Q_LEN`; short queries belong
+to MLX's `sdpa_vector`). So every gemma spec verify, at 4-8 wide, was treated as
+kernel-handled, declined the trim, and then fell through to the explicit-mask
+path anyway. **Gemma got nothing from the trim at all.** A guard predicate that
+is stricter than the thing it guards is a silent no-op: nothing fails, nothing
+logs, the optimization just never runs. Both sites now read the one constant and
+a source scan pins them together.
+
+**The width cap was the other half.** A `SLIDING_TRIM_MAX_WIDTH` of 32 kept
+prefill chunks out while the mask pairing was unproven. That is exactly backwards
+for a SERIAL arch: laguna and inkling never speculate, so a prefill chunk is the
+only multi-token forward they ever do, and the cap excluded the only case that
+could have helped them. With `band_in_kernel` gating the real absolute-position
+consumer, width needs no bound.
+
+Measured, all same-session pairs (screenshare on the GPU, so read the shape not
+the third digit):
+
+| arch | what | trim off | trim on |
+|---|---|---|---|
+| muse-glimmer | verify @ 17.6k | 140 ms | 80 ms (DFlash 0.74x → 1.10x) |
+| gemma4-26b-a4b | decode @ 18.7k, PLD | 95.5 tok/s | 102.9 tok/s |
+| laguna-XS | prefill @ 19.4k | 504 tok/s | 763 tok/s |
+| inkling-small | prefill @ 19.2k | 125 tok/s | 181 tok/s |
+
+The gemma win grows monotonically with context (flat at 0.7k, +2.4% at 4.9k,
++5.5% at 9.6k, +7.7% at 18.7k) — the signature of a read that used to scale with
+the whole cache and now scales with the window.
+
+**Testing trap: a prefill chunk only takes the trim once it lands at a non-zero
+offset.** Chunk 1 has `total_kv == seq_len`, which the span always covers, so
+nothing is trimmed. With the default 8192 chunk a serial arch needs a prompt
+past ~16k before any chunk trims — an 8k prompt prefills in ONE chunk and the
+trim-on/trim-off arms agree for the wrong reason. `slidingViewFor` therefore
+logs a one-shot `[sliding] block trim engaged` line, and
+`tests/test_sliding_window_trim.sh` asserts its presence in the ON arm's log and
+its ABSENCE in the OFF arm's — an A/B arm is proven by an engagement line in its
+own log, never by the env it was launched with.
+
+**Not covered here.** The diffusion canvas path uses a different convention
+(`sliding_window - 1`, plus the whole canvas, which is not a causal tail), and
+`createSlidingWindowDecodeMask` is now an all-zeros no-op — with the view
+already exactly `sw`, `window_start = kv_len - window = 0` masks nothing, yet
+passing `sel_mode = "array"` likely costs MLX's fused SDPA path. Both are real
+follow-ups, neither belongs to this change. The prefill memory guards
+(`prefillAttnKeys`, `server.dsv4PrefillMemoryNeeded`) still bill on `total_kv`,
+so they now over-estimate — conservative, and retuning them is its own measured
+change.

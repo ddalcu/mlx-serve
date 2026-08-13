@@ -164,6 +164,150 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(b.components[0].selection.keepSafetensors?.count, 8)   // allowlist (incl. audio VAE + vocoder + image encoder + two-stage weights)
     }
 
+    /// 2.5 ships its own text encoder, so its bundle must NOT carry the shared
+    /// Gemma-3 chat model as a dependency (8 GB fetched for something the
+    /// server never opens) — and it must reach INTO the pack for the encoder
+    /// it does use, which needs a recursive fetch and a directory ready
+    /// marker. Every one of those follows from `shipsOwnTextEncoder`, which is
+    /// why the flag is what the bundle switches on.
+    func testLtx25ShipsItsOwnEncoderAndPullsNoSharedGemma() {
+        let b = VideoModelPreset.ltx25Q4.bundle
+        XCTAssertTrue(VideoModelPreset.ltx25Q4.shipsOwnTextEncoder)
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertEqual(b.primaryRepo, "ddalcu/LTX-2.5-MLX-Serve-4bit")
+        XCTAssertEqual(b.dependencyRepos, [])
+        XCTAssertFalse(b.dependencyRepos.contains(MediaBundle.ltxGemmaRepo))
+        XCTAssertTrue(b.components[0].selection.recursive)
+        // The encoder's weights are `model.safetensors` — an allowlist without
+        // it downloads a pack whose text path cannot load.
+        XCTAssertEqual(b.components[0].selection.keepSafetensors?.contains("model.safetensors"), true)
+        XCTAssertTrue(b.components[0].readyMarkers.contains(MediaBundle.ltx25TextEncoderDir))
+
+        // 2.3 keeps the shared encoder — the flag is what separates them, not
+        // the backend (both are `.ltx` and share the whole request surface).
+        XCTAssertFalse(VideoModelPreset.ltx23Q4.shipsOwnTextEncoder)
+        XCTAssertEqual(VideoModelPreset.ltx23Q4.bundle.dependencyRepos, [MediaBundle.ltxGemmaRepo])
+        XCTAssertEqual(VideoModelPreset.ltx25Q4.backend, VideoModelPreset.ltx23Q4.backend)
+
+        // First run pulls nothing extra, so the two size figures agree. On 2.3
+        // they must NOT — that difference is the shared encoder.
+        XCTAssertEqual(VideoModelPreset.ltx25Q4.approxDownloadGB,
+                       VideoModelPreset.ltx25Q4.approxFirstRunDownloadGB)
+        XCTAssertNotEqual(VideoModelPreset.ltx23Q4.approxDownloadGB,
+                          VideoModelPreset.ltx23Q4.approxFirstRunDownloadGB)
+    }
+
+    /// Every LTX resolution must survive every QUALITY TIER, and two of the
+    /// four tiers run a two-stage pipeline whose stage 1 is HALF resolution —
+    /// so the server needs both edges divisible by 64 (the latent grid is /32,
+    /// halved). 704x480 and 480x704 are only /32, so picking Quality or Super
+    /// Quality on them earned a 400 with no way to tell from the pane which
+    /// combination was the bad one. The default was one of them.
+    ///
+    /// A resolution offered on a tier that refuses it is the dead-control
+    /// class: the pane must not present a combination the server rejects.
+    func testEveryLtxResolutionSurvivesTheTwoStagePipelines() {
+        // The server gates on the PIPELINE, not the backend, so this asks every
+        // video preset the same question and only holds those that actually
+        // offer a two-stage tier to the /64 rule. A future backend that adopts
+        // two-stage is covered the day it does; H3 (one-stage only) is not
+        // constrained by a rule that cannot apply to it.
+        var checked = 0
+        for preset in VideoModelPreset.all {
+            let twoStageTiers = QualityPreset.allCases.filter {
+                preset.settings($0).mode != .oneStage
+            }
+            guard !twoStageTiers.isEmpty else { continue }
+            checked += 1
+            // Every resolution offered must be legal for those tiers.
+            for r in preset.resolutions {
+                XCTAssertEqual(r.width % 64, 0,
+                               "\(preset.id): \(r.label) width \(r.width) is not /64 — 400s on \(twoStageTiers.map(\.label))")
+                XCTAssertEqual(r.height % 64, 0,
+                               "\(preset.id): \(r.label) height \(r.height) is not /64 — 400s on \(twoStageTiers.map(\.label))")
+            }
+            XCTAssertEqual(preset.defaultResolution.width % 64, 0, "\(preset.id) default resolution is not /64")
+            XCTAssertEqual(preset.defaultResolution.height % 64, 0, "\(preset.id) default resolution is not /64")
+        }
+        // Both LTX presets offer two-stage; a zero here means the loop went
+        // vacuous and the guard stopped guarding anything.
+        XCTAssertGreaterThanOrEqual(checked, 2, "no video preset offers a two-stage tier — guard is vacuous")
+    }
+
+    /// The published repo's ACTUAL file tree (ddalcu/LTX-2.5-MLX-Serve-4bit),
+    /// run through the real bundle selection. A 2.5 pack is only useful if the
+    /// download brings the whole engine AND the in-pack text encoder — and a
+    /// download that quietly misses one file fails 36 GB later, at load, with
+    /// a missing-weight error nobody can map back to the allowlist.
+    func testLtx25BundlePullsEveryFileThePublishedRepoNeeds() {
+        let entries: [[String: Any]] = [
+            ["path": ".gitattributes", "type": "file", "size": 1674],
+            ["path": "LICENSE.md", "type": "file", "size": 30938],
+            ["path": "README.md", "type": "file", "size": 5000],
+            ["path": "ltx-acceptable-use-policy-snapshot-2026-08-12.pdf", "type": "file", "size": 110423],
+            ["path": "config.json", "type": "file", "size": 1039],
+            ["path": "embedded_config.json", "type": "file", "size": 2529],
+            ["path": "quantize_config.json", "type": "file", "size": 100],
+            ["path": "split_model.json", "type": "file", "size": 412],
+            ["path": "spatial_upscaler_x2_v1_1_config.json", "type": "file", "size": 275],
+            ["path": "temporal_upscaler_x2_v1_0_config.json", "type": "file", "size": 273],
+            ["path": "transformer-distilled.safetensors", "type": "file", "size": 11_320_068_903],
+            ["path": "transformer-dev.safetensors", "type": "file", "size": 11_320_068_903],
+            ["path": "connector.safetensors", "type": "file", "size": 6_344_495_770],
+            ["path": "vae_decoder.safetensors", "type": "file", "size": 814_349_515],
+            ["path": "vae_encoder.safetensors", "type": "file", "size": 637_885_335],
+            ["path": "audio_vae.safetensors", "type": "file", "size": 106_509_020],
+            ["path": "vocoder.safetensors", "type": "file", "size": 258_314_115],
+            ["path": "spatial_upscaler_x2_v1_1.safetensors", "type": "file", "size": 995_745_061],
+            ["path": "temporal_upscaler_x2_v1_0.safetensors", "type": "file", "size": 261_945_581],
+            ["path": "gemma4-12b-ltx-v1/model.safetensors", "type": "file", "size": 6_699_162_168],
+            ["path": "gemma4-12b-ltx-v1/config.json", "type": "file", "size": 4438],
+            ["path": "gemma4-12b-ltx-v1/tokenizer.json", "type": "file", "size": 32_169_626],
+            ["path": "gemma4-12b-ltx-v1/tokenizer_config.json", "type": "file", "size": 3736],
+            ["path": "gemma4-12b-ltx-v1/generation_config.json", "type": "file", "size": 255],
+            ["path": "gemma4-12b-ltx-v1/chat_template.jinja", "type": "file", "size": 18683],
+            ["path": "gemma4-12b-ltx-v1/processor_config.json", "type": "file", "size": 1382],
+        ]
+        let sel = VideoModelPreset.ltx25Q4.bundle.components.first!.selection
+        let picked = Set(DownloadManager.selectNeededFiles(from: entries, selection: sel).map(\.0))
+
+        // Everything the LTX engine opens by name.
+        for f in ["config.json", "transformer-distilled.safetensors", "transformer-dev.safetensors",
+                  "connector.safetensors", "vae_decoder.safetensors", "vae_encoder.safetensors",
+                  "audio_vae.safetensors", "vocoder.safetensors",
+                  "spatial_upscaler_x2_v1_1.safetensors", "temporal_upscaler_x2_v1_0.safetensors"] {
+            XCTAssertTrue(picked.contains(f), "engine file \(f) would not be downloaded")
+        }
+        // The in-pack text encoder: weights AND the tokenizer the server loads
+        // beside them. Missing either is a pack that downloads and cannot encode.
+        for f in ["gemma4-12b-ltx-v1/model.safetensors", "gemma4-12b-ltx-v1/config.json",
+                  "gemma4-12b-ltx-v1/tokenizer.json", "gemma4-12b-ltx-v1/tokenizer_config.json"] {
+            XCTAssertTrue(picked.contains(f), "text-encoder file \(f) would not be downloaded")
+        }
+        // Every ready marker must be satisfiable from what was picked, or the
+        // pane offers Download forever on a complete install.
+        for marker in VideoModelPreset.ltx25Q4.bundle.components.first!.readyMarkers {
+            let satisfied = picked.contains(marker) || picked.contains { $0.hasPrefix(marker + "/") }
+            XCTAssertTrue(satisfied, "ready marker \(marker) is never downloaded")
+        }
+        XCTAssertEqual(picked.filter { $0.hasSuffix(".safetensors") }.count, 10)
+    }
+
+    /// The encoder subdir is a three-way contract — the server resolves it,
+    /// the bundle fetches it, the ready marker checks it — with no compiler
+    /// between the Swift and Zig halves. Renaming it on one side makes every
+    /// 2.5 pack fail to load with a message about a missing encoder, so the
+    /// name is scanned out of the server source (same shape as the
+    /// `turbo_lora.safetensors` guard).
+    func testLtx25TextEncoderDirMatchesTheServersOwnConstant() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let src = try String(contentsOf: root.appendingPathComponent("src/ltx_video.zig"), encoding: .utf8)
+        XCTAssertTrue(src.contains("\"\(MediaBundle.ltx25TextEncoderDir)\""),
+                      "src/ltx_video.zig does not name \(MediaBundle.ltx25TextEncoderDir) — the app would fetch an encoder the server never looks for")
+    }
+
     func testFluxAndTtsBundlesAreRecursiveSingleComponent() {
         let f = ImageModelPreset.flux2Klein4B_Q4.bundle
         XCTAssertEqual(f.components.count, 1)

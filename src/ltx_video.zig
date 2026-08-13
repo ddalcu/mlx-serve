@@ -34,13 +34,51 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const transformer_mod = @import("transformer.zig");
 const lora_mod = @import("lora.zig");
 
 const S = mlx.mlx_stream;
 
 // ── Config (from config.json) ──
 
+/// Which LTX release a pack is. 2.5 keeps 2.3's DiT key template minus the 96
+/// video-FF biases and plus one `keyframes_abs_pos_embedding`, and swaps the
+/// text encoder from a shared Gemma-3-12B to a Lightricks-tuned Gemma-4-12B
+/// shipped INSIDE the pack. Everything else — connector geometry, both VAEs,
+/// the vocoder, both upscalers — is unchanged.
+pub const LtxVersion = enum {
+    v23,
+    v25,
+
+    /// `model_version` is "<major>.<minor>.<patch>"; anything we don't
+    /// recognize reads as 2.3, which is what every pack that predates the
+    /// field is.
+    pub fn fromString(v: []const u8) LtxVersion {
+        return if (std.mem.startsWith(u8, v, "2.5")) .v25 else .v23;
+    }
+
+    /// The text encoder a pack of this version brings. 2.5 ships its own
+    /// fine-tuned encoder in a subdirectory (so a pack is self-contained);
+    /// 2.3 points at the shared `mlx-community/gemma-3-12b-it-4bit` download.
+    pub fn textEncoderSubdir(self: LtxVersion) ?[]const u8 {
+        return switch (self) {
+            .v23 => null,
+            .v25 => "gemma4-12b-ltx-v1",
+        };
+    }
+};
+
 pub const LtxConfig = struct {
+    version: LtxVersion = .v23,
+    /// 2.5 sets `ff_bias: false` — the VIDEO feed-forward ships no biases.
+    /// `dQLin` already treats `.bias` as optional, so this is documentation
+    /// for the loader rather than a branch; the AUDIO feed-forward keeps its.
+    ff_bias: bool = true,
+    audio_ff_bias: bool = true,
+    /// 2.5's one new DiT tensor: a learned `[1, video_dim]` row added to the
+    /// tokens of conditioning KEYFRAMES so the model can tell a frame it was
+    /// handed from one it is generating. No keyframe ⇒ never applied.
+    keyframes_abs_pos: bool = false,
     num_heads: u32 = 32,
     head_dim: u32 = 128,
     in_channels: u32 = 128,
@@ -72,6 +110,46 @@ pub const LtxConfig = struct {
         return self.audio_num_heads * self.audio_head_dim; // 2048
     }
 };
+
+/// Parse the fields of `config.json` that DIFFER across LTX releases. The
+/// geometry (48 blocks, 32x128 video / 32x64 audio, connector shape) is
+/// identical in 2.3 and 2.5 and stays as struct defaults — a pack that
+/// disagreed about those would need a new loader, not a new number.
+pub fn parseLtxConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !LtxConfig {
+    var cfg = LtxConfig{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return cfg;
+    defer parsed.deinit();
+    if (parsed.value != .object) return cfg;
+    const root = parsed.value.object;
+    if (root.get("model_version")) |v| {
+        if (v == .string) cfg.version = LtxVersion.fromString(v.string);
+    }
+    if (root.get("ff_bias")) |v| {
+        if (v == .bool) cfg.ff_bias = v.bool;
+    }
+    if (root.get("audio_ff_bias")) |v| {
+        if (v == .bool) cfg.audio_ff_bias = v.bool;
+    }
+    if (root.get("use_keyframes_abs_pos_embedding")) |v| {
+        if (v == .bool) cfg.keyframes_abs_pos = v.bool;
+    }
+    return cfg;
+}
+
+/// Read `<model_dir>/config.json` into an `LtxConfig`. A pack with no readable
+/// config is 2.3 by default — that is what every pack shipped before the field
+/// existed, and refusing to load one would retire working installs.
+pub fn loadLtxConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) LtxConfig {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return .{};
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return .{};
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+    return parseLtxConfig(allocator, bytes) catch .{};
+}
 
 // ── Single-component weight loader ──
 //
@@ -1391,10 +1469,130 @@ fn fmtKey(a: std.mem.Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, suffix });
 }
 
+/// The LTX text-encoder mask: causal AND blind to the left padding, `[1,1,T,T]`
+/// bf16. Both terms are the reference's FINITE -1e9, never -inf — a padding
+/// query row can see nothing but padding, and an all -inf row softmaxes to NaN
+/// which then rides into the connector on rows it has not replaced yet.
+fn causalPadMask(allocator: std.mem.Allocator, ids: []const i32, pad_id: i32, s: S) !mlx.mlx_array {
+    const tn: usize = ids.len;
+    const T: c_int = @intCast(tn);
+    const mbuf = try allocator.alloc(f32, tn * tn);
+    defer allocator.free(mbuf);
+    const neg: f32 = -1e9;
+    for (0..tn) |i| {
+        for (0..tn) |j| {
+            var m: f32 = if (j <= i) 0.0 else neg;
+            if (ids[j] == pad_id) m += neg;
+            mbuf[i * tn + j] = m;
+        }
+    }
+    const mshape = [_]c_int{ 1, 1, T, T };
+    const mask_f32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(mask_f32);
+    var mask = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
+    return mask;
+}
+
+/// LTX 2.5's text encoder: 49 hidden states out of the Lightricks-tuned
+/// Gemma-4-12B the pack ships in `gemma4-12b-ltx-v1/`.
+///
+/// That checkpoint is the SAME `gemma4_unified` decoder mlx-serve already
+/// serves as a chat model — dual head dims on the full-attention layers (512
+/// vs 256), one global KV head, K aliased to V there, partial proportional
+/// RoPE, a per-layer `layer_scalar` — so this runs the real `Transformer` and
+/// taps its residual stream through `capture_layers` instead of hand-rolling
+/// that arithmetic a second time. `gemmaCapture` (2.3, Gemma-3) stays as it
+/// is; the two encoders share only the mask and the sqrt(hidden) embedding
+/// scale.
+///
+/// The prompt is LEFT-PADDED, which the standard forward has no notion of, so
+/// the mask rides in on `ForwardCtx.prefill_mask_add`. ONE forward, no
+/// chunking: the term is sized to the whole prompt.
+///
+/// Caller owns the returned states and the slice.
+pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
+    var config = try model_mod.parseConfig(io, allocator, gemma_dir);
+    var weights = try model_mod.loadWeights(io, allocator, gemma_dir);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try transformer_mod.Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+
+    const n_layers = config.num_hidden_layers;
+    var states = try allocator.alloc(mlx.mlx_array, n_layers + 1);
+    var done: usize = 0;
+    errdefer {
+        for (states[0..done]) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(states);
+    }
+
+    const cap_ids = try allocator.alloc(u32, n_layers);
+    defer allocator.free(cap_ids);
+    for (cap_ids, 0..) |*c, i| c.* = @intCast(i);
+
+    const id_shape = [_]c_int{ 1, @intCast(ids.len) };
+    const ids_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+
+    // states[0] is the embedding output AFTER Gemma's sqrt(hidden) scale —
+    // what `output_hidden_states` returns as hidden_states[0], and what the
+    // connector's 49-state aggregate projection was trained against.
+    states[0] = try xfm.embedding(ids_arr);
+    done = 1;
+
+    const mask = try causalPadMask(allocator, ids, pad_id, s);
+    defer _ = mlx.mlx_array_free(mask);
+
+    for (states[1..]) |*st| st.* = mlx.mlx_array_new();
+    var cl = transformer_mod.CaptureLayers{ .ids = cap_ids, .out = states[1..] };
+    done = states.len;
+    {
+        var ctx = xfm.defaultCtx();
+        ctx.capture_layers = &cl;
+        ctx.prefill_mask_add = mask;
+        // Only the residual stream is wanted, so the 262K-vocab projection
+        // over all 256 prompt rows is pure waste.
+        ctx.skip_lm_head = true;
+        const out = try xfm.forwardWith(&ctx, ids_arr);
+        _ = mlx.mlx_array_free(out);
+    }
+
+    // `capture_layers` is honored by the STANDARD forward only. A checkpoint
+    // that routed elsewhere would leave these empty and the connector would
+    // project 48 blank states into a plausible-looking, meaningless prompt —
+    // so say so instead.
+    for (states) |st| {
+        if (st.ctx == null) return error.GemmaCaptureUnavailable;
+    }
+
+    // The captures are refcount-shared with a LAZY graph whose leaves are the
+    // Transformer's weights, and `xfm.deinit()` runs on the way out — so
+    // realize them here or the frees below pull the inputs out from under it.
+    for (states) |st| _ = mlx.mlx_array_eval(st);
+    return states;
+}
+
 fn addArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&o, x, y, s));
     return o;
+}
+
+/// `[1, Nv, 1]` bf16 selector for the KEYFRAME tokens: 1 where the denoise
+/// mask says a token is clean (supplied by the caller), 0 where it is being
+/// generated. It is the complement of `cond_mask`, so the two can never
+/// disagree about which frames were handed in.
+fn keyframeGate(alloc: std.mem.Allocator, cond_mask: []const f32, s: S) !mlx.mlx_array {
+    const buf = try alloc.alloc(f32, cond_mask.len);
+    defer alloc.free(buf);
+    for (cond_mask, 0..) |m, i| buf[i] = 1.0 - m;
+    const shape = [_]c_int{ 1, @intCast(cond_mask.len), 1 };
+    const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(f32_arr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
+    return out;
 }
 fn mulArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
@@ -1484,23 +1682,8 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
     done = 1;
 
     // ── Combined causal + left-pad mask [1,1,T,T] bf16 ──
-    const tn: usize = ids.len;
-    const mbuf = try allocator.alloc(f32, tn * tn);
-    defer allocator.free(mbuf);
-    const neg: f32 = -1e9;
-    for (0..tn) |i| {
-        for (0..tn) |j| {
-            var m: f32 = if (j <= i) 0.0 else neg;
-            if (ids[j] == pad_id) m += neg;
-            mbuf[i * tn + j] = m;
-        }
-    }
-    const mshape = [_]c_int{ 1, 1, T, T };
-    const mask_f32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
-    defer _ = mlx.mlx_array_free(mask_f32);
-    var mask = mlx.mlx_array_new();
+    const mask = try causalPadMask(allocator, ids, pad_id, s);
     defer _ = mlx.mlx_array_free(mask);
-    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
 
     // ── 48 decoder layers ──
     var li: u32 = 0;
@@ -2450,6 +2633,39 @@ pub fn ditForward(
     // ── patchify ──
     var vh = try linBias(comp, alloc, video_latent, "{s}", .{"transformer.patchify_proj"}, s);
     var ah = try linBias(comp, alloc, audio_latent, "{s}", .{"transformer.audio_patchify_proj"}, s);
+
+    // LTX 2.5: a learned row marking, in the reference's words, "tokens whose
+    // latent encodes a single standalone pixel frame" — added to the PROJECTED
+    // hidden immediately after patchify_proj as `h + mask * embedding`
+    // (`transformer_args.apply_keyframes_absolute_embedding`).
+    //
+    // `cond_mask[n] == 0` is exactly that set here: the only conditioning this
+    // engine builds is one first frame, VAE-encoded on its own, pinned clean by
+    // the denoise loop (`n < HW`). Riding the same mask is what keeps the two
+    // from ever disagreeing about which frames were handed in. A future
+    // conditioning shape whose clean tokens come from a multi-frame CLIP would
+    // need its own mask — those tokens are not standalone frames.
+    //
+    // The parameter is zero-initialized upstream, so on a checkpoint that has
+    // not trained it this is an exact no-op; and no conditioning ⇒ no keyframes
+    // ⇒ nothing added, which is why plain text-to-video is byte-unchanged.
+    if (cfg.keyframes_abs_pos) {
+        if (cond_mask) |mask| {
+            if (comp.get("transformer.keyframes_abs_pos_embedding")) |kf| {
+                const gate = try keyframeGate(alloc, mask, s);
+                defer _ = mlx.mlx_array_free(gate);
+                var kf3 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(kf3);
+                try mlx.check(mlx.mlx_reshape(&kf3, kf, &[_]c_int{ 1, 1, @intCast(vdim) }, 3, s));
+                var scaled = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(scaled);
+                try mlx.check(mlx.mlx_multiply(&scaled, gate, kf3, s));
+                const nv2 = try addArr(vh, scaled, s);
+                _ = mlx.mlx_array_free(vh);
+                vh = nv2;
+            }
+        }
+    }
 
     // ── timestep embeddings → adaLN param sets ──
     // Audio / prompt / AV-gate AdaLN ALWAYS use the scalar sigma sinusoids.
@@ -3769,8 +3985,14 @@ pub const TextEmbeds = struct {
 /// Full text-conditioning path: gemmaCapture (49 states) → connectorProject →
 /// connectorTransform (per modality). `ids` is the left-padded token sequence;
 /// pads are replaced by learnable registers inside connectorTransform.
-pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
-    const states = try gemmaCapture(io, alloc, gemma_dir, ids, pad_id, s);
+pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, version: LtxVersion, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
+    // The connector's aggregate projection is trained against ONE encoder's
+    // 49-state stack, so the version picks the encoder — never a probe of
+    // what happens to be in `gemma_dir`.
+    const states = switch (version) {
+        .v23 => try gemmaCapture(io, alloc, gemma_dir, ids, pad_id, s),
+        .v25 => try gemmaCapture4(io, alloc, gemma_dir, ids, pad_id, s),
+    };
     defer {
         for (states) |st| _ = mlx.mlx_array_free(st);
         alloc.free(states);
@@ -3878,14 +4100,14 @@ pub fn generateVideoFrames(
 
     // ── text embeds (positive; negative only when CFG needs it) ──
     if (progress) |p| p.emit("Encoding prompt", 0, num_steps);
-    var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
+    var pos = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
     var neg: ?TextEmbeds = null;
     defer if (neg) |*n| n.deinit();
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+        neg = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, neg_ids, pad_id, s);
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
@@ -4114,14 +4336,14 @@ pub fn generateVideoFramesTwoStage(
 
     // ── text embeds (positive + negative — stage 1 always runs CFG) ──
     if (progress) |p| p.emit("Encoding prompt", 0, total);
-    var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
+    var pos = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
     var neg: ?TextEmbeds = null;
     defer if (neg) |*n| n.deinit();
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+        neg = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, neg_ids, pad_id, s);
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
@@ -4250,6 +4472,40 @@ test "LtxConfig derived dims" {
     try testing.expectEqual(@as(u32, 4096), c.videoDim());
     try testing.expectEqual(@as(u32, 2048), c.audioDim());
     try testing.expectEqual(@as(u32, 188160), c.gemma_layers * c.gemma_hidden);
+}
+
+// The 2.3 and 2.5 config.json files are byte-identical apart from these four
+// fields, so they ARE the version discriminator — and a pack that predates
+// `model_version` must keep reading as 2.3 rather than failing to load.
+test "parseLtxConfig reads the 2.5 version and its FF-bias / keyframe flags" {
+    const a = testing.allocator;
+
+    const c23 = try parseLtxConfig(a,
+        \\{"model_version":"2.3.0","is_v2":true,"model_type":"AudioVideo","num_layers":48}
+    );
+    try testing.expectEqual(LtxVersion.v23, c23.version);
+    try testing.expect(c23.ff_bias);
+    try testing.expect(c23.audio_ff_bias);
+    try testing.expect(!c23.keyframes_abs_pos);
+    try testing.expectEqual(@as(?[]const u8, null), c23.version.textEncoderSubdir());
+
+    const c25 = try parseLtxConfig(a,
+        \\{"model_version":"2.5.0","is_v2":true,"model_type":"AudioVideo",
+        \\ "use_keyframes_abs_pos_embedding":true,"ff_bias":false,"audio_ff_bias":true}
+    );
+    try testing.expectEqual(LtxVersion.v25, c25.version);
+    try testing.expect(!c25.ff_bias);
+    try testing.expect(c25.audio_ff_bias);
+    try testing.expect(c25.keyframes_abs_pos);
+    try testing.expectEqualStrings("gemma4-12b-ltx-v1", c25.version.textEncoderSubdir().?);
+
+    // Geometry is shared — a version bump must not silently move it.
+    try testing.expectEqual(c23.videoDim(), c25.videoDim());
+    try testing.expectEqual(c23.num_layers, c25.num_layers);
+
+    // No `model_version` at all (pre-2.3.0 packs) reads as 2.3, not an error.
+    const legacy = try parseLtxConfig(a, "{\"model_type\":\"AudioVideo\"}");
+    try testing.expectEqual(LtxVersion.v23, legacy.version);
 }
 
 test "ltxNeedsCfg: both scales 1.0 skips the negative forward" {
@@ -5539,7 +5795,7 @@ test "ltx DiT encodeTextLtx reproduces PromptEncoder" {
     const ids = try readI32(io, allocator, idp);
     defer allocator.free(ids);
 
-    var emb = try encodeTextLtx(&comp, io, allocator, gdir, ids, 0, s);
+    var emb = try encodeTextLtx(&comp, io, allocator, .v23, gdir, ids, 0, s);
     defer emb.deinit();
     var vf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vf);

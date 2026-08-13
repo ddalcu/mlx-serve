@@ -237,6 +237,45 @@ extension MediaBundle {
         )
     }
 
+    /// LTX 2.5: same engine files as 2.3, but the text encoder lives INSIDE
+    /// the pack (`gemma4-12b-ltx-v1/`) instead of being the shared Gemma-3
+    /// chat download — so there is no second component, and the fetch has to
+    /// be recursive to reach the encoder's own tokenizer + config.
+    ///
+    /// The safetensors allowlist still applies (by BASENAME), so `model` is on
+    /// it for the encoder's weights; the upscalers ride along like 2.3's. The
+    /// encoder DIRECTORY is a ready marker: without it the server has no text
+    /// path at all, which is a harder failure than 2.3's missing-I2V case.
+    static func ltx25(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "ltx25:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: [".cache/"],
+                        keepSafetensors: [
+                            "transformer-distilled.safetensors", "transformer-dev.safetensors",
+                            "connector.safetensors", "vae_decoder.safetensors", "vae_encoder.safetensors",
+                            "audio_vae.safetensors", "vocoder.safetensors",
+                            "spatial_upscaler_x2_v1_1.safetensors", "temporal_upscaler_x2_v1_0.safetensors",
+                            // The in-pack Gemma-4 text encoder's weights.
+                            "model.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "config.json", "transformer-distilled.safetensors",
+                        "connector.safetensors", "vae_decoder.safetensors",
+                        ltx25TextEncoderDir,
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Krea-2-Turbo (mlx-serve bundle): ONE public repo, assembled so the engine
     /// loads it directly — a top-level transformer file + `vae/`/`text_encoder/`/
     /// `tokenizer/` subdirs + `config.json`. Recursive download (no auth, no
@@ -344,6 +383,12 @@ extension MediaBundle {
         )
     }
 
+    /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
+    /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
+    /// resolves the encoder from this exact path, so a rename here silently
+    /// makes every 2.5 pack unloadable.
+    static let ltx25TextEncoderDir = "gemma4-12b-ltx-v1"
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -386,7 +431,12 @@ extension AudioModelPreset {
 extension VideoModelPreset {
     var bundle: MediaBundle {
         switch backend {
-        case .ltx:       return .ltx(repo: repo, displayName: name)
+        case .ltx:
+            // A pack carrying its own encoder must NOT also pull the shared
+            // Gemma-3 chat model: 8 GB fetched for a component it never opens.
+            return shipsOwnTextEncoder
+                ? .ltx25(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+                : .ltx(repo: repo, displayName: name)
         case .minimaxH3: return .minimaxH3(repo: repo, displayName: name)
         }
     }

@@ -34,6 +34,22 @@ done
 # capabilities advertise "video"
 curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' || { echo "FAIL: /v1/models missing video capability"; exit 1; }
 
+# The pack's own config.json decides which text encoder loads, and a 2.5 pack
+# ships one INSIDE itself. Getting this wrong does not crash — the connector
+# would project a stack from the wrong encoder and generate a plausible video
+# for a prompt nobody typed — so assert the resolution rather than the output.
+VERSION=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('model_version','2.3.0'))" "$MODEL/config.json" 2>/dev/null || echo 2.3.0)
+case "$VERSION" in
+  2.5*)
+    grep -q "LTX v25" /tmp/test_video_server.log || { echo "FAIL: 2.5 pack did not load as v25"; grep -i "\[video\]" /tmp/test_video_server.log | head -3; exit 1; }
+    grep -q "gemma text encoder: $MODEL/gemma4-12b-ltx-v1" /tmp/test_video_server.log || { echo "FAIL: 2.5 pack did not resolve its in-pack text encoder"; grep -i "text encoder" /tmp/test_video_server.log | head -3; exit 1; }
+    echo "PASS: LTX 2.5 resolved its own in-pack Gemma-4 text encoder"
+    ;;
+  *)
+    grep -q "LTX v23" /tmp/test_video_server.log || { echo "FAIL: 2.3 pack did not load as v23"; grep -i "\[video\]" /tmp/test_video_server.log | head -3; exit 1; }
+    ;;
+esac
+
 OUT=/tmp/test_video_gen.json
 code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
   -d '{"prompt":"a red fox running through a snowy forest","num_frames":9,"height":256,"width":384,"steps":4,"seed":42}' \
