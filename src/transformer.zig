@@ -18686,23 +18686,6 @@ test "KVCache trims the tail view for a BLOCK-wide update, not just decode" {
     // The spec-verify shape: a block of queries lands at the tail of a cache
     // already longer than the window. Before the block trim, `new_len > 1`
     // fell through with view_start 0 and the layer read the ENTIRE cache.
-}
-
-fn testKVWide(seq_len: usize, head_dim: c_int, s: mlx.mlx_stream) mlx.mlx_array {
-    const sl: c_int = @intCast(seq_len);
-    const shape = [_]c_int{ 1, 2, sl, head_dim };
-    var arr = mlx.mlx_array_new();
-    _ = mlx.mlx_zeros(&arr, &shape, 4, .float32, s);
-    return arr;
-}
-
-test "KVCache carries a V head dim narrower than K (MLA 192/128)" {
-    // MLA scores over nope+rope (192) but stores values at v_head_dim (128).
-    // The dense path used to derive BOTH buffers from the K shape, so the V
-    // slice_update wrote a 128-wide chunk into a 192-wide window and the cache
-    // silently mis-shaped — grow, write, view and truncate each have to read
-    // their OWN buffer's last dim. MLX's SDPA has a 192/128 vector kernel, so
-    // this geometry is served, not padded.
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
@@ -18736,6 +18719,31 @@ test "KVCache carries a V head dim narrower than K (MLA 192/128)" {
     // Absolute bookkeeping is untouched by the view trim.
     try testing.expectEqual(@as(usize, 13), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 13), cache.step);
+}
+
+fn testKVWide(seq_len: usize, head_dim: c_int, s: mlx.mlx_stream) mlx.mlx_array {
+    const sl: c_int = @intCast(seq_len);
+    const shape = [_]c_int{ 1, 2, sl, head_dim };
+    var arr = mlx.mlx_array_new();
+    _ = mlx.mlx_zeros(&arr, &shape, 4, .float32, s);
+    return arr;
+}
+
+test "KVCache carries a V head dim narrower than K (MLA 192/128)" {
+    // MLA scores over nope+rope (192) but stores values at v_head_dim (128).
+    // The dense path used to derive BOTH buffers from the K shape, so the V
+    // slice_update wrote a 128-wide chunk into a 192-wide window and the cache
+    // silently mis-shaped — grow, write, view and truncate each have to read
+    // their OWN buffer's last dim. MLX's SDPA has a 192/128 vector kernel, so
+    // this geometry is served, not padded.
+    //
+    // A cache entry's geometry is fixed by its FIRST write, so this needs its
+    // own cache — the 192/128 chunk cannot land in a buffer another test's
+    // narrow prefill already shaped.
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+
     // Prefill 3 tokens, then two decode steps that grow both buffers.
     {
         const k = testKVWide(3, 192, s);
