@@ -2609,6 +2609,37 @@ pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
     return @max(2 * GB, @min(8 * GB, total_ram / 16));
 }
 
+/// Route an MLX error through OUR log before the process dies.
+///
+/// mlx-c's default handler is `printf("MLX error: %s\n"); exit(-1)`: STDOUT,
+/// and nowhere near the file sink. `~/.mlx-serve/logs/mlx-serve-<port>.log` is
+/// documented as THE post-mortem file, so every uncatchable MLX error looked
+/// from there like a process that stopped mid-sentence for no reason — a
+/// gpt_oss mask/view shape mismatch cost a debugger session to read a message
+/// the process had already printed (2026-08-13).
+///
+/// Split from the extern handler so the logging half is testable: this returns.
+pub fn reportMlxFatal(msg: []const u8) void {
+    log.err("[mlx] FATAL: {s}\n", .{msg});
+    log.err("[mlx] MLX errors are uncatchable — the process exits here. This is a bug in mlx-serve, not in your request.\n", .{});
+}
+
+fn mlxFatalHandler(msg: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+    reportMlxFatal(std.mem.sliceTo(msg, 0));
+    // mlx-c's own status, kept so anything watching the exit code (the app's
+    // supervisor, a test's `$?`) sees no change in behaviour — only in what
+    // was written down first.
+    std.process.exit(255);
+}
+
+/// Install the handler. Called ONCE from `main()` beside `applyMlxCacheLimit`,
+/// above every subcommand branch: an MLX error can fire from any of them, and
+/// the load path is the one that fires before a log file even exists (the
+/// message still reaches stderr).
+pub fn installMlxErrorHandler() void {
+    mlx.mlx_set_error_handler(mlxFatalHandler, null, null);
+}
+
 /// PURE: resolve the cap from `MLX_SERVE_CACHE_LIMIT` (bytes) over the
 /// RAM-proportional default. `0` means "leave MLX's default alone" — the
 /// same-boot A/B off-switch. Anything unparseable falls through to the default
@@ -15468,6 +15499,61 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv(null, 128 * GB));
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
+}
+
+
+test "an MLX fatal is written to the log file, not just printf'd to stdout" {
+    // mlx-c's default handler is `printf(...); exit(-1)` — stdout, and the
+    // file sink never sees it. `~/.mlx-serve/logs/mlx-serve-<port>.log` is
+    // documented as THE post-mortem file, so a crash read there as a process
+    // that simply stopped: a gpt_oss mask/view mismatch (a 133-wide mask
+    // against a 128-wide K/V view on the first spec-verify block past the
+    // sliding window) cost a debugger session to recover a message that had
+    // already been printed.
+    const dir = "/tmp/mlx-serve-mlxfatal-test";
+    const path = dir ++ "/s.log";
+    _ = std.c.mkdir(dir, @as(std.c.mode_t, 0o755));
+    _ = std.c.unlink(path);
+    defer {
+        log.closeFile();
+        _ = std.c.unlink(path);
+    }
+
+    try log.openFile(path, 0);
+    reportMlxFatal("[broadcast_shapes] Shapes (1,1,6,133) and (1,64,6,128) cannot be broadcast.");
+    log.closeFile();
+
+    var buf: [4096]u8 = undefined;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    const read_n = std.c.read(fd, &buf, buf.len);
+    try testing.expect(read_n > 0);
+    const text = buf[0..@intCast(read_n)];
+    // The message itself, verbatim…
+    try testing.expect(std.mem.indexOf(u8, text, "(1,1,6,133) and (1,64,6,128)") != null);
+    // …under a marker that says which layer died, so the line is greppable
+    // next to the `jinja error:` / `[cache]` patterns in the same file.
+    try testing.expect(std.mem.indexOf(u8, text, "[mlx] FATAL:") != null);
+    // …and a sentence that stops the reader from re-debugging their request.
+    try testing.expect(std.mem.indexOf(u8, text, "uncatchable") != null);
+}
+
+test "main installs the MLX error handler beside the cache limit" {
+    // Both are process-wide, both belong above every subcommand branch, and
+    // the handler is worthless if it is installed after the thing that fails.
+    // Needles assembled at comptime so this test's source can't satisfy them.
+    const src = @embedFile("main.zig");
+    // Anchored to the line start, so a commented-out call cannot satisfy it.
+    const cache = "\n    server_mod." ++ "applyMlxCacheLimit();";
+    const handler = "\n    server_mod." ++ "installMlxErrorHandler();";
+    const at_cache = std.mem.indexOf(u8, src, cache) orelse return error.CacheLimitCallMissing;
+    const at_handler = std.mem.indexOf(u8, src, handler) orelse return error.ErrorHandlerCallMissing;
+    try testing.expect(at_handler > at_cache);
+    // Nothing may load a model before it: the first subcommand dispatch has to
+    // come after both.
+    const at_dispatch = std.mem.indexOf(u8, src, "std.mem.eql(u8, args[1], " ++ "\"serve\"") orelse src.len;
+    try testing.expect(at_handler < at_dispatch);
 }
 
 test "llama cache default keeps shared prefixes warm" {

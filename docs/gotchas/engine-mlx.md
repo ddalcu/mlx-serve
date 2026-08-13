@@ -3694,3 +3694,14 @@ slidingViewFor, never the raw window` (every `const max_kv: u32 =` binding must
 read `sliding.span`, directly or through the one pinned alias), plus a `gpt-oss`
 arm in `tests/test_sliding_window_trim.sh` — window 128 makes every multi-token
 forward a trimmed one, so the pre-fix code cannot even finish prefill there.
+
+**Second finding, and the reason this cost a debugger session:** mlx-c's default
+error handler is `printf("MLX error: %s\n"); exit(-1)` — STDOUT, and nothing
+ever reaches the log file sink. From `~/.mlx-serve/logs/mlx-serve-<port>.log`,
+every uncatchable MLX error looks like a process that stopped mid-sentence for
+no reason, and the app (which surfaces that file) shows the same nothing. We now
+install our own handler at the top of `main()` (`server.installMlxErrorHandler`
+→ `reportMlxFatal`), which writes `[mlx] FATAL: <message>` through the normal
+log path — file sink included — and then exits 255, mlx-c's own status, so
+nothing watching the exit code sees a change. The next one of these is a grep,
+not a debugger.
