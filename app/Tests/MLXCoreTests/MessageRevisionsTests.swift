@@ -164,9 +164,9 @@ final class RegenerationSeedWiringTests: XCTestCase {
     /// role guard failed and the pager silently never appeared.
     func testTheSeedIsHeldRatherThanWrittenOntoWhateverIsLast() throws {
         let source = SourceScan.source("AppState.swift", from: #filePath)
-        let seed = try XCTUnwrap(source.range(of: "func seedRevisions"),
-                                 "seedRevisions moved — repoint this scan")
-        let body = String(source[seed.lowerBound...].prefix(900))
+        let body = try XCTUnwrap(
+            SourceScan.declarationBody(from: "func seedRevisions", in: source),
+            "seedRevisions moved — repoint this scan")
         XCTAssertTrue(body.contains("pendingRevisionSeed"), """
             seedRevisions writes to a message instead of holding the seed — on \
             the agent path the reply it belongs to does not exist yet.

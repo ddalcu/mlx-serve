@@ -683,7 +683,8 @@ class AppState: ObservableObject {
     /// — the menu has already swallowed the event, and nothing else will run.
     func requestChatDeletionFromMenu() {
         let responder = NSApp.keyWindow?.firstResponder
-        switch ChatDeleteShortcut.route(editingText: ChatDeleteShortcut.isTextEditor(responder)) {
+        switch ChatDeleteShortcut.route(editingText: KeyboardFocus.isTextEditor(responder),
+                                        selectedChats: sidebarSelection.count) {
         case .deleteToLineStart:
             (responder as? NSTextView)?.deleteToBeginningOfLine(nil)
             return

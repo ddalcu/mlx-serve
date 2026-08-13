@@ -48,6 +48,23 @@ enum SourceScan {
         source.components(separatedBy: needle).count - 1
     }
 
+    /// From `marker` to the end of the declaration it opens — the first line
+    /// that closes at a method's own indentation.
+    ///
+    /// Use this rather than `prefix(n)` on the remainder: `strippingComments`
+    /// preserves every OFFSET (it blanks comment characters rather than
+    /// removing them), so a fixed character window shrinks as soon as someone
+    /// writes a long explanation inside the function, and the scan starts
+    /// failing for a reason that has nothing to do with what it checks.
+    /// Returns the rest of the file when no close is found, which keeps a
+    /// mis-anchored scan loud rather than vacuous.
+    static func declarationBody(from marker: String, in source: String) -> String? {
+        guard let start = source.range(of: marker) else { return nil }
+        let rest = String(source[start.lowerBound...])
+        guard let end = rest.range(of: "\n    }\n") else { return rest }
+        return String(rest[..<end.upperBound])
+    }
+
     /// A file under `app/Sources/MLXServe`, comments stripped. `file` is the
     /// path relative to that root.
     static func source(_ file: String, from testFilePath: String) -> String {

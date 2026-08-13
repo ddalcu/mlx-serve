@@ -695,9 +695,29 @@ enum ChatDeleteShortcut {
         case deleteChats
     }
 
-    static func route(editingText: Bool) -> Route {
-        editingText ? .deleteToLineStart : .deleteChats
+    /// - Parameter selectedChats: how many rows the sidebar has picked. Several
+    ///   is unambiguous — you were working in the list — and it OUTRANKS focus,
+    ///   because focus alone is not a signal this window can be trusted to get
+    ///   right: nothing in it takes the keyboard off the composer except
+    ///   `KeyboardFocus.resignTextEditor`, and one stuck reading would
+    ///   otherwise make ⌘⌫ a line delete forever with a dozen chats selected
+    ///   behind it. Belt and braces on a key that deletes conversations.
+    static func route(editingText: Bool, selectedChats: Int) -> Route {
+        if selectedChats > 1 { return .deleteChats }
+        return editingText ? .deleteToLineStart : .deleteChats
     }
+}
+
+/// Who holds the keyboard.
+///
+/// The chat window has no real focus model: its conversation rows are
+/// `.buttonStyle(.plain)` Buttons, which take no first responder under macOS's
+/// default keyboard navigation — the same fact that made `.onDeleteCommand` on
+/// that column never fire. So clicking a chat moved the selection while the
+/// COMPOSER kept the keyboard, and every keystroke-owning decision downstream
+/// read "the user is typing" forever (live 2026-08-12: after one click in the
+/// composer, ⌘⌫ never deleted a chat again).
+enum KeyboardFocus {
 
     /// Whether the responder holding the keyboard is text being typed into.
     ///
@@ -706,6 +726,15 @@ enum ChatDeleteShortcut {
     /// window's FIELD EDITOR does, and that is an `NSTextView`.
     static func isTextEditor(_ responder: NSResponder?) -> Bool {
         responder is NSTextView
+    }
+
+    /// Move the keyboard out of a text field, because nothing else in this
+    /// window will. Only when a text editor actually has it — an unconditional
+    /// `makeFirstResponder(nil)` would yank focus off whatever else legitimately
+    /// holds it.
+    static func resignTextEditor(in window: NSWindow?) {
+        guard let window, isTextEditor(window.firstResponder) else { return }
+        window.makeFirstResponder(nil)
     }
 }
 
@@ -1136,6 +1165,14 @@ struct ChatSidebar: View {
     /// collapses the selection for an active chat it doesn't already contain,
     /// so the other order would undo a cmd-click on its way out.
     private func selectRow(_ id: UUID, ordered: [UUID]) {
+        // Clicking a row means you are working in the LIST, so the keyboard
+        // comes with you. Nothing else moves it: these rows take no first
+        // responder, so the composer keeps the keyboard while you click around
+        // the sidebar — which is what made ⌘⌫ a line delete forever after one
+        // click in the field. Deliberately NOT done by `quickSwitch`: ⌘\<digit\>
+        // is for jumping to a chat and typing in it, so the composer stays
+        // armed there (a multi-selection is what tells ⌘⌫ otherwise).
+        KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
         let flags = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags)
             .intersection(.deviceIndependentFlagsMask)
         let outcome = SidebarMultiSelect.click(
@@ -4779,15 +4816,32 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         }
         let enabled = context.environment.isEnabled
         if tv.isEditable != enabled { tv.isEditable = enabled }
-        // Drive AppKit first-responder from the SwiftUI focus mirror.
-        if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
-            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        // Drive AppKit first-responder from the SwiftUI focus mirror — on the
+        // EDGE of a request, never on its level.
+        //
+        // This ran on every update while `isFocused` was true, which made the
+        // field impossible to leave: `onResignFocus` publishes the cleared flag
+        // ASYNCHRONOUSLY, so any update in between saw a still-true flag and a
+        // text view that no longer had the keyboard, and handed it straight
+        // back. `isFocused` is set true on appear and again whenever a turn goes
+        // idle, and nothing ever cleared it, so the composer held the keyboard
+        // for the life of the window — and ⌘⌫ read "the user is typing" forever
+        // (live 2026-08-12).
+        if isFocused != context.coordinator.appliedFocus {
+            context.coordinator.appliedFocus = isFocused
+            if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
+                DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            }
         }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: GrowingTextEditor
         weak var textView: ComposerTextView?
+        /// The last focus REQUEST this view acted on, so `updateNSView` can
+        /// tell "focus me" from "you are still notionally focused" — see the
+        /// note there.
+        var appliedFocus = false
         init(_ parent: GrowingTextEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {

@@ -170,9 +170,9 @@ final class ComposerHistoryTests: XCTestCase {
     /// last one left off, in a composer that is empty for a different reason.
     func testSendingEndsTheWalk() throws {
         let source = SourceScan.source("Views/ChatView.swift", from: #filePath)
-        let send = try XCTUnwrap(source.range(of: "private func sendMessage"),
-                                 "sendMessage moved — repoint this scan")
-        let body = String(source[send.lowerBound...].prefix(2500))
+        let body = try XCTUnwrap(
+            SourceScan.declarationBody(from: "private func sendMessage", in: source),
+            "sendMessage moved — repoint this scan")
         XCTAssertTrue(body.contains("composerWalk = .idle"),
                       "a sent message must end the recall walk")
     }
