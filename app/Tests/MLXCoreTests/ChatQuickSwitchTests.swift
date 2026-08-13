@@ -165,6 +165,105 @@ final class ChatQuickSwitchTests: XCTestCase {
         XCTAssertEqual(ChatQuickSwitch.id(forSlot: 2, in: rows, numbering: nil), rows[1].id)
     }
 
+    // MARK: - The band is MEASURED, so the badge count follows the window
+
+    private func span(_ top: CGFloat, _ bottom: CGFloat) -> SidebarRowSpan {
+        SidebarRowSpan(top: top, bottom: bottom)
+    }
+
+    /// Twelve rows, 30pt apart, starting at 100.
+    private func ladder(_ rows: [ChatSession]) -> [UUID: SidebarRowSpan] {
+        var spans: [UUID: SidebarRowSpan] = [:]
+        for (i, row) in rows.enumerated() {
+            spans[row.id] = span(CGFloat(100 + i * 30), CGFloat(128 + i * 30))
+        }
+        return spans
+    }
+
+    func testABiggerWindowNumbersMoreRows() {
+        // The whole point of measuring: how many badges appear is a fact about
+        // the window, not a number chosen when the feature was written. The
+        // same rows against a taller clear band earn more numbers.
+        let rows = (0..<12).map { _ in session() }
+        let spans = ladder(rows)
+
+        let small = ChatQuickSwitch.numbering(rowSpans: spans, clearBandTop: 100, clearBandBottom: 250)
+        let fullScreen = ChatQuickSwitch.numbering(rowSpans: spans, clearBandTop: 100, clearBandBottom: 800)
+
+        XCTAssertEqual(small?.count, 5)
+        XCTAssertEqual(fullScreen?.count, 12)
+        XCTAssertEqual(ChatQuickSwitch.numbered(rows, numbering: small).count, 5)
+        XCTAssertEqual(ChatQuickSwitch.numbered(rows, numbering: fullScreen).count,
+                       ChatQuickSwitch.maxSlots,
+                       "a window with room for twelve still stops at nine — that cap is the keyboard's")
+    }
+
+    func testAHalfClippedRowGetsNoNumber() {
+        // A number on a row you can only half read is an answer to "which one
+        // is 3?" that you then have to scroll to check.
+        let rows = (0..<3).map { _ in session() }
+        let spans: [UUID: SidebarRowSpan] = [
+            rows[0].id: span(60, 110),    // straddles the frosted block's edge
+            rows[1].id: span(120, 160),   // fully in the clear
+            rows[2].id: span(180, 240),   // runs off the bottom of the panel
+        ]
+        XCTAssertEqual(ChatQuickSwitch.numbering(rowSpans: spans,
+                                                 clearBandTop: 100, clearBandBottom: 200),
+                       [rows[1].id])
+    }
+
+    func testSubPixelOverlapStillCounts() {
+        // Layout arithmetic lands fractionally off. A third of a point under
+        // the line is not "behind glass", and a badge that flickers as the
+        // window resizes by a pixel is worse than one that is slightly
+        // generous.
+        let row = session()
+        XCTAssertEqual(ChatQuickSwitch.numbering(rowSpans: [row.id: span(99.7, 200.3)],
+                                                 clearBandTop: 100, clearBandBottom: 200),
+                       [row.id])
+    }
+
+    func testNothingMeasuredYetIsNotNothingVisible() {
+        // nil means "no layout has reported", which numbers from the top — the
+        // behaviour of a sidebar with no overlay. An empty SET is the other
+        // thing, and `testNothingVisibleMeansNoNumbers` covers it.
+        let row = session()
+        XCTAssertNil(ChatQuickSwitch.numbering(rowSpans: [:],
+                                               clearBandTop: 100, clearBandBottom: 800))
+        XCTAssertNil(ChatQuickSwitch.numbering(rowSpans: [row.id: span(100, 130)],
+                                               clearBandTop: 0, clearBandBottom: 0),
+                     "an unmeasured band cannot exclude anything")
+        XCTAssertNil(ChatQuickSwitch.numbering(rowSpans: [row.id: span(100, 130)],
+                                               clearBandTop: 400, clearBandBottom: 200),
+                     "nor can an inside-out one")
+    }
+
+    func testTheClearBandIsMeasuredInTheSidebarsOwnCoordinateSpace() {
+        // A `.global` frame is not re-published when a view merely MOVES.
+        // Entering fullscreen translates the whole column without resizing the
+        // pinned destination block, so the block's global maxY stayed at the
+        // number the smaller window had produced while the rows slid out from
+        // under it — measured live: block maxY 370.0 in every state while the
+        // first row moved 378 → 396, and the band lost a row it could see.
+        //
+        // In the column's OWN space the top edge is just the block's height,
+        // which no window move can invalidate, and the bottom edge is the
+        // column's height, which is exactly "how much window there is".
+        let source = SourceScan.strippingComments(
+            SourceScan.source("Views/ChatView.swift", from: #filePath))
+
+        XCTAssertEqual(SourceScan.count("frame(in: .global)", in: source), 0,
+                       "no part of the sidebar band may be measured in window coordinates")
+        XCTAssertTrue(source.contains(".coordinateSpace(.named(ChatSidebar.bandSpace))"),
+                      "the column declares the space the three measurements share")
+        XCTAssertEqual(SourceScan.count("frame(in: .named(ChatSidebar.bandSpace))", in: source), 3,
+                       "exactly three readers: the block's bottom edge, the column's bottom "
+                       + "edge, and each row's span")
+        XCTAssertFalse(source.contains("safeAreaInsets"),
+                       "the safe-area arithmetic described a different line entirely "
+                       + "(measured 104 against a frost line at 370) and is gone with it")
+    }
+
     // MARK: - ⇧⌘<digit>: range from where you are to the numbered row
 
     /// The composition both shortcut families run through. Two different lists

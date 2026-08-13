@@ -15,11 +15,42 @@ import Foundation
 /// while the rows in front of them started at 6. `numbering` is that filter:
 /// the caller passes the rows currently in the clear and the numbers land on
 /// them in the same top-to-bottom order.
+/// Where one conversation row sits vertically, measured in the sidebar
+/// column's own coordinate space.
+struct SidebarRowSpan: Equatable {
+    let top: CGFloat
+    let bottom: CGFloat
+}
+
 enum ChatQuickSwitch {
 
     /// The keyboard has nine of these. A tenth row draws no badge rather than
     /// one promising a shortcut nothing can press.
     static let maxSlots = 9
+
+    /// Which rows are in the clear, from the measurements alone.
+    ///
+    /// The band runs from the bottom of the pinned destination block (rows
+    /// scroll UNDER it) to the bottom of the column, so its height is simply
+    /// how much window there is — a taller window numbers more rows, with no
+    /// count written down anywhere.
+    ///
+    /// - Returns: nil for "nothing has been measured yet", which numbers from
+    ///   the top; never an empty set for that case, because an empty set means
+    ///   the opposite (see `numbered`).
+    static func numbering(rowSpans: [UUID: SidebarRowSpan],
+                          clearBandTop: CGFloat,
+                          clearBandBottom: CGFloat) -> Set<UUID>? {
+        guard !rowSpans.isEmpty, clearBandBottom > clearBandTop else { return nil }
+        return Set(rowSpans.filter {
+            // Fully inside the band. A half-clipped row wearing a number reads
+            // as an answer to "which one is 3?" that you then have to scroll to
+            // check — and the half point of tolerance is because layout
+            // arithmetic lands fractionally off, not because the edge is
+            // approximate.
+            $0.value.top >= clearBandTop - 0.5 && $0.value.bottom <= clearBandBottom + 0.5
+        }.keys)
+    }
 
     /// The conversation rows top to bottom, exactly as the sidebar draws them.
     static func ordered(_ sessions: [ChatSession]) -> [ChatSession] {

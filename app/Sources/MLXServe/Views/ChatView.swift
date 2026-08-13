@@ -757,12 +757,6 @@ enum KeyboardFocus {
 
 // MARK: - Sidebar
 
-/// Where one conversation row sits vertically, in global coordinates.
-struct SidebarRowSpan: Equatable {
-    let top: CGFloat
-    let bottom: CGFloat
-}
-
 /// Every measured row, so the quick-switch can number only the ones in the
 /// clear. Published per row and merged on the way up.
 struct SidebarRowSpansKey: PreferenceKey {
@@ -773,8 +767,8 @@ struct SidebarRowSpansKey: PreferenceKey {
     }
 }
 
-/// The bottom edge of the frosted destination block — rows above this line are
-/// behind glass.
+/// The bottom edge of the frosted destination block, measured in the column's
+/// own space — rows above this line are behind glass.
 struct SidebarClearBandTopKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -791,6 +785,18 @@ struct SidebarClearBandBottomKey: PreferenceKey {
 }
 
 struct ChatSidebar: View {
+    /// The one coordinate space the three band measurements share.
+    ///
+    /// Load-bearing that it is the COLUMN's own space and not `.global`: a
+    /// global frame is not re-published when a view merely MOVES, and entering
+    /// fullscreen translates the whole column without resizing the pinned
+    /// destination block — so the block went on reporting the maxY it had in
+    /// the smaller window while the rows slid out from under it, and rows in
+    /// plain sight lost their badges. Measured here, the top edge is the
+    /// block's own height and the bottom edge is the column's, both of which
+    /// change only when there is genuinely a new layout to report.
+    static let bandSpace = "chatSidebarBand"
+
     @EnvironmentObject var appState: AppState
     /// Observed directly — AppState forwards objectWillChange only for the
     /// server and the agent store, so a badge reading `appState.downloads`
@@ -809,10 +815,10 @@ struct ChatSidebar: View {
     /// which SwiftUI does not report outside a hovered view — see the monitor.
     @StateObject private var modifiers = ModifierKeyMonitor()
     /// Where the frosted destination block ENDS, and where the panel ends, in
-    /// global coordinates — the band a conversation row has to sit inside to be
-    /// readable. Measured rather than derived from the inset's height: the
-    /// block's contents vary (the Create list, the download badge), so the one
-    /// number that cannot go stale is the one the block reports itself.
+    /// the column's own space — the band a conversation row has to sit inside
+    /// to be readable. Measured rather than derived from the inset's height:
+    /// the block's contents vary (the Create list, the download badge), so the
+    /// one number that cannot go stale is the one the block reports itself.
     @State private var clearBandTop: CGFloat = 0
     @State private var clearBandBottom: CGFloat = 0
     /// Each conversation row's vertical extent, reported only while ⌘ is down.
@@ -824,13 +830,9 @@ struct ChatSidebar: View {
     /// behaviour rather than a sidebar of blank rows for one frame.
     private var numberedRows: Set<UUID>? {
         guard modifiers.commandHeld else { return nil }
-        guard clearBandBottom > clearBandTop, !rowSpans.isEmpty else { return nil }
-        return Set(rowSpans.filter {
-            // Fully inside the band. A half-clipped row wearing a number reads
-            // as an answer to "which one is 3?" that you then have to scroll to
-            // check.
-            $0.value.top >= clearBandTop - 0.5 && $0.value.bottom <= clearBandBottom + 0.5
-        }.keys)
+        return ChatQuickSwitch.numbering(rowSpans: rowSpans,
+                                         clearBandTop: clearBandTop,
+                                         clearBandBottom: clearBandBottom)
     }
 
     var body: some View {
@@ -1109,35 +1111,40 @@ struct ChatSidebar: View {
             // "behind glass" — no constant to keep in step with its contents.
             .background {
                 GeometryReader { proxy in
-                    Color.clear.preference(key: SidebarClearBandTopKey.self,
-                                           value: proxy.frame(in: .global).maxY)
+                    Color.clear.preference(
+                        key: SidebarClearBandTopKey.self,
+                        value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
                 }
             }
             // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
             // has something to attach to again and the platform frosts what
             // scrolls beneath this block.
         }
-        // The panel's own bottom edge closes the band. Applied OUTSIDE the
-        // safeAreaInset so it measures the whole column, and so the three
-        // readers below are ancestors of the block that publishes the top edge
-        // — a preference only travels up.
+        // The panel's own bottom edge closes the band — in this space that is
+        // the column's HEIGHT, which is the whole "how much window is there?"
+        // question the badge count answers. Applied OUTSIDE the safeAreaInset
+        // so it measures the whole column, and so the three readers below are
+        // ancestors of the block that publishes the top edge — a preference
+        // only travels up.
+        //
+        // There was a second publisher for the TOP edge here, `frame.minY +
+        // safeAreaInsets.top`, described as the same line derived a second way.
+        // It never was: measured, it reported 104 against a frost line at 370,
+        // because this reader sits below the toolbar (so it has already lost
+        // that inset) and the block's height is not part of what it reads back.
+        // It was harmless only because the key reduces by `max` and the real
+        // measurement was always larger — a fallback that could only ever be
+        // wrong is worse than none.
         .background {
             GeometryReader { proxy in
-                let frame = proxy.frame(in: .global)
-                Color.clear
-                    .preference(key: SidebarClearBandBottomKey.self,
-                                value: frame.maxY - proxy.safeAreaInsets.bottom)
-                    // The SAME edge the destination block publishes, derived a
-                    // second way: a `safeAreaInset` is what the top inset here
-                    // is made of. Belt and braces because the block's own
-                    // measurement has to travel up out of the inset's content
-                    // to be seen at all — and the key reduces by `max`, so
-                    // whichever mechanism reports is the one that decides, and
-                    // if both do they are measuring the same line anyway.
-                    .preference(key: SidebarClearBandTopKey.self,
-                                value: frame.minY + proxy.safeAreaInsets.top)
+                Color.clear.preference(
+                    key: SidebarClearBandBottomKey.self,
+                    value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
             }
         }
+        // Declared here, OUTSIDE both readers and the inset, so the block, the
+        // column and every row resolve against the same origin.
+        .coordinateSpace(.named(ChatSidebar.bandSpace))
         .onPreferenceChange(SidebarClearBandTopKey.self) { value in
             applyMeasurement(value, to: $clearBandTop)
         }
@@ -1320,7 +1327,7 @@ struct ChatSidebar: View {
         .background {
             if modifiers.commandHeld {
                 GeometryReader { proxy in
-                    let frame = proxy.frame(in: .global)
+                    let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
                     Color.clear.preference(
                         key: SidebarRowSpansKey.self,
                         value: [session.id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])

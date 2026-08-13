@@ -351,3 +351,52 @@ superseded by the field.
 
 Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
 history builders carry neither field nor legacy text, tolerant decode).
+
+## The badges stopped where the small window had ended (fullscreen, 2026-08-13)
+
+⌘-held numbers the sidebar's conversation rows, and only the rows in the
+CLEAR get one — the list scrolls under the pinned destination block, so a
+number behind frosted glass names a shortcut you cannot read. That band was
+measured from three `frame(in: .global)` readers: the block's bottom edge, the
+column's bottom edge, and each row's own span.
+
+In fullscreen the badge count stopped tracking the window. Reproduced in an
+isolated SwiftUI harness with the same structure (`ScrollView` of rows +
+`.safeAreaInset(.top)` block + the two background readers), stepped through
+900x600 → 900x1300 → fullscreen:
+
+```
+windowed    blockMaxY=370.0  rows 378…406, 408…436, …   in band 16
+TALL        blockMaxY=370.0  rows 378…406, …            in band 16
+FULLSCREEN  blockMaxY=370.0  rows 396…424, 426…454, …   in band 18
+```
+
+`blockMaxY` is the same 370.0 in every state while the rows genuinely move
+(378 → 396). **A `.global` frame is not re-published when a view merely MOVES
+rather than resizes** — entering fullscreen translates the whole column, and
+the pinned block keeps whatever global maxY it had in the window that last
+laid it out. The band's top edge is then a number from a different window
+size, which is exactly what it looked like: badges based on the geometry the
+feature happened to be written at.
+
+The second `SidebarClearBandTopKey` publisher, `frame.minY +
+safeAreaInsets.top`, was documented as the same line derived a second way. It
+never was — measured, it reports **104** against a frost line at **370**,
+because that reader sits below the toolbar (it has already lost that inset)
+and the block's height is not part of what it reads back. It was harmless only
+because the key reduces by `max` and the real number was always larger. A
+fallback that can only ever be wrong is worse than no fallback: deleted.
+
+Fix: one named coordinate space on the column (`ChatSidebar.bandSpace`), and
+all three measurements taken in it. In the column's own space the top edge is
+the block's HEIGHT and the bottom edge is the column's HEIGHT — neither can be
+invalidated by the window moving, and both re-publish when there is genuinely
+a new layout. Same harness, same three states, container space: top constant
+at 318, bottom 825 → 827 → 897, and fullscreen numbers 19 of 19 measured rows
+where the global version numbered 18.
+
+The filter itself moved out of the view to `ChatQuickSwitch.numbering(rowSpans:
+clearBandTop:clearBandBottom:)`, which is what makes "a taller window numbers
+more rows" a test rather than a screenshot. Guards: `ChatQuickSwitchTests`
+(band cases + a source scan pinning zero `.global` frames and exactly three
+readers in the named space — verified red by reverting one reader).
