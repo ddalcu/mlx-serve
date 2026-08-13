@@ -707,3 +707,74 @@ and the tell is always the same single log line plus wrong-family markers in the
 output. When a checkpoint answers in another family's tags, grep the log for
 `jinja` before touching anything in the arch. Guard: the include-stub cases in
 chat.zig's `chat_template accepts HF's list-of-named-templates shape`.
+## gpt-oss / harmony: a masked structural token, and a null that passed a key check (2026-08-12)
+
+Bringing up `gpt_oss` (gpt-oss-20b, MXFP4-Q8) the arch came up clean — coherent
+451-token generations, correct `analysis`/`final` channel split — and then tool
+calling failed twice, both times in a way that looked like a model problem and
+was not.
+
+**1. The suppressor masked `<|constrain|>`.** First tools request came back with
+no `tool_calls`, `finish_reason: "length"`, and `finish_details:
+{"type": "repetition_loop"}`. The rendered prompt was fine — checked byte-for-byte
+against python jinja2 (634 chars vs the reference's 632; jinja.cpp handles the
+harmony template's self-recursive `render_typescript_type` macro correctly).
+Reading the raw generation through `/v1/completions` with the reference prompt
+showed what the model actually wrote:
+
+    <|channel|>analysis<|message|>We need to call get_weather function.<|end|>
+    <|start|>assistant<|channel|>commentary to=functions.get_weather
+        <|channel|>commentary 1.0<|message|>{"location":"San Francisco","unit":"c"}
+
+The header is malformed: a second `<|channel|>commentary` where
+`<|constrain|>json` belongs. `tokenizer.reservedOutputIds` suppresses any
+`special: true` token whose literal text does not appear in the chat template —
+a good derivation, because a marker the model was shown is a marker it may emit.
+`<|constrain|>` breaks the symmetry: it is written only inside the header the
+model generates, and the template renders tool calls solely when replaying
+history, where it is omitted. So it was filed reserved and masked.
+
+The lesson is not "exempt one token". It is that masking a *structural* token
+does not remove that structure from the output — the model still needs a
+separator there, draws the highest-probability thing it can, and emits a header
+that parses as nonsense. It then loops. `isOutputOnlySpecial` is the documented
+hole in the derivation; a new family owes an answer to "which of my markers are
+generated-only?"
+
+**2. `"content": null` passed a key-existence check.** With `<|constrain|>`
+freed, single-shot calls worked (`finish_reason: "tool_calls"`, name and
+arguments intact). The *round-trip* — sending the tool result back — returned
+the model's own reasoning as content with raw `<|channel|>final>` markers in it.
+
+The harmony template does this on every assistant message:
+
+    {%- if "content" in message %}
+        {%- if "<|channel|>analysis<|message|>" in message.content or ... %}
+
+The outer test asks whether the KEY exists; the inner one indexes into the
+VALUE. `serializeMessagesJson` emitted `"content": null` for any message with no
+text — and the message with no text is precisely the tool-calling assistant turn
+being replayed. Python jinja2 raises `TypeError: argument of type 'NoneType' is
+not iterable` on exactly this input, which is how it was found; jinja.cpp did
+not raise, it just produced a prompt that left the model without a committed
+channel, and it emitted `<|channel|>final>` with no `<|message|>` at all.
+
+Note what did NOT go wrong: `splitHarmonyChannels` correctly declined that
+output (no `<|message|>` in the segment ⇒ the header never resolved ⇒ not
+content), so the splitter did not fabricate a reading of malformed bytes. It
+fell through to the generic think gate, which is why the markers were visible
+rather than silently swallowed — the failure was loud, which is what you want.
+
+Fix is family-scoped (`chat.EmptyContent`, sniffed off the template's
+`<|channel|>`): harmony gets `""`, which satisfies both readings and stays falsy
+wherever the template branches; everyone else keeps the null they have always
+had. Changing it globally would have been a much larger blast radius for a
+one-family bug — plenty of templates test `message.content is none`.
+
+**Also worth keeping:** `<|message|>` is NOT unique to muse. Harmony is muse's
+format ancestor and emits the same marker, so `splitMuseChannels`' "keyed on the
+`<|message|>` marker no other family emits" was true only until gpt-oss landed.
+Harmony's `analysis` header carries no `to=`, so muse's recipient rules would
+have routed the model's private reasoning straight into user-visible content.
+`<|channel|>` is the discriminator, and BOTH routers key on it — one to claim,
+one to decline — with a test on each side.

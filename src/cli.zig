@@ -101,6 +101,11 @@ pub const aliases = [_]Alias{
     // 8-bit attention/router/shared, MTP layer included. ~110 GB on disk;
     // needs a 128 GB Mac.
     .{ .name = "hy3", .tag = "295b", .repo = "mlx-community/Hy3-oQ2e", .is_default = true },
+    // OpenAI gpt-oss. The MXFP4-Q8 conversions keep the native mxfp4 expert
+    // banks (what the model was released in) and put attention/embeddings at
+    // affine 8-bit: ~12 GB for the 20B, ~63 GB for the 120B.
+    .{ .name = "gpt-oss", .tag = "20b", .repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", .is_default = true },
+    .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
 };
 

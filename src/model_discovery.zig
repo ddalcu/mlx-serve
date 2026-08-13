@@ -46,6 +46,7 @@ const supported_model_types = [_][]const u8{
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
+    "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the

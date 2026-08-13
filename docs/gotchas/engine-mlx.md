@@ -2198,3 +2198,59 @@ follow-ups, neither belongs to this change. The prefill memory guards
 (`prefillAttnKeys`, `server.dsv4PrefillMemoryNeeded`) still bill on `total_kv`,
 so they now over-estimate — conservative, and retuning them is its own measured
 change.
+
+## gpt-oss: what the fused kernels could not say (2026-08-12)
+
+Two exclusions fell out of `gpt_oss` bring-up, both of the same shape — a fast
+path that computes a fixed expression, handed an arch whose expression differs.
+
+**Per-expert biases force the sorted MoE path.** gpt-oss's SwitchGLU carries
+additive `[num_experts, out]` biases on gate/up/down. All three MoE decode fast
+paths (`moeDecodeGatherQmv`, the batched-take path, stock gather) produce
+`act(gate) * up` directly out of `gather_qmm` with nowhere to add a per-expert
+term, and `moeDecodeGatherQmv` additionally bakes in the standard SwiGLU.
+Engaging any of them would have dropped both the biases and the clamp silently.
+`has_expert_bias` therefore forces `do_sort`. The cost is nil in practice: at
+decode the sort is over N = B·S·K = 4 indices, and the path's own comment
+already notes argsort overhead is negligible at that size.
+
+**The clamped SwiGLU dispatches above `computeGeglu`, not inside it.** That
+helper's fast paths are `compiled_geglu` and `fusedSwiGLU`, and `fusedSwiGLU`'s
+correctness argument is a sigmoid lookup table that is exact *by construction*
+for `silu(gate)*up` — the whole 16-bit domain was swept for it. A different
+activation routed through that table is not slow, it is wrong. So the branch
+lives one level up, in the MoE forward, keyed on `cfg.swiglu_limit > 0`.
+
+gpt-oss's activation is worth stating exactly, because two of its three parts
+are easy to drop:
+
+    x_glu    = clip(gate, max=limit)        // asymmetric — NO lower clip
+    x_linear = clip(up, -limit, +limit)
+    out      = x_glu * sigmoid(alpha*x_glu) * (x_linear + 1)
+
+The `+ 1` is part of the trained function, not a numerical guard. The unit test
+sweeps 121 (gate, up) pairs straddling both clip boundaries in both directions
+against an f64 oracle, which is what catches clipping gate on both sides,
+dropping the `+1`, or applying alpha outside the sigmoid.
+
+**Sinks cost nothing.** The one feature that usually forces a hand-rolled
+attention turned out to be free: `mlx_fast_scaled_dot_product_attention` already
+takes a `sinks` array in our pin, and in the Metal backend it is a function
+constant (`_has_sinks_`, id 302) on the *fused* kernels with the array bound as
+input 7 — not a fallback to the composed path. Verified in the built metallib,
+not just the source. Likewise `mxfp4_gather_qmm_t_nax_bfloat16_t_gs_32_b_4` is
+present, so gpt-oss's native mxfp4 expert banks stream through the NAX gather
+lanes at exactly the geometry the checkpoint ships (gs 32, bits 4).
+
+The one place sinks are deliberately NOT wired is the fused quantized-KV
+attention path: those kernels are ours and take no sink argument, so engaging
+them would drop the sinks silently. Under `--kv-quant`, `gptOssAttnWith` reads
+the dequantized `DenseKVView` that `cache.update` already returns.
+
+**The mask gate is a list you must join.** `forwardMoeWith` precomputes the
+sliding-window prefill/decode masks under `if ((is_gemma4 or is_laguna or
+is_gpt_oss) and cfg.has_sliding_window)`. An arch whose attention arm reads
+those masks but is missing from that gate receives an empty handle and attends
+over the whole history instead of the window — no error, no log. Caught here by
+reading the gate before trusting it; it would otherwise have shown up only as
+quality drift past 128 tokens on half the layers.
