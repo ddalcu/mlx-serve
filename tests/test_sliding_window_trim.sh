@@ -26,7 +26,8 @@
 #
 # Usage:
 #   SLIDING_GEMMA4_MOE_MODEL=/path SLIDING_LAGUNA_MODEL=/path \
-#   SLIDING_INKLING_MODEL=/path ./tests/test_sliding_window_trim.sh [port]
+#   SLIDING_INKLING_MODEL=/path SLIDING_GPT_OSS_MODEL=/path \
+#   ./tests/test_sliding_window_trim.sh [port]
 
 set -u
 
@@ -44,6 +45,7 @@ SSD="/Volumes/G Drive SSD/models"
 GEMMA4_MOE="${SLIDING_GEMMA4_MOE_MODEL:-$SSD/mlx-community/gemma-4-26b-a4b-it-4bit}"
 LAGUNA="${SLIDING_LAGUNA_MODEL:-$SSD/poolside/Laguna-XS-2.1-NVFP4-mlx}"
 INKLING="${SLIDING_INKLING_MODEL:-$SSD/mlx-community/Inkling-Small-mlx-2bit}"
+GPT_OSS="${SLIDING_GPT_OSS_MODEL:-$HOME/.mlx-serve/models/mlx-community/gpt-oss-20b-MXFP4-Q8}"
 
 FAILURES=0
 RAN=0
@@ -176,6 +178,18 @@ check_arch "laguna" "$LAGUNA" "--no-pld" 96 320
 # inkling: hd 128, window 512, 35/42 local layers, RelativeLogits bias instead
 # of RoPE — the bias is the thing that has to be view-relative here.
 check_arch "inkling" "$INKLING" "--no-pld" 96 320
+
+# gpt-oss: hd 64, window 128 — by far the smallest here, so the prompt is a
+# fraction of the others': anything past ~130 tokens already makes every PLD
+# verify block a trimmed one, and a 20B at this machine's 8k prefill budget is
+# what the size is actually bounded by. This arm is the regression test for the
+# shape mismatch: the arm sized its K/V view with the raw `cfg.sliding_window`
+# while building masks at `window + q_len - 1`, which is invisible at q_len 1
+# and an uncatchable MLX error (`[broadcast_shapes] (1,1,6,133) vs
+# (1,64,6,128)`) on the first prefill chunk or spec-verify block past the
+# window. Before the fix the request kills the server outright, so this reads
+# as a failure, not a diff.
+check_arch "gpt-oss" "$GPT_OSS" "--pld" 128 24
 
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
 
