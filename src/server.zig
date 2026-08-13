@@ -15139,6 +15139,7 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     // pinned auto-context to under a third of what fits.
     var ling = model_mod.ModelConfig{ .model_type = "bailing_hybrid" };
     ling.num_hidden_layers = 24;
+    ling.num_attention_heads = 16;
     ling.num_key_value_heads = 16;
     ling.head_dim = 128;
     ling.full_attention_interval = 4;
@@ -15149,6 +15150,20 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     try t.expectEqual(@as(u32, 6), ling.attnCacheLayerCount());
     try t.expectEqual(@as(u64, 6 * 16 * (192 + 128) * 2), ling.kvBytesPerToken());
     try t.expect(ling.kvBytesPerToken() * 3 < 24 * 2 * 16 * 128 * 2);
+
+    // MLA caches per ATTENTION head — it decompresses the latent to all of
+    // them, so there is no grouping to bill against. Ling 3.0 ships 16/16, so
+    // only an asymmetric config can tell the two spellings apart, and reading
+    // `num_key_value_heads` here UNDER-bills (2 of 16 heads = 8x light) —
+    // which surfaces as an uncatchable Metal OOM, not a refusal.
+    var mla_grouped = ling;
+    mla_grouped.num_key_value_heads = 2;
+    try t.expectEqual(@as(u64, 6 * 16 * (192 + 128) * 2), mla_grouped.kvBytesPerToken());
+    // ...while a NON-MLA arch still bills its KV heads, grouping and all.
+    var gqa = dense;
+    gqa.num_attention_heads = 32;
+    gqa.num_key_value_heads = 8;
+    try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), gqa.kvBytesPerToken());
 
     // A hybrid WITHOUT MLA still drops its linear layers from the bill.
     var gdn = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };

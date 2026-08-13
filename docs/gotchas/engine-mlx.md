@@ -2226,3 +2226,36 @@ Three holes the `bailing_hybrid` port left open, all of the same shape — a gen
 **A lazily-built rotation refuses lazily.** TurboQuant needs a power-of-two width and MLA's key is 192, so it genuinely cannot serve this arch. But `TurboState` builds its Hadamard matrices at the first write, so the refusal (`error.NonPowerOfTwoHeadDim`) fired inside the first request that reached an MLA layer — a 500 mid-generation for something knowable at load. `initWithConfigAndHeadDim` had even taken a `head_dim` parameter and thrown it away (`_ = head_dim; // observed at first write`), while its own doc comment claimed "the scheduler's load path validates head_dim is pow2 at cache init". The parameter is now used — against `ModelConfig.kvCacheKeyHeadDim()`, because `head_dim` says 128 for an arch that caches 192-wide keys, so the declared field would have validated the wrong number. When a lazy constructor's constraint is knowable from config, check it eagerly and let the request path keep the lazy build.
 
 **Two arms means the arm is selected, not defaulted.** `kda_gate_lower_bound` was declared "0 = plain -exp(A_log)·softplus form" and the forward then handed that 0 straight to the bounded chain, which computes `exp(0 · σ(…))` = 1: a forget gate that never forgets, on a checkpoint whose only difference was omitting the key. The parse refuses a non-negative bound that is PRESENT, but an absent one left the field at its default and the field's own comment unhonored. The fix is a predicate (`ModelConfig.kdaUsesBoundedGate`) both sides read, and the absent case routes to the softplus chain — which is elementwise, so with `A_log` already expanded per key channel it serves a per-channel gate with no new code. Whenever a config value's default means "the other formula", the selection belongs in a named predicate; a default that silently degenerates one branch is worse than either branch.
+
+## The refusal was right and the process died anyway: a fallible re-init behind a deinit (2026-08-13)
+
+Making `KVCache.initWithConfigAndHeadDim` fallible was the previous section's fix — TurboQuant cannot serve a 192-wide MLA key, so say so at load instead of mid-request. It worked. `mlx-serve --model <Ling-3.0-tiny> --serve --kv-quant turbo4` printed the named refusal, correctly, and then died:
+
+```
+--kv-quant turbo: cache key width 192 is not a power of two ...
+EXC_BAD_ACCESS in mlx_array_free <- transformer.freeKVEntry <- KVCache.deinit
+  <- Transformer.deinit <- scheduler.doLoadOnInferenceThread
+```
+
+The crash is not in the new check and not in the arch. Every site that re-applies a kv-quant config was written when the constructor was infallible:
+
+```zig
+xfm_ptr.cache.deinit();
+xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(...);
+```
+
+Read that with an error in mind: `deinit` frees the entries slice and every mlx handle in it, `try` returns, and a FREED cache stays installed on the Transformer. The owner's own `deinit` then walks the same entries and frees all of it a second time. Four sites had the shape — the scheduler's cold load, main's offline path, `resetCache`, `tryRestoreCache` — because the pattern is the obvious way to write it and was correct for as long as the callee could not fail. **A constructor becoming fallible is a change to every caller that frees before calling it**, and nothing in the type system says so: the `try` was added at each site by the same patch that introduced the error, which is precisely when the freed-object window opened.
+
+The fix is ordering, held in one place. `KVCache.reinit` builds the replacement, and only then frees and swaps:
+
+```zig
+const fresh = try initWithConfigAndHeadDim(self.allocator, num_layers, config, head_dim);
+self.deinit();
+self.* = fresh;
+```
+
+Failure now leaves the live cache exactly as it was — same scheme, same contents, still serving — which is also the behavior a 503-and-retry story needs, since the alternative to crashing was a model entry holding a cache that could never be used again.
+
+Two things make this a class rather than a bug. First, the symptom is maximally misleading: the stack names `mlx_array_free`, several frames and one full load-path unwind away from the refusal that caused it, so the natural first suspect is the MLA cache geometry or mlx's refcounting — anything but the four-line caller that printed the correct error message immediately before. Second, the shape recurs on its own: any future scheme that refuses an arch, at any of these sites, reopens it. So the guard is a source scan (`.cache = try` appears nowhere in transformer/scheduler/main, and `reinit`'s build precedes its free) rather than only the behavioral test, and the behavioral test is written against the testing allocator so the pre-fix order trips a double free on its own `defer` — verified red exactly that way, and red again with the helper's two statements transposed.
+
+The general rule: **when a fallible call sits after a `deinit` of the thing it replaces, the error path is a use-after-free.** Build, then swap — and when several call sites share the pattern, the ordering belongs inside one helper they all use, not repeated correctly four times.

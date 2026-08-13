@@ -659,7 +659,19 @@ pub const ModelConfig = struct {
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
         else
             2 * @as(u64, self.head_dim);
-        return @as(u64, self.attnCacheLayerCount()) * @as(u64, self.num_key_value_heads) * widths * 2;
+        // MLA decompresses its latent to EVERY attention head before the write
+        // (`mlaAttnWith` broadcasts the MQA rope key to `num_attention_heads`
+        // and caches `[B, num_attention_heads, S, qk_dim]`), so its cache has
+        // no grouping to save on — `num_key_value_heads` is the GQA question
+        // and this arch never asks it. Equal on Ling 3.0 (16/16), so the
+        // spelling is invisible today and would UNDER-bill the first MLA
+        // checkpoint that groups — the direction that ends in an uncatchable
+        // Metal OOM rather than a 400.
+        const heads: u64 = if (self.isMla())
+            @as(u64, self.num_attention_heads)
+        else
+            @as(u64, self.num_key_value_heads);
+        return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -828,10 +840,20 @@ pub const ModelConfig = struct {
     /// the shipped template agrees — never inferred from "the template mentions
     /// enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
-        // muse_glimmer: always deliver reasoning (its templates open a `to=self` pass)
+        // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
+        // header, so the recipient must stay free and the reasoning is
+        // delivered rather than paid-and-dropped). A plain chat request
+        // defaults to the prompt-committed to=user channel instead
+        // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
         if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
-        // Ling / Bailing (reasoner families) ship templates that expect reasoning; enable by default
-        if (has_tools and (std.mem.eql(u8, self.model_type, "bailing_hybrid") or std.mem.eql(u8, self.model_type, "ling"))) return true;
+        // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
+        // checkpoint's own template normalizes an undefined `enable_thinking`
+        // to `thinking_option = 'on'` unconditionally, and unlike muse there
+        // is no prompt-committed no-think channel to fall back to — so a
+        // tool-less silent request gated OFF just makes a reasoner answer
+        // without reasoning ("17 - 9 = 8" where the thinking arm works the
+        // word problem and answers "9 sheep are left").
+        if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
 
         return false;
     }
@@ -3389,10 +3411,14 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const muse = ModelConfig{ .model_type = "muse_glimmer" };
     try testing.expect(!muse.defaultEnableThinking(false));
     try testing.expect(muse.defaultEnableThinking(true));
-    // bailing_hybrid opts IN: Ling 3.0 ships as a reasoner and its template's
-    // own thinking_option default is 'on'.
+    // bailing_hybrid opts IN on BOTH arms: Ling 3.0 ships as a reasoner and
+    // its template normalizes an undefined enable_thinking to 'on' with no
+    // reference to tools. Gating it on has_tools (as muse is) contradicted the
+    // checkpoint and left a tool-less silent request answering without
+    // reasoning — muse can do that because its prompt commits a to=user
+    // channel, and this arch has no such fallback.
     const ling = ModelConfig{ .model_type = "bailing_hybrid" };
-    try testing.expect(!ling.defaultEnableThinking(false));
+    try testing.expect(ling.defaultEnableThinking(false));
     try testing.expect(ling.defaultEnableThinking(true));
 }
 

@@ -2493,6 +2493,23 @@ pub const KVCache = struct {
         self.quant_state = null;
     }
 
+    /// Swap this cache for a freshly-built one under `config`. BUILD FIRST,
+    /// then free: `initWithConfigAndHeadDim` is fallible (a scheme that cannot
+    /// serve the arch's key width refuses at load), and every caller reached
+    /// it through `cache.deinit(); cache = try init(...)`. On the error path
+    /// that left a FREED cache installed on the Transformer, whose own
+    /// `deinit` then freed every handle a second time — an EXC_BAD_ACCESS in
+    /// `mlx_array_free` several frames away from the refusal that caused it
+    /// (live: `--kv-quant turbo4` on an MLA arch printed its named refusal and
+    /// then died). The class is "a fallible re-init behind a deinit"; keeping
+    /// the order inside ONE helper is what stops it recurring, so the call
+    /// sites are scan-pinned to use it.
+    pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig, head_dim: u32) !void {
+        const fresh = try initWithConfigAndHeadDim(self.allocator, num_layers, config, head_dim);
+        self.deinit();
+        self.* = fresh;
+    }
+
     /// Capture cache state for speculative-decoding rollback (PLD/drafter).
     /// Snapshots own array handles that share the underlying buffer with the
     /// source via refcount — cheap (no data copy) and immune to subsequent
@@ -5421,8 +5438,7 @@ pub const Transformer = struct {
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
         const prev_config = self.cache.config;
-        self.cache.deinit();
-        self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.kvCacheKeyHeadDim());
+        try self.cache.reinit(self.config.num_hidden_layers, prev_config, self.config.kvCacheKeyHeadDim());
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
                 ssmFreeSpecCapture(e);
@@ -5458,8 +5474,7 @@ pub const Transformer = struct {
 
         // Full prefix match with tokens remaining — restore cached state.
         const prev_config = self.cache.config;
-        self.cache.deinit();
-        self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.kvCacheKeyHeadDim());
+        try self.cache.reinit(self.config.num_hidden_layers, prev_config, self.config.kvCacheKeyHeadDim());
         self.cache.step = pc.kv_step;
         for (pc.kv_entries, 0..) |src, i| {
             if (src.initialized) {
@@ -18849,6 +18864,96 @@ test "TurboQuant refuses a non-pow2 cache key width at INIT, not mid-request" {
     // A width of 0 means "caller has none to offer" — stays lazy, as before.
     var lazy = try KVCache.initWithConfigAndHeadDim(t.allocator, 4, kv_quant.KVQuantConfig.turboquant(4), 0);
     lazy.deinit();
+}
+
+test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
+    // The refusal above is correct and the process died anyway: every re-init
+    // site read `cache.deinit(); cache = try init(...)`, so the error path
+    // left a FREED cache installed on the Transformer and its owner's deinit
+    // freed every handle a second time — EXC_BAD_ACCESS in `mlx_array_free`,
+    // several frames from the refusal that caused it, on a launch flag the
+    // server had just refused BY NAME (`--kv-quant turbo4` on an MLA arch).
+    // Under the testing allocator the pre-fix order trips the same double
+    // free on this test's own `defer`.
+    const s = mlx.gpuStream();
+    var cache = try KVCache.initWithConfig(testing.allocator, 2, kv_quant.KVQuantConfig.affine(8));
+    defer cache.deinit();
+
+    // Real handles in the cache, so a double free has something to land on.
+    {
+        const k = testKVWide(3, 192, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKVWide(3, 128, s);
+        defer _ = mlx.mlx_array_free(v);
+        var dv = try cache.update(0, k, v, s, 0);
+        dv.deinit();
+    }
+    try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
+
+    // The refusal, at the width the live crash used.
+    try testing.expectError(
+        error.NonPowerOfTwoHeadDim,
+        cache.reinit(2, kv_quant.KVQuantConfig.turboquant(4), 192),
+    );
+
+    // Untouched: same scheme, same contents, same entry count...
+    try testing.expectEqual(kv_quant.Scheme.affine, cache.config.scheme);
+    try testing.expectEqual(@as(u8, 8), cache.config.bits);
+    try testing.expectEqual(@as(usize, 2), cache.entries.len);
+    try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
+    // ...and still SERVING, which a freed-but-readable cache would not be.
+    {
+        const k = testKVWide(1, 192, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKVWide(1, 128, s);
+        defer _ = mlx.mlx_array_free(v);
+        var dv = try cache.update(0, k, v, s, 0);
+        defer dv.deinit();
+        try mlx.check(mlx.mlx_array_eval(dv.k));
+        try mlx.check(mlx.mlx_array_eval(dv.v));
+    }
+    try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
+
+    // A re-init that SUCCEEDS still swaps — the fix must not turn the helper
+    // into a no-op: new scheme, fresh entries, offsets back to zero.
+    try cache.reinit(2, kv_quant.KVQuantConfig.affine(4), 192);
+    try testing.expectEqual(@as(u8, 4), cache.config.bits);
+    try testing.expectEqual(@as(usize, 0), cache.entries[0].offset);
+    try testing.expect(!cache.entries[0].initialized);
+    try testing.expectEqual(@as(usize, 0), cache.step);
+}
+
+test "every live KV cache re-init goes through reinit, which builds before it frees" {
+    // Class guard, not whack-a-mole: the defect was never the refusal, it was
+    // the CALLER SHAPE — a fallible re-init behind a deinit — and four sites
+    // had it (scheduler's cold load, main's offline path, resetCache,
+    // tryRestoreCache). Any future scheme that refuses an arch reopens the
+    // crash at whichever site is respelled. Needles are assembled at comptime
+    // so this test's own source cannot satisfy the scan.
+    const assign = ".cache = " ++ "try ";
+    inline for (.{
+        .{ "transformer.zig", @embedFile("transformer.zig") },
+        .{ "scheduler.zig", @embedFile("scheduler.zig") },
+        .{ "main.zig", @embedFile("main.zig") },
+    }) |f| {
+        if (std.mem.indexOf(u8, f[1], assign) != null) {
+            std.debug.print(
+                "{s}: assigns a fallible KVCache init onto a live `.cache` field; use KVCache.reinit\n",
+                .{f[0]},
+            );
+            return error.FallibleReinitBehindDeinit;
+        }
+    }
+    // ...and the helper itself builds BEFORE it frees. Reversed, it is exactly
+    // the bug it exists to prevent, and every call site inherits it silently.
+    const src = @embedFile("transformer.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn re" ++ "init(self: *KVCache") orelse
+        return error.MissingReinitHelper;
+    const build_at = std.mem.indexOfPos(u8, src, at, "initWithConfigAndHeadDim") orelse
+        return error.MissingReinitBuild;
+    const free_at = std.mem.indexOfPos(u8, src, at, "self." ++ "deinit()") orelse
+        return error.MissingReinitFree;
+    try testing.expect(build_at < free_at);
 }
 
 test "KVCache sliding window views return last max_seq entries" {

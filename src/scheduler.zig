@@ -2978,8 +2978,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     if (params.kv_quant_config.scheme != .off) {
-        xfm_ptr.cache.deinit();
-        xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(sch.allocator, params.config.num_hidden_layers, params.kv_quant_config, params.config.kvCacheKeyHeadDim());
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, params.kv_quant_config, params.config.kvCacheKeyHeadDim());
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
