@@ -10981,9 +10981,17 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(v_t);
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
 
-        // Sliding layers trim the cache to the window on DECODE; prefill keeps
-        // the full buffer and lets the mask set the scope.
-        const max_kv: u32 = if (is_full) 0 else cfg.sliding_window;
+        // Sliding layers read only the tail their queries can reach, and the
+        // width is a property of the whole BLOCK: `window + q_len - 1`,
+        // because the FIRST query of the block reaches back furthest. That is
+        // `slidingViewFor`'s job, and it is the SAME call every mask below is
+        // built from — hand the view one width and the mask another and SDPA
+        // fails to broadcast them, which is an uncatchable MLX error rather
+        // than a bad answer. `cfg.sliding_window` here reads correct at
+        // q_len == 1 (span == window) and kills the process on the first
+        // spec-verify block or prefill chunk past the window.
+        const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
+        const max_kv: u32 = if (is_full) 0 else sliding.span;
         var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
         defer kv_view.deinit();
         const full_k = kv_view.k;
@@ -11002,7 +11010,8 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, fa.sinks, self.s));
             } else if (is_prefill) {
                 if (local_prefill_mask.ctx == null) {
-                    local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                    // Built at the TRIMMED width, matching the view above.
+                    local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                 }
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, fa.sinks, self.s));
             } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
@@ -18546,6 +18555,45 @@ test "FUSED256_MIN_Q_LEN is the single source for the decline and the band predi
     // Neither may respell the floor as a literal.
     try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < 1" ++ "6)") == null);
     try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ "2") == null);
+}
+
+test "every sliding attention arm sizes its KV view from slidingViewFor, never the raw window" {
+    // The mask and the K/V view are ONE decision. `slidingViewFor` is the
+    // chokepoint that makes them agree: an arm passes `sliding.span` to
+    // `cache.update` and builds every mask at `sliding.kv_len`. Spelling the
+    // view width as `cfg.sliding_window` instead looks equivalent because it
+    // IS equivalent at q_len == 1 — and then the first block-wide forward past
+    // the window (a spec-verify block, or a prefill chunk) asks SDPA to
+    // broadcast a `window + q_len - 1` mask against a `window` view, which is
+    // an uncatchable MLX error: gpt_oss shipped exactly that and killed the
+    // process a few hundred tokens into every generation.
+    //
+    // Needles are assembled at comptime so this test's own source cannot
+    // satisfy the scan.
+    const src = @embedFile("transformer.zig");
+    const needle = "const max_kv: u32 " ++ "= ";
+    var i: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |pos| {
+        const line_end = std.mem.indexOfScalarPos(u8, src, pos, '\n') orelse src.len;
+        const line = src[pos..line_end];
+        // The full-attention arm of the ternary keeps everything (0); the
+        // sliding arm must read the chokepoint, directly or through the one
+        // alias pinned below.
+        try testing.expect(std.mem.indexOf(u8, line, "sliding.span") != null or
+            std.mem.indexOf(u8, line, "sliding_span") != null);
+        seen += 1;
+        i = line_end;
+    }
+    // forwardStandardWith, gemma4, laguna, inkling, gpt_oss — a rewrite that
+    // drops the binding entirely must not read as a pass.
+    try testing.expect(seen >= 5);
+    // The alias is only as good as what it is assigned from.
+    try testing.expect(std.mem.indexOf(u8, src, "const sliding_span " ++ "= sliding.span;") != null);
+
+    // And no arm may respell the width as the bare window.
+    try testing.expect(std.mem.indexOf(u8, src, "max_kv: u32 = if (is_full) 0 else " ++ "cfg.sliding_window") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "max_kv: u32 = if (is_global) 0 else " ++ "cfg.sliding_window") == null);
 }
 
 test "KVCache trims the tail view for a BLOCK-wide update, not just decode" {
