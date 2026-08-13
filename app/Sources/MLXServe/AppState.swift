@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import SwiftUI
@@ -673,7 +674,22 @@ class AppState: ObservableObject {
     /// nothing there ever becomes first responder and a bare `.onDeleteCommand`
     /// never fired. Routed through the same rule every delete control reads, so
     /// the keyboard cannot become the one path that skips the confirmation.
+    ///
+    /// It also has to give the keystroke BACK when something is being typed
+    /// into: a menu key equivalent is offered the event ahead of the first
+    /// responder, so this command otherwise stole ⌘⌫ from the composer, where
+    /// it deletes to the start of the line (`ChatDeleteShortcut`). Performing
+    /// that deletion here rather than returning early is the load-bearing part
+    /// — the menu has already swallowed the event, and nothing else will run.
     func requestChatDeletionFromMenu() {
+        let responder = NSApp.keyWindow?.firstResponder
+        switch ChatDeleteShortcut.route(editingText: ChatDeleteShortcut.isTextEditor(responder)) {
+        case .deleteToLineStart:
+            (responder as? NSTextView)?.deleteToBeginningOfLine(nil)
+            return
+        case .deleteChats:
+            break
+        }
         guard let ids = chatDeletionTarget else { return }
         if SidebarDeleteConfirm.required(count: ids.count, keyboard: true) {
             pendingChatDeletion = ids
@@ -754,33 +770,56 @@ class AppState: ObservableObject {
         }
     }
 
-    /// Start a regeneration's revision list on the message just appended,
-    /// carrying the reply that is being replaced.
+    /// The version list a regeneration in flight will put on whatever reply it
+    /// produces, per session.
+    ///
+    /// Held rather than written straight onto a message because the message
+    /// does not exist yet. `runPlainTurn` appends its streaming placeholder
+    /// synchronously, so the gap there is one statement wide — but
+    /// `runAgentLoop` appends one per tool round from inside a Task, and the
+    /// reply the pager belongs to is the LAST of them. Writing at the start
+    /// landed the seed on the user's own message, where the role guard dropped
+    /// it, and the pager silently never appeared with Tools on.
+    private var pendingRevisionSeed: [UUID: [MessageRevision]] = [:]
+
+    /// Start a regeneration's revision list, carrying the reply being replaced.
     ///
     /// `regenerate` truncates the transcript back to the last user message, so
     /// the old reply is destroyed before the new one streams. Capturing it here
-    /// is what makes the pager possible at all.
+    /// is what makes the pager possible at all; `finishRevisions` applies it
+    /// when the turn ends.
     func seedRevisions(in sessionId: UUID, from prior: ChatMessage) {
-        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
-              let mIdx = chatSessions[sIdx].messages.indices.last,
-              chatSessions[sIdx].messages[mIdx].role == .assistant else { return }
         let priorRevision = MessageRevision(content: prior.content,
                                             reasoningContent: prior.reasoningContent)
-        chatSessions[sIdx].messages[mIdx].revisions = MessageRevisions.seeding(
-            prior: priorRevision,
-            existing: prior.revisions)
+        let seeded = MessageRevisions.seeding(prior: priorRevision, existing: prior.revisions)
+        // An empty seed is the "there was nothing worth stepping back to" case,
+        // and leaving a stale one behind would attach it to a later turn.
+        if seeded.isEmpty { pendingRevisionSeed.removeValue(forKey: sessionId) }
+        else { pendingRevisionSeed[sessionId] = seeded }
     }
 
-    /// Record a finished reply as the newest version. A no-op unless a
-    /// regeneration seeded the list, so an ordinary turn is untouched.
-    func commitRevision(in sessionId: UUID) {
+    /// Apply any held seed to the reply this turn produced and record that
+    /// reply as the newest version. Called from turn EXITS only — a
+    /// per-iteration call inside the agent loop would land the pager on the
+    /// first tool round's bubble instead of on the answer.
+    ///
+    /// Targets the last ASSISTANT message rather than the last message: a turn
+    /// stopped mid-tool-execution ends on a `tool` row, and the reply above it
+    /// is still the one the pager belongs to.
+    func finishRevisions(in sessionId: UUID) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
-              let mIdx = chatSessions[sIdx].messages.indices.last,
-              chatSessions[sIdx].messages[mIdx].role == .assistant else { return }
+              let mIdx = chatSessions[sIdx].messages.lastIndex(where: { $0.role == .assistant })
+        else {
+            // Nothing to attach it to, and holding it would leak the seed onto
+            // an unrelated later turn.
+            pendingRevisionSeed.removeValue(forKey: sessionId)
+            return
+        }
         let msg = chatSessions[sIdx].messages[mIdx]
-        guard !msg.revisions.isEmpty else { return }
+        let seed = pendingRevisionSeed.removeValue(forKey: sessionId)
+        guard seed != nil || !msg.revisions.isEmpty else { return }
         let finished = MessageRevision(content: msg.content, reasoningContent: msg.reasoningContent)
-        let result = MessageRevisions.committing(finished, into: msg.revisions)
+        let result = MessageRevisions.finishing(seed: seed, existing: msg.revisions, finished: finished)
         chatSessions[sIdx].messages[mIdx].revisions = result.revisions
         chatSessions[sIdx].messages[mIdx].activeRevision = result.index
     }

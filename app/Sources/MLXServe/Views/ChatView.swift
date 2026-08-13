@@ -673,6 +673,42 @@ enum SidebarDeleteConfirm {
     }
 }
 
+/// Where ⌘⌫ goes.
+///
+/// A menu item's key equivalent is offered the keystroke by
+/// `performKeyEquivalent` BEFORE the first responder ever sees it, so a Delete
+/// Chat command in the menu bar takes ⌘⌫ away from every text field in the app
+/// — including the composer, where it has meant "delete to the start of the
+/// line" since long before this app existed. Typing it mid-message raised a
+/// delete-chat dialog, and `.disabled(chatDeletionTarget == nil)` cannot help:
+/// a chat is open in exactly the state where you are typing into one.
+///
+/// So the command ROUTES rather than claims. The keyboard's own owner wins
+/// while it has focus, and the menu item keeps its slot — which is the half
+/// that made the shortcut discoverable in the first place.
+enum ChatDeleteShortcut {
+    enum Route: Equatable {
+        /// Hand it back to the text being edited (see `deleteToBeginningOfLine`
+        /// — the menu has already swallowed the event, so returning early
+        /// would make ⌘⌫ do nothing at all in the composer).
+        case deleteToLineStart
+        case deleteChats
+    }
+
+    static func route(editingText: Bool) -> Route {
+        editingText ? .deleteToLineStart : .deleteChats
+    }
+
+    /// Whether the responder holding the keyboard is text being typed into.
+    ///
+    /// `NSTextView` covers both cases and is the only type that needs naming: a
+    /// focused `NSTextField` never becomes first responder itself — the
+    /// window's FIELD EDITOR does, and that is an `NSTextView`.
+    static func isTextEditor(_ responder: NSResponder?) -> Bool {
+        responder is NSTextView
+    }
+}
+
 // MARK: - Sidebar
 
 /// Where one conversation row sits vertically, in global coordinates.

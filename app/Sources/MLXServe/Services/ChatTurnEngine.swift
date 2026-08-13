@@ -351,7 +351,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// the orphaned streaming bubble.
     private func appendErrorNotice(_ error: Error, to sessionId: UUID) {
         appState.updateLastMessage(in: sessionId, streaming: false)
-        appState.commitRevision(in: sessionId)
+        // Before the notice row is appended, so a regeneration's pager lands on
+        // the partial reply and not on our own error card.
+        appState.finishRevisions(in: sessionId)
         var msg = ChatMessage(role: .assistant, content: "")
         msg.isStreaming = false
         msg.failedRetry = true
@@ -419,7 +421,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgressSessionId = nil
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
-        appState.commitRevision(in: sessionId)
+        appState.finishRevisions(in: sessionId)
         appState.saveChatHistory()
         publishTurnState()
     }
@@ -434,6 +436,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgress = nil
             mediaProgressSessionId = nil
         }
+        // The ONE exit both paths complete through. A regeneration's held seed
+        // is applied here rather than when the turn started, because on the
+        // agent path the reply it belongs to is the last of several appended
+        // from inside the Task — see AppState.pendingRevisionSeed.
+        appState.finishRevisions(in: sessionId)
+        appState.saveChatHistory()
         publishTurnState()
     }
 
@@ -492,8 +500,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
         runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
                 config: config, approval: approval)
-        // After runTurn: the streaming placeholder is appended synchronously,
-        // so the message this seeds is the one the new reply streams into.
+        // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
+        // turn exit, so a seed placed before it would be spent immediately.
+        // The seed is HELD from here and applied when this turn ends: the
+        // reply it belongs to does not exist yet, and on the agent path it is
+        // the last of several appended from inside the Task.
         if let replaced { appState.seedRevisions(in: sessionId, from: replaced) }
     }
 
@@ -663,7 +674,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             appendErrorNotice(error, to: sessionId)
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
-        appState.commitRevision(in: sessionId)
         appState.saveChatHistory()
         endTurn(sessionId: sessionId, token: token)
     }
@@ -965,7 +975,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 throw CancellationError()
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
-        appState.commitRevision(in: sessionId)
 
             // A repetition-loop cut ENDS the turn, ahead of every recovery path
             // below. The loop's text is already in the transcript — a streamed

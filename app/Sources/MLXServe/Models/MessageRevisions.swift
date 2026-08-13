@@ -79,6 +79,34 @@ enum MessageRevisions {
         return next
     }
 
+    /// Apply a regeneration's held seed and record the reply it produced, in
+    /// one step — the whole transaction a finished turn performs.
+    ///
+    /// The seed is HELD from the moment the regeneration is asked for because
+    /// the reply it belongs to does not exist yet. On the plain path that gap
+    /// is one statement wide; on the agent path the streaming placeholder is
+    /// appended from inside a Task, once per tool round, and the reply the
+    /// pager belongs to is the LAST of them. Writing the seed at the start
+    /// therefore landed it on the user's own message and the role guard
+    /// silently dropped it, so with Tools on the pager never appeared at all.
+    ///
+    /// An `existing` list outranks the seed: that message is already on its
+    /// third version, and the seed describes a reply two regenerations ago.
+    ///
+    /// A finished reply with no text is not a version, for the same reason
+    /// `seeding` refuses an empty prior — a turn that failed before streaming
+    /// anything would otherwise add a blank page to step onto. The seed is
+    /// still installed, so the earlier reply is not lost with it.
+    static func finishing(seed: [MessageRevision]?,
+                          existing: [MessageRevision],
+                          finished: MessageRevision) -> (revisions: [MessageRevision], index: Int) {
+        let base = existing.isEmpty ? (seed ?? []) : existing
+        guard !finished.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return (base, max(base.count - 1, 0))
+        }
+        return committing(finished, into: base)
+    }
+
     /// Record a freshly finished reply as the newest version and select it.
     ///
     /// Only meaningful when a regeneration seeded the list — an ordinary first

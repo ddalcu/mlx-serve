@@ -106,6 +106,93 @@ final class MessageRevisionsTests: XCTestCase {
         XCTAssertEqual(revisions.count, 2)
         XCTAssertEqual(index, 1)
     }
+
+    // MARK: - Seed and commit as ONE step
+
+    /// The seed cannot be written onto the reply when the regeneration STARTS,
+    /// because the reply does not exist yet — and on the agent path it does not
+    /// exist for several more rounds. `runPlainTurn` appends its streaming
+    /// placeholder synchronously, but `runAgentLoop` appends one per iteration
+    /// from inside a Task, and the reply the pager belongs to is the LAST of
+    /// them. So the seed is held until the turn ends and applied to whatever
+    /// reply the turn actually produced.
+    func testAHeldSeedIsAppliedToTheReplyTheTurnProduced() {
+        let (revisions, index) = MessageRevisions.finishing(
+            seed: [rev("first")], existing: [], finished: rev("second"))
+        XCTAssertEqual(revisions.map(\.content), ["first", "second"])
+        XCTAssertEqual(index, 1)
+    }
+
+    /// A message that already carries a list is on its third regeneration —
+    /// the seed is stale and must not overwrite what is there.
+    func testAnExistingListOutranksTheSeed() {
+        let (revisions, _) = MessageRevisions.finishing(
+            seed: [rev("stale")], existing: [rev("first"), rev("second")], finished: rev("third"))
+        XCTAssertEqual(revisions.map(\.content), ["first", "second", "third"])
+    }
+
+    /// No regeneration in flight: an ordinary reply is left exactly as it was,
+    /// pager and all (which is to say, none).
+    func testNoSeedAndNoListLeavesAnOrdinaryReplyAlone() {
+        let (revisions, index) = MessageRevisions.finishing(
+            seed: nil, existing: [], finished: rev("hello"))
+        XCTAssertTrue(revisions.isEmpty)
+        XCTAssertEqual(index, 0)
+    }
+
+    /// A turn that failed before streaming anything is not a version — the
+    /// same rule `seeding` applies to an empty prior. The reply it was going
+    /// to replace still has to survive, or the regeneration destroyed it for
+    /// nothing.
+    func testAFailedRegenerationKeepsTheReplyItWasReplacing() {
+        let (revisions, index) = MessageRevisions.finishing(
+            seed: [rev("first")], existing: [], finished: rev("   \n "))
+        XCTAssertEqual(revisions.map(\.content), ["first"])
+        XCTAssertEqual(index, 0)
+    }
+}
+
+/// The seed has to survive from the moment a regeneration is asked for to the
+/// moment its reply is finished — which on the agent path is many messages
+/// later. This pins the wiring that carries it.
+final class RegenerationSeedWiringTests: XCTestCase {
+
+    /// The bug: `regenerate` wrote the seed straight onto `messages.last`
+    /// immediately after calling `runTurn`. That is the streaming placeholder
+    /// on the plain path and the USER message on the agent path, where the
+    /// placeholder is appended from inside a Task — so with Tools on, the
+    /// role guard failed and the pager silently never appeared.
+    func testTheSeedIsHeldRatherThanWrittenOntoWhateverIsLast() throws {
+        let source = SourceScan.source("AppState.swift", from: #filePath)
+        let seed = try XCTUnwrap(source.range(of: "func seedRevisions"),
+                                 "seedRevisions moved — repoint this scan")
+        let body = String(source[seed.lowerBound...].prefix(900))
+        XCTAssertTrue(body.contains("pendingRevisionSeed"), """
+            seedRevisions writes to a message instead of holding the seed — on \
+            the agent path the reply it belongs to does not exist yet.
+            """)
+        XCTAssertFalse(body.contains("messages.indices.last"), """
+            seedRevisions still targets whatever message happens to be last at \
+            the moment a regeneration starts.
+            """)
+    }
+
+    /// Every turn EXIT applies it, and nothing else does. A per-iteration call
+    /// inside the agent loop would land the pager on the first tool round's
+    /// bubble rather than on the answer.
+    func testOnlyTurnExitsFinishRevisions() throws {
+        let source = SourceScan.source("Services/ChatTurnEngine.swift", from: #filePath)
+        XCTAssertEqual(SourceScan.count("appState.finishRevisions(", in: source), 3, """
+            finishRevisions must be called from exactly the three turn exits — \
+            stop(sessionId:), endTurn(sessionId:token:) and appendErrorNotice. \
+            A fourth call inside runAgentLoop applies the seed to an \
+            intermediate tool round.
+            """)
+        XCTAssertEqual(SourceScan.count("appState.commitRevision(", in: source), 0, """
+            commitRevision was folded into finishRevisions — a surviving call \
+            commits without ever seeding.
+            """)
+    }
 }
 
 /// Editing the model's own reply — putting words in its mouth, then letting it
