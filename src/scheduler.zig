@@ -461,7 +461,7 @@ pub const Slot = struct {
         // slots the engine owns its own cache — we initialize a zero-layer
         // shell so `Slot.deinit` is symmetric with the MLX path.
         const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
-        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.head_dim);
+        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.kvCacheKeyHeadDim());
         errdefer cache.deinit();
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
@@ -2978,8 +2978,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     if (params.kv_quant_config.scheme != .off) {
-        xfm_ptr.cache.deinit();
-        xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(sch.allocator, params.config.num_hidden_layers, params.kv_quant_config, params.config.head_dim);
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, params.kv_quant_config, params.config.kvCacheKeyHeadDim());
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).

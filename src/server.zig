@@ -2702,16 +2702,15 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
-    const layers: u64 = config.num_hidden_layers;
-    const kv_heads: u64 = config.num_key_value_heads;
-    const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
-    //   KV cache (fp16):   layers × 2 × kv_heads × head_dim × 2 bytes per token
+    //   KV cache (fp16):   config.kvBytesPerToken() — the arch's own count of
+    //                      CACHING layers and its own K/V widths, not a
+    //                      uniform layers × 2 × kv_heads × head_dim
     //   Working (fp16):    ~8 × max(hidden, ffn) × 2 bytes per token (per-layer tensors,
     //                      bounded by EVAL_EVERY_N_LAYERS in transformer.zig)
-    const kv_per_tok: u64 = layers * 2 * kv_heads * hdim * 2;
+    const kv_per_tok: u64 = config.kvBytesPerToken();
     const work_per_tok: u64 = 8 * @max(hidden, ffn) * 2;
     const per_tok: u64 = kv_per_tok + work_per_tok;
 
@@ -2759,7 +2758,19 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// prefillAttnKeys): `seq` for dense causal attention, a much smaller bound for
 /// a sparse arch. It scales the SCORE term only — KV/dequant are storage, and
 /// a sparse reader still stores every latent it might later attend to.
-pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64) u64 {
+/// `kv_per_tok` is the whole-model DENSE (f16) KV bytes for one token —
+/// `ModelConfig.kvBytesPerToken()`. It replaced a `layers` parameter because
+/// neither the layer count nor the per-head width is uniform once an arch
+/// interleaves linear-attention layers or stores keys wider than values.
+///
+/// `hdim` and `score_hdim` are two DIFFERENT widths and only coincide on a
+/// symmetric arch. `hdim` is the STORED width the quantized-KV dequant
+/// transient is read at; `score_hdim` is the width the score is contracted at
+/// (`ModelConfig.prefillScoreHeadDim`), which is what decides whether a fused
+/// kernel exists — MLA scores over 192 while storing values at 128, and billing
+/// the score term against `head_dim` 128 declared it fused and billed ZERO for
+/// a composed path that really does materialize [heads, chunk, seq].
+pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64) u64 {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
@@ -2767,10 +2778,10 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdi
     // (live 2026-07-14). No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = if (kv_bits >= 16)
-        layers * 2 * seq * kv_heads * hdim * 2
+        seq * kv_per_tok
     else
-        layers * 2 * seq * kv_heads * hdim * (2 * kv_bits + 1) / 16;
-    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
+        seq * kv_per_tok * (2 * kv_bits + 1) / 32;
+    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
     const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     return (kv_bytes + scores + dequant + 3 * mlp) * 5 / 4;
@@ -2856,7 +2867,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const needed: u64 = if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
-        prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq));
+        prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq));
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -15236,14 +15247,66 @@ test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill m
     try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
+test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
+    const t = std.testing;
+    // Uniform arch: every layer caches, K and V are both head_dim wide.
+    var dense = model_mod.ModelConfig{ .model_type = "qwen3" };
+    dense.num_hidden_layers = 24;
+    dense.num_key_value_heads = 8;
+    dense.head_dim = 128;
+    try t.expectEqual(@as(u32, 24), dense.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), dense.kvBytesPerToken());
+
+    // bailing_hybrid (Ling 3.0): 6 of 24 layers are attention, and MLA stores
+    // a 192-wide key against a 128-wide value. Billing it as a uniform arch
+    // charged 196608 B/token against a real 61440 — a 3.2x over-bill that
+    // pinned auto-context to under a third of what fits.
+    var ling = model_mod.ModelConfig{ .model_type = "bailing_hybrid" };
+    ling.num_hidden_layers = 24;
+    ling.num_attention_heads = 16;
+    ling.num_key_value_heads = 16;
+    ling.head_dim = 128;
+    ling.full_attention_interval = 4;
+    ling.mla_kv_lora_rank = 512;
+    ling.mla_qk_nope_head_dim = 128;
+    ling.mla_qk_rope_head_dim = 64;
+    ling.mla_v_head_dim = 128;
+    try t.expectEqual(@as(u32, 6), ling.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 6 * 16 * (192 + 128) * 2), ling.kvBytesPerToken());
+    try t.expect(ling.kvBytesPerToken() * 3 < 24 * 2 * 16 * 128 * 2);
+
+    // MLA caches per ATTENTION head — it decompresses the latent to all of
+    // them, so there is no grouping to bill against. Ling 3.0 ships 16/16, so
+    // only an asymmetric config can tell the two spellings apart, and reading
+    // `num_key_value_heads` here UNDER-bills (2 of 16 heads = 8x light) —
+    // which surfaces as an uncatchable Metal OOM, not a refusal.
+    var mla_grouped = ling;
+    mla_grouped.num_key_value_heads = 2;
+    try t.expectEqual(@as(u64, 6 * 16 * (192 + 128) * 2), mla_grouped.kvBytesPerToken());
+    // ...while a NON-MLA arch still bills its KV heads, grouping and all.
+    var gqa = dense;
+    gqa.num_attention_heads = 32;
+    gqa.num_key_value_heads = 8;
+    try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), gqa.kvBytesPerToken());
+
+    // A hybrid WITHOUT MLA still drops its linear layers from the bill.
+    var gdn = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    gdn.num_hidden_layers = 40;
+    gdn.num_key_value_heads = 2;
+    gdn.head_dim = 256;
+    gdn.full_attention_interval = 4;
+    try t.expectEqual(@as(u32, 10), gdn.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 10 * 2 * 512 * 2), gdn.kvBytesPerToken());
+}
+
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {
     // hy_v3 live 2026-07-14: with 111 GB of weights resident (~4 GB headroom),
     // a 31-TOKEN prompt was rejected "needs ~6246MB" — the MLP envelope was
     // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
     // 31-token forward (~25 MB). A forward is never wider than the prompt:
     // the envelope must use min(chunk, seq). Guard-tracks-reality rule.
-    const small = prefillMemoryNeeded(31, 64, 8, 80, 128, 4096, 13312, 8, 31, 31);
-    const capped = prefillMemoryNeeded(31, 64, 8, 80, 128, 4096, 13312, 8, 8192, 31);
+    const small = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 31, 31);
+    const capped = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 8192, 31);
     try std.testing.expectEqual(small, capped);
     // Sanity: the clamped estimate for the live 31-token case sits far below
     // the ~4 GB that was actually available.
@@ -15259,17 +15322,17 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
     try t.expectEqual(
         @as(u64, 32_854_507_520),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000),
     );
     // 4-bit: kv billed at (2*4+1)/16 bytes/elem (payload + group scale/bias)
     // = 6.912 GB, plus the 0.8192 GB per-layer dense dequant transient.
     try t.expectEqual(
         @as(u64, 11_798_507_520),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000),
     );
     // Direction: quantized admission must be under half the fp16 bill.
-    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512, 100_000) * 2 <
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000));
+    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000) * 2 <
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000));
 }
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
@@ -15280,7 +15343,7 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
     // mlp 0.377 GB, x1.25 = ~13.1 GiB — admittable on a big Mac.
-    const needed = prefillMemoryNeeded(262_144, 16, 2, 40, 256, 2048, 15360, 4, 512, 262_144);
+    const needed = prefillMemoryNeeded(262_144, 16, 2, 81920, 256, 256, 2048, 15360, 4, 512, 262_144);
     try t.expectEqual(@as(u64, 14_061_404_160), needed);
     try t.expect(needed < 16 << 30);
     // The retired seq-scaled envelope billed 8 x seq x ffn x 2 working bytes
@@ -15298,14 +15361,40 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
     // mlp 69.2 MB, x1.25.
     try t.expectEqual(
         @as(u64, 15_446_507_520),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 128, 2816, 2112, 16, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 122880, 128, 128, 2816, 2112, 16, 512, 100_000),
     );
     // hd=256 adds the [heads, chunk, seq] score tensor (the guard must see
     // what the composed SDPA path actually allocates). Decomposition: the
     // hd-128 bill + the KV doubling from 128->256 (12.288 GB x1.25) + the
     // score tensor (16x512x100000x2 = 1.6384 GB x1.25).
-    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000);
+    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000);
     try t.expectEqual(@as(u64, 15_446_507_520 + 15_360_000_000 + 2_048_000_000), with_scores);
+}
+
+test "prefillMemoryNeeded: the SCORE width decides the score term, not the stored width" {
+    // bailing_hybrid: MLA contracts scores over qk_head_dim 192 while storing
+    // values at v_head_dim 128 and declaring head_dim 128. mlx has a fused
+    // vector kernel for that pair at DECODE and falls back to the composed
+    // path at prefill widths, so the [heads, chunk, seq] score tensor is real —
+    // but `prefillHeadDimFused(128)` is true, so passing the stored width for
+    // both billed it at ZERO. Under-billing ends in an uncatchable Metal OOM
+    // instead of a 400, which is the whole reason this guard exists.
+    const t = std.testing;
+    const kv_per_tok: u64 = 6 * 16 * (192 + 128) * 2; // 6 caching layers of 24
+    const stored: u64 = 128;
+    const scored: u64 = 192;
+    const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768);
+    const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768);
+    // The difference is exactly the score tensor: heads x chunk x seq x 2, x1.25.
+    const score_bytes: u64 = 16 * 4096 * 32_768 * 2;
+    try t.expectEqual(honest - blind, score_bytes * 5 / 4);
+    try t.expect(honest > 2 * blind);
+    // The two widths are independent: at fp16 (no dequant transient) the
+    // stored width touches nothing the score term reads.
+    try t.expectEqual(
+        honest,
+        prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, scored, scored, 1536, 4608, 16, 4096, 32_768),
+    );
 }
 
 test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + dequant" {
@@ -15317,14 +15406,14 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
         @as(u64, 32_854_507_520 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000),
     );
     // The quantized-KV dequant transient is a denseView property, NOT a score
     // property — it must survive the fused kernel (fires on every kv-quant
     // request regardless of head_dim).
     try t.expectEqual(
         @as(u64, 11_798_507_520 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000),
     );
 }
 
@@ -15340,13 +15429,13 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     // 8629 MB free. Pre-fix it billed 10277 MB — a dense 5806-wide key axis
     // PLUS the 15360 intermediate_size struct default — and 400'd.
     const available: u64 = 8629 * 1024 * 1024;
-    const before = prefillMemoryNeeded(5806, 64, 1, 43, 512, 4096, 15360, 8, 5632, 5806);
+    const before = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 15360, 8, 5632, 5806);
     try t.expectEqual(@as(u64, 10277), before / (1024 * 1024));
     try t.expect(before > available);
     // Fixed: 641 keys (window 128 + top-512 + sink) and the width the config
     // actually states (top_k 6 x moe_intermediate 2048 = 12288, what
     // prefillFfnWidth resolves for this checkpoint) — 4848 MB, admitted.
-    const after = prefillMemoryNeeded(5806, 64, 1, 43, 512, 4096, 12288, 8, 5632, 641);
+    const after = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 12288, 8, 5632, 641);
     try t.expectEqual(@as(u64, 4848), after / (1024 * 1024));
     try t.expect(after < available);
     // The score term is the ONLY one the key bound may touch: same call with a
@@ -15354,8 +15443,8 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
-        prefillMemoryNeeded(5806, 64, 1, 43, 256, 4096, 2048, 8, 5632, 5806),
-        prefillMemoryNeeded(5806, 64, 1, 43, 256, 4096, 2048, 8, 5632, 641),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641),
     );
 }
 
@@ -15370,7 +15459,7 @@ test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, no
     // f32 gathered-K set (the very allocation PREFILL_SUB exists to bound).
     // The honest bill for the same request is ~2.3 GB — admitted with room.
     const available: u64 = 3610 * 1024 * 1024;
-    const generic = prefillMemoryNeeded(7514, 64, 1, 43, 512, 4096, 12288, 16, 4096, 641);
+    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641);
     try t.expectEqual(@as(u64, 4069), generic / (1024 * 1024));
     try t.expect(generic > available);
     const honest = dsv4PrefillMemoryNeeded(7514, 43, 512, 4096, 12288, 512, 641);
@@ -15405,13 +15494,23 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // unit test above still passes because they call the function directly.
     // Same class as the two hardcoded `use_drafter=false` call sites: the
     // engagement has to be pinned at the SITE.
+    //
+    // The KV bill is pinned at the same site and for the same reason: it must
+    // come from `config.kvBytesPerToken()` (which knows how many layers cache
+    // and how wide their keys and values are), never a uniform product
+    // recomputed here. Same for the SCORE width: `config.prefillScoreHeadDim()`
+    // is the width the score is contracted at, and handing `hdim` for both
+    // declares an MLA arch's 192-wide scores "fused" and bills them at zero.
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const call = "prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk,";
+    const call = "prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk,";
     const at = std.mem.indexOf(u8, src, call) orelse return error.CallSiteMoved;
     const tail = src[at + call.len ..];
     const end = std.mem.indexOfScalar(u8, tail, ')') orelse return error.CallSiteMoved;
     try t.expectEqualStrings(" config.prefillAttnKeys(seq", tail[0..end]);
+
+    // Auto-context sizing reads the same helper — the two must not drift.
+    try t.expect(std.mem.indexOf(u8, src, "const kv_per_tok: u64 = config.kvBytesPerToken();") != null);
 }
 
 test "prefillFfnWidth: a declared MoE width beats the struct default, which is only a fallback" {

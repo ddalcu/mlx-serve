@@ -1193,3 +1193,18 @@ comment cannot satisfy it — the first version of this scan passed green agains
 the broken build for exactly that reason. The integration bar is the
 stream-vs-non-stream byte invariant rather than a phrasing check, because the
 broken build produced perfectly good prose; it just filed it under the wrong key.
+## A KV bill that assumes every layer caches, at one width for K and V (2026-08-11)
+
+`computeMemoryContext` and `checkAttentionMemory` both billed `layers × 2 × kv_heads × head_dim × 2` bytes per token. On every arch that shipped before, that was exact. `bailing_hybrid` breaks both factors at once: 18 of its 24 layers are Kimi-Delta-Attention, which holds a FIXED-SIZE recurrent state (~9 MB for the whole model, per request, independent of context) rather than a per-token cache; and its MLA stores a 192-wide key against a 128-wide value. Real bill: `6 × 16 × (192+128) × 2 = 61,440` B/token. Billed: `24 × 2 × 16 × 128 × 2 = 196,608`. A 3.2x over-bill, which showed up as auto-context pinning to 14336 tokens on a machine that fits 29696 — on a model whose entire architectural argument is cheap long context.
+
+The fix is `ModelConfig.kvBytesPerToken()`, fed by an honest `attnCacheLayerCount()` (which the struct's own doc comment had anticipated: "a hybrid MLA arch can carry attention on a fraction of its layers"). `prefillMemoryNeeded` lost its `layers` parameter in favour of that per-token figure — `layers` only ever fed the KV term, and neither the layer count nor the per-head width is uniform once an arch interleaves recurrent layers or stores keys wider than values.
+
+Two things this class insists on. The sizer and the ADMISSION GUARD must move together: raising auto-context while the prefill guard still bills the uniform figure produces a server that advertises 29696 tokens and then 400s a 25000-token prompt. And the wiring is source-scan-pinned at the call site for the same reason the `attn_keys` argument is — an estimator that TAKES a per-token KV bill proves nothing if its one caller recomputes a uniform product on the way in.
+
+Note this also corrects the bill for the other hybrids (qwen3.5/3.6 GDN: 10 of 40 layers cache), which raises their auto-context too. The per-request recurrent state those layers do hold is a constant, not a per-token term, and is small next to the KV it replaces.
+
+## The stored width is not the scored width (2026-08-12)
+
+Follow-up on the KV-bill class above. `prefillMemoryNeeded` took one `hdim` and used it twice: for the quantized-KV dequant transient (correct — that reads the STORED width) and for `prefillHeadDimFused(hdim)`, which decides whether the composed SDPA path materializes a `[heads, chunk, seq]` score tensor. Those are different numbers the moment an arch scores wider than it stores. `bailing_hybrid` declares `head_dim` 128, scores over 192, and its own MLA comment says mlx has a fused vector kernel for that pair at DECODE and "falls back to the composed path at prefill widths" — so the score tensor is real, while `prefillHeadDimFused(128)` is true and billed it at zero. At 32K with a 4096 chunk that is ~4 GB of scratch the admission guard could not see, and under-billing does not produce a 400: it produces an uncatchable Metal OOM, or all-zero logits at the working-set edge.
+
+The patch that introduced `ModelConfig.prefillScoreHeadDim()` wired it into the prefill CHUNK cap — the same rule, one call site short. The estimator now takes `score_hdim` beside `hdim`, and both are inside the string the call-site source scan pins, so neither can be quietly recomputed on the way in. Guard: `prefillMemoryNeeded: the SCORE width decides the score term, not the stored width`.

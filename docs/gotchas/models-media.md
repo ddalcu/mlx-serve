@@ -1311,3 +1311,14 @@ the model six unordered crops. Marker order has to match the order the encoder
 concatenated the pieces, because the splice is positional. None of those ids
 live in config.json; `populateLfm2ImageTokens` resolves them by string from the
 tokenizer at load, the same way the user-turn marker is.
+## A routing chain that returns f32 by design makes the CALLER responsible for the dtype (2026-08-11)
+
+`groupLimitedRouting` keeps its expert weights in f32 on purpose, and says so: a bf16 round trip AFTER `routed_scaling_factor` (2.5) lands ~0.4% of 2.5 on every token, measured 2.6e-3 max error on the reference MoE block, 500x the tolerance the rest of the dsv4 port holds. Its doc comment ends "The caller casts to the activation dtype" — dsv4's caller does.
+
+Wiring that chain into `moeMLP2` for `bailing_hybrid` inherited the obligation and not the cast. The f32 weights multiplied the routed expert sum, the sum went back into the residual stream, and from the first MoE layer (layer 1 of 24) the whole forward ran in f32 — which promotes every bf16 weight on read for the remaining 23 layers. Nothing is WRONG in the output; it is a uniform slowdown with no single slow op to find, which is precisely why `[dtype-trace]` exists. The whole diagnosis was one line:
+
+```
+[dtype-trace] moe: residual widened at layer 1: bfloat16 -> float32
+```
+
+The fix is a dtype-conditional cast at the ONE place the scores enter the expert combine, so every current and future caller of the grouped chain is covered rather than each remembering. Two rules restated: a helper that deliberately returns a wider dtype than the stream states the caller's obligation IN the doc comment (this one did), and the caller's failure to honor it is invisible except in the dtype trace — so read the trace on every new arch's first forward, not only when something looks slow.

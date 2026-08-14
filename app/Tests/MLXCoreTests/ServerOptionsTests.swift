@@ -627,6 +627,7 @@ extension ServerOptionsTests {
         o.telegram = .init(enabled: true, botToken: "1:abc", agentMode: true,
                            useMCP: true, enableThinking: true, allowedChatIds: [7, 8])
         o.sandbox = .init(enabled: true, network: false)
+        o.toolsOnlyWhenAsked = true
 
         XCTAssertNotEqual(o, ServerOptions(), "sanity: every field moved off its default")
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))

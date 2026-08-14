@@ -187,6 +187,24 @@ final class ComposerModeControlTests: XCTestCase {
                       "detectIntentPrompt must not offer a mode the agent decides")
     }
 
+    /// The nudge DECISION is pure (`ComposerIntent.nudge`, unit-tested in
+    /// ComposerInputTests) and the view only adapts its inputs. A second copy of
+    /// the rule here is how "Only use tools when I ask" would come back to life
+    /// in one of the branches — the setting has to be read where the decision is
+    /// made, not beside it.
+    func testThePreSendNudgeDecisionIsTheOnePureFunctionAndReadsTheOptInSetting() throws {
+        let source = try chatViewSource()
+        let start = try XCTUnwrap(source.range(of: "private func detectIntentPrompt(for text: String) -> IntentPrompt? {"))
+        let rest = source[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    }")?.upperBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("ComposerIntent.nudge("),
+                      "the view must ask the pure decision, not re-implement it")
+        XCTAssertTrue(body.contains("toolsOnlyWhenAsked"), """
+            the "Only use tools when I ask" setting must reach the decision — \
+            a nudge that ignores it is exactly the interruption the setting turns off.
+            """)
+    }
+
     /// "Edit Agent…" on a locked disc must land on THAT agent, not on whoever
     /// sorts first — the whole reason the row exists is that the user just read
     /// the agent's name on the card.

@@ -184,12 +184,49 @@ pub const ModelConfig = struct {
     // Laguna-S-2.1 checkpoint sets moe_router_logit_softcapping: 0.0).
     moe_router_logit_softcapping: f32 = 0.0,
 
+    // Grouped ("noaux_tc") expert routing: split the biased scores into
+    // moe_n_group equal groups, keep the moe_topk_group best by their top-2
+    // sum, then take the global top-k inside the survivors. 1/1 = ungrouped.
+    moe_n_group: u32 = 1,
+    moe_topk_group: u32 = 1,
+
     // Linear attention (GatedDeltaNet)
     linear_num_key_heads: u32 = 0,
     linear_num_value_heads: u32 = 0,
     linear_key_head_dim: u32 = 128,
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
+
+    // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
+    // GatedDeltaNet recurrence:
+    //   - the forget gate is PER CHANNEL ([B,T,H,Dk]) rather than per head, so
+    //     the fused kernel indexes `g` by the key channel (kda_vector_gate);
+    //   - a non-zero lower bound replaces the softplus gate entirely with
+    //     `g = bound * sigmoid(exp(A_log) * (a + dt_bias))`, which is bounded
+    //     in (bound, 0) instead of (-inf, 0) — it is NOT a clamp on the
+    //     softplus form (fla/ops/kda/fused_recurrent.py);
+    //   - the output gate is a plain sigmoid, not SiLU/swish.
+    kda_vector_gate: bool = false,
+    kda_gate_lower_bound: f32 = 0.0, // 0 = plain -exp(A_log)·softplus form
+    kda_sigmoid_out_gate: bool = false,
+
+    // Multi-head Latent Attention (bailing_hybrid's full-attention layers,
+    // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
+    // a single compressed KV latent (kv_a_proj_with_mqa → kv_lora_rank latent
+    // + qk_rope_head_dim shared rope key) expanded per head by kv_b_proj.
+    // Query/key head dim is nope+rope; the value head dim is SMALLER, so the
+    // KV cache holds asymmetric K/V (MLX's SDPA has a 192/128 vector kernel).
+    // mla_head_gate: per-head sigmoid gate on the attention output (the
+    // checkpoint's `head_wise` gated_attention_proj_granularity_type).
+    mla_q_lora_rank: u32 = 0, // 0 = not an MLA arch
+    mla_kv_lora_rank: u32 = 0,
+    mla_qk_nope_head_dim: u32 = 0,
+    mla_qk_rope_head_dim: u32 = 0,
+    mla_v_head_dim: u32 = 0,
+    mla_head_gate: bool = false,
+    // RoPE rotates ADJACENT PAIRS (x[2i], x[2i+1]) instead of halves — mlx's
+    // `traditional` rope. Set by rope_interleave.
+    rope_interleaved_pairs: bool = false,
 
     // Hybrid attention
     full_attention_interval: u32 = 0,
@@ -596,16 +633,81 @@ pub const ModelConfig = struct {
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
     }
 
-    /// How many layers hold an attention KV cache. A hybrid MLA arch can
-    /// carry attention on a fraction of its layers; every current arch
-    /// caches on all of them. Used by the prefill preflight, which otherwise
-    /// bills a uniform arch's footprint for a model carrying less.
+    /// How many layers hold an attention KV cache. A hybrid arch interleaves
+    /// linear-attention layers, which carry a FIXED-SIZE recurrent state
+    /// instead of a per-token cache — billing them as attention layers made
+    /// the memory model charge a uniform arch's footprint for a model
+    /// carrying a fraction of it (bailing_hybrid: 6 of 24).
     pub fn attnCacheLayerCount(self: *const ModelConfig) u32 {
-        return self.num_hidden_layers;
+        if (self.full_attention_interval == 0) return self.num_hidden_layers;
+        var n: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.num_hidden_layers) : (i += 1) {
+            if (!self.isLinearLayer(i)) n += 1;
+        }
+        return n;
+    }
+
+    /// Dense (bf16) KV-cache bytes ONE token occupies across the whole model.
+    /// The uniform `layers × 2 × kv_heads × head_dim` formula is wrong on a
+    /// hybrid MLA arch in both terms: only `attnCacheLayerCount` layers cache
+    /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
+    /// memory estimate that sizes a KV cache reads this one helper so the
+    /// auto-context sizer and the prefill admission guard cannot disagree.
+    pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        const widths: u64 = if (self.isMla())
+            @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
+        else
+            2 * @as(u64, self.head_dim);
+        // MLA decompresses its latent to EVERY attention head before the write
+        // (`mlaAttnWith` broadcasts the MQA rope key to `num_attention_heads`
+        // and caches `[B, num_attention_heads, S, qk_dim]`), so its cache has
+        // no grouping to save on — `num_key_value_heads` is the GQA question
+        // and this arch never asks it. Equal on Ling 3.0 (16/16), so the
+        // spelling is invisible today and would UNDER-bill the first MLA
+        // checkpoint that groups — the direction that ends in an uncatchable
+        // Metal OOM rather than a 400.
+        const heads: u64 = if (self.isMla())
+            @as(u64, self.num_attention_heads)
+        else
+            @as(u64, self.num_key_value_heads);
+        return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
+    }
+
+    /// True when the full-attention layers are Multi-head Latent Attention
+    /// (compressed KV latent + low-rank Q), not plain GQA projections.
+    pub fn isMla(self: *const ModelConfig) bool {
+        return self.mla_kv_lora_rank > 0;
+    }
+
+    /// MLA query/key head dim = the non-positional part plus the rope part.
+    /// This — not head_dim — is what the attention scale and the cached K's
+    /// last dim are measured in.
+    pub fn mlaQkHeadDim(self: *const ModelConfig) u32 {
+        return self.mla_qk_nope_head_dim + self.mla_qk_rope_head_dim;
+    }
+
+    /// Which of fla's two KDA gate arms this checkpoint declares. A non-zero
+    /// `kda_lower_bound` REPLACES the softplus form with the bounded sigmoid;
+    /// absent (0) means the softplus form, which the shared GatedDeltaNet chain
+    /// already computes elementwise and therefore serves a per-channel gate
+    /// unchanged. Feeding bound 0 to the bounded chain yields exp(0) = 1 — a
+    /// gate that never forgets — so the arm must be chosen, never defaulted.
+    pub fn kdaUsesBoundedGate(self: *const ModelConfig) bool {
+        return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
+    }
+
+    /// The width the KV cache's KEY buffer is laid out at — `head_dim` on every
+    /// symmetric arch, nope+rope on MLA. What a scheme with a shape constraint
+    /// (TurboQuant's Hadamard rotation needs a power of two) must validate
+    /// against; `head_dim` alone says 128 for an arch that caches 192-wide keys
+    /// and the refusal then fires mid-request instead of at load.
+    pub fn kvCacheKeyHeadDim(self: *const ModelConfig) u32 {
+        return if (self.isMla()) self.mlaQkHeadDim() else self.head_dim;
     }
 
     /// The pooling op /v1/embeddings runs: the explicit signal, else masked
@@ -722,6 +824,7 @@ pub const ModelConfig = struct {
     /// score budget that exists for exactly this materializing path never
     /// applies. A new arch scoring wider than it stores adds its arm here.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
 
@@ -742,7 +845,17 @@ pub const ModelConfig = struct {
         // delivered rather than paid-and-dropped). A plain chat request
         // defaults to the prompt-committed to=user channel instead
         // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
-        return has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer");
+        if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
+        // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
+        // checkpoint's own template normalizes an undefined `enable_thinking`
+        // to `thinking_option = 'on'` unconditionally, and unlike muse there
+        // is no prompt-committed no-think channel to fall back to — so a
+        // tool-less silent request gated OFF just makes a reasoner answer
+        // without reasoning ("17 - 9 = 8" where the thinking arm works the
+        // word problem and answers "9 sheep are left").
+        if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
+
+        return false;
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -1137,11 +1250,21 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     if (cfg_obj.get("query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = @intCast(v.integer);
 
     // MoE fields (guard against JSON null values)
-    if (cfg_obj.get("num_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-    if (cfg_obj.get("num_experts_per_tok")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
-    if (cfg_obj.get("top_k_experts")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
-    if (cfg_obj.get("moe_intermediate_size")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
-    if (cfg_obj.get("shared_expert_intermediate_size")) |v| { if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer); }
+    if (cfg_obj.get("num_experts")) |v| {
+        if (v == .integer) config.num_experts = @intCast(v.integer);
+    }
+    if (cfg_obj.get("num_experts_per_tok")) |v| {
+        if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+    }
+    if (cfg_obj.get("top_k_experts")) |v| {
+        if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+    }
+    if (cfg_obj.get("moe_intermediate_size")) |v| {
+        if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+    }
+    if (cfg_obj.get("shared_expert_intermediate_size")) |v| {
+        if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer);
+    }
 
     // Linear attention (GatedDeltaNet) fields
     if (cfg_obj.get("linear_num_key_heads")) |v| config.linear_num_key_heads = @intCast(v.integer);
@@ -1327,22 +1450,44 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (vc_val == .object) {
             config.has_vision = true;
             const vc = vc_val.object;
-            if (vc.get("hidden_size")) |v| { if (v == .integer) config.vision_hidden_size = @intCast(v.integer); }
-            if (vc.get("num_hidden_layers")) |v| { if (v == .integer) config.vision_num_layers = @intCast(v.integer); }
-            if (vc.get("num_attention_heads")) |v| { if (v == .integer) config.vision_num_heads = @intCast(v.integer); }
-            if (vc.get("head_dim")) |v| { if (v == .integer) config.vision_head_dim = @intCast(v.integer); }
-            if (vc.get("global_head_dim")) |v| { if (v == .integer) config.vision_head_dim = @intCast(v.integer); }
-            if (vc.get("intermediate_size")) |v| { if (v == .integer) config.vision_intermediate_size = @intCast(v.integer); }
-            if (vc.get("patch_size")) |v| { if (v == .integer) config.vision_patch_size = @intCast(v.integer); }
-            if (vc.get("pooling_kernel_size")) |v| { if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer); }
-            if (vc.get("default_output_length")) |v| { if (v == .integer) config.vision_soft_tokens = @intCast(v.integer); }
-            if (vc.get("position_embedding_size")) |v| { if (v == .integer) config.vision_position_embedding_size = @intCast(v.integer); }
+            if (vc.get("hidden_size")) |v| {
+                if (v == .integer) config.vision_hidden_size = @intCast(v.integer);
+            }
+            if (vc.get("num_hidden_layers")) |v| {
+                if (v == .integer) config.vision_num_layers = @intCast(v.integer);
+            }
+            if (vc.get("num_attention_heads")) |v| {
+                if (v == .integer) config.vision_num_heads = @intCast(v.integer);
+            }
+            if (vc.get("head_dim")) |v| {
+                if (v == .integer) config.vision_head_dim = @intCast(v.integer);
+            }
+            if (vc.get("global_head_dim")) |v| {
+                if (v == .integer) config.vision_head_dim = @intCast(v.integer);
+            }
+            if (vc.get("intermediate_size")) |v| {
+                if (v == .integer) config.vision_intermediate_size = @intCast(v.integer);
+            }
+            if (vc.get("patch_size")) |v| {
+                if (v == .integer) config.vision_patch_size = @intCast(v.integer);
+            }
+            if (vc.get("pooling_kernel_size")) |v| {
+                if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer);
+            }
+            if (vc.get("default_output_length")) |v| {
+                if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+            }
+            if (vc.get("position_embedding_size")) |v| {
+                if (v == .integer) config.vision_position_embedding_size = @intCast(v.integer);
+            }
             if (vc.get("rope_parameters")) |rp| {
                 if (rp == .object) {
                     if (rp.object.get("rope_theta")) |v| config.vision_rope_theta = jsonFloat(v);
                 }
             }
-            if (vc.get("use_clipped_linears")) |v| { if (v == .bool) config.vision_use_clipped_linears = v.bool; }
+            if (vc.get("use_clipped_linears")) |v| {
+                if (v == .bool) config.vision_use_clipped_linears = v.bool;
+            }
             // vision_config.standardize is presence-only — the actual `std_scale`/`std_bias`
             // safetensors presence drives behavior in `VisionEncoder.init`, so the config
             // flag needs no field.
@@ -1351,20 +1496,32 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             // from the SigLIP tower: mm_embed_dim (vs hidden_size),
             // model_patch_size (48px merged patch vs 16px teacher patch_size),
             // num_soft_tokens (vs default_output_length), mm_posemb_size.
-            if (vc.get("mm_embed_dim")) |v| { if (v == .integer) config.vision_mm_embed_dim = @intCast(v.integer); }
-            if (vc.get("model_patch_size")) |v| { if (v == .integer) config.vision_model_patch_size = @intCast(v.integer); }
-            if (vc.get("num_soft_tokens")) |v| { if (v == .integer) config.vision_soft_tokens = @intCast(v.integer); }
-            if (vc.get("mm_posemb_size")) |v| { if (v == .integer) config.vision_mm_posemb_size = @intCast(v.integer); }
+            if (vc.get("mm_embed_dim")) |v| {
+                if (v == .integer) config.vision_mm_embed_dim = @intCast(v.integer);
+            }
+            if (vc.get("model_patch_size")) |v| {
+                if (v == .integer) config.vision_model_patch_size = @intCast(v.integer);
+            }
+            if (vc.get("num_soft_tokens")) |v| {
+                if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+            }
+            if (vc.get("mm_posemb_size")) |v| {
+                if (v == .integer) config.vision_mm_posemb_size = @intCast(v.integer);
+            }
         }
     }
     // Audio config (Gemma 4 12B unified — raw-waveform projection, no conformer)
     if (root.get("audio_config")) |ac_val| {
         if (ac_val == .object) {
             const ac = ac_val.object;
-            if (ac.get("audio_embed_dim")) |v| { if (v == .integer) config.audio_embed_dim = @intCast(v.integer); }
+            if (ac.get("audio_embed_dim")) |v| {
+                if (v == .integer) config.audio_embed_dim = @intCast(v.integer);
+            }
             // audio_samples_per_token lives in processor_config, not config.json;
             // default 640 (40ms @ 16kHz) matches the only shipped unified checkpoint.
-            if (ac.get("audio_samples_per_token")) |v| { if (v == .integer) config.audio_samples_per_token = @intCast(v.integer); }
+            if (ac.get("audio_samples_per_token")) |v| {
+                if (v == .integer) config.audio_samples_per_token = @intCast(v.integer);
+            }
         }
     }
     if (root.get("audio_token_id")) |v| {
@@ -1506,12 +1663,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (root.get("generation_config")) |gc_val| {
             if (gc_val == .object) {
                 const gc = gc_val.object;
-                if (gc.get("max_denoising_steps")) |v| { if (v == .integer) config.diffusion_max_steps = @intCast(v.integer); }
+                if (gc.get("max_denoising_steps")) |v| {
+                    if (v == .integer) config.diffusion_max_steps = @intCast(v.integer);
+                }
                 if (gc.get("t_min")) |v| config.diffusion_t_min = jsonFloat(v);
                 if (gc.get("t_max")) |v| config.diffusion_t_max = jsonFloat(v);
                 if (gc.get("confidence_threshold")) |v| config.diffusion_confidence_threshold = jsonFloat(v);
-                if (gc.get("stability_threshold")) |v| { if (v == .integer) config.diffusion_stability_threshold = @intCast(v.integer); }
-                if (gc.get("pad_token_id")) |v| { if (v == .integer) config.diffusion_pad_token = @intCast(v.integer); }
+                if (gc.get("stability_threshold")) |v| {
+                    if (v == .integer) config.diffusion_stability_threshold = @intCast(v.integer);
+                }
+                if (gc.get("pad_token_id")) |v| {
+                    if (v == .integer) config.diffusion_pad_token = @intCast(v.integer);
+                }
                 if (gc.get("sampler_config")) |sc_val| {
                     if (sc_val == .object) {
                         if (sc_val.object.get("entropy_bound")) |v| config.diffusion_entropy_bound = jsonFloat(v);
@@ -1583,14 +1746,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (vc_val == .object) {
                 const vc = vc_val.object;
                 config.muse_vision = true;
-                if (vc.get("num_hidden_layers")) |v| { if (v == .integer) config.qv_depth = @intCast(v.integer); }
-                if (vc.get("hidden_size")) |v| { if (v == .integer) config.qv_hidden = @intCast(v.integer); }
-                if (vc.get("num_attention_heads")) |v| { if (v == .integer) config.qv_heads = @intCast(v.integer); }
-                if (vc.get("intermediate_size")) |v| { if (v == .integer) config.qv_intermediate = @intCast(v.integer); }
-                if (vc.get("patch_size")) |v| { if (v == .integer) config.qv_patch = @intCast(v.integer); }
-                if (vc.get("patch_temporal")) |v| { if (v == .integer) config.qv_temporal_patch = @intCast(v.integer); }
-                if (vc.get("merge_size")) |v| { if (v == .integer) config.qv_merge = @intCast(v.integer); }
-                if (vc.get("pos_emb_height")) |v| { if (v == .integer) config.mv_pos_side = @intCast(v.integer); }
+                if (vc.get("num_hidden_layers")) |v| {
+                    if (v == .integer) config.qv_depth = @intCast(v.integer);
+                }
+                if (vc.get("hidden_size")) |v| {
+                    if (v == .integer) config.qv_hidden = @intCast(v.integer);
+                }
+                if (vc.get("num_attention_heads")) |v| {
+                    if (v == .integer) config.qv_heads = @intCast(v.integer);
+                }
+                if (vc.get("intermediate_size")) |v| {
+                    if (v == .integer) config.qv_intermediate = @intCast(v.integer);
+                }
+                if (vc.get("patch_size")) |v| {
+                    if (v == .integer) config.qv_patch = @intCast(v.integer);
+                }
+                if (vc.get("patch_temporal")) |v| {
+                    if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
+                }
+                if (vc.get("merge_size")) |v| {
+                    if (v == .integer) config.qv_merge = @intCast(v.integer);
+                }
+                if (vc.get("pos_emb_height")) |v| {
+                    if (v == .integer) config.mv_pos_side = @intCast(v.integer);
+                }
                 if (vc.get("layer_norm_eps")) |v| config.mv_ln_eps = jsonFloat(v);
                 if (vc.get("rope_parameters")) |rp| {
                     if (rp == .object) {
@@ -1605,7 +1784,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
                 if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
                 config.qv_out_hidden = config.hidden_size;
-                if (root.get("projector_hidden_size")) |v| { if (v == .integer) config.mv_projector_hidden = @intCast(v.integer); }
+                if (root.get("projector_hidden_size")) |v| {
+                    if (v == .integer) config.mv_projector_hidden = @intCast(v.integer);
+                }
                 // The processor wraps the pad run in <|image_start|>/<|image_end|>;
                 // config.json carries neither, so the ids come from the vocab.
                 config.boi_token_id = 200080;
@@ -1639,15 +1820,33 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (vc_val == .object) {
                 const vc = vc_val.object;
                 config.qwen_vision = true;
-                if (vc.get("depth")) |v| { if (v == .integer) config.qv_depth = @intCast(v.integer); }
-                if (vc.get("hidden_size")) |v| { if (v == .integer) config.qv_hidden = @intCast(v.integer); }
-                if (vc.get("num_heads")) |v| { if (v == .integer) config.qv_heads = @intCast(v.integer); }
-                if (vc.get("intermediate_size")) |v| { if (v == .integer) config.qv_intermediate = @intCast(v.integer); }
-                if (vc.get("patch_size")) |v| { if (v == .integer) config.qv_patch = @intCast(v.integer); }
-                if (vc.get("temporal_patch_size")) |v| { if (v == .integer) config.qv_temporal_patch = @intCast(v.integer); }
-                if (vc.get("spatial_merge_size")) |v| { if (v == .integer) config.qv_merge = @intCast(v.integer); }
-                if (vc.get("num_position_embeddings")) |v| { if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer); }
-                if (vc.get("out_hidden_size")) |v| { if (v == .integer) config.qv_out_hidden = @intCast(v.integer); }
+                if (vc.get("depth")) |v| {
+                    if (v == .integer) config.qv_depth = @intCast(v.integer);
+                }
+                if (vc.get("hidden_size")) |v| {
+                    if (v == .integer) config.qv_hidden = @intCast(v.integer);
+                }
+                if (vc.get("num_heads")) |v| {
+                    if (v == .integer) config.qv_heads = @intCast(v.integer);
+                }
+                if (vc.get("intermediate_size")) |v| {
+                    if (v == .integer) config.qv_intermediate = @intCast(v.integer);
+                }
+                if (vc.get("patch_size")) |v| {
+                    if (v == .integer) config.qv_patch = @intCast(v.integer);
+                }
+                if (vc.get("temporal_patch_size")) |v| {
+                    if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
+                }
+                if (vc.get("spatial_merge_size")) |v| {
+                    if (v == .integer) config.qv_merge = @intCast(v.integer);
+                }
+                if (vc.get("num_position_embeddings")) |v| {
+                    if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer);
+                }
+                if (vc.get("out_hidden_size")) |v| {
+                    if (v == .integer) config.qv_out_hidden = @intCast(v.integer);
+                }
                 if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
                 if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
             }
@@ -1656,7 +1855,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // partial_rotary_factor already parsed in the generic rope block above.
         if (cfg_obj.get("rope_parameters")) |rp| {
             if (rp == .object) {
-                if (rp.object.get("mrope_interleaved")) |v| { if (v == .bool) config.mrope_interleaved = v.bool; }
+                if (rp.object.get("mrope_interleaved")) |v| {
+                    if (v == .bool) config.mrope_interleaved = v.bool;
+                }
                 if (rp.object.get("mrope_section")) |v| {
                     if (v == .array) {
                         for (v.array.items, 0..) |item, i| {
@@ -1668,9 +1869,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
         // Qwen vision token ids (top-level).
-        if (root.get("video_token_id")) |v| { if (v == .integer) config.video_token_id = @intCast(v.integer); }
-        if (root.get("vision_start_token_id")) |v| { if (v == .integer) config.vision_start_token_id = @intCast(v.integer); }
-        if (root.get("vision_end_token_id")) |v| { if (v == .integer) config.vision_end_token_id = @intCast(v.integer); }
+        if (root.get("video_token_id")) |v| {
+            if (v == .integer) config.video_token_id = @intCast(v.integer);
+        }
+        if (root.get("vision_start_token_id")) |v| {
+            if (v == .integer) config.vision_start_token_id = @intCast(v.integer);
+        }
+        if (root.get("vision_end_token_id")) |v| {
+            if (v == .integer) config.vision_end_token_id = @intCast(v.integer);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -1726,14 +1933,22 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.moe_sigmoid_router = true;
         // qk_norm / route_norm default TRUE when absent (mlx-lm ModelArgs
         // defaults) but an explicit false must win.
-        if (cfg_obj.get("qk_norm")) |v| { if (v == .bool) config.has_qk_norm = v.bool; }
-        if (cfg_obj.get("route_norm")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("qk_norm")) |v| {
+            if (v == .bool) config.has_qk_norm = v.bool;
+        }
+        if (cfg_obj.get("route_norm")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
         if (cfg_obj.get("router_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
-        if (cfg_obj.get("first_k_dense_replace")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
+        if (cfg_obj.get("first_k_dense_replace")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
         // Expert width may ride as expert_hidden_dim when moe_intermediate_size
         // is absent (both = 1536 on the 295B).
         if (config.moe_intermediate_size == 0) {
-            if (cfg_obj.get("expert_hidden_dim")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
+            if (cfg_obj.get("expert_hidden_dim")) |v| {
+                if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+            }
         }
         // No explicit shared_expert_intermediate_size key in hy_v3 configs:
         // derive num_shared_experts × expert width. 0 shared experts leaves it
@@ -1746,6 +1961,226 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         config.ensureHy3Terminators();
+    } else if (std.mem.eql(u8, model_type, "bailing_hybrid")) {
+        // inclusionAI Ling 3.0 (bailing_hybrid; BailingMoeV3ForCausalLM). A
+        // KDA + MLA hybrid MoE: three Kimi-Delta-Attention linear layers for
+        // every Multi-head-Latent-Attention layer (layer_group_size 4, so
+        // layers 3/7/11/… are full attention), DeepSeek-V3-style grouped
+        // sigmoid routing with an expert bias, one ungated shared expert, and
+        // a dense MLP on the bottom first_k_dense_replace layers.
+        //
+        // Three things here are NOT the qwen3.5 GDN defaults and each has its
+        // own config field: the forget gate is per CHANNEL (kda_vector_gate),
+        // it uses the bounded sigmoid form rather than softplus
+        // (kda_gate_lower_bound), and the output gate is a plain sigmoid.
+        // RoPE covers only the qk_rope_head_dim slice of each query/key head
+        // and rotates ADJACENT PAIRS (rope_interleave).
+        //
+        // References: the checkpoint's own modeling_bailing_moe_v3.py, and
+        // fla/ops/kda/fused_recurrent.py for the gate. Mirror:
+        // rapid-mlx/Ling-3.0-tiny-MLX-4bit.
+        config.model_type = "bailing_hybrid";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false; // MLA norms the LATENTS, not the heads
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+
+        // Hybrid layout. `layer_group_size` counts layers per group with the
+        // LAST one full — exactly isLinearLayer's `(idx+1) % interval != 0`.
+        if (cfg_obj.get("layer_group_size")) |v| {
+            if (v == .integer) config.full_attention_interval = @intCast(v.integer);
+        }
+
+        // KDA: one linear head per attention head, key dim = value dim = head_dim.
+        config.linear_num_key_heads = config.num_attention_heads;
+        config.linear_num_value_heads = config.num_attention_heads;
+        config.linear_key_head_dim = config.head_dim;
+        config.linear_value_head_dim = config.head_dim;
+        if (cfg_obj.get("short_conv_kernel_size")) |v| {
+            if (v == .integer) config.linear_conv_kernel_dim = @intCast(v.integer);
+        }
+        // A per-head KDA (`num_kv_heads_for_linear_attn`) would give the linear
+        // layers their own head count instead of the attention heads' — the
+        // three lines above would then be wrong, so refuse rather than size the
+        // recurrent state off the wrong geometry.
+        if (cfg_obj.get("num_kv_heads_for_linear_attn")) |v| {
+            if (v == .integer and v.integer != 0 and v.integer != @as(i64, config.num_attention_heads)) {
+                log.err("bailing_hybrid: num_kv_heads_for_linear_attn {d} != num_attention_heads {d} (per-head KDA not supported)\n", .{ v.integer, config.num_attention_heads });
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        config.kda_vector_gate = true;
+        config.kda_sigmoid_out_gate = true;
+        // fla's kernel has TWO gate arms and this key selects between them: a
+        // negative bound takes `exp(bound·σ(exp(A_log)·(a+dt_bias)))`, an absent
+        // key the plain `exp(-exp(A_log)·softplus(·))` (which the shared
+        // GatedDeltaNet chain already serves, elementwise, so a per-channel gate
+        // needs nothing new). A bound of exactly 0 would degenerate the bounded
+        // form to exp(0) = 1 — a gate that never forgets — so it is refused
+        // rather than served as the other arm by accident.
+        if (cfg_obj.get("kda_lower_bound")) |v| {
+            if (v != .null) {
+                const lb = jsonFloat(v);
+                if (lb >= 0.0) {
+                    log.err("bailing_hybrid: kda_lower_bound must be negative (got {d})\n", .{lb});
+                    return error.UnsupportedBailingConfig;
+                }
+                config.kda_gate_lower_bound = lb;
+            }
+        }
+        // `kda_safe_gate` is a numerics detail of the reference's own kernel
+        // launch, not a change of formula — both arms above are already
+        // evaluated in f32 here, so it is read as satisfied and ignored.
+        //
+        // The KDA LoRA gate variants (f_a_proj/f_b_proj, g_a_proj/g_b_proj)
+        // are a different weight layout; the shipped checkpoint sets
+        // no_kda_lora. Refuse rather than fail with a MISSING WEIGHT crash —
+        // and accept BOTH spellings, since a checkpoint that states only the
+        // positive one otherwise slips straight through to that crash.
+        if (cfg_obj.get("no_kda_lora")) |v| {
+            if (v == .bool and !v.bool) {
+                log.err("bailing_hybrid: low-rank KDA gates (no_kda_lora=false) not supported\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        if (cfg_obj.get("use_kda_lora")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("bailing_hybrid: low-rank KDA gates (use_kda_lora=true) not supported\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+
+        // MLA.
+        if (cfg_obj.get("q_lora_rank")) |v| {
+            if (v == .integer) config.mla_q_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("kv_lora_rank")) |v| {
+            if (v == .integer) config.mla_kv_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_nope_head_dim")) |v| {
+            if (v == .integer) config.mla_qk_nope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_rope_head_dim")) |v| {
+            if (v == .integer) config.mla_qk_rope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("v_head_dim")) |v| {
+            if (v == .integer) config.mla_v_head_dim = @intCast(v.integer);
+        }
+        if (config.mla_v_head_dim == 0) config.mla_v_head_dim = config.head_dim;
+        // q_lora_rank null (a plain q_proj) is a different weight layout.
+        if (config.mla_q_lora_rank == 0 or config.mla_kv_lora_rank == 0) {
+            log.err("bailing_hybrid: q_lora_rank and kv_lora_rank are required\n", .{});
+            return error.UnsupportedBailingConfig;
+        }
+        // The declared qk_head_dim must agree with nope+rope: everything
+        // downstream (the cached K's last dim, the attention scale, the q_b
+        // split) is derived from the two halves.
+        if (cfg_obj.get("qk_head_dim")) |v| {
+            if (v == .integer and @as(u32, @intCast(v.integer)) != config.mlaQkHeadDim()) {
+                log.err("bailing_hybrid: qk_head_dim {d} != qk_nope_head_dim + qk_rope_head_dim ({d})\n", .{ v.integer, config.mlaQkHeadDim() });
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        // Attention scale is 1/sqrt(qk_head_dim) — the FULL query width,
+        // wider than head_dim. Not derivable from head_dim on this arch.
+        config.query_pre_attn_scalar = config.mlaQkHeadDim();
+        if (cfg_obj.get("gated_attention_proj_granularity_type")) |v| {
+            if (v == .string) {
+                if (std.mem.eql(u8, v.string, "head_wise")) {
+                    config.mla_head_gate = true;
+                } else {
+                    // element_wise gating is a differently-shaped g_proj.
+                    log.err("bailing_hybrid: only head_wise attention gating supported (got '{s}')\n", .{v.string});
+                    return error.UnsupportedBailingConfig;
+                }
+            }
+        }
+        if (cfg_obj.get("rope_interleave")) |v| {
+            if (v == .bool) config.rope_interleaved_pairs = v.bool;
+        }
+        // `use_mla_nope` makes the MLA layers positionless (Kimi-Linear ships
+        // exactly that: `rotary_emb=None`). `mlaAttnWith` always ropes the rope
+        // slice, so a NoPE checkpoint would be served with positions its
+        // reference never applies — refuse by name instead.
+        if (cfg_obj.get("use_mla_nope")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("bailing_hybrid: NoPE MLA (use_mla_nope=true) not supported\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        // partial_rotary_factor is stated against head_dim but the reference's
+        // rotary module overrides it to 1.0 over qk_rope_head_dim — rope covers
+        // that slice ENTIRELY, so the generic partial factor must not leak in.
+        config.partial_rotary_factor = 1.0;
+
+        // Three optional norms the forward does NOT implement. Each is a real
+        // BailingMoeV3 switch and each is FALSE in every shipped checkpoint, so
+        // they cost nothing here — but a variant flipping one would be served
+        // silently without it, which is the failure mode this whole block of
+        // named refusals exists to prevent.
+        const unsupported_flags = [_][]const u8{ "value_norm", "up_proj_norm", "use_nGPT" };
+        for (unsupported_flags) |key| {
+            if (cfg_obj.get(key)) |v| {
+                if (v == .bool and v.bool) {
+                    log.err("bailing_hybrid: {s}=true not supported\n", .{key});
+                    return error.UnsupportedBailingConfig;
+                }
+            }
+        }
+        // The KDA conv activation. True everywhere shipped; the shared
+        // GatedDeltaNet path applies silu after the causal conv unconditionally,
+        // so a checkpoint declaring otherwise would get an activation it never
+        // trained with.
+        if (cfg_obj.get("linear_silu")) |v| {
+            if (v == .bool and !v.bool) {
+                log.err("bailing_hybrid: linear_silu=false not supported (the conv activation is silu)\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+
+        // MoE: grouped sigmoid routing (noaux_tc) + one ungated shared expert.
+        config.moe_sigmoid_router = true;
+        if (cfg_obj.get("first_k_dense_replace")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_group")) |v| {
+            if (v == .integer) config.moe_n_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("topk_group")) |v| {
+            if (v == .integer) config.moe_topk_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        // Shared expert width = num_shared_experts × its own intermediate size
+        // (which falls back to the routed expert width when absent).
+        if (config.shared_expert_intermediate_size == 0) {
+            var shared_width: u32 = config.moe_intermediate_size;
+            if (cfg_obj.get("moe_shared_expert_intermediate_size")) |v| {
+                if (v == .integer) shared_width = @intCast(v.integer);
+            }
+            var n_shared: u32 = 0;
+            if (cfg_obj.get("num_shared_experts")) |v| {
+                if (v == .integer) n_shared = @intCast(v.integer);
+            }
+            config.shared_expert_intermediate_size = shared_width * n_shared;
+        }
+        // Softmax routing is a different score function; only sigmoid ships.
+        if (cfg_obj.get("score_function")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "sigmoid")) {
+                log.err("bailing_hybrid: only sigmoid score_function supported (got '{s}')\n", .{v.string});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        // The MTP head ships disabled (num_nextn_predict_layers 0) and no
+        // mtp.* weights are in the checkpoint. The single terminator
+        // (`<|role_end|>`) rides the root eos_token_id — no additive merge.
     } else if (std.mem.eql(u8, model_type, "laguna")) {
         // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder; nvfp4 experts, 256K
         // ctx). Pure-attention MoE that rides the qwen3.5/hy_v3 MoE forward
@@ -1775,7 +2210,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         // Router: norm_topk_prob → route_norm; moe_routed_scaling_factor → scale.
-        if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
         if (cfg_obj.get("moe_routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
         if (cfg_obj.get("moe_router_logit_softcapping")) |v| config.moe_router_logit_softcapping = jsonFloat(v);
         // Router logit soft-capping is off on the shipped checkpoint and untested;
@@ -1873,20 +2310,38 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 config.intermediate_size_declared = true;
             }
         }
-        if (cfg_obj.get("dense_mlp_idx")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
-        if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-        if (cfg_obj.get("n_shared_experts")) |v| { if (v == .integer) config.inkling_n_shared_experts = @intCast(v.integer); }
+        if (cfg_obj.get("dense_mlp_idx")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_shared_experts")) |v| {
+            if (v == .integer) config.inkling_n_shared_experts = @intCast(v.integer);
+        }
         if (cfg_obj.get("route_scale")) |v| config.router_scaling_factor = jsonFloat(v);
         // Position machinery.
-        if (cfg_obj.get("d_rel")) |v| { if (v == .integer) config.inkling_d_rel = @intCast(v.integer); }
-        if (cfg_obj.get("rel_extent")) |v| { if (v == .integer) config.inkling_rel_extent = @intCast(v.integer); }
-        if (cfg_obj.get("log_scaling_n_floor")) |v| { if (v == .integer) config.inkling_log_n_floor = @intCast(v.integer); }
+        if (cfg_obj.get("d_rel")) |v| {
+            if (v == .integer) config.inkling_d_rel = @intCast(v.integer);
+        }
+        if (cfg_obj.get("rel_extent")) |v| {
+            if (v == .integer) config.inkling_rel_extent = @intCast(v.integer);
+        }
+        if (cfg_obj.get("log_scaling_n_floor")) |v| {
+            if (v == .integer) config.inkling_log_n_floor = @intCast(v.integer);
+        }
         if (cfg_obj.get("log_scaling_alpha")) |v| config.inkling_log_alpha = jsonFloat(v);
-        if (cfg_obj.get("sconv_kernel_size")) |v| { if (v == .integer) config.inkling_sconv_kernel = @intCast(v.integer); }
-        if (cfg_obj.get("use_sconv")) |v| { if (v == .bool and !v.bool) config.inkling_sconv_kernel = 0; }
+        if (cfg_obj.get("sconv_kernel_size")) |v| {
+            if (v == .integer) config.inkling_sconv_kernel = @intCast(v.integer);
+        }
+        if (cfg_obj.get("use_sconv")) |v| {
+            if (v == .bool and !v.bool) config.inkling_sconv_kernel = 0;
+        }
         // Embedding norm (use_embed_norm, default true for this family).
         config.has_embedding_norm = true;
-        if (cfg_obj.get("use_embed_norm")) |v| { if (v == .bool) config.has_embedding_norm = v.bool; }
+        if (cfg_obj.get("use_embed_norm")) |v| {
+            if (v == .bool) config.has_embedding_norm = v.bool;
+        }
         // Hybrid sliding/global: the config names LOCAL (sliding) layers and
         // uses `sliding_window_size` (the generic block reads `sliding_window`).
         if (cfg_obj.get("sliding_window_size")) |v| {
@@ -1908,8 +2363,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         // muP logits + padded vocab.
         if (cfg_obj.get("logits_mup_width_multiplier")) |v| config.logits_mup_width_multiplier = jsonFloat(v);
-        if (cfg_obj.get("unpadded_vocab_size")) |v| { if (v == .integer) config.unpadded_vocab_size = @intCast(v.integer); }
-        if (cfg_obj.get("model_max_length")) |v| { if (v == .integer) config.max_position_embeddings = @intCast(v.integer); }
+        if (cfg_obj.get("unpadded_vocab_size")) |v| {
+            if (v == .integer) config.unpadded_vocab_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("model_max_length")) |v| {
+            if (v == .integer) config.max_position_embeddings = @intCast(v.integer);
+        }
         // v1 is text-only: the hMLP vision_config must not arm the SigLIP path
         // (the generic vision_config block above set has_vision = true).
         config.has_vision = false;
@@ -1942,26 +2401,58 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_pre_ff_norm = false;
         config.has_qk_norm = false; // q-norm is on the lora rank + unweighted per-head RMS, handled in-arch
         config.hidden_act = .silu;
-        if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-        if (cfg_obj.get("num_hash_layers")) |v| { if (v == .integer) config.dsv4_hash_layers = @intCast(v.integer); }
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("num_hash_layers")) |v| {
+            if (v == .integer) config.dsv4_hash_layers = @intCast(v.integer);
+        }
         if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
-        if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
-        if (cfg_obj.get("q_lora_rank")) |v| { if (v == .integer) config.dsv4_q_lora_rank = @intCast(v.integer); }
-        if (cfg_obj.get("o_lora_rank")) |v| { if (v == .integer) config.dsv4_o_lora_rank = @intCast(v.integer); }
-        if (cfg_obj.get("o_groups")) |v| { if (v == .integer) config.dsv4_o_groups = @intCast(v.integer); }
-        if (cfg_obj.get("qk_rope_head_dim")) |v| { if (v == .integer) config.dsv4_rope_head_dim = @intCast(v.integer); }
-        if (cfg_obj.get("index_n_heads")) |v| { if (v == .integer) config.dsv4_index_n_heads = @intCast(v.integer); }
-        if (cfg_obj.get("index_head_dim")) |v| { if (v == .integer) config.dsv4_index_head_dim = @intCast(v.integer); }
-        if (cfg_obj.get("index_topk")) |v| { if (v == .integer) config.dsv4_index_topk = @intCast(v.integer); }
-        if (cfg_obj.get("hc_mult")) |v| { if (v == .integer) config.dsv4_hc_mult = @intCast(v.integer); }
-        if (cfg_obj.get("hc_sinkhorn_iters")) |v| { if (v == .integer) config.dsv4_hc_sinkhorn_iters = @intCast(v.integer); }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("q_lora_rank")) |v| {
+            if (v == .integer) config.dsv4_q_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("o_lora_rank")) |v| {
+            if (v == .integer) config.dsv4_o_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("o_groups")) |v| {
+            if (v == .integer) config.dsv4_o_groups = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_rope_head_dim")) |v| {
+            if (v == .integer) config.dsv4_rope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("index_n_heads")) |v| {
+            if (v == .integer) config.dsv4_index_n_heads = @intCast(v.integer);
+        }
+        if (cfg_obj.get("index_head_dim")) |v| {
+            if (v == .integer) config.dsv4_index_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("index_topk")) |v| {
+            if (v == .integer) config.dsv4_index_topk = @intCast(v.integer);
+        }
+        if (cfg_obj.get("hc_mult")) |v| {
+            if (v == .integer) config.dsv4_hc_mult = @intCast(v.integer);
+        }
+        if (cfg_obj.get("hc_sinkhorn_iters")) |v| {
+            if (v == .integer) config.dsv4_hc_sinkhorn_iters = @intCast(v.integer);
+        }
         if (cfg_obj.get("hc_eps")) |v| config.dsv4_hc_eps = jsonFloat(v);
         if (cfg_obj.get("swiglu_limit")) |v| config.dsv4_swiglu_limit = jsonFloat(v);
         if (cfg_obj.get("compress_rope_theta")) |v| config.dsv4_compress_rope_theta = jsonFloat(v);
-        if (cfg_obj.get("num_nextn_predict_layers")) |v| { if (v == .integer) config.dsv4_mtp_layers = @intCast(v.integer); }
-        if (cfg_obj.get("dspark_block_size")) |v| { if (v == .integer) config.dsv4_dspark_block_size = @intCast(v.integer); }
-        if (cfg_obj.get("dspark_noise_token_id")) |v| { if (v == .integer) config.dsv4_dspark_noise_token_id = @intCast(v.integer); }
-        if (cfg_obj.get("dspark_markov_rank")) |v| { if (v == .integer) config.dsv4_dspark_markov_rank = @intCast(v.integer); }
+        if (cfg_obj.get("num_nextn_predict_layers")) |v| {
+            if (v == .integer) config.dsv4_mtp_layers = @intCast(v.integer);
+        }
+        if (cfg_obj.get("dspark_block_size")) |v| {
+            if (v == .integer) config.dsv4_dspark_block_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("dspark_noise_token_id")) |v| {
+            if (v == .integer) config.dsv4_dspark_noise_token_id = @intCast(v.integer);
+        }
+        if (cfg_obj.get("dspark_markov_rank")) |v| {
+            if (v == .integer) config.dsv4_dspark_markov_rank = @intCast(v.integer);
+        }
         if (cfg_obj.get("dspark_target_layer_ids")) |v| {
             if (v == .array) {
                 for (v.array.items, 0..) |item, i| {
@@ -2150,12 +2641,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.rms_norm_eps = jsonFloat(v);
         }
         // Mamba2-specific config
-        if (cfg_obj.get("mamba_num_heads")) |v| config.mamba_num_heads = switch (v) { .integer => |i| @intCast(i), else => 0 };
-        if (cfg_obj.get("mamba_head_dim")) |v| config.mamba_head_dim = switch (v) { .integer => |i| @intCast(i), else => 0 };
-        if (cfg_obj.get("n_groups")) |v| config.mamba_n_groups = switch (v) { .integer => |i| @intCast(i), else => 8 };
-        if (cfg_obj.get("ssm_state_size")) |v| config.ssm_state_size = switch (v) { .integer => |i| @intCast(i), else => 128 };
-        if (cfg_obj.get("conv_kernel")) |v| config.mamba_conv_kernel = switch (v) { .integer => |i| @intCast(i), else => 4 };
-        if (cfg_obj.get("expand")) |v| config.mamba_expand = switch (v) { .integer => |i| @intCast(i), else => 2 };
+        if (cfg_obj.get("mamba_num_heads")) |v| config.mamba_num_heads = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+        if (cfg_obj.get("mamba_head_dim")) |v| config.mamba_head_dim = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+        if (cfg_obj.get("n_groups")) |v| config.mamba_n_groups = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 8,
+        };
+        if (cfg_obj.get("ssm_state_size")) |v| config.ssm_state_size = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 128,
+        };
+        if (cfg_obj.get("conv_kernel")) |v| config.mamba_conv_kernel = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 4,
+        };
+        if (cfg_obj.get("expand")) |v| config.mamba_expand = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 2,
+        };
         // time_step_limit: Python defaults to (0.0, inf) if not in config.
         // config.json may have time_step_min/time_step_max fields but Python ignores them
         // for SSM clipping — only time_step_limit (a 2-element array) is used.
@@ -2168,7 +2677,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
             }
         }
-        if (cfg_obj.get("chunk_size")) |v| config.mamba_chunk_size = switch (v) { .integer => |i| @intCast(i), else => 256 };
+        if (cfg_obj.get("chunk_size")) |v| config.mamba_chunk_size = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 256,
+        };
         // Parse hybrid_override_pattern: "M-M-M-MM-M-M*-..."
         if (cfg_obj.get("hybrid_override_pattern")) |v| {
             if (v == .string) {
@@ -2863,7 +3375,6 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
     try testing.expectEqual(@as(?u32, null), inkling.gen_top_k);
     try testing.expectEqual(@as(?f32, 0.95), inkling.gen_top_p);
     try testing.expectEqual(@as(?f32, null), inkling.gen_temperature);
-
 }
 
 test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
@@ -2900,6 +3411,15 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const muse = ModelConfig{ .model_type = "muse_glimmer" };
     try testing.expect(!muse.defaultEnableThinking(false));
     try testing.expect(muse.defaultEnableThinking(true));
+    // bailing_hybrid opts IN on BOTH arms: Ling 3.0 ships as a reasoner and
+    // its template normalizes an undefined enable_thinking to 'on' with no
+    // reference to tools. Gating it on has_tools (as muse is) contradicted the
+    // checkpoint and left a tool-less silent request answering without
+    // reasoning — muse can do that because its prompt commits a to=user
+    // channel, and this arch has no such fallback.
+    const ling = ModelConfig{ .model_type = "bailing_hybrid" };
+    try testing.expect(ling.defaultEnableThinking(false));
+    try testing.expect(ling.defaultEnableThinking(true));
 }
 
 test "ModelConfig addEosToken" {
@@ -4263,7 +4783,7 @@ test "ModelConfig gemma3 merges <end_of_turn> (106) even with scalar eos_token_i
         \\}
     ;
     const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(config.isEosToken(1));   // config-declared eos preserved
+    try testing.expect(config.isEosToken(1)); // config-declared eos preserved
     try testing.expect(config.isEosToken(106)); // <end_of_turn> merged in
 }
 
@@ -4419,6 +4939,187 @@ test "parseConfigFromJson dense bf16 qwen3_5_moe → quant_bits 0" {
     try testing.expect(config.attn_output_gate);
     try testing.expect(config.isMoe());
     try testing.expectEqual(@as(u32, 256), config.num_experts);
+}
+
+test "parseConfigFromJson bailing_hybrid (Ling 3.0) KDA/MLA/MoE fields" {
+    // rapid-mlx/Ling-3.0-tiny-MLX-4bit's config.json, trimmed to the keys the
+    // arch actually reads. Every derived quantity here is load-bearing: the
+    // linear_* block sizes the KDA state, the mla_* block sizes the MLA
+    // projections and the KV cache's asymmetric K/V head dims, and the MoE
+    // block picks the grouped (noaux_tc) router.
+    const json =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 1536,
+        \\  "intermediate_size": 4608,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 16,
+        \\  "head_dim": 128,
+        \\  "layer_group_size": 4,
+        \\  "short_conv_kernel_size": 4,
+        \\  "kda_lower_bound": -5,
+        \\  "kda_safe_gate": true,
+        \\  "q_lora_rank": 256,
+        \\  "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128,
+        \\  "qk_rope_head_dim": 64,
+        \\  "qk_head_dim": 192,
+        \\  "v_head_dim": 128,
+        \\  "gated_attention_proj_granularity_type": "head_wise",
+        \\  "rope_interleave": true,
+        \\  "rope_theta": 6000000,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "num_experts": 128,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 512,
+        \\  "moe_shared_expert_intermediate_size": 512,
+        \\  "num_shared_experts": 1,
+        \\  "first_k_dense_replace": 1,
+        \\  "n_group": 8,
+        \\  "topk_group": 4,
+        \\  "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5,
+        \\  "score_function": "sigmoid",
+        \\  "vocab_size": 157184,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("bailing_hybrid", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+
+    // Hybrid layout: layer_group_size 4 ⇒ layers 3/7/11/15/19/23 are MLA,
+    // every other layer is KDA.
+    try testing.expectEqual(@as(u32, 4), config.full_attention_interval);
+    try testing.expect(config.isLinearLayer(0));
+    try testing.expect(config.isLinearLayer(2));
+    try testing.expect(!config.isLinearLayer(3));
+    try testing.expect(!config.isLinearLayer(23));
+    try testing.expect(config.needsSsmEntries());
+
+    // KDA geometry: one head per attention head, key dim == value dim == head_dim.
+    try testing.expectEqual(@as(u32, 16), config.linear_num_key_heads);
+    try testing.expectEqual(@as(u32, 16), config.linear_num_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.linear_key_head_dim);
+    try testing.expectEqual(@as(u32, 128), config.linear_value_head_dim);
+    try testing.expectEqual(@as(u32, 4), config.linear_conv_kernel_dim);
+    try testing.expect(config.kda_vector_gate);
+    try testing.expectEqual(@as(f32, -5), config.kda_gate_lower_bound);
+
+    // MLA geometry.
+    try testing.expectEqual(@as(u32, 256), config.mla_q_lora_rank);
+    try testing.expectEqual(@as(u32, 512), config.mla_kv_lora_rank);
+    try testing.expectEqual(@as(u32, 128), config.mla_qk_nope_head_dim);
+    try testing.expectEqual(@as(u32, 64), config.mla_qk_rope_head_dim);
+    try testing.expectEqual(@as(u32, 128), config.mla_v_head_dim);
+    try testing.expectEqual(@as(u32, 192), config.mlaQkHeadDim());
+    try testing.expect(config.mla_head_gate);
+    try testing.expect(config.rope_interleaved_pairs);
+    try testing.expect(config.isMla());
+
+    // MoE: sigmoid + expert bias + group-limited (noaux_tc) routing.
+    try testing.expect(config.isMoe());
+    try testing.expect(config.moe_sigmoid_router);
+    try testing.expectEqual(@as(u32, 128), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 512), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 512), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), config.first_k_dense_replace);
+    try testing.expectEqual(@as(u32, 8), config.moe_n_group);
+    try testing.expectEqual(@as(u32, 4), config.moe_topk_group);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectEqual(@as(f32, 2.5), config.router_scaling_factor);
+
+    // Attention scale is over the FULL qk head dim (192), not head_dim.
+    try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
+
+    // The cache's KEY width is 192 — what a shape-constrained KV scheme must
+    // validate against (TurboQuant's Hadamard needs a power of two, and 192 is
+    // not one, so it is refused at LOAD instead of at the first MLA layer).
+    try testing.expectEqual(@as(u32, 192), config.kvCacheKeyHeadDim());
+    try testing.expect(!std.math.isPowerOfTwo(config.kvCacheKeyHeadDim()));
+    // A negative bound selects fla's bounded-sigmoid arm.
+    try testing.expect(config.kdaUsesBoundedGate());
+}
+
+test "bailing_hybrid gate arm is SELECTED by the bound, never defaulted" {
+    // `kdaGateChain` with bound 0 computes exp(0) = 1: a decay that never
+    // forgets, on a checkpoint that merely omitted the key. The arms are fla's
+    // two, and the absent case belongs to the softplus chain (which is
+    // elementwise, so it serves a per-channel gate unchanged).
+    var bounded = ModelConfig{ .model_type = "bailing_hybrid" };
+    bounded.kda_vector_gate = true;
+    bounded.kda_gate_lower_bound = -5;
+    try testing.expect(bounded.kdaUsesBoundedGate());
+
+    var unbounded = ModelConfig{ .model_type = "bailing_hybrid" };
+    unbounded.kda_vector_gate = true; // per-channel gate, softplus form
+    try testing.expect(!unbounded.kdaUsesBoundedGate());
+
+    // A per-HEAD gate is never the bounded arm regardless of the field.
+    var per_head = ModelConfig{ .model_type = "qwen3_5_moe" };
+    per_head.kda_gate_lower_bound = -5;
+    try testing.expect(!per_head.kdaUsesBoundedGate());
+}
+
+test "parseConfigFromJson bailing_hybrid refuses by NAME every variant it cannot serve" {
+    // The arch's policy is refuse-loudly over serve-wrong: each key below
+    // selects math this port does not implement, and each is at its harmless
+    // value in every shipped mirror — so the ONLY thing standing between a
+    // future variant and silently wrong output is this list. `use_kda_lora` is
+    // the positive spelling of `no_kda_lora` (a checkpoint stating only that one
+    // otherwise runs straight into a MISSING WEIGHT crash), and
+    // `kda_lower_bound: 0` is the degenerate gate.
+    const cases = [_][]const u8{
+        "\"use_mla_nope\": true",
+        "\"value_norm\": true",
+        "\"up_proj_norm\": true",
+        "\"use_nGPT\": true",
+        "\"linear_silu\": false",
+        "\"use_kda_lora\": true",
+        "\"no_kda_lora\": false",
+        "\"kda_lower_bound\": 0",
+        "\"num_kv_heads_for_linear_attn\": 4",
+        "\"score_function\": \"softmax\"",
+        "\"gated_attention_proj_granularity_type\": \"element_wise\"",
+        "\"qk_head_dim\": 256",
+    };
+    for (cases) |extra| {
+        const json = try std.fmt.allocPrint(testing.allocator,
+            \\{{
+            \\  "model_type": "bailing_hybrid",
+            \\  "hidden_size": 1536, "num_hidden_layers": 24,
+            \\  "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 128,
+            \\  "layer_group_size": 4,
+            \\  "q_lora_rank": 256, "kv_lora_rank": 512,
+            \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+            \\  "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+            \\  "vocab_size": 157184, {s}
+            \\}}
+        , .{extra});
+        defer testing.allocator.free(json);
+        try testing.expectError(error.UnsupportedBailingConfig, parseConfigFromJson(testing.allocator, json));
+    }
+
+    // And the shipped shape still loads: an ABSENT kda_lower_bound is the
+    // softplus arm, not a refusal.
+    const softplus =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 1536, "num_hidden_layers": 24,
+        \\  "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 128,
+        \\  "layer_group_size": 4,
+        \\  "q_lora_rank": 256, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+        \\  "vocab_size": 157184, "num_kv_heads_for_linear_attn": 0
+        \\}
+    ;
+    const ok = try parseConfigFromJson(testing.allocator, softplus);
+    try testing.expect(ok.kda_vector_gate);
+    try testing.expect(!ok.kdaUsesBoundedGate());
 }
 
 test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {

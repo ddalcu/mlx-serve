@@ -2198,3 +2198,64 @@ follow-ups, neither belongs to this change. The prefill memory guards
 (`prefillAttnKeys`, `server.dsv4PrefillMemoryNeeded`) still bill on `total_kv`,
 so they now over-estimate — conservative, and retuning them is its own measured
 change.
+## KDA (Kimi Delta Attention): a lower bound that replaces the formula, and a gate that is an indexing contract (2026-08-11)
+
+Ling 3.0 (`bailing_hybrid`) rides the existing GatedDeltaNet recurrence, and every place it diverges is a place a reasonable reading is wrong.
+
+**The lower bound is not a clamp.** The config says `kda_lower_bound: -5, kda_safe_gate: true`, which reads exactly like "clamp the log-space gate at -5". It is not. fla's `fused_recurrent_kda_fwd_kernel` has two arms:
+
+```
+if USE_LOWER_BOUND:  b_gk = lower_bound * sigmoid(exp(b_A) * b_g)
+else:                b_gk = -exp(b_A) * softplus(b_g)
+```
+
+The bound SELECTS a different function — a bounded sigmoid in `(bound, 0)` — rather than truncating the softplus one. Both are monotonic and both saturate, so a clamped-softplus port produces plausible text and would likely never be caught by eyeballing output; the two disagree most in the middle of the range, where almost every token lives. The rule generalizes past this arch: when a config key looks like a bound on a formula you already implement, read the reference KERNEL's arms before assuming it modifies yours. `kdaGateChain` is pinned by the two properties a clamped-softplus reading breaks — the decay never reaches the floor `exp(bound)`, and it is monotonically DECREASING in `a` (the softplus form's magnitude is unbounded there).
+
+**The gate's shape is an indexing contract.** GatedDeltaNet gates per (token, value head); KDA gates per KEY CHANNEL, so `g` is `[B,T,Hv,Dk]` and each state element decays by its own factor. That is three lines of difference in a 40-line Metal kernel (the base pointer, the subscript, the per-step advance) — which is exactly the kind of difference that gets copy-pasted into a second kernel and then drifts. `gdnKernelSource(vectorized, capture_seq)` generates all four variants (scalar/vector × plain/spec-capture) from ONE recurrence, so the delta rule itself exists once; the existing seq-vs-single parity tests characterized the refactor.
+
+Two things fall out. First, a kernel written for the OTHER shape must decline rather than read the wrong element: the blocked oMLX prefill kernel takes a per-head gate, so it is refused outright on a vector-gated arch (a perf loss on 18 of 24 layers, not a correctness risk — noted as a follow-up). Second, the equivalence test is a per-channel gate held UNIFORM across each head, which must reproduce the scalar kernel EXACTLY (same recurrence, same reduction order, only the fetch differs). A wrong stride — reading head 0's channel for every head, or advancing by `Hv` instead of `Hv*Dk` — passes every "output is finite and roughly decays" check and fails this one. The test also asserts the reference state is non-zero, because an all-zero state would pass any diff.
+
+**A per-variant kernel cache needs a comptime capture.** `getGdnKernelFor(vectorized, capture_seq)` held its compiled kernel in a `struct { var kernel = null; }` declared inside the function. Zig memoizes a struct type declared in a function body when it captures nothing from the comptime parameters — so all four instantiations shared ONE cache slot and the first kernel compiled was handed back for the rest. The symptom was the seq-capture parity test exiting 255: it asked for three outputs and got a kernel that declares two. Adding `const is_vectorized = vectorized;` (and its twin) to the struct forces four distinct types. Any "one cached thing per comptime variant" needs the same capture.
+
+## Follow-ups from the Ling 3.0 review: a cache that assumes one width, and a gate arm that must be chosen (2026-08-12)
+
+Three holes the `bailing_hybrid` port left open, all of the same shape — a generalization applied to one code path and not its twin.
+
+**`updateDense` learned that K and V can differ; `updateAffine` did not.** The dense write path was generalized to read each buffer's own head dim, and the MLA comment noted that "the quantized-KV fused kernels assume one head width for both, so MLA never opts in". That is true of the fused READ kernels and says nothing about the cache SCHEME: `--kv-quant 4|8` builds an `.affine` cache for whatever arch is loaded, and `updateAffine` solved `q_last`/`sc_last` once from `new_k`'s head dim and handed them to all six `growQuantBuf` calls. At K 192 / V 128 the value buffer came out 24 u32 wide while `new_vq.q` was 16, so `writeAtOffset` slice-updated a narrow chunk into a wide window — an mlx-level shape error, i.e. one we cannot catch. `truncate`'s affine arm had the same bug in view form (value scale/bias views sliced against the KEY scales' shape). The rule: a "K and V may differ" generalization is not done until every buffer in every scheme is sized from the operand it stores. Both are now covered by `KVCache affine quant carries an asymmetric K/V too`.
+
+**A lazily-built rotation refuses lazily.** TurboQuant needs a power-of-two width and MLA's key is 192, so it genuinely cannot serve this arch. But `TurboState` builds its Hadamard matrices at the first write, so the refusal (`error.NonPowerOfTwoHeadDim`) fired inside the first request that reached an MLA layer — a 500 mid-generation for something knowable at load. `initWithConfigAndHeadDim` had even taken a `head_dim` parameter and thrown it away (`_ = head_dim; // observed at first write`), while its own doc comment claimed "the scheduler's load path validates head_dim is pow2 at cache init". The parameter is now used — against `ModelConfig.kvCacheKeyHeadDim()`, because `head_dim` says 128 for an arch that caches 192-wide keys, so the declared field would have validated the wrong number. When a lazy constructor's constraint is knowable from config, check it eagerly and let the request path keep the lazy build.
+
+**Two arms means the arm is selected, not defaulted.** `kda_gate_lower_bound` was declared "0 = plain -exp(A_log)·softplus form" and the forward then handed that 0 straight to the bounded chain, which computes `exp(0 · σ(…))` = 1: a forget gate that never forgets, on a checkpoint whose only difference was omitting the key. The parse refuses a non-negative bound that is PRESENT, but an absent one left the field at its default and the field's own comment unhonored. The fix is a predicate (`ModelConfig.kdaUsesBoundedGate`) both sides read, and the absent case routes to the softplus chain — which is elementwise, so with `A_log` already expanded per key channel it serves a per-channel gate with no new code. Whenever a config value's default means "the other formula", the selection belongs in a named predicate; a default that silently degenerates one branch is worse than either branch.
+
+## The refusal was right and the process died anyway: a fallible re-init behind a deinit (2026-08-13)
+
+Making `KVCache.initWithConfigAndHeadDim` fallible was the previous section's fix — TurboQuant cannot serve a 192-wide MLA key, so say so at load instead of mid-request. It worked. `mlx-serve --model <Ling-3.0-tiny> --serve --kv-quant turbo4` printed the named refusal, correctly, and then died:
+
+```
+--kv-quant turbo: cache key width 192 is not a power of two ...
+EXC_BAD_ACCESS in mlx_array_free <- transformer.freeKVEntry <- KVCache.deinit
+  <- Transformer.deinit <- scheduler.doLoadOnInferenceThread
+```
+
+The crash is not in the new check and not in the arch. Every site that re-applies a kv-quant config was written when the constructor was infallible:
+
+```zig
+xfm_ptr.cache.deinit();
+xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(...);
+```
+
+Read that with an error in mind: `deinit` frees the entries slice and every mlx handle in it, `try` returns, and a FREED cache stays installed on the Transformer. The owner's own `deinit` then walks the same entries and frees all of it a second time. Four sites had the shape — the scheduler's cold load, main's offline path, `resetCache`, `tryRestoreCache` — because the pattern is the obvious way to write it and was correct for as long as the callee could not fail. **A constructor becoming fallible is a change to every caller that frees before calling it**, and nothing in the type system says so: the `try` was added at each site by the same patch that introduced the error, which is precisely when the freed-object window opened.
+
+The fix is ordering, held in one place. `KVCache.reinit` builds the replacement, and only then frees and swaps:
+
+```zig
+const fresh = try initWithConfigAndHeadDim(self.allocator, num_layers, config, head_dim);
+self.deinit();
+self.* = fresh;
+```
+
+Failure now leaves the live cache exactly as it was — same scheme, same contents, still serving — which is also the behavior a 503-and-retry story needs, since the alternative to crashing was a model entry holding a cache that could never be used again.
+
+Two things make this a class rather than a bug. First, the symptom is maximally misleading: the stack names `mlx_array_free`, several frames and one full load-path unwind away from the refusal that caused it, so the natural first suspect is the MLA cache geometry or mlx's refcounting — anything but the four-line caller that printed the correct error message immediately before. Second, the shape recurs on its own: any future scheme that refuses an arch, at any of these sites, reopens it. So the guard is a source scan (`.cache = try` appears nowhere in transformer/scheduler/main, and `reinit`'s build precedes its free) rather than only the behavioral test, and the behavioral test is written against the testing allocator so the pre-fix order trips a double free on its own `defer` — verified red exactly that way, and red again with the helper's two statements transposed.
+
+The general rule: **when a fallible call sits after a `deinit` of the thing it replaces, the error path is a use-after-free.** Build, then swap — and when several call sites share the pattern, the ordering belongs inside one helper they all use, not repeated correctly four times.
