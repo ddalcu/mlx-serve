@@ -804,12 +804,100 @@ struct ChatSidebar: View {
     @EnvironmentObject var downloads: DownloadManager
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
+    /// alone by shift itself so dragging a range up and down keeps re-ranging
+    /// from the same origin instead of walking away from it.
+    @State private var selectionAnchor: UUID?
     /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
     /// shared menu body, which needs it.
     @StateObject private var cliDetector = CLILauncher()
+    /// Holding ⌘ numbers the conversation rows. A modifier held down is STATE,
+    /// which SwiftUI does not report outside a hovered view — see the monitor.
+    @StateObject private var modifiers = ModifierKeyMonitor()
+    /// Where the frosted destination block ENDS, and where the panel ends, in
+    /// the column's own space — the band a conversation row has to sit inside
+    /// to be readable. Measured rather than derived from the inset's height:
+    /// the block's contents vary (the Create list, the download badge), so the
+    /// one number that cannot go stale is the one the block reports itself.
+    @State private var clearBandTop: CGFloat = 0
+    @State private var clearBandBottom: CGFloat = 0
+    /// Each conversation row's vertical extent, reported only while ⌘ is down.
+    @State private var rowSpans: [UUID: SidebarRowSpan] = [:]
+
+    /// The rows a number may land on: those fully clear of the frosted block
+    /// and inside the panel. `nil` means "not measured" — before the first
+    /// layout after ⌘ goes down — and numbers everything, which is the old
+    /// behaviour rather than a sidebar of blank rows for one frame.
+    private var numberedRows: Set<UUID>? {
+        guard modifiers.commandHeld else { return nil }
+        return ChatQuickSwitch.numbering(rowSpans: rowSpans,
+                                         clearBandTop: clearBandTop,
+                                         clearBandBottom: clearBandBottom)
+    }
 
     var body: some View {
         conversationsSidebar
+    }
+
+    /// ⌘1…⌘9 jumps to the row wearing that number; ⌃⌘1…⌃⌘9 ranges to it from
+    /// where you are, selecting everything in between.
+    ///
+    /// Zero-size hidden buttons, the same idiom as ⌘R regenerate: they need
+    /// THIS view's session list, and a key equivalent works wherever focus is,
+    /// including while the composer's text view has it.
+    ///
+    /// **Ranging is ⌃⌘, not the ⇧⌘ every macOS list uses, because macOS took
+    /// those digits first**: ⇧⌘3/4/5 are screen capture and ⇧⌘6 grabs the
+    /// Touch Bar, all system-level, so they never reach an app — four of the
+    /// nine ranged silently and the other five worked, which is worse than a
+    /// shortcut that is simply somewhere else. Control is the replacement
+    /// rather than Option because it is the one modifier that does not rewrite
+    /// the character its key produces (⌥4 is ¢), so key-equivalent matching
+    /// stays boring. ⌃ alone would collide with Mission Control's
+    /// switch-to-desktop-N; with ⌘ it does not.
+    private var quickSwitchShortcuts: some View {
+        ForEach(1...ChatQuickSwitch.maxSlots, id: \.self) { slot in
+            let key = KeyEquivalent(Character("\(slot)"))
+            Group {
+                Button { quickSwitch(to: slot, extend: false) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: .command)
+                Button { quickSwitch(to: slot, extend: true) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: [.command, .control])
+            }
+            .frame(width: 0, height: 0)
+            .opacity(0)
+        }
+    }
+
+    /// Go to a numbered chat, or range to it. Not `selectRow`: that one reads
+    /// the CURRENT event's modifier flags, and the event behind these always
+    /// has ⌘ down — every jump would toggle the row into a multi-selection
+    /// instead of going to it. The flags are stated explicitly instead, and the
+    /// decision itself is `ChatQuickSwitch.outcome`.
+    private func quickSwitch(to slot: Int, extend: Bool) {
+        guard let outcome = ChatQuickSwitch.outcome(
+            slot: slot,
+            sessions: appState.visibleChatSessions,
+            numbering: numberedRows,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            extend: extend)
+        else { return }
+        apply(outcome)
+    }
+
+    /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
+    /// same reason `selectRow` does it in that order.
+    private func apply(_ outcome: SidebarMultiSelect.Outcome) {
+        appState.showConversation()
+        selectionAnchor = outcome.anchor
+        if appState.sidebarSelection != outcome.selection {
+            appState.sidebarSelection = outcome.selection
+        }
+        if let target = outcome.activate, appState.activeChatId != target {
+            appState.activeChatId = target
+        }
     }
 
     private var conversationsSidebar: some View {
@@ -817,7 +905,8 @@ struct ChatSidebar: View {
         // `listRowBackground`, which is the double highlight — two grays, the
         // inner one a different value from the destinations above, and an accent
         // agent label sitting on whichever won. Selection is ours now, drawn by
-        // the one `SidebarRowStyle` both halves of this panel read.
+        // the one `SidebarRowStyle` both halves of this panel read — and the
+        // cmd/shift behaviour the binding used to supply is `SidebarMultiSelect`.
         // A ScrollView, not a List. These rows draw everything themselves —
         // background, hover, selection, separators — so the only thing
         // `.listStyle(.sidebar)` still contributed was its own horizontal
@@ -1017,10 +1106,131 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.top, 10)
             .padding(.bottom, 8)
+            // Where the frost ENDS. This block is what conversation rows scroll
+            // under, so its own bottom edge is the line between "readable" and
+            // "behind glass" — no constant to keep in step with its contents.
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SidebarClearBandTopKey.self,
+                        value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
+                }
+            }
             // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
             // has something to attach to again and the platform frosts what
             // scrolls beneath this block.
         }
+        // The panel's own bottom edge closes the band — in this space that is
+        // the column's HEIGHT, which is the whole "how much window is there?"
+        // question the badge count answers. Applied OUTSIDE the safeAreaInset
+        // so it measures the whole column, and so the three readers below are
+        // ancestors of the block that publishes the top edge — a preference
+        // only travels up.
+        //
+        // There was a second publisher for the TOP edge here, `frame.minY +
+        // safeAreaInsets.top`, described as the same line derived a second way.
+        // It never was: measured, it reported 104 against a frost line at 370,
+        // because this reader sits below the toolbar (so it has already lost
+        // that inset) and the block's height is not part of what it reads back.
+        // It was harmless only because the key reduces by `max` and the real
+        // measurement was always larger — a fallback that could only ever be
+        // wrong is worse than none.
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: SidebarClearBandBottomKey.self,
+                    value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
+            }
+        }
+        // Declared here, OUTSIDE both readers and the inset, so the block, the
+        // column and every row resolve against the same origin.
+        .coordinateSpace(.named(ChatSidebar.bandSpace))
+        .onPreferenceChange(SidebarClearBandTopKey.self) { value in
+            applyMeasurement(value, to: $clearBandTop)
+        }
+        .onPreferenceChange(SidebarClearBandBottomKey.self) { value in
+            applyMeasurement(value, to: $clearBandBottom)
+        }
+        .onPreferenceChange(SidebarRowSpansKey.self) { value in
+            guard rowSpans != value else { return }
+            // Async for the same reason the transcript's scroll correction is
+            // (issue #136): a geometry-driven write that lands inside the
+            // layout flush re-enters layout, and under a scroll it does so
+            // every frame. One turn later it coalesces instead.
+            DispatchQueue.main.async { rowSpans = value }
+        }
+    }
+
+    /// Store a measured edge, ignoring sub-pixel noise. The equality gate is
+    /// load-bearing, not an optimisation: a write per layout would re-enter
+    /// layout and never settle.
+    private func applyMeasurement(_ value: CGFloat, to binding: Binding<CGFloat>) {
+        guard abs(binding.wrappedValue - value) > 0.5 else { return }
+        DispatchQueue.main.async { binding.wrappedValue = value }
+    }
+
+    // MARK: Selection
+
+    /// Whether a conversation row can be lit at ALL in the current workspace
+    /// mode. Asked of the active chat against itself, so the answer is the mode
+    /// question alone — the per-row half is now selection membership.
+    private var conversationsAreLit: Bool {
+        guard let active = appState.activeChatId else { return false }
+        return SidebarSelection.isConversationSelected(
+            sessionId: active, activeChatId: active, workspace: appState.chatWorkspace)
+    }
+
+    /// One click on a conversation row. The modifier maths is pure and lives in
+    /// `SidebarMultiSelect`; this is only the wiring — read the flags off the
+    /// event AppKit is currently dispatching (a SwiftUI Button action has no
+    /// other way to see them), then apply the outcome.
+    ///
+    /// Selection is written BEFORE `activeChatId` on purpose: the sync above
+    /// collapses the selection for an active chat it doesn't already contain,
+    /// so the other order would undo a cmd-click on its way out.
+    private func selectRow(_ id: UUID, ordered: [UUID]) {
+        // Clicking a row means you are working in the LIST, so the keyboard
+        // comes with you. Nothing else moves it: these rows take no first
+        // responder, so the composer keeps the keyboard while you click around
+        // the sidebar — which is what made ⌘⌫ a line delete forever after one
+        // click in the field. Deliberately NOT done by `quickSwitch`: ⌘\<digit\>
+        // is for jumping to a chat and typing in it, so the composer stays
+        // armed there (a multi-selection is what tells ⌘⌫ otherwise).
+        KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
+        let flags = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags)
+            .intersection(.deviceIndependentFlagsMask)
+        let outcome = SidebarMultiSelect.click(
+            id, ordered: ordered,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            command: flags.contains(.command),
+            shift: flags.contains(.shift))
+        apply(outcome)
+    }
+
+    /// Every control that deletes conversations comes through here, so which
+    /// ones ask first is `SidebarDeleteConfirm`'s decision and not a per-button
+    /// habit. `keyboard` is what separates ⌘⌫ — which names no row — from a
+    /// click on one.
+    private func requestDeleteChats(_ ids: Set<UUID>, keyboard: Bool) {
+        guard !ids.isEmpty else { return }
+        if SidebarDeleteConfirm.required(count: ids.count, keyboard: keyboard) {
+            appState.pendingChatDeletion = ids
+        } else {
+            deleteChats(ids)
+        }
+    }
+
+    /// Delete a set of conversations and leave the panel's own state consistent
+    /// — the ids go out of the selection and the anchor FIRST, so nothing that
+    /// reads them (the ⌫ handler, the context menu's count) can name a chat that
+    /// is already gone.
+    private func deleteChats(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        appState.sidebarSelection.subtract(ids)
+        if let anchor = selectionAnchor, ids.contains(anchor) { selectionAnchor = nil }
+        appState.deleteSessions(ids)
     }
 
     /// A section heading, sitting on the same left edge as the rows under it.
@@ -1110,6 +1320,20 @@ struct ChatSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Where this row sits, so the numbering can skip whatever is under the
+        // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+        // a preference write per row per scroll frame, and outside this
+        // transient mode nothing reads the answer.
+        .background {
+            if modifiers.commandHeld {
+                GeometryReader { proxy in
+                    let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
+                    Color.clear.preference(
+                        key: SidebarRowSpansKey.self,
+                        value: [session.id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
+                }
+            }
+        }
         // One meaning for gray in this panel, and one SHAPE: the fill rides the
         // row's own content inside the stack's gutter, exactly as a
         // destination's `.background` does. (It was a `listRowBackground` once,
@@ -1123,10 +1347,38 @@ struct ChatSidebar: View {
         // A real Button laid OVER the row, never a tap gesture around one: an
         // overlay is hit-tested first, so its clicks reach it rather than the
         // row underneath, and the row keeps its whole area clickable.
+        //
+        // The badge and the delete button share this one reserved slot, and the
+        // badge WINS while ⌘ is down: they would otherwise draw on top of each
+        // other on the hovered row, which is exactly the row the pointer is on
+        // whenever anyone reads a number. ⌘-click is also how a second row
+        // joins the selection, so the pointer is regularly here with ⌘ held —
+        // and the ✕ is one pixel away from a click meaning "delete this".
         .overlay(alignment: .trailing) {
-            if hoveredSessionId == session.id {
+            if modifiers.commandHeld, let slot = ChatQuickSwitch.slot(for: session.id,
+                                                                      in: appState.visibleChatSessions,
+                                                                      numbering: numberedRows) {
+                Text("\(slot)")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.primary.opacity(0.08))
+                    )
+                    .padding(.trailing, ChatMetrics.sidebarRowInset)
+                    // Decoration: it must never eat the click that selects the
+                    // row it is drawn on.
+                    .allowsHitTesting(false)
+                    .transition(AnyTransition.asymmetric(
+                        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
+                        removal: .opacity.animation(.easeOut(duration: 0.15))
+                     ))
+                    .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
+            } else if hoveredSessionId == session.id {
                 Button {
-                    appState.deleteSession(session.id)
+                    requestDeleteChats([session.id], keyboard: false)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 14))
