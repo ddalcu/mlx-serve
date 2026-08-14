@@ -779,6 +779,31 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Branch a conversation at a message: the transcript up to that point
+    /// becomes a new chat, and the original is left untouched.
+    ///
+    /// The fork opens immediately — you asked to go somewhere else, so being
+    /// left in the old thread wondering whether it worked is the wrong answer
+    /// (the same reason regenerate scrolls to the reply it asked for). Both the
+    /// active chat and the sidebar selection move, or the panel lights a row
+    /// that is not the transcript on screen.
+    ///
+    /// Returns nil when there is nothing to fork, which is also what stops the
+    /// menu item offering it (`ChatFork.isForkable`).
+    @discardableResult
+    func forkSession(_ sessionId: UUID, from messageId: UUID) -> UUID? {
+        guard let source = chatSessions.first(where: { $0.id == sessionId }) else { return nil }
+        let messages = ChatFork.prefix(source.messages, through: messageId)
+        guard !messages.isEmpty else { return nil }
+        let fork = ChatFork.session(from: source, messages: messages)
+        chatSessions.insert(fork, at: 0)
+        activeChatId = fork.id
+        sidebarSelection = [fork.id]
+        showConversation()
+        saveChatHistory()
+        return fork.id
+    }
+
     /// The version list a regeneration in flight will put on whatever reply it
     /// produces, per session.
     ///

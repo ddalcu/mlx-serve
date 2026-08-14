@@ -1503,6 +1503,13 @@ struct ChatDetailView: View {
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
+    /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
+    /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
+    /// walk left running would resume in someone else's conversation. Stale
+    /// indexes are harmless by construction (`ComposerHistory` treats one that
+    /// no longer names an entry as no walk at all), but resetting on the switch
+    /// is what makes the first ↑ in a new tab mean what it says.
+    @State private var composerWalk = ComposerHistory.Walk.idle
     // The three toolbar toggles mirror the visible session's persisted state
     // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
     // the session on appear AND on every `sessionId` change, and written back on
@@ -2456,6 +2463,11 @@ struct ChatDetailView: View {
             // unpinned at whatever offset the previous conversation's content
             // happened to leave behind.
             applyScroll(.transcriptShown)
+            // A history walk belongs to ONE conversation. Stale indexes are
+            // harmless (ComposerHistory reads a mismatched draft as no walk),
+            // but the first ↑ in the newly-visible tab has to mean "the last
+            // thing I said HERE".
+            composerWalk = .idle
         }
     }
 
@@ -3030,6 +3042,10 @@ struct ChatDetailView: View {
             pendingIntentPrompt = prompt
             return
         }
+        // Sending ends any history walk: the composer is about to empty for a
+        // different reason, and a live walk would make the next ↑ resume from
+        // wherever the last one left off rather than from what was just sent.
+        composerWalk = .idle
         proceedSend()
     }
 
