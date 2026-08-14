@@ -400,10 +400,20 @@ struct ChatView: View {
         // not inside the content area — a list of tasks is navigation, and
         // nesting it in the detail column made the window look like it had two
         // unrelated sidebars stacked horizontally.
-        if appState.chatWorkspace.isThreeColumn {
-            threeColumnSplitView
-        } else {
-            standardSplitView
+        Group {
+            if appState.chatWorkspace.isThreeColumn {
+                threeColumnSplitView
+            } else {
+                standardSplitView
+            }
+        }
+        // ⌘L, on the WINDOW rather than on one split: the picker has to open
+        // over Tasks and Agents too, which are the other `NavigationSplitView`.
+        // Environment injected AT the sheet — a sheet inherits none.
+        .sheet(isPresented: $appState.modelPalettePresented) {
+            ModelPaletteSheet()
+                .environmentObject(appState)
+                .environmentObject(server)
         }
     }
 
@@ -497,7 +507,8 @@ struct ChatView: View {
                 ChatWorkspace.gateShouldPresent(gateIsBlocking: gateIsBlocking,
                                                 cancelled: gateCancelled,
                                                 workspace: appState.chatWorkspace,
-                                                welcomePresented: appState.showWelcome)
+                                                welcomePresented: appState.showWelcome,
+                                                palettePresented: appState.modelPalettePresented)
             },
             set: { _ in })) {
             ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)

@@ -244,6 +244,39 @@ class AppState: ObservableObject {
     /// `NavigationSplitView` — neither can own the other's state.
     @Published var selectedTaskId: UUID?
 
+    /// Is the ⌘L model switcher up? A SHEET on the chat window, like the
+    /// welcome screen — so the flag lives here rather than in the view, because
+    /// the thing that opens it is a menu command with no view to talk to.
+    @Published var modelPalettePresented = false
+
+    /// Open the model switcher — the ONE way in, same shape as `showModels()`:
+    /// it must both raise the picker AND bring the chat window forward, or ⌘L
+    /// from the tray opens a sheet on a window nobody is looking at.
+    ///
+    /// Refused while the welcome sheet is up: that screen is the first-run
+    /// model picker, and a second sheet over it is the one-sheet rule.
+    func showModelPalette() {
+        guard !showWelcome else { return }
+        modelPalettePresented = true
+        pendingChatOpenTick += 1
+    }
+
+    /// Apply a `ChatModelSelection` tag — what picking a model MEANS, in one
+    /// place. The tray, the composer's pill and the ⌘L palette all call this:
+    /// each had its own copy of "clear the LAN id, then set the path", which is
+    /// the per-surface-copy class the tag semantics were centralised to avoid.
+    func applyChatModelPick(_ tag: String) {
+        switch ChatModelSelection.action(for: tag) {
+        case .selectLan(let id):
+            selectLanModel(id)
+        case .selectLocal(let path):
+            // Picking a local model always clears the LAN choice, or the chat
+            // keeps being answered by the other Mac.
+            server.lanChatModelId = nil
+            selectedModelPath = path
+        }
+    }
+
     /// Show the model browser — the ONE way in.
     func showModels(_ section: ModelBrowserSection = .recommended) {
         chatWorkspace = .models(section)
