@@ -394,3 +394,113 @@ every allow-listed extension passing it, the full-slot and unreadable-drag
 cases, a real pasteboard round-trip proving the read recovers a
 `public.file-url` item and skips a web URL, and a source scan pinning
 `.onDrop(of: [.fileURL]` + `validateDrop` in the modifier).
+
+## Simplified Chinese (2026-08-14): the localization that was mostly already there
+
+The app had no localization at all — no `.lproj`, no `.xcstrings`, no
+`NSLocalizedString`, no `CFBundleDevelopmentRegion` — and 205 Swift files with
+~615 user-facing string literals in `Views/`. The obvious estimate is a
+mechanical pass over every call site to wrap each string in something.
+
+That pass would have been wasted work. SwiftUI's `Text("…")` picks the
+`LocalizedStringKey` initializer for a string LITERAL, and a `LocalizedStringKey`
+is a `Bundle.main` lookup performed at render time. `Button`, `Label`, `Toggle`,
+`Picker`, `Section`, `TextField`, `Menu`, `.help`, `.navigationTitle` — all the
+same. The app was already asking the main bundle for a translation ~615 times
+per screen and getting the key back, because no bundle had one. Supplying
+`zh-Hans.lproj/Localizable.strings` localized all of it with no code change and
+no `bundle:` argument at any call site.
+
+The choice that makes that work is **keys are the English source strings**.
+A missing entry falls through to the key, which IS the English text, so:
+an untranslated string renders in English rather than as a raw identifier; a
+`swift build` binary (no `.lproj` beside it) is byte-identical to before; and
+the existing tests that assert on copy stayed green without edits.
+
+The same property is what makes the bug class silent. Nothing crashes, nothing
+blanks out — a missed string just renders in English inside a Chinese screen,
+and only a Chinese speaker on that exact pane would notice. So the guard is
+coverage: `LocalizationCatalogTests` re-extracts the keys from the sources the
+way SwiftUI does and demands the catalog answer every one. The extractor lives
+in the test rather than in a script, because a scan that runs when someone
+remembers to run it is not a guard; and it carries a self-test
+(`testTheExtractorReadsTheShapesTheAppActuallyUses`), because a rewrite that
+quietly starts returning nothing would make every coverage assertion pass
+forever.
+
+### Where it must NOT go
+
+`Package.swift` has `exclude: ["Resources"]`, so the target has no
+`Bundle.module`. Keeping it that way was load-bearing: a SwiftPM resource is
+placed in `MLXCore_MLXCore.bundle`, which `Bundle.main` lookups never consult,
+so routing the catalog through SwiftPM would have forced an explicit
+`bundle: .module` onto all ~615 call sites — the mechanical pass, reintroduced
+by the packaging decision. The catalog sits outside SwiftPM's view and is
+compiled into `Contents/Resources` by `build.sh` (`xcrun xcstringstool compile`)
+and by project.yml's resources phase for the MAS Xcode target.
+
+`release.yml` assembles its own bundle rather than calling `build.sh` (it has
+always mirrored it, step by step). A compile step added to only one path ships
+a DMG that is English for every user while the local build looks correct —
+and, per the fallback above, without a single error anywhere. The release step
+is a hard failure (`test -f …/zh-Hans.lproj/Localizable.strings`), not a
+`|| true`, and `tests/test_release_workflow_gates.sh` pins that both paths
+compile the catalog and that both plists declare every language the catalog
+translates.
+
+### Interpolation: the key is generated, not spelled
+
+`Text("Plan (\(n) steps)")` does not look up its source spelling — SwiftUI
+builds a FORMAT string and passes the values as arguments, so the key is
+`"Plan (%lld steps)"`. The specifier comes from the interpolated expression's
+TYPE, which a source scan cannot know. Read off
+`Mirror(reflecting: LocalizedStringKey(…))` rather than assumed:
+
+    Int, Int64 -> %lld     Int32 -> %d      UInt -> %llu
+    Double     -> %lf      Float -> %f
+    String, a ternary yielding String, a nested String(format:) -> %@
+    a literal % -> %% once the string has ANY formatting (plain literals keep %)
+
+Two consequences. First, a string literal nested INSIDE an interpolation is an
+argument, not part of the key, so it is not localizable at all —
+`ownedHere ? "ON in this chat" : "OFF"` inside a `.help` renders English inside
+a translated sentence. Four such sites existed; they now go through
+`String(localized:)`. Second, the guard can't verify an interpolated key by
+equality, so it builds the pattern every possible spelling would match
+(each `\(…)` becomes `%(?:lld|llu|lf|[dfu@])`, each literal `%` matches `%` or
+`%%`) and asks which catalog key answers it. A key that doesn't match degrades
+to English — safe, and visible — rather than to a wrong argument.
+
+Chinese translations use POSITIONAL specifiers (`%1$lld`) throughout, because
+Chinese moves word order and has no plural suffix: `"%lld tool%@"` has to
+become `"%1$lld 个工具"`, reordering nothing and DROPPING the second argument
+entirely. Both are only safe positionally.
+`testEveryTranslatedFormatSpecifierMatchesItsKey` pins that every specifier in
+a translation carries an index, that the index is in range, and that its type
+matches the key's at that position — `%lld` read as `%@` is a pointer
+dereference of an integer, which is a crash, not a typo.
+
+### Two escapes that shipped in the first draft
+
+A catalog value is finished text; its escapes were resolved when the key was
+authored. A translation written by copying the Swift source keeps that source's
+spelling, so `\n` arrived as a backslash and an `n` and rendered that way, and
+`\"` put a stray backslash in front of every quote. Both were invisible in
+review — the reviewer doesn't read the language. `testTranslationsCarryNoSourceSpellingEscapes`
+rejects `\n`, `\t`, `\r`, `\"` and `\u{` in any translation.
+
+Related: the catalog KEY is the resolved string (`Text("say \"hi\"")` looks up
+`say "hi"`), so the extractor unescapes source spellings before looking them up.
+
+### What is deliberately not translated
+
+`AgentPrompt`, `AgentWriter` and `Agent.starters` are read by the MODEL, not the
+user. Translating them breaks the three ported tests asserting exact prompt
+equality with the iPhone app, and a localized tool description measurably
+degrades tool calling on small models — the grammar a 2B model matches is the
+English one it was trained on. `testModelFacingCopyIsNeverLocalized` scans those
+files for `String(localized:`/`NSLocalizedString(`.
+
+The user-visible half of that decision — a Chinese UI still gets English
+answers — is a reply-language line resolved INTO the prompt at
+`AgentResolution`, and is not implemented yet.

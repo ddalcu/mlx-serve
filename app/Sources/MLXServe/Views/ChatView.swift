@@ -1349,7 +1349,7 @@ struct ChatDetailView: View {
                         } else {
                             // The agent forbids it — say so rather than showing
                             // an off switch the user can't turn on.
-                            Text("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities")
+                            Text("\(tool.displayName) — not in \(activeAgent?.name ?? String(localized: "agent"))'s capabilities")
                         }
                     }
                     .disabled(!allowed || isExternalBridgeSession)

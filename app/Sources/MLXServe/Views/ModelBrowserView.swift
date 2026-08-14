@@ -329,7 +329,7 @@ private struct MiniCapability: View {
             bar(pick.intelligenceBar, .blue)
             bar(pick.speedBar, .green)
         }
-        .help("Top bar: intelligence\(pick.intelligenceIsEstimated ? " (our estimate)" : ""). Bottom bar: speed. Both relative to the models here.")
+        .help("Top bar: intelligence\(pick.intelligenceIsEstimated ? String(localized: " (our estimate)") : ""). Bottom bar: speed. Both relative to the models here.")
     }
 
     private func bar(_ fill: Double, _ tint: Color) -> some View {

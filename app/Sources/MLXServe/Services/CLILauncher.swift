@@ -307,7 +307,7 @@ struct CLILauncherButton: View {
                 .buttonStyle(.bordered)
                 .menuIndicator(.hidden)
                 .disabled(!isEnabled)
-                .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
+                .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? String(localized: "none detected") : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }
         }
         .task { await detector.refresh() }

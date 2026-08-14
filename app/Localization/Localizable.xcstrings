@@ -1,0 +1,5506 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    " (our estimate)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "（我们的估算）"
+          }
+        }
+      }
+    },
+    "%@ (network)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@（网络）"
+          }
+        }
+      }
+    },
+    "%@ in Sandbox": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在沙盒中运行 %1$@"
+          }
+        }
+      }
+    },
+    "%@ of memory · about %@ usable for models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ 内存 · 其中约 %2$@ 可用于模型"
+          }
+        }
+      }
+    },
+    "%@ total": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "共 %1$@"
+          }
+        }
+      }
+    },
+    "%@ — file no longer on disk": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ —— 文件已不在本地"
+          }
+        }
+      }
+    },
+    "%@ — not in %@'s capabilities": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ —— 不在 %2$@ 的能力范围内"
+          }
+        }
+      }
+    },
+    "%lld WEB SOURCE%@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 个网页来源"
+          }
+        }
+      }
+    },
+    "%lld bytes": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 字节"
+          }
+        }
+      }
+    },
+    "%lld frames · ~%@s": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 帧 · 约 %2$@ 秒"
+          }
+        }
+      }
+    },
+    "%lld model%@ on disk": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "本地有 %1$lld 个模型"
+          }
+        }
+      }
+    },
+    "%lld source%@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 个来源"
+          }
+        }
+      }
+    },
+    "%lld token%@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 个 token"
+          }
+        }
+      }
+    },
+    "%lld tokens/sec": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld token/秒"
+          }
+        }
+      }
+    },
+    "%lld tool%@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 个工具"
+          }
+        }
+      }
+    },
+    "%lld-bit": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 位"
+          }
+        }
+      }
+    },
+    "%lldms": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 毫秒"
+          }
+        }
+      }
+    },
+    "(%lld tokens)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "（%1$lld 个 token）"
+          }
+        }
+      }
+    },
+    "(no arguments)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "（无参数）"
+          }
+        }
+      }
+    },
+    "(server has produced no output yet)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "（服务器尚未产生任何输出）"
+          }
+        }
+      }
+    },
+    "1. In Telegram, open @BotFather and send /newbot.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1. 在 Telegram 中打开 @BotFather 并发送 /newbot。"
+          }
+        }
+      }
+    },
+    "10GB": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "10GB"
+          }
+        }
+      }
+    },
+    "123456:ABC-DEF…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "123456:ABC-DEF…"
+          }
+        }
+      }
+    },
+    "128 (fast)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "128（快速）"
+          }
+        }
+      }
+    },
+    "2. Copy the token it gives you and paste it above.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "2. 复制它给你的令牌，粘贴到上面。"
+          }
+        }
+      }
+    },
+    "256 (balanced)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "256（均衡）"
+          }
+        }
+      }
+    },
+    "2GB": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "2GB"
+          }
+        }
+      }
+    },
+    "3. Turn on “Enable Telegram bot”, then message your bot once to lock it to your chat.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "3. 打开“启用 Telegram 机器人”，然后给你的机器人发一条消息，把它锁定到你的会话。"
+          }
+        }
+      }
+    },
+    "384 (fine)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "384（精细）"
+          }
+        }
+      }
+    },
+    "A goal the agent runs on its own, on a schedule.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "一个由智能体按计划自行执行的目标。"
+          }
+        }
+      }
+    },
+    "A single, well-lit photo of one object works best. The subject is auto-cut from its background.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "单个物体、光线充足的照片效果最好。主体会自动从背景中抠出。"
+          }
+        }
+      }
+    },
+    "ACE-Step 1.5 has no download yet — convert the weights on-device with tests/convert_acestep_weights.py (see the repo README). They install to ~/.mlx-serve/models/local/.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ACE-Step 1.5 暂无下载 —— 请用 tests/convert_acestep_weights.py 在本机转换权重（见仓库 README）。转换结果会安装到 ~/.mlx-serve/models/local/。"
+          }
+        }
+      }
+    },
+    "Add Voice…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加声音…"
+          }
+        }
+      }
+    },
+    "Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加一段用于克隆的录音。它会被标准化并保存在 ~/.mlx-serve/voice-clips，之后任何智能体都能使用。"
+          }
+        }
+      }
+    },
+    "Add reference image…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加参考图…"
+          }
+        }
+      }
+    },
+    "Add the tools from every enabled Model Context Protocol server.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "加入所有已启用的 Model Context Protocol 服务器提供的工具。"
+          }
+        }
+      }
+    },
+    "Advanced": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "高级"
+          }
+        }
+      }
+    },
+    "Advanced (overrides Quality preset)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "高级（覆盖画质预设）"
+          }
+        }
+      }
+    },
+    "Advanced options": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "高级选项"
+          }
+        }
+      }
+    },
+    "After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在形状阶段之后，用同一张照片为网格绘制完整的 PBR 贴图（albedo + 金属度-粗糙度）。需要已转换的绘制权重（约 4.6 GB）。"
+          }
+        }
+      }
+    },
+    "Agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "智能体"
+          }
+        }
+      }
+    },
+    "Agents": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "智能体"
+          }
+        }
+      }
+    },
+    "Agents…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "智能体…"
+          }
+        }
+      }
+    },
+    "All Settings": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "全部设置"
+          }
+        }
+      }
+    },
+    "Allow": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允许"
+          }
+        }
+      }
+    },
+    "Allow all tools this session": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "本次会话允许所有工具"
+          }
+        }
+      }
+    },
+    "Allow this tool call?": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允许这次工具调用吗？"
+          }
+        }
+      }
+    },
+    "Always": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "始终"
+          }
+        }
+      }
+    },
+    "An upper bound — the model may end the song earlier.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上限值 —— 模型可能提前结束这首曲子。"
+          }
+        }
+      }
+    },
+    "Animate": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "动画"
+          }
+        }
+      }
+    },
+    "App default": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "应用默认"
+          }
+        }
+      }
+    },
+    "Apply one or more LoRA adapters to the image model for a custom style. Several can stack at once.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "为图像模型应用一个或多个 LoRA 适配器以获得自定义风格。可同时叠加多个。"
+          }
+        }
+      }
+    },
+    "Apply one or more LoRA adapters to the video model for a custom style. Several can stack at once.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "为视频模型应用一个或多个 LoRA 适配器以获得自定义风格。可同时叠加多个。"
+          }
+        }
+      }
+    },
+    "Approve": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "批准"
+          }
+        }
+      }
+    },
+    "Ask every time": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "每次都询问"
+          }
+        }
+      }
+    },
+    "Ask the current model to turn your description into a system prompt. You can edit whatever it writes.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "让当前模型把你的描述写成系统提示词。它写完之后你可以随意修改。"
+          }
+        }
+      }
+    },
+    "Ask the local model anything…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "向本地模型提问…"
+          }
+        }
+      }
+    },
+    "Attach Folder for Q&A…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "附加文件夹用于问答…"
+          }
+        }
+      }
+    },
+    "Auto": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动"
+          }
+        }
+      }
+    },
+    "Auto-scroll": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动滚动"
+          }
+        }
+      }
+    },
+    "Auto-start on launch": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启动时自动运行"
+          }
+        }
+      }
+    },
+    "Automatic": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动"
+          }
+        }
+      }
+    },
+    "Automatically": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动"
+          }
+        }
+      }
+    },
+    "Available to this task": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此任务可用"
+          }
+        }
+      }
+    },
+    "Back to the simple switches": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "返回简易开关"
+          }
+        }
+      }
+    },
+    "Blank agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "空白智能体"
+          }
+        }
+      }
+    },
+    "Boots the guest and prepares configs. First-run installs stream into the terminal once it opens.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启动客户机并准备配置。首次运行的安装过程会在终端打开后实时显示。"
+          }
+        }
+      }
+    },
+    "Browse Models…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "浏览模型…"
+          }
+        }
+      }
+    },
+    "Browse all models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "浏览全部模型"
+          }
+        }
+      }
+    },
+    "Browse pages and search the web (browse + webSearch).": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "浏览网页并搜索互联网（browse + webSearch）。"
+          }
+        }
+      }
+    },
+    "Browser": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "浏览器"
+          }
+        }
+      }
+    },
+    "Built-in — duplicate it to make changes": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内置 —— 复制一份后才能修改"
+          }
+        }
+      }
+    },
+    "Cancel": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "取消"
+          }
+        }
+      }
+    },
+    "Cancel download": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "取消下载"
+          }
+        }
+      }
+    },
+    "Capabilities, model, workspace and sampling. Most agents need none of these.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "能力、模型、工作区与采样。大多数智能体都用不到这些。"
+          }
+        }
+      }
+    },
+    "Capability": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "能力"
+          }
+        }
+      }
+    },
+    "Change Model": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更换模型"
+          }
+        }
+      }
+    },
+    "Change the symbol": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更换图标"
+          }
+        }
+      }
+    },
+    "Chat": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "对话"
+          }
+        }
+      }
+    },
+    "Chat model. Click to switch — models on this Mac and any shared by other Macs on your network.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "对话模型。点击可切换 —— 包括这台 Mac 上的模型，以及局域网中其他 Mac 共享的模型。"
+          }
+        }
+      }
+    },
+    "Check Hacker News and write me the top AI stories": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "看看 Hacker News，把最热门的 AI 新闻写给我"
+          }
+        }
+      }
+    },
+    "Check Now": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "立即检查"
+          }
+        }
+      }
+    },
+    "Choose .safetensors…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择 .safetensors…"
+          }
+        }
+      }
+    },
+    "Choose a photo and press Generate.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择一张照片，然后点击“生成”。"
+          }
+        }
+      }
+    },
+    "Choose audio…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择音频…"
+          }
+        }
+      }
+    },
+    "Choose file…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择文件…"
+          }
+        }
+      }
+    },
+    "Choose…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择…"
+          }
+        }
+      }
+    },
+    "Clear": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清除"
+          }
+        }
+      }
+    },
+    "Clear filter": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清除筛选"
+          }
+        }
+      }
+    },
+    "Clear finished": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清除已完成"
+          }
+        }
+      }
+    },
+    "Clear first frame": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清除首帧"
+          }
+        }
+      }
+    },
+    "Clear reference": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清除参考"
+          }
+        }
+      }
+    },
+    "Clear the filter": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清除筛选条件"
+          }
+        }
+      }
+    },
+    "Clear the in-memory log buffer (does not affect the running server)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清空内存中的日志缓冲（不影响正在运行的服务器）"
+          }
+        }
+      }
+    },
+    "Click Restart Now to apply, or Discard to revert the unsaved server-launch fields.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "点击“立即重启”以应用，或点击“放弃”以还原未保存的服务器启动项。"
+          }
+        }
+      }
+    },
+    "Clip length. LTX only generates %lld–%lld frames on its 8N+1 ladder; the slider snaps to valid counts.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "片段长度。LTX 只能按 8N+1 的阶梯生成 %1$lld–%2$lld 帧；滑块会自动吸附到有效数值。"
+          }
+        }
+      }
+    },
+    "Close Tab": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关闭标签页"
+          }
+        }
+      }
+    },
+    "Close this session": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关闭此会话"
+          }
+        }
+      }
+    },
+    "Code": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "代码"
+          }
+        }
+      }
+    },
+    "Conditioning rebalance": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "条件重平衡"
+          }
+        }
+      }
+    },
+    "Connect a coding agent CLI (Claude Code, pi, OpenCode) to this server — shows the terminal commands to run": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "把编程智能体命令行（Claude Code、pi、OpenCode）接入这个服务器 —— 会显示需要在终端里运行的命令"
+          }
+        }
+      }
+    },
+    "Connect external tools via the Model Context Protocol": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "通过 Model Context Protocol 接入外部工具"
+          }
+        }
+      }
+    },
+    "Connect from your terminal:": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从你的终端连接："
+          }
+        }
+      }
+    },
+    "Connected — %lld tool%@ available": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已连接 —— 可用工具 %1$lld 个"
+          }
+        }
+      }
+    },
+    "Context size": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上下文长度"
+          }
+        }
+      }
+    },
+    "Context window": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上下文窗口"
+          }
+        }
+      }
+    },
+    "Context window — %@ of %@ tokens used. Click for the breakdown.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上下文窗口 —— 已使用 %2$@ token 中的 %1$@。点击查看明细。"
+          }
+        }
+      }
+    },
+    "Copy All": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "全部复制"
+          }
+        }
+      }
+    },
+    "Copy Error": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制错误"
+          }
+        }
+      }
+    },
+    "Copy Message": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制消息"
+          }
+        }
+      }
+    },
+    "Copy model name": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制模型名称"
+          }
+        }
+      }
+    },
+    "Copy the entire log to the clipboard": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "把整个日志复制到剪贴板"
+          }
+        }
+      }
+    },
+    "Copy the ssh command — opens another session into the same guest": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制 ssh 命令 —— 可再开一个进入同一客户机的会话"
+          }
+        }
+      }
+    },
+    "Copy this code block": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制此代码块"
+          }
+        }
+      }
+    },
+    "Create New Agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新建智能体"
+          }
+        }
+      }
+    },
+    "Curated servers": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "精选服务器"
+          }
+        }
+      }
+    },
+    "Current": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前"
+          }
+        }
+      }
+    },
+    "Custom Folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自定文件夹"
+          }
+        }
+      }
+    },
+    "Custom folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自定文件夹"
+          }
+        }
+      }
+    },
+    "Custom servers (from mcp.json)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自定服务器（来自 mcp.json）"
+          }
+        }
+      }
+    },
+    "Default": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "默认"
+          }
+        }
+      }
+    },
+    "Default folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "默认文件夹"
+          }
+        }
+      }
+    },
+    "Delete": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除"
+          }
+        }
+      }
+    },
+    "Delete %@? This will remove all downloaded files.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要删除 %1$@ 吗？这会移除所有已下载的文件。"
+          }
+        }
+      }
+    },
+    "Delete %@? This will remove the downloaded files.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要删除 %1$@ 吗？这会移除已下载的文件。"
+          }
+        }
+      }
+    },
+    "Delete All Sandbox Data": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除全部沙盒数据"
+          }
+        }
+      }
+    },
+    "Delete Message": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除消息"
+          }
+        }
+      }
+    },
+    "Delete Model": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除模型"
+          }
+        }
+      }
+    },
+    "Delete Quant": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除量化版本"
+          }
+        }
+      }
+    },
+    "Delete Quantization": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除量化版本"
+          }
+        }
+      }
+    },
+    "Delete all completed, failed and cancelled runs": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除所有已完成、失败和已取消的运行记录"
+          }
+        }
+      }
+    },
+    "Delete chat": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除对话"
+          }
+        }
+      }
+    },
+    "Delete model": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除模型"
+          }
+        }
+      }
+    },
+    "Delete run": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除运行记录"
+          }
+        }
+      }
+    },
+    "Delete saved…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除已保存…"
+          }
+        }
+      }
+    },
+    "Delete task": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除任务"
+          }
+        }
+      }
+    },
+    "Delete the %@ build? Other quantizations of this model stay on disk.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要删除 %1$@ 构建吗？该模型的其他量化版本会保留在本地。"
+          }
+        }
+      }
+    },
+    "Delete the %@ quant? Other quants of this model stay on disk.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要删除 %1$@ 量化版本吗？该模型的其他量化版本会保留在本地。"
+          }
+        }
+      }
+    },
+    "Delete this agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除此智能体"
+          }
+        }
+      }
+    },
+    "Demo unavailable in this build.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此版本不提供演示。"
+          }
+        }
+      }
+    },
+    "Deny": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "拒绝"
+          }
+        }
+      }
+    },
+    "Describe a style, optionally add lyrics, and press Generate.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "描述一种风格，可另外加入歌词，然后点击“生成”。"
+          }
+        }
+      }
+    },
+    "Describe the change in the prompt — “make the hair blue”, “remove the monitor”. The model sees the original and keeps the rest.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在提示词里描述要改什么 ——“把头发改成蓝色”“去掉显示器”。模型会看到原图并保留其余部分。"
+          }
+        }
+      }
+    },
+    "Detach folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "分离文件夹"
+          }
+        }
+      }
+    },
+    "Diffusion decoder (sharper, slower)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "扩散解码器（更锐利，更慢）"
+          }
+        }
+      }
+    },
+    "Discard": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "放弃"
+          }
+        }
+      }
+    },
+    "Discover": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "发现"
+          }
+        }
+      }
+    },
+    "Don't show again": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "不再显示"
+          }
+        }
+      }
+    },
+    "Double-click to open in Preview": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "双击以在“预览”中打开"
+          }
+        }
+      }
+    },
+    "Download": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载"
+          }
+        }
+      }
+    },
+    "Download & Install": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载并安装"
+          }
+        }
+      }
+    },
+    "Download (%@)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载（%1$@）"
+          }
+        }
+      }
+    },
+    "Download a model below to start chatting.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在下方下载一个模型即可开始对话。"
+          }
+        }
+      }
+    },
+    "Download a voice first — open the Audio window and grab Qwen3-TTS, then come back.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请先下载一个声音 —— 打开音频窗口获取 Qwen3-TTS，然后再回来。"
+          }
+        }
+      }
+    },
+    "Download this model — you can keep using the app while it transfers": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载这个模型 —— 传输过程中你可以继续使用本应用"
+          }
+        }
+      }
+    },
+    "Download v%@, install, and relaunch": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载 v%1$@，安装并重新启动"
+          }
+        }
+      }
+    },
+    "Downloaded and ready to use": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已下载，可以使用"
+          }
+        }
+      }
+    },
+    "Downloading %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在下载 %1$@ %2$@"
+          }
+        }
+      }
+    },
+    "Downloads": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载"
+          }
+        }
+      }
+    },
+    "Drafter": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "草稿模型"
+          }
+        }
+      }
+    },
+    "Drag files in — each one joins the list for its own type.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "把文件拖进来 —— 每个文件会按自身类型加入对应的列表。"
+          }
+        }
+      }
+    },
+    "Drag to resize the prompt box.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "拖动可调整提示词框的大小。"
+          }
+        }
+      }
+    },
+    "Duplicate": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制"
+          }
+        }
+      }
+    },
+    "Duplicate this agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制此智能体"
+          }
+        }
+      }
+    },
+    "Duration (%@)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "时长（%1$@）"
+          }
+        }
+      }
+    },
+    "Each session is its own terminal in the isolated Linux VM, talking to this Mac's local model. Run several at once — nothing runs on the host.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "每个会话都是隔离 Linux 虚拟机里的一个独立终端，与这台 Mac 上的本地模型通信。可同时运行多个 —— 宿主机上不会运行任何东西。"
+          }
+        }
+      }
+    },
+    "Edit": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "编辑"
+          }
+        }
+      }
+    },
+    "Edit Agent…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "编辑智能体…"
+          }
+        }
+      }
+    },
+    "Edit System Prompt": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "编辑系统提示词"
+          }
+        }
+      }
+    },
+    "Edit task": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "编辑任务"
+          }
+        }
+      }
+    },
+    "Edit ~/.mlx-serve/mcp.json to add custom servers or fine-tune existing ones": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "编辑 ~/.mlx-serve/mcp.json 可添加自定服务器或微调已有服务器"
+          }
+        }
+      }
+    },
+    "Enable Assistant MTP Drafter model": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启用 MTP 助手草稿模型"
+          }
+        }
+      }
+    },
+    "Enabled": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已启用"
+          }
+        }
+      }
+    },
+    "End Session": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "结束会话"
+          }
+        }
+      }
+    },
+    "End the %@ session?": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要结束 %1$@ 会话吗？"
+          }
+        }
+      }
+    },
+    "Engine the selected model runs on": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所选模型运行所用的引擎"
+          }
+        }
+      }
+    },
+    "Enter a prompt and press Generate.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "输入提示词，然后点击“生成”。"
+          }
+        }
+      }
+    },
+    "Enter text, add a reference voice, and press Generate.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "输入文本，添加参考声音，然后点击“生成”。"
+          }
+        }
+      }
+    },
+    "Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "根据实测运行数据和这台 Mac 的 GPU 估算。实际耗时会随 GPU 上的其他负载而变化。"
+          }
+        }
+      }
+    },
+    "Every quantization is downloaded": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所有量化版本均已下载"
+          }
+        }
+      }
+    },
+    "Examples": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "示例"
+          }
+        }
+      }
+    },
+    "Failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "失败"
+          }
+        }
+      }
+    },
+    "Filter settings": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "筛选设置"
+          }
+        }
+      }
+    },
+    "Filter your models...": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "筛选你的模型…"
+          }
+        }
+      }
+    },
+    "First frame": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "首帧"
+          }
+        }
+      }
+    },
+    "Fixed at %lld steps — this model is distilled for a %lld-step schedule, so more steps cost time without adding detail.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "固定为 %1$lld 步 —— 这个模型是按 %2$lld 步的调度蒸馏的，增加步数只会更慢，不会带来更多细节。"
+          }
+        }
+      }
+    },
+    "Format": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "格式"
+          }
+        }
+      }
+    },
+    "Frames": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "帧数"
+          }
+        }
+      }
+    },
+    "GET": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GET"
+          }
+        }
+      }
+    },
+    "GET STARTED": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开始使用"
+          }
+        }
+      }
+    },
+    "GPU %lld%%": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GPU %1$lld%%"
+          }
+        }
+      }
+    },
+    "Generate": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "生成"
+          }
+        }
+      }
+    },
+    "Generate Anyway": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仍然生成"
+          }
+        }
+      }
+    },
+    "Generation was cancelled.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "生成已取消。"
+          }
+        }
+      }
+    },
+    "Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "曲风、情绪、乐器 —— 例如 \"upbeat synthwave with driving bass and dreamy pads\"。"
+          }
+        }
+      }
+    },
+    "Give these lyrics a name to reuse them from the Examples menu.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "给这段歌词起个名字，之后可从“示例”菜单再次使用。"
+          }
+        }
+      }
+    },
+    "Give this style a name to reuse it from the Examples menu.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "给这个风格起个名字，之后可从“示例”菜单再次使用。"
+          }
+        }
+      }
+    },
+    "Global gain": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "全局增益"
+          }
+        }
+      }
+    },
+    "Guidance (%@)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "引导强度（%1$@）"
+          }
+        }
+      }
+    },
+    "Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "引导强度 —— 视频与提示词的贴合程度。1.0 = 关闭：最快，画面也最自然。数值越高越严格贴合提示词，但速度更慢，画面可能过饱和。LTX 默认值为 3.0。"
+          }
+        }
+      }
+    },
+    "HTTP": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HTTP"
+          }
+        }
+      }
+    },
+    "Hands-free voice assistant — talk to the model with no chat window required. Speech-to-text and text-to-speech run locally on your Mac. When this popover is closed, feedback is audio-only; reopen it for status and controls.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "免动手语音助手 —— 无需对话窗口即可与模型交谈。语音识别与语音合成都在你的 Mac 本地运行。此弹窗关闭时只有语音反馈；重新打开可查看状态和控制项。"
+          }
+        }
+      }
+    },
+    "Hey Loki": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hey Loki"
+          }
+        }
+      }
+    },
+    "Higher = finer mesh, more memory and time.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "数值越高网格越精细，占用内存和耗时也越多。"
+          }
+        }
+      }
+    },
+    "Higher = more expressive and varied.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "数值越高，表现力和变化越强。"
+          }
+        }
+      }
+    },
+    "How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "每张参考图送入模型的尺寸。最高细节能更好地保持人物一致性，但会慢上数倍 —— 每个采样步都要重新读取全部参考 token。"
+          }
+        }
+      }
+    },
+    "How many times this repo has been pulled from HuggingFace": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这个仓库从 HuggingFace 被拉取的次数"
+          }
+        }
+      }
+    },
+    "Hugging Face Cache": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hugging Face 缓存"
+          }
+        }
+      }
+    },
+    "Hunyuan3D 2.1 has no download yet — convert the weights on-device with tests/convert_hunyuan3d_weights.py (see the repo README). They install to ~/.mlx-serve/models/local/.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hunyuan3D 2.1 暂无下载 —— 请用 tests/convert_hunyuan3d_weights.py 在本机转换权重（见仓库 README）。转换结果会安装到 ~/.mlx-serve/models/local/。"
+          }
+        }
+      }
+    },
+    "I couldn't read that — try “every day at 8am”.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法理解 —— 试试“每天早上 8 点”。"
+          }
+        }
+      }
+    },
+    "Idle motion: the model turns on a turntable with a gentle breathing pulse.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "待机动作：模型在转盘上旋转，并带有轻微的呼吸起伏。"
+          }
+        }
+      }
+    },
+    "Image detail": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "图像细节"
+          }
+        }
+      }
+    },
+    "In the sandbox": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在沙盒中"
+          }
+        }
+      }
+    },
+    "Includes %lld models (e.g. a text encoder)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "包含 %1$lld 个模型（例如文本编码器）"
+          }
+        }
+      }
+    },
+    "Includes %lld models (e.g. the text encoder).": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "包含 %1$lld 个模型（例如文本编码器）。"
+          }
+        }
+      }
+    },
+    "Increase Context Size": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "增大上下文长度"
+          }
+        }
+      }
+    },
+    "Installed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已安装"
+          }
+        }
+      }
+    },
+    "Installing — the app will relaunch": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在安装 —— 应用将会重新启动"
+          }
+        }
+      }
+    },
+    "Jump to the latest message": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "跳到最新消息"
+          }
+        }
+      }
+    },
+    "Keep model loaded after generating": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "生成后保持模型常驻"
+          }
+        }
+      }
+    },
+    "Key": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "键"
+          }
+        }
+      }
+    },
+    "Kokoro": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kokoro"
+          }
+        }
+      }
+    },
+    "Kokoro voice": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kokoro 声音"
+          }
+        }
+      }
+    },
+    "Last request overflowed the context window.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上一次请求超出了上下文窗口。"
+          }
+        }
+      }
+    },
+    "Launch Claude Code…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启动 Claude Code…"
+          }
+        }
+      }
+    },
+    "Launch a coding agent — on this Mac (%@) or inside the sandbox (pi, hermes)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启动编程智能体 —— 在这台 Mac 上（%1$@），或在沙盒中（pi、hermes）"
+          }
+        }
+      }
+    },
+    "Layer weights (%lld numbers, comma or space separated)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "层权重（%1$lld 个数字，用逗号或空格分隔）"
+          }
+        }
+      }
+    },
+    "Line to speak — e.g. Good morning. Coffee's ready.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要朗读的台词 —— 例如：早上好，咖啡好了。"
+          }
+        }
+      }
+    },
+    "Live server state: whether this model is loaded, and the total memory held by all loaded models.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "服务器实时状态：该模型是否已加载，以及所有已加载模型占用的总内存。"
+          }
+        }
+      }
+    },
+    "Load %@ as the server's model, then open chat": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "把 %1$@ 加载为服务器模型，然后打开对话"
+          }
+        }
+      }
+    },
+    "Load More": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "加载更多"
+          }
+        }
+      }
+    },
+    "Loading quants…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在加载量化版本…"
+          }
+        }
+      }
+    },
+    "Local AI on Apple Silicon": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 Apple 芯片上运行的本地 AI"
+          }
+        }
+      }
+    },
+    "Locked to": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "锁定为"
+          }
+        }
+      }
+    },
+    "Low = stay close to the source; high = mostly the prompt.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "数值低则贴近原图；数值高则主要听提示词。"
+          }
+        }
+      }
+    },
+    "MCP": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MCP"
+          }
+        }
+      }
+    },
+    "MCP Marketplace": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MCP 市场"
+          }
+        }
+      }
+    },
+    "MCP Marketplace…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MCP 市场…"
+          }
+        }
+      }
+    },
+    "MLX Core": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLX Core"
+          }
+        }
+      }
+    },
+    "MLX Core v%@ is available": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLX Core v%1$@ 已发布"
+          }
+        }
+      }
+    },
+    "MLX Sandbox": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLX 沙盒"
+          }
+        }
+      }
+    },
+    "MLX-Serve Models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLX-Serve 模型"
+          }
+        }
+      }
+    },
+    "Manage Models…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "管理模型…"
+          }
+        }
+      }
+    },
+    "Manage…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "管理…"
+          }
+        }
+      }
+    },
+    "Max quality (slower)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最高画质（较慢）"
+          }
+        }
+      }
+    },
+    "Media": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "媒体"
+          }
+        }
+      }
+    },
+    "Mem %lld%%": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内存 %1$lld%%"
+          }
+        }
+      }
+    },
+    "Memory needed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所需内存"
+          }
+        }
+      }
+    },
+    "Mesh resolution": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "网格分辨率"
+          }
+        }
+      }
+    },
+    "Model": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模型"
+          }
+        }
+      }
+    },
+    "Model exceeds your Mac's RAM": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模型超出了这台 Mac 的内存"
+          }
+        }
+      }
+    },
+    "More Models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更多模型"
+          }
+        }
+      }
+    },
+    "More options": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更多选项"
+          }
+        }
+      }
+    },
+    "My Models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "我的模型"
+          }
+        }
+      }
+    },
+    "Name": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "名称"
+          }
+        }
+      }
+    },
+    "Needs about %@ — your Mac can use about %@ for a model.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "大约需要 %1$@ —— 你的 Mac 可为模型提供约 %2$@。"
+          }
+        }
+      }
+    },
+    "Needs about %lld GB of RAM — your Mac has %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "大约需要 %1$lld GB 内存 —— 你的 Mac 有 %2$@"
+          }
+        }
+      }
+    },
+    "Needs exactly %lld numbers — one per tapped encoder layer.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "必须正好 %1$lld 个数字 —— 每个被取用的编码器层一个。"
+          }
+        }
+      }
+    },
+    "Needs more memory than this Mac has": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所需内存超过这台 Mac 的容量"
+          }
+        }
+      }
+    },
+    "New  ⌘N": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新建  ⌘N"
+          }
+        }
+      }
+    },
+    "New Session": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新建会话"
+          }
+        }
+      }
+    },
+    "New agent — start from a type, or blank": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新建智能体 —— 可从类型开始，也可从空白开始"
+          }
+        }
+      }
+    },
+    "New session (pi, hermes, or a plain shell)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新建会话（pi、hermes 或普通 shell）"
+          }
+        }
+      }
+    },
+    "No chat models downloaded": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "尚未下载任何对话模型"
+          }
+        }
+      }
+    },
+    "No clips yet": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "还没有片段"
+          }
+        }
+      }
+    },
+    "No downloads in progress": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前没有正在进行的下载"
+          }
+        }
+      }
+    },
+    "No local models yet — download one first.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "还没有本地模型 —— 请先下载一个。"
+          }
+        }
+      }
+    },
+    "No model loaded yet — every section is shown so you can pre-tune. Once a model is active, sections that don't apply will hide automatically.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "尚未加载模型 —— 这里显示了全部分区，方便你提前调好。模型激活之后，不适用的分区会自动隐藏。"
+          }
+        }
+      }
+    },
+    "No models found": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未找到模型"
+          }
+        }
+      }
+    },
+    "No models yet": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "还没有模型"
+          }
+        }
+      }
+    },
+    "No runs yet. Tap Run now to try it.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "还没有运行记录。点击“立即运行”试一下。"
+          }
+        }
+      }
+    },
+    "No settings match “%@”": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "没有与“%1$@”匹配的设置"
+          }
+        }
+      }
+    },
+    "No tasks yet.\nTap + to create one.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "还没有任务。\n点击 + 新建一个。"
+          }
+        }
+      }
+    },
+    "No voices installed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "尚未安装任何声音"
+          }
+        }
+      }
+    },
+    "None": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无"
+          }
+        }
+      }
+    },
+    "None (app defaults)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无（应用默认）"
+          }
+        }
+      }
+    },
+    "None loaded — models load on demand": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未加载 —— 模型会按需加载"
+          }
+        }
+      }
+    },
+    "None — voice mode uses the system voice.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无 —— 语音模式将使用系统声音。"
+          }
+        }
+      }
+    },
+    "Not downloaded": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未下载"
+          }
+        }
+      }
+    },
+    "OFF": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已关闭"
+          }
+        }
+      }
+    },
+    "OK": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "好"
+          }
+        }
+      }
+    },
+    "ON in another chat — click to move it here": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已在其他对话中开启 —— 点击可移到这里"
+          }
+        }
+      }
+    },
+    "ON in this chat": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已在此对话中开启"
+          }
+        }
+      }
+    },
+    "Off": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关"
+          }
+        }
+      }
+    },
+    "Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关（默认）：快速方案 —— 步缓存 + 注意力复用，在 768p 下约快 2.8 倍。开：每个去噪步都完整计算；最终成片的细节略好一些。"
+          }
+        }
+      }
+    },
+    "Off (default): the plain convolutional decoder. On: LTX's own diffusion decoder — the one their published clips use. It denoises the frames instead of interpolating them, so fine texture and edges come out sharper. The decode itself takes about 21 s for a 97-frame clip at 768x512; measured end to end against the plain decoder in the same session the difference was inside run-to-run variance.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关（默认）：普通卷积解码器。开：LTX 自家的扩散解码器 —— 他们公开的片段用的就是它。它对帧做去噪而不是插值，因此细腻纹理和边缘更锐利。在 768x512 下解码一段 97 帧的片段本身约需 21 秒；在同一次会话中与普通解码器做端到端对比，差异仍在运行间波动范围之内。"
+          }
+        }
+      }
+    },
+    "On": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开"
+          }
+        }
+      }
+    },
+    "On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开（默认）：生成的图像会由本机 NSFW 分类器筛查，露骨结果会被拦截。关：不做过滤 —— 输出内容由你自行负责。"
+          }
+        }
+      }
+    },
+    "On This Mac": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在这台 Mac 上"
+          }
+        }
+      }
+    },
+    "On Your Network": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在你的局域网中"
+          }
+        }
+      }
+    },
+    "On this Mac": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在这台 Mac 上"
+          }
+        }
+      }
+    },
+    "On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开：模型保持常驻，下一次生成可立即开始。关（默认）：卸载模型以释放 GPU 内存。"
+          }
+        }
+      }
+    },
+    "Open @BotFather ↗": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开 @BotFather ↗"
+          }
+        }
+      }
+    },
+    "Open MLX Serve Folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开 MLX Serve 文件夹"
+          }
+        }
+      }
+    },
+    "Open Memory File": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开记忆文件"
+          }
+        }
+      }
+    },
+    "Open Model Browser": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开模型浏览器"
+          }
+        }
+      }
+    },
+    "Open Server Log in a separate window (easier copy/paste)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在单独窗口中打开服务器日志（更方便复制粘贴）"
+          }
+        }
+      }
+    },
+    "Open Settings → Context size. A larger window needs more memory and takes effect when the server restarts.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开“设置 → 上下文长度”。更大的窗口需要更多内存，并在服务器重启后生效。"
+          }
+        }
+      }
+    },
+    "Open Skills Folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开技能文件夹"
+          }
+        }
+      }
+    },
+    "Open Voices Folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开声音文件夹"
+          }
+        }
+      }
+    },
+    "Open in Chat  ⌘↩": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在对话中打开  ⌘↩"
+          }
+        }
+      }
+    },
+    "Open mcp.json": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开 mcp.json"
+          }
+        }
+      }
+    },
+    "Open output folder in Finder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在访达中打开输出文件夹"
+          }
+        }
+      }
+    },
+    "Open the Sandbox Terminal": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开沙盒终端"
+          }
+        }
+      }
+    },
+    "Open the mlx-serve repository on GitHub": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 GitHub 上打开 mlx-serve 仓库"
+          }
+        }
+      }
+    },
+    "Open the server status page in your browser": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在浏览器中打开服务器状态页"
+          }
+        }
+      }
+    },
+    "Optional — the reference audio alone clones the voice": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选 —— 仅凭参考音频即可克隆声音"
+          }
+        }
+      }
+    },
+    "Options": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选项"
+          }
+        }
+      }
+    },
+    "Other Discovered Models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "发现的其他模型"
+          }
+        }
+      }
+    },
+    "Pages this answer drew on": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "本回答参考的网页"
+          }
+        }
+      }
+    },
+    "Pause": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "暂停"
+          }
+        }
+      }
+    },
+    "Photo": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "照片"
+          }
+        }
+      }
+    },
+    "Pick a task to see its runs, or create a new one.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择一个任务查看其运行记录，或新建一个。"
+          }
+        }
+      }
+    },
+    "Pick an agent, or create one from a type.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择一个智能体，或按类型新建一个。"
+          }
+        }
+      }
+    },
+    "Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "精确指定这个智能体可以调用哪些工具。打开后，上方的粗粒度开关将被冻结。"
+          }
+        }
+      }
+    },
+    "Pick, record or drag in ~%lld seconds of the voice to clone. Without a reference, the model's default voice is used.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择、录制或拖入约 %1$lld 秒要克隆的声音。没有参考音频时将使用模型的默认声音。"
+          }
+        }
+      }
+    },
+    "Plain shell": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "普通 shell"
+          }
+        }
+      }
+    },
+    "Plan (%lld steps)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "计划（%1$lld 步）"
+          }
+        }
+      }
+    },
+    "Play": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "播放"
+          }
+        }
+      }
+    },
+    "Preview": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "预览"
+          }
+        }
+      }
+    },
+    "Preview reference": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "预览参考"
+          }
+        }
+      }
+    },
+    "Preview the clip": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "预览片段"
+          }
+        }
+      }
+    },
+    "Privacy: prompts sent to a model you share are processed on — and visible to — this Mac. Prompts you send to a network model are visible to the Mac hosting it. Traffic stays on your local network, and everything here is off unless you turn it on.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "隐私说明：发给你所共享模型的提示词会在这台 Mac 上处理，并对这台 Mac 可见。你发给局域网模型的提示词，对承载该模型的 Mac 可见。流量仅在你的局域网内传输，且这里的所有功能默认关闭，需你手动开启。"
+          }
+        }
+      }
+    },
+    "Prompt": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "提示词"
+          }
+        }
+      }
+    },
+    "Prompt tips": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "提示词技巧"
+          }
+        }
+      }
+    },
+    "Quality": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "画质"
+          }
+        }
+      }
+    },
+    "Quick Launcher (%@)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "快速启动器（%1$@）"
+          }
+        }
+      }
+    },
+    "Quit MLX Core": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "退出 MLX Core"
+          }
+        }
+      }
+    },
+    "Re-pull Image": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重新拉取镜像"
+          }
+        }
+      }
+    },
+    "Reasoning": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "推理"
+          }
+        }
+      }
+    },
+    "Recommended": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "推荐"
+          }
+        }
+      }
+    },
+    "Recommended for This Mac": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "为这台 Mac 推荐"
+          }
+        }
+      }
+    },
+    "Recommended for your Mac": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "为你的 Mac 推荐"
+          }
+        }
+      }
+    },
+    "Recommended for your Mac:": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "为你的 Mac 推荐："
+          }
+        }
+      }
+    },
+    "Record": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "录制"
+          }
+        }
+      }
+    },
+    "Refer to the pictures by number — the source is image 1, references follow in order: “replace the face of the man in image 1 with the face from image 2”.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用编号引用图片 —— 原图是图 1，参考图按顺序排在后面：“把图 1 中男人的脸换成图 2 里的脸”。"
+          }
+        }
+      }
+    },
+    "Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1> — the numbering is per type, in the order below.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在提示词中用 <Picture 1>、<Video 1>、<Audio 1> 来引用 —— 编号按类型分别计数，顺序如下。"
+          }
+        }
+      }
+    },
+    "Reference voice": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "参考声音"
+          }
+        }
+      }
+    },
+    "References": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "参考"
+          }
+        }
+      }
+    },
+    "Reject": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "拒绝"
+          }
+        }
+      }
+    },
+    "Release notes": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "发行说明"
+          }
+        }
+      }
+    },
+    "Remove photo": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除照片"
+          }
+        }
+      }
+    },
+    "Remove the clip": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除片段"
+          }
+        }
+      }
+    },
+    "Remove the clip — voice mode falls back to the system voice": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除片段 —— 语音模式将回退到系统声音"
+          }
+        }
+      }
+    },
+    "Remove this LoRA": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除此 LoRA"
+          }
+        }
+      }
+    },
+    "Remove this reference": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除此参考"
+          }
+        }
+      }
+    },
+    "Reset": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重置"
+          }
+        }
+      }
+    },
+    "Reset Sandbox…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重置沙盒…"
+          }
+        }
+      }
+    },
+    "Reset lock": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重置锁定"
+          }
+        }
+      }
+    },
+    "Reset the Agent Sandbox?": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要重置智能体沙盒吗？"
+          }
+        }
+      }
+    },
+    "Resetting…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在重置…"
+          }
+        }
+      }
+    },
+    "Resolution": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "分辨率"
+          }
+        }
+      }
+    },
+    "Restart Now": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "立即重启"
+          }
+        }
+      }
+    },
+    "Restart the server to apply this change": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重启服务器以应用此更改"
+          }
+        }
+      }
+    },
+    "Retry": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重试"
+          }
+        }
+      }
+    },
+    "Reveal artifacts in Finder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在访达中显示产物"
+          }
+        }
+      }
+    },
+    "Reveal in Finder": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在访达中显示"
+          }
+        }
+      }
+    },
+    "Roll a new seed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "换一个随机种子"
+          }
+        }
+      }
+    },
+    "Run": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "运行"
+          }
+        }
+      }
+    },
+    "Run a command in the sandbox…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在沙盒中运行命令…"
+          }
+        }
+      }
+    },
+    "Run an agent inside the sandbox": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在沙盒中运行智能体"
+          }
+        }
+      }
+    },
+    "Run these commands in Terminal from your project folder. They point the CLI at this Mac's local server — nothing leaves your machine.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在项目文件夹下的终端里运行这些命令。它们会把命令行指向这台 Mac 的本地服务器 —— 数据不会离开你的机器。"
+          }
+        }
+      }
+    },
+    "Runs": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "运行记录"
+          }
+        }
+      }
+    },
+    "Runs the Turbo distillation LoRA: 4 steps instead of 30, about twice as fast end to end. Slightly softer detail and harder light than a full render. The adapter ships with the model; packs downloaded before it existed fetch it once, on the first run with this on.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启用 Turbo 蒸馏 LoRA：只需 4 步而非 30 步，端到端约快一倍。细节比完整渲染略柔，光线略硬。该适配器随模型一同提供；在它出现之前下载的模型包，会在首次开启此项运行时下载一次。"
+          }
+        }
+      }
+    },
+    "Safe mode (NSFW content filter)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "安全模式（NSFW 内容过滤）"
+          }
+        }
+      }
+    },
+    "Same seed + prompt reproduces the track.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "相同的随机种子 + 提示词可复现同一段音乐。"
+          }
+        }
+      }
+    },
+    "Sandbox image out of date": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "沙盒镜像已过期"
+          }
+        }
+      }
+    },
+    "Sandbox session": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "沙盒会话"
+          }
+        }
+      }
+    },
+    "Save": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存"
+          }
+        }
+      }
+    },
+    "Save current…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存当前…"
+          }
+        }
+      }
+    },
+    "Save lyrics": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存歌词"
+          }
+        }
+      }
+    },
+    "Save style prompt": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存风格提示词"
+          }
+        }
+      }
+    },
+    "Save the log to a .log file": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "把日志保存为 .log 文件"
+          }
+        }
+      }
+    },
+    "Saved": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已保存"
+          }
+        }
+      }
+    },
+    "Save…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存…"
+          }
+        }
+      }
+    },
+    "Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "缩放每个被取用的文本编码器层的权重（1 = 中性）。留空 = 关闭。"
+          }
+        }
+      }
+    },
+    "Scheduled Tasks": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "定时任务"
+          }
+        }
+      }
+    },
+    "Scheduled Tasks…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "定时任务…"
+          }
+        }
+      }
+    },
+    "Search": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "搜索"
+          }
+        }
+      }
+    },
+    "Search models...": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "搜索模型…"
+          }
+        }
+      }
+    },
+    "Seed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "随机种子"
+          }
+        }
+      }
+    },
+    "Select an image to use as the first frame of the video.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择一张图片作为视频的首帧。"
+          }
+        }
+      }
+    },
+    "Selecting this agent loads its model; “Current” leaves whatever is running alone.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择这个智能体会加载它的模型；选“当前”则不改动正在运行的模型。"
+          }
+        }
+      }
+    },
+    "Send Anyway": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仍然发送"
+          }
+        }
+      }
+    },
+    "Send to Chat — opens a new conversation with this attached": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "发送到对话 —— 会新建一个已附带此内容的会话"
+          }
+        }
+      }
+    },
+    "Set by %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "由 %1$@ 设定"
+          }
+        }
+      }
+    },
+    "Settings": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "设置"
+          }
+        }
+      }
+    },
+    "Settings…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "设置…"
+          }
+        }
+      }
+    },
+    "Setup": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "设置"
+          }
+        }
+      }
+    },
+    "Show log": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "显示日志"
+          }
+        }
+      }
+    },
+    "Show this session": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "显示此会话"
+          }
+        }
+      }
+    },
+    "Showing %lld models": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "显示 %1$lld 个模型"
+          }
+        }
+      }
+    },
+    "Shut the guest down. Live sessions end; it re-boots on the next command.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关闭客户机。进行中的会话会结束；下次执行命令时它会重新启动。"
+          }
+        }
+      }
+    },
+    "Size": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "大小"
+          }
+        }
+      }
+    },
+    "Size on Disk": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "占用磁盘空间"
+          }
+        }
+      }
+    },
+    "Some changes require a server restart": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "部分更改需要重启服务器"
+          }
+        }
+      }
+    },
+    "Sound": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "声音"
+          }
+        }
+      }
+    },
+    "Source image (optional)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "源图像（可选）"
+          }
+        }
+      }
+    },
+    "Spawning the MCP server and listing its tools…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在启动 MCP 服务器并列出它的工具…"
+          }
+        }
+      }
+    },
+    "Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "投机解码草稿模型 —— 需在设置中与 Gemma 4 基础模型搭配使用，无法单独加载。"
+          }
+        }
+      }
+    },
+    "Speech & sound": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "语音与声音"
+          }
+        }
+      }
+    },
+    "Speed (%@)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "速度（%1$@）"
+          }
+        }
+      }
+    },
+    "Spotlight-style prompt panel on %@: summon it from any app, ask the local model, and press ⌘↩ to continue in the chat window. If nothing happens on %@, macOS may be using it for input-source switching (System Settings → Keyboard → Keyboard Shortcuts → Input Sources).": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "类似聚焦搜索的提问面板，快捷键 %1$@：在任何应用中都能唤出，向本地模型提问，按 ⌘↩ 可转到对话窗口继续。如果按 %2$@ 没有反应，可能是 macOS 把它用于切换输入法了（系统设置 → 键盘 → 键盘快捷键 → 输入法）。"
+          }
+        }
+      }
+    },
+    "Star on GitHub": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 GitHub 上点亮 Star"
+          }
+        }
+      }
+    },
+    "Start Chat with this Agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "与此智能体开始对话"
+          }
+        }
+      }
+    },
+    "Start a chat with %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "与 %1$@ 开始对话"
+          }
+        }
+      }
+    },
+    "Start from a type": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从类型开始"
+          }
+        }
+      }
+    },
+    "Start one from Recommended or Discover.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从“推荐”或“发现”里挑一个开始。"
+          }
+        }
+      }
+    },
+    "Starting %@ session…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在启动 %1$@ 会话…"
+          }
+        }
+      }
+    },
+    "Status": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "状态"
+          }
+        }
+      }
+    },
+    "Steps (%lld)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "步数（%1$lld）"
+          }
+        }
+      }
+    },
+    "Stop": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止"
+          }
+        }
+      }
+    },
+    "Stop background process %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止后台进程 %1$@"
+          }
+        }
+      }
+    },
+    "Stop guest": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止客户机"
+          }
+        }
+      }
+    },
+    "Stop run": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止运行"
+          }
+        }
+      }
+    },
+    "Style LoRAs": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "风格 LoRA"
+          }
+        }
+      }
+    },
+    "Style prompt": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "风格提示词"
+          }
+        }
+      }
+    },
+    "System": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "系统"
+          }
+        }
+      }
+    },
+    "System RAM: %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "系统内存：%1$@"
+          }
+        }
+      }
+    },
+    "Tasks": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "任务"
+          }
+        }
+      }
+    },
+    "Telegram conversation (view only)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Telegram 会话（仅供查看）"
+          }
+        }
+      }
+    },
+    "Telegram conversation — view only. Reply from your phone.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Telegram 会话 —— 仅供查看。请在手机上回复。"
+          }
+        }
+      }
+    },
+    "Temperature (%@)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "温度（%1$@）"
+          }
+        }
+      }
+    },
+    "Templates": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模板"
+          }
+        }
+      }
+    },
+    "Tempo": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "速度"
+          }
+        }
+      }
+    },
+    "Text to speak": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "要朗读的文本"
+          }
+        }
+      }
+    },
+    "Texture (PBR)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "贴图（PBR）"
+          }
+        }
+      }
+    },
+    "The Agent Sandbox is off.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "智能体沙盒已关闭。"
+          }
+        }
+      }
+    },
+    "The edit comes back at the source image's own size.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "编辑结果会以源图像本身的尺寸返回。"
+          }
+        }
+      }
+    },
+    "The model invents a soundtrack from your prompt. Attach speech to make characters say exact words.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模型会根据你的提示词自行创作配乐。附加语音可让角色说出指定台词。"
+          }
+        }
+      }
+    },
+    "The server isn't running — the task will start it on its first run.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "服务器未运行 —— 任务会在首次运行时自动启动它。"
+          }
+        }
+      }
+    },
+    "The tool-calling loop: shell, files, search, tasks, media generation.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具调用循环：shell、文件、搜索、任务、媒体生成。"
+          }
+        }
+      }
+    },
+    "Thinking": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "思考"
+          }
+        }
+      }
+    },
+    "This agent can't answer until %@ is on disk. Nothing is downloaded automatically.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 %1$@ 下载到本地之前，这个智能体无法回答。系统不会自动下载任何内容。"
+          }
+        }
+      }
+    },
+    "This can't be undone.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此操作无法撤销。"
+          }
+        }
+      }
+    },
+    "This is one of the built-in agents. Duplicate it to make it yours.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这是内置智能体之一。复制一份即可自由修改。"
+          }
+        }
+      }
+    },
+    "This model is distilled for %lld steps; other values cost time without adding detail.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这个模型是按 %1$lld 步蒸馏的；其他数值只会更慢，不会带来更多细节。"
+          }
+        }
+      }
+    },
+    "This model writes its own soundtrack. Describe it in the prompt after \"overall_soundscape:\" (and \"non_diegetic_music:\" for score).": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这个模型会自行创作配乐。请在提示词中的 \"overall_soundscape:\" 后面描述它（配乐则写在 \"non_diegetic_music:\" 后面）。"
+          }
+        }
+      }
+    },
+    "Time signature": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "拍号"
+          }
+        }
+      }
+    },
+    "Toggle a server on, fill in any required fields, then click Save. Servers spawn lazily the next time you send a message with MCP mode on.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开某个服务器的开关，填好必填项，然后点击“保存”。服务器会在你下次以 MCP 模式发送消息时按需启动。"
+          }
+        }
+      }
+    },
+    "Tool Call": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具调用"
+          }
+        }
+      }
+    },
+    "Tool calling": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具调用"
+          }
+        }
+      }
+    },
+    "Tool: %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具：%1$@"
+          }
+        }
+      }
+    },
+    "Tools": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具"
+          }
+        }
+      }
+    },
+    "Tools — run a tool-calling loop": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具 —— 运行工具调用循环"
+          }
+        }
+      }
+    },
+    "Top bar: intelligence%@. Bottom bar: speed. Both relative to the models here.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上方条：智能程度%1$@。下方条：速度。两者都是相对于此处这些模型而言的。"
+          }
+        }
+      }
+    },
+    "Transcript of reference (optional)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "参考音频的文字稿（可选）"
+          }
+        }
+      }
+    },
+    "Turbo (distilled 4-step sampling)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turbo（蒸馏 4 步采样）"
+          }
+        }
+      }
+    },
+    "Turbo needs a %lld MB adapter this pack predates — it downloads once, and Generate waits for it.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turbo 需要一个 %1$lld MB 的适配器，而这个模型包发布得更早 —— 它只会下载一次，“生成”会等它完成。"
+          }
+        }
+      }
+    },
+    "Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turbo 在承载该模型的 Mac 上运行；适配器必须存在于那台机器的模型包副本中。"
+          }
+        }
+      }
+    },
+    "Turn On Networking": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开启网络"
+          }
+        }
+      }
+    },
+    "Turn it on in Settings → Agent Sandbox to run agents and commands in an isolated Linux VM.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在“设置 → 智能体沙盒”中开启，即可在隔离的 Linux 虚拟机中运行智能体和命令。"
+          }
+        }
+      }
+    },
+    "URL": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "URL"
+          }
+        }
+      }
+    },
+    "Unload from memory (the model reloads on its next use)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从内存中卸载（下次使用时会重新加载）"
+          }
+        }
+      }
+    },
+    "Unloading — waits for any running request to finish": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在卸载 —— 会等待进行中的请求结束"
+          }
+        }
+      }
+    },
+    "Unsupported": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "不支持"
+          }
+        }
+      }
+    },
+    "Update": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更新"
+          }
+        }
+      }
+    },
+    "Update System Prompt to Latest…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "把系统提示词更新到最新…"
+          }
+        }
+      }
+    },
+    "Use": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用"
+          }
+        }
+      }
+    },
+    "Use current model": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用当前模型"
+          }
+        }
+      }
+    },
+    "Use with a coding agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "配合编程智能体使用"
+          }
+        }
+      }
+    },
+    "Variation": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "变化"
+          }
+        }
+      }
+    },
+    "Variation strength": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "变化强度"
+          }
+        }
+      }
+    },
+    "Vision (image input)": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "视觉（图像输入）"
+          }
+        }
+      }
+    },
+    "Vocal language": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "人声语言"
+          }
+        }
+      }
+    },
+    "Voice clone clip": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "声音克隆片段"
+          }
+        }
+      }
+    },
+    "Voice engine": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "语音引擎"
+          }
+        }
+      }
+    },
+    "Voice mode (%@) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "语音模式（%1$@）—— 免动手与模型交谈。语音识别与语音合成都在你的 Mac 本地运行；模型只处理文本（以及已启用的工具／思考）。"
+          }
+        }
+      }
+    },
+    "Voices blend: type several separated by commas (af_bella,af_sky) to make a new one.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "声音混合：用逗号分隔输入多个（af_bella,af_sky）即可合成新声音。"
+          }
+        }
+      }
+    },
+    "Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "人声、口型和时间轴都跟随这段片段 —— 它会成为视频的配乐。使用两阶段流程运行。"
+          }
+        }
+      }
+    },
+    "WAV, MP3, M4A or AAC. The clip drives the performance and becomes the video's soundtrack.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "WAV、MP3、M4A 或 AAC。该片段驱动表演，并成为视频的配乐。"
+          }
+        }
+      }
+    },
+    "Wake phrase": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "唤醒词"
+          }
+        }
+      }
+    },
+    "Wants to run “%@”": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请求运行“%1$@”"
+          }
+        }
+      }
+    },
+    "Weights not found": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未找到权重"
+          }
+        }
+      }
+    },
+    "Who you're talking to. An agent brings its own prompt, voice, tools, workspace and model; “None” uses the app's own settings, exactly as before. Say another agent's wake phrase to hand the conversation over mid-session.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你正在与谁对话。智能体自带提示词、声音、工具、工作区和模型；选“无”则完全沿用应用自身的设置。说出另一个智能体的唤醒词，可在会话中途把对话交接过去。"
+          }
+        }
+      }
+    },
+    "Workspace…": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工作区…"
+          }
+        }
+      }
+    },
+    "Written from the description under the name.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "根据名称下方的描述写成。"
+          }
+        }
+      }
+    },
+    "Your Mac": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你的 Mac"
+          }
+        }
+      }
+    },
+    "Your voices": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你的声音"
+          }
+        }
+      }
+    },
+    "[exit %d]": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "[退出码 %1$d]"
+          }
+        }
+      }
+    },
+    "[timed out]": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "[已超时]"
+          }
+        }
+      }
+    },
+    "agent": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "智能体"
+          }
+        }
+      }
+    },
+    "e.g. a blunt Swift code reviewer that never comments on style": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "例如：一个直言不讳、从不评论代码风格的 Swift 代码审查者"
+          }
+        }
+      }
+    },
+    "error": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "错误"
+          }
+        }
+      }
+    },
+    "every weekday at 8am · or a cron expression": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "每个工作日早上 8 点 · 或填写 cron 表达式"
+          }
+        }
+      }
+    },
+    "malformed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "格式错误"
+          }
+        }
+      }
+    },
+    "none": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无"
+          }
+        }
+      }
+    },
+    "none detected": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未检测到"
+          }
+        }
+      }
+    },
+    "optional — I2V": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选 —— 图生视频"
+          }
+        }
+      }
+    },
+    "optional — audio-to-video": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选 —— 音频生视频"
+          }
+        }
+      }
+    },
+    "optional — the generation follows them": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选 —— 生成会跟随它们"
+          }
+        }
+      }
+    },
+    "or drag one here": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "或把文件拖到这里"
+          }
+        }
+      }
+    },
+    "random": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "随机"
+          }
+        }
+      }
+    },
+    "scale %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "强度 %1$@"
+          }
+        }
+      }
+    },
+    "starting": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在启动"
+          }
+        }
+      }
+    },
+    "~%llds recommended": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "建议约 %1$lld 秒"
+          }
+        }
+      }
+    },
+    "· %lld on disk": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "· 本地 %1$lld 个"
+          }
+        }
+      }
+    },
+    "—": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "—"
+          }
+        }
+      }
+    },
+    "↩ ask · esc close": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "↩ 提问 · esc 关闭"
+          }
+        }
+      }
+    },
+    "✓ On disk": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "✓ 已在本地"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

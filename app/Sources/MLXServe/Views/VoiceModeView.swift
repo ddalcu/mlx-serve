@@ -164,6 +164,10 @@ struct VoiceComposerToggle: View {
         .buttonStyle(.plain)
         .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
         .disabled(disabled)
-        .help("Voice mode (\(ownedHere ? "ON in this chat" : controller.isActive ? "ON in another chat — click to move it here" : "OFF")) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
+        // The state word is interpolated, so SwiftUI folds it into the format
+        // ARGUMENT rather than the lookup key — a bare literal here would stay
+        // English inside a translated sentence. Same for every ternary that
+        // feeds a `Text`/`.help` interpolation.
+        .help("Voice mode (\(ownedHere ? String(localized: "ON in this chat") : controller.isActive ? String(localized: "ON in another chat — click to move it here") : String(localized: "OFF"))) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
     }
 }
