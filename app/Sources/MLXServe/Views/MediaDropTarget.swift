@@ -26,23 +26,6 @@ enum MediaDropKind {
         }
     }
 
-    /// The same allow-list said in UTTypes, for the drop target's own `of:`.
-    /// The extension check below runs after the providers RESOLVE, which is
-    /// after SwiftUI has already animated the file in — so a type the pane
-    /// can't use has to be refused here or a dropped `.txt` lights the border,
-    /// flies home and does nothing. Every accepted extension conforms to one
-    /// of these (pinned by `MediaDropTests`).
-    var contentTypes: [UTType] {
-        switch self {
-        case .image: [.image]
-        case .video: [.movie]
-        case .audio: [.audio]
-        }
-    }
-
-    /// What a mixed target (the H3 references section) advertises.
-    static let allContentTypes: [UTType] = [.image, .movie, .audio]
-
     func accepts(_ url: URL) -> Bool {
         extensions.contains(url.pathExtension.lowercased())
     }
@@ -50,6 +33,47 @@ enum MediaDropKind {
     /// Which list a mixed drop belongs to, or nil for a file no pane wants.
     static func of(_ url: URL) -> MediaDropKind? {
         [.image, .video, .audio].first { $0.accepts(url) }
+    }
+}
+
+/// The verdict a drag needs while it is still in the air.
+///
+/// The type check can't wait for the providers: they resolve after SwiftUI has
+/// accepted the drop and animated the file in, so a dropped `.txt` lit the
+/// dashed border, flew home and did nothing. Naming the kind's UTTypes in the
+/// target's `of:` is NOT the fix — a Finder drag carries `public.file-url` and
+/// nothing else (the file's own content type is not on the pasteboard), so a
+/// target registered for `.image`/`.movie`/`.audio` is never offered the drag
+/// at all and every pane silently stopped accepting files. So the target
+/// registers `.fileURL` — which is what a file drag actually is — and the
+/// refusal happens in `validateDrop`, reading the drag pasteboard, which is
+/// the one synchronous view of what is being dragged.
+enum MediaDropValidation {
+    /// Whether this drop is worth lighting the border for: something in it
+    /// fits the slot, and the slot has room. A mixed target (`kind == nil`)
+    /// takes anything one of the three lists would.
+    ///
+    /// A drag we could read NOTHING off (`urls` empty while it still claims to
+    /// carry files) is no information, not a refusal — it falls back to the
+    /// old behaviour, accepting and letting the post-resolve filter drop what
+    /// the pane can't use. Bouncing everything is the worse failure of the
+    /// two: it is the one that makes the pane look broken.
+    static func accepts(_ urls: [URL], carriesFileURLs: Bool,
+                        kind: MediaDropKind?, limit: Int) -> Bool {
+        guard limit > 0 else { return false }
+        guard !urls.isEmpty else { return carriesFileURLs }
+        guard let kind else { return urls.contains { MediaDropKind.of($0) != nil } }
+        return urls.contains { kind.accepts($0) }
+    }
+
+    /// The files a live drag is carrying. `.drag` is the system-wide dragging
+    /// pasteboard — the same one the providers are bridged from — so this is
+    /// the drop's own contents, not a guess from a type identifier.
+    static func draggedFileURLs(
+        _ pasteboard: NSPasteboard = NSPasteboard(name: .drag)
+    ) -> [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] ?? []
     }
 }
 
@@ -157,9 +181,10 @@ private enum MediaDropLoader {
         var all: [URL?] { lock.lock(); defer { lock.unlock() }; return urls }
     }
 
-    /// Returns whether the drop is worth accepting at all — SwiftUI uses it to
-    /// animate the file in or bounce it back, so a full slot bounces rather
-    /// than swallowing the file and doing nothing.
+    /// Runs after the drop is accepted, so this is the SECOND filter: the
+    /// verdict in front of it works off the pasteboard, and this one off what
+    /// the providers actually resolved to. Returns false when there was
+    /// nothing to resolve at all.
     static func load(_ providers: [NSItemProvider], kind: MediaDropKind?, limit: Int,
                      completion: @escaping ([URL]) -> Void) -> Bool {
         let files = providers.filter {
@@ -188,6 +213,33 @@ private enum MediaDropLoader {
     }
 }
 
+/// Refuses the drag before it is ever highlighted, then hands the accepted
+/// files over. A `DropDelegate` rather than `onDrop(of:isTargeted:perform:)`
+/// purely for `validateDrop`: it is the only hook that answers WHILE the drag
+/// is in the air, and SwiftUI calls `dropEntered` (where the border lights) on
+/// validated drops only, so one verdict does both jobs.
+private struct MediaDropDelegate: DropDelegate {
+    let kind: MediaDropKind?
+    let limit: Int
+    @Binding var isTargeted: Bool
+    let onURLs: ([URL]) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        MediaDropValidation.accepts(MediaDropValidation.draggedFileURLs(),
+                                    carriesFileURLs: info.hasItemsConforming(to: [.fileURL]),
+                                    kind: kind, limit: limit)
+    }
+
+    func dropEntered(info: DropInfo) { isTargeted = true }
+    func dropExited(info: DropInfo) { isTargeted = false }
+
+    func performDrop(info: DropInfo) -> Bool {
+        isTargeted = false
+        return MediaDropLoader.load(info.itemProviders(for: [.fileURL]),
+                                    kind: kind, limit: limit, completion: onURLs)
+    }
+}
+
 private struct MediaDropModifier: ViewModifier {
     let kind: MediaDropKind?
     let limit: Int
@@ -203,15 +255,12 @@ private struct MediaDropModifier: ViewModifier {
             // and a drop there falls through to the ScrollView behind — which
             // is most of a section made of small rows.
             .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
-            // Typed rather than `[.fileURL]`: the extension check can only run
-            // once the providers have RESOLVED, by which point the drop has
-            // been accepted and animated in. Naming the types here is what
-            // bounces a file the pane has no use for, before it lights the
-            // border — the same thing the chat composer's drop does.
-            .onDrop(of: kind?.contentTypes ?? MediaDropKind.allContentTypes,
-                    isTargeted: $isTargeted) { providers in
-                MediaDropLoader.load(providers, kind: kind, limit: limit, completion: onURLs)
-            }
+            // `.fileURL` is what a file drag IS — see `MediaDropValidation`
+            // for why the kind's own UTTypes belong in the verdict rather than
+            // here.
+            .onDrop(of: [.fileURL],
+                    delegate: MediaDropDelegate(kind: kind, limit: limit,
+                                                isTargeted: $isTargeted, onURLs: onURLs))
             .overlay {
                 RoundedRectangle(cornerRadius: Self.cornerRadius)
                     .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))

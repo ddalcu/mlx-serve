@@ -1,5 +1,4 @@
 import XCTest
-import UniformTypeIdentifiers
 @testable import MLXCore
 
 /// The pure half of the Create panes' drag-and-drop: which files a drop keeps,
@@ -12,6 +11,13 @@ import UniformTypeIdentifiers
 final class MediaDropTests: XCTestCase {
 
     private func u(_ name: String) -> URL { URL(fileURLWithPath: "/tmp/drop/\(name)") }
+
+    /// The drag-time verdict on a readable drag — the case every drop from
+    /// Finder takes.
+    private func accepts(_ names: [String], kind: MediaDropKind?, limit: Int = 1) -> Bool {
+        MediaDropValidation.accepts(names.map(u), carriesFileURLs: true,
+                                    kind: kind, limit: limit)
+    }
 
     // MARK: - What a drop keeps
 
@@ -32,19 +38,102 @@ final class MediaDropTests: XCTestCase {
         XCTAssertEqual(MediaDrop.accepted(mixed, as: .image, limit: 0), [])
     }
 
-    /// The extension list and the drop target's own UTType filter are two
-    /// spellings of one allow-list: a file the picker opens must not bounce
-    /// off the target, and vice versa.
-    func testEveryAcceptedExtensionConformsToTheTypesTheTargetAdvertises() {
+    // MARK: - The verdict the drag itself gets
+
+    /// The whole point of validating: a file the pane cannot open is refused
+    /// while the drag is still in the air, so it never lights the border.
+    func testAFileThePaneCannotOpenIsRefusedBeforeItAnimatesIn() {
+        XCTAssertFalse(accepts(["notes.txt"], kind: .image))
+        XCTAssertFalse(accepts(["clip.mov"], kind: .image))
+        XCTAssertTrue(accepts(["a.png"], kind: .image))
+    }
+
+    /// One usable file in a mixed drop is enough to accept it — the rest are
+    /// dropped on the way in, which is what `accepted` above is for.
+    func testAMixedDropIsAcceptedWhenAnySingleFileFits() {
+        XCTAssertTrue(accepts(["notes.txt", "a.png"], kind: .image))
+        XCTAssertFalse(accepts(["notes.txt", "readme.md"], kind: .image))
+    }
+
+    /// The mixed target (H3 references) takes any of the three, and nothing
+    /// else.
+    func testTheMixedTargetTakesAnyOfTheThreeTypesAndNothingElse() {
+        for name in ["a.png", "b.mov", "c.wav"] {
+            XCTAssertTrue(accepts([name], kind: nil, limit: 12), name)
+        }
+        XCTAssertFalse(accepts(["notes.txt"], kind: nil, limit: 12))
+    }
+
+    /// A full slot bounces rather than swallowing the file with the accept
+    /// animation playing — the same `room` the target advertises.
+    func testAFullSlotIsRefusedWhateverIsBeingDragged() {
+        XCTAssertFalse(accepts(["a.png"], kind: .image, limit: 0))
+        XCTAssertFalse(MediaDropValidation.accepts([], carriesFileURLs: true,
+                                                   kind: .image, limit: 0))
+    }
+
+    /// A drag whose files we cannot read is NO INFORMATION: it is accepted and
+    /// filtered after the providers resolve, exactly as before. Bouncing
+    /// everything is the worse of the two failures — it is the one that makes
+    /// the pane look broken.
+    func testADragWeCannotReadFallsBackToFilteringAfterTheResolve() {
+        XCTAssertTrue(MediaDropValidation.accepts([], carriesFileURLs: true,
+                                                  kind: .image, limit: 1))
+        XCTAssertFalse(MediaDropValidation.accepts([], carriesFileURLs: false,
+                                                   kind: .image, limit: 1))
+    }
+
+    /// The verdict and the post-resolve filter are ONE allow-list: anything
+    /// `accepted` would keep must survive the gate in front of it, or the
+    /// picker opens a file its own drop target bounces.
+    func testEveryAcceptedExtensionAlsoPassesTheDragTimeVerdict() {
         for kind in [MediaDropKind.image, .video, .audio] {
             for ext in kind.extensions {
-                guard let type = UTType(filenameExtension: ext) else {
-                    return XCTFail("\(ext) has no UTType at all")
-                }
-                XCTAssertTrue(kind.contentTypes.contains { type.conforms(to: $0) },
-                              "\(ext) (\(type.identifier)) is accepted by \(kind) but its drop target would bounce it")
+                XCTAssertTrue(accepts(["f.\(ext)"], kind: kind),
+                              "\(ext) is accepted by \(kind) but its drop target would bounce it")
+                XCTAssertTrue(accepts(["f.\(ext)"], kind: nil),
+                              "\(ext) is accepted by \(kind) but the mixed target would bounce it")
             }
         }
+    }
+
+    /// The verdict is only as good as the read behind it: a file drag puts
+    /// `public.file-url` items on the pasteboard, and that is what the helper
+    /// has to turn back into paths (with anything that isn't a file — a URL
+    /// dragged out of a browser — left out of the count).
+    func testTheDragPasteboardReadRecoversTheDroppedFilesAndOnlyThose() throws {
+        let pasteboard = NSPasteboard(name: .init("com.mlxserve.tests.mediadrop"))
+        pasteboard.clearContents()
+        let file = NSPasteboardItem()
+        file.setString(u("a.png").absoluteString, forType: .fileURL)
+        let link = NSPasteboardItem()
+        link.setString("https://example.com/b.png", forType: .URL)
+        pasteboard.writeObjects([file, link])
+
+        let read = MediaDropValidation.draggedFileURLs(pasteboard)
+        XCTAssertEqual(read.map(\.lastPathComponent), ["a.png"])
+        XCTAssertTrue(MediaDropValidation.accepts(read, carriesFileURLs: true,
+                                                  kind: .image, limit: 1))
+    }
+
+    /// A Finder drag carries `public.file-url` and NOTHING else — the file's
+    /// own content type is not on the pasteboard — so a target registered for
+    /// `.image`/`.movie`/`.audio` is never offered the drag at all. That is
+    /// what made every Create pane stop accepting files; the type filtering it
+    /// was meant to buy lives in `validateDrop` instead.
+    func testTheDropTargetRegistersTheFileURLTypeAndRefusesBeforeTheHighlight() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/MediaDropTarget.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let body = source.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        XCTAssertTrue(body.contains(".onDrop(of: [.fileURL]"),
+                      "a Finder drag matches nothing but .fileURL")
+        XCTAssertTrue(body.contains("func validateDrop"),
+                      "without a synchronous verdict the type check can only run after the drop is accepted")
     }
 
     // MARK: - Where a dropped image lands on the Image pane

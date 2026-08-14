@@ -351,3 +351,46 @@ superseded by the field.
 
 Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
 history builders carry neither field nor legacy text, tolerant decode).
+
+## A typed `onDrop(of:)` never saw the Create panes' drops (2026-08-13)
+
+The media panes' shared drop target (`MediaDropTarget.swift`) shipped as
+`onDrop(of: [.fileURL])` with the type filtering done in the completion
+handler — after the providers had RESOLVED, which is after SwiftUI has
+accepted the drop and animated the file in. So a dropped `.txt` lit the
+dashed border, flew home, and nothing happened: the pane had already said
+yes to a file it then silently discarded.
+
+The obvious fix — name the kind's own UTTypes in `of:` (`.image` / `.movie` /
+`.audio`), the way the chat composer's drop reads — made it worse in the way
+that is hardest to argue with: the panes stopped accepting ANY file. A drag
+out of Finder puts `public.file-url` on the pasteboard and nothing else; the
+file's own content type is not there to match against. A target registered
+for `.image` is therefore never offered the drag, and no amount of correct
+filtering downstream matters. (The chat composer gets away with the typed
+list because its other source — an image dragged out of a browser — really is
+`public.png` DATA, and its fallback branch reads that with `NSImage`. It has
+never been the same question: the panes need a PATH on disk.)
+
+The two requirements are not in conflict, they just belong to different
+hooks. The target registers `.fileURL`, which is what a file drag actually
+is, and the refusal moves to `DropDelegate.validateDrop` — the one hook that
+answers while the drag is still in the air. It reads the drag pasteboard
+(`NSPasteboard(name: .drag)`, `.urlReadingFileURLsOnly`) and gets the real
+URLs synchronously, so the verdict is the pane's own extension allow-list
+rather than a UTType approximation of it: a `.tiff` the picker opens is
+accepted, a `.txt` bounces, and a full slot bounces too. `dropEntered` fires
+on validated drops only, so one verdict both refuses the file and decides
+whether the border lights.
+
+A drag the pasteboard tells us nothing about (`urls` empty while the drag
+still claims to carry files) is NO INFORMATION, not a refusal: it falls back
+to accepting and filtering after the resolve, which is exactly the old
+behaviour. Between the two failures, bouncing everything is the worse one —
+it is the one that makes the pane look broken.
+
+Guards: `MediaDropTests` (the verdict per kind and for the mixed H3 target,
+every allow-listed extension passing it, the full-slot and unreadable-drag
+cases, a real pasteboard round-trip proving the read recovers a
+`public.file-url` item and skips a web URL, and a source scan pinning
+`.onDrop(of: [.fileURL]` + `validateDrop` in the modifier).
