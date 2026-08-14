@@ -351,6 +351,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// the orphaned streaming bubble.
     private func appendErrorNotice(_ error: Error, to sessionId: UUID) {
         appState.updateLastMessage(in: sessionId, streaming: false)
+        // Before the notice row is appended, so a regeneration's pager lands on
+        // the partial reply and not on our own error card.
+        appState.finishRevisions(in: sessionId)
         var msg = ChatMessage(role: .assistant, content: "")
         msg.isStreaming = false
         msg.failedRetry = true
@@ -418,6 +421,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgressSessionId = nil
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.finishRevisions(in: sessionId)
         appState.saveChatHistory()
         publishTurnState()
     }
@@ -432,6 +436,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgress = nil
             mediaProgressSessionId = nil
         }
+        // The ONE exit both paths complete through. A regeneration's held seed
+        // is applied here rather than when the turn started, because on the
+        // agent path the reply it belongs to is the last of several appended
+        // from inside the Task — see AppState.pendingRevisionSeed.
+        appState.finishRevisions(in: sessionId)
+        appState.saveChatHistory()
         publishTurnState()
     }
 

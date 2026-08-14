@@ -779,6 +779,107 @@ class AppState: ObservableObject {
         }
     }
 
+    /// The version list a regeneration in flight will put on whatever reply it
+    /// produces, per session.
+    ///
+    /// Held rather than written straight onto a message because the message
+    /// does not exist yet. `runPlainTurn` appends its streaming placeholder
+    /// synchronously, so the gap there is one statement wide — but
+    /// `runAgentLoop` appends one per tool round from inside a Task, and the
+    /// reply the pager belongs to is the LAST of them. Writing at the start
+    /// landed the seed on the user's own message, where the role guard dropped
+    /// it, and the pager silently never appeared with Tools on.
+    private var pendingRevisionSeed: [UUID: [MessageRevision]] = [:]
+
+    /// Start a regeneration's revision list, carrying the reply being replaced.
+    ///
+    /// `regenerate` truncates the transcript back to the last user message, so
+    /// the old reply is destroyed before the new one streams. Capturing it here
+    /// is what makes the pager possible at all; `finishRevisions` applies it
+    /// when the turn ends.
+    func seedRevisions(in sessionId: UUID, from prior: ChatMessage) {
+        let priorRevision = MessageRevision(content: prior.content,
+                                            reasoningContent: prior.reasoningContent)
+        let seeded = MessageRevisions.seeding(prior: priorRevision, existing: prior.revisions)
+        // An empty seed is the "there was nothing worth stepping back to" case,
+        // and leaving a stale one behind would attach it to a later turn.
+        if seeded.isEmpty { pendingRevisionSeed.removeValue(forKey: sessionId) }
+        else { pendingRevisionSeed[sessionId] = seeded }
+    }
+
+    /// Apply any held seed to the reply this turn produced and record that
+    /// reply as the newest version. Called from turn EXITS only — a
+    /// per-iteration call inside the agent loop would land the pager on the
+    /// first tool round's bubble instead of on the answer.
+    ///
+    /// Targets the last ASSISTANT message rather than the last message: a turn
+    /// stopped mid-tool-execution ends on a `tool` row, and the reply above it
+    /// is still the one the pager belongs to.
+    func finishRevisions(in sessionId: UUID) {
+        let continuing = continuingSessions.remove(sessionId) != nil
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.lastIndex(where: { $0.role == .assistant })
+        else {
+            // Nothing to attach it to, and holding it would leak the seed onto
+            // an unrelated later turn.
+            pendingRevisionSeed.removeValue(forKey: sessionId)
+            return
+        }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        let seed = pendingRevisionSeed.removeValue(forKey: sessionId)
+        // A continuation is an in-place extension of the version being read,
+        // exactly like an edit — and for the same reason `applyingEdit` exists:
+        // stepping away and back reloads `content` from the stored revision, so
+        // an unsynced list silently discards the text the model just added.
+        if continuing {
+            guard !msg.revisions.isEmpty else { return }
+            chatSessions[sIdx].messages[mIdx].revisions =
+                MessageRevisions.applyingEdit(msg.content, to: msg.revisions, at: msg.activeRevision)
+            return
+        }
+        guard seed != nil || !msg.revisions.isEmpty else { return }
+        let finished = MessageRevision(content: msg.content, reasoningContent: msg.reasoningContent)
+        let result = MessageRevisions.finishing(seed: seed, existing: msg.revisions, finished: finished)
+        chatSessions[sIdx].messages[mIdx].revisions = result.revisions
+        chatSessions[sIdx].messages[mIdx].activeRevision = result.index
+    }
+
+    /// Rewrite the model's own reply in place.
+    ///
+    /// Unlike editing YOUR message — which drops everything after it and
+    /// resubmits, because the conversation past that point answered something
+    /// you no longer said — editing a reply changes only that reply. It is
+    /// putting words in the model's mouth: the turn already happened, and the
+    /// point is to steer what comes NEXT (Continue, or the following turn),
+    /// not to re-run it. Deleting the rest of the thread would take the choice
+    /// away; the messages after it are still there to delete by hand.
+    func editAssistantMessage(in sessionId: UUID, messageId: UUID, newText: String) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        chatSessions[sIdx].messages[mIdx].content = newText
+        chatSessions[sIdx].messages[mIdx].revisions =
+            MessageRevisions.applyingEdit(newText, to: msg.revisions, at: msg.activeRevision)
+        // The notice described the text that was there. It is not that text
+        // any more, and an edited reply is not a truncated one.
+        chatSessions[sIdx].messages[mIdx].truncationNotice = nil
+        chatSessions[sIdx].updatedAt = Date()
+    }
+
+    /// Show a different version of a reply. `content` is what every reader
+    /// uses, so switching writes the selected version into it.
+    func selectRevision(in sessionId: UUID, messageId: UUID, index: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        guard index >= 0, index < msg.revisions.count else { return }
+        chatSessions[sIdx].messages[mIdx].activeRevision = index
+        chatSessions[sIdx].messages[mIdx].content = msg.revisions[index].content
+        chatSessions[sIdx].messages[mIdx].reasoningContent = msg.revisions[index].reasoningContent
+    }
+
     func appendMessage(to sessionId: UUID, message: ChatMessage) {
         guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
         chatSessions[idx].messages.append(message)
@@ -810,7 +911,27 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
-    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, truncation: TruncationNotice.Notice? = nil) {
+    /// Drops every message from `count` onward, keeping only the first `count`.
+    /// Used by regenerate (drop the old user turn + reply so `runTurn` can
+    /// re-append a fresh copy) and by edit-and-resend (drop everything from
+    /// the edited message onward before resubmitting its new text).
+    func truncateMessages(in sessionId: UUID, keepingFirst count: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              count < chatSessions[sIdx].messages.count else { return }
+        chatSessions[sIdx].messages.removeSubrange(count...)
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
+    /// - Parameter addingCompletionTokens: the usage describes a SECOND
+    ///   generation into a message that already holds one (a continuation), so
+    ///   the completion count is added rather than replaced. `content` is
+    ///   appended here by construction, and a footnote reading "42 tokens"
+    ///   under a reply of 900 describes only the sentence that finished it.
+    ///   The prompt count and the rate stay the latest generation's: the prompt
+    ///   for a continuation already includes everything before it, and a rate
+    ///   is not a quantity to sum.
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, addingCompletionTokens: Bool = false, truncation: TruncationNotice.Notice? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
         let mIdx = chatSessions[sIdx].messages.count - 1

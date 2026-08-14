@@ -1984,6 +1984,12 @@ struct ChatDetailView: View {
         (session?.messages.isEmpty ?? true) && composerState != .generatingHere
     }
 
+    /// Which reply Cmd+R / the footer's Regenerate button targets — the
+    /// last assistant message, so the button only ever shows on that one.
+    private var lastAssistantMessageId: UUID? {
+        session?.messages.last { $0.role == .assistant }?.id
+    }
+
     /// Greeting + discovery chips, one fixed-height block. The vertical slack
     /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
     /// nested in here shares space unevenly with the body's own trailing one,
@@ -2052,7 +2058,52 @@ struct ChatDetailView: View {
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    })
+                                    },
+                                    // Both roles are editable, and they mean
+                                    // different things. Editing YOUR message
+                                    // is a re-ask: the turns after it answered
+                                    // something you no longer said, so they go
+                                    // and it resubmits. Editing the MODEL's is
+                                    // putting words in its mouth — that turn
+                                    // already happened, and the point is to
+                                    // steer what comes next (Continue, or the
+                                    // following turn), so nothing is dropped
+                                    // and nothing re-runs.
+                                    onEdit: session?.isExternalBridge == true ? nil : { newText in
+                                        if m.role == .user {
+                                            editAndResend(messageId: m.id, newText: newText)
+                                        } else {
+                                            appState.editAssistantMessage(in: sessionId,
+                                                                          messageId: m.id,
+                                                                          newText: newText)
+                                        }
+                                    },
+                                    onRegenerate: (m.role == .assistant && m.id == lastAssistantMessageId)
+                                        ? { regenerateLastResponse() }
+                                        : nil,
+                                    // Only the last message: a continuation
+                                    // streams into the END of the transcript,
+                                    // so offering it on an earlier reply would
+                                    // append the text to a different bubble.
+                                    onContinue: (m.id == session?.messages.last?.id && canContinue)
+                                        ? { continueReply() }
+                                        : nil,
+                                    onSelectRevision: { index in
+                                        appState.selectRevision(in: sessionId,
+                                                                messageId: m.id,
+                                                                index: index)
+                                    },
+                                    // Branch here. Offered on both roles and at
+                                    // any depth — unlike Continue and
+                                    // Regenerate, which act on the END of the
+                                    // transcript, a fork is a statement about
+                                    // this message. A task run or a bridge
+                                    // mirror can be branched INTO an ordinary
+                                    // chat, so no read-only gate: nothing about
+                                    // the source is changed.
+                                    onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
+                                        ? { appState.forkSession(sessionId, from: m.id) }
+                                        : nil)
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -2220,6 +2271,18 @@ struct ChatDetailView: View {
             // The top spacer's sibling — see the empty-state branch above.
             if isEmptyConversation { Spacer(minLength: 0) }
         }
+        // Cmd+R — regenerate the last reply. A zero-size hidden button rather
+        // than a window-level `.commands` entry: it needs THIS tab's session
+        // and toolbar state, and disabling it here (rather than graying out a
+        // menu item elsewhere) is what keeps it from firing mid-stream or on
+        // an empty chat.
+        .background(
+            Button(action: regenerateLastResponse) { EmptyView() }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(!canRegenerate)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+        )
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
@@ -3016,9 +3079,22 @@ struct ChatDetailView: View {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
-        // any) overrides what it declared. One builder, so no field is read from
-        // a global here — see ChatTurnEngine.TurnConfig.
+        chatEngine.runTurn(sessionId: sessionId, userText: text,
+                           images: attachedImages, audio: attachedAudio,
+                           config: buildTurnConfig(),
+                           approval: { await requestToolApproval($0) })
+        // Your own message always wins: sending from halfway up the history used
+        // to leave you exactly there, because auto-follow was off and nothing
+        // else scrolled.
+        applyScroll(.userSentMessage)
+    }
+
+    /// The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
+    /// any) overrides what it declared. One builder, so no field is read from
+    /// a global here — see ChatTurnEngine.TurnConfig. Shared by send, Cmd+R
+    /// regenerate, and edit-and-resend so all three run under identical
+    /// settings.
+    private func buildTurnConfig() -> ChatTurnEngine.TurnConfig {
         let resolved = appState.resolvedAgentSettings(
             agentId: session?.agentId,
             toolsEnabled: isAgentMode,
@@ -3028,15 +3104,98 @@ struct ChatDetailView: View {
             workingDirectory: session?.workingDirectory,
             disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []),
             reasoningEffort: reasoningEffort)
-        let config = ChatTurnEngine.TurnConfig.from(
+        return ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
-                           config: config,
+    }
+
+    /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
+    /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
+    /// the last user turn and resubmits it fresh.
+    private var canRegenerate: Bool {
+        server.status == .running && composerState != .generatingHere
+            && session?.isExternalBridge != true
+            && (session?.messages.contains { $0.role == .user } ?? false)
+    }
+
+    /// Whether the reply at the end of this transcript can be finished off.
+    private var canContinue: Bool {
+        ContinueReply.isEligible(session?.messages ?? [],
+                                 serverRunning: server.status == .running,
+                                 busy: composerState != .idle,
+                                 engine: server.chatModelInfo?.engine)
+    }
+
+    /// Hand the last reply back to the model to finish. Same turn config as a
+    /// send, so the continuation runs under the settings that produced it.
+    private func continueReply() {
+        guard canContinue else { return }
+        chatEngine.continueReply(sessionId: sessionId, config: buildTurnConfig())
+        // The text lands at the END of a reply already on screen, so follow it
+        // down the same way a fresh send does.
+        applyScroll(.userSentMessage)
+    }
+
+    /// ↑ / ↓ in the composer: bring back an earlier message of your own.
+    ///
+    /// The rule is `ComposerHistory`, which decides from the draft, the caret
+    /// position and where the walk currently sits — everything here does is
+    /// feed it this chat's history and write the answer back. Returning false
+    /// hands the key to AppKit, which is what makes the arrows still move the
+    /// caret inside a draft.
+    private func recallHistory(_ direction: ComposerHistory.Direction,
+                               caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
+        let entries = ComposerHistory.entries(session?.messages ?? [])
+        let action = direction == .up
+            ? ComposerHistory.up(draft: inputText, caretAtStart: caretAtStart,
+                                 walk: composerWalk, entries: entries)
+            : ComposerHistory.down(draft: inputText, caretAtEnd: caretAtEnd,
+                                   walk: composerWalk, entries: entries)
+        switch action {
+        case .pass:
+            return false
+        case .recall(let text, let walk):
+            inputText = text
+            composerWalk = walk
+            return true
+        }
+    }
+
+    /// Stop this chat's turn. The ONE call both the composer's stop disc and
+    /// Escape make — per-session, because other tabs may be generating and
+    /// neither control may reach across.
+    private func stopGeneration() {
+        chatEngine.stop(sessionId: sessionId)
+    }
+
+    private func regenerateLastResponse() {
+        guard canRegenerate else { return }
+        chatEngine.regenerate(sessionId: sessionId, config: buildTurnConfig(),
+                               approval: { await requestToolApproval($0) })
+        // Same rule as a fresh send: the reply you just asked for is the thing
+        // to be looking at, wherever in the history the request came from.
+        applyScroll(.userSentMessage)
+    }
+
+    /// Edit a past user message in place, then resend it: everything from
+    /// that message onward (its old reply, any tool chain) is dropped and the
+    /// edited text runs as a brand-new turn — the standard "edit and resend"
+    /// behaviour rather than silently rewriting history the model already
+    /// answered.
+    private func editAndResend(messageId: UUID, newText: String) {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let msgs = session?.messages,
+              let idx = msgs.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let images = msgs[idx].images
+        let audio = msgs[idx].audio
+        appState.truncateMessages(in: sessionId, keepingFirst: idx)
+        chatEngine.runTurn(sessionId: sessionId, userText: trimmed,
+                           images: images, audio: audio,
+                           config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
-        // Your own message always wins: sending from halfway up the history used
-        // to leave you exactly there, because auto-follow was off and nothing
-        // else scrolled.
+        // An edit is started from wherever that message sits, which is by
+        // definition not the bottom — follow the resend down to it.
         applyScroll(.userSentMessage)
     }
 
@@ -3242,8 +3401,32 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Edit this (user) message's text and resend it, dropping everything
+    /// that followed. nil for assistant messages and read-only surfaces —
+    /// same reasoning as `onDelete`.
+    var onEdit: ((String) -> Void)?
+    /// Regenerate this reply. Only ever set on the LAST assistant message —
+    /// the caller decides that, so the bubble itself doesn't need to know its
+    /// position in the transcript.
+    var onRegenerate: (() -> Void)?
+    /// Hand this reply back to the model to finish. Present only on the last
+    /// message, and only when it is continuable (`ContinueReply.isEligible`).
+    var onContinue: (() -> Void)?
+    /// Show a different generated version of this reply.
+    var onSelectRevision: ((Int) -> Void)?
+    /// Branch the conversation here: everything up to this message becomes a
+    /// new chat and this one is left alone. nil when there would be nothing to
+    /// fork (`ChatFork.isForkable`) or on a read-only surface.
+    var onFork: (() -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    @State private var isEditing = false
+    @State private var editDraft = ""
+    /// The edit field is the composer's field (`GrowingTextEditor`), so it
+    /// needs the composer's two bindings: where the caret is, and how tall the
+    /// text has grown.
+    @State private var editFocused = false
+    @State private var editHeight: CGFloat = 0
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -3331,7 +3514,15 @@ struct MessageBubble: View {
                 }
 
                 // Content.
-                if !message.content.isEmpty || message.isStreaming {
+                if isEditing, onEdit != nil {
+                    editingContent
+                } else if !message.content.isEmpty || message.isStreaming {
+                    // Only the USER gets a bubble (`isBare` below). An assistant
+                    // reply is the page's main content — long, formatted, full
+                    // of code blocks and tables — and boxing it wastes the
+                    // column's width and fights every block that wants the full
+                    // measure. A tool-call summary keeps its card so it still
+                    // reads as machinery, not prose.
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
@@ -3354,6 +3545,27 @@ struct MessageBubble: View {
                             GeneratingIndicator()
                         }
                     }
+                    // `.highPriorityGesture`, not `.onTapGesture` — the `Text`
+                    // above has `.textSelection(.enabled)`, which installs its
+                    // OWN double-click-to-select-word handling. A plain
+                    // `.onTapGesture(count: 2)` sits behind that in the
+                    // gesture hierarchy and never sees the second click, so
+                    // double-click silently did nothing. `highPriorityGesture`
+                    // makes this the one that wins.
+                    //
+                    // Which is exactly why the `onEdit` test is on the MODIFIER
+                    // and not inside the closure: a message with no edit action
+                    // (every assistant reply, every read-only surface) would
+                    // otherwise still install a winning gesture that beats
+                    // text selection and then does nothing — killing
+                    // double-click-to-select-a-word on the replies, which is
+                    // most of what anyone selects.
+                    // …and why the model's replies are excluded even though they
+                    // ARE editable now: the gesture wins over text selection,
+                    // and an assistant reply is prose people select words in.
+                    // Its edit is reached from the context menu instead.
+                    .modifier(DoubleClickToEdit(
+                        action: (onEdit == nil || message.role != .user) ? nil : { startEditing() }))
                     .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
                     .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
                     .background(bubbleBackground)
@@ -3389,10 +3601,94 @@ struct MessageBubble: View {
         }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
+            if onEdit != nil {
+                // Named for what it DOES: editing your own message re-asks the
+                // question, editing the model's rewrites what it said.
+                Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
+            }
+            if onRegenerate != nil {
+                Button("Regenerate") { onRegenerate?() }
+            }
+            if let onFork {
+                // Between the two destructive answers and Delete: a fork keeps
+                // BOTH branches, so it belongs next to the ones that don't.
+                Divider()
+                Button("Branch Chat From Here", action: onFork)
+            }
             if onDelete != nil {
                 Button("Delete Message", role: .destructive) { onDelete?() }
             }
         }
+    }
+
+    /// Replaces the static bubble while editing: a growing multi-line field
+    /// pre-filled with the message's current text, Cancel / Save beneath it.
+    /// Save hands the new text to `onEdit`, which drops this message and
+    /// everything after it and resubmits — same shape as a fresh send.
+    ///
+    /// It is the COMPOSER's field, not a `TextEditor`. Editing a message is a
+    /// send, so it answers the keyboard like one: Return submits, Shift+Return
+    /// breaks the line — `ComposerKey.onReturn` decides for both, and
+    /// `editCanSubmit` is the same gate that dims Save, so the key and the
+    /// button can never disagree about whether this draft can go.
+    private var editingContent: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            GrowingTextEditor(text: $editDraft,
+                              isFocused: $editFocused,
+                              measuredHeight: $editHeight,
+                              maxLines: 12,
+                              isIdle: ComposerKey.editCanSubmit(editDraft),
+                              onSend: { commitEdit() },
+                              // Belt and braces: the Cancel button's key
+                              // equivalent claims Escape first while this is up.
+                              onCancel: { cancelEdit(); return true })
+                .frame(height: max(ChatMetrics.composerMinHeight, editHeight))
+                .padding(8)
+                .background(Color(nsColor: .controlBackgroundColor)) // Distinct surface fill
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.accentColor.opacity(0.6), lineWidth: 1.5) // Glowing outline
+                )
+                .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
+
+            HStack(spacing: 8) {
+                Button("Cancel") { cancelEdit() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Save") { commitEdit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!ComposerKey.editCanSubmit(editDraft))
+            }
+            .font(.caption)
+        }
+        .padding(4)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func startEditing() {
+        editDraft = message.content
+        isEditing = true
+        // Put the caret in the field the edit just opened — otherwise Return
+        // is typed at whatever still holds focus (the composer below), which
+        // sends a NEW message instead of the edit.
+        editFocused = true
+    }
+
+    private func cancelEdit() {
+        isEditing = false
+        editFocused = false
+        editDraft = ""
+    }
+
+    private func commitEdit() {
+        guard ComposerKey.editCanSubmit(editDraft) else { return }
+        let text = editDraft
+        isEditing = false
+        editFocused = false
+        onEdit?(text)
     }
 
     // MARK: - Bubble vs bare
@@ -3433,8 +3729,56 @@ struct MessageBubble: View {
 
             Spacer(minLength: 8)
 
+            // Which version of this reply you are reading. Left of the actions
+            // because it is a statement about the text above it, not another
+            // thing to do to it — and it only exists once there is a choice.
+            if MessageRevisions.isPagerVisible(message.revisions) {
+                HStack(spacing: 1) {
+                    footerButton("chevron.left", help: "Previous version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: -1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
+                    Text(MessageRevisions.label(index: message.activeRevision,
+                                                count: message.revisions.count))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    footerButton("chevron.right", help: "Next version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: 1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoForward(index: message.activeRevision,
+                                                             count: message.revisions.count))
+                }
+            }
+
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                // The model's replies are editable but have no double-click
+                // route into it (that gesture belongs to selecting a word), so
+                // without this the only way in is a context menu nobody thinks
+                // to open on a paragraph.
+                if onEdit != nil, message.role == .assistant {
+                    footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
+                        startEditing()
+                    }
+                }
+                // Continue sits BEFORE regenerate: they are the two answers to
+                // "this reply isn't what I need", and the non-destructive one
+                // goes first — regenerate throws the reply away.
+                if let onContinue {
+                    footerButton("text.append",
+                                 help: message.truncationNotice != nil
+                                     ? "Finish this reply — it was cut short"
+                                     : "Keep writing from where this left off",
+                                 action: onContinue)
+                }
+                if let onRegenerate {
+                    footerButton("arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                 action: onRegenerate)
+                }
                 if let onDelete {
                     footerButton("trash", help: "Delete this message from the conversation",
                                  action: onDelete)

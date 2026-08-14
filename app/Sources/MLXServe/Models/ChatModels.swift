@@ -253,6 +253,12 @@ struct ChatMessage: Identifiable, Codable {
     // back to the model as history, and the old in-content banner taught it
     // the warning text. Absent forever on messages saved before the field.
     var truncationNotice: TruncationNotice.Notice? = nil
+    /// Every generated version of this reply, oldest first, populated only
+    /// once it has been regenerated at least once. `content` mirrors the
+    /// selected one — the transcript, the history builder and every existing
+    /// reader keep reading `content` and never learn this field exists.
+    var revisions: [MessageRevision] = []
+    var activeRevision: Int = 0
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -275,7 +281,7 @@ struct ChatMessage: Identifiable, Codable {
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
         case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
-        case errorNotice, media, truncationNotice
+        case errorNotice, media, truncationNotice, revisions, activeRevision
     }
 
     init(from decoder: Decoder) throws {
@@ -303,6 +309,10 @@ struct ChatMessage: Identifiable, Codable {
         errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
         // Tolerant: a cause this build doesn't know must not fail the message.
         truncationNotice = (try? c.decodeIfPresent(TruncationNotice.Notice.self, forKey: .truncationNotice)) ?? nil
+        // Tolerant, like every other optional here: a session written by an
+        // older build has neither key and decodes as an ordinary reply.
+        revisions = (try? c.decodeIfPresent([MessageRevision].self, forKey: .revisions)) ?? []
+        activeRevision = (try? c.decodeIfPresent(Int.self, forKey: .activeRevision)) ?? 0
     }
 }
 
