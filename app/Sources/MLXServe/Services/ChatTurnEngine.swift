@@ -518,10 +518,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func continueReply(sessionId: UUID, config: TurnConfig) {
         guard ContinueReply.isEligible(session(sessionId)?.messages ?? [],
                                        serverRunning: server.status == .running,
-                                       busy: composerState(for: sessionId) != .idle)
+                                       busy: composerState(for: sessionId) != .idle,
+                                       engine: server.chatModelInfo?.engine)
         else { return }
         stop(sessionId: sessionId)
         let token = ledger.begin(session: sessionId)
+        // AFTER stop, which is a turn exit and would consume the mark — the
+        // same ordering hazard `regenerate` has with its seed. It tells the
+        // turn exit to EXTEND the version being read rather than file the
+        // continuation as a new one.
+        appState.markContinuing(sessionId)
         publishTurnState()
         runPlainTurn(sessionId: sessionId, text: "", images: nil, audio: nil,
                      config: config, token: token, continuing: true)
@@ -650,7 +656,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     streamDelta(reasoning: text, coalescer: &coalescer, to: sessionId)
                 case .usage(let usage):
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, usage: usage)
+                    // A continuation streams into a message that already
+                    // carries a generation's worth of tokens, so the counts
+                    // ADD — the footnote describes the reply, and the reply is
+                    // both halves.
+                    appState.updateLastMessage(in: sessionId, usage: usage,
+                                               addingCompletionTokens: continuing)
                     setLiveTokens(usage.completionTokens, for: sessionId)   // reconcile to the authoritative count
                 case .toolCalls:
                     break

@@ -87,4 +87,84 @@ final class ContinueReplyTests: XCTestCase {
         failed.failedRetry = true
         XCTAssertFalse(ContinueReply.isEligible([user(), failed], serverRunning: true, busy: false))
     }
+
+    // MARK: - The engine has to be able to serve one
+
+    func testTheEmbeddedDs4EngineIsNotOfferedAContinuation() {
+        // ds4 renders its chat template INSIDE the engine, so there is nowhere
+        // to append the prefill and the server refuses by name. A live button
+        // over a guaranteed 400 is the dead-control class — the click buys an
+        // error card and nothing else.
+        XCTAssertFalse(ContinueReply.isEligible([user(), reply()], serverRunning: true,
+                                                busy: false, engine: .dsv4))
+    }
+
+    func testEveryOtherEngineRendersThroughOurOwnJinjaAndIsOffered() {
+        // MLX and the generic llama.cpp path both render here, where the
+        // prefill has somewhere to go — `encodeChatViaLlama` takes the flag.
+        for engine in [ServerEngine.mlx, .llama] {
+            XCTAssertTrue(ContinueReply.isEligible([user(), reply()], serverRunning: true,
+                                                   busy: false, engine: engine),
+                          "\(engine) renders through our Jinja and can serve a continuation")
+        }
+    }
+
+    func testAnUnknownEngineIsNotRefused() {
+        // nil is "no model info yet", which the serverRunning gate covers.
+        // Refusing on it would hide the button during every model switch.
+        XCTAssertTrue(ContinueReply.isEligible([user(), reply()], serverRunning: true,
+                                               busy: false, engine: nil))
+    }
+}
+
+/// A continuation streams into a message that already holds a finished
+/// generation, so everything the bubble reports about that message has to keep
+/// up with it. The text does by construction (`updateLastMessage` appends); the
+/// two things that describe it do not.
+final class ContinuedReplyBookkeepingTests: XCTestCase {
+
+    /// `usage` REPLACES the counts, so a 900-token reply finished by a 42-token
+    /// continuation reported 42 in its footnote. Same class as the truncation
+    /// notice the continuation already clears: the reply changed, and the data
+    /// describing the reply has to change with it.
+    func testTheFootnoteCountsBothHalvesOfAContinuedReply() throws {
+        let source = SourceScan.source("AppState.swift", from: #filePath)
+        let body = try XCTUnwrap(
+            SourceScan.declarationBody(from: "func updateLastMessage", in: source),
+            "updateLastMessage moved — repoint this scan")
+        XCTAssertTrue(body.contains("addingCompletionTokens"), """
+            updateLastMessage overwrites completionTokens unconditionally, so a \
+            continued reply reports only the tokens of the sentence that \
+            finished it.
+            """)
+    }
+
+    /// The flag is only correct on the path that knows it is continuing — the
+    /// agent loop never serves one, and a blanket `true` would double-count an
+    /// ordinary turn's retry.
+    func testTheAccumulationIsDrivenByThePlainTurnsOwnContinuingFlag() throws {
+        let source = SourceScan.source("Services/ChatTurnEngine.swift", from: #filePath)
+        XCTAssertTrue(source.contains("addingCompletionTokens: continuing"), """
+            the usage write must read runPlainTurn's own `continuing` flag — a \
+            literal there is either a permanent double-count or a permanent \
+            reset.
+            """)
+        XCTAssertEqual(SourceScan.count("addingCompletionTokens:", in: source), 1, """
+            exactly one usage site accumulates: the plain-chat stream. The agent \
+            loop appends a fresh placeholder per tool round and never serves a \
+            continuation.
+            """)
+    }
+
+    /// The notice describes a reply that was cut. It is being un-cut.
+    func testAContinuationClearsTheTruncationNotice() throws {
+        let source = SourceScan.source("Services/ChatTurnEngine.swift", from: #filePath)
+        let body = try XCTUnwrap(
+            SourceScan.declarationBody(from: "func runPlainTurn", in: source),
+            "runPlainTurn moved — repoint this scan")
+        XCTAssertTrue(body.contains("clearTruncationNotice"), """
+            a continued reply keeps "Stopped — hit the output limit" under a \
+            paragraph that carried on.
+            """)
+    }
 }

@@ -3166,7 +3166,8 @@ struct ChatDetailView: View {
     private var canContinue: Bool {
         ContinueReply.isEligible(session?.messages ?? [],
                                  serverRunning: server.status == .running,
-                                 busy: composerState != .idle)
+                                 busy: composerState != .idle,
+                                 engine: server.chatModelInfo?.engine)
     }
 
     /// Hand the last reply back to the model to finish. Same turn config as a

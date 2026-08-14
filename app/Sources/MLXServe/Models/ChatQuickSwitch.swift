@@ -141,9 +141,19 @@ enum ChatQuickSwitch {
 /// message that would be the wrong target — caught as a disabled button rather
 /// than discovered as text landing in the wrong bubble.
 enum ContinueReply {
+    /// - Parameter engine: which backend is serving the model. The embedded
+    ///   ds4 engine renders its chat template INSIDE the engine, where there is
+    ///   nowhere to append a prefill, so the server refuses a continuation
+    ///   there by name (`continuationRejectReason`). Offering the button anyway
+    ///   spends a click to earn a 400 rendered as an error card — the
+    ///   dead-control class, and the same rule as a locked composer disc: never
+    ///   offer what the resolver will refuse. `nil` is "no model info yet",
+    ///   which the `serverRunning` gate already covers.
     static func isEligible(_ messages: [ChatMessage],
                            serverRunning: Bool,
-                           busy: Bool) -> Bool {
+                           busy: Bool,
+                           engine: ServerEngine? = nil) -> Bool {
+        guard engine != .dsv4 else { return false }
         guard serverRunning, !busy, let last = messages.last else { return false }
         guard last.role == .assistant else { return false }
         // Already being written.

@@ -1830,6 +1830,15 @@ fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commi
     return "";
 }
 
+/// Whether this conversation SHAPE is a continuation: it ends with an
+/// assistant message carrying prose. The one predicate every surface asks, so
+/// "what counts as continuable" cannot differ between the endpoint that
+/// implies it and the endpoint that takes a flag — and so the answer matches
+/// what `continuationPrefill` will actually do with it.
+pub fn continuationRequested(messages: []const Message) bool {
+    return continuationPrefill(messages, true) != null;
+}
+
 /// The partial assistant reply a continuation request is asking to extend, or
 /// null when this is an ordinary turn.
 ///
@@ -1842,15 +1851,6 @@ fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commi
 /// differently than the same text does mid-reply. (Anthropic's API rejects such
 /// a prefill outright; trimming keeps the request serviceable, and only the
 /// PROMPT is trimmed — the stored reply keeps its whitespace.)
-/// Whether this conversation SHAPE is a continuation: it ends with an
-/// assistant message carrying prose. The one predicate every surface asks, so
-/// "what counts as continuable" cannot differ between the endpoint that
-/// implies it and the endpoint that takes a flag — and so the answer matches
-/// what `continuationPrefill` will actually do with it.
-pub fn continuationRequested(messages: []const Message) bool {
-    return continuationPrefill(messages, true) != null;
-}
-
 fn continuationPrefill(messages: []const Message, continue_final: bool) ?[]const u8 {
     if (!continue_final or messages.len == 0) return null;
     const last = messages[messages.len - 1];

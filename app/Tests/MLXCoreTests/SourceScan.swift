@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 
 /// Shared machinery for the source-scan guards.
 ///
@@ -12,6 +13,14 @@ enum SourceScan {
 
     /// Replace comments with spaces, leaving string literals — and every
     /// offset — intact.
+    ///
+    /// Two Swift constructs it deliberately does not model, because nothing in
+    /// this target uses them near a scanned needle: NESTED block comments
+    /// (`/* /* */ */` — legal Swift, and this ends the outer one at the first
+    /// `*/`) and multi-line `"""` literals (each `"` flips the string state, so
+    /// a delimiter's three quotes leave it flipped). If a scan ever starts
+    /// failing for a reason that has nothing to do with what it checks, look
+    /// here first.
     static func strippingComments(_ source: String) -> String {
         var out = ""
         out.reserveCapacity(source.count)
@@ -67,11 +76,25 @@ enum SourceScan {
 
     /// A file under `app/Sources/MLXServe`, comments stripped. `file` is the
     /// path relative to that root.
-    static func source(_ file: String, from testFilePath: String) -> String {
+    ///
+    /// An unreadable path FAILS rather than returning empty. A scan whose
+    /// source is `""` still passes every "this needle appears zero times"
+    /// assertion — so a renamed or moved file would turn a guard into a
+    /// permanent green tick, which is the one failure mode a source scan
+    /// cannot afford (same reason `declarationBody` returns the rest of the
+    /// file instead of nothing when it finds no close).
+    static func source(_ file: String, from testFilePath: String,
+                       line: UInt = #line) -> String {
         let url = URL(fileURLWithPath: testFilePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/MLXServe/\(file)")
-        return strippingComments((try? String(contentsOf: url, encoding: .utf8)) ?? "")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            XCTFail("source scan could not read \(file) at \(url.path) — the file "
+                    + "moved or was renamed, and an empty source passes every "
+                    + "zero-count assertion silently", line: line)
+            return ""
+        }
+        return strippingComments(text)
     }
 }

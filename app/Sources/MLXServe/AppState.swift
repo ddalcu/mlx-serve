@@ -857,6 +857,27 @@ class AppState: ObservableObject {
         else { pendingRevisionSeed[sessionId] = seeded }
     }
 
+    /// Sessions whose in-flight turn EXTENDS the reply already at the end of
+    /// the transcript instead of producing a new one.
+    ///
+    /// The pager counts REGENERATIONS — answers to the same question — and a
+    /// continuation is not one of those: it is the reply you are reading,
+    /// carrying on. Without this marker `finishRevisions` reached
+    /// `MessageRevisions.committing` and filed the extended text as a new
+    /// version, so a reply that had been regenerated once went to 3/3 the
+    /// moment you finished it, and stepping back to 2/3 showed the same reply
+    /// with the ending removed. Same shape as `pendingRevisionSeed`: the turn
+    /// exit is the only place that knows the turn is over, so the fact has to
+    /// be held from the moment the continuation is asked for.
+    private var continuingSessions: Set<UUID> = []
+
+    /// Declare this session's next turn a continuation. Must be called AFTER
+    /// `stop(sessionId:)` — stop is a turn exit, and a mark placed before it
+    /// would be consumed immediately (the `seedRevisions` ordering hazard).
+    func markContinuing(_ sessionId: UUID) {
+        continuingSessions.insert(sessionId)
+    }
+
     /// Apply any held seed to the reply this turn produced and record that
     /// reply as the newest version. Called from turn EXITS only — a
     /// per-iteration call inside the agent loop would land the pager on the
@@ -866,6 +887,7 @@ class AppState: ObservableObject {
     /// stopped mid-tool-execution ends on a `tool` row, and the reply above it
     /// is still the one the pager belongs to.
     func finishRevisions(in sessionId: UUID) {
+        let continuing = continuingSessions.remove(sessionId) != nil
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               let mIdx = chatSessions[sIdx].messages.lastIndex(where: { $0.role == .assistant })
         else {
@@ -876,6 +898,16 @@ class AppState: ObservableObject {
         }
         let msg = chatSessions[sIdx].messages[mIdx]
         let seed = pendingRevisionSeed.removeValue(forKey: sessionId)
+        // A continuation is an in-place extension of the version being read,
+        // exactly like an edit — and for the same reason `applyingEdit` exists:
+        // stepping away and back reloads `content` from the stored revision, so
+        // an unsynced list silently discards the text the model just added.
+        if continuing {
+            guard !msg.revisions.isEmpty else { return }
+            chatSessions[sIdx].messages[mIdx].revisions =
+                MessageRevisions.applyingEdit(msg.content, to: msg.revisions, at: msg.activeRevision)
+            return
+        }
         guard seed != nil || !msg.revisions.isEmpty else { return }
         let finished = MessageRevision(content: msg.content, reasoningContent: msg.reasoningContent)
         let result = MessageRevisions.finishing(seed: seed, existing: msg.revisions, finished: finished)
@@ -973,7 +1005,15 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
-    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, truncation: TruncationNotice.Notice? = nil) {
+    /// - Parameter addingCompletionTokens: the usage describes a SECOND
+    ///   generation into a message that already holds one (a continuation), so
+    ///   the completion count is added rather than replaced. `content` is
+    ///   appended here by construction, and a footnote reading "42 tokens"
+    ///   under a reply of 900 describes only the sentence that finished it.
+    ///   The prompt count and the rate stay the latest generation's: the prompt
+    ///   for a continuation already includes everything before it, and a rate
+    ///   is not a quantity to sum.
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, addingCompletionTokens: Bool = false, truncation: TruncationNotice.Notice? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
         let mIdx = chatSessions[sIdx].messages.count - 1
@@ -981,7 +1021,9 @@ class AppState: ObservableObject {
         if let truncation { chatSessions[sIdx].messages[mIdx].truncationNotice = truncation }
         if let usage {
             chatSessions[sIdx].messages[mIdx].promptTokens = usage.promptTokens
-            chatSessions[sIdx].messages[mIdx].completionTokens = usage.completionTokens
+            chatSessions[sIdx].messages[mIdx].completionTokens = addingCompletionTokens
+                ? (chatSessions[sIdx].messages[mIdx].completionTokens ?? 0) + usage.completionTokens
+                : usage.completionTokens
             chatSessions[sIdx].messages[mIdx].tokensPerSecond = usage.tokensPerSecond
         }
         if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }

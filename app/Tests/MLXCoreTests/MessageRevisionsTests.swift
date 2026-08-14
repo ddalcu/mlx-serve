@@ -177,6 +177,47 @@ final class RegenerationSeedWiringTests: XCTestCase {
             """)
     }
 
+    /// A continuation is not a regeneration, and the turn exit is the only
+    /// place that can tell them apart.
+    ///
+    /// The pager counts ANSWERS to the same question. A continuation is the
+    /// answer you are reading, carrying on — so it must sync into the version
+    /// being read (`applyingEdit`) rather than reach `committing`, which filed
+    /// it as a new version: a reply regenerated once went to 3/3 the moment you
+    /// finished it, and 2/3 was then the same reply with its ending removed.
+    func testAContinuationExtendsTheVersionBeingReadRatherThanAddingOne() throws {
+        let source = SourceScan.source("AppState.swift", from: #filePath)
+        let body = try XCTUnwrap(
+            SourceScan.declarationBody(from: "func finishRevisions", in: source),
+            "finishRevisions moved — repoint this scan")
+        XCTAssertTrue(body.contains("continuingSessions.remove("), """
+            finishRevisions no longer consumes the continuation mark, so a \
+            continuation is filed as a new version of the reply it extended.
+            """)
+        XCTAssertTrue(body.contains("MessageRevisions.applyingEdit("), """
+            the continuation branch must sync the extended text into the active \
+            revision — exactly what an in-place edit does, and for the same \
+            reason: stepping away and back reloads content from the revision.
+            """)
+    }
+
+    /// The mark has the same ordering hazard as the seed, and it is invisible:
+    /// placed before `stop`, the turn exit inside stop consumes it and the
+    /// continuation files itself as a new version anyway.
+    func testTheContinuationMarkIsSetAfterTheTurnItSupersedesHasStopped() throws {
+        let source = SourceScan.source("Services/ChatTurnEngine.swift", from: #filePath)
+        let body = try XCTUnwrap(
+            SourceScan.declarationBody(from: "func continueReply", in: source),
+            "continueReply moved — repoint this scan")
+        let stopAt = try XCTUnwrap(body.range(of: "stop(sessionId: sessionId)")?.upperBound,
+                                   "continueReply no longer supersedes the running turn")
+        XCTAssertTrue(body[stopAt...].contains("appState.markContinuing("), """
+            markContinuing must come AFTER stop(sessionId:) — stop is a turn \
+            exit, so a mark placed before it is consumed immediately and the \
+            continuation is recorded as a new version.
+            """)
+    }
+
     /// Every turn EXIT applies it, and nothing else does. A per-iteration call
     /// inside the agent loop would land the pager on the first tool round's
     /// bubble rather than on the answer.
