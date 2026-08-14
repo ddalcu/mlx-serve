@@ -4393,6 +4393,46 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
+/// `continue_final_message`: extend the trailing assistant message instead of
+/// answering after it. vLLM's spelling, because a client that already knows how
+/// to ask another local server for this should not have to learn a second name.
+///
+/// The flag alone is not enough — the conversation has to BE continuable
+/// (`chat_mod.continuationRequested`). A flag set on a user-final request is
+/// ignored rather than 400'd: the request is perfectly answerable as an
+/// ordinary turn, and refusing it would break the obvious client that sets the
+/// field once for the whole session.
+fn continueFinalMessageRequested(root: std.json.ObjectMap, messages: []const chat_mod.Message) bool {
+    const v = root.get("continue_final_message") orelse return false;
+    if (v != .bool or !v.bool) return false;
+    return chat_mod.continuationRequested(messages);
+}
+
+/// Why this model cannot serve a continuation, or null when it can.
+///
+/// ds4 renders through the embedded engine's OWN template, which lives inside
+/// the engine and is unreachable from this process — there is nowhere to append
+/// the partial reply, so a continuation there would silently render it as
+/// history and open a second assistant turn.
+///
+/// ONE predicate, consulted by BOTH surfaces before they render, so a model
+/// that cannot serve one is never handed to `cachedFormatChat`'s backstop —
+/// which returns an error no handler can turn into a response, and therefore
+/// hangs up the socket with no status line at all. What the two surfaces do
+/// with the answer differs, and must: the OpenAI surface was ASKED and gets a
+/// named 400, while `/v1/messages` infers the request from the message list and
+/// falls back to an ordinary turn — refusing a request the client never made
+/// would break every Anthropic SDK caller on an embedded-engine model.
+fn continuationRejectReason(embedded_engine: bool) ?[]const u8 {
+    if (embedded_engine) {
+        return "continue_final_message is not supported by this model: its chat " ++
+            "template is rendered inside the embedded GGUF engine, so there is " ++
+            "nowhere to append the partial reply. Send the partial text as the " ++
+            "end of your prompt instead.";
+    }
+    return null;
+}
+
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -4921,8 +4961,20 @@ fn handleChatCompletions(
     // Phase 4 instrumentation + Iteration 2 cache: time the render+tokenize
     // step. The cache is engine-agnostic — same hit even when the
     // underlying call is ds4 / llama / MLX formatChat.
+    // Continuation is EXPLICIT on this surface (`continue_final_message`, the
+    // spelling vLLM uses). It cannot be implied by a trailing assistant
+    // message the way /v1/messages implies it: agent frameworks legitimately
+    // POST assistant-last history here and expect a fresh turn, and turning
+    // that into a prefill would change what every one of them gets back.
+    // Asked for by name, so a model that cannot serve it is refused by name.
+    const continue_final = continueFinalMessageRequested(root, messages.items);
+    if (continue_final) if (continuationRejectReason(lm.ds4_engine != null)) |reason| {
+        log.warn("  -> 400 (continuation unsupported by the embedded engine)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    };
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
     const tokenize_ns = tokenize_sw.read();
 
     // Run vision encoder if any messages contain images. Phase A8: each
@@ -7959,6 +8011,56 @@ test "the route-existence 404 is answered BEFORE the model is resolved" {
     try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
 }
 
+test "continuationRejectReason names the embedded engine, and only it" {
+    // An MLX checkpoint renders through our own Jinja, so the prefill has
+    // somewhere to go.
+    try std.testing.expect(continuationRejectReason(false) == null);
+    // ds4 does not, and the refusal has to SAY so — the reason is what a
+    // client reads instead of the answer it asked for.
+    const reason = continuationRejectReason(true) orelse return error.NoReason;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "continue_final_message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "embedded GGUF engine") != null);
+}
+
+test "every continuation surface consults continuationRejectReason before rendering" {
+    // `cachedFormatChat`'s guard returns an error, and an error at that depth
+    // reaches no handler that can turn it into a response: it unwinds to
+    // `handleConnectionThread`, which logs it and closes the socket. The client
+    // gets a dropped connection with no status line — and on `/v1/messages`,
+    // where a continuation is INFERRED from the message list, that happened
+    // with no client opt-in at all on every ds4 model.
+    //
+    // So the predicate is the gate and the error is the backstop: each surface
+    // that computes a `continue_final` must consult it in the same statement or
+    // just after, and this scan is what keeps a third surface from wiring the
+    // flag straight into the render.
+    // Needles are split so this test's own source cannot match them — it sits
+    // in the file it greps, and an unsplit literal is found here first.
+    const src = @embedFile("server.zig");
+    const predicate = "continuationRejectReason" ++ "(";
+
+    // Both computations of `continue_final`, each followed by the gate before
+    // the next one starts.
+    const binding = "const continue_final " ++ "= ";
+    const explicit = binding ++ "continueFinalMessageRequested" ++ "(";
+    const implicit = binding ++ "chat_mod.continuationRequested" ++ "(";
+    const explicit_at = std.mem.indexOf(u8, src, explicit) orelse return error.ExplicitSurfaceMissing;
+    const implicit_at = std.mem.indexOf(u8, src, implicit) orelse return error.ImplicitSurfaceMissing;
+    // Within the ~40 lines after each, the predicate must appear.
+    const window = 1600;
+    for ([_]usize{ explicit_at, implicit_at }) |at| {
+        const end = @min(src.len, at + window);
+        if (std.mem.indexOf(u8, src[at..end], predicate) == null) return error.SurfaceSkipsThePredicate;
+    }
+
+    // Exactly two computations — a third `continue_final` binding is a third
+    // surface, and it has to come with its own gate rather than inherit one.
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, binding)) |at| : (i = at + binding.len) count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
 test "routeExists answers endpoint existence without consulting the model" {
     // Whether a path EXISTS has nothing to do with which models are loaded, but
     // model resolution runs ahead of dispatch — so on a headless boot (`--serve
@@ -8349,10 +8451,12 @@ fn cachedFormatChat(
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
     reasoning_effort: ?[]const u8,
+    /// Extend the trailing assistant message rather than answering after it.
+    continue_final: bool,
 ) ![]u32 {
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
     const key_opt: ?u64 = if (cache_ptr != null)
-        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
     else
         null;
     if (cache_ptr) |cache| if (key_opt) |key| {
@@ -8360,12 +8464,21 @@ fn cachedFormatChat(
     };
     // ds4 renders through the GGUF engine's own template, which never reads
     // the effort string — only the Jinja paths thread it.
+    // Backstop only. Both surfaces consult `continuationRejectReason` before
+    // they get here, because an error returned from this depth reaches no
+    // handler that can answer it — it unwinds to `handleConnectionThread`,
+    // which logs and closes the socket, so the client sees a dropped
+    // connection instead of a status line. A NEW surface that wires
+    // continuation without asking first gets that ugly failure rather than a
+    // silently doubled assistant turn; the scan below is what stops it
+    // shipping.
+    if (continue_final and lm.ds4_engine != null) return error.ContinuationUnsupported;
     const ids = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort)
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
     else
-        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort);
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -10225,10 +10338,21 @@ fn handleAnthropicMessages(
     // `effective_tools_json` swap (`null` when has_tools is false) keeps
     // the cache key consistent with what the encoder actually sees.
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
+    // Anthropic's own contract: a conversation ending in an assistant message
+    // means "continue this", with no flag. Implicit here and explicit on the
+    // OpenAI surface is not an inconsistency — it is each surface's documented
+    // behaviour, so an Anthropic SDK client gets prefill for free.
+    //
+    // And because it is INFERRED, a model that cannot serve one gets an
+    // ordinary turn rather than a 400: the client never asked for a
+    // continuation, so refusing its request would take away an answer this
+    // endpoint has always given.
+    const continue_final = chat_mod.continuationRequested(messages.items) and
+        continuationRejectReason(lm.ds4_engine != null) == null;
     var tokenize_sw = Stopwatch.init(stream.io);
     // Anthropic's thinking opt-in is a budget object — it carries no
     // OpenAI-style effort string, so dsv4 templates get their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, null);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, null, continue_final);
     const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
@@ -11772,7 +11896,7 @@ fn handleResponses(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
     const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──

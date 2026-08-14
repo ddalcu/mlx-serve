@@ -313,8 +313,10 @@ pub fn formatChat(
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
     effort: ?[]const u8,
+    /// Extend the trailing assistant message instead of answering after it.
+    continue_final: bool,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
 
@@ -475,8 +477,10 @@ pub fn encodeChatViaLlama(
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
     effort: ?[]const u8,
+    /// Extend the trailing assistant message instead of answering after it.
+    continue_final: bool,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
     const i32_ids = try engine.tokenizeText(allocator, rendered, false);
@@ -518,9 +522,24 @@ fn renderChatTemplate(
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
     effort: ?[]const u8,
+    /// Extend the trailing assistant message instead of answering after it —
+    /// the prompt ends mid-turn and generation resumes from its last word.
+    continue_final: bool,
 ) ![]const u8 {
+    // Split the partial reply off FIRST, so every transform below (tool
+    // fallback synthesis, muse's reasoning drop) sees exactly the message list
+    // an ordinary turn would have. The template must open the assistant turn
+    // once, which it only does when the trailing assistant is not in `messages`.
+    const prefill = continuationPrefill(messages, continue_final);
+    const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
+
     if (chat_config.chat_template.len == 0) {
-        return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+        const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+        if (prefill) |partial| {
+            defer allocator.free(base);
+            return std.mem.concat(allocator, u8, &.{ base, partial });
+        }
+        return base;
     }
 
     // Some chat templates (e.g. DeepSeek V4) don't reference `tools` or `role == 'tool'`
@@ -531,11 +550,11 @@ fn renderChatTemplate(
     const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
     const tpl_has_tool_role = templateReferencesToolRole(tpl);
     const needs_inject_tools = tools_json != null and !tpl_has_tools;
-    const needs_rewrite_tool_role = !tpl_has_tool_role and messagesHaveToolContent(messages);
+    const needs_rewrite_tool_role = !tpl_has_tool_role and messagesHaveToolContent(msgs);
 
     var fallback_arena: ?std.heap.ArenaAllocator = null;
     defer if (fallback_arena) |*a| a.deinit();
-    var effective_messages = messages;
+    var effective_messages = msgs;
     var effective_tools_json = tools_json;
     // Optional keys a template may dump blindly (see fillOptionalToolDefKeys).
     // Arena-owned, so the rewritten bytes outlive the render with no free path
@@ -554,7 +573,7 @@ fn renderChatTemplate(
         const arena_alloc = fallback_arena.?.allocator();
         effective_messages = try synthesizeToolFallbackMessages(
             arena_alloc,
-            messages,
+            msgs,
             tools_json,
             tool_choice_instruction,
             needs_inject_tools,
@@ -614,6 +633,16 @@ fn renderChatTemplate(
     if (result_ptr) |ptr| {
         defer jinja_c.jinja_str_free(ptr);
         const collapsed = try collapseDoubledThinkTags(allocator, std.mem.span(ptr));
+        // A continuation commits the content channel and then hands the model
+        // its own unfinished sentence. It runs INSTEAD of the thinking-off
+        // tail, never beside it — both append the same channel commit, and
+        // twice is a malformed turn header.
+        if (prefill) |partial| {
+            defer allocator.free(collapsed);
+            return std.mem.concat(allocator, u8, &.{
+                collapsed, contentChannelTail(tpl, collapsed, true), partial,
+            });
+        }
         if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
@@ -629,7 +658,12 @@ fn renderChatTemplate(
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
     }
-    return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    if (prefill) |partial| {
+        defer allocator.free(base);
+        return std.mem.concat(allocator, u8, &.{ base, partial });
+    }
+    return base;
 }
 
 /// Null `reasoning_content` on assistant messages BEFORE the last user
@@ -1863,13 +1897,64 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
 ///     match; no tools gate — tool calls ride outside the think block.
 fn noThinkTailSuffix(tpl: []const u8, rendered: []const u8, enable_thinking: bool, has_tools: bool) ?[]const u8 {
     if (enable_thinking) return null;
-    if (!has_tools and std.mem.indexOf(u8, tpl, "reasoning_strength") != null and
+    const tail = contentChannelTail(tpl, rendered, !has_tools);
+    return if (tail.len > 0) tail else null;
+}
+
+/// What must be appended to a rendered prompt so generation resumes in the
+/// assistant's VISIBLE CONTENT channel rather than inside a reasoning block.
+///
+/// Two callers, one rule, deliberately: thinking-off enforces the content
+/// channel so no reasoning pass runs, and a CONTINUATION needs the same thing
+/// for a different reason — the partial text is prose the user has already
+/// read, so a prompt that lands inside a think block would return the rest of
+/// their answer as reasoning. Written twice, the muse and LFM2.5 cases would
+/// drift apart the first time a third family joined.
+///
+/// `allow_channel_commit` is thinking-off's extra gate: with tools present it
+/// declines to commit muse's `to=user`, since that would forbid the tool call
+/// the model may be about to make. A continuation always passes true — it is
+/// resuming prose by construction.
+fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commit: bool) []const u8 {
+    if (allow_channel_commit and std.mem.indexOf(u8, tpl, "reasoning_strength") != null and
         std.mem.endsWith(u8, rendered, "<|start|>assistant"))
     {
         return " to=user<|message|>";
     }
     if (promptTailOpensThink(rendered[rendered.len -| 64 ..])) return "</think>";
-    return null;
+    return "";
+}
+
+/// Whether this conversation SHAPE is a continuation: it ends with an
+/// assistant message carrying prose. The one predicate every surface asks, so
+/// "what counts as continuable" cannot differ between the endpoint that
+/// implies it and the endpoint that takes a flag — and so the answer matches
+/// what `continuationPrefill` will actually do with it.
+pub fn continuationRequested(messages: []const Message) bool {
+    return continuationPrefill(messages, true) != null;
+}
+
+/// The partial assistant reply a continuation request is asking to extend, or
+/// null when this is an ordinary turn.
+///
+/// The flag describes the SHAPE of the request, so a client that sets it on a
+/// conversation not ending in an assistant message gets an ordinary turn —
+/// never the user's own words committed into the assistant's mouth.
+///
+/// The prefill is trimmed of trailing whitespace: a tokenizer merges a trailing
+/// space into the word that follows, so a prompt ending in one tokenizes
+/// differently than the same text does mid-reply. (Anthropic's API rejects such
+/// a prefill outright; trimming keeps the request serviceable, and only the
+/// PROMPT is trimmed — the stored reply keeps its whitespace.)
+fn continuationPrefill(messages: []const Message, continue_final: bool) ?[]const u8 {
+    if (!continue_final or messages.len == 0) return null;
+    const last = messages[messages.len - 1];
+    if (!std.mem.eql(u8, last.role, "assistant")) return null;
+    // A reply that ended in a tool call has no prose to resume — splicing a
+    // continuation onto it would re-run the parse chain over half a call.
+    if (last.tool_calls != null) return null;
+    const trimmed = std.mem.trimEnd(u8, last.content, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
 }
 
 /// Split model output into reasoning_content and content.
@@ -8146,7 +8231,7 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
         // Verbatim shape from the live failure: hide-cursor ANSI code + prompt UI.
         .{ .role = "tool", .content = "\x1b[?25l\u{2502}\n\u{25c6}  Which template would you like?", .tool_call_id = "tc_0" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
     defer allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "<|tool_response>") != null);
@@ -8189,7 +8274,7 @@ test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(
         .{ .role = "user", .content = "write it" },
         .{ .role = "assistant", .content = "", .tool_calls = &tc },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
     defer allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "<user:opensource>write it") != null);
@@ -8241,7 +8326,7 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
 
     // Thinking ON: generation prompt must end inside a think block.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "hy_begin_of_sentence:opensource") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "hy_User:opensource") != null);
@@ -8257,7 +8342,7 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
     }
     // Thinking OFF (reasoning_effort no_think): think opened AND closed.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expect(!promptTailOpensThink(rendered));
         try testing.expect(std.mem.indexOf(u8, rendered, "<think:opensource></think:opensource>") != null);
@@ -8299,7 +8384,7 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
     // {"name":...,"args":{...}} with args as an OBJECT (sorted, compact), tool
     // result named via tool_call_id lookup, generation prompt at the tail.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|>tool_declare<|content_xml|>") != null);
@@ -8316,7 +8401,7 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
     // Thinking OFF: the effort header must be the template's "0" form — hy3's
     // "no_think" is UNKNOWN to this template and raises.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Thinking effort level: 0<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
@@ -8332,7 +8417,7 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
             .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
             .{ .role = "user", .content = "And sunsets?" },
         };
-        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
@@ -8381,7 +8466,7 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     const bare =
         \\[{"type":"function","function":{"name":"note"}}]
     ;
-    const rendered = try renderChatTemplate(allocator, &messages, &config, bare, null, true, null);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, bare, null, true, null, false);
     defer allocator.free(rendered);
     // The muse tools preamble proves the REAL template ran; the fallback emits
     // ChatML markers instead and would carry no tools text at all.
@@ -8445,7 +8530,7 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
     // the checkpoint's (see qwen38EffortFor) — xhigh reasons without a bound
     // and a client that sends nothing gets no bound either.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
@@ -8459,11 +8544,11 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
     }
     // OpenAI's "high" is this family's "xhigh"; "medium" injects no preamble.
     {
-        const hi = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high");
+        const hi = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high", false);
         defer allocator.free(hi);
         try testing.expect(std.mem.indexOf(u8, hi, "Reasoning effort is set to xhigh.") != null);
 
-        const med = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "medium");
+        const med = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "medium", false);
         defer allocator.free(med);
         try testing.expect(std.mem.indexOf(u8, med, "Reasoning effort is set to") == null);
         try testing.expect(std.mem.indexOf(u8, med, "You have access to the following functions:") != null);
@@ -8472,7 +8557,7 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
     // must stay on the low-effort arm and the block the template opened is
     // closed in the prompt (noThinkTailSuffix) instead.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
@@ -8514,7 +8599,7 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
     // Thinking ON is unchanged: OpenAI's "high" still has to become this
     // family's "xhigh" or the render raises and silently falls back.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high");
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high", false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to xhigh.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
@@ -8523,7 +8608,7 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
     }
     // Absent client effort takes OUR default (low), not the template's xhigh.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
@@ -8531,7 +8616,7 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
     // Thinking OFF renders the template's OWN no-think prompt: closed block,
     // no reasoning preamble, and nothing appended after it.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to") == null);
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
@@ -8723,7 +8808,7 @@ test "assistant history reasoning_content reaches a template that reads it (lagu
         .{ .role = "user", .content = "What is 2+2?" },
         .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
     defer allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, "<think>two plus two is four</think>4") != null);
 }
@@ -9162,7 +9247,7 @@ test "renderChatTemplate: DSV4-style template gets tool fallback applied" {
     const messages = [_]Message{
         .{ .role = "user", .content = "list my files" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
     defer allocator.free(rendered);
     // Tool prompt should have been injected as a system message.
     try testing.expect(std.mem.indexOf(u8, rendered, "Available functions") != null);
@@ -11181,7 +11266,7 @@ test "renderChatTemplate: muse_glimmer shipped template renders byte-identical t
         .{ .role = "user", .content = "thanks, and in kelvin?" },
     };
 
-    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
     defer allocator.free(rendered);
     try testing.expectEqualStrings(expected, rendered);
 }
@@ -11201,18 +11286,18 @@ test "renderChatTemplate: muse thinking-off no-tools commits the to=user channel
     };
     const messages = [_]Message{.{ .role = "user", .content = "hi" }};
 
-    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null);
+    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
     defer allocator.free(off);
     try testing.expect(std.mem.endsWith(u8, off, "<|start|>assistant to=user<|message|>"));
 
-    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
     defer allocator.free(on);
     try testing.expect(std.mem.endsWith(u8, on, "<|start|>assistant"));
 
     const tools_json =
         \\[{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
     ;
-    const off_tools = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+    const off_tools = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
     defer allocator.free(off_tools);
     try testing.expect(std.mem.endsWith(u8, off_tools, "<|start|>assistant"));
 }
@@ -11238,7 +11323,7 @@ test "renderChatTemplate: muse template dedups a client-supplied reasoning direc
         .{ .role = "system", .content = "Be terse.\nReasoning effort: low." },
         .{ .role = "user", .content = "hi" },
     };
-    const r = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    const r = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
     defer allocator.free(r);
     try testing.expect(std.mem.indexOf(u8, r, "Reasoning strength: low.") != null);
     try testing.expect(std.mem.indexOf(u8, r, "Reasoning effort") == null);
@@ -11261,13 +11346,138 @@ test "renderChatTemplate: thinking-off closes a template-opened think block (LFM
     };
     const messages = [_]Message{.{ .role = "user", .content = "hi" }};
 
-    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null);
+    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
     defer allocator.free(off);
     try testing.expect(std.mem.endsWith(u8, off, "<think></think>"));
 
-    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
     defer allocator.free(on);
     try testing.expect(std.mem.endsWith(u8, on, "<think>"));
+}
+
+test "renderChatTemplate: continuation appends the partial reply into the OPEN assistant turn" {
+    // Continuing a reply means the prompt ends mid-assistant-turn. The trailing
+    // assistant message is a PREFIX to extend, not history: rendering it as
+    // history and then letting add_generation_prompt open a second assistant
+    // turn is what the server did before this existed, and the model answers
+    // the doubled turn by starting over.
+    const allocator = testing.allocator;
+    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "",
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "count to three" },
+        .{ .role = "assistant", .content = "one, two," },
+    };
+
+    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
+    defer allocator.free(cont);
+    // Ends INSIDE the turn, on the partial text — no close tag after it.
+    try testing.expect(std.mem.endsWith(u8, cont, "<|im_start|>assistantone, two,"));
+    // Exactly one assistant turn was opened.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, cont, "<|im_start|>assistant"));
+    // The partial appears once — as the prefill, not also as history.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, cont, "one, two,"));
+
+    // Same messages WITHOUT the flag stay history + a fresh turn, unchanged.
+    const plain = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+    defer allocator.free(plain);
+    try testing.expect(std.mem.endsWith(u8, plain, "<|im_start|>assistant"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, plain, "<|im_start|>assistant"));
+}
+
+test "renderChatTemplate: continuation resumes in the CONTENT channel, not a think block" {
+    // A template that opens `<think>` unconditionally (LFM2.5 class) would
+    // otherwise put the partial reply — visible prose the user already read —
+    // inside a reasoning block, and the continuation would come back as
+    // reasoning. The same tail that thinking-off uses closes it first.
+    const allocator = testing.allocator;
+    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n<think>{%- endif -%}";
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "",
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "Hello ther" },
+    };
+
+    // Thinking ON is the hard case: nothing else would close the block.
+    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
+    defer allocator.free(cont);
+    try testing.expect(std.mem.endsWith(u8, cont, "<think></think>Hello ther"));
+}
+
+test "renderChatTemplate: a continuation prefill is trimmed of trailing whitespace" {
+    // The tokenizer merges a trailing space with the word that follows it, so
+    // a prompt ending in one splits differently than the same text mid-reply —
+    // the hazard Anthropic's API rejects prefills outright for. Trim it: the
+    // stored reply keeps its whitespace, only the PROMPT is trimmed.
+    const allocator = testing.allocator;
+    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "",
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "Once upon a time \n" },
+    };
+    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
+    defer allocator.free(cont);
+    try testing.expect(std.mem.endsWith(u8, cont, "Once upon a time"));
+}
+
+test "renderChatTemplate: continuation is declined when the last message is not an assistant" {
+    // The flag describes the SHAPE of the request; a client that sets it on a
+    // user-final conversation gets an ordinary turn rather than a prompt with
+    // the user's own words committed into the assistant's mouth.
+    const allocator = testing.allocator;
+    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "",
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
+    defer allocator.free(cont);
+    try testing.expect(std.mem.endsWith(u8, cont, "<|im_start|>assistant"));
+}
+
+test "renderChatTemplate: muse commits its content channel before the partial reply" {
+    // Muse's turn header is `<|start|>assistant to=<recipient><|message|>`, and
+    // an uncommitted header means the model picks the channel — including
+    // `to=self`, which would make the continuation reasoning.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|return|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "Hello, I was say" },
+    };
+    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
+    defer allocator.free(cont);
+    try testing.expect(std.mem.endsWith(u8, cont, " to=user<|message|>Hello, I was say"));
 }
 
 test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current tool round's" {
@@ -11293,7 +11503,7 @@ test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current too
         .{ .role = "assistant", .content = "hello there", .reasoning_content = "waffling chain" },
         .{ .role = "user", .content = "and again?" },
     };
-    const r1 = try renderChatTemplate(allocator, &prior, &config, null, null, true, null);
+    const r1 = try renderChatTemplate(allocator, &prior, &config, null, null, true, null, false);
     defer allocator.free(r1);
     try testing.expect(std.mem.indexOf(u8, r1, "to=self") == null);
     try testing.expect(std.mem.indexOf(u8, r1, "waffling chain") == null);
@@ -11310,7 +11520,7 @@ test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current too
         .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
         .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
     };
-    const r2 = try renderChatTemplate(allocator, &current, &config, tools_json, null, true, null);
+    const r2 = try renderChatTemplate(allocator, &current, &config, tools_json, null, true, null, false);
     defer allocator.free(r2);
     try testing.expect(std.mem.indexOf(u8, r2, "<|start|>assistant to=self<|message|>Need the weather tool.<|eom|>") != null);
 
@@ -11324,7 +11534,7 @@ test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current too
         .add_bos_token = false,
         .allocator = allocator,
     };
-    const r3 = try renderChatTemplate(allocator, &prior, &generic, null, null, true, null);
+    const r3 = try renderChatTemplate(allocator, &prior, &generic, null, null, true, null, false);
     defer allocator.free(r3);
     try testing.expect(std.mem.indexOf(u8, r3, "<think>waffling chain</think>") != null);
 }
@@ -11598,7 +11808,7 @@ test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_resu
 
     // Thinking OFF (chat mode): assistant turns open with the bare </think>.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "You are helpful.\n\n## Tools") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "\"<｜DSML｜tool_calls>\" block") != null);
@@ -11619,7 +11829,7 @@ test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_resu
     // turn — the laguna round-trip class), so the tool-calling assistant
     // renders <think>…</think> even though a tool result follows it.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
         try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜><think></think>\n\n<｜DSML｜tool_calls>") != null);
@@ -11635,14 +11845,14 @@ test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_resu
     // serializeExtraContext → Jinja.
     {
         const user_only = [_]Message{.{ .role = "user", .content = "prove it" }};
-        const r_max = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "xhigh");
+        const r_max = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "xhigh", false);
         defer allocator.free(r_max);
         try testing.expect(std.mem.indexOf(u8, r_max, "Reasoning Effort: Beyond maximum") != null);
-        const r_high = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "high");
+        const r_high = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "high", false);
         defer allocator.free(r_high);
         try testing.expect(std.mem.indexOf(u8, r_high, "Reasoning Effort: Absolute maximum") != null);
         // Outside thinking mode the preamble never applies, whatever the effort.
-        const r_chat = try renderChatTemplate(allocator, &user_only, &config, null, null, false, "high");
+        const r_chat = try renderChatTemplate(allocator, &user_only, &config, null, null, false, "high", false);
         defer allocator.free(r_chat);
         try testing.expect(std.mem.indexOf(u8, r_chat, "Reasoning Effort:") == null);
     }
@@ -11654,7 +11864,7 @@ test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_resu
             .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
             .{ .role = "user", .content = "And sunsets?" },
         };
-        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null);
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>Rayleigh scattering.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "Shorter wavelengths") == null);
@@ -11672,7 +11882,7 @@ test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_resu
         const no_sys = [_]Message{
             .{ .role = "user", .content = "hi" },
         };
-        const rendered = try renderChatTemplate(allocator, &no_sys, &config, tools_json, null, false, null);
+        const rendered = try renderChatTemplate(allocator, &no_sys, &config, tools_json, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expect(std.mem.startsWith(u8, rendered, "<｜begin▁of▁sentence｜>\n\n## Tools"));
         try testing.expect(std.mem.indexOf(u8, rendered, "tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi") != null);

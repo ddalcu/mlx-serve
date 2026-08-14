@@ -1329,7 +1329,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .role = "user", .content = user_prompt },
         };
 
-        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null);
+        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null, false);
         defer allocator.free(prompt_ids);
 
         // Reset peak memory before generation
