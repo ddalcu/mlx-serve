@@ -278,6 +278,13 @@ struct MLXCoreApp: App {
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
             CommandMenu("Tools") {
+                // ⌘L: the model switcher, over the same rows the composer's
+                // pill offers. A menu key equivalent so it works from every
+                // window, and it goes through AppState's door — which raises
+                // the picker AND brings the chat window forward.
+                Button("Switch Model…") { appState.showModelPalette() }
+                    .keyboardShortcut("l", modifiers: [.command])
+
                 Button("Browse Models…") { appState.showModels() }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
 
