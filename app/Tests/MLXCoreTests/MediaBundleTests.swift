@@ -197,6 +197,147 @@ final class MediaBundleTests: XCTestCase {
                           VideoModelPreset.ltx23Q4.approxFirstRunDownloadGB)
     }
 
+    /// Every LTX pack that carries its own text encoder must ride the `ltx25`
+    /// bundle, and every LTX bundle must pull BOTH transformer variants — the
+    /// two-stage tiers need `dev` for stage 1 and `distilled` for the refine,
+    /// and a pack missing one 400s at generate time after a 40-60 GB download.
+    /// Written over `all` so a preset added later (an 8-bit pack, a 2.6) is
+    /// covered the day it lands rather than the day someone remembers.
+    func testEveryLtxPackPullsBothTransformersAndItsOwnEncoder() {
+        var checked = 0
+        for preset in VideoModelPreset.all where preset.backend == .ltx {
+            checked += 1
+            let files = Set(preset.bundle.components.flatMap { Array($0.selection.keepSafetensors ?? []) })
+            XCTAssertTrue(files.contains("transformer-dev.safetensors"), "\(preset.id) never fetches the dev transformer")
+            XCTAssertTrue(files.contains("transformer-distilled.safetensors"), "\(preset.id) never fetches the distilled transformer")
+            if preset.shipsOwnTextEncoder {
+                XCTAssertTrue(preset.bundle.id.hasPrefix("ltx25:"),
+                              "\(preset.id) ships its own encoder but uses \(preset.bundle.id) — the shared Gemma-3 fetch is 8 GB it never opens")
+                XCTAssertEqual(preset.bundle.components.count, 1, "\(preset.id) should have no second component")
+                XCTAssertTrue(preset.bundle.components[0].readyMarkers.contains(MediaBundle.ltx25TextEncoderDir),
+                              "\(preset.id) reads ready without its text encoder")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(checked, 2, "no LTX preset found — guard is vacuous")
+    }
+
+    /// LTX-2.5's own pipeline defaults denoise a 1920x1088 canvas; our ladder
+    /// stopped at 768x512, which is 0.39 MP against the reference's 2.09 MP.
+    /// That is the whole "looks softer than the published clips" gap before
+    /// anything about quantization: a canvas the model was not asked to fill
+    /// cannot be sharpened by steps, guidance or a wider quant.
+    ///
+    /// Pins the ladder REACHES the reference canvas rather than pinning the
+    /// exact list — a future ladder may re-space its rungs, but dropping the
+    /// top one silently puts every user back on a preview-sized render.
+    func testTheLtxLadderReachesTheReferenceCanvas() {
+        for preset in VideoModelPreset.all where preset.backend == .ltx {
+            let best = preset.resolutions.map { $0.width * $0.height }.max() ?? 0
+            XCTAssertGreaterThanOrEqual(
+                best, 1920 * 1088,
+                "\(preset.id) tops out at \(best) px — below LTX's own 1920x1088 default canvas")
+            // And the rungs must be distinct enough to be worth offering: at
+            // least four separate pixel counts, or the menu is decoration.
+            let areas = Set(preset.resolutions.map { $0.width * $0.height })
+            XCTAssertGreaterThanOrEqual(areas.count, 4, "\(preset.id) ladder has \(areas.count) distinct sizes")
+        }
+    }
+
+    /// The one-stage tiers run the DISTILLED transformer, whose sigma table is
+    /// fixed at 8 steps — the server clamps anything else and logs it. A tier
+    /// asking for 12 is a dead knob: it reads as "more steps than Fast" in the
+    /// pane's own hint while both tiers run the identical schedule.
+    func testOneStageTiersAskForTheStepCountTheDistilledScheduleActuallyRuns() {
+        for preset in VideoModelPreset.all where preset.backend == .ltx {
+            for q in QualityPreset.allCases {
+                let s = preset.settings(q)
+                guard s.mode == .oneStage else { continue }
+                XCTAssertEqual(s.steps, 8,
+                               "\(preset.id) \(q.label): one-stage runs the fixed 8-step distilled table, tier asks \(s.steps)")
+            }
+        }
+    }
+
+    /// A two-stage tier denoises at HALF the requested size and upscales, so on
+    /// a small canvas "Quality" is a 384x256 render — worse than the one-stage
+    /// tier it sits below in the menu. The pane must be able to say so, which
+    /// means the rule is a function, not a comment.
+    func testTwoStageTierWarnsUntilTheCanvasIsBigEnoughToHalve() {
+        // 768x512 halves to 384x256 — below the model's smallest offered rung.
+        XCTAssertNotNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 768, height: 512))
+        XCTAssertNotNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 1024, height: 576))
+        // 1600x896 halves to 800x448, 1920x1088 to 960x544 — both at or above
+        // the smallest canvas the picker offers, so the tier pays for itself.
+        XCTAssertNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 1600, height: 896))
+        XCTAssertNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 1920, height: 1088))
+        // H3 has no two-stage pipeline, so it never carries the note.
+        XCTAssertNil(VideoModelPreset.minimaxH3.twoStageCanvasNote(width: 768, height: 512))
+    }
+
+    /// The default canvas is a per-MAC decision: 1920x1088 is right on this
+    /// 128 GB machine and unusable on a 16 GB one, and a single static default
+    /// has to be sized for the smallest Mac — which is how everyone ended up
+    /// rendering previews. Mirrors `RecommendedModelPick.starterPick`: a pure
+    /// function of physical memory, so it is testable off-machine.
+    func testDefaultCanvasScalesWithTheMacsMemory() {
+        let p = VideoModelPreset.ltx25Q4
+        // 16 GB cannot hold the 24 GB pack at all — it falls back to the
+        // smallest rung rather than to a canvas it definitely cannot render.
+        let small = p.recommendedResolution(totalGB: 16)
+        let mid   = p.recommendedResolution(totalGB: 36)
+        let big   = p.recommendedResolution(totalGB: 128)
+        XCTAssertEqual(small, p.resolutions.min { $0.width * $0.height < $1.width * $1.height })
+        XCTAssertLessThanOrEqual(small.width * small.height, 768 * 512,
+                                 "16 GB Mac must not default to a canvas it cannot hold")
+        XCTAssertGreaterThan(big.width * big.height, small.width * small.height,
+                             "a 128 GB Mac defaults to the same canvas as a 16 GB one")
+        XCTAssertGreaterThanOrEqual(mid.width * mid.height, small.width * small.height)
+        // Every pick must be a rung the picker actually offers, or the menu
+        // renders blank on first launch.
+        for r in [small, mid, big] {
+            XCTAssertTrue(p.resolutions.contains(r), "\(r.label) is not on the ladder")
+        }
+        // And the auto-pick stays inside what the frame ladder can serve: a
+        // default nobody can render at the default length is not a default.
+        let frames = p.settings(p.defaultQuality).numFrames
+        for (gb, r) in [(36, mid), (128, big)] {
+            XCTAssertGreaterThanOrEqual(
+                RAMChecker.safeFrameCap(model: p, width: r.width, height: r.height, available: gb), frames,
+                "\(gb) GB: default canvas \(r.label) cannot hold \(frames) frames")
+        }
+    }
+
+    /// The whole RGB volume comes back as ONE base64 blob (the server
+    /// base64s `frames.rgb` into the JSON body and the app decodes it in
+    /// memory), so a frame count is only offerable if its payload is. At
+    /// 1920x1088 a 193-frame clip is 1.2 GB of raw RGB — 1.6 GB base64, held
+    /// twice on each side. The ladder must shorten as the canvas grows.
+    ///
+    /// Hard cap rather than the existing soft RAM warning: an over-budget
+    /// pick does not run slowly, it hangs and then dies.
+    func testTheFrameLadderShortensAsTheCanvasGrows() {
+        let p = VideoModelPreset.ltx25Q4
+        let small = p.frameOptions(width: 768, height: 512)
+        let big = p.frameOptions(width: 1920, height: 1088)
+        XCTAssertEqual(small.last, p.maxFrames, "768x512 is nowhere near the payload budget")
+        XCTAssertLessThan(big.last ?? 0, small.last ?? 0, "1920x1088 must offer fewer frames than 768x512")
+        for opts in [small, big] {
+            XCTAssertFalse(opts.isEmpty)
+            for n in opts { XCTAssertEqual((n - 1) % 8, 0, "\(n) is off LTX's 8N+1 ladder") }
+        }
+        // Every offered combination stays inside the budget it was cut for.
+        for r in p.resolutions {
+            guard let longest = p.frameOptions(width: r.width, height: r.height).last else {
+                return XCTFail("\(r.label) offers no frame counts")
+            }
+            XCTAssertLessThanOrEqual(longest * r.width * r.height * 3, VideoModelPreset.maxFramePayloadBytes,
+                                     "\(r.label) x \(longest)f exceeds the response-payload budget")
+        }
+        // A canvas so large nothing fits still offers the ladder's first rung
+        // rather than an empty picker.
+        XCTAssertFalse(p.frameOptions(width: 4096, height: 4096).isEmpty)
+    }
+
     /// Every LTX resolution must survive every QUALITY TIER, and two of the
     /// four tiers run a two-stage pipeline whose stage 1 is HALF resolution —
     /// so the server needs both edges divisible by 64 (the latent grid is /32,

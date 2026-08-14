@@ -392,6 +392,11 @@ final class VideoGenService: ObservableObject {
         // The fast recipe is the SERVER's default — the app only speaks up to
         // opt OUT, and only on a backend that has the recipe at all.
         if request.model.supportsFastRecipe, request.bestQuality { body["fast"] = false }
+        // The conv decoder is the server's default, so the app only speaks up
+        // to ask for the DiffVAE — and only on a pack that ships it.
+        if request.model.supportsDiffusionDecoder, request.diffusionDecoder {
+            body["decoder"] = "diffusion"
+        }
         // Turbo + chained windows: capability-gated like every H3 field above,
         // and emitted only when engaged — the server's defaults are the
         // absent-field behavior.

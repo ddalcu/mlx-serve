@@ -173,6 +173,23 @@ const corpus = [_]Expect{
         .tool_arg_key = "timezone",
         .tool_arg_value = "UTC",
     },
+    .{
+        // LIVE capture 2026-08-12 (ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via
+        // pi). Qwen 3.5/3.6's OWN template mandates this `<function=` dialect,
+        // and it rides inside the SAME `<tool_call>` wrapper the JSON form
+        // uses — so the JSON branch snapped the first balanced object in the
+        // body, which was the package.json being WRITTEN, and shipped its
+        // "name" key as the tool name. A parameter VALUE is arbitrary bytes:
+        // the class is "never let a value decide the call".
+        .family = "qwen",
+        .name = "function-tag call whose parameter value is itself a JSON object",
+        .raw = "<tool_call>\n<function=write>\n<parameter=path>\n/tmp/package.json\n</parameter>\n" ++
+            "<parameter=content>\n{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}\n" ++
+            "</parameter>\n</function>\n</tool_call>",
+        .tool_name = "write",
+        .tool_arg_key = "content",
+        .tool_arg_value = "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}",
+    },
     // ── Qwen 3.6 MoE (broken-JSON repair paths) ─────────────────────────────
     .{
         // Real broken output from Qwen3.6-35B-A3B-6bit: `, {` instead of
@@ -1908,5 +1925,241 @@ test "format corpus: history round-trip serialization survives any byte content"
             try testing.expectEqualStrings(entry.raw, assistant_content);
             try testing.expectEqualStrings(tool_result, tool_content);
         }
+    }
+}
+
+// ── Dialect matrix ────────────────────────────────────────────────────────
+//
+// A family's own chat template often declares MORE THAN ONE call syntax, and
+// the parser has to read every one of them. On 2026-08-12 qwen 3.5/3.6 shipped
+// a `<function=NAME>`/`<parameter=KEY>` form INSIDE the same `<tool_call>`
+// wrapper its JSON form uses; the JSON branch ran first, `balancedJsonObject`
+// snapped a package.json out of a `content` PARAMETER, and that object's
+// `"name"` key became the tool name ("Tool voxel-pagoda-garden not found",
+// and the model then looped on its own error). Nothing in the suite generated
+// that dialect, so nothing caught it.
+//
+// One row per (family, dialect). A new family adds rows; the assertions are
+// shared, so coverage cannot drift away from the parser.
+const Dialect = struct {
+    family: []const u8,
+    dialect: []const u8,
+    raw: []const u8,
+    name: []const u8,
+    key: []const u8,
+    value: []const u8,
+};
+
+const dialects = [_]Dialect{
+    .{
+        .family = "qwen3.5/3.6", .dialect = "tool_call wrapper + JSON body",
+        .raw = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n</tool_call>",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+    .{
+        // The dialect the checkpoint's OWN template mandates.
+        .family = "qwen3.5/3.6", .dialect = "tool_call wrapper + <function=> body",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>\n</tool_call>",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+    .{
+        .family = "qwen3.5/3.6", .dialect = "bare <function=>, no wrapper",
+        .raw = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+    .{
+        .family = "hermes/chatml", .dialect = "tool_call wrapper, single line",
+        .raw = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}</tool_call>",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+    .{
+        .family = "gemma4", .dialect = "channel tool_call",
+        .raw = "<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>,content:<|\"|>hi<|\"|>}<tool_call|>",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+    .{
+        .family = "llama3", .dialect = "raw JSON, name+parameters",
+        .raw = "{\"name\": \"write_file\", \"parameters\": {\"path\": \"a.txt\", \"content\": \"hi\"}}",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+    .{
+        .family = "lfm2", .dialect = "pythonic call expression",
+        .raw = "<|tool_call_start|>[write_file(path=\"a.txt\", content=\"hi\")]<|tool_call_end|>",
+        .name = "write_file", .key = "path", .value = "a.txt",
+    },
+};
+
+fn firstCallArg(allocator: std.mem.Allocator, raw: []const u8, key: []const u8) !?struct { name: []const u8, value: ?[]const u8 } {
+    const calls = (try chat.parseToolCalls(allocator, raw)) orelse return null;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{}) catch {
+        return error.ArgumentsNotValidJson;
+    };
+    defer parsed.deinit();
+    const v = parsed.value.object.get(key);
+    const val: ?[]const u8 = if (v) |vv| switch (vv) {
+        .string => |sv| try allocator.dupe(u8, sv),
+        else => null,
+    } else null;
+    return .{ .name = try allocator.dupe(u8, calls[0].name), .value = val };
+}
+
+test "format corpus: every dialect a family declares parses to the same call" {
+    const allocator = testing.allocator;
+    for (dialects) |d| {
+        const got = (try firstCallArg(allocator, d.raw, d.key)) orelse {
+            std.debug.print("\n[{s}] {s}: no tool call parsed\n  raw: {s}\n", .{ d.family, d.dialect, d.raw });
+            return error.DialectNotParsed;
+        };
+        defer allocator.free(got.name);
+        defer if (got.value) |v| allocator.free(v);
+
+        if (!std.mem.eql(u8, got.name, d.name)) {
+            std.debug.print("\n[{s}] {s}: name {s} (want {s})\n  raw: {s}\n", .{ d.family, d.dialect, got.name, d.name, d.raw });
+            return error.DialectWrongName;
+        }
+        const v = got.value orelse {
+            std.debug.print("\n[{s}] {s}: no string arg {s}\n  raw: {s}\n", .{ d.family, d.dialect, d.key, d.raw });
+            return error.DialectMissingArg;
+        };
+        if (!std.mem.eql(u8, v, d.value)) {
+            std.debug.print("\n[{s}] {s}: {s}={s} (want {s})\n", .{ d.family, d.dialect, d.key, v, d.value });
+            return error.DialectWrongArg;
+        }
+    }
+}
+
+test "format corpus: a parameter VALUE never decides the call" {
+    // A parameter value is arbitrary bytes. Feed each wrapper dialect a value
+    // that LOOKS like call syntax — a balanced JSON object carrying its own
+    // "name" (the live 2026-08-12 bug), a nested closing tag, a literal
+    // <tool_call> opener, a lone brace — and the parsed NAME must still be the
+    // one the call declared.
+    const allocator = testing.allocator;
+    const hostile = [_][]const u8{
+        "{\"name\": \"voxel-pagoda-garden\", \"version\": \"1.0.0\"}",
+        "</parameter>",
+        "<tool_call>{\"name\": \"rm_rf\"}</tool_call>",
+        "{",
+        "}\n</function>\n</tool_call>",
+        "line1\nline2\ttabbed",
+        "\"unbalanced",
+    };
+    // Wrappers whose body carries the value verbatim, as (prefix, suffix)
+    // around it — a format string would have to be comptime.
+    const Shape = struct { pre: []const u8, post: []const u8 };
+    const shapes = [_]Shape{
+        .{ .pre = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n",
+           .post = "\n</parameter>\n</function>\n</tool_call>" },
+        .{ .pre = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n",
+           .post = "\n</parameter>\n</function>" },
+    };
+
+    for (shapes) |shape| {
+        for (hostile) |value| {
+            const raw = try std.mem.concat(allocator, u8, &.{ shape.pre, value, shape.post });
+            defer allocator.free(raw);
+
+            const calls = (try chat.parseToolCalls(allocator, raw)) orelse continue;
+            defer {
+                for (calls) |tc| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
+                allocator.free(calls);
+            }
+            // The call the model MADE is write_file. A value must never rename it.
+            if (!std.mem.eql(u8, calls[0].name, "write_file")) {
+                std.debug.print("\na parameter value decided the call: name={s}\n  value: {s}\n  raw: {s}\n", .{ calls[0].name, value, raw });
+                return error.ValueDecidedTheCall;
+            }
+            // And whatever it shipped is still valid JSON (universal invariant).
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{}) catch {
+                std.debug.print("\nhostile value produced invalid args JSON\n  value: {s}\n  args: {s}\n", .{ value, calls[0].arguments });
+                return error.HostileValueBrokeArgsJson;
+            };
+            parsed.deinit();
+        }
+    }
+}
+
+test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
+    // Every call we parse is rendered back into the NEXT request's history by
+    // serializeMessagesJson. If that round-trip loses or mangles a call, the
+    // model sees a malformed version of its own last turn and repeats it —
+    // which is what turns one bad call into a loop. Parse the dialect, put the
+    // result through the serializer, read it back, and require the same call.
+    const allocator = testing.allocator;
+    for (dialects) |d| {
+        const calls = (try chat.parseToolCalls(allocator, d.raw)) orelse {
+            std.debug.print("\n[{s}] {s}: no call to round-trip\n", .{ d.family, d.dialect });
+            return error.DialectNotParsed;
+        };
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+
+        var tcs = try allocator.alloc(chat.ToolCall, calls.len);
+        defer allocator.free(tcs);
+        for (calls, 0..) |c, i| tcs[i] = .{ .id = "tc_0", .name = c.name, .arguments = c.arguments };
+
+        const messages = [_]chat.Message{
+            .{ .role = "user", .content = "write a.txt" },
+            .{ .role = "assistant", .content = "", .tool_calls = tcs },
+        };
+        const serialized = try chat.serializeMessagesJson(allocator, &messages);
+        defer allocator.free(serialized);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, serialized, .{}) catch {
+            std.debug.print("\n[{s}] {s}: serialized history is not valid JSON\n  {s}\n", .{ d.family, d.dialect, serialized });
+            return error.FixpointNotJson;
+        };
+        defer parsed.deinit();
+
+        const asst = parsed.value.array.items[1].object;
+        const rt = asst.get("tool_calls") orelse {
+            std.debug.print("\n[{s}] {s}: tool_calls dropped by the serializer\n", .{ d.family, d.dialect });
+            return error.FixpointLostCall;
+        };
+        const fn_obj = rt.array.items[0].object.get("function").?.object;
+        const rt_name = fn_obj.get("name").?.string;
+        try testing.expectEqualStrings(d.name, rt_name);
+
+        // `arguments` rides as a JSON STRING on the OpenAI shape, and stays an
+        // OBJECT for the families whose template demands it (Inkling
+        // raise_exception's on a string). Either is legal; both must still
+        // carry the argument back intact.
+        const rt_args = fn_obj.get("arguments").?;
+        var reparsed: ?std.json.Parsed(std.json.Value) = null;
+        defer if (reparsed) |r| r.deinit();
+        const args_obj: std.json.ObjectMap = switch (rt_args) {
+            .string => |sv| blk: {
+                reparsed = std.json.parseFromSlice(std.json.Value, allocator, sv, .{}) catch {
+                    std.debug.print("\n[{s}] {s}: round-tripped arguments are not valid JSON: {s}\n", .{ d.family, d.dialect, sv });
+                    return error.FixpointArgsNotJson;
+                };
+                break :blk reparsed.?.value.object;
+            },
+            .object => |o| o,
+            else => {
+                std.debug.print("\n[{s}] {s}: arguments came back as neither string nor object\n", .{ d.family, d.dialect });
+                return error.FixpointArgsWrongShape;
+            },
+        };
+        const rt_val = args_obj.get(d.key) orelse {
+            std.debug.print("\n[{s}] {s}: key {s} lost in the round-trip\n", .{ d.family, d.dialect, d.key });
+            return error.FixpointLostArg;
+        };
+        try testing.expectEqualStrings(d.value, rt_val.string);
     }
 }

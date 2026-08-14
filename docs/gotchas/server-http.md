@@ -1097,3 +1097,99 @@ have gone silently vacuous the moment this was fixed. It now posts to
 `/v1/load-model`, checks the HTTP status, and asserts the clone reached `ready`
 in the arm whose evidence is a MISSING log line. A silent arm has to prove it
 did the work.
+
+## A stream and a non-stream answer must be the same bytes (2026-08-13)
+
+Found by `tests/test_logprobs.sh`, which reported three streaming failures:
+
+```
+FAIL  [stream] same entry count as non-streaming   17 vs 16
+FAIL  [stream] tokens match non-streaming          [0, 1, 2, 3, 4]
+FAIL  [stream] logprob VALUES match non-streaming  [0, 1, 2, 3, 14]
+```
+
+Logprobs was innocent. Each surface described its OWN content faithfully; the
+content itself differed. Same model, same request, same seed:
+
+```
+non-stream : 'One, two, three, four, five, six, seven, eight.'
+stream     : '\n\nOne, two, three, four, five, six, seven, eight.'
+messages   : '\n\nOne, two, three, four, five, six, seven, eight.'
+```
+
+Every non-streaming delivery goes through `splitThinkBlock`, whose no-tag branch
+ends in `trimStart(content, "\n ")`. The streaming paths flush token text
+verbatim, so they kept the whitespace the non-streaming split had always dropped.
+
+The model that exposes it is LFM2.5, whose template opens `<think>`
+**unconditionally**: with thinking off the prompt gets `</think>` appended
+(`chat.noThinkTailSuffix`), so the model's first generated token is the `'\n\n'`
+that follows the closer. But the class is wider than one checkpoint — any model
+whose first visible token is whitespace is in it.
+
+### Why it hid
+
+`LOGPROBS_TEST_MODEL` defaults to `~/.mlx-serve/models/mlx-community/LFM2.5-2.6B-8bit`.
+That path stopped existing when the library moved to the external drive, and the
+script exits 0 on a missing model, so it had been SKIPPING. Three suites were
+skipping for the same reason. A skipped arm reads as a pass.
+
+### The fix, and its two deliberate limits
+
+`chat.streamContentLead(chunk, content_started)`, wired into all four content
+emitters on both streaming surfaces (chat completions: the tools flush arm, the
+plain token arm, the post-close remainder, the end-of-stream tail; `/v1/messages`:
+the same four).
+
+Leading whitespace is the ONE thing a stream can still withhold — nothing visible
+has been sent, so this is a suppression, never a retraction.
+
+1. **It never cuts inside a token.** A partial trim would ship a logprobs entry
+   whose `token` no longer appears in `content`; the collector describes whole
+   tokens and cannot split one. So a chunk is suppressed only when it is
+   ENTIRELY whitespace. A token mixing whitespace and text rides whole — the
+   narrow residual, and the honest one.
+2. **A suppressed chunk retires its pending logprob** (`lps.dropPending()`, the
+   arm the empty-content case already used). Without it the entry rode the next
+   chunk and the stream reported 17 entries for 16 content tokens — the original
+   symptom, now caused by the fix instead of the bug.
+
+Interior whitespace is untouched: `'line one\n\nline two'` streams intact.
+
+### A thinking-enabled STREAM that answers into an empty content field
+
+LFM2-VL, live 2026-08-13. The app shows a Thinking block containing a complete,
+correct answer — and nothing under it. Same request non-streaming: the answer is
+in `content`, `reasoning_content` is null. Two surfaces, one prompt, different
+bytes.
+
+All three streaming handlers seeded their think state as
+`enable_thinking OR prompt_opened_think`. The OR is the bug. It encodes an
+assumption — "a thinking-enabled model opens `<think>` as its first token" —
+that is true for Qwen and Gemma and irrelevant for them: their templates RENDER
+the opener when thinking is on, so `promptOpensThink` already sees it in the
+rendered bytes and the flag adds nothing. It is false for LFM2-VL, whose
+generation prompt is a bare `<|im_start|>assistant\n` and whose model answers
+directly. So the stream opened a block nobody opened, every token routed to
+`reasoning_content`, no `</think>` ever arrived to close it, and `content`
+finished empty.
+
+The existing rule (`in_think_block` starts from the PROMPT, not the request
+flag) was written for the end-of-stream FLUSH, and `streamTailIsReasoning`
+enforces it there — positive evidence required, `prompt_opened_think` or
+`saw_think_open`. The SEED was never covered, so the per-token routing did the
+damage before the flush's guard could matter. A rule that names one site is a
+rule about one site.
+
+Signature to recognize it: the whole answer arrives as reasoning, `content` is
+empty, the non-streaming request is fine, and nothing in the log looks wrong —
+`thinking=true` is exactly what was asked for. It also is not vision-specific,
+even though a VL checkpoint is what surfaced it: any model whose template does
+not render the opener is in the class, text requests included.
+
+The guard is a source scan (`a stream never starts inside a think block because
+the REQUEST asked for thinking`) with the needle `++`-split so the test's own
+comment cannot satisfy it — the first version of this scan passed green against
+the broken build for exactly that reason. The integration bar is the
+stream-vs-non-stream byte invariant rather than a phrasing check, because the
+broken build produced perfectly good prose; it just filed it under the wrong key.

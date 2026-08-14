@@ -37,7 +37,8 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// **Speed** is always our OWN relative estimate, never the site's: their
 /// figure is measured on cloud GPUs, and that ordering does not survive the
 /// move to Apple Silicon, where decode is bandwidth-bound and ACTIVE
-/// parameters dominate. Same M4 Max in `docs/perf-csvs/all-26.7.12.csv`:
+/// parameters dominate. Same M4 Max, 26.7.12 bench (benchmarks.md; the
+/// per-cell CSV lives in git history at docs/perf-csvs/all-26.7.12.csv):
 /// `gemma4-26b-a4b` 118 tok/s against `gemma4-31b` 25 tok/s — a 4.7× gap a
 /// cloud comparison shows as nearly level. The score is `round(100 × tok/s / 200)`
 /// over PLAIN autoregressive decode, calibrated against that CSV where a row

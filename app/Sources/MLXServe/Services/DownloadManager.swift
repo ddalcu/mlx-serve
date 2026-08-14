@@ -1616,9 +1616,15 @@ class DownloadManager: ObservableObject {
         guard let data = FileManager.default.contents(atPath: configPath),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return meta }
         if let mt = cfg["model_type"] as? String { meta.modelType = mt }
-        // Vision: a `vision_config` block on a non-`_text` arch (the `_text`
-        // guard skips text-only quantized checkpoints with a vestigial block).
-        meta.hasVision = cfg["vision_config"] != nil && !meta.modelType.hasSuffix("_text")
+        // Vision: a NON-EMPTY `vision_config` block on a non-`_text` arch. Both
+        // guards earn their place — `_text` skips text-only quantized
+        // checkpoints with a vestigial block, and the emptiness check catches
+        // the ones that keep the key but not the arch tag (mlx-community's
+        // text-only LFM2.5 packs declare `Lfm2ForCausalLM` and ship
+        // `"vision_config": {}`, which badged them vision-capable while the
+        // server served them text-only). A block with no geometry is not a tower.
+        let visionBlock = cfg["vision_config"] as? [String: Any]
+        meta.hasVision = !(visionBlock?.isEmpty ?? true) && !meta.modelType.hasSuffix("_text")
         // Quant: MLX writes `quantization`/`quantization_config` with `bits`.
         if let q = (cfg["quantization"] ?? cfg["quantization_config"]) as? [String: Any] {
             meta.quantBits = q["bits"] as? Int

@@ -1,32 +1,35 @@
 #!/usr/bin/env python3
-"""bench_csv.py — turn a directory of llmprobe `--save` reports into the one
-CSV both charts render from.
+"""bench_csv.py — turn a directory of llmprobe `--save` reports into one CSV.
 
-llmprobe is the measurement layer (tests/bench.sh drives it). One `--bench-only`
-run per engine per model produces headline decode/prefill/TTFT medians AND the
-context-scaling ladder, so a release needs ONE bench run and ONE CSV where it
-used to need two protocols and two files.
+Helper for `tests/bench_versions.sh` (shipped-.app vs dev-tree A/B), which
+charts its two arms with `plot_version_ab.py`. The release bench does NOT use
+this: `tests/bench.sh` prints its rows straight into `benchmarks.md` and keeps
+no CSV at all.
 
 Input:  a directory of `<model>__<engine>__<spec>.json` llmprobe reports.
 Output: pipe-delimited CSV, one row per (model, engine, context):
 
   model|engine|spec|context|prefill_tps|decode_tps|ttft_ms|tok_per_step|spec_ratio|checkpoint|hardware|notes
 
-`context` is `headline` for the top-level bench numbers (what the bar chart
-plots) and a rung label — 0.5k, 4k, 8k, 16k, 32k, 64k — for each ladder point
-(what the ladder chart plots). A rung the engine rejected is written with empty
-rates and llmprobe's own error in `notes`, never as a zero.
+`context` is `headline` for the top-level bench numbers and a rung label —
+0.5k, 4k, 8k, 16k, 32k, 64k — for each context-ladder point. A rung the engine
+rejected is written with empty rates and llmprobe's own error in `notes`, never
+as a zero.
 
 Usage:
-  python3 tests/bench_csv.py <json_dir> --out docs/perf-csvs/probe-<ver>.csv
+  python3 tests/bench_csv.py <json_dir> --out <run_dir>/versions-<tag>.csv
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-from bench_engines import format_engines_note  # noqa: E402
+def format_engines_note(versions: dict) -> str:
+    """The `# engines: ...` line body, stably ordered so CSVs diff cleanly."""
+    if not versions:
+        return ""
+    return "engines: " + " ".join(f"{k}={versions[k]}" for k in sorted(versions))
+
 
 HEADER = ("model|engine|spec|context|prefill_tps|decode_tps|ttft_ms|"
           "tok_per_step|spec_ratio|checkpoint|hardware|notes")

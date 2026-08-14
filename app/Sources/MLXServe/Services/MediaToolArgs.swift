@@ -278,14 +278,36 @@ enum MediaToolArgs {
 
     // MARK: - Music
 
-    static func musicSeconds(_ raw: String?) -> Int {
+    static func musicSeconds(_ raw: String?, lyrics: String = "") -> Int {
         // Models write "45" but also "45 seconds" and "45.0" — read the leading
         // number rather than refusing a perfectly clear request.
         guard let raw, let v = Double(raw.prefix(while: { $0.isNumber || $0 == "." })), v.isFinite else {
-            return MediaChatDefaults.musicSeconds
+            return clampMusicSeconds(secondsForLyrics(lyrics) ?? MediaChatDefaults.musicSeconds)
         }
-        return min(max(Int(v), MediaChatDefaults.musicSecondsRange.lowerBound),
-                   MediaChatDefaults.musicSecondsRange.upperBound)
+        return clampMusicSeconds(Int(v))
+    }
+
+    private static func clampMusicSeconds(_ v: Int) -> Int {
+        min(max(v, MediaChatDefaults.musicSecondsRange.lowerBound),
+            MediaChatDefaults.musicSecondsRange.upperBound)
+    }
+
+    /// Seconds a lyric sheet needs, or nil when there is nothing sung. The
+    /// flat 30 s default cut full songs off mid-verse (and the tool schema
+    /// invited it: "omit for 30"), so an omitted duration is derived from the
+    /// words instead: ~4 s a sung line plus 15 for intro/outro, rounded up to
+    /// a quarter minute. Section tags are directives, not lines to sing.
+    /// Erring long is the cheap direction — Music 3 treats the duration as an
+    /// upper bound and ACE-Step fills the tail, while erring short truncates
+    /// the song the user asked for.
+    static func secondsForLyrics(_ lyrics: String) -> Int? {
+        let sung = lyrics.split(separator: "\n").filter { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            return !t.isEmpty && !(t.hasPrefix("[") && t.hasSuffix("]"))
+        }
+        guard !sung.isEmpty else { return nil }
+        let raw = 15 + sung.count * 4
+        return (raw + 14) / 15 * 15
     }
 
     /// Beats per minute, clamped to the engine's `[30,300]` — outside it the
@@ -348,7 +370,7 @@ enum MediaToolArgs {
             bpm: musicBpm(args["bpm"]),
             keyscale: musicKeyscale(args["keyscale"]),
             timesignature: musicTimeSignature(args["time_signature"]),
-            durationSeconds: musicSeconds(args["duration_seconds"]),
+            durationSeconds: musicSeconds(args["duration_seconds"], lyrics: text(args, "lyrics") ?? ""),
             keepResident: keepResident, lanModelId: lanId)
     }
 

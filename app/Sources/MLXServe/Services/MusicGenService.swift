@@ -34,21 +34,30 @@ final class MusicGenService: ObservableObject {
     /// The `/v1/audio/music-generations` request body. Static + pure so unit
     /// tests pin the wire contract (omit-empty fields, seed resolution).
     nonisolated static func requestBody(_ request: MusicGenRequest, modelName: String) -> [String: Any] {
+        // Sticky settings outlive a model switch: clamp the duration into THIS
+        // model's server-valid range rather than earn a 400.
+        let range = request.model.durationRange
+        let duration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
         var body: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
-            "duration_seconds": request.durationSeconds,
+            "duration_seconds": duration,
             "stream": true,
         ]
         let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
         if !lyrics.isEmpty { body["lyrics"] = lyrics }
-        let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lang.isEmpty { body["vocal_language"] = lang }
-        if let bpm = request.bpm { body["bpm"] = bpm }
-        let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ks.isEmpty { body["keyscale"] = ks }
-        let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ts.isEmpty { body["timesignature"] = ts }
+        // The musical-metadata knob set is ACE-Step's; Music 3 names each
+        // field a 400 — gate the FIELDS here, not just the pane's controls
+        // (values may linger from an ACE session).
+        if request.model.supportsMusicalMeta {
+            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lang.isEmpty { body["vocal_language"] = lang }
+            if let bpm = request.bpm { body["bpm"] = bpm }
+            let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ks.isEmpty { body["keyscale"] = ks }
+            let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ts.isEmpty { body["timesignature"] = ts }
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -63,13 +72,15 @@ final class MusicGenService: ObservableObject {
             "duration_seconds: \(request.durationSeconds)",
             "seed: \(resolvedSeed)",
         ]
-        let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lang.isEmpty, lang != "unknown" { lines.append("vocal_language: \(lang)") }
-        if let bpm = request.bpm { lines.append("bpm: \(bpm)") }
-        let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ks.isEmpty { lines.append("keyscale: \(ks)") }
-        let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ts.isEmpty { lines.append("timesignature: \(ts)") }
+        if request.model.supportsMusicalMeta {
+            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lang.isEmpty, lang != "unknown" { lines.append("vocal_language: \(lang)") }
+            if let bpm = request.bpm { lines.append("bpm: \(bpm)") }
+            let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ks.isEmpty { lines.append("keyscale: \(ks)") }
+            let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ts.isEmpty { lines.append("timesignature: \(ts)") }
+        }
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let lyr = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -88,6 +99,11 @@ final class MusicGenService: ObservableObject {
     func generate(_ request: MusicGenRequest, server: ServerManager) {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
+            return
+        }
+        if request.model.requiresLyrics,
+           request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            phase = .failed("\(request.model.name) needs lyrics — put structure tags like [verse] on their own lines.")
             return
         }
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
@@ -127,7 +143,8 @@ final class MusicGenService: ObservableObject {
                         let stage = ev["stage"] as? String ?? "Generating"
                         let label: String
                         switch stage {
-                        case "encode": label = "Encoding prompt…"
+                        case "encode", "prefill": label = "Encoding prompt…"
+                        case "frames": label = "Composing (frame \(step)/\(total))…"
                         case "diffuse": label = "Composing (step \(step)/\(total))…"
                         case "decode": label = "Rendering audio (\(step)/\(total))…"
                         default: label = "\(stage)…"
@@ -175,6 +192,10 @@ final class MusicGenService: ObservableObject {
                           onProgress: ((MediaGenProgress) -> Void)? = nil) async throws -> String {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MediaGenError.emptyInput("Prompt")
+        }
+        if request.model.requiresLyrics,
+           request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw MediaGenError.emptyInput("Lyrics (this model is lyric-conditioned)")
         }
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             throw MediaGenError.notDownloaded(request.model.name)

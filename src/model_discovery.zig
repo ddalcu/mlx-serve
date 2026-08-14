@@ -66,6 +66,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
     // MiniMax-H3: our converted layout always writes this next to config.json.
     if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
+    // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
+    if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
     return null;
 }
 
@@ -79,6 +81,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "kokoro") or
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
+        std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -419,7 +422,8 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
-        std.mem.eql(u8, model_type, "acestep")) return .audio;
+        std.mem.eql(u8, model_type, "acestep") or
+        std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
@@ -1136,6 +1140,12 @@ test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
     try testing.expectEqual(ModelKind.image, modelKindFromType("mageflow"));
     // Guardrail: a regular LM must not be swept up by the prefix match.
     try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "minimax_music3 classifies as audio media with the vocoder marker" {
+    try testing.expect(isMediaModelType("minimax_music3"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
+    try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
 }
 
 test "discoverModels finds flat and org/repo model dirs" {

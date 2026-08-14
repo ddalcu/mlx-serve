@@ -21,7 +21,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "llama",
     "mistral",
     "nemotron",   // nemotron_h (Mamba2 SSM hybrid)
-    "lfm",        // lfm2, lfm2-vl (Liquid state-space hybrid)
+    "lfm",        // lfm2, lfm2_vl (Liquid state-space hybrid; VL serves images)
     "bert",       // encoder-only embedding models (/v1/embeddings)
     "hunyuan",    // Tencent Hunyuan 3 (model_type hy_v3) — repos tag "hunyuan"
     "hy_v3",      // …and/or the model_type verbatim (some tag only that)
@@ -41,12 +41,12 @@ let supportedModelTypes: Set<String> = [
     "qwen3_moe", "qwen3_moe_text",
     "qwen2",
     "llama", "mistral",
-    "lfm2", "lfm2-vl",
+    "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
-    "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text served, vision pending)
+    "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so

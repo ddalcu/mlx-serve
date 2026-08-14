@@ -261,6 +261,11 @@ extension MediaBundle {
                             "connector.safetensors", "vae_decoder.safetensors", "vae_encoder.safetensors",
                             "audio_vae.safetensors", "vocoder.safetensors",
                             "spatial_upscaler_x2_v1_1.safetensors", "temporal_upscaler_x2_v1_0.safetensors",
+                            // LTX's own DiffVAE decoder — the 8-bit pack ships
+                            // it, the 4-bit one does not, and the allowlist is
+                            // by basename so a pack without it just has one
+                            // fewer file to fetch.
+                            "vae_diffusion_decoder.safetensors",
                             // The in-pack Gemma-4 text encoder's weights.
                             "model.safetensors",
                         ]
@@ -363,6 +368,36 @@ extension MediaBundle {
         )
     }
 
+    /// MiniMax Music 3: a flat converted dir — `config.json` + five component
+    /// safetensors (LLM, depth decoder, DiT, condition encoder, vocoder) +
+    /// the `tokenizer/` subdir the engine reads (`music_tokenizer/` rides
+    /// along via the recursive scan). The vocoder is the completeness marker
+    /// (written LAST by the converter — mirrors the server's
+    /// `requiredMediaMarker`).
+    static func music3(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "music3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "language_model.safetensors", "rvq_depth_decoder.safetensors",
+                        "transformer.safetensors", "condition_encoder.safetensors",
+                        "vocoder.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "language_model.safetensors",
+                        "rvq_depth_decoder.safetensors", "transformer.safetensors",
+                        "condition_encoder.safetensors", "vocoder.safetensors",
+                        "tokenizer/tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Mage-Flow (diffusers layout): one repo with weight subdirs
     /// (`transformer/`, `vae/`, `text_encoder/`, `scheduler/`) and NO root
     /// config.json — detection keys on `model_index.json`. Recursive download
@@ -450,7 +485,10 @@ extension Model3DModelPreset {
 
 extension MusicModelPreset {
     var bundle: MediaBundle {
-        .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        switch family {
+        case .acestep: return .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .minimaxMusic3: return .music3(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        }
     }
 }
 

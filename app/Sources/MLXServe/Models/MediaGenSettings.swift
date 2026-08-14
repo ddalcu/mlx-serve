@@ -243,6 +243,8 @@ struct VideoGenSettings: Codable, Equatable {
     var keepResident: Bool = false
     /// Max-quality opt-out of the server's fast recipe (H3).
     var bestQuality: Bool = false
+    /// Decode with LTX's DiffVAE instead of the conv decoder (8-bit LTX-2.5 only).
+    var diffusionDecoder: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling.
     var turbo: Bool = false
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
@@ -291,8 +293,13 @@ extension VideoGenSettings {
         return .ltx23Q4
     }
 
+    /// A persisted pick wins; with nothing saved the canvas is sized for THIS
+    /// Mac rather than for the smallest supported one (see
+    /// `VideoModelPreset.recommendedResolution`) — a static default meant a
+    /// 128 GB machine opened on a preview-sized render.
     func resolvedResolution(for m: VideoModelPreset) -> ResolutionOption {
-        m.resolutions.first { $0.id == resolutionId } ?? m.defaultResolution
+        m.resolutions.first { $0.id == resolutionId }
+            ?? m.recommendedResolution(totalGB: RAMChecker.totalGB)
     }
 
     init(from decoder: Decoder) throws {

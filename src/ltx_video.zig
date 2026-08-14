@@ -36,6 +36,8 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const lora_mod = @import("lora.zig");
+const diffvae = @import("ltx_diffvae.zig");
+const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 
 const S = mlx.mlx_stream;
 
@@ -449,6 +451,26 @@ fn unpatchifySpatial(x: mlx.mlx_array, ps: u32, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(t);
     return reshapeTo(t, &[_]c_int{ B, F, H * psc, W * psc, C }, s);
 }
+
+/// Which decoder turns the final latent into pixels. The conv `vae_decoder` is
+/// the default; `.diffusion` is LTX's own DiffVAE (`vae_diffusion_decoder`),
+/// which their published clips are decoded with. The two travel as ONE value so
+/// a second decode call site cannot pick up half of them (`server.PldDefaults`
+/// pattern) — and the seed rides along because the DiffVAE denoises from noise.
+pub const VaeChoice = struct {
+    conv: *const Component,
+    diffusion: ?*const Component = null,
+    seed: u64 = 0,
+
+    /// `[1,128,F,H,W]` latent → `[1,3,F',H',W']` pixels in [-1,1]; both arms
+    /// return the same shape and range, so callers are decoder-agnostic.
+    pub fn decode(self: VaeChoice, alloc: std.mem.Allocator, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+        if (self.diffusion) |d| {
+            return diffvae_fwd.decode(alloc, d, diffvae.production, latent_bcfhw, .{ .seed = self.seed }, s);
+        }
+        return vaeDecode(self.conv, latent_bcfhw, s);
+    }
+};
 
 const ResStageSpec = struct { up_idx: u32, num_blocks: u32 };
 const UpSpec = struct { up_idx: u32, sf: u32, tf: u32 };
@@ -1330,6 +1352,23 @@ const GemmaCfg = struct {
     theta_global: f32 = 1000000.0,
 };
 
+/// (bits, group_size) of an affine-quantized weight, SOLVED from the packed
+/// geometry — never assumed. The pack's width is a property of the pack: the
+/// 4-bit and 8-bit LTX packs are the same layout at different widths, and a
+/// hardcoded 4 meant the engine could only ever load one of them (an 8-bit
+/// pack died at the first matmul with a shapes-incompatible MLX error, which
+/// reads like a corrupt file rather than an engine that never asked).
+/// `in_dim` is the contraction size — the last axis of the activation.
+fn quantGeom(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) !transformer_mod.QuantParams {
+    return transformer_mod.affineParamsFromGeometry(w, sc, in_dim) orelse error.UnsupportedQuantGeometry;
+}
+
+/// Contraction size of `x` (its last axis).
+fn lastDim(x: mlx.mlx_array) u32 {
+    const sh = mlx.getShape(x);
+    return if (sh.len == 0) 0 else @intCast(sh[sh.len - 1]);
+}
+
 fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
     return w.get(key) orelse {
         log.err("[ltx-gemma] MISSING WEIGHT: {s}\n", .{key});
@@ -1337,7 +1376,7 @@ fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
     };
 }
 
-/// q4 linear: y = x @ dequant(<base>.weight).T  (affine g64 b4).
+/// Affine-quantized linear; (bits, group_size) solved per weight.
 fn gQLin(w: *const model_mod.Weights, a: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
     const wk = try std.fmt.allocPrint(a, "{s}.weight", .{base});
     defer a.free(wk);
@@ -1348,8 +1387,9 @@ fn gQLin(w: *const model_mod.Weights, a: std.mem.Allocator, x: mlx.mlx_array, ba
     const wq = try gGet(w, wk);
     const sc = try gGet(w, sk);
     const bi = try gGet(w, bk);
+    const qp = try quantGeom(wq, sc, lastDim(x));
     var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(&o, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    try mlx.check(mlx.mlx_quantized_matmul(&o, x, wq, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
     return o;
 }
 
@@ -1670,7 +1710,9 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
     var deq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(deq);
     const null_gs = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_dequantize(&deq, rw, rs, rb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gs, .{ .value = .bfloat16, .has_value = true }, s));
+    // The embedding table's contraction axis is the hidden width.
+    const eqp = try quantGeom(emb_w, emb_s, cfg.hidden);
+    try mlx.check(mlx.mlx_dequantize(&deq, rw, rs, rb, mlx.mlx_optional_int.some(@intCast(eqp.group_size)), mlx.mlx_optional_int.some(@intCast(eqp.bits)), "affine", null_gs, .{ .value = .bfloat16, .has_value = true }, s));
     const hd: c_int = @intCast(cfg.hidden);
     const emb3 = try gReshape(deq, &[_]c_int{ 1, T, hd }, s);
     defer _ = mlx.mlx_array_free(emb3);
@@ -1706,7 +1748,10 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
 
 /// get_timestep_embedding(t_scaled, dim): sinusoidal, flip_sin_to_cos=True
 /// (cos first), downscale_freq_shift=0, max_period=10000. Returns [1, dim].
-fn ditTimestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
+/// `get_timestep_embedding(t, dim, flip_sin_to_cos=True, downscale_freq_shift=0)`
+/// — `[cos, sin]` concatenated. Shared with the DiffVAE decoder, whose
+/// `t_embedder` is the same PixArt combined-timestep block at 256 wide.
+pub fn timestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
     const half: c_int = @intCast(dim / 2);
     var ar = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ar);
@@ -1743,7 +1788,7 @@ fn ditTimestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
     return out;
 }
 
-/// Per-token sinusoidal timestep embedding `[N, dim]` — `ditTimestepSinusoid`
+/// Per-token sinusoidal timestep embedding `[N, dim]` — `timestepSinusoid`
 /// applied row-wise to each `t_scaled[n]` (= the reference `get_timestep_embedding`
 /// on a flat `(N,)` vector). Used for I2V per-token AdaLN: clean tokens get
 /// t_scaled=0, generated tokens get t_scaled=sigma*1000.
@@ -1811,7 +1856,8 @@ fn ditAdaLNSingle(comp: *const Component, alloc: std.mem.Allocator, t_sin: mlx.m
 // `.bias`; adaLN scale_shift tables F32. Reference: transformer.py / attention.py.
 // ════════════════════════════════════════════════════════════════════════
 
-/// q4 linear over a Component: y = x @ dequant(<base>.weight).T + <base>.bias.
+/// Affine-quantized linear over a Component ((bits, gs) solved per weight):
+/// y = x @ dequant(<base>.weight).T + <base>.bias.
 /// Mirrors `gQLin` (affine g64 b4) but reads from a Component and adds the
 /// quantized Linear's separate bf16 `.bias` (present on every DiT projection).
 /// When a LoRA is installed on the Component, adds scale·(x@Aᵀ)@Bᵀ unfused
@@ -1828,8 +1874,9 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
     const wq = comp.get(wk) orelse return error.MissingDitWeight;
     const sc = comp.get(sk) orelse return error.MissingDitWeight;
     const bi = comp.get(bk) orelse return error.MissingDitWeight;
+    const qp = try quantGeom(wq, sc, lastDim(x));
     var mm = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
     if (comp.lora != null) {
         var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
         const refs = loraRefsFor(comp, base, &rbuf);
@@ -2669,9 +2716,9 @@ pub fn ditForward(
 
     // ── timestep embeddings → adaLN param sets ──
     // Audio / prompt / AV-gate AdaLN ALWAYS use the scalar sigma sinusoids.
-    const t_sin = try ditTimestepSinusoid(sigma * cfg.timestep_scale, 256, s); // sigma*1000
+    const t_sin = try timestepSinusoid(sigma * cfg.timestep_scale, 256, s); // sigma*1000
     defer _ = mlx.mlx_array_free(t_sin);
-    const t_sin_gate = try ditTimestepSinusoid(sigma * 1.0, 256, s); // av_ca gate scale (×1)
+    const t_sin_gate = try timestepSinusoid(sigma * 1.0, 256, s); // av_ca gate scale (×1)
     defer _ = mlx.mlx_array_free(t_sin_gate);
 
     // Video AdaLN (9-param self/ff/text-ca + 4-param AV-cross-video): scalar from
@@ -2702,7 +2749,7 @@ pub fn ditForward(
         _ = mlx.mlx_array_free(t_sin_a);
     };
     if (audio_sigma) |asig| {
-        t_sin_a = try ditTimestepSinusoid(asig * cfg.timestep_scale, 256, s);
+        t_sin_a = try timestepSinusoid(asig * cfg.timestep_scale, 256, s);
         t_sin_a_owned = true;
     }
     const a_ada = try ditAdaLNSingle(comp, alloc, t_sin_a, "transformer.audio_adaln_single", s);
@@ -4071,7 +4118,7 @@ pub fn generateVideoFrames(
     cfg: LtxConfig,
     transformer: *const Component,
     connector: *const Component,
-    vae: *const Component,
+    vae: VaeChoice,
     vae_encoder: ?*const Component,
     cond_image: ?mlx.mlx_array,
     gemma_dir: []const u8,
@@ -4197,7 +4244,7 @@ pub fn generateVideoFrames(
     if (progress) |p| p.emit("Decoding video", total_steps, total_steps);
     const latent = try unpatchifyVideo(final.v, F, H, W, s);
     defer _ = mlx.mlx_array_free(latent);
-    const pixels = try vaeDecode(vae, latent, s);
+    const pixels = try vae.decode(alloc, latent, s);
     defer _ = mlx.mlx_array_free(pixels);
     const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
     const rgb = try framesToU8(pixels, alloc, s);
@@ -4294,7 +4341,7 @@ pub fn generateVideoFramesTwoStage(
     cfg: LtxConfig,
     transformer: *const Component,
     connector: *const Component,
-    vae: *const Component,
+    vae: VaeChoice,
     vae_encoder: *const Component,
     cond_image_half: ?mlx.mlx_array,
     cond_image_full: ?mlx.mlx_array,
@@ -4454,7 +4501,7 @@ pub fn generateVideoFramesTwoStage(
     if (progress) |p| p.emit("Decoding video", total, total);
     const latent = try unpatchifyVideo(out2.v, F, H2, W2, s);
     defer _ = mlx.mlx_array_free(latent);
-    const pixels = try vaeDecode(vae, latent, s);
+    const pixels = try vae.decode(alloc, latent, s);
     defer _ = mlx.mlx_array_free(pixels);
     const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
     const rgb = try framesToU8(pixels, alloc, s);
@@ -4466,6 +4513,33 @@ pub fn generateVideoFramesTwoStage(
 // ── Tests ──
 
 const testing = std.testing;
+
+test "the LTX quant helpers solve their width instead of assuming 4-bit" {
+    // The 4-bit and 8-bit packs are the SAME layout at different widths, so a
+    // hardcoded `bits` is an engine that can only load the pack it was written
+    // against — the 8-bit text encoder died at its first matmul with an MLX
+    // "shapes ... incompatible" error, which reads like a corrupt download.
+    // Every quantized read in this file resolves (bits, gs) from geometry.
+    const src = @embedFile("ltx_video.zig");
+    var it = std.mem.splitScalar(u8, src, '\n');
+    var checked: usize = 0;
+    while (it.next()) |line| {
+        // `mlx.check(` keeps the scan on real CALL SITES — this test's own
+        // search literals name the same functions.
+        if (std.mem.indexOf(u8, line, "mlx.check(") == null) continue;
+        const is_quant_call = std.mem.indexOf(u8, line, "mlx_quantized_matmul(") != null or
+            std.mem.indexOf(u8, line, "mlx_dequantize(") != null;
+        if (!is_quant_call) continue;
+        checked += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, "some(4)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "some(8)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "qp.bits") != null or
+            std.mem.indexOf(u8, line, "eqp.bits") != null);
+    }
+    // Three today (gQLin, dQLin, the embedding table). A zero here means the
+    // scan stopped matching the call and is guarding nothing.
+    try std.testing.expect(checked >= 3);
+}
 
 test "LtxConfig derived dims" {
     const c = LtxConfig{};
@@ -5003,7 +5077,7 @@ test "ltx DiT adaLN conditioning reproduces AdaLayerNormSingle" {
     const refe = try readF32(io, allocator, ep);
     defer allocator.free(refe);
 
-    const t_sin = try ditTimestepSinusoid(700.0, 256, s);
+    const t_sin = try timestepSinusoid(700.0, 256, s);
     defer _ = mlx.mlx_array_free(t_sin);
     const out = try ditAdaLNSingle(&comp, allocator, t_sin, "transformer.adaln_single", s);
     defer _ = mlx.mlx_array_free(out.params);

@@ -16,8 +16,9 @@ final class MusicGenTests: XCTestCase {
             XCTAssertFalse(p.id.isEmpty)
             XCTAssertFalse(p.repo.isEmpty)
             XCTAssertGreaterThan(p.approxRAMGB, 0)
-            // Turbo checkpoints are distillation-fixed at 8 steps.
-            XCTAssertEqual(p.fixedSteps, 8)
+            // Steps are checkpoint facts: ACE Turbo is distillation-fixed at
+            // 8; Music 3 runs the reference 30-step flow-match schedule.
+            XCTAssertEqual(p.fixedSteps, p.family == .acestep ? 8 : 30)
         }
         // Published converted repo → the pane offers a one-click download
         // (a `local/` prefix would show the convert-locally hint instead).
@@ -154,11 +155,17 @@ final class MusicGenTests: XCTestCase {
     // MARK: - Built-in example / template catalogs
 
     func testBuiltinStylesAndLyricsAreWellFormed() {
-        XCTAssertGreaterThanOrEqual(MusicPrompt.builtinStyles.count, 6)
         XCTAssertGreaterThanOrEqual(MusicPrompt.builtinLyrics.count, 4)
-        for p in MusicPrompt.builtinStyles {
-            XCTAssertFalse(p.title.isEmpty)
-            XCTAssertGreaterThan(p.body.count, 40, "style descriptions should be descriptive: \(p.title)")
+        // Both engine families have their own starters — Music 3 has no
+        // bpm/key/meter controls, so its examples carry that in the caption.
+        for family in [MusicEngineFamily.acestep, .minimaxMusic3] {
+            let styles = MusicPrompt.builtinStyles(for: family)
+            XCTAssertGreaterThanOrEqual(styles.count, 6)
+            for p in styles {
+                XCTAssertFalse(p.title.isEmpty)
+                XCTAssertGreaterThan(p.body.count, 40, "style descriptions should be descriptive: \(p.title)")
+            }
+            XCTAssertEqual(Set(styles.map(\.title)).count, styles.count)
         }
         for p in MusicPrompt.builtinLyrics {
             XCTAssertFalse(p.title.isEmpty)
@@ -167,7 +174,6 @@ final class MusicGenTests: XCTestCase {
                           "lyric template needs section tags: \(p.title)")
         }
         // Titles are unique (they're the dedup + display key).
-        XCTAssertEqual(Set(MusicPrompt.builtinStyles.map(\.title)).count, MusicPrompt.builtinStyles.count)
         XCTAssertEqual(Set(MusicPrompt.builtinLyrics.map(\.title)).count, MusicPrompt.builtinLyrics.count)
     }
 
@@ -325,5 +331,124 @@ final class MusicGenTests: XCTestCase {
             fm.createFile(atPath: (te as NSString).appendingPathComponent(f), contents: Data([0]))
         }
         XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
+    // MARK: - MiniMax Music 3 (second music family — the field-gating tests)
+
+    func testMusic3PresetDeclaresItsOwnKnobSet() {
+        let p = MusicModelPreset.miniMaxMusic3_8bit
+        XCTAssertEqual(p.family, .minimaxMusic3)
+        XCTAssertFalse(p.supportsMusicalMeta, "bpm/keyscale/timesignature/vocal_language are ACE-Step-only")
+        XCTAssertTrue(p.requiresLyrics, "the model is lyric-conditioned; the server 400s empty lyrics")
+        XCTAssertEqual(p.durationRange, 5...360)
+        XCTAssertFalse(p.isLocalOnly)
+        XCTAssertEqual(p.repo, "ddalcu/MiniMax-Music3-MLX-Serve-8bit")
+        XCTAssertTrue(MusicModelPreset.all.contains(p), "catalog must offer it")
+        // ACE keeps its full knob set.
+        let ace = MusicModelPreset.acestepXLTurbo8bit
+        XCTAssertTrue(ace.supportsMusicalMeta)
+        XCTAssertFalse(ace.requiresLyrics)
+        XCTAssertEqual(ace.durationRange, 10...600)
+    }
+
+    func testRequestBodyDropsAcestepOnlyFieldsForMusic3() {
+        // Fields left over from an ACE-Step session must NOT ride the wire —
+        // the server names each one a 400 (the app gates the FIELDS, not just
+        // the controls).
+        let req = MusicGenRequest(
+            model: .miniMaxMusic3_8bit,
+            prompt: "upbeat synthwave",
+            lyrics: "[verse]\nneon lights",
+            vocalLanguage: "en",
+            bpm: 128,
+            keyscale: "F# minor",
+            timesignature: "4",
+            durationSeconds: 60,
+            seed: 7
+        )
+        let body = MusicGenService.requestBody(req, modelName: "m")
+        XCTAssertNil(body["bpm"])
+        XCTAssertNil(body["keyscale"])
+        XCTAssertNil(body["timesignature"])
+        XCTAssertNil(body["vocal_language"])
+        XCTAssertEqual(body["lyrics"] as? String, "[verse]\nneon lights")
+        XCTAssertEqual(body["prompt"] as? String, "upbeat synthwave")
+    }
+
+    func testRequestBodyClampsDurationToTheModelsRange() {
+        // Sticky settings persist across model switches: ACE's 600 s against
+        // music3's 360 cap (and ACE's own 10 s floor) must clamp, not 400.
+        let long = MusicGenRequest(model: .miniMaxMusic3_8bit, prompt: "p", lyrics: "l", durationSeconds: 600)
+        XCTAssertEqual(MusicGenService.requestBody(long, modelName: "m")["duration_seconds"] as? Int, 360)
+        let short = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "p", durationSeconds: 5)
+        XCTAssertEqual(MusicGenService.requestBody(short, modelName: "m")["duration_seconds"] as? Int, 10)
+    }
+
+    func testSettingsSidecarOmitsAcestepFieldsForMusic3() {
+        let req = MusicGenRequest(
+            model: .miniMaxMusic3_8bit,
+            prompt: "synthwave",
+            lyrics: "[verse]\nla",
+            vocalLanguage: "en",
+            bpm: 128,
+            keyscale: "F# minor",
+            timesignature: "4",
+            durationSeconds: 30,
+            seed: 3
+        )
+        let text = MusicGenService.settingsText(req, resolvedSeed: 3, modelName: "m")
+        XCTAssertFalse(text.contains("bpm:"))
+        XCTAssertFalse(text.contains("keyscale:"))
+        XCTAssertFalse(text.contains("timesignature:"))
+        XCTAssertFalse(text.contains("vocal_language:"))
+        XCTAssertTrue(text.contains("# Lyrics\n[verse]"))
+    }
+
+    func testMusic3FamilyResolvesFromArchitecture() {
+        // A downloaded pack (any dir name) surfaces in the pane with music3's
+        // gated knob set — resolution keys on the server-reported arch.
+        let models = [ModelInfo(name: "ddalcu/MiniMax-Music3-MLX-Serve-8bit",
+                                quantBits: 8, layers: 0, hiddenSize: 0, vocabSize: 0,
+                                contextLength: 0, modelMaxTokens: 0,
+                                architecture: "minimax_music3",
+                                capabilities: ["audio", "music"])]
+        let p = CustomMediaModels.musicPreset(for: "ddalcu/MiniMax-Music3-MLX-Serve-8bit", from: models)
+        XCTAssertEqual(p?.family, .minimaxMusic3)
+        XCTAssertEqual(p?.repo, "ddalcu/MiniMax-Music3-MLX-Serve-8bit")
+        XCTAssertFalse(p?.supportsMusicalMeta ?? true)
+    }
+
+    func testMusic3SelectionAgainstPackListing() {
+        // Simulated HF tree of the published pack: the selection must pull the
+        // five safetensors + config + both tokenizer dirs and skip the junk;
+        // every readiness marker must be in the downloaded set.
+        let entries: [[String: Any]] = [
+            ["path": ".gitattributes", "type": "file", "size": 1600],
+            ["path": "LICENSE", "type": "file", "size": 9000],
+            ["path": "README.md", "type": "file", "size": 4000],
+            ["path": "config.json", "type": "file", "size": 1400],
+            ["path": "language_model.safetensors", "type": "file", "size": 9_890_000_000],
+            ["path": "rvq_depth_decoder.safetensors", "type": "file", "size": 710_000_000],
+            ["path": "transformer.safetensors", "type": "file", "size": 2_600_000_000],
+            ["path": "condition_encoder.safetensors", "type": "file", "size": 100_000_000],
+            ["path": "vocoder.safetensors", "type": "file", "size": 220_000_000],
+            ["path": "tokenizer/tokenizer.json", "type": "file", "size": 11_400_000],
+            ["path": "tokenizer/tokenizer_config.json", "type": "file", "size": 377],
+            ["path": "tokenizer/chat_template.jinja", "type": "file", "size": 4168],
+            ["path": "music_tokenizer/tokenizer.json", "type": "file", "size": 11_400_000],
+            ["path": "music_tokenizer/vocab.json", "type": "file", "size": 2_700_000],
+            ["path": "music_tokenizer/merges.txt", "type": "file", "size": 1_670_000],
+        ]
+        let comp = MusicModelPreset.miniMaxMusic3_8bit.bundle.components[0]
+        let picked = DownloadManager.selectNeededFiles(from: entries, selection: comp.selection).map(\.0)
+        for f in ["config.json", "language_model.safetensors", "rvq_depth_decoder.safetensors",
+                  "transformer.safetensors", "condition_encoder.safetensors", "vocoder.safetensors",
+                  "tokenizer/tokenizer.json"] {
+            XCTAssertTrue(picked.contains(f), "\(f) must be downloaded")
+        }
+        XCTAssertFalse(picked.contains("README.md"))
+        for marker in comp.readyMarkers {
+            XCTAssertTrue(picked.contains(marker), "readiness marker \(marker) not downloaded")
+        }
     }
 }

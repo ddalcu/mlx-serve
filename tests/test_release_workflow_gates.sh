@@ -151,6 +151,102 @@ for name, text in (("release.yml CLI tarball + app bundle", wf_text),
 check(wf_text.count("LICENSE-APACHE-2.0") >= 2,
       "release.yml packages the licenses into BOTH the tarball and the .app")
 
+# ── app/build.sh FAST_DEV: an iteration lever must not become a shipping mode.
+# Every fast-dev shortcut (incremental Swift, in-place bundle, reused
+# frameworks, no notarization) is gated on ONE variable, and an UNSET variable
+# has to be the release path — the version of this that got written first
+# reindented the whole script and left `# ... (rest of the block is identical)`
+# where the notarization and the App Store .pkg used to be, which is a release
+# script that silently ships an unnotarized app.
+b_lines = build_sh.splitlines()
+# Comments blanked, line numbers kept: these checks are about what the script
+# DOES, and every rule below is also explained in a comment right beside it.
+b_code = ["" if l.lstrip().startswith("#") else l for l in b_lines]
+
+def b_first(pat):
+    return next((i for i, l in enumerate(b_code) if re.search(pat, l)), None)
+
+def b_count(text):
+    return sum(l.count(text) for l in b_code)
+
+def in_fast_dev_else(idx):
+    """True when line `idx` sits in the ELSE arm of the nearest enclosing FAST_DEV if."""
+    els = max((i for i in range(idx) if b_lines[i].strip() == "else"), default=None)
+    if els is None:
+        return False
+    ifs = max((i for i in range(els) if b_lines[i].lstrip().startswith("if ")), default=None)
+    return ifs is not None and "$FAST_DEV" in b_lines[ifs]
+
+check("FAST_DEV:-0" in build_sh,
+      "FAST_DEV defaults to 0 — an unset env is the release path")
+
+# The engine defaults to ReleaseFast in BOTH modes: a Debug mlx-serve decodes
+# 2-4x slower, so an app built that way lies about every latency. ZIG_DEBUG is
+# the deliberate opt-in, and it is FAST_DEV-only — FAST_DEV is what stops before
+# notarization and the DMG, so that gate is the whole reason a Debug engine
+# cannot reach a shipping artifact.
+check("ZIG_DEBUG:-0" in build_sh,
+      "ZIG_DEBUG defaults to 0 — the engine is ReleaseFast unless asked otherwise")
+check(b_count("-Doptimize=ReleaseFast") == 1
+      and re.search(r"^ZIG_OPT=\(-Doptimize=ReleaseFast\)", build_sh, re.M),
+      "the zig optimize mode defaults to ReleaseFast, in exactly one place")
+dbg_opt = b_first(r"-Doptimize=Debug")
+check(b_count("-Doptimize=Debug") == 1 and dbg_opt is not None
+      and 'if [ "$ZIG_DEBUG" = "1" ]; then' in b_lines[dbg_opt - 1],
+      "the Debug optimize mode sits directly under the ZIG_DEBUG gate")
+check(re.search(r'\[ "\$ZIG_DEBUG" = "1" \] && \[ "\$FAST_DEV" != "1" \]', build_sh)
+      and re.search(r'ZIG_DEBUG=1 is a FAST_DEV-only lever', build_sh),
+      "ZIG_DEBUG without FAST_DEV is refused BY NAME, never quietly ignored")
+refuse = b_first(r"ZIG_DEBUG=1 is a FAST_DEV-only lever")
+check(refuse is not None
+      and any(l.strip() == "exit 1" for l in b_lines[refuse:refuse + 4]),
+      "the ZIG_DEBUG refusal actually exits")
+check(refuse is not None and b_first(r'"\$ZIG" build') is not None
+      and refuse < b_first(r'"\$ZIG" build'),
+      "the refusal fires before any build work is done")
+
+# The debug Swift configuration is reachable only from the FAST_DEV gate.
+dbg = b_first(r"^\s*SWIFT_CONFIG=debug")
+rel = b_first(r"^\s*SWIFT_CONFIG=release")
+check(dbg is not None and 'if [ "$FAST_DEV" = "1" ]; then' in b_lines[dbg - 1],
+      "the debug swift configuration sits directly under the FAST_DEV gate")
+check(rel is not None and in_fast_dev_else(rel),
+      "the release path still compiles -c release")
+
+# The clean-bundle wipe belongs to the release path — only `rm -rf` guarantees
+# a retired resource stops shipping.
+rmapp = b_first(r'^\s*rm -rf "\$APP"$')
+check(rmapp is not None and in_fast_dev_else(rmapp),
+      "the release build still starts from an EMPTY bundle")
+
+# FAST_DEV stops at a signed .app: everything past that point produces
+# something to hand someone.
+fast_exit = next((i for i, l in enumerate(b_lines)
+                  if l.strip() == "exit 0"
+                  and any('"$FAST_DEV" = "1"' in x for x in b_lines[max(0, i - 8):i])), None)
+sign_app = b_first(r'codesign "\$\{APP_SIGN_OPTS\[@\]\}" "\$APP"')
+check(fast_exit is not None, "FAST_DEV exits before anything shippable is produced")
+check(sign_app is not None and fast_exit is not None and sign_app < fast_exit,
+      "a fast build is still a SIGNED bundle")
+for shipping in (r"notarytool submit", r"productbuild", r"create-dmg\.sh"):
+    at = b_first(shipping)
+    check(at is not None and fast_exit is not None and fast_exit < at,
+          f"the FAST_DEV exit precedes {shipping.replace(chr(92), '')}")
+
+# Reusing the staged frameworks means skipping their re-sign too: the fixups
+# that would follow rewrite the files and invalidate the signatures.
+skip_stage = b_first(r"^\s*STAGE_FRAMEWORKS=0")
+check(skip_stage is not None
+      and any('"$FAST_DEV" = "1"' in l for l in b_lines[max(0, skip_stage - 8):skip_stage]),
+      "frameworks are only reused under FAST_DEV")
+for pat, what in ((r'install_name_tool -add_rpath @loader_path "\$CONTENTS/Frameworks/libmlx\.dylib"',
+                   "libmlx rpath fixup"),
+                  (r'codesign "\$\{SIGN_OPTS\[@\]\}" "\$fw"', "framework signing")):
+    for i, l in enumerate(b_lines):
+        if re.search(pat, l):
+            guarded = any('STAGE_FRAMEWORKS' in x for x in b_lines[max(0, i - 12):i])
+            check(guarded, f"{what} runs only when the frameworks were restaged")
+
 # ── Homebrew push timing: the release is created as a DRAFT, so its assets
 # are not downloadable until it is published. The formula push must fire on
 # the publish transition ONLY — any other trigger reintroduces the window

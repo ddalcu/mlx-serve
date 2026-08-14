@@ -74,6 +74,7 @@ struct VideoGenView: View {
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     @State private var bestQuality: Bool = false
+    @State private var diffusionDecoder: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, recipe off.
     @State private var turbo: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -320,6 +321,14 @@ struct VideoGenView: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .onChange(of: resolution) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
+            // A two-stage tier denoises at HALF this canvas and upscales, so on
+            // a small pick "Quality" is softer than the one-stage tiers above
+            // it in the same menu. Only shown when that tier is selected — the
+            // note is about the combination, not the resolution.
+            if model.settings(quality).mode != .oneStage,
+               let note = model.twoStageCanvasNote(width: resolution.width, height: resolution.height) {
+                Text(note).font(.caption2).foregroundStyle(.orange)
+            }
         }
     }
 
@@ -368,7 +377,7 @@ struct VideoGenView: View {
     /// pick longer than RAM suggests — we just hint at it in the warning
     /// below the dropdown rather than removing the option.
     private var availableFrameOptions: [Int] {
-        model.frameOptions
+        model.frameOptions(width: resolution.width, height: resolution.height)
     }
 
     /// Soft hint when the chosen length looks too aggressive for the Mac's
@@ -872,6 +881,11 @@ struct VideoGenView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
+            if model.supportsDiffusionDecoder {
+                Toggle("Diffusion decoder (sharper, slower)", isOn: $diffusionDecoder)
+                    .font(.caption)
+                    .help("Off (default): the plain convolutional decoder. On: LTX's own diffusion decoder — the one their published clips use. It denoises the frames instead of interpolating them, so fine texture and edges come out sharper. The decode itself takes about 21 s for a 97-frame clip at 768x512; measured end to end against the plain decoder in the same session the difference was inside run-to-run variance.")
+            }
             if model.supportsFastRecipe {
                 Toggle("Max quality (slower)", isOn: $bestQuality)
                     .font(.caption)
@@ -1210,6 +1224,7 @@ struct VideoGenView: View {
         seed = s.seed
         keepResident = s.keepResident
         bestQuality = s.bestQuality
+        diffusionDecoder = s.diffusionDecoder
         promptHeight = PromptEditorHeight.clamp(s.promptHeight)
         loras = s.loras
         // A LoRA file may have moved since last session — drop stale entries.
@@ -1231,6 +1246,7 @@ struct VideoGenView: View {
         s.seed = seed
         s.keepResident = keepResident
         s.bestQuality = bestQuality
+        s.diffusionDecoder = diffusionDecoder
         s.turbo = turbo
         s.promptHeight = PromptEditorHeight.clamp(promptHeight)
         s.loras = loras
@@ -1241,7 +1257,7 @@ struct VideoGenView: View {
 
     private func applyModelDefaults() {
         quality = model.defaultQuality
-        resolution = model.defaultResolution
+        resolution = model.recommendedResolution(totalGB: RAMChecker.totalGB)
         fps = model.fps
         // A clip attached under LTX must not survive a switch to a backend
         // that takes no audio input: the section hides, so the user can't
@@ -1253,6 +1269,12 @@ struct VideoGenView: View {
             clearAudio()
             audioSource = .none
         }
+        // The DiffVAE is the decoder LTX's own published clips use, and only
+        // the 8-bit pack ships it — a pack chosen FOR quality. Following the
+        // preset here (rather than defaulting the stored setting) also clears
+        // it on a switch to a pack that cannot serve it, so the toggle's state
+        // can never outlive the capability.
+        diffusionDecoder = model.supportsDiffusionDecoder
         applyQualityDefaults()
     }
 
@@ -1279,9 +1301,12 @@ struct VideoGenView: View {
     /// cap (`8N+1` ladder) — but no RAM-based clamping anymore. The user
     /// gets a soft warning instead.
     private func clampFramesToRAM() {
-        guard let lo = model.frameOptions.first, let hi = model.frameOptions.last else { return }
+        // The ladder is per-CANVAS now (the whole clip rides back as one
+        // base64 blob), so a length saved at 768×512 must snap down when the
+        // user moves to 1920×1088 — the slider only reads `numFrames`.
+        guard let lo = availableFrameOptions.first, let hi = availableFrameOptions.last else { return }
         if numFrames > hi {
-            numFrames = model.frameOptions.last(where: { $0 <= hi }) ?? hi
+            numFrames = availableFrameOptions.last(where: { $0 <= hi }) ?? hi
         } else if numFrames < lo {
             // Stale persisted value below a raised floor (e.g. H3's 5→124) —
             // the slider can't self-correct since it only reads `numFrames`.
@@ -1313,6 +1338,9 @@ struct VideoGenView: View {
             audioPath: model.supportsAudioInput ? audioURL?.path : nil,
             keepResident: keepResident,
             bestQuality: bestQuality,
+            // Belt-and-braces with the requestBody gate: the toggle's state
+            // survives a preset switch, and only one pack ships the decoder.
+            diffusionDecoder: model.supportsDiffusionDecoder && diffusionDecoder,
             lanModelId: lanModel,
             loras: loras,
             // Belt-and-braces with the requestBody gate (turbo state survives

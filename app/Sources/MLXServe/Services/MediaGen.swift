@@ -445,6 +445,13 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// pulled the shared encoder would fetch 8 GB it never opens, and one
     /// that didn't ship its own would generate against the wrong encoder.
     var shipsOwnTextEncoder: Bool = false
+    /// LTX's own DiffVAE decoder (`vae_diffusion_decoder.safetensors`), which
+    /// their published clips are decoded with — a small NA diffusion model that
+    /// denoises the pixels the plain conv decoder interpolates. DECLARED per
+    /// preset, because only the 8-bit pack ships the file: the 4-bit one does
+    /// not, and a toggle that always 400s is worse than no toggle. The field is
+    /// omitted from the request entirely when this is false.
+    var supportsDiffusionDecoder: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -491,11 +498,83 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// two landscape/portrait pairs keep their place in the list. Pinned by
     /// `testEveryLtxResolutionSurvivesTheTwoStagePipelines`.
     private static let ltxResolutions: [ResolutionOption] = [
-        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2) — default"),
-        .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)"),
-        .init(width: 704,  height: 448, label: "704 × 448 (landscape 14:9)"),
+        .init(width: 704,  height: 448, label: "704 × 448 (landscape 14:9) — fastest"),
         .init(width: 448,  height: 704, label: "448 × 704 (portrait 9:14)"),
+        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2)"),
+        .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)"),
+        .init(width: 1024, height: 576, label: "1024 × 576 (landscape 16:9)"),
+        .init(width: 576,  height: 1024, label: "576 × 1024 (portrait 9:16)"),
+        .init(width: 1600, height: 896, label: "1600 × 896 (landscape 16:9) — recommended"),
+        .init(width: 896,  height: 1600, label: "896 × 1600 (portrait 9:16)"),
+        .init(width: 1920, height: 1088, label: "1920 × 1088 (landscape 16:9) — LTX's own canvas, slowest"),
+        .init(width: 1088, height: 1920, label: "1088 × 1920 (portrait 9:16) — slowest"),
     ]
+
+    /// Ceiling on ONE generation's raw RGB volume. The server base64s the whole
+    /// `frames.rgb` buffer into a single JSON body and the app decodes it in
+    /// memory, so both sides hold the volume plus its base64 at once — a
+    /// 193-frame 1920×1088 clip is 1.2 GB raw, 1.6 GB encoded, and that is a
+    /// hang followed by a death rather than a slow render. 768 MB is twice the
+    /// largest volume we already ship (H3's 124f at 1344×768 = 384 MB).
+    /// Lifting it is a TRANSPORT change (stream the frames, or mux server-side)
+    /// — not a number to raise on its own.
+    static let maxFramePayloadBytes = 768 * 1024 * 1024
+
+    /// Frame counts offerable at this canvas: the `8N+1` ladder trimmed to what
+    /// one response can carry. Always returns at least the first rung, so the
+    /// picker can never render blank.
+    func frameOptions(width: Int, height: Int) -> [Int] {
+        let perFrame = max(1, width * height * 3)
+        let budget = Self.maxFramePayloadBytes / perFrame
+        let fits = frameOptions.filter { $0 <= budget }
+        return fits.isEmpty ? Array(frameOptions.prefix(1)) : fits
+    }
+
+    /// Ceiling for the AUTO-picked default canvas. This is a TIME budget, not a
+    /// memory one: the RAM rule below would hand a 64 GB Mac 1920×1088, and the
+    /// default tier is the one people press without thinking. 1920×1088 stays
+    /// one click away in the picker for finals.
+    private static let autoCanvasCapPixels = 1600 * 896
+
+    /// Stage 1 of a two-stage render must itself be a canvas this model would
+    /// be asked to fill: the pipeline denoises at HALF the requested size and
+    /// upscales, so "Quality" at 768×512 is a 384×256 render — visibly softer
+    /// than the one-stage tier sitting above it in the same menu. The smallest
+    /// canvas we offer is the floor, which makes 1408×896 the smallest size
+    /// where the tier pays for itself (and 1600×896 the first one on the
+    /// ladder). nil = no note; the backend without a two-stage tier never
+    /// carries one.
+    func twoStageCanvasNote(width: Int, height: Int) -> String? {
+        guard QualityPreset.allCases.contains(where: { settings($0).mode != .oneStage }) else { return nil }
+        guard let smallest = resolutions.map({ $0.width * $0.height }).min() else { return nil }
+        let halfArea = (width / 2) * (height / 2)
+        guard halfArea < smallest else { return nil }
+        return "Quality and Super Quality denoise at half this size (\(width / 2) × \(height / 2)) and upscale — "
+             + "below 1600 × 896 they can look softer than the one-stage tiers, not sharper."
+    }
+
+    /// Default canvas for THIS Mac. A single static default has to be safe on
+    /// the smallest supported machine, which is how a 128 GB Mac ended up
+    /// rendering 0.39 MP previews while LTX's own pipeline defaults to 2.09 MP.
+    /// Pure function of physical memory (mirrors `RecommendedModelPick`), so it
+    /// is testable off-machine: the largest rung that can still hold the
+    /// default tier's frame count, capped by `autoCanvasCapPixels`, and the
+    /// smallest rung when the model does not comfortably fit at all.
+    func recommendedResolution(totalGB: Int) -> ResolutionOption {
+        let frames = settings(defaultQuality).numFrames
+        let area = { (r: ResolutionOption) in r.width * r.height }
+        let fits = resolutions.filter {
+            area($0) <= Self.autoCanvasCapPixels
+                && RAMChecker.safeFrameCap(model: self, width: $0.width, height: $0.height,
+                                           available: totalGB) >= frames
+        }
+        // Ties are the portrait twin of the same canvas — resolve them by
+        // LADDER ORDER (landscape first), never by whichever the sort emitted
+        // last, or a fresh install opens in portrait for no stated reason.
+        let target = fits.map(area).max() ?? resolutions.map(area).min()
+        guard let want = target else { return defaultResolution }
+        return resolutions.first { area($0) == want } ?? defaultResolution
+    }
 
     /// LTX-2.3 frame ladder — every valid `8N+1` count from 9 up to
     /// `maxFrames`. 193 is the practical cap (≈8s at 24 fps); beyond that
@@ -526,7 +605,10 @@ struct VideoModelPreset: Identifiable, Hashable {
             fps: 24,
             qualityProfiles: [
                 .fast:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 49),
-                .good:         .init(mode: .oneStage,   steps: 12, cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
+                // One-stage runs the distilled transformer, whose sigma table
+                // is fixed at 8 — the server clamps anything else and logs it,
+                // so asking for 12 only made the pane's hint lie.
+                .good:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
                 .quality:      .init(mode: .twoStage,   steps: 30, cfgScale: 3.0, stgScale: 1.0, numFrames: 97),
                 .superQuality: .init(mode: .twoStageHQ, steps: 15, cfgScale: 3.0, stgScale: 0.0, numFrames: 97),
             ],
@@ -560,7 +642,10 @@ struct VideoModelPreset: Identifiable, Hashable {
             fps: 24,
             qualityProfiles: [
                 .fast:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 49),
-                .good:         .init(mode: .oneStage,   steps: 12, cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
+                // One-stage runs the distilled transformer, whose sigma table
+                // is fixed at 8 — the server clamps anything else and logs it,
+                // so asking for 12 only made the pane's hint lie.
+                .good:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
                 .quality:      .init(mode: .twoStage,   steps: 30, cfgScale: 3.0, stgScale: 1.0, numFrames: 97),
                 .superQuality: .init(mode: .twoStageHQ, steps: 15, cfgScale: 3.0, stgScale: 0.0, numFrames: 97),
             ],
@@ -569,6 +654,44 @@ struct VideoModelPreset: Identifiable, Hashable {
             frameOptions: frameLadder(maxFrames: cap),
             description: "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use.",
             shipsOwnTextEncoder: true
+        )
+    }()
+
+    /// LTX-2.5 at 8 bits — the quality pack. Same weights, same recipe, same
+    /// files as the 4-bit one; only the DiT/text-encoder width differs.
+    ///
+    /// Affine 4-bit group-64 injects ~9.9% relative noise into every one of the
+    /// 1632 quantized linears (measured off the packs: quantizer step over
+    /// per-group weight std); 8 bits is ~0.6%, and the same clip at the same
+    /// seed keeps a face, legs and fur the 4-bit render loses. It costs 3.5% of
+    /// generation time (measured 175 s vs 169 s, 97f at 768x512 one-stage) — the
+    /// DiT is compute-bound at these token counts, so the wider weights are
+    /// nearly free. 4-bit stays for Macs that cannot hold this one; every
+    /// community LTX int4 pack uses ConvRot/W4A8 rather than plain affine.
+    static let ltx25Q8: VideoModelPreset = {
+        let cap = 193
+        return VideoModelPreset(
+            id: "ddalcu/LTX-2.5-MLX-Serve-8bit",
+            name: "LTX-Video 2.5 (8-bit, best quality, ~59 GB)",
+            repo: "ddalcu/LTX-2.5-MLX-Serve-8bit",
+            approxDownloadGB: 59,
+            approxFirstRunDownloadGB: 59,
+            approxRAMGB: 42,
+            resolutions: ltxResolutions,
+            defaultResolution: ltxResolutions[2],
+            fps: 24,
+            qualityProfiles: [
+                .fast:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 49),
+                .good:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
+                .quality:      .init(mode: .twoStage,   steps: 30, cfgScale: 3.0, stgScale: 1.0, numFrames: 97),
+                .superQuality: .init(mode: .twoStageHQ, steps: 15, cfgScale: 3.0, stgScale: 0.0, numFrames: 97),
+            ],
+            defaultQuality: .good,
+            maxFrames: cap,
+            frameOptions: frameLadder(maxFrames: cap),
+            description: "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory.",
+            shipsOwnTextEncoder: true,
+            supportsDiffusionDecoder: true
         )
     }()
 
@@ -742,7 +865,9 @@ struct VideoModelPreset: Identifiable, Hashable {
         supportsReferences: true
     )
 
-    static let all: [VideoModelPreset] = [.ltx25Q4, .ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA]
+    // 8-bit first: it is the one to reach for on a Mac that can hold it, and
+    // the picker features the first entry of each capability group.
+    static let all: [VideoModelPreset] = [.ltx25Q8, .ltx25Q4, .ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)
@@ -926,14 +1051,26 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
 }
 
-/// ACE-Step music-generation checkpoints (the second audio backend beside
-/// Qwen3-TTS). Same local-convert convention as `Model3DModelPreset`.
+/// Which music ENGINE a checkpoint drives. The two families share the
+/// endpoint and nothing else: ACE-Step reads the whole musical-metadata knob
+/// set, MiniMax Music 3 rejects every one of those fields BY NAME and
+/// requires lyrics — so the family gates the FIELDS (request body + sidecar),
+/// not just the pane's controls.
+enum MusicEngineFamily {
+    case acestep
+    case minimaxMusic3
+}
+
+/// Music-generation checkpoints (ACE-Step + MiniMax Music 3, the music arms
+/// of the audio backend). Same local-convert convention as `Model3DModelPreset`.
 struct MusicModelPreset: Identifiable, Hashable {
     var id: String
     var name: String
     /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
     /// convert-on-device model (no HF pull); any other prefix is a normal repo.
     var repo: String
+    /// Engine family — decides the knob set, duration range and bundle layout.
+    var family: MusicEngineFamily = .acestep
     /// Peak unified-memory footprint, GB — drives the soft RAM gate
     /// (DiT + Qwen3-Embedding text encoder + Oobleck VAE resident together).
     let approxRAMGB: Int
@@ -955,6 +1092,18 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// button while its weights are absent.
     var isLocalOnly: Bool { repo.hasPrefix("local/") }
 
+    /// bpm/keyscale/timesignature/vocal_language — ACE-Step conditioning
+    /// fields with NO Music 3 equivalent (the server names each a 400).
+    var supportsMusicalMeta: Bool { family == .acestep }
+    /// Music 3 is lyric-conditioned; the server 400s empty lyrics. ACE-Step
+    /// defaults empty lyrics to "[Instrumental]".
+    var requiresLyrics: Bool { family == .minimaxMusic3 }
+    /// Server-valid duration bounds (ACE [10,600]; Music 3 [1,360], floored
+    /// at 5 for a usable slider).
+    var durationRange: ClosedRange<Double> {
+        family == .acestep ? 10...600 : 5...360
+    }
+
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
     /// text encoder in one bundle) — one-click download in the Music tab.
@@ -969,9 +1118,22 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "Generates full songs — instrumental or with sung lyrics — from a style description in just 8 steps. One self-contained download."
     )
 
-    /// Catalog. One entry today (the XL Turbo build); grows as more ACE-Step
-    /// variants convert.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit]
+    /// MiniMax Music 3, 8-bit — hierarchical AR (8B LLM + depth decoder)
+    /// driving a flow-matching DiT; full songs with sung lyrics at 44.1 kHz.
+    static let miniMaxMusic3_8bit = MusicModelPreset(
+        id: "minimax-music3-8bit",
+        name: "MiniMax Music 3 (8-bit)",
+        repo: "ddalcu/MiniMax-Music3-MLX-Serve-8bit",
+        family: .minimaxMusic3,
+        approxRAMGB: 20,
+        approxDownloadGB: 13.6,
+        fixedSteps: 30,
+        supportsLyrics: true,
+        description: "MiniMax's full-song model: an 8B language model writes the music frame by frame from your style prompt and lyrics, then a diffusion decoder renders it. Slower than ACE-Step, strongest vocals."
+    )
+
+    /// Catalog, best-first per family.
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit]
 }
 
 /// Dropdown catalogs for the Music tab's advanced options. Users shouldn't
@@ -1026,6 +1188,16 @@ struct MusicPrompt: Codable, Equatable, Identifiable {
     let body: String
     var id: String { title }
 
+    /// Style starters for the pane's Examples menu, per engine family.
+    /// ACE-Step reads a one-line genre/mood description and takes tempo, key
+    /// and meter from its own controls. Music 3 has none of those controls
+    /// (the server 400s the fields) and was trained on a structured caption —
+    /// so the caption is the ONLY place its tempo, key and arrangement can be
+    /// stated, and a one-liner leaves every one of those to the model.
+    static func builtinStyles(for family: MusicEngineFamily) -> [MusicPrompt] {
+        family == .minimaxMusic3 ? music3Styles : builtinStyles
+    }
+
     /// Built-in style-prompt starters (genre / mood / instrumentation).
     static let builtinStyles: [MusicPrompt] = [
         MusicPrompt(title: "Synthwave",
@@ -1048,6 +1220,132 @@ struct MusicPrompt: Codable, Equatable, Identifiable {
             body: "Hard-hitting trap beat with booming 808 bass, crisp rattling hi-hats, dark atmospheric bells, and punchy snappy snares. Confident, cinematic, modern."),
         MusicPrompt(title: "Cinematic ambient",
             body: "Slow cinematic ambient with evolving warm synth pads, distant piano, soft field-recording textures, and a gentle emotional swell. Spacious, reflective, calm."),
+    ]
+
+    /// MiniMax Music 3 captions — the checkpoint's own three-block format
+    /// (Global Metadata / Vocal Details / Arrangement) with its labelled
+    /// lines, written out in full so a user can edit one line and re-run.
+    static let music3Styles: [MusicPrompt] = [
+        MusicPrompt(title: "Synthwave", body: """
+            Global Metadata
+            Basic Attributes: bpm is 118. key is F, and scale is minor. Retro Synthwave / Outrun.
+            Global Emotional Progression: Opens cool and mechanical, warms through the first chorus into something wistful and wide-eyed, peaks in a euphoric final chorus, then empties out into calm.
+            Application Scenarios & Imagery: A night drive along an empty coastal highway, neon signs smearing past the windscreen.
+            Sonics & Production Profile: Wide analog stereo field, warm saturated low end, glassy chorused highs, gated reverb on the snare, a light tape flutter across the whole mix.
+
+            Vocal Details
+            Vocal Gender & Timbre: A single female lead, breathy and cool in a comfortable mid register, slightly detached.
+            Vocal Style: Long sustained phrases riding over the pulse, conversational in the verses and fully open in the choruses.
+            Harmony/Backing Vocals: Octave-up doubles and soft airy thirds in the choruses only.
+            Vocal FX: Lush plate reverb and a slow quarter-note delay, always kept intelligible.
+
+            Arrangement
+            Instrument Lifecycle Description (Primary/Secondary Layering):
+            Primary: An arpeggiated analog synth runs from the first bar to the last, joined by a soaring lead synth in the choruses.
+            Secondary: Analog bass and a punchy drum machine enter at the first verse, warm pads sit underneath, extra percussion arrives for the final chorus.
+            Groove & Foundation Progression: A steady eighth-note pulse under a driving four-on-the-floor kick, with the bass locking to the arpeggio and opening into longer notes in the chorus.
+            Embellishments, Textures & Spatial FX: Slow filter sweeps open each section, a snare fill lifts the pre-chorus, the bridge drops the drums for a single held pad, and the outro strips back to the arpeggio and tape hiss.
+            """),
+        MusicPrompt(title: "Lo-fi study beats", body: """
+            Global Metadata
+            Basic Attributes: bpm is 82. key is Eb, and scale is major. Lo-fi Hip Hop / Chillhop.
+            Global Emotional Progression: Nostalgic and unhurried from the first bar, drifting a little brighter in the middle and settling back into stillness.
+            Application Scenarios & Imagery: Rain on a window at 2am, a desk lamp, a half-finished page.
+            Sonics & Production Profile: Narrow warm mix, rolled-off highs, dusty vinyl crackle throughout, gentle tape saturation and soft sidechain breathing on the pads.
+
+            Vocal Details
+            Vocal Gender & Timbre: Largely instrumental — the Rhodes piano carries the melody.
+            Vocal Style: Occasional wordless female vocal fragments, soft and half-buried.
+            Harmony/Backing Vocals: None beyond those fragments.
+            Vocal FX: Heavy low-pass and long reverb, used as texture rather than as a lead.
+
+            Arrangement
+            Instrument Lifecycle Description (Primary/Secondary Layering):
+            Primary: Warm mellow Rhodes chords with a loose swung feel, present the whole track.
+            Secondary: Soft boom-bap drums and a round upright bass enter after the intro; a muted guitar figure joins in the middle third and drops away for the outro.
+            Groove & Foundation Progression: Laid-back swung sixteenths, snare slightly behind the beat, bass walking simply under the chord changes without ever pushing the tempo.
+            Embellishments, Textures & Spatial FX: Vinyl crackle and distant room tone run underneath, a tape-stop marks the halfway point, and the final bars fade to crackle alone.
+            """),
+        MusicPrompt(title: "Epic orchestral", body: """
+            Global Metadata
+            Basic Attributes: bpm is 96. key is D, and scale is minor. Cinematic Orchestral / Trailer.
+            Global Emotional Progression: Ominous and sparse at the start, gathering tension in waves, breaking into a triumphant, overwhelming climax before a quiet, exhausted resolution.
+            Application Scenarios & Imagery: An army cresting a ridge at dawn; the last shot before the credits.
+            Sonics & Production Profile: Huge concert-hall depth, deep sub-heavy percussion, wide string sections panned across the stage, generous natural reverb tails and enormous dynamic range.
+
+            Vocal Details
+            Vocal Gender & Timbre: A mixed choir, no soloist — deep basses under bright sopranos.
+            Vocal Style: Wordless sustained vowels in the build, shifting to hard rhythmic syllables at the climax.
+            Harmony/Backing Vocals: Dense block harmony doubling the brass line an octave above.
+            Vocal FX: Nothing beyond the hall — the space is the effect.
+
+            Arrangement
+            Instrument Lifecycle Description (Primary/Secondary Layering):
+            Primary: Low strings open alone with a repeating ostinato that survives every section and returns at the end.
+            Secondary: Taiko drums and low brass enter for the first build, horns and full strings for the second, choir and cymbals at the climax, solo cello for the resolution.
+            Groove & Foundation Progression: A driving ostinato pulse that doubles in rhythmic density each build, with the percussion moving from a slow half-time thud into hammered eighth notes.
+            Embellishments, Textures & Spatial FX: Rising string runs and braams mark each transition, a full silence lands one bar before the climax, and the last thirty seconds decay into a single sustained note.
+            """),
+        MusicPrompt(title: "Modern pop", body: """
+            Global Metadata
+            Basic Attributes: bpm is 112. key is A, and scale is major. Contemporary Pop / Dance Pop.
+            Global Emotional Progression: Bright and confident from the first line, building anticipation through the pre-chorus and landing on an open, celebratory chorus that gets bigger every time it returns.
+            Application Scenarios & Imagery: Windows down in late summer, a city that stays warm after dark.
+            Sonics & Production Profile: Loud, tight and radio-forward — punchy compressed drums, a clean wide top end, shimmering synths and a bass that sits right under the vocal.
+
+            Vocal Details
+            Vocal Gender & Timbre: A female lead, bright and forward with a light rasp at the top of her range.
+            Vocal Style: Rhythmic and clipped in the verses, sustained and belted in the choruses.
+            Harmony/Backing Vocals: Stacked thirds and fifths on every chorus line, plus short answering ad-libs between phrases.
+            Vocal FX: Tight doubling, a clean short slap delay and a bright plate — polished but not processed into glass.
+
+            Arrangement
+            Instrument Lifecycle Description (Primary/Secondary Layering):
+            Primary: A bouncy synth bass and the lead vocal drive the whole song.
+            Secondary: Muted plucks and finger snaps carry the verses, full drums and shimmering pad chords land at each chorus, a guitar counter-line appears only in the last chorus.
+            Groove & Foundation Progression: A four-on-the-floor kick with an offbeat bass bounce, the verse groove stripped to kick and snaps and the chorus opening into full kit with a clap layer.
+            Embellishments, Textures & Spatial FX: Riser sweeps and a drum drop-out set up each chorus, the bridge cuts to vocal and pad alone, and the final chorus adds an octave-up vocal stack.
+            """),
+        MusicPrompt(title: "Acoustic folk", body: """
+            Global Metadata
+            Basic Attributes: bpm is 72. key is G, and scale is major. Acoustic Folk / Singer-Songwriter.
+            Global Emotional Progression: Intimate and tentative at first, growing in warmth and certainty as the arrangement fills, then returning to the quiet it started in.
+            Application Scenarios & Imagery: A wooden room, one microphone, rain outside and a fire that has been going a while.
+            Sonics & Production Profile: Close, dry and honest — natural room sound, minimal compression, full mid-range, breaths and string noise left in.
+
+            Vocal Details
+            Vocal Gender & Timbre: A male lead, soft and warm in a low-to-mid register, a little air on every phrase.
+            Vocal Style: Storytelling delivery, close to the microphone, gentle and unhurried, lifting only slightly at the emotional peak.
+            Harmony/Backing Vocals: A single female harmony a third above, entering at the second chorus and staying to the end.
+            Vocal FX: A short natural room reverb, nothing else.
+
+            Arrangement
+            Instrument Lifecycle Description (Primary/Secondary Layering):
+            Primary: Fingerpicked steel-string acoustic guitar from the first note to the last.
+            Secondary: An upright bass joins the first chorus, a cello enters in the second verse and holds long notes underneath, brushed drums arrive only for the final chorus.
+            Groove & Foundation Progression: A steady fingerpicked pattern acts as the pulse, with the bass outlining the roots and the brushes adding a soft swing at the end rather than a beat.
+            Embellishments, Textures & Spatial FX: Occasional harmonics and a slide into each chorus, one bar of guitar alone before the last verse, and a final chord left to ring out into the room.
+            """),
+        MusicPrompt(title: "Trap", body: """
+            Global Metadata
+            Basic Attributes: bpm is 140. key is C#, and scale is minor. Trap / Dark Cinematic Hip Hop.
+            Global Emotional Progression: Cold and menacing from the opening bar, tightening as the hats accelerate, opening into a wide, cinematic hook and dropping back to near silence at the close.
+            Application Scenarios & Imagery: Empty parking garage, headlights, rain on concrete.
+            Sonics & Production Profile: Sub-heavy and modern — long distorted 808s, sharp transient drums, a dark and mostly empty midrange, wide reverb on the melodic layer only.
+
+            Vocal Details
+            Vocal Gender & Timbre: A male lead, low and half-spoken, with a relaxed confident delivery.
+            Vocal Style: Rhythmic triplet phrasing in the verses, longer melodic lines on the hook.
+            Harmony/Backing Vocals: Doubled hook lines an octave down and short ad-libs answering the ends of phrases.
+            Vocal FX: Light autotune on the hook only, tight doubling and a dark reverb.
+
+            Arrangement
+            Instrument Lifecycle Description (Primary/Secondary Layering):
+            Primary: A booming 808 bass and a dark bell melody carry the track end to end.
+            Secondary: Rattling hi-hats and snappy snares enter after the intro, a low string pad joins for the hook, and a detuned pluck answers the vocal in the second verse.
+            Groove & Foundation Progression: Half-time snare on the third beat against triplet hat rolls that double in speed into each hook, the 808 sliding between roots rather than repeating them.
+            Embellishments, Textures & Spatial FX: Reverse cymbals mark transitions, the beat cuts out entirely for two bars before the final hook, and the outro leaves the bell melody alone in the reverb.
+            """),
     ]
 
     /// Built-in lyric templates — ORIGINAL, royalty-free skeletons across the
@@ -1343,6 +1641,9 @@ struct VideoGenRequest {
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every
     /// forward dense, ~2.8x slower at 768p, "just a smidge better").
     var bestQuality: Bool = false
+    /// Decode the final latent with LTX's DiffVAE instead of the conv decoder
+    /// ("decoder": "diffusion"). Only sent on a preset that declares it.
+    var diffusionDecoder: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.

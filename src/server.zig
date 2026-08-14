@@ -10,6 +10,7 @@ const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
+const lfm2_vision = @import("lfm2_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -1396,8 +1397,9 @@ pub fn serve(
     const rss = metrics.getAppRssMb();
     if (rss >= 1024) {
         log.info("RSS: {d}.{d}G  Mem: {d}%  CPU: {d}%  GPU: {d}%\n", .{
-            rss / 1024, (rss % 1024) * 10 / 1024,
-            metrics.getSysMemPct(), metrics.getCpuPct(), metrics.getGpuPct(),
+            rss / 1024,             (rss % 1024) * 10 / 1024,
+            metrics.getSysMemPct(), metrics.getCpuPct(),
+            metrics.getGpuPct(),
         });
     } else {
         log.info("RSS: {d}M  Mem: {d}%  CPU: {d}%  GPU: {d}%\n", .{
@@ -2871,8 +2873,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
-        const msg = try std.fmt.allocPrint(allocator,
-            "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -3117,7 +3118,10 @@ fn renderModelEntry(
             .has_embedding = config.hasEmbeddingCapability(),
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
-            .has_music_backend = if (entry.audio_engine) |ae| ae.backend == .music else false,
+            .has_music_backend = if (entry.audio_engine) |ae| switch (ae.backend) {
+                .music, .music3 => true,
+                else => false,
+            } else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
         });
@@ -3208,7 +3212,8 @@ fn renderModelEntry(
     const err_part: []const u8 = if (entry.error_name) |name| blk: {
         // Inline escape to avoid double allocation; the names we emit
         // never contain quotes/backslashes (they're @errorName output).
-        break :blk try std.fmt.allocPrint(allocator,
+        break :blk try std.fmt.allocPrint(
+            allocator,
             ",\"error\":\"{s}\"",
             .{name},
         );
@@ -3244,7 +3249,7 @@ fn renderModelEntry(
         if (media_modality) |m| {
             // The music backend advertises "music" beside "audio" on the stub
             // too (matches the ready-path readyCapsJson additive rule).
-            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint) == .music)
+            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint).servesMusic())
                 break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"music\"]");
             break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
         }
@@ -3727,15 +3732,14 @@ fn renderPropsBody(
     return std.fmt.allocPrint(allocator,
         \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}}}
     , .{
-        config.model_type,        ctx_str,
-        config.vocab_size,        config.hidden_size,
-        config.num_hidden_layers, config.num_attention_heads,
-        config.num_key_value_heads, config.head_dim,
-        config.quant_bits,        config.quant_group_size,
-        config.max_position_embeddings,
-        active_mem,               peak_mem,
-        available_mem,            safe_ctx,
-        cache_mem,
+        config.model_type,              ctx_str,
+        config.vocab_size,              config.hidden_size,
+        config.num_hidden_layers,       config.num_attention_heads,
+        config.num_key_value_heads,     config.head_dim,
+        config.quant_bits,              config.quant_group_size,
+        config.max_position_embeddings, active_mem,
+        peak_mem,                       available_mem,
+        safe_ctx,                       cache_mem,
     });
 }
 
@@ -4457,12 +4461,7 @@ fn handleChatCompletions(
                         if (img_obj != .object) continue;
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
-                        if (parseImageUrlContent(allocator, url_val.string, visionPreprocFromConfig(config))) |img| {
-                            image_list.append(allocator, img) catch {
-                                allocator.free(img.pixels);
-                                continue;
-                            };
-                        }
+                        appendImageUrlContent(allocator, &image_list, url_val.string, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
@@ -4628,8 +4627,7 @@ fn handleChatCompletions(
                     if (func == .object) {
                         if (func.object.get("name")) |name_val| {
                             if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator,
-                                    "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
+                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
                                 tool_choice_allocated = true;
                             }
                         }
@@ -4906,7 +4904,9 @@ fn handleChatCompletions(
     // request owns its embedding locally; we hand it off to the slot at
     // submit time. Defer frees if we don't transfer ownership.
     var local_ve: ?mlx.mlx_array = null;
-    defer { if (local_ve) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
+    }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_aud: usize = 0;
@@ -4915,7 +4915,7 @@ fn handleChatCompletions(
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -5743,7 +5743,9 @@ fn handleNonStreamingGeneration(
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
     // it). Nulled before transfer so the early-return defer is a no-op.
     var ve_local = vision_embeddings;
-    defer { if (ve_local) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
+    }
 
     var timer = Stopwatch.init(stream.io);
 
@@ -6328,7 +6330,9 @@ fn handleStreamingGeneration(
     // the slot on submit (slot.deinit frees). Nulled before transfer so
     // the early-return defer is a no-op.
     var ve_local = vision_embeddings;
-    defer { if (ve_local) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
+    }
 
     const config = lm.config.?;
     const chat_id = nowMs(stream.io);
@@ -6451,8 +6455,19 @@ fn handleStreamingGeneration(
     // the prompt itself opened a think block: generated reasoning is always
     // DELIVERED as reasoning_content, never paid-for-and-dropped. Thinking-off
     // is enforced prompt-side (chat.noThinkTailSuffix commits the channel).
-    var in_think_block = enable_thinking or prompt_opened_think;
+    // A stream starts inside a think block only when the RENDERED PROMPT ends
+    // inside one — never because the request asked for thinking. Qwen/Gemma
+    // templates render the opener when thinking is on, so `promptOpensThink`
+    // sees it; LFM2-VL's generation prompt is a bare `<|im_start|>assistant`
+    // and its model answers directly, so seeding from the flag routed the whole
+    // answer into reasoning_content and left `content` empty (live 2026-08-13).
+    // A model that opens the block itself is picked up by `saw_think_open`.
+    var in_think_block = prompt_opened_think;
     var think_closed = false; // a complete think block was already split+emitted this stream
+    // Leading whitespace is suppressed until the first visible byte, so the
+    // stream reaches the same content bytes as splitThinkBlock's own
+    // trimStart (chat.streamContentLead).
+    var content_started = false;
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
@@ -6635,6 +6650,7 @@ fn handleStreamingGeneration(
                         // re-opened later in the turn starts counting from zero.
                         reasoning_streamed = 0;
                         if (split.content.len > 0) {
+                            content_started = true;
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
                     },
@@ -6645,7 +6661,16 @@ fn handleStreamingGeneration(
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
-                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null, null, .{ .logprobs_json = try lps.take() });
+                            const vis = chat_mod.streamContentLead(tt, content_started);
+                            // Suppressed lead: nothing pending describes text the
+                            // client received, so retire it rather than letting it
+                            // ride the next chunk (logprobs.content ↔ content).
+                            if (vis.len == 0) {
+                                lps.dropPending();
+                                continue;
+                            }
+                            content_started = true;
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
                         token_texts.clearRetainingCapacity();
                     },
@@ -6827,7 +6852,11 @@ fn handleStreamingGeneration(
                     // The reasoning above this point never reaches the client,
                     // so its entries stop here rather than riding the answer.
                     lps.skipToContent(think_buf.items, content_after);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    const vis_content_after = chat_mod.streamContentLead(content_after, content_started);
+                    if (vis_content_after.len > 0) {
+                        content_started = true;
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_content_after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    }
                 } else {
                     lps.dropPending();
                 }
@@ -6864,7 +6893,13 @@ fn handleStreamingGeneration(
             if (chat_mod.isChannelMarkerToken(token_text)) {
                 continue;
             }
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null, null, .{ .logprobs_json = try lps.take() });
+            const vis_token_text = chat_mod.streamContentLead(token_text, content_started);
+            if (vis_token_text.len == 0) {
+                lps.dropPending();
+            } else {
+                content_started = true;
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_token_text }, null, null, null, .{ .logprobs_json = try lps.take() });
+            }
         }
 
         // Every branch above may have written NOTHING (tool-call detection and
@@ -6892,7 +6927,11 @@ fn handleStreamingGeneration(
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
         } else {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_buf.items }, null, null, null, .{ .logprobs_json = try lps.take() });
+            const vis_tail = chat_mod.streamContentLead(think_buf.items, content_started);
+            if (vis_tail.len > 0) {
+                content_started = true;
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take() });
+            }
         }
     }
 
@@ -8277,10 +8316,10 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
     const lead = s[i];
     // Determine expected sequence length from leading byte
     const expected: usize = if (lead & 0x80 == 0) 1 // 0xxxxxxx — ASCII
-    else if (lead & 0xE0 == 0xC0) 2 // 110xxxxx
-    else if (lead & 0xF0 == 0xE0) 3 // 1110xxxx
-    else if (lead & 0xF8 == 0xF0) 4 // 11110xxx
-    else return 0; // invalid leading byte, don't buffer
+        else if (lead & 0xE0 == 0xC0) 2 // 110xxxxx
+        else if (lead & 0xF0 == 0xE0) 3 // 1110xxxx
+        else if (lead & 0xF8 == 0xF0) 4 // 11110xxx
+        else return 0; // invalid leading byte, don't buffer
     const actual = s.len - i;
     return if (actual < expected) actual else 0;
 }
@@ -9015,6 +9054,70 @@ fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs:
     return .{ .pos = flat, .total = total, .delta = ri.delta };
 }
 
+/// LFM2-VL's image block is NOT a flat run of pads: each image opens with
+/// `<|image_start|>` and closes with `<|image_end|>`, and a TILED image labels
+/// every tile with `<|img_row_R_col_C|>` and its thumbnail with
+/// `<|img_thumbnail|>` before that piece's pads. The marker order has to match
+/// the order the encoder concatenated the pieces — both walk `images` — because
+/// the splice scatters embedding rows into pad slots positionally.
+///
+/// Returns null when the model isn't LFM2-VL or the turn carries no images, in
+/// which case the caller falls back to the flat BOI/pads/EOI run.
+fn lfm2ImageSegment(
+    allocator: std.mem.Allocator,
+    msgs: []const chat_mod.Message,
+    config: *const model_mod.ModelConfig,
+) !?[]u32 {
+    if (!config.lfm2_vision or config.image_token_id == 0) return null;
+    var images: []const chat_mod.ImageData = &.{};
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, msgs[i].role, "user")) {
+            images = msgs[i].images orelse &.{};
+            break;
+        }
+    }
+    if (images.len == 0) return null;
+
+    var seg = std.ArrayList(u32).empty;
+    errdefer seg.deinit(allocator);
+    const merge = if (config.lv_downsample > 0) config.lv_downsample else 1;
+    var open = false;
+    for (images) |img| {
+        // A tiled source contributes several entries in a row; they share one
+        // start/end pair, so the block opens on the first piece and closes when
+        // the last piece of that source has been emitted.
+        if (!open) {
+            if (config.boi_token_id > 0) try seg.append(allocator, config.boi_token_id);
+            open = true;
+        }
+        if (img.tile_rows > 0) {
+            const tiles: u16 = img.tile_rows * img.tile_cols;
+            if (img.tile_index == tiles) {
+                if (config.lv_thumbnail_token_id > 0) try seg.append(allocator, config.lv_thumbnail_token_id);
+            } else if (config.lv_row_col_base_id > 0) {
+                // The `<|img_row_R_col_C|>` block is contiguous and row-major
+                // over the MAX tile grid, not this image's.
+                const row = img.tile_index / img.tile_cols;
+                const col = img.tile_index % img.tile_cols;
+                const max_cols = if (config.lv_max_tiles > 0) config.lv_max_tiles else 10;
+                try seg.append(allocator, config.lv_row_col_base_id + row * max_cols + col);
+            }
+        }
+        const pads = (img.grid_h / merge) * (img.grid_w / merge);
+        try seg.appendNTimes(allocator, config.image_token_id, pads);
+        // Untiled, or the thumbnail that ends a tiled source.
+        if (img.tile_rows == 0 or img.tile_index == img.tile_rows * img.tile_cols) {
+            if (config.eoi_token_id > 0) try seg.append(allocator, config.eoi_token_id);
+            open = false;
+        }
+    }
+    // A tiled source whose thumbnail was suppressed leaves the block open.
+    if (open and config.eoi_token_id > 0) try seg.append(allocator, config.eoi_token_id);
+    return try seg.toOwnedSlice(allocator);
+}
+
 fn insertMultimodalTokens(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
@@ -9023,6 +9126,7 @@ fn insertMultimodalTokens(
     audio_token_id: u32,
     n_audio: usize,
     config: *const model_mod.ModelConfig,
+    msgs: []const chat_mod.Message,
 ) ![]u32 {
     const want_image = image_token_id != 0 and n_image > 0;
     const want_audio = audio_token_id != 0 and n_audio > 0;
@@ -9038,12 +9142,19 @@ fn insertMultimodalTokens(
     const boa = config.boa_token_id;
     const eoa = config.eoa_token_id;
 
+    const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, msgs, config) else null;
+    defer if (lfm2_seg) |ls| allocator.free(ls);
+
     var seg = std.ArrayList(u32).empty;
     defer seg.deinit(allocator);
     if (want_image) {
-        if (boi > 0) try seg.append(allocator, boi);
-        try seg.appendNTimes(allocator, image_token_id, n_image);
-        if (eoi > 0) try seg.append(allocator, eoi);
+        if (lfm2_seg) |ls| {
+            try seg.appendSlice(allocator, ls);
+        } else {
+            if (boi > 0) try seg.append(allocator, boi);
+            try seg.appendNTimes(allocator, image_token_id, n_image);
+            if (eoi > 0) try seg.append(allocator, eoi);
+        }
     }
     if (want_audio) {
         if (boa > 0) try seg.append(allocator, boa);
@@ -9086,6 +9197,24 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.lfm2_vision) {
+        // NaFlex: no temporal axis and no merge-block patch order — the
+        // projector unshuffles AFTER the tower, so the grid stays plain
+        // row-major and `merge` only sizes the token count.
+        return .{
+            .mode = .lfm2,
+            .patch = config.vision_patch_size,
+            .tps = 1,
+            .merge = config.lv_downsample,
+            .min_tokens = config.lv_min_image_tokens,
+            .max_tokens = config.lv_max_image_tokens,
+            .tile_size = if (config.lv_split_images) config.lv_tile_size else 0,
+            .min_tiles = config.lv_min_tiles,
+            .max_tiles = config.lv_max_tiles,
+            .use_thumbnail = config.lv_use_thumbnail,
+            .pixels_tolerance = config.lv_pixels_tolerance,
+        };
+    }
     if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
         .mode = if (config.muse_vision) .muse else .qwen,
@@ -9193,60 +9322,223 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
     return null;
 }
 
-fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
-    const target: u32 = 768; // Gemma 4 default for square images
+/// Decode one `image_url` into as many entries as the model's processor makes
+/// of it — one per tower call. Only LFM2-VL ever yields more than one: past its
+/// single-tile token budget it splits the source into a tile grid plus a
+/// thumbnail, and each piece is encoded separately. Every other arch appends
+/// exactly one entry, or none when the payload can't be decoded.
+pub fn appendImageUrlContent(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    url: []const u8,
+    vp: chat_mod.VisionPreproc,
+) void {
+    if (vp.mode == .lfm2 and vp.tile_size > 0 and std.mem.startsWith(u8, url, "data:image/") and
+        !std.mem.startsWith(u8, url, "data:image/x-mlx-pixels"))
+    {
+        appendLfm2Tiles(allocator, list, url, vp);
+        return;
+    }
+    if (parseImageUrlContent(allocator, url, vp)) |img| {
+        list.append(allocator, img) catch allocator.free(img.pixels);
+    }
+}
 
-    // Try stb_image first (JPEG/PNG) — request 4 channels to handle transparency
+/// `Lfm2VlImageProcessor.resize_and_split`: a source inside the budget is one
+/// resized image; past it, the WHOLE image is resized onto a `cols`x`rows`
+/// canvas of `tile_size` tiles, cut into tiles, and a thumbnail of the whole
+/// image is appended after them. The canvas is resampled ONCE and read tile by
+/// tile — re-resizing per tile would resample each region on its own and is not
+/// what `split_to_tiles` does.
+fn appendLfm2Tiles(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    url: []const u8,
+    vp: chat_mod.VisionPreproc,
+) void {
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return;
+    const b64 = url[sep + 8 ..];
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return;
+    const raw = allocator.alloc(u8, decoded_size) catch return;
+    defer allocator.free(raw);
+    std.base64.standard.Decoder.decode(raw, b64) catch return;
+
+    const src = decodeRgbOwned(allocator, raw) orelse return;
+    defer src.deinit(allocator);
+
+    const split = vp.max_tiles > 1 and
+        lfm2_vision.isImageTooLarge(src.h, src.w, vp.patch, vp.merge, vp.max_tokens, vp.pixels_tolerance);
+    // Doubles as the whole-image geometry when the source stays one tile.
+    const thumb = lfm2_vision.smartResize(src.h, src.w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens);
+    const thumb_tokens = (thumb.h / vp.patch / vp.merge) * (thumb.w / vp.patch / vp.merge);
+
+    if (!split) {
+        const chw = lfm2Canvas(allocator, src, thumb.h, thumb.w) orelse return;
+        defer allocator.free(chw);
+        const img = lfm2Region(allocator, chw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w) orelse return;
+        list.append(allocator, img) catch {
+            allocator.free(img.pixels);
+            return;
+        };
+        log.info("  Decoded {d}x{d} image → lfm2 grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+            src.w, src.h, thumb.h / vp.patch, thumb.w / vp.patch, thumb_tokens, thumb.w, thumb.h,
+        });
+        return;
+    }
+
+    const grid = lfm2_vision.gridLayout(src.h, src.w, vp.min_tiles, vp.max_tiles, vp.tile_size);
+    const canvas_h = vp.tile_size * grid.rows;
+    const canvas_w = vp.tile_size * grid.cols;
+    const per_tile = (vp.tile_size / vp.patch / vp.merge) * (vp.tile_size / vp.patch / vp.merge);
+    const n_tiles: u16 = @intCast(grid.rows * grid.cols);
+    const before = list.items.len;
+
+    // A partial tile set would be spliced against a token layout that assumes
+    // all of them, so any failure drops the whole image rather than some of it.
+    var ok = true;
+    {
+        const chw = lfm2Canvas(allocator, src, canvas_h, canvas_w) orelse return;
+        defer allocator.free(chw);
+        outer: for (0..grid.rows) |row| {
+            for (0..grid.cols) |col| {
+                var img = lfm2Region(
+                    allocator,
+                    chw,
+                    canvas_h,
+                    canvas_w,
+                    vp,
+                    @intCast(row * vp.tile_size),
+                    @intCast(col * vp.tile_size),
+                    vp.tile_size,
+                    vp.tile_size,
+                ) orelse {
+                    ok = false;
+                    break :outer;
+                };
+                img.tile_rows = @intCast(grid.rows);
+                img.tile_cols = @intCast(grid.cols);
+                img.tile_index = @intCast(row * grid.cols + col);
+                list.append(allocator, img) catch {
+                    allocator.free(img.pixels);
+                    ok = false;
+                    break :outer;
+                };
+            }
+        }
+    }
+    if (!ok) {
+        for (list.items[before..]) |prior| allocator.free(prior.pixels);
+        list.shrinkRetainingCapacity(before);
+        return;
+    }
+
+    var thumb_note: []const u8 = "";
+    if (vp.use_thumbnail and n_tiles != 1) {
+        if (lfm2Canvas(allocator, src, thumb.h, thumb.w)) |tchw| {
+            defer allocator.free(tchw);
+            if (lfm2Region(allocator, tchw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w)) |t| {
+                var img = t;
+                img.tile_rows = @intCast(grid.rows);
+                img.tile_cols = @intCast(grid.cols);
+                img.tile_index = n_tiles;
+                list.append(allocator, img) catch allocator.free(img.pixels);
+                thumb_note = " + thumbnail";
+            }
+        }
+    }
+    log.info("  Decoded {d}x{d} image → lfm2 {d}x{d} tiles{s} on a {d}x{d} canvas ({d} tokens)\n", .{
+        src.w,     src.h,
+        grid.rows, grid.cols,
+        thumb_note, canvas_w,
+        canvas_h,  @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
+    });
+}
+
+/// Resize `src` onto a `canvas_h` x `canvas_w` normalized CHW buffer, owned by
+/// the caller. One resample serves every tile cut from it.
+fn lfm2Canvas(allocator: std.mem.Allocator, src: DecodedRgb, canvas_h: u32, canvas_w: u32) ?[]f32 {
+    const chw = allocator.alloc(f32, 3 * @as(usize, canvas_h) * canvas_w) catch return null;
+    qwen_vision.resizeRgbNormalizedChw(allocator, chw, src.rgb, src.h, src.w, canvas_h, canvas_w, .bicubic) catch {
+        allocator.free(chw);
+        return null;
+    };
+    return chw;
+}
+
+/// Emit the patch region at (`y0`, `x0`) of a prepared canvas as one `ImageData`.
+fn lfm2Region(
+    allocator: std.mem.Allocator,
+    chw: []const f32,
+    canvas_h: u32,
+    canvas_w: u32,
+    vp: chat_mod.VisionPreproc,
+    y0: u32,
+    x0: u32,
+    region_h: u32,
+    region_w: u32,
+) ?chat_mod.ImageData {
+    const C: u32 = 3;
+    const gh = region_h / vp.patch;
+    const gw = region_w / vp.patch;
+    const n: usize = @as(usize, gh) * gw;
+    const feat: usize = @as(usize, C) * vp.patch * vp.patch;
+    const bytes = allocator.alloc(u8, n * feat * 4) catch return null;
+    const out = @as([*]f32, @ptrCast(@alignCast(bytes.ptr)))[0 .. n * feat];
+    lfm2_vision.buildPixelValuesRegion(out, chw, C, canvas_h, canvas_w, vp.patch, y0, x0, region_h, region_w);
+    return .{ .pixels = bytes, .width = region_w, .height = region_h, .grid_h = gh, .grid_w = gw };
+}
+
+/// A decoded source image as packed RGB8, owned by `allocator`. One owner and
+/// one free path — stb and libwebp buffers are copied out and released here, so
+/// callers that need the pixels for more than one pass (LFM2-VL's tiles) do not
+/// juggle three different deallocators.
+const DecodedRgb = struct {
+    rgb: []u8,
+    w: u32,
+    h: u32,
+
+    fn deinit(self: DecodedRgb, allocator: std.mem.Allocator) void {
+        allocator.free(self.rgb);
+    }
+};
+
+fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    const pixels_rgba: ?[*]u8 = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4);
-    var pixels: ?[*]u8 = null;
-    var free_fn: enum { stb_free, webp_free, alloc_free } = .stb_free;
-
-    // Composite RGBA onto white background → RGB
-    if (pixels_rgba) |rgba| {
+    // stb first (JPEG/PNG) — 4 channels so transparency composites onto white.
+    if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
+        defer stb.stbi_image_free(rgba);
         const total_px: usize = @intCast(w * h);
-        const rgb_buf = allocator.alloc(u8, total_px * 3) catch {
-            stb.stbi_image_free(rgba);
-            return null;
-        };
+        const rgb = allocator.alloc(u8, total_px * 3) catch return null;
         for (0..total_px) |i| {
             const a = @as(u16, rgba[i * 4 + 3]);
             const inv_a = 255 - a;
-            rgb_buf[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
-            rgb_buf[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
-            rgb_buf[i * 3 + 2] = @intCast((a * @as(u16, rgba[i * 4 + 2]) + inv_a * 255) / 255);
+            rgb[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
+            rgb[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
+            rgb[i * 3 + 2] = @intCast((a * @as(u16, rgba[i * 4 + 2]) + inv_a * 255) / 255);
         }
-        stb.stbi_image_free(rgba);
-        pixels = rgb_buf.ptr;
-        free_fn = .alloc_free;
+        return .{ .rgb = rgb, .w = @intCast(w), .h = @intCast(h) };
     }
 
-    // If stb_image failed, try WebP
-    if (pixels == null) {
-        var webp_w: c_int = 0;
-        var webp_h: c_int = 0;
-        pixels = webp.WebPDecodeRGB(encoded.ptr, encoded.len, &webp_w, &webp_h);
-        if (pixels != null) {
-            w = webp_w;
-            h = webp_h;
-            free_fn = .webp_free;
-        }
-    }
-    if (pixels == null) return null;
-    const px = pixels.?;
-    defer switch (free_fn) {
-        .stb_free => stb.stbi_image_free(px),
-        .webp_free => webp.WebPFree(px),
-        .alloc_free => {
-            const src_total: usize = @intCast(w * h * 3);
-            allocator.free(px[0..src_total]);
-        },
-    };
+    var webp_w: c_int = 0;
+    var webp_h: c_int = 0;
+    const decoded = webp.WebPDecodeRGB(encoded.ptr, encoded.len, &webp_w, &webp_h) orelse return null;
+    defer webp.WebPFree(decoded);
+    const total: usize = @as(usize, @intCast(webp_w)) * @as(usize, @intCast(webp_h)) * 3;
+    const rgb = allocator.alloc(u8, total) catch return null;
+    @memcpy(rgb, decoded[0..total]);
+    return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
+}
 
-    const src_w: u32 = @intCast(w);
-    const src_h: u32 = @intCast(h);
+fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+    const target: u32 = 768; // Gemma 4 default for square images
+
+    const src = decodeRgbOwned(allocator, encoded) orelse return null;
+    defer src.deinit(allocator);
+    const px = src.rgb.ptr;
+    const src_w: u32 = src.w;
+    const src_h: u32 = src.h;
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
@@ -9261,10 +9553,11 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             vp.max_pixels
         else
             @max(qwen_vision.MAX_PIXELS, min_pixels);
-        const rs = if (vp.mode == .muse)
-            muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS)
-        else
-            qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels);
+        const rs = switch (vp.mode) {
+            .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
+            .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
+            else => qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels),
+        };
         const rh = rs.h;
         const rw = rs.w;
         const C: u32 = 3;
@@ -9289,19 +9582,20 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
-        const pv_f32 = @as([*]f32, @alignCast(@ptrCast(pv_bytes.ptr)))[0 .. n * feat];
-        if (vp.mode == .muse)
-            muse_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps)
-        else
-            qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
-        log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, if (vp.mode == .muse) "Muse" else "Qwen", gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
+        const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
+        switch (vp.mode) {
+            .muse => muse_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps),
+            .lfm2 => lfm2_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch),
+            else => qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge),
+        }
+        log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, @tagName(vp.mode), gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
         return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
     }
 
     // Allocate float32 CHW output: [3, target, target]
     const out_size = 3 * target * target;
     const out_buf = allocator.alloc(u8, out_size * 4) catch return null;
-    const float_buf: [*]f32 = @alignCast(@ptrCast(out_buf.ptr));
+    const float_buf: [*]f32 = @ptrCast(@alignCast(out_buf.ptr));
 
     // Bilinear resize + HWC→CHW + rescale to [0,1]
     for (0..target) |ty| {
@@ -9638,7 +9932,10 @@ fn handleAnthropicMessages(
                                     const rtype = if (rb.object.get("type")) |t| (if (t == .string) t.string else "") else "";
                                     if (std.mem.eql(u8, rtype, "text")) {
                                         if (rb.object.get("text")) |t| {
-                                            if (t == .string) { result_text = t.string; break; }
+                                            if (t == .string) {
+                                                result_text = t.string;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -9688,12 +9985,7 @@ fn handleAnthropicMessages(
                             };
                             if (data_url) |du| {
                                 defer allocator.free(du);
-                                if (parseImageUrlContent(allocator, du, visionPreprocFromConfig(config))) |img| {
-                                    image_list.append(allocator, img) catch {
-                                        allocator.free(img.pixels);
-                                        continue;
-                                    };
-                                }
+                                appendImageUrlContent(allocator, &image_list, du, visionPreprocFromConfig(config));
                             }
                         }
                     }
@@ -9843,8 +10135,7 @@ fn handleAnthropicMessages(
                     } else if (std.mem.eql(u8, tc_type, "tool")) {
                         if (tc.object.get("name")) |name_val| {
                             if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator,
-                                    "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
+                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
                                 tool_choice_allocated = true;
                             }
                         }
@@ -9955,7 +10246,9 @@ fn handleAnthropicMessages(
     // image tokens into the prompt at the model's configured image_token_id.
     // Phase A8: per-request ownership.
     var local_ve: ?mlx.mlx_array = null;
-    defer { if (local_ve) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
+    }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_aud: usize = 0;
@@ -9964,7 +10257,7 @@ fn handleAnthropicMessages(
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -10070,7 +10363,9 @@ fn handleAnthropicNonStreaming(
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
     var ve_local = vision_embeddings;
-    defer { if (ve_local) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
+    }
 
     var timer = Stopwatch.init(stream.io);
 
@@ -10307,7 +10602,9 @@ fn handleAnthropicStreaming(
     // Vision-array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer.
     var ve_local = vision_embeddings;
-    defer { if (ve_local) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
+    }
 
     // Pick speculative-decoding mode (regular / PLD / drafter). The token-
     // stream adapter below feeds the per-token Anthropic state machine the
@@ -10391,11 +10688,19 @@ fn handleAnthropicStreaming(
     const opens_think = prompt_opened_think;
     // Prompt-opened reasoning is DELIVERED as thinking blocks even when the
     // request didn't ask for thinking — generated tokens are never dropped.
-    var in_think_block = enable_thinking or prompt_opened_think;
+    // A stream starts inside a think block only when the RENDERED PROMPT ends
+    // inside one — never because the request asked for thinking. Qwen/Gemma
+    // templates render the opener when thinking is on, so `promptOpensThink`
+    // sees it; LFM2-VL's generation prompt is a bare `<|im_start|>assistant`
+    // and its model answers directly, so seeding from the flag routed the whole
+    // answer into reasoning_content and left `content` empty (live 2026-08-13).
+    // A model that opens the block itself is picked up by `saw_think_open`.
+    var in_think_block = prompt_opened_think;
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
+    var content_started = false;
     // Muse-Glimmer plain-arm segment-header skip (<|start|>…<|message|>).
     var muse_skip_header = false;
     var think_buf = std.ArrayList(u8).empty;
@@ -10469,7 +10774,10 @@ fn handleAnthropicStreaming(
                 @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
                 utf8_carry_len = @intCast(tail);
             }
-            if (with_carry.len == tail) { allocator.free(with_carry); continue; }
+            if (with_carry.len == tail) {
+                allocator.free(with_carry);
+                continue;
+            }
             if (tail > 0) {
                 const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
                 allocator.free(with_carry);
@@ -10492,7 +10800,10 @@ fn handleAnthropicStreaming(
                     break;
                 }
             }
-            if (stopped) { allocator.free(token_text); break; }
+            if (stopped) {
+                allocator.free(token_text);
+                break;
+            }
         }
 
         if (has_tools) {
@@ -10541,6 +10852,7 @@ fn handleAnthropicStreaming(
                                 try sendAnthropicEvent(stream, "content_block_start", sd);
                                 text_block_open = true;
                             }
+                            content_started = true;
                             try emitAnthropicTextDelta(allocator, stream, block_index, split.content);
                         }
                         for (token_texts.items) |tt| allocator.free(tt);
@@ -10556,6 +10868,9 @@ fn handleAnthropicStreaming(
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
+                            const vis = chat_mod.streamContentLead(tt, content_started);
+                            if (vis.len == 0) continue;
+                            content_started = true;
                             if (!text_block_open) {
                                 const sd = try std.fmt.allocPrint(allocator,
                                     \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10564,7 +10879,7 @@ fn handleAnthropicStreaming(
                                 try sendAnthropicEvent(stream, "content_block_start", sd);
                                 text_block_open = true;
                             }
-                            try emitAnthropicTextDelta(allocator, stream, block_index, tt);
+                            try emitAnthropicTextDelta(allocator, stream, block_index, vis);
                         }
                         token_texts.clearRetainingCapacity();
                     },
@@ -10756,6 +11071,7 @@ fn handleAnthropicStreaming(
                 if (std.mem.indexOf(u8, content_after, "<|eot|>")) |et| content_after = content_after[0..et];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
+                    content_started = true;
                     if (!text_block_open) {
                         const sd = try std.fmt.allocPrint(allocator,
                             \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10791,6 +11107,9 @@ fn handleAnthropicStreaming(
             muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
             if (was_skipping or muse_skip_header) continue;
             if (chat_mod.isChannelMarkerToken(token_text)) continue;
+            const vis_token = chat_mod.streamContentLead(token_text, content_started);
+            if (vis_token.len == 0) continue;
+            content_started = true;
             if (!text_block_open) {
                 const sd = try std.fmt.allocPrint(allocator,
                     \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10799,7 +11118,7 @@ fn handleAnthropicStreaming(
                 try sendAnthropicEvent(stream, "content_block_start", sd);
                 text_block_open = true;
             }
-            try emitAnthropicTextDelta(allocator, stream, block_index, token_text);
+            try emitAnthropicTextDelta(allocator, stream, block_index, vis_token);
         }
 
         // See the chat-completions loop: a buffered tool call / thinking block
@@ -10844,7 +11163,10 @@ fn handleAnthropicStreaming(
         const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
-                for (tool_calls) |tc| { allocator.free(tc.name); allocator.free(tc.arguments); }
+                for (tool_calls) |tc| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
                 allocator.free(tool_calls);
             }
 
@@ -10934,6 +11256,7 @@ fn handleAnthropicStreaming(
                     block_index += 1;
                 }
                 if (think_split.content.len > 0) {
+                    content_started = true;
                     if (!text_block_open) {
                         const sd2 = try std.fmt.allocPrint(allocator,
                             \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -11056,7 +11379,6 @@ fn handleResponsesDelete(allocator: std.mem.Allocator, stream: *Conn, id: []cons
     }
 }
 
-
 fn responsesToolExists(tools_val: ?std.json.Value, name: []const u8) bool {
     const v = tools_val orelse return false;
     if (v != .array) return false;
@@ -11170,7 +11492,7 @@ fn handleResponsesCompact(
 
     // ── parse → resolved message history ──
     // Compaction drops images, so the preprocessing selector is irrelevant here.
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent, .{}) catch |err| {
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, appendImageUrlContent, .{}) catch |err| {
         log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -11418,7 +11740,7 @@ fn handleResponses(
     }
 
     // ── parse input → messages ──
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -11468,7 +11790,9 @@ fn handleResponses(
     // Phase A8: per-request ownership. Defer frees if we don't end up
     // transferring the array to a scheduler slot.
     var local_ve: ?mlx.mlx_array = null;
-    defer { if (local_ve) |arr| _ = mlx.mlx_array_free(arr); }
+    defer {
+        if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
+    }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_aud: usize = 0;
@@ -11477,7 +11801,7 @@ fn handleResponses(
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, pi.messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -11590,12 +11914,25 @@ fn handleResponses(
         // Timings are all zero on the skeleton — the real numbers appear on
         // the final `response.completed` envelope after generation.
         const skel = try buildResponsesEnvelope(
-            stream.io, allocator, esc_resp_id, esc_model,
-            "in_progress", "[]",
-            0, 0, 0, 0,
-            should_store, prev_id,
-            false, false, response_echo,
-            0, 0, tokenize_ns, 0,
+            stream.io,
+            allocator,
+            esc_resp_id,
+            esc_model,
+            "in_progress",
+            "[]",
+            0,
+            0,
+            0,
+            0,
+            should_store,
+            prev_id,
+            false,
+            false,
+            response_echo,
+            0,
+            0,
+            tokenize_ns,
+            0,
         );
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
@@ -11723,7 +12060,8 @@ fn handleResponses(
         // Prompt-opened thinking streams as reasoning even when the request
         // asked for thinking off — generated reasoning is delivered, never
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
-        var in_think_block = enable_thinking or promptOpensThink(allocator, lm, tok, prompt_ids);
+        // Prompt-derived, never flag-derived — see the chat streaming arm.
+        var in_think_block = promptOpensThink(allocator, lm, tok, prompt_ids);
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
@@ -12169,7 +12507,6 @@ fn handleResponses(
     } else {
         try sendResponse(stream, "200 OK", "application/json", envelope);
     }
-
 }
 
 // ─── WebSocket transport for /v1/responses ────────────────────────────────
@@ -12673,9 +13010,7 @@ fn renderResponsesReasoningEcho(allocator: std.mem.Allocator, root: std.json.Obj
                 std.mem.eql(u8, s, "detailed");
             if (valid) {
                 // share buffer is fine since alloc happens immediately after
-                if (std.mem.eql(u8, s, "auto")) summary_str = "\"auto\""
-                else if (std.mem.eql(u8, s, "concise")) summary_str = "\"concise\""
-                else summary_str = "\"detailed\"";
+                if (std.mem.eql(u8, s, "auto")) summary_str = "\"auto\"" else if (std.mem.eql(u8, s, "concise")) summary_str = "\"concise\"" else summary_str = "\"detailed\"";
             }
         };
     };
@@ -13775,7 +14110,6 @@ test "getTimeoutNs computes correctly" {
     try testing.expectEqual(@as(u64, 0), getTimeoutNs());
 }
 
-
 test "responsesToolExists validates Responses function tool names" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
         \\[{"type":"function","name":"smartSearch","parameters":{}},{"type":"web_search"}]
@@ -13849,11 +14183,11 @@ test "insertImageTokens lands right after the user-turn marker (Gemma 4)" {
     // and the trailing model-generation prompt. The marker [105, 2364, 107]
     // appears once at the start of the user turn (positions 5-7).
     const prompt = [_]u32{
-        2,   500, 501, 502, 503, // BOS + system prefix
-        105, 2364, 107,          // <|turn>user\n
-        900, 901, 902,           // user content
-        106, 107,                // <turn|>\n
-        105, 4368, 107,          // <|turn>model\n (generation prompt)
+        2, 500, 501, 502, 503, // BOS + system prefix
+        105, 2364, 107, // <|turn>user\n
+        900, 901, 902, // user content
+        106, 107, // <turn|>\n
+        105, 4368, 107, // <|turn>model\n (generation prompt)
     };
 
     const out = try insertImageTokens(testing.allocator, &prompt, 999, 4, &config);
@@ -13863,8 +14197,8 @@ test "insertImageTokens lands right after the user-turn marker (Gemma 4)" {
     // i.e., between "<|turn>user\n" and the user content.
     // Expected: prompt[0..8] + BOI + image*4 + EOI + prompt[8..]
     try testing.expectEqual(@as(usize, prompt.len + 6), out.len);
-    try testing.expectEqual(@as(u32, 200), out[8]);  // BOI
-    try testing.expectEqual(@as(u32, 999), out[9]);  // image
+    try testing.expectEqual(@as(u32, 200), out[8]); // BOI
+    try testing.expectEqual(@as(u32, 999), out[9]); // image
     try testing.expectEqual(@as(u32, 999), out[10]);
     try testing.expectEqual(@as(u32, 999), out[11]);
     try testing.expectEqual(@as(u32, 999), out[12]);
@@ -13887,7 +14221,7 @@ test "insertImageTokens picks the LAST user turn when multiple are present" {
         106, 107,
         105, 4368, 107, 850, 851, // first model turn
         106, 107,
-        105, 2364, 107, 900,      // second user turn (the one we're answering)
+        105, 2364, 107, 900, // second user turn (the one we're answering)
     };
 
     const out = try insertImageTokens(testing.allocator, &prompt, 999, 1, &config);
@@ -13917,6 +14251,100 @@ test "insertImageTokens falls back gracefully when marker is unset" {
 
     // Should be original len + 2 image + 2 BOI/EOI = +4
     try testing.expectEqual(@as(usize, prompt.len + 4), out.len);
+}
+
+test "a stream never starts inside a think block because the REQUEST asked for thinking" {
+    // Every streaming surface seeded the think flag by OR-ing the request's
+    // enable-thinking flag into the prompt-derived one (the needle below is
+    // ++-split so this comment cannot satisfy the scan), on the assumption
+    // that a thinking-enabled model
+    // opens `<think>` as its first token. That is true for Qwen and Gemma —
+    // whose templates render the opener, which `promptOpensThink` then SEES in
+    // the rendered bytes anyway — and false for LFM2-VL, whose generation
+    // prompt is a bare `<|im_start|>assistant\n` and whose model answers
+    // directly. With `enable_thinking: true` the whole answer streamed as
+    // `reasoning_content` and `content` came back EMPTY (live 2026-08-13: the
+    // app renders it as a Thinking block with no reply under it). The same
+    // request non-streaming was correct, because the non-streaming split has
+    // always keyed on the prompt — so the two surfaces disagreed about the
+    // bytes of one answer, which is the class this scan pins.
+    //
+    // Whether a stream starts inside a think block is a property of the
+    // RENDERED PROMPT. A request flag is a request.
+    const src = @embedFile("server.zig");
+    const needle = "in_think_block = enable" ++ "_thinking";
+    try testing.expect(std.mem.indexOf(u8, src, needle) == null);
+    // …and the initialization that replaces it must still exist, or the scan
+    // passes on a file that stopped tracking think state at all.
+    var count: usize = 0;
+    var i: usize = 0;
+    const init = "in_think_block = prompt_opened_think";
+    while (std.mem.indexOfPos(u8, src, i, init)) |at| : (i = at + init.len) count += 1;
+    try testing.expect(count >= 2);
+}
+
+test "lfm2ImageSegment labels every tile and closes on the thumbnail" {
+    // LFM2-VL's block is `<|image_start|>`, then per tile
+    // `<|img_row_R_col_C|>` + that tile's pads, then `<|img_thumbnail|>` +
+    // the thumbnail's pads, then `<|image_end|>`. Emitting a flat pad run
+    // instead still SPLICES (the counts match), so the model gets every tile
+    // with no idea where any of them sits — which is the whole point of tiling.
+    var config = model_mod.ModelConfig{ .model_type = "lfm2" };
+    config.lfm2_vision = true;
+    config.image_token_id = 124907;
+    config.boi_token_id = 125009;
+    config.eoi_token_id = 125010;
+    config.lv_thumbnail_token_id = 125008;
+    config.lv_row_col_base_id = 124908;
+    config.lv_max_tiles = 10;
+    config.lv_downsample = 2;
+
+    // A 2x2 tile grid (4 patches each → 1 pad each) plus a 1-pad thumbnail.
+    const imgs = [_]chat_mod.ImageData{
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 0 },
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 1 },
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 2 },
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 3 },
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 4 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
+    const seg = (try lfm2ImageSegment(testing.allocator, &msgs, &config)) orelse return error.NoSegment;
+    defer testing.allocator.free(seg);
+
+    // Row/col ids are laid out over the MAX grid (10 wide), not this image's:
+    // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
+    const want = [_]u32{
+        125009,
+        124908, 124907,
+        124909, 124907,
+        124918, 124907,
+        124919, 124907,
+        125008, 124907,
+        125010,
+    };
+    try testing.expectEqualSlices(u32, &want, seg);
+}
+
+test "lfm2ImageSegment wraps an untiled image and declines every other arch" {
+    var config = model_mod.ModelConfig{ .model_type = "lfm2" };
+    config.lfm2_vision = true;
+    config.image_token_id = 124907;
+    config.boi_token_id = 125009;
+    config.eoi_token_id = 125010;
+    config.lv_downsample = 2;
+
+    const imgs = [_]chat_mod.ImageData{
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 4, .grid_w = 2 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
+    const seg = (try lfm2ImageSegment(testing.allocator, &msgs, &config)) orelse return error.NoSegment;
+    defer testing.allocator.free(seg);
+    const want = [_]u32{ 125009, 124907, 124907, 125010 };
+    try testing.expectEqualSlices(u32, &want, seg);
+
+    // Not LFM2-VL ⇒ null, so every other arch keeps the flat BOI/pads/EOI run.
+    config.lfm2_vision = false;
+    try testing.expect((try lfm2ImageSegment(testing.allocator, &msgs, &config)) == null);
 }
 
 test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
@@ -13950,12 +14378,12 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
 
     const prompt = [_]u32{ 2, 500, 105, 2364, 107, 900, 901 };
     // image_token=999 ×2, audio_token=888 ×3.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 3, &config);
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 3, &config, &.{});
     defer testing.allocator.free(out);
 
     // Inserted after marker (position 5): [BOI 999 999 EOI][BOA 888 888 888 EOA].
     const expected = [_]u32{
-        2,   500, 105, 2364, 107,
+        2, 500, 105, 2364, 107,
         200, 999, 999, 201, // image block
         300, 888, 888, 888, 301, // audio block
         900, 901,
@@ -13974,17 +14402,17 @@ test "insertMultimodalTokens handles audio-only and image-only" {
     const prompt = [_]u32{ 1, 105, 7 };
 
     // Audio only (n_image=0) → just the audio block.
-    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 2, &config);
+    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 2, &config, &.{});
     defer testing.allocator.free(ao);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 7 }, ao);
 
     // Image only (n_audio=0) → just the image block.
-    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 0, &config);
+    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 0, &config, &.{});
     defer testing.allocator.free(io);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 7 }, io);
 
     // Neither → unchanged.
-    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 0, &config);
+    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 0, &config, &.{});
     defer testing.allocator.free(none);
     try testing.expectEqualSlices(u32, &prompt, none);
 }
@@ -14051,12 +14479,12 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
-    try testing.expect(std.mem.indexOf(u8, body, "\"n_ctx\":4096") != null);          // integration_test.sh
-    try testing.expect(std.mem.indexOf(u8, body, "\"total_slots\":1") != null);       // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"n_ctx\":4096") != null); // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_slots\":1") != null); // integration_test.sh
     try testing.expect(std.mem.indexOf(u8, body, "\"model_info\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"memory\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"active_bytes\":1234") != null);   // Swift fetchProps
-    try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null);     // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"active_bytes\":1234") != null); // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null); // Swift fetchProps
     try testing.expect(std.mem.indexOf(u8, body, "\"available_bytes\":9000000000") != null); // Swift fetchProps (Free RAM line)
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
     // #110: the panel showed 19.6 GB (active) while the process held 81 GB.
@@ -14093,7 +14521,6 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
 }
-
 
 test "llama cache default keeps shared prefixes warm" {
     // With the legacy default of 1, every llama.cpp request evicted the
@@ -15166,8 +15593,7 @@ test "contextOverflowMessage: the 400 names both counts so a client can act on i
     // long", and our own app can't offer "raise the context to N" — which is
     // the one action that fixes it.
     const msg = contextOverflowMessage(&buf, 4108, 4096);
-    try t.expectEqualStrings(
-        "Prompt exceeds maximum context length: 4108 tokens requested, 4096 available", msg);
+    try t.expectEqualStrings("Prompt exceeds maximum context length: 4108 tokens requested, 4096 available", msg);
 
     // Legacy prefix preserved verbatim — APIError.looksLikeContextOverflow and
     // every third-party client key on this exact phrase.
@@ -15183,8 +15609,7 @@ test "contextOverflowMessage: a buffer too small falls back rather than sending 
     // bufPrint failing must not propagate — the media-gen 400 that sent NO body
     // at all when its fixed buffer overflowed is the class this guards.
     var tiny: [8]u8 = undefined;
-    try t.expectEqualStrings("Prompt exceeds maximum context length",
-        contextOverflowMessage(&tiny, 999999, 1));
+    try t.expectEqualStrings("Prompt exceeds maximum context length", contextOverflowMessage(&tiny, 999999, 1));
 }
 
 test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {

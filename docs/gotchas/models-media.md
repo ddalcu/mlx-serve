@@ -916,3 +916,398 @@ POSITIONAL-ENCODING symptom signature, not a sampling one; (3) an unmerged refer
 divergence then isolates the runtime. Guards: the `rope_local_base_freq == 500000` assertion
 in the muse config test (red on revert) + `tests/test_muse_repetition.sh` (replays the real
 capture; exits 1 on any `finish_details.type == "repetition_loop"`).
+
+## A converter that keeps the HF module layout renames the router (laguna oQ, issue #169)
+
+`mlx-community/Laguna-S-2.1-oQ4e-fast` and `-oQ5e` died at load with
+`MISSING WEIGHT: language_model.model.layers.1.mlp.gate.weight`. poolside's own
+NVFP4-mlx build flattens the router module, so the [E, hidden] router matrix is
+`mlp.gate.weight` and the aux-loss-free selection bias sits beside it as
+`mlp.gate.e_score_correction_bias`. The oQ converter keeps HF's module tree, where
+the router is a `proj` Linear INSIDE the gate module: same tensor, same dtype
+(bf16, unquantized in both builds), at `mlp.gate.proj.weight`. The bias is a
+buffer on the gate module in both layouts, so it never moves — only the
+projection does. `lagunaRouterBase` probes for the flat name first (so the
+poolside pack binds byte-identically) and falls back to the nested one, exactly
+like `hy3ExpertContainer` resolves `mlp.experts` vs `mlp.switch_mlp`. Everything
+else about the pack loads generically: the experts are mlx-lm's stacked
+`mlp.switch_mlp.*`, and the mixed-bit affine quantization (4/5/6/8 bits, gs
+64/128, 214 per-tensor overrides) solves from packed geometry per weight.
+
+Two things about that pack that are NOT bugs: the `language_model.` weight
+prefix is resolved from the checkpoint (`resolveWeightPrefix`, logged), and its
+config declares YaRN `factor: 128` / `max_position_embeddings: 1048576` where
+poolside declares 32 / 262144 — a 1M-context rope the loader honours as
+declared (the computed mscale 1.4852 matches the field the pack ships).
+
+Class lesson: a checkpoint's module tree is the CONVERTER's choice, not the
+architecture's. Any name a converter could have flattened or nested gets a probe
+the first time a second converter ships the arch — one probe, resolved once per
+layer, flat name preferred so the reference build cannot shift.
+Guard: transformer.zig `lagunaRouterBase resolves both the flat mlx-lm gate and
+the HF-native gate.proj naming`.
+
+## LTX-2.5 looked soft: three causes, one of them ours (2026-08-13)
+
+Report: "videos generate and look generally good, just not at the bar I see in
+other examples." Three separate things, measured rather than guessed.
+
+**1. The canvas.** The clips were 768×512 / 704×480 — the app's LTX ladder
+topped out there. LTX's own `PipelineParams` default is 1920×1088 (2.09 MP vs
+0.39), and the published examples are 1080p+. Worse, the two-stage "Quality"
+tiers denoise at HALF the requested size and upscale, so picking Quality at
+768×512 ran the dev DiT at 384×256 — softer than the one-stage tier sitting
+above it in the same menu. No amount of steps, guidance or quantization width
+fixes a canvas the model was never asked to fill.
+
+**2. The quantization.** Our pack was affine 4-bit group-64 on all 1632
+transformer linears (the recipe inherited from the community 2.3 pack, where
+q4 is documented as the "fits 16 GB" option and q8 is what the reference's own
+examples use). Measured off the packs themselves — quantizer step over
+per-group weight std, sampled across blocks 0/24/47:
+
+| pack | median injected weight noise |
+|---|---|
+| q4 (affine g64) | **9.87%** (p90 ~12%) |
+| q8 (same recipe) | **0.584%** |
+
+~10% noise on every linear, compounded over 48 blocks × 8 distilled steps.
+Same prompt, same seed, one-stage 97f at 768×512: the 4-bit fox has no visible
+eye, blurred legs and flat fur; the 8-bit one has a defined muzzle, individual
+fur strands and real legs. Cost: 175 s vs 169 s (+3.5%) — the DiT is
+compute-bound at these token counts, so the wider weights are nearly free.
+Upstream's own quants are int8-convrot / fp8 / nvfp4, and every community
+*int4* pack uses ConvRot / W4A8 — plain affine int4 is nobody's shipping
+recipe for this DiT.
+
+Objective per-frame metrics could NOT settle it: a 10% weight perturbation in
+an 8-step schedule moves the trajectory, so the two arms fork CONTENT
+(luma correlation 0.44–0.55) and per-frame detail deltas ran from −20% to +40%
+with a +5.9% clip mean. Same class as the spec-decode rule — when the arms
+fork content, per-frame numbers are variance. The stills decided it.
+
+**3. The decoder we didn't ship.** Upstream ships
+`vae_diffusion_decoder.safetensors` (417M, "DiffVAE 1-step x0 decoder") and
+decodes its demos with it; we used the plain conv decoder, and so does the MLX
+reference. Ported 2026-08-13 — see below.
+
+### The bug the 8-bit pack found
+
+The first 8-bit load died at its first matmul:
+
+```
+MLX error: [quantized_matmul] The shapes of the weight and scales are
+incompatible based on bits and group_size. w.shape() == (4096,1024) and
+scales.shape() == (4096,64) with group_size=64 and bits=4
+```
+
+`ltx_video.zig` passed `mlx_optional_int.some(4)` literally at all three
+quantized reads. The pack's config said `bits: 8`, the geometry said 8, and
+nothing asked either. The error names the shapes, not the assumption, so it
+reads like a corrupt download — which is what makes this class expensive:
+every other quant path in the tree (mtp, dflash, drafter, deepseek_v4) already
+solves `(bits, group_size)` from packed geometry via
+`transformer.affineParamsFromGeometry`. The LTX engine now does too
+(`quantGeom`), pinned by a source scan over its own call sites.
+
+### Building the 8-bit pack
+
+`scripts/quantize_ltx25.py <src> <dst> --bits 8`. Only the two transformers and
+the text encoder need the bf16 source (~100 GB); the connector, both VAEs, the
+vocoder and both upscalers are passthrough and byte-identical to the ones
+already in the 4-bit pack (verified against upstream blob sizes), so they are
+symlinked in rather than re-downloaded. Result: 20.60 GB per transformer,
+12.65 GB encoder, ~59 GB total.
+
+Watch the CLI: `hf download REPO --include a b c` eats `a` as the option's
+value and warns `Ignoring --include since filenames have been explicitly set`
+— which is how `transformer-dev.safetensors` silently didn't download on the
+first pass. Pass filenames POSITIONALLY.
+
+
+## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
+
+The third cause above, closed. `vae_diffusion_decoder.safetensors` is four
+deterministic neighborhood-attention stages that upsample the latent into a
+full-resolution context volume, then eight diffusion blocks that denoise
+patchified pixel tokens against it. Architecture, geometry and the tiling plan
+live in `src/ltx_diffvae.zig`; the fused NA Metal kernel in
+`src/ltx_diffvae_kernel.zig`; the MLX pass in `src/ltx_diffvae_forward.zig`.
+
+### The kernel came first, and its window semantics are the whole risk
+
+NATTEN SHIFTS its window inward at a boundary — it does not clamp-and-mask.
+Porting the clamp reading gives a decoder that looks right everywhere except a
+`kernel/2`-wide frame around each edge of every tile, which is exactly the kind
+of error a whole-frame cosine cannot see. `naWindowStart` is the one definition
+and the kernel's parity test covers boundary-only volumes (`T=3` against
+`K_t=3`, axes shorter than their kernel) as well as the interior. Verified
+red-on-revert: swapping in a clamp turns both cases red.
+
+One thread per (query, head), 64-float accumulator and an online softmax in
+registers, K/V read THROUGH the cache. Staging K/V in threadgroup memory was
+declined by arithmetic, not by taste: a (1,4,32) query tile under (3,7,7) needs
+(3,10,38) keys = 145 KB of K+V, against Metal's 32 KB and the house occupancy
+rule of ~10 KiB. Neighbouring queries share ~95% of their window, so threads
+walk W first and a simdgroup's 32 windows overlap in L1.
+
+### The failure: a faithful port of a guess
+
+Per-stage parity against a PyTorch transcription of the reference came out at
+cos 0.99997-0.99999 with `rms_ratio` 0.999 on every stage, the context volume,
+the model prediction and the final pixels. Then the first real generation
+decoded to **pure static**.
+
+The port was right. The CONTRACT was wrong. `DiffusionVideoDecoder.__init__`
+takes `model_output_type`, `default_num_inference_steps` and
+`timestep_scale_multiplier` as constructor arguments, read by
+`_build_diffusion_video_decoder` from a `vae` config section — and no LTX pack
+ships one. The class defaults are v-prediction, 2 steps, timestep x1. Run that
+way the model's output is small against the noise it is subtracted from, so
+`x - 0.5*v` twice returns approximately the noise.
+
+The transcription inherited the same defaults, so parity was green against a
+reference that would also have produced static. **A faithful-port oracle proves
+your port; it cannot prove the reference's own unstated arguments.** The tell
+was in the file's own name all along: Lightricks call it a *1-step x0 decoder*.
+
+Measured, one lever at a time, on the same prompt/seed — the metric is
+`tests/lora_noise.py`'s mean absolute difference between horizontally adjacent
+pixels, which is the static detector:
+
+| arm | gradient | verdict |
+|---|---|---|
+| conv decoder (baseline) | 2.2-2.9 | picture |
+| x0, 1 step, t x1000 | **2.4** | picture |
+| x0, 2 steps, t x1000 | 17.7 | static |
+| x0, 1 step, t x1 | 29.5 | static |
+| v, 2 steps, t x1 (reference defaults) | 44.8 | static |
+
+All three matter, and each is provable. `Sampler` owns them with a kill switch
+each (`MLX_SERVE_DIFFVAE_{OUTPUT,STEPS,TSCALE}`), a unit test pins the values,
+and `tests/test_video_gen.sh` asserts the gradient RELATIVELY against the conv
+arm's own number on the same clip — the absolute value is a property of the
+canvas and step count (13.9 on a 4-step 9-frame 384x256 render, 2.2 on a
+25-frame 8-step one), so an absolute bar false-fails a small canvas. Measured
+ratios: 1.04-1.09 healthy, 7.7-15.4 on each broken arm.
+
+### What it buys, and what it costs
+
+Same prompt, same seed, 97f at 768x512 one-stage: the DiffVAE resolves the
+fox's ear, eye and individual fur strands where the conv decoder smears them,
+and the background branches separate. Cost: the decode itself measures 21.2 s
+and peaks at 20.7 GiB. End to end it does not show: 165.7 s (conv) against
+163.8 s (diffusion), same session, same prompt and seed — the conv decoder over
+97x512x768 is not free either, and the DiT dominates. Do not quote a per-clip
+penalty from these two runs; quote the decode stage, which is what was
+isolated.
+
+Per-frame metrics do NOT settle this either — the two decoders share the latent
+so the content does not fork, but detail deltas are still the wrong instrument
+at this size. The stills decided it, as with the quant round above.
+
+### Memory: a per-request decision, not a load-gate term
+
+The diffusion stage carries context + x + q/k/v at 256 wide over the whole
+tile: measured 10 KiB per stage-5 token. Stages 1-3 run on the FULL volume
+(1.6M tokens at dim 512 even for a 1920x1088 clip); only stage 4 and the
+diffusion stage are tiled, cut until one tile fits a budget that
+`tileTokensForMemory` derives from currently-free RAM. Billing that into the
+per-MODEL load gate would newly refuse packs that only ever use the conv
+decoder — the same reason `ltxPeakBytes` carries no activation term. The
+decoder FILE is already in the directory sum.
+
+Tiles overlap by `max(stage-4 halo, diffusion halo)` and blend with trapezoid
+ramps whose two sides sum to exactly 1 (half-offset: `(j+0.5)/L` against
+`(L-j-0.5)/L`), so no weight buffer and no division. Whole-volume against
+forced-tiled on the same seed: cos 0.9999972 overall AND on a band centred on
+the seam — the seam crop is asserted separately because a whole-frame cosine
+will happily hide a visible band down the middle.
+
+Cutting the budget is a real trade: 3M tokens/tile = 21 s and 20.7 GiB, 1.2M =
+46 s and 6.4 GiB (the tiles overlap, and stage 4 re-runs per tile).
+
+## MiniMax Music 3 (`minimax_music3`, src/music3.zig) — the traps behind the port (2026-08-13)
+
+Shipped against the diffusers `minimax-music3-integration` reference (dafe3733)
+with per-component parity oracles (`tests/dump_music3_fixtures.py`, a
+TRANSCRIPTION oracle in plain torch on our dequantized weights — the branch is
+not installable standalone). Everything below is a place where the "obvious"
+implementation is wrong and the oracle or a table test caught or pinned it.
+
+### It looks like ACE-Step; almost every detail differs
+
+Same endpoint, same modality slot, entirely different machine. The DiT's
+timestep is a PREPENDED TOKEN removed after the blocks — `norm1`/`norm2` are
+plain LayerNorm with weight AND bias, there is no `scale_shift_table` anywhere
+in the checkpoint, so reaching for acestep's AdaLN helpers produces a model
+that runs and generates plausible noise. The block FF is REVERSED SwiGLU:
+`ff_in` is fused 2×8192 and the output is `first_chunk * silu(second_chunk)` —
+the usual `silu(first) * second` also runs fine and also produces garbage. The
+vocoder Snake is `x + (α+1e-9)⁻¹·sin²(αx)` — alpha only, NO beta, NO exp;
+ACE-Step's has both. DiT RoPE rotates only the first 32 of 64 head dims at
+theta 10000 — hardcoded in the module default, NOT the LLM's 1e6 and NOT in
+config.json.
+
+### The AR loop's three silent corrupters (reference `encoders.py:282`)
+
+1. **Frame 0 is not emitted.** The loop runs `max_frames + 1` iterations; the
+   first only advances state past `<|audio_start|>` — but its codes STILL feed
+   back through `_embed_audio_frame`. The greedy-replay fixture therefore dumps
+   frame 0's codes too, or the replay desyncs immediately.
+2. **The vocab mask applies three times** in the reference because guiding two
+   `-inf` logits makes NaN. Our engine sidesteps the whole class with a FINITE
+   additive mask (-1e9): CFG arithmetic stays finite, one application, no
+   nan_to_num needed.
+3. **The top-k threshold comes from the CONDITIONAL branch**, strictly-less,
+   ties kept — thresholding the guided distribution instead is a one-line slip
+   the logits oracle sees as a different sampled trajectory.
+
+The per-frame feedback embedding is `(semantic row + Σ residual bank rows) ×
+8^-0.5` — the scale is load-bearing; the depth banks are codebook-major
+(`code + (index-1)*1024`).
+
+### Weight-norm fusion: the bias-length heuristic fails on square convs
+
+The plan said "which conv kind a tensor is can be read off the bias length
+(`bias.len == v.shape[1]` ⇒ transpose)". The vocoder's res-unit convs are
+768×768 — `shape[0] == shape[1]`, the heuristic is ambiguous exactly there.
+`conv_t1` is the only ConvTranspose1d in the stack, so the kind is keyed BY
+NAME, with the load test pinning the fused/swapped shapes
+(`[1536,768,16] → [768,16,1536]`).
+
+### A bare f32 scalar promotes a bf16 stream (`scalarLike`)
+
+`mlx_array_new_float` makes a STRONG f32 rank-0 array; `bf16_tensor * f32_scalar`
+promotes the whole product to f32 and every downstream quantized matmul then
+runs off-dtype. Every scalar op in music3.zig goes through `scalarLike`
+(cast-to-operand-dtype) — the same rule MageFlow established.
+
+### The prompt is a byte contract with cross-line regex semantics
+
+`_clean_caption`'s markdown-rule regex `^\s*[-*_]{3,}\s*$` (MULTILINE) lets
+`\s` cross newlines: a whitespace-only line IMMEDIATELY before a rule is
+absorbed into the match, and the trailing `\s*$` greedily ends at the LAST
+newline inside its run. A line-based reimplementation diverges on exactly
+those captions. The Zig scanners replicate regex retry semantics too (a failed
+`<|…|>` match advances ONE char, so `<|a<|b|>` → `<|ab`), and the whole
+surface is table-pinned against outputs generated by executing the reference's
+own Python regexes.
+
+### Numbers (2026-08-13, M-series 128 GB, 8-bit pack)
+
+AR stage 29.4 ms/frame ReleaseFast after the perf round (43.8 before it;
+60.3 Debug pre-round; probe-armed ladder 30.2/31.4 across two reps, both-off
+arm on the new build 43.7 ≈ the old-code baseline) — a 60 s song is ~45 s of
+AR plus the DiT/vocoder stage. The 4-bit depth requant experiment measured
+26.3 ms/frame (depth 11.7 → 8.0) at a real quality cost (replay agreement
+0.942 → 0.913, ar_hiddens cos 0.9988) — env-only, default OFF. Per-stage attribution (MUSIC3_COST_PROBE laps, eval barriers symmetric
+across arms): lm decode 17.5 ms in EVERY arm (batch-2 q8 8B weight-read
+floor), depth 23.3 → 11.7 ms (KV cache), head+sample 2.6 → 0.5 ms (lm_head
+prune), feed+book ~0.2. Parity after the round: prefill cos 0.99992, lm_head
+logits 0.99998, greedy AR replay agreement 0.942 with prune AND depth-kv
+engaged (identical to pre-round), ar_hiddens cos 0.9999, condition encoder
+0.999999, DiT velocity 0.9990–0.9999, vocoder 1.000000. The QLin preresolve
+is byte-identical (fixed-seed 8 s WAV vs the pre-round build). Multi-window
+stitch (3 windows, 14 s) has no silent seams; the 86/258-latent crops tile
+the song sample-exact (350 frames → exactly 14.00 s).
+
+### A depth KV cache CAN beat a "weight-read floor" — when the naive path was never at it
+
+The bandwidth model priced the depth decoder's 7 full re-forwards at ~11 ms
+of weight reads (7 × 0.65 GB q8), so a KV cache — which still reads every
+weight once per step — was estimated worth 1–3 ms. Measured: 23.3 ms naive,
+11.7 ms cached. The naive path sat 2× ABOVE its own read floor: re-computed
+positions widen every kernel, the per-step concat rebuild and per-forward
+graph-build add CPU, and none of that appears in a bytes-read table. The
+cache took the stage TO the floor — the floor is where a cache stops paying,
+not a reason it can't start. The corollary cuts the other way too: the lm
+decode stage measured 17.5 ms in every arm of the ladder — that one really
+is the read floor, and no cache, prune, or handle preresolve moved it by a
+tenth. Attribute with per-stage laps (MUSIC3_COST_PROBE; barriers symmetric
+across arms so A/B deltas stay honest) before pricing a lever off bandwidth
+arithmetic. Same round, same old trap: one zsh ladder arm passed two kill
+switches via `env $extra` (no word-split), silently dropping the second —
+caught immediately by the engagement line in the arm's own log, which is
+exactly what that rule is for.
+
+### LFM2-VL: a forward ARM with no vision splice answers "a completely black rectangle"
+
+The tower was correct before the model saw an image. Position resample cos
+0.999999 across six grids, tower hidden cos 0.99998, projected features cos
+0.9997 against transformers' own `Siglip2VisionModel` on our pack's weights.
+First live request: *"The image appears to be a completely black rectangle with
+no visible content or details."*
+
+Nothing errored. The encoder logged its boot line, the decode logged
+`grid 26x38 (247 tokens)`, the encode logged `[1,247,2048]`, the prompt logged
+`Inserted 247 image tokens`, `prompt_tokens` came back 265. Every number was
+right. `forwardWith` fans out to one arm per architecture family and the vision
+splice lives inside each arm — `forwardStandardWith` and `forwardMoeWith` have
+it, `forwardHybridWith` never did, because until LFM2-VL no hybrid arch (lfm2,
+nemotron_h, qwen3_next) had a tower. So 247 identical `<image>` placeholder
+embeddings went through the trunk and the model described them faithfully.
+
+The failure mode is the point: a missing splice presents as a bad IMAGE, not as
+a bug. Every observable except the answer is indistinguishable from working, so
+the guard cannot be an output assertion. It is a source scan —
+`every generative forward arm splices vision embeddings` — over every
+`forward*With` the dispatcher reaches, with the encoder-only arms
+(`forwardBertWith`, `forwardGemma3EncoderWith`, which serve `/v1/embeddings` and
+have no `image_token_id`) exempt BY NAME. A new arch is required to splice
+rather than inheriting the hole.
+
+### The reference for a position resample is `bilinear` + antialias, and mlx-vlm's bicubic is a SCALE error
+
+SigLIP2-NaFlex stores one learned 16x16 position table and resamples it onto
+each image's patch grid. transformers uses
+`F.interpolate(mode="bilinear", align_corners=False, antialias=True)`. mlx-vlm
+0.6.3 uses `bicubic_interpolate` there instead. Measured on the real table:
+cos 0.99 and **rms_ratio 1.13** — the resampled table comes out 13% hot, which
+is a scale error added to every patch embedding before block 0, not rounding.
+
+That made mlx-vlm unusable as the oracle even though it is the obvious one
+(installed, has `lfm2_vl`, and the packs are LiquidAI's own MLX conversions).
+The oracle became torch + transformers run on the pack's weights instead, and
+the Zig side reuses the Pillow-convention filter already in `qwen_vision.zig`
+(`resampleWeightMatrix`, new `.bilinear` arm): its footprint widens by
+`input/output` on downscale, which is precisely what torch's antialias does and
+what a fixed 2-tap bilinear does not. Antialias is a no-op when upsampling, so
+this only bites when a grid axis is SHORTER than 16 — which happens whenever an
+extreme aspect ratio fits the token budget (a 200x50 source lands on 32x8).
+Measured after: cos 0.999999 on every grid, both directions.
+
+Two smaller traps in the same file. The patch feature order is `[py, px, c]`
+with channel INNERMOST (`convert_image_to_patches`), where Qwen and Muse both
+put channel outermost — same shapes, same token count, scrambled image, and a
+cosine test on flat colour cannot see it. And the checkpoint carries TWO gelus:
+the encoder MLP is `gelu_pytorch_tanh`, the projector is plain erf `gelu`.
+
+### For a NaFlex model, tiling IS the resolution
+
+`smart_resize` caps a single view at `max_image_tokens` (256 merged tokens =
+a 32x32 patch grid). Anything past `max_image_tokens * 32² *
+max_pixels_tolerance` is instead resized onto a `cols x rows` canvas of 512px
+tiles, cut up, and encoded tile by tile with a thumbnail of the whole image
+appended. A 1800x1400 photo is 2x3 tiles + a 252-token thumbnail = 1788 tokens
+against 252 for the single view.
+
+Skipping tiling is not a small quality delta. Same picture, same prompt, 15px
+print: tiled reads `Serial: QX-88231-KLM`, `Batch code: 7741-ZZ`,
+`Checksum: 0xBEEF42` exactly; the untiled geometry returns
+`Social OS #0001 HLM`, `Batch code: 7941-02`, `Chemist: 100%F1F2` — confident,
+well-formed, wrong. That is why `tests/test_lfm2_vision.sh` runs BOTH arms and
+compares: this checkpoint reads large text fine at thumbnail resolution, so an
+absolute bar on the tiled arm alone would pass a build where tiling silently
+stopped happening.
+
+Two implementation notes. The canvas is resampled ONCE and each tile is a
+WINDOW into it (`buildPixelValuesRegion`) — resizing each tile region on its own
+resamples different pixels and is not what `split_to_tiles` does. And the prompt
+block is not a flat pad run: `lfm2ImageSegment` labels every tile
+`<|img_row_R_col_C|>` and the thumbnail `<|img_thumbnail|>`, so the model knows
+where each tile sits. A flat run still splices — the counts match — and hands
+the model six unordered crops. Marker order has to match the order the encoder
+concatenated the pieces, because the splice is positional. None of those ids
+live in config.json; `populateLfm2ImageTokens` resolves them by string from the
+tokenizer at load, the same way the user-turn marker is.

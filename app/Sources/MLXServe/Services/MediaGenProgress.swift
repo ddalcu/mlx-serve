@@ -93,6 +93,8 @@ enum MediaSSE {
     static func stageLabel(_ stage: String) -> String {
         switch stage {
         case "encode":  return "Encoding prompt"
+        case "prefill": return "Encoding prompt"
+        case "frames":  return "Composing frames"
         case "diffuse": return "Composing"
         case "decode":  return "Rendering audio"
         default:        return stage

@@ -1135,6 +1135,7 @@ pub fn main(init: std.process.Init) !void {
     // Pre-encode the user-turn marker so vision-image insertion can locate the
     // latest user turn at request time, regardless of architecture.
     try config.populateUserTurnMarker(allocator, tok, chat_config.chat_template);
+    config.populateLfm2ImageTokens(tok);
 
     const load_vision = config.has_vision and !no_vision;
 

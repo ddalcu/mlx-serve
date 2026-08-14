@@ -686,6 +686,30 @@ final class HFModelQuantGateTests: XCTestCase {
         // Lockstep with the model_type gate the local (downloaded) rows use.
         XCTAssertTrue(supportedModelTypes.contains("muse_glimmer"))
     }
+
+    func testLfm2VlIsSupported() {
+        // LiquidAI LFM2.5-VL ships config.json `model_type: "lfm2_vl"` — with an
+        // UNDERSCORE. The app's set carried the hyphenated "lfm2-vl", which the
+        // exact-match gate never matches, so every LFM2-VL pack read as
+        // "Unsupported architecture" in the Downloaded tab while the server
+        // served it happily (Zig matches the "lfm2" PREFIX, so the two gates
+        // disagreed). Tags verified live 2026-08-13.
+        let m = mlx(id: "LiquidAI/LFM2.5-VL-3B-MLX-4bit",
+                    tags: ["mlx", "safetensors", "lfm2_vl", "image-text-to-text", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "lfm2_vl is served (SigLIP2-NaFlex tower + projector) — the HF tag gate must accept it")
+        XCTAssertNil(m.incompatibleReason)
+        let upstream = HFModel(id: "LiquidAI/LFM2.5-VL-3B", downloads: 1, likes: 1,
+                               lastModified: nil,
+                               tags: ["transformers", "safetensors", "lfm2_vl",
+                                      "image-text-to-text", "conversational"],
+                               safetensors: nil, pipelineTag: "image-text-to-text")
+        XCTAssertNil(upstream.incompatibleReason)
+        // The gate a DOWNLOADED pack goes through is the model_type set, and
+        // that is where the spelling was wrong.
+        XCTAssertTrue(supportedModelTypes.contains("lfm2_vl"),
+                      "config.json spells it lfm2_vl; a hyphen here silently unsupports every LFM2-VL download")
+    }
 }
 
 // MARK: - HFModel.quantization label parsing

@@ -646,6 +646,32 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).hasVision)
     }
 
+    func testParseConfigMetadataEmptyVisionConfigIsNotAVisionTower() throws {
+        // mlx-community's TEXT-ONLY LFM2.5 packs declare `Lfm2ForCausalLM` and
+        // ship a vestigial EMPTY `vision_config` (verified on
+        // mlx-community/LFM2.5-2.6B-8bit, 2026-08-13). The `_text` suffix guard
+        // cannot see it — the arch is plain "lfm2" — so the Downloaded tab
+        // badged a text-only checkpoint as vision-capable while the server
+        // (which arms its tower on `model_type == "lfm2_vl"`) served it text.
+        // A block with no geometry in it is not a tower.
+        let dir = (tempRoot as NSString).appendingPathComponent("cfg-empty-vision")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"lfm2","vision_config":{}}"#
+            .write(toFile: cfg, atomically: true, encoding: .utf8)
+        XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).hasVision)
+
+        // …and the real VL pack next to it still reports vision.
+        let vlDir = (tempRoot as NSString).appendingPathComponent("cfg-lfm2-vl")
+        try FileManager.default.createDirectory(atPath: vlDir, withIntermediateDirectories: true)
+        let vlCfg = (vlDir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"lfm2_vl","vision_config":{"hidden_size":1152,"num_hidden_layers":27}}"#
+            .write(toFile: vlCfg, atomically: true, encoding: .utf8)
+        let vl = DownloadManager.parseConfigMetadata(atPath: vlCfg)
+        XCTAssertTrue(vl.hasVision)
+        XCTAssertEqual(vl.modelType, "lfm2_vl")
+    }
+
     func testParseConfigMetadataMissingFileDefaults() {
         let meta = DownloadManager.parseConfigMetadata(atPath: "/nope/config.json")
         XCTAssertEqual(meta, DownloadManager.ConfigMetadata())

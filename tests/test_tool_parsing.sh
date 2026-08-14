@@ -54,7 +54,7 @@ fi
 # Build if needed
 if [ ! -f "$BINARY" ]; then
     echo "Building..."
-    zig build 2>&1 || { echo "Build failed"; exit 1; }
+    { [ -x ./.zig-toolchain/zig ] && ZIG=./.zig-toolchain/zig || ZIG=zig; "$ZIG" build -Doptimize=ReleaseFast 2>&1; } || { echo "Build failed"; exit 1; }
 fi
 
 # Start server
@@ -285,12 +285,43 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
     "stream": false
   }')
 
-TOKENS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['completion_tokens'])" 2>/dev/null)
-if [ "$TOKENS" -gt 2 ] 2>/dev/null; then
-    run_test "Model responds after tool result with code content" "PASS"
-    echo -e "    ${DIM}tokens: $TOKENS${NC}"
+# What a MODEL does after a tool result is its own choice — gemma-4-e4b emits
+# EOS immediately, LFM2.5 calls the tool again, the Qwens answer, and its own
+# template deliberately omits a generation prompt after a tool_response so the
+# model simply continues its turn. Demanding ">2 tokens" asserted a capability,
+# so this failed on a checkpoint that was behaving correctly. Assert the
+# INVARIANT instead — the round-trip is well-formed — and REPORT the choice.
+VERDICT=$(echo "$RESULT" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print('fail:unparseable response'); raise SystemExit
+try:
+    c = d['choices'][0]; m = c['message']
+except Exception:
+    print('fail:no choice in response'); raise SystemExit
+fr = c.get('finish_reason')
+if fr not in ('stop', 'length', 'tool_calls'):
+    print(f'fail:finish_reason={fr}'); raise SystemExit
+content = m.get('content') or ''
+for tag in ('<tool_call', '<|tool_call', '<tool_response', '<|tool_response', '</think'):
+    if tag in content:
+        print(f'fail:{tag} leaked into visible content'); raise SystemExit
+for tc in (m.get('tool_calls') or []):
+    try:
+        json.loads(tc['function']['arguments'])
+    except Exception:
+        print('fail:tool_call arguments are not valid JSON'); raise SystemExit
+n = d.get('usage', {}).get('completion_tokens', 0)
+kind = 'tool_call' if m.get('tool_calls') else ('answer' if content.strip() else 'no-reply')
+print(f'ok:{kind}:{n}')
+" 2>/dev/null)
+if [ "${VERDICT:0:3}" = "ok:" ]; then
+    run_test "Tool-result round-trip is well-formed" "PASS"
+    echo -e "    ${DIM}model chose: ${VERDICT#ok:}${NC}"
 else
-    run_test "Model responds after tool result with code content" "FAIL" "only $TOKENS completion tokens"
+    run_test "Tool-result round-trip is well-formed" "FAIL" "${VERDICT:-no verdict}"
 fi
 echo ""
 

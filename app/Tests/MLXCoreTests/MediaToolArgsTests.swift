@@ -160,6 +160,29 @@ final class MediaToolArgsTests: XCTestCase {
         XCTAssertEqual(MediaToolArgs.musicSeconds("a while"), MediaChatDefaults.musicSeconds)
     }
 
+    // An omitted duration used to be a flat 30 s — which the tool description
+    // actively invited ("omit for 30") — so a full lyric sheet was cut off
+    // mid-song. With lyrics in hand the fallback is derived from them; the
+    // model's own number still wins whenever it sends one.
+    func testAnOmittedDurationIsSizedToTheLyrics() {
+        let sheet = (1...24).map { "line \($0)" }.joined(separator: "\n")
+        let sized = MediaToolArgs.musicSeconds(nil, lyrics: "[verse]\n" + sheet)
+        XCTAssertGreaterThan(sized, 100, "24 sung lines do not fit in 30 seconds")
+        XCTAssertLessThanOrEqual(sized, MediaChatDefaults.musicSecondsRange.upperBound)
+
+        // Section tags are not sung, so they don't buy time.
+        XCTAssertEqual(MediaToolArgs.musicSeconds(nil, lyrics: "[verse]\n[chorus]\n[outro]"),
+                       MediaChatDefaults.musicSeconds)
+        // No lyrics → the short instrumental preview, unchanged.
+        XCTAssertEqual(MediaToolArgs.musicSeconds(nil, lyrics: ""), MediaChatDefaults.musicSeconds)
+        // An explicit request is never second-guessed.
+        XCTAssertEqual(MediaToolArgs.musicSeconds("45", lyrics: sheet), 45)
+        // A novel's worth of lyrics still lands in the server's range.
+        let huge = (1...5000).map { "line \($0)" }.joined(separator: "\n")
+        XCTAssertEqual(MediaToolArgs.musicSeconds(nil, lyrics: huge),
+                       MediaChatDefaults.musicSecondsRange.upperBound)
+    }
+
     func testMusicDefaultsToAShortPreviewNotTheWindowsSixtySeconds() {
         // The tray window keeps its own 60s default; a chat generation blocks
         // decode on one GPU, so it stays a preview.

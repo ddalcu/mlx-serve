@@ -927,7 +927,7 @@
   //           2·active_params. It does NOT vary with context length.
   //
   // The two efficiency pairs below are the only fitted constants, and they
-  // are fitted against four cells of docs/perf-csvs/all-26.7.12.csv measured
+  // are fitted against four cells of docs/perf-csvs/all-26.7.12.csv (git history) measured
   // on an Apple M4 Max 128 GB. tests/website_tier_list_logic.mjs replays
   // those four measurements through this code and fails if it stops
   // reproducing them — so the numbers on this page stay tied to a bench we
@@ -1032,7 +1032,7 @@
   }
 
   // KV bytes per token, anchored on the 27.8B dense measurement implied by the
-  // 64k ladder in docs/perf-csvs/mtp-ladder-26.7.12.csv. KV scales with the
+  // 64k ladder in docs/perf-csvs/mtp-ladder-26.7.12.csv (git history). KV scales with the
   // model's DIMENSIONS, not its expert count, so an MoE is billed on
   // sqrt(total x active) — which lands within a few percent of the real
   // layer x kv_head x head_dim product for the MoEs we ship.
@@ -1067,7 +1067,7 @@
 
   // Measured speculative-decoding multipliers. Draft acceptance is a property
   // of the TEXT, so the workload picker is not a nicety — it is the honest
-  // range. Sources: docs/perf-csvs/all-26.7.12.csv (PLD/drafter/MTP columns)
+  // range. Sources: docs/perf-csvs/all-26.7.12.csv, git history (PLD/drafter/MTP columns)
   // and the DSpark / Ling MTP rounds in our engine notes.
   const SPEC_GAIN = {
     none:    { prose: 1.00, code: 1.00, agent: 1.00 },

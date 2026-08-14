@@ -39,6 +39,28 @@ enum AgentPrompt {
             + "This machine gives you about \(effective) tokens per response. Exceed it and the response is cut off mid-write: a tool call in progress is LOST (the file is NOT written) and the turn can end unfinished. Keep any single writeFile/editFile content under ~\(safeLines) lines (~\(safeTokens) tokens). For a larger file, write the first chunk, then call writeFile again with append:\"true\" for each remaining chunk — a shell heredoc has the same cap, so chunking is the only fix."
     }
 
+    /// The music engine the Music window is set to. The `generate_music`
+    /// schema is static, but the two engines take DIFFERENT inputs: Music 3
+    /// is lyric-conditioned (a call with no lyrics fails before the model
+    /// loads) and the server 400s bpm/keyscale/time_signature/vocal_language,
+    /// while ACE-Step reads all of them. The model sees only the schema, so
+    /// the contract rides the prompt — DERIVED from the preset's own flags,
+    /// so a third engine gets a correct line without new prose.
+    static func musicEngineNote(_ model: MusicModelPreset) -> String {
+        var note = "\n\n# Music engine\nThe Music window is set to “\(model.name)”, so that is what `generate_music` runs. "
+        if model.requiresLyrics {
+            note += "It requires `lyrics` — a call without them fails. Write original words with section tags ([verse], [chorus]) on their own lines; for an instrumental send the tags with no words under them. "
+        } else {
+            note += "`lyrics` are optional — omit them for an instrumental. "
+        }
+        if model.supportsMusicalMeta {
+            note += "It reads `bpm`, `keyscale`, `time_signature` and `vocal_language`; set them when the user names a tempo, key or language."
+        } else {
+            note += "It ignores tempo, key, meter and language arguments — put those in the `prompt` instead."
+        }
+        return note
+    }
+
     private static let mlxServeDir = NSString(string: "~/.mlx-serve").expandingTildeInPath
     private static let promptPath = (mlxServeDir as NSString).appendingPathComponent("system-prompt.md")
     private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
@@ -267,7 +289,7 @@ enum AgentPrompt {
       {"type":"function","function":{"name":"listProcesses","description":"List the background processes you've started in this chat, with their handles and status (running/exited). Takes no arguments. Example: {}","parameters":{"type":"object","properties":{},"required":[]}}},
       {"type":"function","function":{"name":"generate_image","description":"Draw an image from a text prompt and show it INLINE in this chat. Call it only when the user wants a picture PRODUCED — a question that merely mentions images (how image generation works, which model to use) is answered in text with NO tool call. Chat images are quick previews at fast settings; the Image window is where full-quality work happens. This is a HEAVY one-shot (it loads a multi-GB diffusion model and can take a while), so make at most ONE media generation per user message. The model must already be downloaded; if it isn't you'll get a message telling the user to open the Image window once. The result is displayed automatically — reply with one short sentence, and never invent a file name or a markdown image link. Example: {\"prompt\": \"a red fox in the snow at golden hour, cinematic\"}","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"What to draw — a vivid, detailed description of the image."},"size":{"type":"string","description":"Optional shape: WIDTHxHEIGHT like \"1344x768\", or a plain ratio like \"16:9\" or \"9:16\". Snapped to the nearest size the model was trained on. Omit unless the user asked for a shape."}},"required":["prompt"]}}},
       {"type":"function","function":{"name":"generate_speech","description":"Speak a line of text out loud with the neural voice model and attach the clip to this chat. Use it when the user wants something SAID or narrated as an audio file — not for ordinary answers, which are always plain text. For music or a song use generate_music instead. This is a HEAVY one-shot (a voice model loads first), so make at most ONE media generation per user message. The clip is attached and playable automatically — reply with one short sentence and never invent a file name. Example: {\"text\": \"Your coffee is ready.\"}","parameters":{"type":"object","properties":{"text":{"type":"string","description":"Exactly the words to speak. Write them out in full — no markdown, no stage directions."},"speed":{"type":"string","description":"Optional speaking rate, 0.5 (slow) to 2.0 (fast). Omit for normal."}},"required":["text"]}}},
-      {"type":"function","function":{"name":"generate_music","description":"Compose a piece of music from a style description and attach the track to this chat. Describe genre, mood and instrumentation in the prompt; supply lyrics only if the user wants singing (omit them for an instrumental). For a spoken line use generate_speech instead. This is a HEAVY one-shot (a multi-GB model loads and a 30s track takes a while), so make at most ONE media generation per user message. The track is attached and playable automatically — reply with one short sentence and never invent a file name. Example: {\"prompt\": \"warm lo-fi hip hop with a mellow Rhodes piano, dusty vinyl texture and soft boom-bap drums\", \"duration_seconds\": \"30\", \"bpm\": \"85\"}","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The style: genre, mood, instrumentation, tempo feel. Not lyrics."},"lyrics":{"type":"string","description":"Optional words to sing, with [Verse] / [Chorus] section tags. Omit for an instrumental."},"duration_seconds":{"type":"string","description":"Optional track length in seconds, 10 to 600. Omit for 30."},"bpm":{"type":"string","description":"Optional tempo in beats per minute, 30 to 300 (85 hip-hop, 120 pop/house, 128 EDM, 174 drum & bass). Omit to let the model choose."},"keyscale":{"type":"string","description":"Optional musical key as note + major/minor, e.g. \"A minor\", \"C major\", \"Eb major\" (notes C C# D Eb E F F# G Ab A Bb B). Omit to let the model choose."},"time_signature":{"type":"string","description":"Optional meter, one of \"4/4\", \"3/4\", \"2/4\", \"6/8\". Omit to let the model choose."},"vocal_language":{"type":"string","description":"Optional language for the SUNG lyrics, e.g. \"English\", \"Spanish\", \"Japanese\". Only meaningful with lyrics. Omit unless the user asked."}},"required":["prompt"]}}},
+      {"type":"function","function":{"name":"generate_music","description":"Compose a piece of music from a style description and attach the track to this chat. Describe genre, mood and instrumentation in the prompt; supply lyrics only if the user wants singing (omit them for an instrumental). For a spoken line use generate_speech instead. This is a HEAVY one-shot (a multi-GB model loads and a 30s track takes a while), so make at most ONE media generation per user message. The track is attached and playable automatically — reply with one short sentence and never invent a file name. Example: {\"prompt\": \"warm lo-fi hip hop with a mellow Rhodes piano, dusty vinyl texture and soft boom-bap drums\", \"duration_seconds\": \"30\", \"bpm\": \"85\"}","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The style: genre, mood, instrumentation, tempo feel. Not lyrics."},"lyrics":{"type":"string","description":"Optional words to sing, with [Verse] / [Chorus] section tags. Omit for an instrumental."},"duration_seconds":{"type":"string","description":"Track length in seconds, 10 to 600. SIZE IT TO THE LYRICS — whatever does not fit is cut off mid-song: about 4 seconds per sung line plus 15 for intro and outro, so a 24-line song needs ~120, not 30. Omit only for an instrumental (30s preview)."},"bpm":{"type":"string","description":"Optional tempo in beats per minute, 30 to 300 (85 hip-hop, 120 pop/house, 128 EDM, 174 drum & bass). Omit to let the model choose."},"keyscale":{"type":"string","description":"Optional musical key as note + major/minor, e.g. \"A minor\", \"C major\", \"Eb major\" (notes C C# D Eb E F F# G Ab A Bb B). Omit to let the model choose."},"time_signature":{"type":"string","description":"Optional meter, one of \"4/4\", \"3/4\", \"2/4\", \"6/8\". Omit to let the model choose."},"vocal_language":{"type":"string","description":"Optional language for the SUNG lyrics, e.g. \"English\", \"Spanish\", \"Japanese\". Only meaningful with lyrics. Omit unless the user asked."}},"required":["prompt"]}}},
       {"type":"function","function":{"name":"generate_video","description":"Generate a short video clip from a text prompt and attach it to this chat. Call it only when the user wants a clip PRODUCED. This is the SLOWEST tool here — a couple of seconds of video takes MINUTES on one GPU and blocks the chat while it runs — so make at most ONE media generation per user message and keep the clip short. The model must already be downloaded; if it isn't you'll get a message telling the user to open the Video window once. The clip is attached and playable automatically — reply with one short sentence and never invent a file name. Example: {\"prompt\": \"a timelapse of clouds rolling over a mountain range at sunrise\", \"seconds\": \"2\"}","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"What the clip should show — subject, motion, camera, lighting."},"seconds":{"type":"string","description":"Optional clip length in seconds, up to 4. Omit for 2. Every extra second costs another minute of generation."},"size":{"type":"string","description":"Optional shape: WIDTHxHEIGHT like \"704x480\", or a plain ratio like \"16:9\" or \"9:16\". Snapped to the nearest size the model was trained on."}},"required":["prompt"]}}}
     ]
     """#
@@ -395,7 +417,7 @@ class SkillManager {
 
     init(skillsDir: String? = nil) {
         self.skillsDir = skillsDir ?? NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
-        seedDefaultSkillIfFirstRun()
+        seedBuiltinSkills()
         reload()
     }
 
@@ -403,16 +425,49 @@ class SkillManager {
     /// Folder" menu item (accessing the shared manager also triggers seeding).
     var skillsDirectory: String { skillsDir }
 
-    /// First-run seed: when the skills directory doesn't exist yet, create it
-    /// and drop a single example skill so the feature is discoverable and users
-    /// have a working template to copy. Keyed on directory existence — once the
-    /// dir is there we never re-seed, so editing or deleting the example sticks.
-    private func seedDefaultSkillIfFirstRun() {
+    /// Seed the skills the app ships with. Per FILE against a ledger of names
+    /// already seeded (`.seeded` in the folder), not directory existence: the
+    /// old gate was "does the dir exist", so a built-in added later would have
+    /// reached brand-new installs only. Deleting a seeded skill still sticks —
+    /// its name stays in the ledger. A pre-ledger folder is migrated by taking
+    /// what is already ON DISK as seeded, so an example the user deleted back
+    /// then is not resurrected.
+    private func seedBuiltinSkills() {
         let fm = FileManager.default
-        guard !fm.fileExists(atPath: skillsDir) else { return }
-        guard (try? fm.createDirectory(atPath: skillsDir, withIntermediateDirectories: true)) != nil else { return }
-        let path = (skillsDir as NSString).appendingPathComponent("review.md")
-        try? Self.defaultSkillFile.write(toFile: path, atomically: true, encoding: .utf8)
+        let firstRun = !fm.fileExists(atPath: skillsDir)
+        if firstRun {
+            guard (try? fm.createDirectory(atPath: skillsDir, withIntermediateDirectories: true)) != nil else { return }
+        }
+        let ledger = (skillsDir as NSString).appendingPathComponent(".seeded")
+        var seeded: Set<String>
+        if let text = try? String(contentsOfFile: ledger, encoding: .utf8) {
+            seeded = Set(text.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty })
+        } else {
+            seeded = Set((try? fm.contentsOfDirectory(atPath: skillsDir)) ?? [])
+            // Pre-ledger folder: the old scheme already made its call on the
+            // review example (seeded on first run, possibly deleted since).
+            if !firstRun { seeded.insert("review.md") }
+        }
+        var changed = false
+        for skill in Self.builtinSkills where !seeded.contains(skill.file) {
+            let path = (skillsDir as NSString).appendingPathComponent(skill.file)
+            if !fm.fileExists(atPath: path) {
+                try? skill.body.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+            seeded.insert(skill.file)
+            changed = true
+        }
+        if changed {
+            try? seeded.sorted().joined(separator: "\n").write(toFile: ledger, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// The skills the app ships with, seeded into the folder so they are
+    /// discoverable and editable like any user skill.
+    static var builtinSkills: [(file: String, body: String)] {
+        [("review.md", defaultSkillFile), ("music3.md", musicSkillFile)]
     }
 
     /// The example skill shipped on first run. Genuinely useful (a focused,
@@ -449,6 +504,71 @@ class SkillManager {
     system prompt when a trigger matches.)
     """
 
+    /// Music skill: MiniMax Music 3 takes a structured CAPTION plus separate
+    /// lyrics, and a one-line "lo-fi beat" prompt leaves every arrangement
+    /// decision to the model. A condensed version of MiniMax's own
+    /// music-caption-rewriter — the three caption blocks and the lyric-tag
+    /// contract, no template library.
+    static let musicSkillFile = """
+    ---
+    name: music3
+    description: Write a MiniMax Music 3 caption plus lyrics, then generate the track
+    trigger: song, music, lyrics, soundtrack, jingle
+    ---
+    When the user asks for a song or a piece of music, write the two things the
+    music model conditions on, then call `generate_music` once with them.
+
+    This caption format is what MiniMax Music 3 was trained on. ACE-Step reads
+    the same text happily, but takes tempo, key and meter from its own
+    arguments instead.
+
+    ## prompt — the caption
+
+    Three plain-prose blocks in this order, about 120-250 words total. Plain
+    text, no markdown, and never any lyrics.
+
+    Global Metadata
+    Genre and subgenre, tempo feel, the emotional arc from first bar to last,
+    and the production profile: soundstage, warmth, dynamics.
+
+    Vocal Details
+    Lead voice — gender, timbre, register, delivery. Harmony and backing
+    vocals, and restrained vocal effects. For an instrumental, say it is
+    instrumental and name the instrument carrying the melody instead.
+
+    Arrangement
+    The song as a timeline: what enters, exits or intensifies in each section,
+    how the groove develops, how sections transition. Concrete musical changes,
+    not a list of gear.
+
+    ## lyrics — the words
+
+    Original words you write, unless the user gives you theirs. 
+    Section tags go on their own line, above the
+    lines they cover: [intro] [verse] [pre-chorus] [chorus] [bridge]
+    [instrumental] [solo] [outro].
+
+    The caption never contains lyrics, and the lyrics never contain style notes.
+
+    ## Rules
+
+    - The "Music engine" section of your instructions names the engine that
+      will actually run, whether `lyrics` are required, and whether tempo, key
+      and meter arguments are read. It wins over anything here.
+    - Do not invent an exact BPM or key the user did not ask for — describe the
+      tempo instead ("slow, unhurried", "driving four-on-the-floor").
+    - Size `duration_seconds` to the lyrics: about 4 seconds a sung line plus 15
+      for intro and outro, so a 24-line song needs ~120, not the 30-second
+      default — whatever does not fit is cut off mid-song. On Music 3 the
+      duration is an upper bound, so rounding up costs nothing.
+    - One track per message. Always show the user what you used: the caption in
+      its own fenced code block, then the lyrics in a second one, so either can
+      be copied straight into the Music window's Style and Lyrics fields.
+    - No `generate_music` tool in this chat? Write the same two code blocks and
+      tell the user to switch Tools on (or paste them into the Music window) to
+      render the track. Do not pretend to have made audio.
+    """
+
     /// Whole-word/phrase trigger match: `keyword` must appear in `text` bounded
     /// by non-alphanumeric characters or the string edges — a plain
     /// `text.contains(keyword)` fired on fragments inside unrelated words
@@ -471,7 +591,24 @@ class SkillManager {
         return false
     }
 
-    /// Returns skill index (always) + matching skill bodies (when triggered).
+    /// Every skill, for the composer's "/" menu.
+    var summaries: [SkillSummary] {
+        reloadIfNeeded()
+        return skills.map { SkillSummary(name: $0.name, description: $0.description) }
+    }
+
+    /// The body block for a skill invoked by name, or "" — the composer's
+    /// `/name` path, which works in every chat mode (the user asked for it by
+    /// name, so it does not wait for the agent loop's trigger matching).
+    func invokedSkill(for userMessage: String) -> String {
+        reloadIfNeeded()
+        guard let name = SlashCommands.invokedSkillName(in: userMessage),
+              let skill = skills.first(where: { $0.name.lowercased() == name }) else { return "" }
+        return "\n\n## Skill: \(skill.name)\n\(skill.body)"
+    }
+
+    /// Returns skill index (always) + matching skill bodies (when triggered,
+    /// or when the message invokes one by name).
     func matchingSkills(for userMessage: String) -> String {
         reloadIfNeeded()
         guard !skills.isEmpty else { return "" }
@@ -479,8 +616,10 @@ class SkillManager {
         let lower = userMessage.lowercased()
         var result = "\nAvailable skills: " + skills.map { "\($0.name) (\($0.description))" }.joined(separator: ", ")
 
+        let invoked = SlashCommands.invokedSkillName(in: userMessage)
         let matched = skills.filter { skill in
-            skill.triggers.contains { Self.triggerMatches(lower, $0) }
+            skill.name.lowercased() == invoked
+                || skill.triggers.contains { Self.triggerMatches(lower, $0) }
         }
         for skill in matched {
             result += "\n\n## Skill: \(skill.name)\n\(skill.body)"

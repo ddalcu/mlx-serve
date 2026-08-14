@@ -93,14 +93,32 @@ ns = (r["choices"][0].get("logprobs") or {}).get("content") or []
 ck("[non-stream] logprobs present", bool(ns), f"got {r['choices'][0].get('logprobs')}")
 if ns:
     entries_ok("non-stream", ns)
-    ck("[non-stream] one entry per completion token",
-       len(ns) == r["usage"]["completion_tokens"],
+    # logprobs.content describes message.content, NOT the whole completion:
+    # tokens generated outside content (LFM2.5 closes its unconditionally-opened
+    # <think> with one token) are billed in completion_tokens and correctly have
+    # no entry. So the model-independent contract is the CONCATENATION, which
+    # also catches an off-by-one in position that a count identity cannot.
+    ck("[non-stream] entries concatenate to message.content",
+       "".join(e["token"] for e in ns) == (r["choices"][0]["message"].get("content") or ""),
+       f"joined={''.join(e['token'] for e in ns)[:80]!r} vs content={(r['choices'][0]['message'].get('content') or '')[:80]!r}")
+    ck("[non-stream] entries never exceed completion tokens",
+       len(ns) <= r["usage"]["completion_tokens"],
        f"{len(ns)} entries vs {r['usage']['completion_tokens']} tokens")
 
 print("── [2/7] temperature must not move the model's own distribution ──")
-a = post("/v1/chat/completions", {**REQ, "max_tokens": 1, "stream": False})["choices"][0]["logprobs"]["content"][0]
-b = post("/v1/chat/completions", {**REQ, "max_tokens": 1, "temperature": 2.0, "top_k": 1,
-                                  "stream": False})["choices"][0]["logprobs"]["content"][0]
+# max_tokens=1 is not enough to guarantee a CONTENT token: a model whose template
+# opens <think> unconditionally spends its first token closing it, and that token
+# has no logprobs.content entry (the field describes message.content). Ask for a
+# few and take the first content entry — greedy on both arms, so it is the same
+# token either way, which is exactly what this check is about.
+def first_content_entry(req):
+    ents = (post("/v1/chat/completions", req)["choices"][0].get("logprobs") or {}).get("content") or []
+    if not ents:
+        print("  \033[0;31mFAIL\033[0m  no content logprob entries to compare"); sys.exit(1)
+    return ents[0]
+
+a = first_content_entry({**REQ, "max_tokens": 8, "stream": False})
+b = first_content_entry({**REQ, "max_tokens": 8, "temperature": 2.0, "top_k": 1, "stream": False})
 ck("same token drawn", a["token"] == b["token"], f"{a['token']!r} vs {b['token']!r}")
 ck("its logprob is temperature-INDEPENDENT", abs(a["logprob"] - b["logprob"]) < 1e-3,
    f"temp0={a['logprob']} temp2={b['logprob']}")

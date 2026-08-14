@@ -1,30 +1,31 @@
 ---
 name: bench
-description: mlx-serve benchmarking methodology — bench.sh/llmprobe usage, comparison-trap rules (same-methodology CSVs only, spec-decode variance, thermal lies, engine naming), perf-claim etiquette. Use before running benchmarks or making any performance claim.
+description: mlx-serve benchmarking methodology — bench.sh/llmprobe usage, comparison-trap rules (same-methodology cells only, spec-decode variance, thermal lies, engine naming), perf-claim etiquette. Use before running benchmarks or making any performance claim.
 ---
 
 ## Benchmarking
 
-**llmprobe is the measurement layer.** `tests/bench.sh` drives engines (boot, warm, kill, settle) and llmprobe takes every number: `--bench-only` per engine per model, saved as JSON, converted by `tests/bench_csv.py` into ONE CSV that both charts render from. We do not hand-roll timing loops any more — llmprobe discards a warmup per scenario, reports median-of-3 as `median (min-max)`, refuses to fabricate a number when usage is missing, records the machine, and applies the identical protocol to every engine.
+**llmprobe is the measurement layer.** `tests/bench.sh` boots mlx-serve (one model at a time: boot, probe, kill, settle) and llmprobe takes every number via `--bench-only`. We do not hand-roll timing loops — llmprobe discards a warmup per scenario, reports median-of-3 as `median (min-max)`, refuses to fabricate a number when usage is missing, records the machine it ran on, and applies the same protocol to every engine.
 
 ```
-./tests/bench.sh                                   # mlx-serve only, all models (~did we regress)
-./tests/bench.sh --only qwen36-27b                 # one model row
-./tests/bench.sh --lmstudio --omlx --mtplx --full  # the release / marketing run
+./tests/bench.sh                                # every model (~did we regress)
+./tests/bench.sh --only qwen36-27b              # one row
+./tests/bench.sh --url 127.0.0.1:1234 -m <id>   # a server someone else started
+./tests/bench.sh --full                         # median of 3 per rung, to 64k
 ```
 
-Artifacts, all from ONE run: `docs/perf-csvs/probe-<tag>.csv`, `docs/perf-pngs/perf-vs-lmstudio-omlx-all-<tag>.png` (headline bars), `docs/perf-pngs/perf-mtp-ladder-<tag>.png` (context ladder). The ladder is llmprobe's `contextScaling` block out of the same run — there is no second protocol to keep in sync.
+**Each cell is mlx-serve at its FASTEST.** `--mtp` is forced wherever the checkpoint ships an MTP head, because it is default-OFF on MoE targets and that is where it pays most (35B-A3B reads 157 without and 191 with). Everything else is already on by default. The mode that actually engaged is read off the server's own `[spec-stats] mode=` lines and named beside the number — a mode that silently stops engaging shows up as a bare cell, which is the regression signal.
 
-**One boot = one cell, on shipping defaults.** llmprobe measures the server that is running, so there is no spec sweep and no "best config" collapse. mlx-serve picks its own speculative mode per checkpoint; the bar is what a user gets out of the box, and llmprobe's speculative probe reports what that turned out to be (ratio + tokens/step land in the CSV as `spec_ratio` / `tok_per_step`). To A/B a flag, boot mlx-serve yourself and compare cells — a kill-switch A/B beats a cross-version absolute diff, always.
+**Another engine = another URL.** Start LM Studio / oMLX / MTPLX / llama-server yourself, then `--url host:port -m <id>`. Same script, same probe, nothing about their binaries, ports or version strings lives in the bench.
+
+The only artifacts: the paste-ready rows bench.sh prints at the end, which go into `benchmarks.md` (one column per release in the history table, plus the cross-engine table rewritten when a comparison is run), and the saved llmprobe reports + server logs under `~/claude-tmp/bench-<tag>/`.
 
 ### Comparison traps (these cost real days)
 
-- **Diff only against same-methodology CSVs.** `probe-*.csv` (llmprobe) and `all-*.csv` / `mtp-ladder-*.csv` (the pre-2026-08 hand-rolled bench.sh) are DIFFERENT methodologies — different prompts, different warmup, different rate math. Never diff across the two families; the old CSVs are frozen history, kept for their charts.
+- **Only diff same-methodology cells.** Columns through 26.7.12 are the old in-repo harness; 26.8 on is llmprobe — different prompts, different warmup, different rate math. Never diff across that boundary. Same rule inside one column: a forced-spec cell and a shipping-defaults cell are not the same measurement.
 - **"Reproducible ≠ not variance"** for spec-decode cells — sample across runs and boot orders before any regression claim. A cell that reads the same twice can still be variance.
 - **Attribute before believing.** Check whether the change could physically reach the cell that moved; reachability is faster to check than another bench and is what makes a repeat a confirmation.
 - **Never quote a win without naming the engine it is over** — vs LM-GGUF a row reads +33%; vs oMLX the same row is +1.6%.
-- **Thermal soak lies harder than drift** — same-session ratios only. llmprobe's own sustained-load check catches drift WITHIN a cell; bench.sh runs mlx-serve first on every row so drift that builds across a row lands on the comparison engines, not on us.
+- **Thermal soak lies harder than drift** — same-session ratios only. llmprobe's own sustained-load check catches drift WITHIN a cell; run the comparison engine right after ours, not hours later, or say so beside the number.
 - **An A/B arm is proven by ENGAGEMENT lines in its own log, never by its launch env.** zsh does not word-split `env $VAR`, so a multi-switch arm's first switch swallowed the rest as its value and the "composed" arm silently ran the fast path — reading a 2x win as "neutral" for half a session (live 2026-07-30, story in docs/qwentts-cache.md).
-- **A bench's port wait-list must equal its kill-list.** `stop_all_engines` waits only on ports it kills. LM Studio's server is a persistent daemon we deliberately never kill (its MODEL is freed by `lms unload --all`), so LMS_PORT in the wait list burned the full 30 s timeout on every stop — measured 11 of 20 min on a `--family all --lmstudio` run, one row 233.5 s → 55.5 s when dropped. Symptom: wall clock dominated by fixed ~40 s stalls between cells regardless of model size, and fast when comparison engines are off.
-
-The record IS the artifacts: CSVs → `docs/perf-csvs/`, charts → `docs/perf-pngs/`. `BenchmarkLog.md` is retired as a hand-maintained narrative — don't add entries.
+- **A bench's port wait-list must equal its kill-list.** LM Studio's server is a persistent daemon you never kill (its MODEL is freed by `lms unload --all`), so waiting on its port burns the full timeout on every stop — measured 11 of 20 min on one run. This is why bench.sh no longer manages other engines at all.

@@ -79,7 +79,9 @@ extension AudioModelPreset {
 }
 
 extension MusicModelPreset {
-    var capabilityLabel: String { "Best for music" }
+    var capabilityLabel: String {
+        family == .acestep ? "Fastest music (8-step Turbo)" : "Best for full songs with vocals"
+    }
 }
 
 extension Model3DModelPreset {

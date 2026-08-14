@@ -63,7 +63,11 @@ enum CustomMediaModels {
     }
 
     private static func musicFamily(arch: String) -> MusicModelPreset? {
-        arch == "acestep" ? .acestepXLTurbo8bit : nil
+        switch arch {
+        case "acestep": return .acestepXLTurbo8bit
+        case "minimax_music3": return .miniMaxMusic3_8bit
+        default: return nil
+        }
     }
 
     private static func meshFamily(arch: String) -> Model3DModelPreset? {

@@ -14,6 +14,7 @@ test {
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
     _ = @import("muse_vision.zig");
+    _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
@@ -51,6 +52,9 @@ test {
     _ = @import("lora.zig");
     _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
+    _ = @import("ltx_diffvae.zig");
+    _ = @import("ltx_diffvae_kernel.zig");
+    _ = @import("ltx_diffvae_forward.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("minimax_h3.zig");
     _ = @import("minimax_h3_vision.zig");
@@ -61,6 +65,7 @@ test {
     _ = @import("glb.zig");
     _ = @import("hunyuan3d.zig");
     _ = @import("acestep.zig");
+    _ = @import("music3.zig");
     _ = @import("uvwrap.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");

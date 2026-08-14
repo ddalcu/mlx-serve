@@ -425,6 +425,24 @@ pub const ModelConfig = struct {
     mv_rope_theta: f64 = 10000.0,
     mv_max_image_tokens: u32 = 0, // processor cap, in MERGED tokens
     mv_full_attn: [MAX_VISION_LAYERS]bool = @splat(false),
+    // LFM2-VL vision (src/lfm2_vision.zig). The tower's geometry comes from the
+    // generic vision_* fields above (it is a stock SigLIP2); these are LFM2-VL's
+    // own wrapper — the projector, and the NaFlex processor's token budget.
+    lfm2_vision: bool = false,
+    lv_pos_side: u32 = 0, // learned pos table is pos_side x pos_side
+    lv_downsample: u32 = 2, // projector pixel-unshuffle factor
+    lv_projector_hidden: u32 = 0,
+    lv_ln_eps: f32 = 1e-6,
+    lv_min_image_tokens: u32 = 64,
+    lv_max_image_tokens: u32 = 256,
+    lv_tile_size: u32 = 512,
+    lv_min_tiles: u32 = 2,
+    lv_max_tiles: u32 = 10,
+    lv_split_images: bool = true,
+    lv_use_thumbnail: bool = true,
+    lv_pixels_tolerance: f32 = 2.0,
+    lv_thumbnail_token_id: u32 = 0,
+    lv_row_col_base_id: u32 = 0, // id of `<|img_row_1_col_1|>`; the block is row-major
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -827,6 +845,28 @@ pub const ModelConfig = struct {
         @memcpy(self.user_turn_marker_ids[0..ids.len], ids);
         self.user_turn_marker_len = @intCast(ids.len);
         log.info("User turn marker: \"{s}\" -> {d} tokens\n", .{ prefix, ids.len });
+    }
+
+    /// LFM2-VL wraps its image-token run in `<|image_start|>`/`<|image_end|>`,
+    /// labels every tile with `<|img_row_R_col_C|>` and marks the thumbnail
+    /// with `<|img_thumbnail|>`. NONE of those ids appear in config.json — the
+    /// tokenizer is the only place they exist — so they are resolved by STRING
+    /// at load, like the user-turn marker. A missing marker leaves its id 0,
+    /// which every consumer reads as "this checkpoint has no such token".
+    pub fn populateLfm2ImageTokens(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (!self.lfm2_vision) return;
+        if (tok.special_tokens.get("<|image_start|>")) |id| self.boi_token_id = id;
+        if (tok.special_tokens.get("<|image_end|>")) |id| self.eoi_token_id = id;
+        if (tok.special_tokens.get("<|img_thumbnail|>")) |id| self.lv_thumbnail_token_id = id;
+        // The row/col markers are one contiguous block laid out row-major over
+        // the max tile grid, so the first one plus (row, col) locates them all.
+        if (tok.special_tokens.get("<|img_row_1_col_1|>")) |id| self.lv_row_col_base_id = id;
+        if (self.image_token_id == 0) {
+            if (tok.special_tokens.get("<image>")) |id| self.image_token_id = id;
+        }
+        log.info("LFM2-VL image tokens: <image>={d} start={d} end={d} thumbnail={d} row_col_base={d}\n", .{
+            self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
+        });
     }
 };
 
@@ -2055,6 +2095,38 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (config.num_eos_tokens == 0) {
             if (cfg_obj.get("eos_token_id")) |v| {
                 if (v == .integer) config.addEosToken(@intCast(v.integer));
+            }
+        }
+        // LFM2-VL: a stock `siglip2_vision_model` tower (src/lfm2_vision.zig)
+        // plus LFM2-VL's own projector. The generic vision_config block above
+        // already read the tower's geometry; everything here is the wrapper.
+        // A `lfm2` checkpoint with no vision_config stays text-only.
+        if (root.get("vision_config")) |vc_val| {
+            if (vc_val == .object and std.mem.eql(u8, model_type, "lfm2_vl")) {
+                config.lfm2_vision = true;
+                const vc = vc_val.object;
+                config.lv_ln_eps = 1e-6;
+                if (vc.get("layer_norm_eps")) |v| config.lv_ln_eps = jsonFloat(v);
+                // The stored table is square: num_patches = pos_side².
+                var num_patches: u32 = 256;
+                if (vc.get("num_patches")) |v| { if (v == .integer) num_patches = @intCast(v.integer); }
+                config.lv_pos_side = std.math.sqrt(num_patches);
+                if (root.get("downsample_factor")) |v| { if (v == .integer) config.lv_downsample = @intCast(v.integer); }
+                if (root.get("projector_hidden_size")) |v| { if (v == .integer) config.lv_projector_hidden = @intCast(v.integer); }
+                if (root.get("min_image_tokens")) |v| { if (v == .integer) config.lv_min_image_tokens = @intCast(v.integer); }
+                if (root.get("max_image_tokens")) |v| { if (v == .integer) config.lv_max_image_tokens = @intCast(v.integer); }
+                if (root.get("tile_size")) |v| { if (v == .integer) config.lv_tile_size = @intCast(v.integer); }
+                if (root.get("min_tiles")) |v| { if (v == .integer) config.lv_min_tiles = @intCast(v.integer); }
+                if (root.get("max_tiles")) |v| { if (v == .integer) config.lv_max_tiles = @intCast(v.integer); }
+                if (root.get("do_image_splitting")) |v| { if (v == .bool) config.lv_split_images = v.bool; }
+                if (root.get("use_thumbnail")) |v| { if (v == .bool) config.lv_use_thumbnail = v.bool; }
+                if (root.get("max_pixels_tolerance")) |v| config.lv_pixels_tolerance = jsonFloat(v);
+                if (config.lv_projector_hidden == 0) config.lv_projector_hidden = config.hidden_size;
+            } else {
+                // `vision_config` present without the VL tag (mlx-community's
+                // text-only LFM2.5 packs ship an EMPTY one): never advertise a
+                // tower we have no weights for.
+                config.has_vision = false;
             }
         }
     } else if (std.mem.eql(u8, model_type, "nemotron_h")) {

@@ -120,7 +120,7 @@ echo ""
 # ── Build ──
 
 echo -e "${YELLOW}Building...${NC}"
-zig build 2>&1
+{ [ -x ./.zig-toolchain/zig ] && ZIG=./.zig-toolchain/zig || ZIG=zig; "$ZIG" build -Doptimize=ReleaseFast 2>&1; }
 echo ""
 
 # ── Start server ──

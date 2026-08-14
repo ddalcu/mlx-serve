@@ -28,7 +28,7 @@ pub const Resized = struct { h: u32, w: u32 };
 /// `std.math.round` is round-half-away-from-zero. `_smart_resize_image` uses the
 /// Python builtin, so we must match it for byte-faithful grids. Inputs here are
 /// always positive (image dimensions / factor).
-fn roundHalfEven(x: f64) f64 {
+pub fn roundHalfEven(x: f64) f64 {
     const fl = std.math.floor(x);
     const frac = x - fl;
     if (frac < 0.5) return fl;
@@ -69,20 +69,23 @@ pub fn smartResizeDefault(height: u32, width: u32) Resized {
 /// Resampling kernels, matching Pillow's. Qwen's processor asks for BICUBIC,
 /// Muse-Glimmer's for LANCZOS.
 pub const Filter = enum {
+    bilinear,
     bicubic,
     lanczos,
 
     fn support(self: Filter) f64 {
         return switch (self) {
+            .bilinear => 1.0,
             .bicubic => 2.0,
             .lanczos => 3.0,
         };
     }
 
-    /// Keys bicubic (a = -0.5) / Lanczos-3.
+    /// Triangle / Keys bicubic (a = -0.5) / Lanczos-3.
     fn weight(self: Filter, distance: f64) f64 {
         const x = @abs(distance);
         switch (self) {
+            .bilinear => return if (x < 1.0) 1.0 - x else 0.0,
             .bicubic => {
                 if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
                 if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
@@ -126,6 +129,52 @@ const ResampleCoefficients = struct {
 /// Precompute one separable Pillow-style resize axis. Downscaling widens the
 /// filter footprint by `input_len / output_len`; this anti-aliasing step is the
 /// material difference between Image.resize(BICUBIC) and a fixed 4-tap sampler.
+/// Separable-axis geometry, shared by every consumer of this filter so the
+/// fixed-point image path and the float matrix path cannot drift apart.
+const AxisGeometry = struct {
+    scale: f64,
+    support: f64,
+    inverse_filter_scale: f64,
+
+    fn init(input_len: usize, output_len: usize, filter: Filter) AxisGeometry {
+        const scale = @as(f64, @floatFromInt(input_len)) / @as(f64, @floatFromInt(output_len));
+        const filter_scale = @max(scale, 1.0);
+        return .{
+            .scale = scale,
+            .support = filter.support() * filter_scale,
+            .inverse_filter_scale = 1.0 / filter_scale,
+        };
+    }
+
+    fn kernelSize(self: AxisGeometry) usize {
+        return @intFromFloat(@ceil(self.support) * 2.0 + 1.0);
+    }
+
+    /// The clipped input window contributing to one output coordinate, plus its
+    /// filter center. Pillow's half-pixel convention throughout.
+    fn window(self: AxisGeometry, output_index: usize, input_len: usize) !struct { start: usize, count: usize, center: f64 } {
+        const center = (@as(f64, @floatFromInt(output_index)) + 0.5) * self.scale;
+        const raw_start: i64 = @intFromFloat(center - self.support + 0.5);
+        const raw_end: i64 = @intFromFloat(center + self.support + 0.5);
+        const start = if (raw_start <= 0) 0 else @min(@as(usize, @intCast(raw_start)), input_len);
+        const end = if (raw_end <= 0) 0 else @min(@as(usize, @intCast(raw_end)), input_len);
+        if (end <= start) return error.InvalidResampleCoefficients;
+        return .{ .start = start, .count = end - start, .center = center };
+    }
+
+    /// Normalized (sum == 1) tap weights for one output coordinate.
+    fn taps(self: AxisGeometry, dst: []f64, start: usize, center: f64, filter: Filter) !void {
+        var total: f64 = 0.0;
+        for (dst, 0..) |*w, i| {
+            const source_center = @as(f64, @floatFromInt(start + i)) + 0.5;
+            w.* = filter.weight((source_center - center) * self.inverse_filter_scale);
+            total += w.*;
+        }
+        if (total == 0.0) return error.InvalidResampleCoefficients;
+        for (dst) |*w| w.* /= total;
+    }
+};
+
 fn buildResampleCoefficients(
     allocator: std.mem.Allocator,
     input_len: usize,
@@ -134,10 +183,8 @@ fn buildResampleCoefficients(
 ) !ResampleCoefficients {
     if (input_len == 0 or output_len == 0) return error.InvalidImageDimensions;
 
-    const scale = @as(f64, @floatFromInt(input_len)) / @as(f64, @floatFromInt(output_len));
-    const filter_scale = @max(scale, 1.0);
-    const support = filter.support() * filter_scale;
-    const kernel_size: usize = @intFromFloat(@ceil(support) * 2.0 + 1.0);
+    const geo = AxisGeometry.init(input_len, output_len, filter);
+    const kernel_size = geo.kernelSize();
     const weights_len = try std.math.mul(usize, output_len, kernel_size);
 
     const bounds = try allocator.alloc(ResampleBound, output_len);
@@ -145,42 +192,52 @@ fn buildResampleCoefficients(
     const weights = try allocator.alloc(i32, weights_len);
     errdefer allocator.free(weights);
 
-    const inverse_filter_scale = 1.0 / filter_scale;
-    for (0..output_len) |output_index| {
-        const center = (@as(f64, @floatFromInt(output_index)) + 0.5) * scale;
-        const raw_start: i64 = @intFromFloat(center - support + 0.5);
-        const raw_end: i64 = @intFromFloat(center + support + 0.5);
-        const start = if (raw_start <= 0)
-            0
-        else
-            @min(@as(usize, @intCast(raw_start)), input_len);
-        const end = if (raw_end <= 0)
-            0
-        else
-            @min(@as(usize, @intCast(raw_end)), input_len);
-        const count = end - start;
-        if (count == 0) return error.InvalidResampleCoefficients;
+    const taps = try allocator.alloc(f64, kernel_size);
+    defer allocator.free(taps);
 
-        var total: f64 = 0.0;
-        for (0..count) |input_offset| {
-            const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
-            total += filter.weight((source_center - center) * inverse_filter_scale);
-        }
-        if (total == 0.0) return error.InvalidResampleCoefficients;
+    for (0..output_len) |output_index| {
+        const win = try geo.window(output_index, input_len);
+        try geo.taps(taps[0..win.count], win.start, win.center, filter);
 
         // Pillow converts each normalized coefficient to signed 22-bit fixed
         // point before applying it to uint8 image rows.
-        const row = weights[output_index * kernel_size ..][0..count];
-        for (row, 0..) |*weight, input_offset| {
-            const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
-            const value = filter.weight((source_center - center) * inverse_filter_scale);
-            const scaled = value / total * RESAMPLE_PRECISION_SCALE;
+        const row = weights[output_index * kernel_size ..][0..win.count];
+        for (row, taps[0..win.count]) |*weight, value| {
+            const scaled = value * RESAMPLE_PRECISION_SCALE;
             weight.* = @intFromFloat(if (scaled < 0.0) scaled - 0.5 else scaled + 0.5);
         }
-        bounds[output_index] = .{ .start = start, .len = count };
+        bounds[output_index] = .{ .start = win.start, .len = win.count };
     }
 
     return .{ .bounds = bounds, .weights = weights, .kernel_size = kernel_size };
+}
+
+/// Dense `[output_len, input_len]` row-major resample matrix in f32, so an
+/// axis can be resampled by a matmul instead of a gather. Same taps as the
+/// image path — including the anti-aliasing footprint widening on downscale,
+/// which is what makes this equal to torch's `interpolate(..., antialias=True)`
+/// and unequal to a fixed 2-tap bilinear.
+pub fn resampleWeightMatrix(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    input_len: usize,
+    output_len: usize,
+    filter: Filter,
+) !void {
+    if (input_len == 0 or output_len == 0) return error.InvalidImageDimensions;
+    std.debug.assert(dst.len == output_len * input_len);
+    @memset(dst, 0);
+
+    const geo = AxisGeometry.init(input_len, output_len, filter);
+    const taps = try allocator.alloc(f64, geo.kernelSize());
+    defer allocator.free(taps);
+
+    for (0..output_len) |output_index| {
+        const win = try geo.window(output_index, input_len);
+        try geo.taps(taps[0..win.count], win.start, win.center, filter);
+        const row = dst[output_index * input_len ..][0..input_len];
+        for (taps[0..win.count], 0..) |value, i| row[win.start + i] = @floatCast(value);
+    }
 }
 
 fn clipFixedResample(value: i64) u8 {
@@ -1034,6 +1091,37 @@ test "qwen bicubic RGB preprocessing preserves colors and interpolates" {
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[center], 1e-6);
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[9 + center], 1e-6);
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[18 + center], 1e-6);
+}
+
+test "resampleWeightMatrix reproduces torch's antialiased bilinear on one axis" {
+    // Reference: torch.nn.functional.interpolate(mode="bilinear",
+    // align_corners=False, antialias=True) on a 16-long signal — the exact call
+    // Siglip2 makes to resample its 16x16 position table onto an image's own
+    // patch grid. A grid axis SHORTER than 16 is a real downscale, where a
+    // fixed 2-tap bilinear (no footprint widening) diverges; 16 -> 8 below is
+    // that case, and its last entry (204.571426, not 210.5) is the clipped
+    // edge window renormalizing, which a hand-rolled sampler also misses.
+    const signal = [_]f64{ 0, 1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225 };
+    const cases = [_]struct { out: usize, want: []const f32 }{
+        .{ .out = 14, .want = &.{ 0.166667, 1.833334, 5.944445, 12.500000, 21.500004, 32.944450, 47.736851, 65.894753, 86.277786, 108.166679, 132.500015, 159.277786, 188.500031, 220.166687 } },
+        .{ .out = 20, .want = &.{ 0.000000, 0.700000, 2.500000, 5.500000, 9.700001, 15.300001, 22.300003, 30.500000, 39.900002, 50.500000, 62.500008, 75.899994, 90.500000, 106.300011, 123.300011, 141.700012, 161.500000, 182.500000, 204.700012, 225.000000 } },
+        .{ .out = 8, .want = &.{ 1.000000, 7.000000, 21.000000, 43.000000, 73.000000, 111.000000, 157.000000, 204.571426 } },
+        .{ .out = 32, .want = &.{ 0.000000, 0.250000, 0.750000, 1.750000, 3.250000, 5.250000, 7.750000, 10.750000, 14.250000, 18.250000, 22.750000, 27.750000, 33.250000, 39.250000, 45.750000, 52.750000, 60.250000, 68.250000, 76.750000, 85.750000, 95.250000, 105.250000, 115.750000, 126.750000, 138.250000, 150.250000, 162.750000, 175.750000, 189.250000, 203.250000, 217.750000, 225.000000 } },
+    };
+    const a = std.testing.allocator;
+    for (cases) |c| {
+        const m = try a.alloc(f32, c.out * signal.len);
+        defer a.free(m);
+        try resampleWeightMatrix(a, m, signal.len, c.out, .bilinear);
+        for (0..c.out) |i| {
+            var acc: f64 = 0;
+            for (signal, 0..) |v, j| acc += v * m[i * signal.len + j];
+            std.testing.expectApproxEqAbs(c.want[i], @as(f32, @floatCast(acc)), 2e-4) catch |e| {
+                std.debug.print("16->{d} [{d}] = {d:.6}, want {d:.6}\n", .{ c.out, i, acc, c.want[i] });
+                return e;
+            };
+        }
+    }
 }
 
 test "qwen bicubic downscale matches Pillow anti-aliased RGB output" {

@@ -1,18 +1,50 @@
 # Changelog
 
-## v26.8.6 — LTX-Video 2.5, and way faster decode and prefill at long context
+## v26.8.6 — LTX-Video 2.5, MiniMax Music 3, faster long chats
 
 ### Highlights
 
-- **LTX-Video 2.5 runs on your Mac.** Lightricks' newest video model, joint audio+video like 2.3, with a 4-bit ddalcu build on the Hub (36 GB, down from 110). Text-to-video, image-to-video, audio-to-video and the two-stage pipelines all work; 704x480 at 97 frames takes about two minutes on an M4 Max, soundtrack included.
-- **Long chats got faster on sliding-window models.** These models keep the whole conversation but only attend to a recent slice of it. The server was reading the whole thing anyway on every speculative step and every prompt chunk, and now reads only the part the model can actually see. Muse-Glimmer 30B decodes 63% faster at 16k and 144% faster at 64k, and Laguna XS chews through a 64k prompt at more than twice the speed.
+- **LTX-Video 2.5 runs on your Mac.** Lightricks' newest video model, joint audio+video like 2.3, in a 4-bit build (36 GB) and an 8-bit quality build (59 GB). Text-to-video, image-to-video, audio-to-video and the two-stage pipelines all work.
+- **MiniMax Music 3 writes full songs.** An 8B language model composes the track frame by frame from your style caption and your lyrics, then a diffusion decoder renders it at 44.1 kHz. Strongest vocals we ship.
+- **LFM 2.5 VL reads images.** Liquid's small vision model runs now. Big pictures are split into tiles instead of shrunk to fit, so fine print stays readable.
+- **Video renders at the size your Mac can actually hold.** The default canvas used to be 768x512 on every machine, which is a quarter of what LTX's own pipeline denoises. It is now picked from your memory, so a big Mac gets a big picture without touching a setting.
+- **Long chats got faster on sliding-window models.** Muse-Glimmer 30B decodes 63% faster at 16k and 144% faster at 64k; Laguna XS chews through a 64k prompt at more than twice the speed.
+
+### LTX-Video 2.5
+
+- Pick **LTX-Video 2.5** in the Video window. It brings its own text encoder, so unlike 2.3 there is no separate 8 GB download on first use.
+- Two packs. 4-bit for Macs that can't hold more, 8-bit when they can: 4-bit quantization injects about 10% noise into every layer of the model against 0.6% at 8-bit, and the same clip at the same seed keeps faces, legs and fur that the 4-bit render loses. It costs 3.5% more time, because the model is compute-bound at this size.
+- **Diffusion decoder** toggle (8-bit pack only): LTX's own decoder, the one their published clips use. It denoises the frames instead of interpolating them, so texture and edges come out sharper. Adds about 21 s on a 97-frame 768x512 clip, which end to end sits inside run-to-run variance. Over the API it is `"decoder": "diffusion"`.
+- Resolutions and frame counts are now per-Mac and per-canvas: bigger machines default to a bigger canvas, and the frame ladder follows it. Two-stage tiers denoise at half the chosen size and upscale, so on a small canvas "Quality" is softer than the tier above it.
+- LTX prompts were padded to a quarter of the length the model expects. Both versions now use the full length, so prompts are followed more closely and long ones are no longer cut short.
+- 2.3 keeps working exactly as before, and both can sit side by side.
+
+### MiniMax Music 3
+
+- New music model in the Music window, alongside ACE-Step. 8-bit pack, 13.6 GB to download, about 20 GB of memory to run.
+- Give it a style caption and lyrics and it sings them. Songs up to six minutes; the duration is an upper bound and the model may end earlier.
+- Lyrics are required. Structure tags like `[verse]` and `[chorus]` go on their own lines.
+- ACE-Step's tempo, key, meter and language controls don't exist on this model, so they disappear when you pick it. Put those facts in the caption instead.
+- The app ships a **music3** skill that writes the three-block caption format the model was trained on, so asking the chat for a song gets you a proper caption and original lyrics rather than a one-liner.
+- ACE-Step is unchanged, and stays the fast option (8 steps).
+- Over the API: `POST /v1/audio/music-generations` with `prompt` and `lyrics`.
+
+### LFM 2.5 VL
+
+- Pick **LFM 2.5 VL 3B** and attach an image. It is small and quick: 2.2 GB in 4-bit, and it answers at over 200 tokens a second.
+- A large picture is cut into tiles and sent with a thumbnail of the whole thing, rather than being shrunk down to fit. On a 1800x1400 screenshot that is seven times the detail, which is the difference between reading the fine print and guessing at it.
+- The smaller 1.6B build works too.
+
+### Skills from the composer
+
+- Type `/` in the chat box to see your skills and pick one; `/name` runs that skill in any chat, agent mode or not.
+- Skills that ship with the app are now seeded one at a time, so a skill added in a later version reaches existing installs. Deleting one still sticks.
 
 ### Long-context speedup
 
-- A sliding-window model looks back over a fixed window, not the whole conversation. The server trimmed its read down to that window on single-token steps only, so anything wider went back to reading everything: every speculative verify, every chunk of a long prompt. On a model where 3 layers in 4 slide, that was full attention on most of the network, on every round.
-- Nothing to turn on, and nothing to tune. The gain grows with the length of the conversation, so short prompts are unchanged, and below roughly 8k there is nothing to trim yet.
+A sliding-window model looks back over a fixed window, not the whole conversation. The server trimmed its read to that window on single-token steps only, so anything wider read everything: every speculative step, every chunk of a long prompt. On a model where 3 layers in 4 slide, that was full attention on most of the network, every round. Nothing to turn on, nothing to tune.
 
-Measured against v26.8.5 on an M4 Max, median of three runs per point, same models and same settings on both:
+Measured against v26.8.5 on an M4 Max, median of three runs per point, same models and settings on both:
 
 | Model | | 16k context | 64k context |
 |---|---|---|---|
@@ -20,27 +52,18 @@ Measured against v26.8.5 on an M4 Max, median of three runs per point, same mode
 | Laguna XS 2.1 NVFP4 | prompt | 609 -> **774 tok/s** | 236 -> **540 tok/s** |
 | Laguna XS 2.1 NVFP4 | decode | 62.7 -> **77.7 tok/s** | 34.9 -> **46.8 tok/s** |
 
-- The gain climbs the whole way: Muse-Glimmer decodes 15% faster at 4k, 63% at 16k and 144% at 64k, so the longer you talk to it the further ahead it gets. Inkling Small gains the same way on prompt processing.
-- Gemma 4 is covered by the same fix but gains less: its prompt processing already ran a kernel that applies the window itself, so only its speculative steps get quicker.
-
-### LTX-Video 2.5
-
-- Pick **LTX-Video 2.5** in the Video window, or point the server at the pack. It brings its own text encoder, so unlike 2.3 there is no separate 8 GB download on first use.
-- 2.5 is the same size and shape of model as 2.3 and takes the same settings — resolutions, frame lengths and quality tiers are unchanged, so anything you had dialled in for 2.3 carries over.
-- 2.3 keeps working exactly as before, and both can sit side by side; the server tells them apart from the model's own files.
-
-### Better prompt following on LTX (2.3 and 2.5)
-
-- LTX prompts were being padded to a quarter of the length the model expects, which gave it less of your prompt's context to work with than it was trained on. Both versions now use the full length. Nothing to change — prompts are simply followed more closely, and long ones are no longer cut short.
-
-### Vision chats keep their speedup
-
-- Sending Muse-Glimmer an image quietly switched its draft companion off, so vision chats ran at serial speed while text chats stayed fast. Images keep the speedup now (thanks @cerebralcoding, #160).
+The gain grows with the conversation, so short prompts are unchanged and below roughly 8k there is nothing to trim yet. Inkling Small gains the same way on prompt processing. Gemma 4 gains less: its prompt processing already applied the window itself, so only its speculative steps get quicker.
 
 ### Fixes
 
-- A speculative round could push a reply past the token limit you asked for. Every block decoder now trims the block before it commits, so `max_tokens` is respected exactly (thanks @cerebralcoding, #160).
-- Picking up an earlier conversation kept the drafter speedup instead of quietly falling back to drafting blind, and the draft size now adapts correctly on Macs without the widest verify path.
+- Laguna models converted by mlx-community (oQ4e, oQ5e) load now. Their converter nests the router weight where we weren't looking (#169).
+- Models whose chat template lives in a separate file next to the config are rendered correctly. Newer conversion tools write a pointer into the config instead of the template, which we read as the template itself and quietly fell back to a generic format, breaking tool calls (#169).
+- Sending Muse-Glimmer an image quietly switched its draft companion off, so vision chats ran at serial speed. Images keep the speedup now (thanks @cerebralcoding, #160).
+- A speculative round could push a reply past the token limit you asked for. `max_tokens` is now respected exactly (thanks @cerebralcoding, #160).
+- Picking up an earlier conversation kept the drafter speedup instead of quietly drafting blind, and the draft size adapts correctly on Macs without the widest verify path.
+- Streaming and non-streaming replies could differ by a couple of blank lines at the start of an answer. The same question now gives the same text either way, on chat completions and on the Anthropic endpoint.
+- Turning thinking on for a model that has no thinking mode put the whole reply inside the Thinking box and left the answer blank. Only streaming replies were affected.
+- A tool call could be named after the wrong tool when one of its arguments contained something that looked like a tool call, such as a package.json being written to a file. Qwen 3.5 and 3.6 allow two ways of writing a call and the server read the wrong one first, so a file's contents could decide which tool ran.
 
 ## v26.8.5 — Muse-Glimmer 
 

@@ -270,7 +270,7 @@ assert(quantQuality(16, 30) === 1, "bf16 is the quality reference");
 assert(quantQuality(2, 4) < quantQuality(2, 200), "low bits hurt a small model more than a big one");
 
 // ── SPEED MODEL CALIBRATION ───────────────────────────────────────────────
-// These four cells are OUR OWN measurements from docs/perf-csvs/all-26.7.12.csv
+// These four cells are OUR OWN measurements from docs/perf-csvs/all-26.7.12.csv (git history)
 // (mlx-serve, spec=none, Apple-M4-Max-128gb). The calculator must reproduce
 // them: it is a roofline fit, and this is the fit's evidence. Change a
 // constant and this test says which measurement you stopped matching.
@@ -318,7 +318,7 @@ assert(estimateDecodeTps({ id: "gemma-4-e4b", paramsB: 8, activeB: 4, tags: [] }
 }
 
 // ── context decay: KV reads join the per-token byte bill. Pinned against the
-//    64k ladder in docs/perf-csvs/mtp-ladder-26.7.12.csv (27B dense, spec off:
+//    64k ladder in docs/perf-csvs/mtp-ladder-26.7.12.csv, git history (27B dense, spec off:
 //    51.8 tok/s @1k -> 28.83 @64k, i.e. 0.56x) ─────────────────────────────
 {
   const m = { paramsB: 27.8, activeB: 27.8, tags: [], id: "x" };

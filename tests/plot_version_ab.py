@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """plot_version_ab.py — the same engine, two builds, one chart.
 
-Renders the CSV `tests/bench_versions.sh` folds out of llmprobe reports.
-Companion to plot_vs_lmstudio_omlx.py (cross-engine) and plot_mtp_ladder.py
-(one model, many rungs); this one holds the ENGINE fixed and varies the BUILD.
+Renders the CSV `tests/bench_versions.sh` folds out of llmprobe reports (via
+bench_csv.py): the ENGINE is held fixed and the BUILD varies.
 
 Two things shape the layout, both learned the hard way:
 

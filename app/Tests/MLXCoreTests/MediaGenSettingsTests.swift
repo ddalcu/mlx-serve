@@ -144,7 +144,11 @@ final class MediaGenSettingsTests: XCTestCase {
         s.resolutionId = "1x1"
         XCTAssertEqual(s.resolvedModel.id, VideoModelPreset.ltx23Q4.id)
         let m = s.resolvedModel
-        XCTAssertEqual(s.resolvedResolution(for: m).id, m.defaultResolution.id)
+        // With nothing saved the canvas is sized for THIS Mac, not a static
+        // default — but it is always a rung the picker offers.
+        let r = s.resolvedResolution(for: m)
+        XCTAssertEqual(r.id, m.recommendedResolution(totalGB: RAMChecker.totalGB).id)
+        XCTAssertTrue(m.resolutions.contains(r))
     }
 
     // MARK: - Migration-safe decode: a missing key defaults, never throws

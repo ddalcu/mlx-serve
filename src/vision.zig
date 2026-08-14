@@ -4,6 +4,7 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
+const lfm2_vision = @import("lfm2_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -121,11 +122,13 @@ pub const VisionEncoder = struct {
     // sentinels. See src/qwen_vision.zig / src/muse_vision.zig.
     qwen: ?qwen_vision.QwenVision = null,
     muse: ?muse_vision.MuseVision = null,
+    lfm2: ?lfm2_vision.Lfm2Vision = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
         if (config.qwen_vision) return initQwen(allocator, config, weights);
         if (config.muse_vision) return initMuse(allocator, config, weights);
+        if (config.lfm2_vision) return initLfm2(allocator, config, weights);
         const s = mlx.mlx_default_gpu_stream_new();
 
         var name_buf: [256]u8 = undefined;
@@ -249,6 +252,7 @@ pub const VisionEncoder = struct {
         _ = mlx.mlx_array_free(self.one);
         if (self.qwen) |*q| q.deinit();
         if (self.muse) |*m| m.deinit();
+        if (self.lfm2) |*l| l.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -390,12 +394,39 @@ pub const VisionEncoder = struct {
         };
     }
 
+    /// Build a VisionEncoder wrapping the LFM2-VL SigLIP2-NaFlex tower. Same
+    /// sentinel shape as `initQwen`; `lfm2` drives `forwardPatches`.
+    fn initLfm2(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const s = mlx.mlx_default_gpu_stream_new();
+        const lv = try lfm2_vision.Lfm2Vision.init(allocator, config, weights);
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = config.quant_group_size,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6,
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+            .lfm2 = lv,
+        };
+    }
+
     /// Encode one image on a patch-grid tower: `patches` is the processor's
     /// pixel_values [N, feat]; `grid_h/grid_w` is the full patch grid.
     /// Returns [1, N/merge², out_hidden].
     pub fn forwardPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         if (self.muse) |*mv| return mv.forward(patches, grid_h, grid_w);
         if (self.qwen) |*qv| return qv.forward(patches, grid_h, grid_w);
+        if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
         return error.NoPatchGridEncoder;
     }
 
@@ -582,7 +613,7 @@ pub const VisionEncoder = struct {
         // (Gemma-shaped) buffer reaching here is a client/preprocessing
         // mismatch, not something to dereference. Backstop for the parse-level
         // refusal in `parseImageUrlContent`.
-        if (self.qwen != null or self.muse != null) return error.PixelsMissingPatchGrid;
+        if (self.qwen != null or self.muse != null or self.lfm2 != null) return error.PixelsMissingPatchGrid;
         const cfg = &self.config;
         const ps: c_int = @intCast(cfg.vision_patch_size);
         const hidden: c_int = @intCast(cfg.vision_hidden_size);

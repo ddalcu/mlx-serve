@@ -55,7 +55,11 @@ struct MusicGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: model) { _, m in
+            guard !hydrating else { return }
+            durationSeconds = min(max(durationSeconds, m.durationRange.lowerBound), m.durationRange.upperBound)
+            persist()
+        }
         .onChange(of: durationSeconds) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: vocalLanguage) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
@@ -149,7 +153,8 @@ struct MusicGenView: View {
     private var lyricsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Lyrics (optional)").font(.subheadline.weight(.semibold))
+                Text(model.requiresLyrics ? "Lyrics" : "Lyrics (optional)")
+                    .font(.subheadline.weight(.semibold))
                 Spacer()
                 lyricsExamplesMenu
             }
@@ -159,7 +164,9 @@ struct MusicGenView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
-            Text("Leave empty for an instrumental track.")
+            Text(model.requiresLyrics
+                 ? "This model sings your lyrics — structure tags like [verse] or [chorus] go on their own lines."
+                 : "Leave empty for an instrumental track.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
     }
@@ -185,7 +192,11 @@ struct MusicGenView: View {
     private var durationSection: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("Duration (\(formattedDuration))").font(.subheadline.weight(.semibold))
-            Slider(value: $durationSeconds, in: 10...600, step: 5)
+            Slider(value: $durationSeconds, in: model.durationRange, step: 5)
+            if model.family == .minimaxMusic3 {
+                Text("An upper bound — the model may end the song earlier.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -213,7 +224,11 @@ struct MusicGenView: View {
                     .buttonStyle(.plain).foregroundStyle(.secondary)
             }
             // Dropdowns only — every choice is a value the server accepts,
-            // "Auto" leaves the decision to the model (field omitted).
+            // "Auto" leaves the decision to the model (field omitted). The
+            // whole musical-metadata knob set is ACE-Step's; Music 3 has no
+            // equivalent (the server names each field a 400), so the controls
+            // disappear with it — and `requestBody` gates the FIELDS too.
+            if model.supportsMusicalMeta {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Vocal language").font(.caption)
@@ -257,6 +272,7 @@ struct MusicGenView: View {
                     .labelsHidden().pickerStyle(.menu).frame(width: 90)
                 }
             }
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text("Seed").font(.caption)
                 TextField("random", text: $seedText)
@@ -288,7 +304,9 @@ struct MusicGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || (model.requiresLyrics && lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                              || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -421,7 +439,7 @@ struct MusicGenView: View {
                 }
             }
             Section("Examples") {
-                ForEach(MusicPrompt.builtinStyles) { p in
+                ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
                     Button(p.title) { prompt = p.body }
                 }
             }

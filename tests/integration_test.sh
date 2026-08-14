@@ -86,9 +86,16 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Build ──
-echo -e "${YELLOW}Building...${NC}"
-zig build 2>&1
-echo ""
+# ReleaseFast, never bare `zig build`: a Debug binary is 2-4x slower AND it
+# overwrites zig-out/bin/mlx-serve, so a later perf run silently measures Debug.
+# Prefer the pinned toolchain — brew's 0.16.0 cannot build this tree at all.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo -e "${YELLOW}Building (ReleaseFast)...${NC}"
+    ZIG="zig"
+    [ -x "./.zig-toolchain/zig" ] && ZIG="./.zig-toolchain/zig"
+    "$ZIG" build -Doptimize=ReleaseFast 2>&1
+    echo ""
+fi
 
 # ── Check model exists ──
 if [ ! -d "$MODEL_DIR" ]; then

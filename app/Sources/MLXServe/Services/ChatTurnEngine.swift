@@ -583,6 +583,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
                 hasPersona: !persona.isEmpty))
         }
+        // Third explicit ask: a skill the user invoked by NAME (`/music3 …`).
+        // Plain chat builds its own system message, so this is a SECOND
+        // construction site — the agent loop's injection does not cover it
+        // (live: /music3 with Tools off answered from the model's own head).
+        let invokedSkill = AgentPrompt.skillManager.invokedSkill(for: text)
+        if !invokedSkill.isEmpty { plainSystemBits.append(invokedSkill) }
         if !plainSystemBits.isEmpty {
             messagesArray.insert(["role": "system",
                                   "content": plainSystemBits.joined(separator: "\n\n")],
@@ -831,6 +837,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // working-dir listing: matched skills (per message), the
                 // working-dir listing (changes as files change), then the
                 // learned recent-dirs/commands snippet (changes per command).
+                // Most-stable volatile item first (it only changes when the
+                // user switches music model), so a per-message skill hit
+                // re-prefills less.
+                if config.advertisedTools.contains(.generateMusic) {
+                    agentVolatileTail += AgentPrompt.musicEngineNote(
+                        MusicGenSettings.load().resolvedModel(models: server.allModels))
+                }
                 agentVolatileTail += skills
                 if let wd = workingDirectory {
                     agentVolatileTail += AgentEngine.workingDirectoryContext(wd)
@@ -845,6 +858,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 systemPrompt = AgentPrompt.docsOnlySystemPrompt(
                     folderName: index?.folderName ?? "documents",
                     fileCount: indexedFileCount(index))
+            }
+            // A skill invoked by NAME (`/music3 …`) works in every mode: the
+            // user asked for it explicitly, so it does not wait for the agent
+            // loop's trigger matching (which also covers it, above).
+            if !config.agentMode {
+                agentVolatileTail += AgentPrompt.skillManager.invokedSkill(for: userMsg)
             }
             // Attached-docs section for the modes whose base prompt doesn't
             // already explain the searchDocuments tool.

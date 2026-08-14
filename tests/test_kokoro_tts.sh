@@ -41,7 +41,11 @@ expect_code() { # label, expected, body, [path]
 secs()   { python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}')" "$1" 2>/dev/null || echo "0"; }
 
 echo "== booting headless on :$PORT =="
-"$BIN" --serve --port "$PORT" --model-dir "$HOME/.mlx-serve/models" --log-level info > "$LOG" 2>&1 &
+# Discovery root comes from the MODEL, not a hardcoded home path — the
+# library moved to an external drive and this discovered nothing.
+ROOT="$(dirname "$(dirname "$MODEL")")"
+[ -d "$ROOT" ] || ROOT="$HOME/.mlx-serve/models"
+"$BIN" --serve --port "$PORT" --model-dir "$ROOT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 for _ in $(seq 1 40); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 0.5; done
 

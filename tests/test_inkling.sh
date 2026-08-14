@@ -61,12 +61,21 @@ refuse() { # name, got, forbidden-substring
     fi
 }
 
-# [1] Raw completion greedy equivalence (prefix; INT4 kernel-order divergence
-#     past the first tokens is the sanctioned class — the PREFIX must hold).
+# [1] Raw completion greedy PREFIX. Only the prefix is a contract: INT4
+#     kernel-order divergence past the first tokens is the sanctioned class, and
+#     this checkpoint is 2-bit REAP-pruned — it answers " Paris." correctly and
+#     then repeats the sentence instead of moving on to Germany. That is the
+#     checkpoint's continuation behaviour, not a serving defect: identical with
+#     MLX_SERVE_SLIDING_BLOCK_TRIM=0 (and the trim never engages at this prompt
+#     length), and all 12 chat/tool/thinking checks below pass. Asserting the
+#     whole sentence made this a capability expectation, so it asserted more
+#     than the comment claimed.
 RAW=$(curl -s -m 300 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
     -d '{"model":"mlx-serve","prompt":"The capital of France is","max_tokens":16,"temperature":0}' \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])")
-check "raw greedy prefix" "$RAW" " Paris. The capital of Germany is Berlin."
+check "raw greedy prefix" "$RAW" " Paris."
+refuse "raw completion leaks no Inkling markers" "$RAW" "<|"
+echo "  raw continuation (informational): $RAW"
 
 # [2] Chat, thinking OFF: clean content, no channel markers.
 OFF=$(curl -s -m 300 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \

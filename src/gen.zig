@@ -22,8 +22,10 @@ const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
+const music3 = @import("music3.zig");
 const kokoro = @import("kokoro.zig");
 const ltx = @import("ltx_video.zig");
+const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
 const hy3d = @import("hunyuan3d.zig");
@@ -90,9 +92,9 @@ pub const Modality = enum {
 /// "unsupported model_type" while the engine that serves it was ready and
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
-    "flux2",     "krea",      "mage_flow", "mageflow",
-    "qwen3_tts", "acestep",   "kokoro",    "AudioVideo",
-    "hunyuan3d", "minimax_h3",
+    "flux2",     "krea",       "mage_flow",      "mageflow",
+    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
+    "hunyuan3d", "minimax_h3", "minimax_music3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -101,6 +103,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
+    if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
@@ -132,6 +135,7 @@ pub const GenRoute = enum {
 /// `AudioEngine.load` re-peek performs).
 pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
+    if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
     return .tts;
 }
@@ -141,7 +145,18 @@ pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
 /// clones from `ref_audio` and has no voice list, Kokoro has 54 named blendable
 /// voices and no cloning. The handler refuses the wrong control rather than
 /// ignoring it.
-pub const AudioBackendKind = enum { tts, music, kokoro };
+pub const AudioBackendKind = enum {
+    tts,
+    music,
+    music3,
+    kokoro,
+
+    /// Music-generation backends serve /v1/audio/music-generations and
+    /// advertise "music" beside "audio"; the TTS arms never do.
+    pub fn servesMusic(self: AudioBackendKind) bool {
+        return self == .music or self == .music3;
+    }
+};
 
 /// Peek `model_dir/config.json` for its `model_type` string (owned dupe, caller
 /// frees) or null on any read/parse error. Cheap — used both to route to a media
@@ -761,6 +776,7 @@ fn bodyDisablesSafety(body: []const u8) bool {
 pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
+    music3: *music3.Engine,
     kokoro: *kokoro.Engine,
 };
 
@@ -782,6 +798,11 @@ pub const AudioEngine = struct {
             log.info("[audio] ACE-Step music engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .music3) {
+            self.backend = .{ .music3 = try music3.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] MiniMax Music 3 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .kokoro) {
             const ks = mlx.mlx_default_gpu_stream_new();
             self.backend = .{ .kokoro = try kokoro.Engine.load(io, allocator, model_dir, ks) };
@@ -798,6 +819,7 @@ pub const AudioEngine = struct {
         switch (self.backend) {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
+            .music3 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
         }
         self.allocator.destroy(self);
@@ -1069,6 +1091,10 @@ pub const LtxVideoEngine = struct {
     audio: ?ltx.Component = null, // audio VAE + vocoder; null → video has no sound
     vae_encoder: ?ltx.Component = null, // image VAE encoder; null → image-to-video + two-stage disabled
     upsampler: ?ltx.Component = null, // spatial x2 latent upsampler; lazy-loaded for two-stage
+    // LTX's own DiffVAE decoder — what their published clips are decoded with.
+    // Lazy like the upsampler: the 4-bit pack does not ship it, and a request
+    // that never asks for it must not pay 0.83 GB.
+    diffusion_decoder: ?ltx.Component = null,
     tok: tok_mod.Tokenizer,
     gemma_dir: []u8,
     model_dir: []u8,
@@ -1090,6 +1116,7 @@ pub const LtxVideoEngine = struct {
         self.audio = null;
         self.vae_encoder = null;
         self.upsampler = null;
+        self.diffusion_decoder = null;
         self.lora_stack = null;
         self.lora_matched = 0;
 
@@ -1223,6 +1250,19 @@ pub const LtxVideoEngine = struct {
         return &self.upsampler.?;
     }
 
+    /// Lazily load the DiffVAE decoder. Absent → `error.MissingDiffusionDecoder`,
+    /// which the handler turns into a NAMED 400; a silent fall back to the conv
+    /// decoder would answer a different question than the one asked.
+    pub fn ensureDiffusionDecoder(self: *LtxVideoEngine, io: std.Io) !*const ltx.Component {
+        if (self.diffusion_decoder) |*d| return d;
+        var buf: [1024]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, diffvae_fwd.FILE_NAME }, 0) catch return error.MissingDiffusionDecoder;
+        if (!fileExists(io, p)) return error.MissingDiffusionDecoder;
+        const cpu_s = mlx.mlx_default_cpu_stream_new();
+        self.diffusion_decoder = try diffvae_fwd.load(self.allocator, p, cpu_s);
+        return &self.diffusion_decoder.?;
+    }
+
     pub fn deinit(self: *LtxVideoEngine) void {
         self.clearLora();
         self.transformer.deinit();
@@ -1231,6 +1271,7 @@ pub const LtxVideoEngine = struct {
         if (self.audio) |*a| a.deinit();
         if (self.vae_encoder) |*e| e.deinit();
         if (self.upsampler) |*u| u.deinit();
+        if (self.diffusion_decoder) |*d| d.deinit();
         self.tok.deinit();
         self.allocator.free(self.gemma_dir);
         self.allocator.free(self.model_dir);
@@ -2038,7 +2079,7 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+        .music, .music3 => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
     // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
@@ -2214,10 +2255,14 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
 /// non-stream; SSE `progress` per stage/step + a base64 `complete` event when
 /// streaming. Targeting a TTS voice model here is an explicit 400.
 pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
-    const music = switch (engine.backend) {
-        .music => |m| m,
+    switch (engine.backend) {
+        .music => |m| return handleMusicAcestep(allocator, conn, body, m),
+        .music3 => |m| return handleMusic3(allocator, conn, body, m),
         .tts, .kokoro => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
-    };
+    }
+}
+
+fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, music: *acestep.Engine) !void {
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
     const prompt = try jsonUnescape(allocator, raw_prompt);
     defer allocator.free(prompt);
@@ -2273,6 +2318,95 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     };
     defer allocator.free(wav);
     log.info("[music] -> {d} WAV bytes\n", .{wav.len});
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
+}
+
+/// `POST /v1/audio/music-generations` — MiniMax Music 3 text2music.
+/// `{"model", "prompt" (style/genre/mood caption, REQUIRED), "lyrics"
+/// (REQUIRED — the model is lyric-conditioned; structure tags like `[verse]`
+/// each on their own line), "duration_seconds" (default 60, valid 1-360, an
+/// UPPER bound — the model may stop earlier), "steps" (flow-match steps,
+/// default 30, valid 4-100), "seed", "stream"}`. ACE-Step's
+/// bpm/keyscale/timesignature/vocal_language have NO equivalent here and are
+/// named 400s rather than silent ignores. Response mirrors the ACE-Step
+/// handler: raw `audio/wav` non-stream, SSE progress + base64 complete when
+/// streaming.
+fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3: *music3.Engine) !void {
+    for ([_][]const u8{ "bpm", "keyscale", "timesignature", "vocal_language" }) |field| {
+        const present = extractJsonString(body, field) != null or extractJsonInt(body, field) != null;
+        if (present) {
+            var msg: [128]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step field; MiniMax Music 3 has no equivalent (put style facts in 'prompt')", .{field}) catch "unsupported field";
+            return sendError(conn, 400, m);
+        }
+    }
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const raw_lyrics = extractJsonString(body, "lyrics") orelse return sendError(conn, 400, "missing 'lyrics' (MiniMax Music 3 is lyric-conditioned; structure tags like [verse] go on their own lines)");
+    const lyrics = try jsonUnescape(allocator, raw_lyrics);
+    defer allocator.free(lyrics);
+    if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'lyrics'");
+
+    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
+        return sendError(conn, 400, "'duration_seconds' must be in [1,360]");
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse music3.DEFAULT_STEPS);
+    if (steps < 4 or steps > 100) return sendError(conn, 400, "'steps' must be in [4,100]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+
+    // Pre-validate the prompt budget BEFORE any SSE bytes go out, so the cap
+    // is a clean named 400 instead of a mid-stream error.
+    {
+        const toks = m3.tokenizePrompt(allocator, prompt, lyrics) catch |err| switch (err) {
+            error.PromptTooLong => return sendError(conn, 400, "assembled prompt exceeds 5000 tokens"),
+            else => return err,
+        };
+        allocator.free(toks.ids);
+        allocator.free(toks.uncond);
+    }
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[music3] generating {d}s steps={d} seed={d} lyrics={d}ch stream={}\n", .{ duration, steps, seed, lyrics.len, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const req = music3.MusicRequest{
+        .caption = prompt,
+        .lyrics = lyrics,
+        .duration_s = duration,
+        .seed = seed,
+        .steps = steps,
+    };
+    const wav = m3.generateWav(allocator, req, prog) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[music3] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[music3] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -2871,8 +3005,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             return sendError(conn, 400, msg);
         for (refs.items) |m| {
             log.info("[video] minimax-h3 reference {s} #{d}: {d}x{d} {d}f, latent {d}x{d}x{d}, audio_t {d}\n", .{
-                @tagName(m.ref.kind), m.ref.ordinal, m.ref.canvas.w, m.ref.canvas.h,
-                m.ref.frames,        m.ref.latent_t, m.ref.latent_h, m.ref.latent_w,
+                @tagName(m.ref.kind), m.ref.ordinal,  m.ref.canvas.w, m.ref.canvas.h,
+                m.ref.frames,         m.ref.latent_t, m.ref.latent_h, m.ref.latent_w,
                 m.ref.audio_t,
             });
         }
@@ -3100,6 +3234,23 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         }
     }
 
+    // `decoder`: which VAE turns the final latent into pixels. Default is the
+    // conv `vae_decoder` we have always shipped; `diffusion` is LTX's own
+    // DiffVAE, which their published clips are decoded with and which only the
+    // 8-bit pack ships. An absent file is a NAMED 400, never a silent downgrade.
+    var vae_choice = ltx.VaeChoice{ .conv = &engine.vae, .seed = seed +% 0x5DEC0DE };
+    if (extractJsonString(body, "decoder")) |raw_dec| {
+        const dec = try jsonUnescape(allocator, raw_dec);
+        defer allocator.free(dec);
+        if (std.mem.eql(u8, dec, "diffusion")) {
+            vae_choice.diffusion = engine.ensureDiffusionDecoder(io) catch
+                return sendError(conn, 400, "'decoder':\"diffusion\" requires vae_diffusion_decoder.safetensors — the 8-bit LTX-2.5 pack ships it, the 4-bit pack does not");
+            log.info("[video] decoder: diffusion (DiffVAE)\n", .{});
+        } else if (!std.mem.eql(u8, dec, "conv") and dec.len > 0) {
+            return sendError(conn, 400, "'decoder' must be \"conv\" or \"diffusion\"");
+        }
+    }
+
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?ltx.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -3109,7 +3260,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             // Run the schedule the loaded variant was trained for; the request
             // never forces a swap here (dev-only bundles keep working).
             const distilled = engine.transformer_variant == .distilled;
-            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, &engine.vae, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
         .two_stage, .two_stage_hq => blk: {
             engine.ensureTransformer(.dev) catch |err| break :blk err;
@@ -3122,7 +3273,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = Stage2Swap.swap,
             };
-            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
         if (err == error.Cancelled) {
@@ -3502,6 +3653,11 @@ pub const H3_DIT_RESIDENT_PCT: u64 = 65;
 /// is what refused the 8-bit pack on every Mac under ~96 GB.
 pub const H3_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
+/// MiniMax Music 3's non-weight working set at the request caps: batch-2 KV
+/// cache for 36 layers at 9000 frames + 5000 prompt tokens (~4.1 GB), the
+/// bf16 frame-hidden buffer (~0.6 GB), and DiT/vocoder window transients.
+pub const MUSIC3_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
 /// The DiT term of the H3 bill. `precompute` mirrors
 /// MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never
 /// freed and the whole file stays resident, so the shed size would under-bill
@@ -3551,6 +3707,16 @@ pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []co
             sz(io, dir, "video_vae.safetensors"),
             sz(io, dir, "audio_vae.safetensors"),
         );
+    }
+    if (std.mem.eql(u8, model_type, "minimax_music3")) {
+        // The whole engine is resident for its lifetime (no staging), so the
+        // sum is the right weight bill — plus the AR stage's working set the
+        // directory cannot see: the batch-2 KV cache (~4.1 GB at the 9000-frame
+        // + 5000-token caps), the frame-hidden buffer (~0.6 GB bf16), and the
+        // DiT/vocoder window transients.
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum + MUSIC3_GEN_BUFFER_BYTES;
     }
     if (std.mem.eql(u8, model_type, "AudioVideo")) {
         // Both variants ship; only one is ever loaded. Subtract the smaller so
@@ -4018,6 +4184,7 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.image, modalityFromType("krea").?);
     try testing.expectEqual(Modality.audio, modalityFromType("qwen3_tts").?);
     try testing.expectEqual(Modality.audio, modalityFromType("acestep").?);
+    try testing.expectEqual(Modality.audio, modalityFromType("minimax_music3").?);
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
@@ -4253,8 +4420,34 @@ test "GenRoute: speech + music share the audio modality slot" {
 
 test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(audioBackendKindForType("acestep") == .music);
+    try testing.expect(audioBackendKindForType("minimax_music3") == .music3);
     try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
     try testing.expect(audioBackendKindForType("gemma4") == .tts);
+    // Both music engines serve /v1/audio/music-generations and advertise the
+    // "music" capability; TTS backends never do.
+    try testing.expect(AudioBackendKind.music.servesMusic());
+    try testing.expect(AudioBackendKind.music3.servesMusic());
+    try testing.expect(!AudioBackendKind.tts.servesMusic());
+    try testing.expect(!AudioBackendKind.kokoro.servesMusic());
+}
+
+test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR working set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const b100: [100]u8 = @splat('x');
+    const b40: [40]u8 = @splat('x');
+    for ([_][]const u8{ "language_model.safetensors", "rvq_depth_decoder.safetensors", "transformer.safetensors", "condition_encoder.safetensors" }) |name|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = &b100 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocoder.safetensors", .data = &b40 });
+    // The whole engine is resident for its lifetime (no staging), so the sum
+    // is right — but the AR stage's KV cache + frame-hidden buffer are real
+    // resident bytes no directory sum can see.
+    try std.testing.expectEqual(@as(u64, 440) + MUSIC3_GEN_BUFFER_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_music3"));
+    // An unreadable/empty dir stays 0 = "unknown, never block".
+    var empty = std.testing.tmpDir(.{ .iterate = true });
+    defer empty.cleanup();
+    try std.testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, empty.dir, "minimax_music3"));
 }
 
 test "bodyDisablesSafety detects per-request opt-out" {
@@ -4981,6 +5174,9 @@ test "media markers are per-TYPE, not per-modality" {
     // file from every model in its modality breaks the next backend added.
     try std.testing.expectEqualStrings("connector.safetensors", requiredMarkerFor("AudioVideo").?);
     try std.testing.expectEqualStrings("transformer.safetensors", requiredMarkerFor("minimax_h3").?);
+    // Music3: the converter writes the vocoder LAST, so its presence is the
+    // completeness marker for the whole five-file pack.
+    try std.testing.expectEqualStrings("vocoder.safetensors", requiredMarkerFor("minimax_music3").?);
     // H3 must NOT be gated on LTX's file.
     try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
 

@@ -351,15 +351,11 @@ Every media endpoint takes `"stream": true` for SSE progress ending in a base64 
 
 ## Performance
 
-Apple M4 Max, identical weights per engine. Both charts are regenerated per release by `tests/bench.sh`, which boots each engine in turn and lets [llmprobe](https://github.com/ddalcu/llmprobe) take the numbers: warmup discarded, median of three, same protocol for everyone. CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release. Every engine's version is recorded in the CSV and printed in the chart legend, so a number here always says which build it beat.
+Apple M4 Max, identical weights per engine. [benchmarks.md](benchmarks.md) tracks decode tok/s release by release, plus the current head-to-head against other engines. Numbers come from `tests/bench.sh`, which boots the server and lets [llmprobe](https://github.com/ddalcu/llmprobe) take them: warmup discarded, median of three, same protocol for everyone.
 
-![mlx-serve vs LM Studio · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.8.3.png)
+![mlx-serve vs LM Studio · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-vs-engines.png)
 
-*Code completion decode tok/s, v26.8.3, against LM Studio 0.4.19+2, oMLX 0.5.2 and MTPLX 2.5.3. Every bar is that engine on its **shipping defaults** — llmprobe measures the server that is running, so there is no best-config collapse and no per-model tuning. All four engines load the identical MLX weight files. MTPLX shows 0 where it can't run (it needs its own MTP artifacts), and LM Studio is absent on two rows it has no copy of. Geomean decode: **+26% over LM Studio** across the four shared models and **+25% over oMLX** across all six, with prefill +36% and +10%. The two head-to-heads that matter are on the competitors' own checkpoints: **+23% decode over oMLX** on its oQ4e (prefill level), and **+10% decode / +17% prefill over MTPLX** on its own MTPLX-Optimized build. The bench is `./tests/bench.sh --family all --lmstudio --omlx --mtplx`.*
-
-![Native MTP context ladder — MLX-serve vs oMLX (Qwen3.6-27B), 0.5K–16K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.8.3.png)
-
-*Same-checkpoint head-to-head, coding-agent prompts, fresh boots, cold prompts. Against oMLX 0.5.2 running its native Lightning MTP on its own oQ4e checkpoint, mlx-serve decodes **25–36% faster at every rung** from 0.5K to 16K, with prefill ahead at all four (+2% to +8%). Both engines speculate with the checkpoint's own MTP head, so this is engine against engine on identical weights. The ladder reaches 64K under `--full`; this release shipped the default depth.*
+*Code completion decode tok/s, v26.8.3, against LM Studio 0.4.19+2, oMLX 0.5.2 and MTPLX 2.5.3. Every bar is that engine on its **shipping defaults** — llmprobe measures the server that is running, so there is no best-config collapse and no per-model tuning. All four engines load the identical MLX weight files. MTPLX shows 0 where it can't run (it needs its own MTP artifacts), and LM Studio is absent on two rows it has no copy of. Geomean decode: **+26% over LM Studio** across the four shared models and **+25% over oMLX** across all six, with prefill +36% and +10%. The two head-to-heads that matter are on the competitors' own checkpoints: **+23% decode over oMLX** on its oQ4e (prefill level), and **+10% decode / +17% prefill over MTPLX** on its own MTPLX-Optimized build.*
 
 ### Speculative decoding
 
@@ -557,6 +553,7 @@ So there's a fund for a Mac Studio Ultra. If mlx-serve replaced an API bill for 
 
 @jcprichard
 @skudinov
+@davidfekke
 
 Everyone who chips in gets a line here, with a link if they want one, or stays anonymous. (msg me) Thank you in advance.
 

@@ -192,7 +192,9 @@ code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Conten
   -d "{\"prompt\":\"a red apple\",\"size\":\"1024x1024\",\"steps\":2,\"lora_path\":\"$LORA_OK\",\"seed\":7}" \
   -o /tmp/test_lora.json -w "%{http_code}")
 [ "$code" = "200" ] || { echo "FAIL: lora http $code"; head -c 300 /tmp/test_lora.json; exit 1; }
-grep -q "\[image\] lora: matched 1 modules" /tmp/test_image_server.log || { echo "FAIL: no lora matched log"; exit 1; }
+# The wording gained "-attachment(s) across N adapter(s)" when LoRAs became
+# stackable; match the stable prefix so a reword does not silently disarm this.
+grep -qE "\[image\] lora: matched 1 module" /tmp/test_image_server.log || { echo "FAIL: no lora matched log"; grep -i lora /tmp/test_image_server.log | tail -3; exit 1; }
 # zero-B delta is exactly 0 → output must be byte-identical to the baseline
 # (proves the runtime-LoRA path is numerically transparent and the base
 # weights weren't corrupted by attach)

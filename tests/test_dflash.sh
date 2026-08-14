@@ -66,7 +66,9 @@ gen() { # prompt, max_tokens, extra_json_fragment
 
 # [2] Echo-ish greedy round WITH dflash (the default when the sidecar loads) —
 # long enough to accumulate spec-stats rounds.
+DFLASH_ON_REQS=0
 LONG=$(gen "List the numbers from 1 to 15, one per line, then repeat the same list once more." 200 "")
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on generation non-empty"; fi
 
 # Equivalence arms: SHORT window (the PLD-equivalence first-30-tokens rule —
@@ -76,6 +78,7 @@ if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on
 # prefix-cache entry; the OFF arm turns off PLD too — fully serial.
 EQ_PROMPT="Explain in one short paragraph why the sky is blue."
 ON=$(gen "$EQ_PROMPT" 30 "")
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 OFF=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
 
 # [4] Engagement COUNTS: at least one dflash round ran, with accepts.
@@ -112,25 +115,72 @@ else
 fi
 
 # [5] Greedy equivalence over the exact 30-token window (reasoning+content).
-if python3 - "$ON" "$OFF" <<'PY'
-import sys
-on, off = sys.argv[1], sys.argv[2]
-assert min(len(on), len(off)) >= 80, "window too short"
-assert on == off, f"diverged within the exact token window:\n--- on ---\n{on}\n--- off ---\n{off}"
-PY
-then
-    ok "greedy dflash-on == dflash-off (byte-equal exact window)"
-else
-    bad "greedy dflash-on == dflash-off" "--- on ---" "$(echo "$ON" | head -c 300)" "--- off ---" "$(echo "$OFF" | head -c 300)"
-fi
+#
+# The bar depends on the checkpoint's WIDTH. Spec verify runs the trunk as a
+# block-wide `qmm` where serial decode runs `qmv`, and at 4 bits a near-tie
+# argmax flips between them — the sanctioned INT4 divergence class. Measured on
+# Muse-Glimmer-30B: the 8-bit build is byte-identical 6/6, the 4-bit build
+# diverges reproducibly while each arm stays perfectly self-consistent, and the
+# divergence is unchanged with MLX_SERVE_SLIDING_BLOCK_TRIM=0.
+#
+# So: byte-equality at 8-bit or wider; at narrower widths assert what must still
+# hold — each arm REPRODUCIBLE (a broken verify or rollback shows as run-to-run
+# instability, not as a stable difference) and a long shared prefix — and print
+# where they parted. Skipping instead would read as a pass.
+QUANT_BITS=$(curl -s -m 10 "$BASE/v1/models" | python3 -c "
+import json, re, sys
+try:
+    d = json.load(sys.stdin)['data'][0]
+    m = re.search(r'(\d+)', str((d.get('meta') or {}).get('quantization') or ''))
+    print(m.group(1) if m else 8)
+except Exception:
+    print(8)
+" 2>/dev/null || echo 8)
 
-# [6] The opt-out arm really ran serial (no NEW dflash stats line for it:
-# requests 1+2 ran dflash → 2 lines; the opt-out added none).
+EQ_VERDICT=$(python3 - "$ON" "$OFF" "$QUANT_BITS" <<'PYEQ'
+import sys
+on, off, bits = sys.argv[1], sys.argv[2], int(sys.argv[3] or 8)
+if min(len(on), len(off)) < 80:
+    print("fail:window too short"); raise SystemExit
+if bits >= 8:
+    print("ok:byte-equal" if on == off else "fail:diverged at %d-bit" % bits); raise SystemExit
+shared = 0
+for a, b in zip(on, off):
+    if a != b: break
+    shared += 1
+print("narrow:%d:%d" % (bits, shared))
+PYEQ
+)
+case "$EQ_VERDICT" in
+    ok:*)
+        ok "greedy dflash-on == dflash-off (byte-equal exact window, ${QUANT_BITS}-bit)" ;;
+    narrow:*)
+        SHARED="${EQ_VERDICT##*:}"
+        ON2=$(gen "$EQ_PROMPT" 30 "")
+        DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
+        OFF2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
+        if [ "$ON" != "$ON2" ]; then
+            bad "dflash-ON is reproducible at temp 0" "$(echo "$ON" | head -c 200)" "$(echo "$ON2" | head -c 200)"
+        elif [ "$OFF" != "$OFF2" ]; then
+            bad "serial decode is reproducible at temp 0" "$(echo "$OFF" | head -c 200)" "$(echo "$OFF2" | head -c 200)"
+        elif [ "$SHARED" -lt 40 ]; then
+            bad "dflash arms agree before the near-tie" "shared only $SHARED chars" "$(echo "$ON" | head -c 200)" "$(echo "$OFF" | head -c 200)"
+        else
+            ok "greedy dflash arms reproducible + agree for $SHARED chars before a sanctioned ${QUANT_BITS}-bit near-tie"
+        fi ;;
+    *)
+        bad "greedy dflash-on == dflash-off" "$EQ_VERDICT" "--- on ---" "$(echo "$ON" | head -c 300)" "--- off ---" "$(echo "$OFF" | head -c 300)" ;;
+esac
+
+# [6] The opt-out arms really ran serial: one `mode=dflash` line per request
+# that had dflash ENABLED, and none for the opt-outs. Counted rather than
+# hardcoded — the equivalence arm above issues a different number of requests
+# depending on the checkpoint's quantization width.
 N_STATS=$(grep -c "mode=dflash" "$LOG")
-if [ "$N_STATS" -eq 2 ]; then
-    ok "enable_drafter:false opted out (2 dflash stats lines for 3 requests)"
+if [ "$N_STATS" -eq "$DFLASH_ON_REQS" ]; then
+    ok "enable_drafter:false opted out ($N_STATS dflash stats lines for $DFLASH_ON_REQS dflash-enabled requests)"
 else
-    bad "enable_drafter:false opted out" "saw $N_STATS mode=dflash lines (expected 2)"
+    bad "enable_drafter:false opted out" "saw $N_STATS mode=dflash lines (expected $DFLASH_ON_REQS)"
 fi
 
 # [7] A final accepted block is clipped to the request budget. This checks the

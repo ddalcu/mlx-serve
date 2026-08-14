@@ -291,6 +291,88 @@ else
   echo "a2vid prerequisites incomplete in $MODEL -> skipping audio-to-video test"
 fi
 
+# ── DiffVAE decoder (`"decoder":"diffusion"`) ──────────────────────────────
+# LTX's own diffusion decoder, which their published clips are decoded with.
+# Only the 8-bit 2.5 pack ships `vae_diffusion_decoder.safetensors`; a pack
+# without it must answer a NAMED 400, never silently fall back to the conv
+# decoder (the two-stage-prerequisite precedent). ENGAGEMENT is the log line —
+# a 200 alone cannot tell the two decoders apart, and per-frame pixel metrics
+# fork with content, so this asserts the resolution and that the bytes DIFFER.
+DV_OUT=/tmp/test_video_gen_diffvae.json
+DV_REQ='{"prompt":"a red fox running through a snowy forest","num_frames":9,"height":256,"width":384,"steps":4,"seed":42'
+code=$(curl -s --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d "$DV_REQ,\"decoder\":\"diffusion\"}" -o "$DV_OUT" -w "%{http_code}")
+if [ -f "$MODEL/vae_diffusion_decoder.safetensors" ]; then
+  if [ "$code" != "200" ]; then
+    echo "FAIL: decoder=diffusion returned $code"; head -c 300 "$DV_OUT"; rc=1
+  else
+    grep -q "\[video\] decoder: diffusion" /tmp/test_video_server.log \
+      || { echo "FAIL: decoder=diffusion did not engage (no log line)"; rc=1; }
+    grep -q "\[diffvae\] NA kernel engaged" /tmp/test_video_server.log \
+      || { echo "FAIL: the DiffVAE NA kernel never ran"; rc=1; }
+    grep -q "\[diffvae\] decoding " /tmp/test_video_server.log \
+      || { echo "FAIL: no DiffVAE decode line"; rc=1; }
+    python3 - "$OUT" "$DV_OUT" <<'PYEOF' || rc=1
+import base64, json, sys
+conv = json.load(open(sys.argv[1]))
+diff = json.load(open(sys.argv[2]))
+if (conv["frames"], conv["height"], conv["width"]) != (diff["frames"], diff["height"], diff["width"]):
+    print("FAIL: diffusion decode changed the clip geometry"); sys.exit(1)
+a = base64.b64decode(conv["data"]); b = base64.b64decode(diff["data"])
+if len(a) != len(b):
+    print("FAIL: diffusion decode changed the byte count"); sys.exit(1)
+if a == b:
+    print("FAIL: decoder=diffusion produced the conv decoder's bytes"); sys.exit(1)
+
+# STATIC is the failure mode, and it is not a range check: noise spans 0..255
+# happily. The sampler contract (x0, one step, timesteps x1000) is MEASURED —
+# no pack ships a VAE config — and every wrong arm decodes to static, so the
+# guard is the mean absolute difference between horizontally adjacent pixels
+# (tests/lora_noise.py's metric, inlined here without numpy). It is compared
+# RELATIVELY: the absolute value is a property of the canvas and step count
+# (13.9 on a 4-step 9-frame 384x256 render, 2.2 on a 25-frame 8-step one), so
+# the bar is the CONV arm's own number on the same clip. Measured ratios:
+# 1.04-1.09 healthy, 16x on the broken sampler.
+def gradient(buf, w, h, frames):
+    total = 0
+    count = 0
+    row = w * 3
+    for f in range(0, frames, max(1, frames // 4)):
+        base = f * h * row
+        for y in range(0, h, 8):
+            o = base + y * row
+            for x in range(0, w - 1):
+                p = o + x * 3
+                q = p + 3
+                l = (buf[p] + buf[p + 1] + buf[p + 2]) / 3.0
+                r = (buf[q] + buf[q + 1] + buf[q + 2]) / 3.0
+                total += abs(l - r)
+                count += 1
+    return total / max(1, count)
+
+gc = gradient(a, conv["width"], conv["height"], conv["frames"])
+gd = gradient(b, diff["width"], diff["height"], diff["frames"])
+print(f"adjacent-pixel gradient: conv {gc:.2f}  diffusion {gd:.2f}  ratio {gd / max(gc, 1e-6):.2f}")
+if gd > gc * 2.0 + 2.0:
+    print("FAIL: decoder=diffusion decoded to STATIC — check the sampler contract "
+          "(MLX_SERVE_DIFFVAE_OUTPUT/STEPS/TSCALE)"); sys.exit(1)
+print(f"PASS: decoder=diffusion decoded {diff['frames']}f, real picture, differs from conv")
+PYEOF
+  fi
+elif [ "$code" = "400" ]; then
+  grep -q "vae_diffusion_decoder" "$DV_OUT" \
+    && echo "PASS: decoder=diffusion 400s by name when the pack does not ship it" \
+    || { echo "FAIL: 400 body does not name the missing file"; head -c 300 "$DV_OUT"; rc=1; }
+else
+  echo "FAIL: decoder=diffusion returned $code without the decoder file (want 400)"; rc=1
+fi
+
+# An unknown decoder name is a named 400 on every pack.
+code=$(curl -s --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d "$DV_REQ,\"decoder\":\"nope\"}" -o /tmp/test_video_gen_baddec.json -w "%{http_code}")
+[ "$code" = "400" ] && echo "PASS: unknown 'decoder' value 400s" \
+  || { echo "FAIL: unknown 'decoder' returned $code (want 400)"; rc=1; }
+
 # Optional: mux to mp4 if ffmpeg is present (proves a playable clip, with sound
 # when an audio track was decoded above into /tmp/test_video_gen.wav).
 if [ $rc -eq 0 ] && command -v ffmpeg >/dev/null 2>&1; then

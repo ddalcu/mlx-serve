@@ -174,6 +174,25 @@ final class AgentPromptTests: XCTestCase {
                       "host section carries the LAN-reachable URL directive (IP from the grounding line)")
     }
 
+    // MARK: - Selected music engine
+
+    // The `generate_music` schema is STATIC, but the two engines take
+    // different inputs — Music 3 fails a call with no lyrics and 400s the
+    // bpm/key/meter fields, ACE-Step reads all of them. The model only ever
+    // sees the schema, so the selected engine's contract rides the prompt,
+    // DERIVED from the preset's own flags (a third engine gets a correct line
+    // without editing prose).
+    func testMusicEngineNoteFollowsThePresetsOwnContract() {
+        for model in MusicModelPreset.all {
+            let note = AgentPrompt.musicEngineNote(model)
+            XCTAssertTrue(note.contains(model.name), "the note names the selected model")
+            XCTAssertEqual(note.contains("bpm"), model.supportsMusicalMeta,
+                           "bpm/keyscale/meter are advertised exactly when the engine reads them: \(model.name)")
+            XCTAssertEqual(note.contains("requires `lyrics`"), model.requiresLyrics,
+                           "the lyric requirement is stated exactly when it exists: \(model.name)")
+        }
+    }
+
     // MARK: - Skill seeding
 
     private func tempSkillsDir() -> String {
@@ -258,6 +277,35 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertTrue(mgr.matchingSkills(for: "do a code review please").contains("## Skill: phrase-only"))
         XCTAssertTrue(mgr.matchingSkills(for: "run /plan now").contains("## Skill: planner"))
         XCTAssertTrue(mgr.matchingSkills(for: "open requirements.txt").contains("## Skill: deps"))
+    }
+
+    // A built-in added AFTER first run has to reach installs whose skills dir
+    // already exists — the old seeding gate was directory existence, so every
+    // future built-in would have shipped only to brand-new installs. Seeding
+    // is per-file against a ledger, so a deleted built-in still stays deleted
+    // and a built-in the user never had is not resurrected by the migration.
+    func testNewBuiltinSkillReachesAnExistingSkillsDir() throws {
+        let fm = FileManager.default
+        let dir = tempSkillsDir()
+        defer { try? fm.removeItem(atPath: dir) }
+        func path(_ f: String) -> String { (dir as NSString).appendingPathComponent(f) }
+
+        // Pre-ledger install: the dir is there, the user already deleted the
+        // review example.
+        try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        let mgr = SkillManager(skillsDir: dir)
+        XCTAssertTrue(fm.fileExists(atPath: path("music3.md")),
+                      "a built-in added after first run still ships to an existing skills dir")
+        XCTAssertTrue(mgr.matchingSkills(for: "write me a song about the sea").contains("## Skill: music3"),
+                      "the seeded file parses and its trigger fires")
+        XCTAssertFalse(fm.fileExists(atPath: path("review.md")),
+                       "migration must not resurrect a built-in the user deleted before the ledger existed")
+
+        try fm.removeItem(atPath: path("music3.md"))
+        _ = SkillManager(skillsDir: dir)
+        XCTAssertFalse(fm.fileExists(atPath: path("music3.md")),
+                       "deleting a seeded built-in sticks")
     }
 
     func testSkillManagerDoesNotReSeedAfterUserDeletesExample() throws {

@@ -275,6 +275,13 @@ and they are listed because they made that work possible.
   * DeepSeek's `inference/model.py` and `encoding_dsv4.py`, shipped with the
     DeepSeek-V4-Flash release, the reference for the `deepseek_v4` architecture
     and its chat template.
+  * The diffusers `minimax-music3-integration` branch (Apache-2.0, The MiniMax
+    Team + The HuggingFace Team), the reference for the `minimax_music3`
+    architecture: its prompt-normalization contract, the hierarchical AR loop,
+    condition encoder, flow-matching DiT, chunked denoise and Flow-VAE vocoder.
+    Its module code is transcribed into plain torch by
+    `tests/dump_music3_fixtures.py` as the parity oracle; the fixtures it
+    produces are golden values, not source.
   * ComfyUI's `comfy/ldm/minimax/*` and `comfy_extras/nodes_minimax_h3.py`
     (GPL-3.0), the reference for the `minimax_h3` architecture, its packed
     layout and its dual sigma schedule. Its layout/schedule output is executed

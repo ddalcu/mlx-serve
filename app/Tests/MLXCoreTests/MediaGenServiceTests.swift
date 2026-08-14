@@ -53,6 +53,28 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body["first_frame_image"])
     }
 
+    func testDiffusionDecoderFieldIsGatedOnThePacksOwnCapability() {
+        // `vae_diffusion_decoder.safetensors` ships in the 8-bit LTX-2.5 pack
+        // and NOT in the 4-bit one, so the toggle is per preset — and the state
+        // survives a preset switch, which is exactly how a field reaches a
+        // backend that answers 400 (the H3 `pipeline` class). The conv decoder
+        // is the server's default, so the field is absent unless asked for.
+        func body(_ model: VideoModelPreset, on: Bool) -> [String: Any] {
+            var r = VideoGenRequest(model: model, prompt: "p", width: 384, height: 256,
+                                    numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+            r.diffusionDecoder = on
+            return VideoGenService.requestBody(model: "m", prompt: "p", request: r,
+                                               firstFrameB64: nil)
+        }
+        XCTAssertTrue(VideoModelPreset.ltx25Q8.supportsDiffusionDecoder)
+        XCTAssertFalse(VideoModelPreset.ltx25Q4.supportsDiffusionDecoder)
+        XCTAssertFalse(VideoModelPreset.ltx23Q4.supportsDiffusionDecoder)
+        XCTAssertEqual(body(.ltx25Q8, on: true)["decoder"] as? String, "diffusion")
+        XCTAssertNil(body(.ltx25Q8, on: false)["decoder"])
+        XCTAssertNil(body(.ltx25Q4, on: true)["decoder"])
+        XCTAssertNil(body(.ltx23Q4, on: true)["decoder"])
+    }
+
     func testRef2vaFieldsAreGatedOnTheModelsOwnCapability() {
         // Hiding a control is not the same as not sending its field — the class
         // that made every H3 request carry `pipeline` and 400. FL2VA has no

@@ -319,7 +319,15 @@ pub const ParsedInput = struct {
 /// Decode a single image_url string into preprocessed pixels. Provided as a
 /// callback because the actual decoder lives in `server.zig` (uses stb_image
 /// + libwebp). Returning null is fine — the input item will lack images.
-pub const ImageUrlDecoder = *const fn (allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData;
+/// Appends one entry per tower call an `image_url` expands into — usually one,
+/// but LFM2-VL splits a large source into tiles plus a thumbnail. Appending
+/// rather than returning is what lets a single URL produce several.
+pub const ImageUrlDecoder = *const fn (
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    url: []const u8,
+    vp: chat_mod.VisionPreproc,
+) void;
 
 /// Translate a Responses `input` value (string or array of input items) into
 /// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
@@ -443,11 +451,7 @@ fn appendMessageItem(
                         .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
                         else => continue,
                     };
-                    if (image_decoder) |dec| {
-                        if (dec(allocator, url, vp)) |img| {
-                            try image_list.append(allocator, img);
-                        }
-                    }
+                    if (image_decoder) |dec| dec(allocator, &image_list, url, vp);
                 }
             }
             if (text_parts.items.len > 0) {
