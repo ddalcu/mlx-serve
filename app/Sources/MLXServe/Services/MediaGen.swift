@@ -728,6 +728,7 @@ struct VideoModelPreset: Identifiable, Hashable {
         .init(width: 768,  height: 768,  label: "768 × 768 (square) — 1.2x slower"),
         .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 1.8x slower"),
         .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 1.8x slower"),
+        .init(width: 544,  height: 960,  label: "544 × 960 (9:16 portrait) — fastest, best for long clips"),
         .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 2.9x slower"),
         .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 2.9x slower"),
     ]
