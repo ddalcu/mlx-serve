@@ -499,6 +499,7 @@ private struct RecommendedModelTableRow: View {
                         downloads.deleteModel(repoId: pick.repoId)
                         appState.refreshModels()
                     }
+                    .keyboardShortcut(.defaultAction)
                 } message: {
                     Text("Delete \(pick.name)? This will remove all downloaded files.")
                 }
@@ -989,6 +990,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                         downloads.deleteModel(repoId: bundle.primaryRepo)
                         appState.refreshModels()
                     }
+                    .keyboardShortcut(.defaultAction)
                 } message: {
                     Text("Delete \(preset.name)? This will remove the downloaded files.")
                 }
@@ -1466,6 +1468,7 @@ private struct ModelBrowserRow: View {
                 downloads.deleteModel(repoId: model.id)
                 appState.refreshModels()
             }
+            .keyboardShortcut(.defaultAction)
         } message: {
             Text("Delete \(model.modelName)? This will remove all downloaded files.")
         }
@@ -1573,6 +1576,7 @@ private struct GgufQuantMenu: View {
                 pendingDelete = nil
                 appState.refreshModels()
             }
+            .keyboardShortcut(.defaultAction)
         } message: { quant in
             Text("Delete the \(quant.label) quant? Other quants of this model stay on disk.")
         }
@@ -1669,6 +1673,7 @@ private struct MlxVariantMenu: View {
                 pendingDelete = nil
                 appState.refreshModels()
             }
+            .keyboardShortcut(.defaultAction)
         } message: { v in
             Text("Delete the \(v.label) build? Other quantizations of this model stay on disk.")
         }
@@ -1800,6 +1805,7 @@ private struct LocalModelRow: View {
                             downloads.deleteModel(model)
                             appState.refreshModels()
                         }
+                        .keyboardShortcut(.defaultAction)
                     } message: {
                         // A GGUF row is ONE quant of a repo — deleting it must not
                         // promise (or perform) the removal of its siblings.

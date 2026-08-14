@@ -2402,6 +2402,11 @@ struct ChatDetailView: View {
                 pendingIntentPrompt = nil
                 proceedSend()
             }
+            // The nudge exists to recommend this one, so it is what Return
+            // takes. "Send Anyway" stays a deliberate click — it also
+            // suppresses the suggestion for the rest of the chat, which is
+            // not something to hand to a reflex.
+            .keyboardShortcut(.defaultAction)
             Button("Send Anyway") {
                 intentSuppress.suppress(prompt, for: sessionId)
                 pendingIntentPrompt = nil
@@ -2482,6 +2487,19 @@ struct ChatDetailView: View {
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
                           onSend: { sendMessage() },
+                          // Escape stops the reply being written. Handled here
+                          // rather than as a hidden `.cancelAction` button so
+                          // the edit bubble and the approval sheet keep the key
+                          // while they are up (ComposerKey.onEscape).
+                          onCancel: {
+                              switch ComposerKey.onEscape(isGenerating: composerState == .generatingHere) {
+                              case .stop: stopGeneration(); return true
+                              case .pass: return false
+                              }
+                          },
+                          onArrow: { direction, caretAtStart, caretAtEnd in
+                              recallHistory(direction, caretAtStart: caretAtStart, caretAtEnd: caretAtEnd)
+                          },
                           onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
@@ -2563,7 +2581,7 @@ struct ChatDetailView: View {
 
         Button {
             if composerState == .generatingHere {
-                chatEngine.stop(sessionId: sessionId)
+                stopGeneration()
             } else {
                 sendMessage()
             }
@@ -4778,6 +4796,11 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 enum ComposerReturnAction: Equatable { case send, newline, ignore }
 
+/// What an Escape keypress does in the composer. `.pass` hands the key back to
+/// AppKit rather than swallowing it — with no turn to stop, Escape still has
+/// its platform meaning here.
+enum ComposerEscapeAction: Equatable { case stop, pass }
+
 /// A key the composer offers to the "/" menu before handling it itself.
 enum ComposerKeyCommand { case up, down, accept, cancel }
 
@@ -4785,6 +4808,27 @@ enum ComposerKey {
     static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
         if shift { return .newline }
         return isIdle ? .send : .ignore
+    }
+
+    /// Escape stops the reply being written, and does nothing otherwise.
+    ///
+    /// This runs from `cancelOperation(_:)` — the RESPONDER CHAIN — not from a
+    /// `.keyboardShortcut(.cancelAction)`. Key equivalents are offered the
+    /// keystroke first, so the edit bubble's Cancel and the tool-approval
+    /// sheet's Deny keep Escape whenever they are on screen, and the composer
+    /// only sees it when neither is. That ordering is the whole reason this
+    /// is not a hidden button like ⌘R regenerate.
+    static func onEscape(isGenerating: Bool) -> ComposerEscapeAction {
+        isGenerating ? .stop : .pass
+    }
+
+    /// Whether an in-place message edit is submittable — the ONE gate the Save
+    /// button and the Return key both read. A resubmit drops the old reply and
+    /// everything after it, so a blanked draft must not be able to spend that:
+    /// the edit field feeds this to `onReturn`'s `isIdle`, which turns a bare
+    /// Return on nothing into `.ignore` rather than a send.
+    static func editCanSubmit(_ draft: String) -> Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -4802,8 +4846,18 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var onSend: () -> Void
+    /// Escape, from the responder chain. Defaults to nothing so a field that
+    /// has no use for the key leaves it to AppKit.
+    var onCancel: () -> Bool = { false }
+    /// ↑ / ↓, with WHERE THE CARET IS — the composer recalls earlier messages,
+    /// but only from the edge of the text, so the keys keep moving the caret
+    /// inside a multi-line draft (`ComposerHistory`). Returning false hands the
+    /// key back to AppKit. Defaults to nothing: the in-place message editor has
+    /// no history to walk.
+    var onArrow: (ComposerHistory.Direction, _ caretAtStart: Bool, _ caretAtEnd: Bool) -> Bool = { _, _, _ in false }
     /// Keys the "/" menu wants first. Returns true when it consumed one — the
-    /// editor's own Return handling only runs when nothing above claimed it.
+    /// editor's own Return handling, Escape and arrow recall only run when
+    /// nothing above claimed the key.
     var onKeyCommand: (ComposerKeyCommand) -> Bool = { _ in false }
 
     /// Read from the SAME constants the placeholder overlay reads — the two
@@ -4855,19 +4909,41 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         // in-progress edit at the same value.
         if tv.string != text {
             tv.string = text
+            // Caret to the END of whatever was just put in the field. Setting
+            // `string` collapses the selection to the front, which after a
+            // history recall means typing lands BEFORE the recalled message and
+            // ↓ (which arms at the end) can never walk back out of it.
+            tv.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
             context.coordinator.recomputeHeight()
         }
         let enabled = context.environment.isEnabled
         if tv.isEditable != enabled { tv.isEditable = enabled }
-        // Drive AppKit first-responder from the SwiftUI focus mirror.
-        if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
-            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        // Drive AppKit first-responder from the SwiftUI focus mirror — on the
+        // EDGE of a request, never on its level.
+        //
+        // This ran on every update while `isFocused` was true, which made the
+        // field impossible to leave: `onResignFocus` publishes the cleared flag
+        // ASYNCHRONOUSLY, so any update in between saw a still-true flag and a
+        // text view that no longer had the keyboard, and handed it straight
+        // back. `isFocused` is set true on appear and again whenever a turn goes
+        // idle, and nothing ever cleared it, so the composer held the keyboard
+        // for the life of the window — and ⌘⌫ read "the user is typing" forever
+        // (live 2026-08-12).
+        if isFocused != context.coordinator.appliedFocus {
+            context.coordinator.appliedFocus = isFocused
+            if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
+                DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            }
         }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: GrowingTextEditor
         weak var textView: ComposerTextView?
+        /// The last focus REQUEST this view acted on, so `updateNSView` can
+        /// tell "focus me" from "you are still notionally focused" — see the
+        /// note there.
+        var appliedFocus = false
         init(_ parent: GrowingTextEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
@@ -4877,6 +4953,14 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            // The "/" skill menu gets FIRST REFUSAL on every key it navigates
+            // with, and only a menu that is actually open claims one. When it
+            // declines, the composer's own bindings below run unchanged — so
+            // Escape still stops a reply and ↑/↓ still walk history whenever
+            // the menu is closed. Order matters both ways: an open menu that
+            // let Escape through would stop the generation instead of closing
+            // itself, and arrows reaching history would scroll the transcript
+            // out from under the highlighted row.
             switch commandSelector {
             case #selector(NSResponder.moveUp(_:)):
                 if parent.onKeyCommand(.up) { return true }
@@ -4888,6 +4972,27 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
                 if parent.onKeyCommand(.cancel) { return true }
             default:
                 break
+            }
+            // Escape. Reached only when no `.cancelAction` key equivalent is on
+            // screen to claim it first — see ComposerKey.onEscape.
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                return parent.onCancel()
+            }
+            // ↑ / ↓ recall earlier messages, but the caret position is what
+            // decides — a draft is regularly several lines tall, and swallowing
+            // the arrows inside one would make it uneditable. The rule needs
+            // both edges, so both are measured here rather than inferred: the
+            // caret is at the start and the end simultaneously in an empty
+            // field, which is the state the walk arms from.
+            if commandSelector == #selector(NSResponder.moveUp(_:))
+                || commandSelector == #selector(NSResponder.moveDown(_:)) {
+                let selection = textView.selectedRange()
+                let length = (textView.string as NSString).length
+                let collapsed = selection.length == 0
+                return parent.onArrow(
+                    commandSelector == #selector(NSResponder.moveUp(_:)) ? .up : .down,
+                    collapsed && selection.location == 0,
+                    collapsed && selection.location == length)
             }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
             // Return picks the highlighted command when the menu is open —
