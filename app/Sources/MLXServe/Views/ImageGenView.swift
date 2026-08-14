@@ -56,6 +56,9 @@ struct ImageGenView: View {
     @State private var hydrating: Bool = false
     /// Hydrate exactly once per window lifetime (the first `.onAppear`).
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file is hovering the source-image section
+    /// — drives that section's dashed-border highlight and the well's fill.
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
         // No window-sized floor: this is a PAGE of the chat window now, and a
@@ -155,74 +158,48 @@ struct ImageGenView: View {
 
     private var sourceImageSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Source image (optional)").font(.subheadline.weight(.semibold))
-            if let url = initImageURL {
-                HStack(spacing: 8) {
-                    if let img = NSImage(contentsOf: url) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 40, height: 40)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                    Text(url.lastPathComponent)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button {
-                        initImageURL = nil
-                        refImageURLs = []
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Remove the source image (back to text-to-image)")
-                }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-                // The mode switch only makes sense where BOTH modes exist. A
-                // model with instruction editing but no VAE-encoder variation
-                // path (Mage-Flow-Edit) would otherwise offer "Variation" and
-                // get a 400 back.
-                if model.supportsReferenceEdit && model.supportsImg2Img {
+            HStack(spacing: 8) {
+                Text("Source image (optional)").font(.subheadline.weight(.semibold))
+                Spacer(minLength: 8)
+                // The mode switch belongs to the SECTION, not to the source
+                // row: sitting between the source and the references it split
+                // a list of identical rows in half and read as a property of
+                // the picture above it. In the header it sits beside the name
+                // of the thing it modifies, and the pictures below are one
+                // uninterrupted list. It only appears where BOTH modes exist —
+                // a model with instruction editing but no VAE-encoder
+                // variation path (Mage-Flow-Edit) would otherwise offer
+                // "Variation" and get a 400 back — and only once there is a
+                // source for it to apply to.
+                if initImageURL != nil && model.supportsReferenceEdit && model.supportsImg2Img {
                     Picker("", selection: $editMode) {
                         Text("Edit").tag(true)
                         Text("Variation").tag(false)
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
                     .onChange(of: editMode) { _, _ in guard !hydrating else { return }; persist() }
                 }
+            }
+            if let url = initImageURL {
+                // The source is picture 1 and the references follow it, which
+                // is the numbering the prompt refers to — so they are one
+                // list, drawn by one row.
+                imageRow(url, number: numberedImageRows ? 1 : nil,
+                         help: "Remove the source image (back to text-to-image)") {
+                    initImageURL = nil
+                    refImageURLs = []
+                }
                 if effectiveEditMode {
-                    ForEach(refImageURLs, id: \.self) { ref in
-                        HStack(spacing: 8) {
-                            if let img = NSImage(contentsOf: ref) {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 40, height: 40)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
-                            Text(ref.lastPathComponent)
-                                .font(.caption)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                            Button {
-                                refImageURLs.removeAll { $0 == ref }
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(.secondary)
-                            .help("Remove this reference image")
+                    ForEach(Array(refImageURLs.enumerated()), id: \.element) { i, ref in
+                        imageRow(ref, number: numberedImageRows ? i + 2 : nil,
+                                 help: "Remove this reference image") {
+                            refImageURLs.removeAll { $0 == ref }
                         }
-                        .padding(6)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
                     }
-                    if refImageURLs.count < 3 {
+                    if refImageURLs.count < maxRefImages {
                         Button {
                             chooseRefImage()
                         } label: {
@@ -256,17 +233,69 @@ struct ImageGenView: View {
                     }
                 }
             } else {
-                Button {
-                    chooseSourceImage()
-                } label: {
-                    Label(sourceImageButtonLabel, systemImage: "photo.badge.plus")
-                        .font(.caption)
-                }
+                MediaDropWell(title: sourceImageButtonLabel,
+                              systemImage: "photo.badge.plus",
+                              isTargeted: isDropTargeted) { chooseSourceImage() }
                 Text(sourceImageHint)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
         }
+        // Drops land on the source-image section rather than the whole window,
+        // and because the section GROWS once a source is set, the target grows
+        // to cover the thumbnail and reference rows — which is exactly where a
+        // later drop is aimed. `ImageDropPlacement` decides which slot it
+        // lands in, and states the ROOM it has for one — so a pane with
+        // nothing left to fill bounces the file instead of swallowing it.
+        .mediaDrop(.image,
+                   limit: ImageDropPlacement.room(source: initImageURL,
+                                                  editing: effectiveEditMode,
+                                                  refs: refImageURLs.count,
+                                                  refLimit: maxRefImages),
+                   isTargeted: $isDropTargeted) { placeDroppedImages($0) }
+    }
+
+    /// One attached picture. The source and every reference draw the SAME row
+    /// — they are one numbered list to the model, so they read as one list
+    /// here, and a row that differs only in what its ✕ does has no business
+    /// being written twice.
+    private func imageRow(_ url: URL, number: Int?, help: String,
+                          remove: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            if let number {
+                Text("\(number)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 10, alignment: .trailing)
+            }
+            if let img = NSImage(contentsOf: url) {
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+            Text(url.lastPathComponent)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help(help)
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// The numbers are the prompt's own vocabulary ("the face from image 2"),
+    /// so they appear exactly when there is more than one picture to tell
+    /// apart. A lone "1" beside the only image on screen is decoration.
+    private var numberedImageRows: Bool {
+        effectiveEditMode && !refImageURLs.isEmpty
     }
 
     /// What a source image is FOR on this model — instruction editing, a
@@ -555,13 +584,26 @@ struct ImageGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if AppActivation.runModal(panel) == .OK, let url = panel.url, refImageURLs.count < 3 {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url, refImageURLs.count < maxRefImages {
             refImageURLs.append(url)
         }
     }
 
     /// Max simultaneously-attached LoRAs — mirrors the server's `lora.MAX_LORAS`.
     private let maxLoras = 8
+    /// Reference images an edit takes beside the source.
+    private let maxRefImages = 3
+
+    /// Routing lives in `ImageDropPlacement` — one drop can carry several
+    /// files, so this is the whole placement (source, then references) applied
+    /// at once rather than a per-file decision.
+    private func placeDroppedImages(_ urls: [URL]) {
+        let placed = ImageDropPlacement.place(
+            urls, source: initImageURL, editing: effectiveEditMode,
+            refs: refImageURLs, refLimit: maxRefImages)
+        initImageURL = placed.source
+        refImageURLs = placed.refs
+    }
 
     private func chooseLora() {
         guard loras.count < maxLoras else { return }

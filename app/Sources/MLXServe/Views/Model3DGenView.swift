@@ -36,6 +36,9 @@ struct Model3DGenView: View {
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file hovers the photo section — drives its
+    /// dashed-border highlight and the well's fill (see `MediaDropTarget`).
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
         // No window-sized floor — see ImageGenView: pages shrink their
@@ -119,12 +122,18 @@ struct Model3DGenView: View {
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             } else {
-                Button { choosePhoto() } label: {
-                    Label("Choose photo…", systemImage: "photo.badge.plus").font(.caption)
-                }
+                MediaDropWell(title: "Choose photo…",
+                              systemImage: "photo.badge.plus",
+                              isTargeted: isDropTargeted) { choosePhoto() }
                 Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+        }
+        // One photo slot, so a drop replaces what's there — see
+        // `MediaDropTarget`. The target covers the whole section, which once a
+        // photo is set is the thumbnail row you'd aim a replacement at.
+        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { photoURL = url }
         }
     }
 
