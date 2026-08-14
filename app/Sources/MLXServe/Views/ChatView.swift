@@ -575,9 +575,228 @@ enum SidebarRowStyle {
     }
 }
 
+/// The conversation list's modifier-aware selection maths. Pure, and at file
+/// scope rather than inside `ChatSidebar`, so it can be driven from
+/// `SidebarMultiSelectTests` without a rendered view — same reason
+/// `ChatRowBuilder` and `ChatModeToggles` live out here.
+///
+/// The list stopped being a `List` (see `conversationsSidebar`), and with it
+/// went the cmd/shift behaviour a `selection:` binding gives you for free.
+/// This is that behaviour, written out.
+enum SidebarMultiSelect {
+    struct Outcome: Equatable {
+        var selection: Set<UUID>
+        /// What a subsequent shift-click ranges FROM.
+        var anchor: UUID?
+        /// The chat the detail column should show, or nil to leave it where it
+        /// is — a cmd-click that deselects some OTHER row changes what is
+        /// selected without changing where you are.
+        var activate: UUID?
+    }
+
+    /// - Parameters:
+    ///   - ordered: every visible row id in panel order, both sections
+    ///     flattened — a shift-range crosses the Agents/Chats boundary.
+    ///   - active: the chat currently on screen.
+    static func click(_ id: UUID,
+                      ordered: [UUID],
+                      selection: Set<UUID>,
+                      anchor: UUID?,
+                      active: UUID?,
+                      command: Bool,
+                      shift: Bool) -> Outcome {
+        // Shift wins when both are held, as it does in every macOS list.
+        if shift, let anchor, anchor != id,
+           let from = ordered.firstIndex(of: anchor),
+           let to = ordered.firstIndex(of: id) {
+            let span = from <= to ? from...to : to...from
+            // The range REPLACES the selection and the anchor stays put, so
+            // shift-clicking around re-ranges from one origin instead of
+            // accumulating every range you passed through.
+            return Outcome(selection: Set(ordered[span]), anchor: anchor, activate: id)
+        }
+        guard command else {
+            return Outcome(selection: [id], anchor: id, activate: id)
+        }
+        guard selection.contains(id) else {
+            return Outcome(selection: selection.union([id]), anchor: id, activate: id)
+        }
+        // Cmd-clicking the ONLY selected row is a no-op: this selection is also
+        // the panel's "you are here", and emptying it would leave a transcript
+        // on screen with nothing in the list pointing at it.
+        guard selection.count > 1 else {
+            return Outcome(selection: selection, anchor: id, activate: nil)
+        }
+        var next = selection
+        next.remove(id)
+        // Deselecting the row you were READING moves to the nearest survivor —
+        // otherwise the transcript belongs to a row that is no longer lit.
+        let activate = active == id ? nearest(to: id, in: ordered, within: next) : nil
+        return Outcome(selection: next, anchor: id, activate: activate)
+    }
+
+    /// What the selection becomes when the composer takes the keyboard, or nil
+    /// when it already says that.
+    ///
+    /// Typing is a statement that you are working in ONE conversation. Without
+    /// this the multi-selection stayed lit behind the field, and since a
+    /// multi-selection outranks focus for ⌘⌫ (`ChatDeleteShortcut.route`) the
+    /// chord kept raising a delete dialog mid-message — two rules each reading
+    /// a true fact and disagreeing about which one meant "the user is deleting
+    /// chats". The chat you are typing IN is the survivor: its transcript is
+    /// the one on screen above the field.
+    ///
+    /// Nil rather than an equal set, so a focus event that changes nothing does
+    /// not publish.
+    static func focusingComposer(in sessionId: UUID, selection: Set<UUID>) -> Set<UUID>? {
+        selection == [sessionId] ? nil : [sessionId]
+    }
+
+    private static func nearest(to id: UUID, in ordered: [UUID], within set: Set<UUID>) -> UUID? {
+        guard let origin = ordered.firstIndex(of: id) else { return set.first }
+        return ordered.enumerated()
+            .filter { set.contains($0.element) }
+            .min { abs($0.offset - origin) < abs($1.offset - origin) }?
+            .element
+    }
+}
+
+/// Which deletions stop and ask first. Pure, and beside `SidebarMultiSelect`
+/// for the same reason — the rule is worth pinning, and there is nothing to
+/// see on screen until you have already lost the conversations.
+enum SidebarDeleteConfirm {
+    /// ⌘⌫ ALWAYS asks: the key names no row, so its target is implicit — every
+    /// selected row, or, with nothing selected, whichever chat you happen to be
+    /// reading. And any BULK delete asks whichever control started it, because
+    /// N conversations go on one action and nothing undoes it. A single
+    /// deliberate delete on a named row (the row's ✕, its context menu) still
+    /// goes straight through, as it always has.
+    static func required(count: Int, keyboard: Bool) -> Bool {
+        count > 0 && (keyboard || count > 1)
+    }
+
+    /// What ⌘⌫ acts on: the sidebar's selection, or — with nothing selected —
+    /// the chat being read. Nil when there is nothing to delete, which is also
+    /// what disables the menu item, since a command that does nothing when you
+    /// pick it is the dead-control class.
+    static func target(selection: Set<UUID>, activeChatId: UUID?) -> Set<UUID>? {
+        let ids = selection.isEmpty ? (activeChatId.map { Set([$0]) } ?? []) : selection
+        return ids.isEmpty ? nil : ids
+    }
+
+    /// The count is the thing to check before agreeing, so it is in the title.
+    static func title(count: Int) -> String {
+        count == 1 ? "Delete this chat?" : "Delete \(count) chats?"
+    }
+}
+
+/// Where ⌘⌫ goes.
+///
+/// A menu item's key equivalent is offered the keystroke by
+/// `performKeyEquivalent` BEFORE the first responder ever sees it, so a Delete
+/// Chat command in the menu bar takes ⌘⌫ away from every text field in the app
+/// — including the composer, where it has meant "delete to the start of the
+/// line" since long before this app existed. Typing it mid-message raised a
+/// delete-chat dialog, and `.disabled(chatDeletionTarget == nil)` cannot help:
+/// a chat is open in exactly the state where you are typing into one.
+///
+/// So the command ROUTES rather than claims. The keyboard's own owner wins
+/// while it has focus, and the menu item keeps its slot — which is the half
+/// that made the shortcut discoverable in the first place.
+enum ChatDeleteShortcut {
+    enum Route: Equatable {
+        /// Hand it back to the text being edited (see `deleteToBeginningOfLine`
+        /// — the menu has already swallowed the event, so returning early
+        /// would make ⌘⌫ do nothing at all in the composer).
+        case deleteToLineStart
+        case deleteChats
+    }
+
+    /// - Parameter selectedChats: how many rows the sidebar has picked. Several
+    ///   is unambiguous — you were working in the list — and it OUTRANKS focus,
+    ///   because focus alone is not a signal this window can be trusted to get
+    ///   right: nothing in it takes the keyboard off the composer except
+    ///   `KeyboardFocus.resignTextEditor`, and one stuck reading would
+    ///   otherwise make ⌘⌫ a line delete forever with a dozen chats selected
+    ///   behind it. Belt and braces on a key that deletes conversations.
+    static func route(editingText: Bool, selectedChats: Int) -> Route {
+        if selectedChats > 1 { return .deleteChats }
+        return editingText ? .deleteToLineStart : .deleteChats
+    }
+}
+
+/// Who holds the keyboard.
+///
+/// The chat window has no real focus model: its conversation rows are
+/// `.buttonStyle(.plain)` Buttons, which take no first responder under macOS's
+/// default keyboard navigation — the same fact that made `.onDeleteCommand` on
+/// that column never fire. So clicking a chat moved the selection while the
+/// COMPOSER kept the keyboard, and every keystroke-owning decision downstream
+/// read "the user is typing" forever (live 2026-08-12: after one click in the
+/// composer, ⌘⌫ never deleted a chat again).
+enum KeyboardFocus {
+
+    /// Whether the responder holding the keyboard is text being typed into.
+    ///
+    /// `NSTextView` covers both cases and is the only type that needs naming: a
+    /// focused `NSTextField` never becomes first responder itself — the
+    /// window's FIELD EDITOR does, and that is an `NSTextView`.
+    static func isTextEditor(_ responder: NSResponder?) -> Bool {
+        responder is NSTextView
+    }
+
+    /// Move the keyboard out of a text field, because nothing else in this
+    /// window will. Only when a text editor actually has it — an unconditional
+    /// `makeFirstResponder(nil)` would yank focus off whatever else legitimately
+    /// holds it.
+    static func resignTextEditor(in window: NSWindow?) {
+        guard let window, isTextEditor(window.firstResponder) else { return }
+        window.makeFirstResponder(nil)
+    }
+}
+
 // MARK: - Sidebar
 
+/// Every measured row, so the quick-switch can number only the ones in the
+/// clear. Published per row and merged on the way up.
+struct SidebarRowSpansKey: PreferenceKey {
+    static let defaultValue: [UUID: SidebarRowSpan] = [:]
+    static func reduce(value: inout [UUID: SidebarRowSpan],
+                       nextValue: () -> [UUID: SidebarRowSpan]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// The bottom edge of the frosted destination block, measured in the column's
+/// own space — rows above this line are behind glass.
+struct SidebarClearBandTopKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The bottom edge of the panel — rows below this line are off the fold.
+struct SidebarClearBandBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ChatSidebar: View {
+    /// The one coordinate space the three band measurements share.
+    ///
+    /// Load-bearing that it is the COLUMN's own space and not `.global`: a
+    /// global frame is not re-published when a view merely MOVES, and entering
+    /// fullscreen translates the whole column without resizing the pinned
+    /// destination block — so the block went on reporting the maxY it had in
+    /// the smaller window while the rows slid out from under it, and rows in
+    /// plain sight lost their badges. Measured here, the top edge is the
+    /// block's own height and the bottom edge is the column's, both of which
+    /// change only when there is genuinely a new layout to report.
+    static let bandSpace = "chatSidebarBand"
+
     @EnvironmentObject var appState: AppState
     /// Observed directly — AppState forwards objectWillChange only for the
     /// server and the agent store, so a badge reading `appState.downloads`
@@ -614,21 +833,107 @@ struct ChatSidebar: View {
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
             let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+            // The panel's visual order, both sections flattened — a shift-click
+            // ranges across the Agents/Chats boundary, because the split is a
+            // heading, not a wall.
+            let ordered = groups.agents.map(\.id) + groups.chats.map(\.id)
             LazyVStack(alignment: .leading, spacing: 2) {
                 if !groups.agents.isEmpty {
                     sectionHeader("Agents")
                     ForEach(groups.agents) { session in
-                        sessionRow(session)
+                        sessionRow(session, ordered: ordered)
                     }
                 }
                 sectionHeader("Chats")
                 ForEach(groups.chats) { session in
-                    sessionRow(session)
+                    sessionRow(session, ordered: ordered)
                 }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
         }
+        .onAppear {
+            // The rows READ the selection to decide their highlight, so it has
+            // to be primed: `activeChatId` is usually set long before this panel
+            // first appears, and an .onChange can't fire for a value that was
+            // already there.
+            if appState.sidebarSelection.isEmpty, let id = appState.activeChatId {
+                appState.sidebarSelection = [id]
+                selectionAnchor = id
+            }
+        }
+        // Deletions from anywhere else (the tray, a task run, another window)
+        // must not leave ids in the selection that no longer name a chat — a
+        // stale one would be counted by the context menu's "Delete N Chats" and
+        // handed straight back to `deleteSessions` by ⌫.
+        .onChange(of: appState.visibleChatSessions.count) { _, _ in
+            let live = Set(appState.visibleChatSessions.map(\.id))
+            if !appState.sidebarSelection.isSubset(of: live) {
+                appState.sidebarSelection.formIntersection(live)
+            }
+            if let anchor = selectionAnchor, !live.contains(anchor) { selectionAnchor = nil }
+        }
+        .onChange(of: appState.sidebarSelection) { _, newSelection in
+            // When the sidebar's selection becomes a single id, make that the
+            // active chat so the detail column follows the user's intent.
+            if newSelection.count == 1, let id = newSelection.first {
+                if appState.activeChatId != id { appState.activeChatId = id }
+            }
+        }
+        .onChange(of: appState.activeChatId) { _, newActive in
+            // Keep the sidebar selection in sync when other parts of the app
+            // change the active chat (open-from-tray, quick launcher, etc.).
+            // Only COLLAPSE it when the new active chat isn't already IN it:
+            // this ran unconditionally, so a cmd-click that added a second row
+            // was overwritten by `[id]` on its way out and the panel could never
+            // hold more than one — the multi-select bug. A chat the selection
+            // already contains is a move WITHIN the selection, and leaves it be.
+            guard let id = newActive else {
+                appState.sidebarSelection.removeAll()
+                selectionAnchor = nil
+                return
+            }
+            if !appState.sidebarSelection.contains(id) {
+                appState.sidebarSelection = [id]
+                selectionAnchor = id
+            }
+        }
+        // NO `.onDeleteCommand`: it only fires while its view is in the
+        // responder chain, which is why it is List API — a `List(selection:)`
+        // becomes first responder when you click a row. This column stopped
+        // being a List (see above) and its rows are `.buttonStyle(.plain)`
+        // Buttons, which take no focus under macOS's default keyboard
+        // navigation, so the modifier sat here reading like a working ⌫ and
+        // never once ran. The keyboard route is the File menu's Delete Chat
+        // (⌘⌫, Finder's own shortcut), which is a menu command and therefore
+        // needs no focus at all — and being IN a menu, it is also visible.
+        //
+        // The dialog it raises is the one every delete control shares, so its
+        // state lives on AppState where the menu command can reach it.
+        .confirmationDialog(
+            SidebarDeleteConfirm.title(count: appState.pendingChatDeletion?.count ?? 1),
+            isPresented: Binding(get: { appState.pendingChatDeletion != nil },
+                                 set: { if !$0 { appState.pendingChatDeletion = nil } }),
+            presenting: appState.pendingChatDeletion
+        ) { ids in
+            Button("Delete", role: .destructive) {
+                deleteChats(ids)
+                appState.pendingChatDeletion = nil
+            }
+            // Return deletes. The dialog is the second time you have said so
+            // (a menu command or a row's Delete raised it), and reaching for
+            // the trackpad to confirm a decision already made is the whole
+            // reason this asked to be a keyboard app. Escape still cancels —
+            // AppKit gives the `.cancel` role that for free.
+            .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
+        } message: { _ in
+            Text("This can't be undone.")
+        }
+        // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
+        // they address THIS view's conversation list; hidden in a background so
+        // they cost no layout.
+        .background(quickSwitchShortcuts)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -731,24 +1036,24 @@ struct ChatSidebar: View {
             .padding(.bottom, 2)
     }
 
-    /// One conversation row, shared by both sections.
+    /// One conversation row, shared by both sections. `ordered` is the panel's
+    /// flattened visual order, which shift-click ranges over.
     @ViewBuilder
-    private func sessionRow(_ session: ChatSession) -> some View {
-        // Exactly ONE row in this panel is lit at a time. A conversation is
-        // where you ARE only while the window is showing conversations —
-        // otherwise opening Tasks left the last chat lit alongside the Tasks
-        // destination, two "you are here" marks for one window.
-        let isSelected = SidebarSelection.isConversationSelected(
-            sessionId: session.id, activeChatId: appState.activeChatId,
-            workspace: appState.chatWorkspace)
+    private func sessionRow(_ session: ChatSession, ordered: [UUID]) -> some View {
+        // Lit rows are the SELECTION, not just the active chat — otherwise a
+        // cmd-clicked second row is selected (⌫ deletes it) while looking
+        // exactly like an unselected one. A conversation is still only lit while
+        // the window is showing conversations: otherwise opening Tasks left the
+        // last chat lit alongside the Tasks destination, two "you are here"
+        // marks for one window.
+        let isSelected = conversationsAreLit && appState.sidebarSelection.contains(session.id)
         // The button IS the row: it carries the padding, the height floor and
         // the contentShape, so every pixel of the fill is clickable. As a
         // sibling sized by an outer frame, the label was CENTRED in the row's
         // height and only its own text band answered a click — the dead strip
         // along the top and bottom of the highlight.
         Button {
-            appState.showConversation()
-            appState.activeChatId = session.id
+            selectRow(session.id, ordered: ordered)
         } label: {
             // An agent thread is named for its AGENT, with the agent's own
             // symbol beside it — the Agents section is a list of who you talk
@@ -837,8 +1142,17 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
-            Button("Delete", role: .destructive) {
-                appState.deleteSession(session.id)
+            // Right-clicking INSIDE a multi-selection acts on all of it, and
+            // says how many; right-clicking outside one is a single delete.
+            if appState.sidebarSelection.count > 1,
+               appState.sidebarSelection.contains(session.id) {
+                Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
+                    requestDeleteChats(appState.sidebarSelection, keyboard: false)
+                }
+            } else {
+                Button("Delete", role: .destructive) {
+                    requestDeleteChats([session.id], keyboard: false)
+                }
             }
         }
     }
@@ -1803,6 +2117,18 @@ struct ChatDetailView: View {
         .onChange(of: composerState) { _, state in
             if state == .idle { inputFocused = true }
         }
+        // The keyboard arriving in the composer collapses the sidebar selection
+        // to this chat. Keyed on the focus MIRROR rather than on the click, so
+        // it covers every way the field ends up holding the keyboard — and the
+        // rule is what keeps ⌘⌫ from raising a delete dialog mid-message with
+        // several chats still lit behind the field.
+        .onChange(of: inputFocused) { _, focused in
+            guard focused,
+                  let collapsed = SidebarMultiSelect.focusingComposer(
+                      in: sessionId, selection: appState.sidebarSelection)
+            else { return }
+            appState.sidebarSelection = collapsed
+        }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
             // the newly-visible session. The allow-list is NOT reset here — it's
@@ -2629,6 +2955,26 @@ struct GeneratingIndicator: View {
 // replacements for lsof/ps/vm_stat) lives in Services/SystemMetrics.swift.
 
 // MARK: - Message Bubble
+
+/// Attaches double-click-to-edit, or attaches NOTHING at all.
+///
+/// A `nil` action must leave the view untouched rather than install a gesture
+/// that does nothing: this one is `highPriorityGesture`, so merely EXISTING is
+/// enough to beat `textSelection`'s own double-click-to-select-word. A
+/// no-op-inside-the-closure version therefore reads as "double-click stopped
+/// selecting words" on exactly the messages nobody can edit.
+private struct DoubleClickToEdit: ViewModifier {
+    let action: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let action {
+            content.highPriorityGesture(TapGesture(count: 2).onEnded { _ in action() })
+        } else {
+            content
+        }
+    }
+}
 
 struct MessageBubble: View {
     let message: ChatMessage
