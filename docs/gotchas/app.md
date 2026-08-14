@@ -400,6 +400,61 @@ clearBandTop:clearBandBottom:)`, which is what makes "a taller window numbers
 more rows" a test rather than a screenshot. Guards: `ChatQuickSwitchTests`
 (band cases + a source scan pinning zero `.global` frames and exactly three
 readers in the named space — verified red by reverting one reader).
+
+## Continuing a reply filed itself as a new version of it (2026-08-14)
+
+Three features landed together and two of them meet on one message. Regenerate
+puts a version pager under a reply; Continue hands the reply back to the model
+to finish. Both end at the same place — `ChatTurnEngine.endTurn` →
+`AppState.finishRevisions`, the ONE turn exit — and that exit could not tell
+them apart:
+
+```swift
+let seed = pendingRevisionSeed.removeValue(forKey: sessionId)   // nil after a continuation
+guard seed != nil || !msg.revisions.isEmpty else { return }     // …but revisions is not
+```
+
+So a reply that had been regenerated once (pager reading 2/2) went to **3/3**
+the moment you continued it, with 2/3 holding the same reply minus the ending
+that had just been written. Nothing errors and nothing is lost — the text is in
+v3 — which is what makes it the quiet kind: the pager silently grew a page that
+is not another answer to the question.
+
+The rule is that **the pager counts REGENERATIONS**, and a continuation is not
+one. It is the reply you are reading, carrying on — the same relationship an
+edit has to the version it changes, which is why `MessageRevisions.applyingEdit`
+already exists and says so: stepping away and back reloads `content` from the
+stored revision, so any in-place change that does not sync into the list is
+discarded the first time you touch an arrow.
+
+The fact has to be HELD, for the same reason `pendingRevisionSeed` is held: the
+turn exit is the only place that knows the turn is over, and by then the request
+that started it is gone. `AppState.markContinuing(_:)` is that marker, and it
+carries the seed's ordering hazard too — `continueReply` opens with
+`stop(sessionId:)`, which IS a turn exit, so a mark set before it is consumed
+immediately and the continuation records itself as a new version anyway. Set
+after `stop`, pinned by a scan that reads the two statements in order.
+
+Two more things describing a message that a continuation changes and the first
+cut did not carry over. The truncation notice was already cleared (the reply was
+cut; it is being un-cut). Token usage was not: `updateLastMessage` **replaces**
+`completionTokens`, so a 900-token reply finished by a 42-token continuation
+reported 42 in its footnote. `addingCompletionTokens:` adds instead, driven by
+`runPlainTurn`'s own `continuing` flag — the prompt count and the rate stay the
+latest generation's, since a continuation's prompt already contains everything
+before it and a rate is not a quantity to sum.
+
+And the affordance itself: `ContinueReply.isEligible` takes the `ServerEngine`
+now. ds4 renders its chat template inside the embedded engine, where there is
+nowhere to append a prefill, so the server refuses by name
+(`continuationRejectReason`) — a live button over a guaranteed 400 is the
+dead-control class, and the same rule as a locked composer disc.
+
+Guards: `ContinuedReplyBookkeepingTests`, `ContinueReplyTests` engine cases,
+`RegenerationSeedWiringTests` continuation cases (both verified red by
+reverting each half separately — the AppState branch and the `markContinuing`
+ordering fail independently).
+
 ## A typed `onDrop(of:)` never saw the Create panes' drops (2026-08-13)
 
 The media panes' shared drop target (`MediaDropTarget.swift`) shipped as

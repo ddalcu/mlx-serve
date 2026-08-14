@@ -479,15 +479,76 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
+    /// Regenerate the last reply: drop the last user turn (and whatever
+    /// followed it — the old assistant reply, any tool-call chain) and
+    /// resubmit that same user text as a fresh turn. Reuses `runTurn` rather
+    /// than duplicating the plain/agent branching, so a regenerated turn is
+    /// indistinguishable from a freshly sent one.
+    func regenerate(sessionId: UUID, config: TurnConfig,
+                     approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard let msgs = session(sessionId)?.messages,
+              let lastUserIdx = msgs.lastIndex(where: { $0.role == .user })
+        else { return }
+        let text = msgs[lastUserIdx].content
+        let images = msgs[lastUserIdx].images
+        let audio = msgs[lastUserIdx].audio
+        // The reply about to be destroyed. `truncateMessages` drops everything
+        // from the last user turn onward, so this is the only moment it can be
+        // captured — and a regeneration that silently threw away a better first
+        // answer is the whole reason the pager exists.
+        let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
+        appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
+        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+                config: config, approval: approval)
+        // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
+        // turn exit, so a seed placed before it would be spent immediately.
+        // The seed is HELD from here and applied when this turn ends: the
+        // reply it belongs to does not exist yet, and on the agent path it is
+        // the last of several appended from inside the Task.
+        if let replaced { appState.seedRevisions(in: sessionId, from: replaced) }
+    }
+
+    /// Extend the reply at the end of the transcript instead of answering
+    /// after it — the model is handed its own unfinished text and resumes.
+    ///
+    /// Deliberately NOT routed through `runTurn`: that appends a user message
+    /// and a fresh placeholder, which is exactly what a continuation must not
+    /// do. It also never takes the agent path — a tool loop mid-reply would
+    /// have to splice a call into text the user has already read.
+    func continueReply(sessionId: UUID, config: TurnConfig) {
+        guard ContinueReply.isEligible(session(sessionId)?.messages ?? [],
+                                       serverRunning: server.status == .running,
+                                       busy: composerState(for: sessionId) != .idle,
+                                       engine: server.chatModelInfo?.engine)
+        else { return }
+        stop(sessionId: sessionId)
+        let token = ledger.begin(session: sessionId)
+        // AFTER stop, which is a turn exit and would consume the mark — the
+        // same ordering hazard `regenerate` has with its seed. It tells the
+        // turn exit to EXTEND the version being read rather than file the
+        // continuation as a new one.
+        appState.markContinuing(sessionId)
+        publishTurnState()
+        runPlainTurn(sessionId: sessionId, text: "", images: nil, audio: nil,
+                     config: config, token: token, continuing: true)
+    }
+
     // MARK: - Plain chat
 
+    /// - Parameter continuing: extend the reply already at the end of the
+    ///   transcript instead of answering after it. No user message is added and
+    ///   no placeholder is appended — the trailing assistant message IS the
+    ///   placeholder, and the server is told to treat it as a prefill.
     private func runPlainTurn(sessionId: UUID, text: String,
                               images: [ChatImage]?, audio: [ChatAudio]?,
-                              config: TurnConfig, token: UUID) {
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = images
-        userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+                              config: TurnConfig, token: UUID,
+                              continuing: Bool = false) {
+        if !continuing {
+            var userMsg = ChatMessage(role: .user, content: text)
+            userMsg.images = images
+            userMsg.audio = audio
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
 
@@ -541,21 +602,31 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
 
         // Streaming placeholder for the UI — appended AFTER the request body is
-        // built so it doesn't show up in the prompt.
-        var assistantMsg = ChatMessage(role: .assistant, content: "")
-        assistantMsg.isStreaming = true
-        appState.appendMessage(to: sessionId, message: assistantMsg)
+        // built so it doesn't show up in the prompt. A continuation has one
+        // already: the reply being extended. Appending a second would stream
+        // the rest of the sentence into a NEW bubble under the one it belongs
+        // to, and `updateLastMessage` (which appends) writes to the last
+        // message either way, so reusing it needs no other change.
+        if continuing {
+            // The notice said the reply was cut. It is being un-cut.
+            appState.clearTruncationNotice(in: sessionId)
+            appState.updateLastMessage(in: sessionId, streaming: true)
+        } else {
+            var assistantMsg = ChatMessage(role: .assistant, content: "")
+            assistantMsg.isStreaming = true
+            appState.appendMessage(to: sessionId, message: assistantMsg)
+        }
 
         tasks[sessionId] = Task { [weak self] in
             await self?.streamPlainResponse(api: api, sessionId: sessionId,
                                             messages: messagesArray, config: config,
-                                            token: token)
+                                            token: token, continuing: continuing)
         }
     }
 
     private func streamPlainResponse(api: APIClient, sessionId: UUID,
                                      messages: [[String: Any]], config: TurnConfig,
-                                     token: UUID) async {
+                                     token: UUID, continuing: Bool = false) async {
         do {
             // A media-first server runs headless (no default model) — hot-load
             // the selected chat model once so the request below resolves.
@@ -571,7 +642,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
                 defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId
+                modelId: server.chatModelId,
+                continueFinalMessage: continuing
             )
             var coalescer = StreamCoalescer()
             beginLiveTokenCount(for: sessionId)
@@ -584,7 +656,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     streamDelta(reasoning: text, coalescer: &coalescer, to: sessionId)
                 case .usage(let usage):
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, usage: usage)
+                    // A continuation streams into a message that already
+                    // carries a generation's worth of tokens, so the counts
+                    // ADD — the footnote describes the reply, and the reply is
+                    // both halves.
+                    appState.updateLastMessage(in: sessionId, usage: usage,
+                                               addingCompletionTokens: continuing)
                     setLiveTokens(usage.completionTokens, for: sessionId)   // reconcile to the authoritative count
                 case .toolCalls:
                     break

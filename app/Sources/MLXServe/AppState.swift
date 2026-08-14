@@ -807,6 +807,27 @@ class AppState: ObservableObject {
         else { pendingRevisionSeed[sessionId] = seeded }
     }
 
+    /// Sessions whose in-flight turn EXTENDS the reply already at the end of
+    /// the transcript instead of producing a new one.
+    ///
+    /// The pager counts REGENERATIONS — answers to the same question — and a
+    /// continuation is not one of those: it is the reply you are reading,
+    /// carrying on. Without this marker `finishRevisions` reached
+    /// `MessageRevisions.committing` and filed the extended text as a new
+    /// version, so a reply that had been regenerated once went to 3/3 the
+    /// moment you finished it, and stepping back to 2/3 showed the same reply
+    /// with the ending removed. Same shape as `pendingRevisionSeed`: the turn
+    /// exit is the only place that knows the turn is over, so the fact has to
+    /// be held from the moment the continuation is asked for.
+    private var continuingSessions: Set<UUID> = []
+
+    /// Declare this session's next turn a continuation. Must be called AFTER
+    /// `stop(sessionId:)` — stop is a turn exit, and a mark placed before it
+    /// would be consumed immediately (the `seedRevisions` ordering hazard).
+    func markContinuing(_ sessionId: UUID) {
+        continuingSessions.insert(sessionId)
+    }
+
     /// Apply any held seed to the reply this turn produced and record that
     /// reply as the newest version. Called from turn EXITS only — a
     /// per-iteration call inside the agent loop would land the pager on the
@@ -880,6 +901,17 @@ class AppState: ObservableObject {
         chatSessions[sIdx].messages[mIdx].reasoningContent = msg.revisions[index].reasoningContent
     }
 
+    /// Drop the "this reply was cut short" footnote from the last message.
+    ///
+    /// Called when a continuation starts: the notice is a statement about the
+    /// reply, and the reply is about to stop being cut. Leaving it would put
+    /// "Stopped — hit the output limit" under a paragraph that carried on.
+    func clearTruncationNotice(in sessionId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.indices.last else { return }
+        chatSessions[sIdx].messages[mIdx].truncationNotice = nil
+    }
+
     func appendMessage(to sessionId: UUID, message: ChatMessage) {
         guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
         chatSessions[idx].messages.append(message)
@@ -939,7 +971,9 @@ class AppState: ObservableObject {
         if let truncation { chatSessions[sIdx].messages[mIdx].truncationNotice = truncation }
         if let usage {
             chatSessions[sIdx].messages[mIdx].promptTokens = usage.promptTokens
-            chatSessions[sIdx].messages[mIdx].completionTokens = usage.completionTokens
+            chatSessions[sIdx].messages[mIdx].completionTokens = addingCompletionTokens
+                ? (chatSessions[sIdx].messages[mIdx].completionTokens ?? 0) + usage.completionTokens
+                : usage.completionTokens
             chatSessions[sIdx].messages[mIdx].tokensPerSecond = usage.tokensPerSecond
         }
         if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }
