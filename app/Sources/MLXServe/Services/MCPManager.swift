@@ -485,6 +485,11 @@ final class MCPManager: ObservableObject, MCPToolRouting {
                 while !Task.isCancelled {
                     if !child.isRunning {
                         resumed.tryResume {
+                            // Break-glass: the child is already dead, so Path A's client.connect()
+                            // is stuck awaiting a JSON-RPC reply that will never arrive. disconnect()
+                            // resumes that pending continuation (per swift-sdk Client.swift) instead
+                            // of leaving the abandoned Task running forever.
+                            Task.detached { [client] in await client.disconnect() }
                             let tail = stderrBox.snapshot().trimmingCharacters(in: .whitespacesAndNewlines)
                             let err = MCPSpawnError.serverExitedEarly(status: child.exitStatus ?? -1, stderr: tail)
                             continuation.resume(returning: .failure(err))
@@ -499,6 +504,13 @@ final class MCPManager: ObservableObject, MCPToolRouting {
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(hardCapSeconds * 1_000_000_000))
                 resumed.tryResume {
+                    // Same break-glass as Path B: the child may still be alive (it just never
+                    // answered), so terminate it AND disconnect the client — terminate() alone only
+                    // sometimes wakes the SDK's read loop via EOF; disconnect() is what reliably
+                    // resumes Path A's pending continuation (see executeToolCall's watchdog above,
+                    // which uses the identical pattern).
+                    if child.isRunning { child.terminate() }
+                    Task.detached { [client] in await client.disconnect() }
                     continuation.resume(returning: .failure(MCPManagerError.timeout(seconds: hardCapSeconds)))
                 }
             }
