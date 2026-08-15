@@ -78,19 +78,12 @@ enum CLIInstaller {
         raw.split(separator: ":").map(String.init).filter { !$0.isEmpty }
     }
 
-    private static let pathMarkerBegin = "__MLX_PATH_BEGIN__"
-    private static let pathMarkerEnd = "__MLX_PATH_END__"
-
     /// The command we ask the login shell to run. Markers isolate the PATH
     /// from any banner/echo noise an interactive rc file prints.
-    static let pathProbeCommand =
-        "printf '\\n\(pathMarkerBegin)%s\(pathMarkerEnd)\\n' \"$PATH\""
+    static let pathProbeCommand = LoginShellEnv.probeCommand(["PATH"])
 
     static func extractPath(fromShellOutput output: String) -> String? {
-        guard let begin = output.range(of: pathMarkerBegin),
-              let end = output.range(of: pathMarkerEnd, range: begin.upperBound..<output.endIndex)
-        else { return nil }
-        return String(output[begin.upperBound..<end.lowerBound])
+        LoginShellEnv.parse(["PATH"], fromShellOutput: output)["PATH"]
     }
 
     static func shellQuote(_ s: String) -> String {
@@ -195,28 +188,7 @@ enum CLIInstaller {
     /// process PATH if the shell misbehaves or hangs.
     static func userShellPathEntries() -> [String] {
         let fallback = parsePathEntries(ProcessInfo.processInfo.environment["PATH"] ?? "")
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: shell)
-        p.arguments = ["-l", "-i", "-c", pathProbeCommand]
-        let outPipe = Pipe()
-        p.standardOutput = outPipe
-        p.standardError = Pipe()
-        p.standardInput = FileHandle.nullDevice
-        do { try p.run() } catch { return fallback }
-
-        // Watchdog: a pathological rc file must not wedge the app.
-        let deadline = DispatchWorkItem { if p.isRunning { p.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: deadline)
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        deadline.cancel()
-
-        guard let out = String(data: data, encoding: .utf8),
-              let path = extractPath(fromShellOutput: out),
-              !path.isEmpty
-        else { return fallback }
+        guard let path = LoginShellEnv.values(of: ["PATH"])["PATH"] else { return fallback }
         return parsePathEntries(path)
     }
 

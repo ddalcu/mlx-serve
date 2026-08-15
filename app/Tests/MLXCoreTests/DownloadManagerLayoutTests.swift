@@ -851,3 +851,134 @@ final class DownloadManagerLayoutTests: XCTestCase {
         try "{\"model_type\":\"gemma4_assistant\"}".write(toFile: cfg, atomically: true, encoding: .utf8)
     }
 }
+
+// MARK: - Hugging Face cache ROOT resolution
+//
+// `huggingface_hub` lets people move the cache with three env vars, in this
+// precedence: `HF_HUB_CACHE`, then `$HF_HOME/hub`, then
+// `$XDG_CACHE_HOME/huggingface/hub`, then `~/.cache/huggingface/hub`. A
+// Finder-launched bundle has NO shell environment, so the value also has to be
+// reachable from the login shell — `LoginShellEnv` is that half.
+
+final class HuggingFaceRootTests: XCTestCase {
+    private var tempRoot: String!
+
+    override func setUpWithError() throws {
+        tempRoot = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("mlx-serve-hfroot-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: tempRoot, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(atPath: tempRoot)
+    }
+
+    private func mkdir(_ path: String) throws -> String {
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        return path
+    }
+
+    private func sub(_ components: String) -> String {
+        (tempRoot as NSString).appendingPathComponent(components)
+    }
+
+    func testHubCacheRootPrecedenceAcrossEnvVars() throws {
+        let explicit = try mkdir(sub("explicit-hub"))
+        let hfHome = try mkdir(sub("hf-home"))
+        let hfHomeHub = try mkdir(sub("hf-home/hub"))
+        let xdg = try mkdir(sub("xdg"))
+        let xdgHub = try mkdir(sub("xdg/huggingface/hub"))
+        let home = try mkdir(sub("home"))
+        let defaultHub = try mkdir(sub("home/.cache/huggingface/hub"))
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(
+                environment: ["HF_HUB_CACHE": explicit, "HF_HOME": hfHome, "XDG_CACHE_HOME": xdg],
+                home: home),
+            explicit, "HF_HUB_CACHE outranks everything")
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(
+                environment: ["HF_HOME": hfHome, "XDG_CACHE_HOME": xdg], home: home),
+            hfHomeHub, "HF_HOME names the cache PARENT — the hub dir is a level down")
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(environment: ["XDG_CACHE_HOME": xdg], home: home),
+            xdgHub, "XDG_CACHE_HOME moves the default cache")
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(environment: [:], home: home),
+            defaultHub)
+    }
+
+    func testConfiguredRootThatIsNotOnDiskDoesNotFallBackToTheDefaultCache() throws {
+        let home = try mkdir(sub("home"))
+        _ = try mkdir(sub("home/.cache/huggingface/hub"))
+        XCTAssertNil(
+            DownloadManager.huggingFaceRootPath(
+                environment: ["HF_HOME": sub("not-mounted")], home: home),
+            "HF_HOME set means the models are elsewhere; serving the default cache would be a lie")
+    }
+
+    func testTildeAndTrailingSlashResolveToOneFolder() throws {
+        let home = try mkdir(sub("home"))
+        let hub = try mkdir(sub("home/.cache/huggingface/hub"))
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(environment: ["HF_HUB_CACHE": hub + "/"], home: home),
+            hub)
+    }
+
+    // MARK: - Login-shell probe
+
+    func testLoginShellEnvParsesMarkedValuesOutOfRcNoise() {
+        let names = ["HF_HOME", "HF_TOKEN"]
+        let out = """
+        [oh-my-zsh] updating...
+        \(LoginShellEnv.beginMarker("HF_HOME"))/Volumes/G Drive SSD/hf\(LoginShellEnv.endMarker("HF_HOME"))
+        \(LoginShellEnv.beginMarker("HF_TOKEN"))\(LoginShellEnv.endMarker("HF_TOKEN"))
+        """
+        let values = LoginShellEnv.parse(names, fromShellOutput: out)
+        XCTAssertEqual(values["HF_HOME"], "/Volumes/G Drive SSD/hf")
+        XCTAssertNil(values["HF_TOKEN"], "an unset var must not come back as an empty-string override")
+        XCTAssertNil(LoginShellEnv.parse(names, fromShellOutput: "no markers")["HF_HOME"])
+    }
+
+    /// CLASS GUARD. The bug was not "HF_HOME is unread" — it was read, from
+    /// `ProcessInfo.processInfo.environment`, which a Finder-launched bundle
+    /// does not have. Every HF variable must come from the merged accessor so
+    /// the next one added does not repeat it.
+    func testHuggingFaceEnvIsNeverReadStraightFromTheProcessEnvironment() throws {
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe")
+        let fm = FileManager.default
+        let walker = try XCTUnwrap(fm.enumerator(at: sources, includingPropertiesForKeys: nil))
+        var offenders: [String] = []
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            guard url.lastPathComponent != "LoginShellEnv.swift" else { continue }
+            let text = try String(contentsOf: url, encoding: .utf8)
+            for (n, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let line = String(rawLine)
+                guard !line.trimmingCharacters(in: .whitespaces).hasPrefix("//"),
+                      line.contains("ProcessInfo.processInfo.environment"),
+                      LoginShellEnv.huggingFaceNames.contains(where: { line.contains("\"\($0)\"") })
+                else { continue }
+                offenders.append("\(url.lastPathComponent):\(n + 1)")
+            }
+        }
+        XCTAssertTrue(offenders.isEmpty, """
+            Hugging Face env read straight from the process environment: \(offenders.joined(separator: ", "))
+            A Finder-launched bundle has no shell environment — use
+            LoginShellEnv.huggingFaceEnvironment() so the login shell's value is seen.
+            """)
+    }
+
+    func testProcessEnvironmentWinsOverTheLoginShell() {
+        let merged = LoginShellEnv.merge(shell: ["HF_HOME": "/from/shell", "HF_TOKEN": "shell"],
+                                         into: ["HF_HOME": "/from/process"])
+        XCTAssertEqual(merged["HF_HOME"], "/from/process",
+                       "a launch that DOES carry the var is authoritative")
+        XCTAssertEqual(merged["HF_TOKEN"], "shell")
+    }
+}

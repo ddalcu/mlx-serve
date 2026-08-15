@@ -101,7 +101,7 @@ write_pi_models_config() {
       "apiKey": "mlx",
       "compat": {
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
+        "supportsReasoningEffort": true,
         "maxTokensField": "max_tokens",
         "thinkingFormat": "$thinking_format"
       },
@@ -123,7 +123,7 @@ EOF
       "apiKey": "mlx",
       "compat": {
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
+        "supportsReasoningEffort": true,
         "maxTokensField": "max_tokens"
       },
       "models": [

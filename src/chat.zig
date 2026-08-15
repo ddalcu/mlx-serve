@@ -537,8 +537,20 @@ fn renderChatTemplate(
     defer if (fallback_arena) |*a| a.deinit();
     var effective_messages = messages;
     var effective_tools_json = tools_json;
+    // Optional keys a template may dump blindly (see fillOptionalToolDefKeys).
+    // Arena-owned, so the rewritten bytes outlive the render with no free path
+    // of their own.
+    if (tools_json) |tj| {
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        if (try fillOptionalToolDefKeys(fallback_arena.?.allocator(), tj)) |filled| {
+            effective_tools_json = filled;
+        }
+    }
     if (needs_inject_tools or needs_rewrite_tool_role) {
-        fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        // NEVER re-init: the tool-def fill above may already own this arena,
+        // and clobbering it orphans everything allocated there (a leak here, a
+        // use-after-free the moment `effective_tools_json` points into it).
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
         const arena_alloc = fallback_arena.?.allocator();
         effective_messages = try synthesizeToolFallbackMessages(
             arena_alloc,
@@ -898,6 +910,70 @@ pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const
     return buf.toOwnedSlice(allocator);
 }
 
+/// Fill the OPTIONAL tool-definition keys a template may dump blindly.
+///
+/// `description` is optional in OpenAI's function schema and a no-arg tool
+/// needs no `parameters`, but a template that renders `fn.description | tojson`
+/// (muse) or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
+/// jinja RAISE — i.e. a silent `fallbackFormatChat` with no tools preamble at
+/// all, for a request that was perfectly legal. Returns null when every
+/// function already carries both keys, so the common path re-emits nothing and
+/// the caller keeps the client's own bytes (provenance, not content, decides
+/// ownership).
+///
+/// Defaults are the empty ones: `""` says the client supplied no description,
+/// and an empty-properties object is what a no-argument tool means. Neither
+/// invents a capability the client did not declare.
+pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const u8) !?[]u8 {
+    // Own the intermediates: growing a parsed ObjectMap allocates OUTSIDE the
+    // parse's arena, so mutating with the caller's allocator leaks unless the
+    // caller happens to be an arena too. Only the returned bytes are theirs.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, tools_json, .{}) catch return null;
+    if (parsed.value != .array) return null;
+
+    var changed = false;
+    for (parsed.value.array.items) |*tool| {
+        if (tool.* != .object) continue;
+        const fn_val = tool.object.getPtr("function") orelse continue;
+        if (fn_val.* != .object) continue;
+        if (fn_val.object.get("description") == null) {
+            try fn_val.object.put(a, "description", .{ .string = "" });
+            changed = true;
+        }
+        if (fn_val.object.get("parameters") == null) {
+            var params: std.json.ObjectMap = .empty;
+            try params.put(a, "type", .{ .string = "object" });
+            try params.put(a, "properties", .{ .object = .empty });
+            try fn_val.object.put(a, "parameters", .{ .object = params });
+            changed = true;
+        }
+    }
+    if (!changed) return null;
+
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+/// Whether the template READS `reasoning_effort` — i.e. the word is a
+/// BEHAVIORAL lever on this checkpoint (dsv4's preamble, Qwen3.8's and
+/// Inkling's effort arms) rather than a string we hand over and it ignores.
+/// Where it is, the server must NOT also derive a token budget from the same
+/// word: the budget only truncates what the client is shown, so the two
+/// levers fight — pi asking for `medium` on Qwen3.8 got the model's default
+/// (unguided, long) thinking AND a 2048-token display cut, then 25.9k tokens
+/// of invisible generation (live 2026-08-14). An explicit
+/// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
+/// cap on purpose and still applies.
+///
+/// Substring on the KEY, so a family reading a different one is untouched:
+/// muse's `reasoning_strength` is a near-miss the corpus pins.
+pub fn templateConsumesEffort(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
+}
+
 /// OpenAI's effort vocabulary → DeepSeek's low|high|max. `medium` maps to
 /// low deliberately: DeepSeek's `high` text is "Absolute maximum with no
 /// shortcuts permitted" and its own default is low, so nothing verbose is
@@ -908,6 +984,32 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, e, "high")) return "high";
     if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max")) return "max";
     return "low";
+}
+
+/// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
+/// raise_exception's on any other string and its own default is xhigh, so an
+/// absent or unrecognized effort keeps the checkpoint default. Thinking-off
+/// maps to low for the variants that REFUSE it (2.4T-A95B): the request is
+/// served on the cheapest arm with the think block closed in the prompt by
+/// `noThinkTailSuffix`. On a variant that accepts thinking-off (27B) the
+/// template never reads the key on that arm, so the value is inert.
+fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "low";
+    // An ABSENT effort takes OUR default, not the checkpoint's. The template
+    // defaults to xhigh, whose preamble asks the model to validate assumptions
+    // and consider alternatives, and nothing bounds the result: a pi agent turn
+    // that sent no effort ran 16803 reasoning tokens before the client gave up
+    // (live 2026-08-14). The server-side `reasoning_effort` budget is NOT the
+    // answer to that — it truncates rather than shortens, and on exhaustion the
+    // model is still inside its block, so the rest of the thought streams as
+    // CONTENT. Low is the only lever that makes the model itself stop early
+    // ("keep your thinking brief and focused, moving directly to the
+    // conclusion"). A client that wants the checkpoint default still gets it by
+    // asking for it; only silence changed meaning.
+    const e = effort orelse return "low";
+    if (std.mem.eql(u8, e, "medium")) return "medium";
+    if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
+    return "xhigh";
 }
 
 /// `effort` is the client's raw `reasoning_effort` string (null when the
@@ -931,8 +1033,23 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try appendJsonString(allocator, &buf, eos);
         need_comma = true;
     }
+    // Qwen3.8's effort vocabulary, sniffed on the jinja STRING LITERAL 'xhigh'
+    // — it appears in both the `reasoning_effort|default('xhigh')` line and the
+    // accepted-values tuple, so a reworded raise message can't drift the
+    // detection. EVERY 3.8 template raises on OpenAI's "high", so this keys the
+    // mapping for the whole family.
+    const qwen38_style = std.mem.indexOf(u8, chat_config.chat_template, "'xhigh'") != null;
+    // Whether the template REFUSES thinking-off is a SEPARATE question from the
+    // effort vocabulary, and the two split inside one family: 2.4T-A95B raises
+    // ("Disabling thinking is not supported"), the 27B answers that arm the 3.6
+    // way with a closed `<think>\n\n</think>` and NO reasoning preamble. Keying
+    // the override on the shared 'xhigh' literal forced the 27B's thinking-off
+    // requests onto the thinking-on arm, injecting a system line the checkpoint
+    // never renders there. Only a refusing template gets the flag withheld;
+    // thinking-off is then committed in the prompt by `noThinkTailSuffix`.
+    const refuses_nothink = std.mem.indexOf(u8, chat_config.chat_template, "Disabling thinking is not supported") != null;
     if (need_comma) try buf.append(allocator, ',');
-    if (enable_thinking) {
+    if (enable_thinking or refuses_nothink) {
         try buf.appendSlice(allocator, "\"enable_thinking\":true");
     } else {
         try buf.appendSlice(allocator, "\"enable_thinking\":false");
@@ -947,6 +1064,9 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // anything else — hy3's "no_think" would fail the render and silently
     // swap in fallbackFormatChat (wrong-family tags). Its thinking-off word
     // is "none"; sniffed by the effort header string unique to that family.
+    // Qwen3.8 reads it too, with a THIRD vocabulary (xhigh|medium|low,
+    // default xhigh) and its own raise_exception — hy3's "high"/"no_think"
+    // fail the render on every request, thinking on or off.
     // DeepSeek-V4-0731's encoder made `reasoning_effort` a THREE-level
     // vocabulary (low|high|max) whose high/max levels PREPEND a verbose
     // "Reasoning Effort: …" preamble to the whole conversation, with low (=
@@ -959,6 +1079,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     if (dsv4_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, dsv4EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (qwen38_style) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, qwen38EffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -8550,6 +8674,206 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
         try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
+    }
+}
+
+test "templateConsumesEffort: the real templates that READ the effort word" {
+    // The three families whose templates act on `reasoning_effort`. For these
+    // the word is the lever and an effort-derived TOKEN budget on top is pure
+    // truncation (see the fn doc).
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_27b_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv4_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/inkling_chat_template.jinja")));
+
+    // Muse reads `reasoning_strength` — the near-miss. Matching it would strip
+    // the budget from a family the word never reaches, silently uncapping it.
+    try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
+    // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
+    // Nemotron, llama, mistral) reads neither: thinking is a bool there.
+    try testing.expect(!templateConsumesEffort(
+        "{%- if enable_thinking %}<think>\n{%- endif %}"));
+    try testing.expect(!templateConsumesEffort(""));
+}
+
+test "renderChatTemplate: a tool with no description/parameters still renders (no silent fallback)" {
+    // OpenAI's schema makes `description` optional and a no-arg tool needs no
+    // `parameters`, but muse's template dumps all three through `tojson`, and
+    // `tojson` RAISES on Undefined — so a description-less tool killed the
+    // render and fell back to ChatML with no tools preamble at all (found
+    // 2026-08-14 by a sweep whose own test tool omitted the key). Every family
+    // that dumps `tool | tojson` wholesale is one missing key from the same
+    // class, so the defaults are filled for ALL templates, not just this one.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("fixtures/muse_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|eot|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    // No `description`, no `parameters` — both legal over the wire.
+    const bare =
+        \\[{"type":"function","function":{"name":"note"}}]
+    ;
+    const rendered = try renderChatTemplate(allocator, &messages, &config, bare, null, true, null);
+    defer allocator.free(rendered);
+    // The muse tools preamble proves the REAL template ran; the fallback emits
+    // ChatML markers instead and would carry no tools text at all.
+    try testing.expect(std.mem.indexOf(u8, rendered, "In this environment you have access to a set of tools") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"note\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+
+    // A COMPLETE declaration re-emits nothing: null means the caller keeps the
+    // client's own bytes, so no request that works today is re-serialized
+    // (key order, number formatting and unicode escaping all stay theirs).
+    const complete =
+        \\[{"type":"function","function":{"name":"note","description":"d","parameters":{"type":"object","properties":{}}}}]
+    ;
+    try testing.expect(try fillOptionalToolDefKeys(allocator, complete) == null);
+    // Only the missing keys are added, and only to the function that lacks them.
+    const partial =
+        \\[{"type":"function","function":{"name":"a","description":"d"}},{"type":"function","function":{"name":"b","description":"e","parameters":{"type":"object"}}}]
+    ;
+    const filled = (try fillOptionalToolDefKeys(allocator, partial)).?;
+    defer allocator.free(filled);
+    try testing.expect(std.mem.indexOf(u8, filled, "\"parameters\"") != null);
+    try testing.expect(std.mem.indexOf(u8, filled, "\"description\":\"d\"") != null);
+    try testing.expect(std.mem.indexOf(u8, filled, "\"description\":\"e\"") != null);
+}
+
+test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallback (hermetic)" {
+    // src/fixtures/qwen38_chat_template.jinja is verbatim from
+    // Qwen/Qwen3.8-2.4T-A95B, the first public Qwen3.8 checkpoint (the VL
+    // siblings keep this body and re-add the vision macro). Qwen3.8 added two
+    // raise_exception gates that make our previous extra-context values
+    // unrenderable on this family:
+    //   - `enable_thinking is false` -> 'Disabling thinking is not supported.'
+    //   - reasoning_effort outside (xhigh, medium, low) -> raise, and we sent
+    //     "high" on every thinking request, "no_think" on every off one.
+    // A raise is a silent fallbackFormatChat, and this family's fallback is
+    // ChatML too, so the downgrade shows up only as a missing tools preamble.
+    // Both arms pinned.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking ON, no client effort: OUR default, which is deliberately NOT
+    // the checkpoint's (see qwen38EffortFor) — xhigh reasons without a bound
+    // and a client that sends nothing gets no bound either.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<function=get_time>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<parameter=timezone>\nUTC\n</parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>\n12:34 UTC\n</tool_response>") != null);
+        // Unconditional think opener at the generation prompt.
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
+        try testing.expect(promptTailOpensThink(rendered));
+    }
+    // OpenAI's "high" is this family's "xhigh"; "medium" injects no preamble.
+    {
+        const hi = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high");
+        defer allocator.free(hi);
+        try testing.expect(std.mem.indexOf(u8, hi, "Reasoning effort is set to xhigh.") != null);
+
+        const med = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "medium");
+        defer allocator.free(med);
+        try testing.expect(std.mem.indexOf(u8, med, "Reasoning effort is set to") == null);
+        try testing.expect(std.mem.indexOf(u8, med, "You have access to the following functions:") != null);
+    }
+    // Thinking OFF: the template REFUSES to disable thinking, so the render
+    // must stay on the low-effort arm and the block the template opened is
+    // closed in the prompt (noThinkTailSuffix) instead.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "</think>"));
+        try testing.expect(!promptTailOpensThink(rendered));
+    }
+}
+
+test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" {
+    // Same family, DIFFERENT gates: `qwen38_chat_template.jinja` (2.4T-A95B)
+    // raises on `enable_thinking is false`, while the 27B's template answers
+    // that arm the 3.6 way — a CLOSED `<think>\n\n</think>\n\n` and no
+    // reasoning-instructions preamble at all (its effort validation lives
+    // INSIDE the thinking-on branch). Sniffing the shared `'xhigh'` literal
+    // for both decisions forced every thinking-off request onto the
+    // thinking-on arm at effort low, which injects a system line the
+    // checkpoint never renders for that arm and leaves the block to be closed
+    // by `noThinkTailSuffix` instead of by the template. The effort mapping is
+    // still keyed on `'xhigh'` (both templates raise on OpenAI's "high"); only
+    // the enable_thinking override is keyed on the refusal itself.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+    };
+
+    // Thinking ON is unchanged: OpenAI's "high" still has to become this
+    // family's "xhigh" or the render raises and silently falls back.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high");
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to xhigh.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
+        try testing.expect(promptTailOpensThink(rendered));
+    }
+    // Absent client effort takes OUR default (low), not the template's xhigh.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
+    }
+    // Thinking OFF renders the template's OWN no-think prompt: closed block,
+    // no reasoning preamble, and nothing appended after it.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        try testing.expect(!promptTailOpensThink(rendered));
     }
 }
 

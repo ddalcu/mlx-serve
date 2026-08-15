@@ -939,10 +939,11 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // 31B: 31B dense — fits 36 GB+ Macs (4-bit) or 48 GB+ (8-bit)
     GemmaModelOption(id: "31b-4bit", displayName: "Gemma 4 31B (4-bit)", repoId: "mlx-community/gemma-4-31b-it-4bit", sizeEstimate: "~18.4 GB, needs 36 GB+ RAM"),
     GemmaModelOption(id: "31b-8bit", displayName: "Gemma 4 31B (8-bit)", repoId: "mlx-community/gemma-4-31b-it-8bit", sizeEstimate: "~33.8 GB, needs 48 GB+ RAM"),
-    // Qwen 3.6 27B dense (4-bit) with a native MTP head — fits 24 GB+ Macs. Ships
-    // an mtp/weights.safetensors sidecar; the server auto-loads it for multi-token
-    // speculative decode (~1.1–1.4× decode on agent/code workloads).
-    GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
+    // Qwen 3.8 27B dense (4-bit), vision + a native MTP head IN the checkpoint —
+    // fits 24 GB+ Macs. The server auto-loads the head for multi-token
+    // speculative decode (26 -> 75 tok/s on code, M4 Max). Supersedes the
+    // Qwen 3.6 27B MTP entry: same geometry, newer weights, images too.
+    GemmaModelOption(id: "qwen38-27b-4bit", displayName: "Qwen 3.8 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit", sizeEstimate: "~18.2 GB, needs 24 GB+ RAM"),
     // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
     GemmaModelOption(
         id: "dsv4-flash-mlx",

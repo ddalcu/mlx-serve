@@ -275,17 +275,29 @@ extension RecommendedModelPick {
         activeParamsB: 9.0
     )
 
-    static let qwen36_27bMtp = RecommendedModelPick(
-        id: "qwen36-27b-mtp",
-        name: "Qwen 3.6 27B",
+    /// Qwen 3.8 27B, the pick this app leads with on any Mac that can hold it.
+    /// Same geometry as the 3.6 27B it replaces (dense 27B, 64 layers, 256K
+    /// context) with a newer generation's weights, a vision tower and the MTP
+    /// draft head inside the checkpoint rather than in a sidecar.
+    ///
+    /// `intelligence` is ESTIMATED: the model shipped 2026-08-14 and the index
+    /// has no entry for it. Placed level with Hunyuan 3 and one point above the
+    /// 3.6 27B it supersedes — a newer generation of the same size class — and
+    /// below DeepSeek-V4-Flash. `speed` is our own measurement of PLAIN decode
+    /// on an M4 Max (26.3 tok/s on code, 26.7 on prose, median of 3 at temp 0,
+    /// `--no-mtp`): the draft head takes it to ~75, which is excluded from the
+    /// score by policy and named in the blurb instead — see the file header.
+    static let qwen38_27b = RecommendedModelPick(
+        id: "qwen38-27b",
+        name: "Qwen 3.8 27B",
         tagline: "One of the strongest models here",
-        blurb: "One of the most capable models this app can run — excellent at coding and at multi-step \u{201c}agent\u{201d} tasks like using tools and following a plan. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size.",
-        repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve",
-        sizeGB: 15.0,
+        blurb: "One of the most capable models this app can run — excellent at coding and at multi-step \u{201c}agent\u{201d} tasks like using tools and following a plan, and it reads images too. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size.",
+        repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+        sizeGB: 18.2,
         family: .qwen,
-        intelligence: 62,
-        intelligenceIsEstimated: false,
-        speed: 14,
+        intelligence: 63,
+        intelligenceIsEstimated: true,
+        speed: 13,
         contextTokens: 262_144,
         activeParamsB: 27.0
     )
@@ -415,10 +427,10 @@ extension RecommendedModelPick {
         .gemmaE2B, .gemmaE4B, .gemma12B, .gemma26bA4b, .gemma31B, .gemma26bA4b8bit, .gemma31B8bit,
     ]
 
-    /// Qwen 3.5/3.6 picks, ascending by size — the Recommended pane's other
-    /// family section.
+    /// Qwen picks, ascending by size — the Recommended pane's other family
+    /// section.
     static let qwenCatalog: [RecommendedModelPick] = [
-        .qwen35_9b, .qwen36_27bMtp, .qwen36_35bA3b,
+        .qwen35_9b, .qwen38_27b, .qwen36_35bA3b,
     ]
 
     /// poolside's Laguna family, ascending by size — the fast XS 2.1, then
@@ -459,7 +471,7 @@ extension RecommendedModelPick {
     /// | ≤ 8 GB  | Gemma 4 E2B  |  3.3 GB |  4.0 GB |
     /// | 8–16 GB | Gemma 4 E4B  |  4.8 GB |  5.8 GB |
     /// | 16–32 GB| Gemma 4 12B  |  6.3 GB |  7.6 GB |
-    /// | 32 GB+  | Qwen 3.6 27B | 15.0 GB | 18.0 GB |
+    /// | 32 GB+  | Qwen 3.8 27B | 18.2 GB | 21.8 GB |
     ///
     /// Bands are upper-INCLUSIVE: a 16 GB Mac gets E4B, not 12B. A boundary
     /// machine is the one with the least headroom in its band, so it takes the
@@ -469,7 +481,7 @@ extension RecommendedModelPick {
         if gib <= 8 { return .gemmaE2B }
         if gib <= 16 { return .gemmaE4B }
         if gib <= 32 { return .gemma12B }
-        return .qwen36_27bMtp
+        return .qwen38_27b
     }
 }
 

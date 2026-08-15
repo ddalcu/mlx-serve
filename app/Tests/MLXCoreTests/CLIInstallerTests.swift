@@ -87,7 +87,7 @@ final class CLIInstallerTests: XCTestCase {
         // marker-delimited segment is the PATH.
         let output = """
         Welcome banner from .zshrc!
-        __MLX_PATH_BEGIN__/usr/bin:/Users/tester/.local/bin__MLX_PATH_END__
+        \(LoginShellEnv.beginMarker("PATH"))/usr/bin:/Users/tester/.local/bin\(LoginShellEnv.endMarker("PATH"))
         trailing noise
         """
         XCTAssertEqual(

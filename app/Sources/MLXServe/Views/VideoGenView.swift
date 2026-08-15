@@ -80,6 +80,11 @@ struct VideoGenView: View {
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file hovers the first-frame section —
+    /// drives that section's dashed-border highlight (see `MediaDropTarget`).
+    @State private var isDropTargeted: Bool = false
+    /// The same, for the ref2va References section, which is its own target.
+    @State private var isRefDropTargeted: Bool = false
 
     var body: some View {
         // No window-sized floor — see ImageGenView: pages shrink their
@@ -476,16 +481,19 @@ struct VideoGenView: View {
                     .help("Clear first frame")
                 }
             } else {
-                Button {
-                    chooseFirstFrameImage()
-                } label: {
-                    Label("Choose image...", systemImage: "photo.on.rectangle.angled")
-                        .font(.caption)
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help("Select an image to use as the first frame of the video.")
+                // The same well the Image and 3D panes' empty states draw —
+                // one shape for "a picture goes here" across the four panes.
+                MediaDropWell(title: "Choose image...",
+                              systemImage: "photo.on.rectangle.angled",
+                              isTargeted: isDropTargeted) { chooseFirstFrameImage() }
+                    .help("Select an image to use as the first frame of the video.")
             }
+        }
+        // One image slot, so a drop REPLACES whatever is there — same as
+        // picking again. Drops land on this section rather than the whole
+        // window; see `MediaDropTarget`.
+        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { firstFrameImageURL = url }
         }
     }
 
@@ -505,6 +513,9 @@ struct VideoGenView: View {
                         .foregroundStyle(.secondary)
                 }
                 Text("Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1> — the numbering is per type, in the order below.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Drag files in — each one joins the list for its own type.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -541,6 +552,20 @@ struct VideoGenView: View {
                     // this is a real time cost, not a quality knob.
                     .help("How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step.")
                 }
+            }
+            // ONE target for the whole section rather than three: the lists are
+            // rows a few points tall, and which list a file belongs to is
+            // already knowable from the file itself. `H3RefDrop` spends the
+            // per-type caps and the combined budget the Add buttons follow.
+            .mediaDropAnyKind(limit: H3RefLimits.remaining(perType: H3RefLimits.total,
+                                                           current: 0,
+                                                           totalAttached: refFilesAttached),
+                              isTargeted: $isRefDropTargeted) { urls in
+                let routed = H3RefDrop.route(urls, images: refImageURLs,
+                                             videos: refVideoURLs, audios: refAudioURLs)
+                refImageURLs = routed.images
+                refVideoURLs = routed.videos
+                refAudioURLs = routed.audios
             }
         }
     }

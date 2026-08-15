@@ -2182,6 +2182,15 @@ private struct SandboxSectionContent: View {
 
     var body: some View {
         SettingsRow(
+            title: "Only use tools when I ask",
+            explainer: "ON = tools are opt-in: a chat only gets them when you turn the wrench (or MCP) on yourself, and sending a message that looks like a task — \"make me a website\", \"npm install react\" — no longer stops to ask whether to enable Tools or MCP first. OFF = that suggestion still appears before such a message is sent. Either way the toolbar toggles, and any agent that decides them for its tab, are unchanged."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.toolsOnlyWhenAsked)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
             title: "Agent workspace folder",
             explainer: "The default working folder for the agent's tools (shell, readFile, writeFile, …) in every chat — and the folder shared into the sandbox VM at /workspace while the sandbox is on. Changing it moves chats still on the previous default, remounts a running sandbox, and restarts any open terminal sessions in the new folder; a chat with its own picked folder (the folder icon on the Agent pill) keeps it."
         ) {

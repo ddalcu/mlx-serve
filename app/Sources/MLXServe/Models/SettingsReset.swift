@@ -133,6 +133,9 @@ enum SettingsReset {
         case .sandbox:
             return [
                 f("sandbox") { $0.sandbox = $1.sandbox },
+                // Agent behavior rather than sandboxing, but this is the pane
+                // that holds it — and every field needs exactly one owner.
+                f("toolsOnlyWhenAsked") { $0.toolsOnlyWhenAsked = $1.toolsOnlyWhenAsked },
             ]
 
         case .messaging:

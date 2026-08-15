@@ -351,3 +351,98 @@ superseded by the field.
 
 Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
 history builders carry neither field nor legacy text, tolerant decode).
+
+## A typed `onDrop(of:)` never saw the Create panes' drops (2026-08-13)
+
+The media panes' shared drop target (`MediaDropTarget.swift`) shipped as
+`onDrop(of: [.fileURL])` with the type filtering done in the completion
+handler — after the providers had RESOLVED, which is after SwiftUI has
+accepted the drop and animated the file in. So a dropped `.txt` lit the
+dashed border, flew home, and nothing happened: the pane had already said
+yes to a file it then silently discarded.
+
+The obvious fix — name the kind's own UTTypes in `of:` (`.image` / `.movie` /
+`.audio`), the way the chat composer's drop reads — made it worse in the way
+that is hardest to argue with: the panes stopped accepting ANY file. A drag
+out of Finder puts `public.file-url` on the pasteboard and nothing else; the
+file's own content type is not there to match against. A target registered
+for `.image` is therefore never offered the drag, and no amount of correct
+filtering downstream matters. (The chat composer gets away with the typed
+list because its other source — an image dragged out of a browser — really is
+`public.png` DATA, and its fallback branch reads that with `NSImage`. It has
+never been the same question: the panes need a PATH on disk.)
+
+The two requirements are not in conflict, they just belong to different
+hooks. The target registers `.fileURL`, which is what a file drag actually
+is, and the refusal moves to `DropDelegate.validateDrop` — the one hook that
+answers while the drag is still in the air. It reads the drag pasteboard
+(`NSPasteboard(name: .drag)`, `.urlReadingFileURLsOnly`) and gets the real
+URLs synchronously, so the verdict is the pane's own extension allow-list
+rather than a UTType approximation of it: a `.tiff` the picker opens is
+accepted, a `.txt` bounces, and a full slot bounces too. `dropEntered` fires
+on validated drops only, so one verdict both refuses the file and decides
+whether the border lights.
+
+A drag the pasteboard tells us nothing about (`urls` empty while the drag
+still claims to carry files) is NO INFORMATION, not a refusal: it falls back
+to accepting and filtering after the resolve, which is exactly the old
+behaviour. Between the two failures, bouncing everything is the worse one —
+it is the one that makes the pane look broken.
+
+Guards: `MediaDropTests` (the verdict per kind and for the mixed H3 target,
+every allow-listed extension passing it, the full-slot and unreadable-drag
+cases, a real pasteboard round-trip proving the read recovers a
+`public.file-url` item and skips a web URL, and a source scan pinning
+`.onDrop(of: [.fileURL]` + `validateDrop` in the modifier).
+
+## The Hugging Face cache was "supported" and never worked (2026-08-14)
+
+Reported as "we don't account for `HF_HOME`". We did — `DownloadManager.huggingFaceRoot`
+read `HF_HUB_CACHE`, then `$HF_HOME/hub`, then `~/.cache/huggingface/hub`. The code
+was right and the feature was dead, because the read was
+`ProcessInfo.processInfo.environment` and a bundle launched from Finder or the Dock
+has none of the user's shell environment. Anything exported from `~/.zshrc` is simply
+not there. So the env branches only ever fired when the binary was run from a terminal,
+and everyone else silently got the default cache — an empty folder if they had moved
+theirs to an external drive.
+
+The tell that this was already known and had been solved twice, in two other places:
+
+* `hfToken`'s own comment — *"the token file `huggingface-cli login` writes is the one
+  that actually works in the app, because a bundle launched from Finder has NO shell
+  environment"*.
+* `CLIInstaller.userShellPathEntries()` — spawns `$SHELL -l -i -c` to print `$PATH`,
+  because *"Finder-launched apps get a minimal PATH that never contains
+  `~/.local/bin`"*.
+
+Neither generalized, so the third instance shipped broken. `LoginShellEnv` is now the
+one probe and `CLIInstaller` delegates to it.
+
+Mechanics worth keeping:
+
+* **Markers, not line parsing.** An interactive rc file prints banners. Each value comes
+  back between `__MLX_ENV_<NAME>_BEGIN__` / `__MLX_ENV_<NAME>_END__`.
+* **An unset variable is omitted, never returned as `""`.** Otherwise the shell's empty
+  answer shadows a value the process genuinely has, and the merge inverts.
+* **Process env wins.** A launch that does carry the variable (terminal, or an explicit
+  override) is authoritative; the shell only fills gaps.
+* **Off-main, watchdogged.** The probe spawns a shell and can be wedged by a pathological
+  rc file, so it is primed from a detached task at launch with a 5 s terminate, and
+  `refreshModels()` re-runs only if the resolved root actually moved. `huggingFaceRoot`
+  had to stop being a `let` for that.
+* **A configured-but-missing root is nil.** Falling back to `~/.cache/huggingface/hub`
+  when `HF_HOME` points at an unmounted drive would list the wrong library and read as
+  "your models vanished" rather than "that drive isn't mounted".
+* **`XDG_CACHE_HOME` was missing entirely** — `huggingface_hub` defaults `HF_HOME` to
+  `$XDG_CACHE_HOME/huggingface`, so a user who moves only that var was in the same hole.
+  It is now in the precedence for both the cache root and the token file.
+
+Under MAS the probe is gated off (`BuildFeatures.customModelFolders`): the app is
+sandboxed, `~` is the container, and a cache outside it is unreadable no matter what the
+shell reports — so there is nothing to find and no reason to spawn `/bin/zsh` (which is
+also why `HostEscapeAuditTests` needed a disposition entry for the new file).
+
+The class guard is the one that matters: a source scan asserting no file outside
+`LoginShellEnv.swift` reads an HF variable straight from `ProcessInfo`. That is exactly
+how the bug got in, and it is what the next `HF_*` variable will trip over. Verified red
+by injecting a single direct read into `CLIInstaller.swift`.

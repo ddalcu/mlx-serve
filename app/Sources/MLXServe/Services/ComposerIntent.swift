@@ -69,6 +69,41 @@ enum ComposerIntent {
             return !n.isEmpty && t.contains(n)
         }
     }
+
+    /// The WHOLE pre-send nudge decision, as one pure function — the view only
+    /// gathers the inputs (see `ChatView.detectIntentPrompt`). Keeping it here
+    /// is what makes every branch testable, and what keeps the opt-in setting
+    /// from being honoured in one branch and forgotten in the other.
+    ///
+    /// - `onlyToolsWhenAsked` is the user's "Only use tools when I ask" setting
+    ///   and short-circuits everything: with tools opt-in there is nothing to
+    ///   suggest, so no send is ever interrupted.
+    /// - MCP takes priority over Agent — a named server is the more specific
+    ///   signal.
+    /// - A mode that is already on, LOCKED by the tab's agent (accepting would
+    ///   change nothing), or already declined in this chat is never offered.
+    static func nudge(for text: String,
+                      onlyToolsWhenAsked: Bool,
+                      toolsOn: Bool,
+                      toolsLocked: Bool,
+                      mcpOn: Bool,
+                      mcpLocked: Bool,
+                      enabledServers: [String],
+                      suppressed: SessionIntentSuppression,
+                      sessionId: UUID) -> IntentPrompt? {
+        guard !onlyToolsWhenAsked else { return nil }
+        if !mcpOn, !mcpLocked, !enabledServers.isEmpty,
+           !suppressed.isSuppressed(.mcp, for: sessionId),
+           wantsMCP(text, serverNames: enabledServers) {
+            return .mcp
+        }
+        if !toolsOn, !toolsLocked,
+           !suppressed.isSuppressed(.agent, for: sessionId),
+           wantsAgent(text) {
+            return .agent
+        }
+        return nil
+    }
 }
 
 /// Per-session record of which nudges the user has already declined ("Send

@@ -2727,24 +2727,70 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     return if (max_pos > 0) @min(memory_ctx, max_pos) else memory_ctx;
 }
 
+/// The process-wide KV width a request gets when it names none — the same
+/// expression `checkAttentionMemory` falls back to, so the sizer and the
+/// admission guard read one answer.
+fn defaultKvBits() u64 {
+    const cfg: transformer_mod.KVQuantConfig =
+        if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense;
+    return if (cfg.scheme == .off) 16 else cfg.bits;
+}
+
+/// The prefill working set that is NOT the KV cache: score scratch, the
+/// quantized-KV dequant, and the QKV/MLP transient envelope — all bounded by
+/// the prefill CHUNK, at the widest chunk any prompt on this model can run.
+///
+/// It is a one-off reserve, not a per-token cost. `computeMemoryContext` used
+/// to bill the MLP envelope (`8 × max(hidden, ffn) × 2`) against every token of
+/// CONTEXT: 272 KB/token beside a 64 KB/token KV cache on a qwen3_5 27B, i.e.
+/// 81% of the budget spent on a transient that never scales with the context
+/// length, which caps a 16 GB Mac under 4k tokens whatever the weights cost.
+/// Measured on the shipped 4-bit 27B (2026-08-14): the peak above steady state
+/// is flat in prompt length and tracks the chunk — 3.34 GB at chunk 2048 for
+/// prompts from 3k to 51k tokens.
+///
+/// Same estimator as the admission guard with the KV term zeroed, because the
+/// KV cache is exactly what the sizer is solving for.
+pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    return prefillMemoryNeeded(
+        chunk,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        0,
+        config.head_dim,
+        config.prefillScoreHeadDim(),
+        config.hidden_size,
+        prefillFfnWidth(config),
+        kv_bits,
+        chunk,
+        config.prefillAttnKeys(chunk),
+    );
+}
+
 /// The largest context this model's per-token footprint fits into RAM right
 /// now, IGNORING the checkpoint's own maximum. Reads live memory.
 fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
-    const layers: u64 = config.num_hidden_layers;
-    const kv_heads: u64 = config.num_key_value_heads;
-    const hdim: u64 = config.head_dim;
-    const hidden: u64 = config.hidden_size;
-    const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
+    //   KV cache: config.kvBytesPerToken() — the arch's own count of CACHING
+    //   layers and its own K/V widths, not a uniform layers × 2 × kv_heads ×
+    //   head_dim — billed at the width the ACTIVE kv-quant scheme stores, not
+    //   an unconditional fp16. A `--kv-quant 4` server otherwise reports (and
+    //   serves) under a third of the context it can actually hold.
+    const kv_bits: u64 = defaultKvBits();
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
 
-    //   KV cache (fp16):   layers × 2 × kv_heads × head_dim × 2 bytes per token
-    //   Working (fp16):    ~8 × max(hidden, ffn) × 2 bytes per token (per-layer tensors,
-    //                      bounded by EVAL_EVERY_N_LAYERS in transformer.zig)
-    const kv_per_tok: u64 = layers * 2 * kv_heads * hdim * 2;
-    const work_per_tok: u64 = 8 * @max(hidden, ffn) * 2;
-    const per_tok: u64 = kv_per_tok + work_per_tok;
+    // `total_ctx = 0` asks boundedPrefillChunk for the UNSHRUNK cap: every
+    // branch that narrows the chunk does so for longer contexts, so this is the
+    // widest forward any prompt can run and therefore the honest reserve.
+    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
+        config.prefillScoreHeadDim(),
+        config.num_attention_heads,
+        0,
+        config.has_sliding_window,
+        config.isMoe(),
+    ));
 
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
@@ -2755,9 +2801,9 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         // memory, instead of oversubscribing into an uncatchable Metal OOM (#64).
         currentGpuMemoryCeiling(active_mem),
         active_mem,
-        // The hot prefix cache fills to this cap over a session — reserve it so
-        // auto-context doesn't oversubscribe once the cache is full.
-        prefix_cache_mem_bytes,
+        // The hot prefix cache fills to this cap over a session, and a prefill
+        // has to land on top of whatever context we report — reserve both.
+        prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
         // cap AFTER the safety margin, so a model whose own max is the binding
@@ -2790,18 +2836,41 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// prefillAttnKeys): `seq` for dense causal attention, a much smaller bound for
 /// a sparse arch. It scales the SCORE term only — KV/dequant are storage, and
 /// a sparse reader still stores every latent it might later attend to.
-pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64) u64 {
+/// `kv_per_tok` is the whole-model DENSE (f16) KV bytes for one token —
+/// `ModelConfig.kvBytesPerToken()`. It replaced a `layers` parameter because
+/// neither the layer count nor the per-head width is uniform once an arch
+/// interleaves linear-attention layers or stores keys wider than values.
+///
+/// `hdim` and `score_hdim` are two DIFFERENT widths and only coincide on a
+/// symmetric arch. `hdim` is the STORED width the quantized-KV dequant
+/// transient is read at; `score_hdim` is the width the score is contracted at
+/// (`ModelConfig.prefillScoreHeadDim`), which is what decides whether a fused
+/// kernel exists — MLA scores over 192 while storing values at 128, and billing
+/// the score term against `head_dim` 128 declared it fused and billed ZERO for
+/// a composed path that really does materialize [heads, chunk, seq].
+/// KV bytes for ONE token at the width the cache actually STORES. `dense` is
+/// `ModelConfig.kvBytesPerToken()` — the arch's own caching-layer count and its
+/// own K and V widths, at fp16. A quantized cache stores `kv_bits` per element
+/// plus the group scale/bias pair, which is the `+1` in `(2·bits + 1)/32`
+/// (~0.5 bit/elem at group 64 with bf16 params).
+///
+/// Both the auto-context sizer and the prefill admission guard bill through
+/// here. The sizer used to bill fp16 unconditionally, so a `--kv-quant 4`
+/// server reported — and served — under a third of the context it can hold.
+pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
+    if (kv_bits >= 16) return dense;
+    return dense * (2 * kv_bits + 1) / 32;
+}
+
+pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64) u64 {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
     // 31-token prompt for "needing" 6.2 GB on a memory-squeezed hy_v3 host
     // (live 2026-07-14). No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
-    const kv_bytes: u64 = if (kv_bits >= 16)
-        layers * 2 * seq * kv_heads * hdim * 2
-    else
-        layers * 2 * seq * kv_heads * hdim * (2 * kv_bits + 1) / 16;
-    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
+    const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
+    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
     const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     return (kv_bytes + scores + dequant + 3 * mlp) * 5 / 4;
@@ -2887,7 +2956,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const needed: u64 = if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
-        prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq));
+        prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq));
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -4325,11 +4394,19 @@ const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 
 /// strings still enable). "none" is an explicit off (the gpt-5.1 default
 /// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
 /// stays in charge and existing clients see zero behavior change.
-fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
+fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
     if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget, .effort = v.string };
-    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget), .effort = v.string };
+    // Where the TEMPLATE reads the effort word, the word is the behavioral
+    // lever and a budget derived from the same string is pure display
+    // truncation on top of it (`chat.templateConsumesEffort`). An explicit
+    // `--reasoning-budget` still rides `default_budget`.
+    const budget = if (template_consumes_effort)
+        default_budget
+    else
+        responses_mod.effortBudget(v.string, default_budget);
+    return .{ .enable = true, .budget = budget, .effort = v.string };
 }
 
 /// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
@@ -4742,7 +4819,7 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget);
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
     const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
@@ -6463,6 +6540,7 @@ fn handleStreamingGeneration(
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
+    var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
 
@@ -6591,15 +6669,27 @@ fn handleStreamingGeneration(
                         // with the thought) while the no-tools path is already
                         // streaming at 0.05 s.
                         //
-                        // A reasoning BUDGET keeps the old buffering: capping what
-                        // the client is allowed to see cannot be reconciled with
-                        // having already sent it.
-                        if (reasoning_budget < 0) {
+                        // A reasoning BUDGET is a cap, not a reason to hide the
+                        // thought: you never exceed a cap you STOP emitting at.
+                        // This was gated on `reasoning_budget < 0`, so a capped
+                        // tools request showed nothing for the whole generation
+                        // and got one dump at the end — a capped agent session
+                        // looked frozen (live 2026-08-14, pi on Qwen3.8-27B).
+                        // Each loop iteration is one model token, so an
+                        // iteration that produced fresh reasoning IS one
+                        // reasoning token; at the cap the latch stops every
+                        // later emitter from shipping the remainder.
+                        if (!budget_exhausted) {
                             const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
                             if (so_far.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                     reasoning_streamed = rc.len;
+                                    reasoning_tokens_sent += 1;
+                                    if (reasoning_budget >= 0 and reasoning_tokens_sent >= @as(usize, @intCast(reasoning_budget))) {
+                                        budget_exhausted = true;
+                                        log.info("  reasoning budget exhausted ({d}/{d} tokens, streamed)\n", .{ reasoning_tokens_sent, reasoning_budget });
+                                    }
                                 }
                             }
                         }
@@ -6620,9 +6710,15 @@ fn handleStreamingGeneration(
                         text_buf.clearRetainingCapacity();
                         think_scan.reset();
                         think_closed = true;
-                        if (split.reasoning_content) |rc| {
-                            if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                        // Past the cap the tail is exactly what the budget
+                        // exists to withhold. This arm applied no budget at all,
+                        // so a capped request received the WHOLE thought the
+                        // moment the block closed.
+                        if (!budget_exhausted) {
+                            if (split.reasoning_content) |rc| {
+                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                                }
                             }
                         }
                         // Block done and `text_buf` was just cleared — a thought
@@ -6992,7 +7088,8 @@ fn handleStreamingGeneration(
             // generated is delivered, thinking flag or not.
             {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
-                if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
+                // `budget_exhausted` means the cap was already streamed in full.
+                if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -7053,7 +7150,8 @@ fn handleStreamingGeneration(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
-                if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
+                // `budget_exhausted` means the cap was already streamed in full.
+                if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -9331,7 +9429,7 @@ fn appendLfm2Tiles(
     const thumb_tokens = (thumb.h / vp.patch / vp.merge) * (thumb.w / vp.patch / vp.merge);
 
     if (!split) {
-        const chw = lfm2Canvas(allocator, src, thumb.h, thumb.w) orelse return;
+        const chw = lfm2Canvas(allocator, src, thumb.h, thumb.w, vp) orelse return;
         defer allocator.free(chw);
         const img = lfm2Region(allocator, chw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w) orelse return;
         list.append(allocator, img) catch {
@@ -9355,7 +9453,7 @@ fn appendLfm2Tiles(
     // all of them, so any failure drops the whole image rather than some of it.
     var ok = true;
     {
-        const chw = lfm2Canvas(allocator, src, canvas_h, canvas_w) orelse return;
+        const chw = lfm2Canvas(allocator, src, canvas_h, canvas_w, vp) orelse return;
         defer allocator.free(chw);
         outer: for (0..grid.rows) |row| {
             for (0..grid.cols) |col| {
@@ -9392,7 +9490,7 @@ fn appendLfm2Tiles(
 
     var thumb_note: []const u8 = "";
     if (vp.use_thumbnail and n_tiles != 1) {
-        if (lfm2Canvas(allocator, src, thumb.h, thumb.w)) |tchw| {
+        if (lfm2Canvas(allocator, src, thumb.h, thumb.w, vp)) |tchw| {
             defer allocator.free(tchw);
             if (lfm2Region(allocator, tchw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w)) |t| {
                 var img = t;
@@ -9414,9 +9512,24 @@ fn appendLfm2Tiles(
 
 /// Resize `src` onto a `canvas_h` x `canvas_w` normalized CHW buffer, owned by
 /// the caller. One resample serves every tile cut from it.
-fn lfm2Canvas(allocator: std.mem.Allocator, src: DecodedRgb, canvas_h: u32, canvas_w: u32) ?[]f32 {
+/// The resample filter belongs to the ARCH's reference processor, not to the
+/// resampler it shares: muse smart-resizes with Lanczos, LFM2-VL with PIL
+/// BILINEAR (`Lfm2VlImageProcessor` uses it at all three sites — tile canvas,
+/// thumbnail, single view), Qwen with bicubic. Reusing a neighbouring tower's
+/// filter is silent: the geometry and token counts still match, the pixels do
+/// not (measured 2026-08-14: bicubic loses 3 of 144 ScreenSpot-v2 items on
+/// LFM2.5-VL and never wins one).
+fn resampleFilterFor(vp: chat_mod.VisionPreproc) qwen_vision.Filter {
+    return switch (vp.mode) {
+        .muse => .lanczos,
+        .lfm2 => .bilinear,
+        else => .bicubic,
+    };
+}
+
+fn lfm2Canvas(allocator: std.mem.Allocator, src: DecodedRgb, canvas_h: u32, canvas_w: u32, vp: chat_mod.VisionPreproc) ?[]f32 {
     const chw = allocator.alloc(f32, 3 * @as(usize, canvas_h) * canvas_w) catch return null;
-    qwen_vision.resizeRgbNormalizedChw(allocator, chw, src.rgb, src.h, src.w, canvas_h, canvas_w, .bicubic) catch {
+    qwen_vision.resizeRgbNormalizedChw(allocator, chw, src.rgb, src.h, src.w, canvas_h, canvas_w, resampleFilterFor(vp)) catch {
         allocator.free(chw);
         return null;
     };
@@ -9536,7 +9649,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             src_w,
             rh,
             rw,
-            if (vp.mode == .muse) .lanczos else .bicubic,
+            resampleFilterFor(vp),
         ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
@@ -13992,6 +14105,92 @@ test "safeContextForBudget floors when memory is exhausted and caps at max_pos" 
     try testing.expectEqual(@as(u32, 1024), safeContextForBudget(8 * GB, 0, 0, 0, 0));
 }
 
+test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
+    const t = std.testing;
+    // qwen3_5 27B dense: 16 caching layers x 4 kv heads x 256 head_dim x (K+V) x 2 B.
+    const dense: u64 = 16 * 4 * 256 * 2 * 2; // 65536
+
+    // Dense/off bills fp16 verbatim — no change for anyone not using --kv-quant.
+    try t.expectEqual(dense, kvBytesPerTokenAtBits(dense, 16));
+    try t.expectEqual(dense, kvBytesPerTokenAtBits(dense, 32));
+
+    // Quantized widths carry the group scale/bias overhead (+0.5 bit/elem), the
+    // SAME expression prefillMemoryNeeded bills — the sizer and the admission
+    // guard must not disagree about what one token costs.
+    try t.expectEqual(dense * 9 / 32, kvBytesPerTokenAtBits(dense, 4)); // 18432
+    try t.expectEqual(dense * 17 / 32, kvBytesPerTokenAtBits(dense, 8));
+    // 4-bit is what makes the 16 GB tier reachable: under a third of dense.
+    try t.expect(kvBytesPerTokenAtBits(dense, 4) * 3 < dense);
+}
+
+test "auto-context on a 16 GB profile: activations are a chunk reserve, not a per-token multiplier" {
+    const t = std.testing;
+    // Qwen3.8-27B on a 16 GB Mac: ~10.6 GB reachable Metal working set, an
+    // 8.6 GB iQ-MLX pack resident, --kv-quant 4, and the small prefill chunk
+    // the machine can actually afford.
+    const ceiling: u64 = 10_600 * 1000 * 1000;
+    const weights: u64 = 8_600 * 1000 * 1000;
+    const dense_kv: u64 = 16 * 4 * 256 * 2 * 2;
+    const per_tok = kvBytesPerTokenAtBits(dense_kv, 4);
+
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+
+    const reserve = prefillTransientReserve(&cfg, 4, 512);
+    const got = safeContextForBudget(ceiling, weights, reserve, per_tok, 262144);
+
+    // The pre-fix formula billed 8 x max(hidden, ffn) x 2 = 272 KB PER TOKEN on
+    // top of a 64 KB/token dense KV — 344 KB/token, which caps this machine at
+    // under 4k tokens no matter what the weights cost.
+    const old_per_tok: u64 = dense_kv + 8 * 17408 * 2;
+    const old = safeContextForBudget(ceiling, weights, 0, old_per_tok, 262144);
+    try t.expect(old < 4096);
+
+    // Corrected, the same machine holds a real working context.
+    try t.expect(got > 35_000);
+    try t.expect(got < 60_000);
+
+    // The reserve is a CONSTANT of the chunk, so halving the chunk buys context
+    // back rather than being invisible.
+    const narrow = safeContextForBudget(ceiling, weights, prefillTransientReserve(&cfg, 4, 256), per_tok, 262144);
+    try t.expect(narrow > got);
+}
+
+test "auto-context never sizes past the ceiling as weights grow" {
+    const t = std.testing;
+    const ceiling: u64 = 10_600 * 1000 * 1000;
+    const dense_kv: u64 = 16 * 4 * 256 * 2 * 2;
+    const per_tok = kvBytesPerTokenAtBits(dense_kv, 4);
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    const reserve = prefillTransientReserve(&cfg, 4, 512);
+
+    // Under-billing here ends in an uncatchable Metal OOM, not a 400: at every
+    // weight size the reported context plus what is already spoken for has to
+    // stay inside the ceiling, and the reported figure must fall as the pack
+    // grows rather than staying pinned to the checkpoint's max.
+    var prev: u32 = std.math.maxInt(u32);
+    var weights: u64 = 2_000 * 1000 * 1000;
+    while (weights < ceiling) : (weights += 1_000 * 1000 * 1000) {
+        const ctx = safeContextForBudget(ceiling, weights, reserve, per_tok, 262144);
+        try t.expect(weights + reserve + @as(u64, ctx) * per_tok <= ceiling or ctx == 1024);
+        try t.expect(ctx <= prev);
+        prev = ctx;
+    }
+    // Squeezed to nothing it floors rather than reporting a context that cannot exist.
+    try t.expectEqual(@as(u32, 1024), safeContextForBudget(ceiling, ceiling, reserve, per_tok, 262144));
+}
+
 test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
@@ -15035,7 +15234,7 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const got = parseReasoningEffort(parsed.value.object, -1);
+        const got = parseReasoningEffort(parsed.value.object, -1, false);
         if (case.expect) |want| {
             try std.testing.expectEqual(want.enable, got.?.enable);
             try std.testing.expectEqual(want.budget, got.?.budget);
@@ -15046,6 +15245,43 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
         } else {
             try std.testing.expect(got == null);
         }
+    }
+}
+
+test "parseReasoningEffort: a template that READS the effort word gets no budget from it" {
+    // Two levers, one word. Where the template acts on `reasoning_effort` the
+    // word already shortens the THOUGHT; deriving a token budget from the same
+    // string only truncates what the client is SHOWN, so pi asking Qwen3.8 for
+    // `medium` got the model's unguided (long) thinking AND a 2048-token cut,
+    // followed by 25.9k tokens of invisible generation (live 2026-08-14).
+    // An EXPLICIT cap is someone asking on purpose and still applies — that is
+    // `default_budget` here, which carries `--reasoning-budget`.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, consumes: bool, default_budget: i32, want: i32 }{
+        // Consuming template (qwen3.8 / dsv4 / inkling): no effort-derived cap.
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = -1, .want = -1 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = true, .default_budget = -1, .want = -1 },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = true, .default_budget = -1, .want = -1 },
+        // ...but `--reasoning-budget` still binds there.
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = 4096, .want = 4096 },
+        // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse, laguna,
+        // Ling): the effort word reaches no template, so the budget is the ONLY
+        // thing it does and every mapping stays exactly as it shipped.
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 128 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 512 },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 2048 },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = 8192 },
+        .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .consumes = false, .default_budget = -1, .want = -1 },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = parseReasoningEffort(parsed.value.object, case.default_budget, case.consumes).?;
+        try std.testing.expect(got.enable);
+        try std.testing.expectEqual(case.want, got.budget);
+        // The raw string rides along either way — the template still renders it.
+        try std.testing.expectEqualStrings(
+            parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
 }
 
@@ -15072,7 +15308,7 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const effort = parseReasoningEffort(parsed.value.object, -1);
+        const effort = parseReasoningEffort(parsed.value.object, -1, false);
         try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
     }
 }
@@ -15285,14 +15521,66 @@ test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill m
     try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
+test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
+    const t = std.testing;
+    // Uniform arch: every layer caches, K and V are both head_dim wide.
+    var dense = model_mod.ModelConfig{ .model_type = "qwen3" };
+    dense.num_hidden_layers = 24;
+    dense.num_key_value_heads = 8;
+    dense.head_dim = 128;
+    try t.expectEqual(@as(u32, 24), dense.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), dense.kvBytesPerToken());
+
+    // bailing_hybrid (Ling 3.0): 6 of 24 layers are attention, and MLA stores
+    // a 192-wide key against a 128-wide value. Billing it as a uniform arch
+    // charged 196608 B/token against a real 61440 — a 3.2x over-bill that
+    // pinned auto-context to under a third of what fits.
+    var ling = model_mod.ModelConfig{ .model_type = "bailing_hybrid" };
+    ling.num_hidden_layers = 24;
+    ling.num_attention_heads = 16;
+    ling.num_key_value_heads = 16;
+    ling.head_dim = 128;
+    ling.full_attention_interval = 4;
+    ling.mla_kv_lora_rank = 512;
+    ling.mla_qk_nope_head_dim = 128;
+    ling.mla_qk_rope_head_dim = 64;
+    ling.mla_v_head_dim = 128;
+    try t.expectEqual(@as(u32, 6), ling.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 6 * 16 * (192 + 128) * 2), ling.kvBytesPerToken());
+    try t.expect(ling.kvBytesPerToken() * 3 < 24 * 2 * 16 * 128 * 2);
+
+    // MLA caches per ATTENTION head — it decompresses the latent to all of
+    // them, so there is no grouping to bill against. Ling 3.0 ships 16/16, so
+    // only an asymmetric config can tell the two spellings apart, and reading
+    // `num_key_value_heads` here UNDER-bills (2 of 16 heads = 8x light) —
+    // which surfaces as an uncatchable Metal OOM, not a refusal.
+    var mla_grouped = ling;
+    mla_grouped.num_key_value_heads = 2;
+    try t.expectEqual(@as(u64, 6 * 16 * (192 + 128) * 2), mla_grouped.kvBytesPerToken());
+    // ...while a NON-MLA arch still bills its KV heads, grouping and all.
+    var gqa = dense;
+    gqa.num_attention_heads = 32;
+    gqa.num_key_value_heads = 8;
+    try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), gqa.kvBytesPerToken());
+
+    // A hybrid WITHOUT MLA still drops its linear layers from the bill.
+    var gdn = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    gdn.num_hidden_layers = 40;
+    gdn.num_key_value_heads = 2;
+    gdn.head_dim = 256;
+    gdn.full_attention_interval = 4;
+    try t.expectEqual(@as(u32, 10), gdn.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 10 * 2 * 512 * 2), gdn.kvBytesPerToken());
+}
+
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {
     // hy_v3 live 2026-07-14: with 111 GB of weights resident (~4 GB headroom),
     // a 31-TOKEN prompt was rejected "needs ~6246MB" — the MLP envelope was
     // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
     // 31-token forward (~25 MB). A forward is never wider than the prompt:
     // the envelope must use min(chunk, seq). Guard-tracks-reality rule.
-    const small = prefillMemoryNeeded(31, 64, 8, 80, 128, 4096, 13312, 8, 31, 31);
-    const capped = prefillMemoryNeeded(31, 64, 8, 80, 128, 4096, 13312, 8, 8192, 31);
+    const small = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 31, 31);
+    const capped = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 8192, 31);
     try std.testing.expectEqual(small, capped);
     // Sanity: the clamped estimate for the live 31-token case sits far below
     // the ~4 GB that was actually available.
@@ -15308,17 +15596,17 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
     try t.expectEqual(
         @as(u64, 32_854_507_520),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000),
     );
     // 4-bit: kv billed at (2*4+1)/16 bytes/elem (payload + group scale/bias)
     // = 6.912 GB, plus the 0.8192 GB per-layer dense dequant transient.
     try t.expectEqual(
         @as(u64, 11_798_507_520),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000),
     );
     // Direction: quantized admission must be under half the fp16 bill.
-    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512, 100_000) * 2 <
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000));
+    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000) * 2 <
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000));
 }
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
@@ -15329,7 +15617,7 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
     // mlp 0.377 GB, x1.25 = ~13.1 GiB — admittable on a big Mac.
-    const needed = prefillMemoryNeeded(262_144, 16, 2, 40, 256, 2048, 15360, 4, 512, 262_144);
+    const needed = prefillMemoryNeeded(262_144, 16, 2, 81920, 256, 256, 2048, 15360, 4, 512, 262_144);
     try t.expectEqual(@as(u64, 14_061_404_160), needed);
     try t.expect(needed < 16 << 30);
     // The retired seq-scaled envelope billed 8 x seq x ffn x 2 working bytes
@@ -15347,14 +15635,40 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
     // mlp 69.2 MB, x1.25.
     try t.expectEqual(
         @as(u64, 15_446_507_520),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 128, 2816, 2112, 16, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 122880, 128, 128, 2816, 2112, 16, 512, 100_000),
     );
     // hd=256 adds the [heads, chunk, seq] score tensor (the guard must see
     // what the composed SDPA path actually allocates). Decomposition: the
     // hd-128 bill + the KV doubling from 128->256 (12.288 GB x1.25) + the
     // score tensor (16x512x100000x2 = 1.6384 GB x1.25).
-    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000);
+    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000);
     try t.expectEqual(@as(u64, 15_446_507_520 + 15_360_000_000 + 2_048_000_000), with_scores);
+}
+
+test "prefillMemoryNeeded: the SCORE width decides the score term, not the stored width" {
+    // bailing_hybrid: MLA contracts scores over qk_head_dim 192 while storing
+    // values at v_head_dim 128 and declaring head_dim 128. mlx has a fused
+    // vector kernel for that pair at DECODE and falls back to the composed
+    // path at prefill widths, so the [heads, chunk, seq] score tensor is real —
+    // but `prefillHeadDimFused(128)` is true, so passing the stored width for
+    // both billed it at ZERO. Under-billing ends in an uncatchable Metal OOM
+    // instead of a 400, which is the whole reason this guard exists.
+    const t = std.testing;
+    const kv_per_tok: u64 = 6 * 16 * (192 + 128) * 2; // 6 caching layers of 24
+    const stored: u64 = 128;
+    const scored: u64 = 192;
+    const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768);
+    const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768);
+    // The difference is exactly the score tensor: heads x chunk x seq x 2, x1.25.
+    const score_bytes: u64 = 16 * 4096 * 32_768 * 2;
+    try t.expectEqual(honest - blind, score_bytes * 5 / 4);
+    try t.expect(honest > 2 * blind);
+    // The two widths are independent: at fp16 (no dequant transient) the
+    // stored width touches nothing the score term reads.
+    try t.expectEqual(
+        honest,
+        prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, scored, scored, 1536, 4608, 16, 4096, 32_768),
+    );
 }
 
 test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + dequant" {
@@ -15366,14 +15680,14 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
         @as(u64, 32_854_507_520 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000),
     );
     // The quantized-KV dequant transient is a denseView property, NOT a score
     // property — it must survive the fused kernel (fires on every kv-quant
     // request regardless of head_dim).
     try t.expectEqual(
         @as(u64, 11_798_507_520 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512, 100_000),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000),
     );
 }
 
@@ -15389,13 +15703,13 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     // 8629 MB free. Pre-fix it billed 10277 MB — a dense 5806-wide key axis
     // PLUS the 15360 intermediate_size struct default — and 400'd.
     const available: u64 = 8629 * 1024 * 1024;
-    const before = prefillMemoryNeeded(5806, 64, 1, 43, 512, 4096, 15360, 8, 5632, 5806);
+    const before = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 15360, 8, 5632, 5806);
     try t.expectEqual(@as(u64, 10277), before / (1024 * 1024));
     try t.expect(before > available);
     // Fixed: 641 keys (window 128 + top-512 + sink) and the width the config
     // actually states (top_k 6 x moe_intermediate 2048 = 12288, what
     // prefillFfnWidth resolves for this checkpoint) — 4848 MB, admitted.
-    const after = prefillMemoryNeeded(5806, 64, 1, 43, 512, 4096, 12288, 8, 5632, 641);
+    const after = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 12288, 8, 5632, 641);
     try t.expectEqual(@as(u64, 4848), after / (1024 * 1024));
     try t.expect(after < available);
     // The score term is the ONLY one the key bound may touch: same call with a
@@ -15403,8 +15717,8 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
-        prefillMemoryNeeded(5806, 64, 1, 43, 256, 4096, 2048, 8, 5632, 5806),
-        prefillMemoryNeeded(5806, 64, 1, 43, 256, 4096, 2048, 8, 5632, 641),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641),
     );
 }
 
@@ -15419,7 +15733,7 @@ test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, no
     // f32 gathered-K set (the very allocation PREFILL_SUB exists to bound).
     // The honest bill for the same request is ~2.3 GB — admitted with room.
     const available: u64 = 3610 * 1024 * 1024;
-    const generic = prefillMemoryNeeded(7514, 64, 1, 43, 512, 4096, 12288, 16, 4096, 641);
+    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641);
     try t.expectEqual(@as(u64, 4069), generic / (1024 * 1024));
     try t.expect(generic > available);
     const honest = dsv4PrefillMemoryNeeded(7514, 43, 512, 4096, 12288, 512, 641);
@@ -15454,13 +15768,34 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // unit test above still passes because they call the function directly.
     // Same class as the two hardcoded `use_drafter=false` call sites: the
     // engagement has to be pinned at the SITE.
+    //
+    // The KV bill is pinned at the same site and for the same reason: it must
+    // come from `config.kvBytesPerToken()` (which knows how many layers cache
+    // and how wide their keys and values are), never a uniform product
+    // recomputed here. Same for the SCORE width: `config.prefillScoreHeadDim()`
+    // is the width the score is contracted at, and handing `hdim` for both
+    // declares an MLA arch's 192-wide scores "fused" and bills them at zero.
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const call = "prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk,";
+    const call = "prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk,";
     const at = std.mem.indexOf(u8, src, call) orelse return error.CallSiteMoved;
     const tail = src[at + call.len ..];
     const end = std.mem.indexOfScalar(u8, tail, ')') orelse return error.CallSiteMoved;
     try t.expectEqualStrings(" config.prefillAttnKeys(seq", tail[0..end]);
+
+    // Auto-context sizing reads the same helpers — the two must not drift.
+    // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
+    // `--kv-quant 4` server cannot size its context against fp16 while the
+    // guard admits against 4-bit (that mismatch reported a third of what fits).
+    try t.expect(std.mem.indexOf(u8, src,
+        "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src,
+        "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
+    // The prefill transient: the sizer RESERVES it once at the chunk width
+    // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
+    // never as a per-token multiplier on the context it is solving for.
+    try t.expect(std.mem.indexOf(u8, src,
+        "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "prefillFfnWidth: a declared MoE width beats the struct default, which is only a fallback" {
