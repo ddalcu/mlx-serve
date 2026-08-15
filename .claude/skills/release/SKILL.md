@@ -10,6 +10,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 | # | Step | Command | Time |
 |---|---|---|---|
 | 1 | Hermetic suite | `zig build test` (**must** be 6/6 steps, 0 fail) + `cd app && swift test` | ~1 min |
+| 1b | Localization coverage | `cd app && MLX_SERVE_STRICT_LOCALIZATION=1 swift test --filter LocalizationCatalogTests` — day-to-day `swift test` only REPORTS missing/untranslated/orphaned catalog keys, this is where they're enforced | ~5 s |
 | 2 | ReleaseFast binary | `zig build -Doptimize=ReleaseFast` → `du -h zig-out/bin/mlx-serve` ≈ **7 MB** (Debug ≈ 2× = fake regression) | ~10 s |
 | 3 | **Perf gate** (did WE regress?) | `./tests/bench.sh` (mlx-serve only, llmprobe) → diff vs the previous column in `benchmarks.md` → append this release's column | ~15 min |
 | 4 | Tool-call correctness | `zig build test -Dtest-filter="format corpus"` + `-Dtest-filter="tool traffic"`; live: `./tests/test_tool_matrix_small.sh` | ~3 min |

@@ -23,6 +23,22 @@ import XCTest
 /// extractor lives HERE rather than in a script, because a scan that only runs
 /// when someone remembers to run it is not a guard.
 ///
+/// Catalog DRIFT — a missing key, a language with no translation for one, or
+/// an ORPHANED key nothing draws any more — is enforced STRICTLY only under
+/// `MLX_SERVE_STRICT_LOCALIZATION=1`: the `/release` checklist's job, not
+/// `swift test`'s. All three fall back gracefully rather than misbehaving
+/// (missing/untranslated render the English source at runtime; an orphan is
+/// inert JSON), so none is a correctness bug for a PR that only edits copy —
+/// REWORDING a string orphans its old key and leaves the new one unanswered
+/// in the SAME edit, so treating "missing" as blocking while "orphan" was
+/// lenient (or vice versa) would still trip every copy change. A default run
+/// REPORTS what's outstanding (`reportOrFail`/`reportOrFailCoverage`)
+/// instead of failing, so a contributor changing a model blurb never needs
+/// to know Chinese, or block on someone who does, to get green. Structural
+/// checks on translations that DO exist — no leftover source escapes,
+/// format specifiers matching their key — stay unconditional, because
+/// neither requires writing a new translation to satisfy.
+///
 /// Deliberately NOT covered: strings that are model-facing rather than
 /// user-facing (system prompts, tool names and descriptions) — see
 /// `testModelFacingCopyIsNeverLocalized`.
@@ -498,8 +514,15 @@ final class LocalizationCatalogTests: XCTestCase {
         XCTAssertFalse(carriesProse("·"))
     }
 
-    /// The coverage guard. A new English string with no Chinese translation
-    /// fails here, naming itself.
+    /// The coverage guard. A new English string with no Chinese translation is
+    /// REPORTED here, naming itself — not failed. Coverage is a release gate
+    /// (`MLX_SERVE_STRICT_LOCALIZATION=1`, see `/release`), not a per-PR one:
+    /// a contributor adding a button label or a model blurb should never need
+    /// to know Chinese, or wait on someone who does, to get `swift test`
+    /// green. An entry this misses still renders — untranslated and missing
+    /// both fall back to the English source at runtime (see the class comment
+    /// above) — this test's whole job is making that fallback VISIBLE instead
+    /// of silent, at whichever cadence the strict flag is run.
     func testEveryUserFacingStringIsTranslatedIntoEveryTargetLanguage() throws {
         let catalog = try loadCatalog()
         var missing: [String] = []
@@ -520,16 +543,18 @@ final class LocalizationCatalogTests: XCTestCase {
             }
         }
 
-        XCTAssertTrue(missing.isEmpty,
-                      "\(missing.count) string(s) are drawn by the app but absent from Localization/Localizable.xcstrings:\n"
-                      + missing.prefix(40).joined(separator: "\n"))
-        XCTAssertTrue(untranslated.isEmpty,
-                      "\(untranslated.count) string/language pair(s) have no translation:\n"
-                      + untranslated.prefix(40).joined(separator: "\n"))
+        reportOrFailCoverage(
+            missing: missing,
+            missingLabel: "string(s) are drawn by the app but absent from Localization/Localizable.xcstrings",
+            untranslated: untranslated,
+            untranslatedLabel: "string/language pair(s) have no translation")
     }
 
-    /// A key nobody draws any more is copy a translator is still paying for,
-    /// and it hides real coverage gaps behind a green test.
+    /// A key nobody draws any more is copy a translator is still paying for.
+    /// Reported rather than failed by default — see `strictLocalizationCoverage`'s
+    /// doc comment: REWORDING a string orphans its old key in the very same
+    /// edit that leaves the new one unanswered, so this and the two coverage
+    /// tests are one release-gated policy, not three independent ones.
     func testTheCatalogHasNoEntriesTheAppNeverDraws() throws {
         let catalog = try loadCatalog()
         var drawn = Set<String>()
@@ -546,9 +571,7 @@ final class LocalizationCatalogTests: XCTestCase {
             for resolved in catalogKeys(matching: key, in: catalog) { drawn.insert(resolved) }
         }
         let orphans = catalog.strings.keys.filter { !drawn.contains($0) }.sorted()
-        XCTAssertTrue(orphans.isEmpty,
-                      "\(orphans.count) catalog entrie(s) are no longer drawn by any call site:\n"
-                      + orphans.prefix(40).joined(separator: "\n"))
+        reportOrFail(orphans, label: "catalog entrie(s) are no longer drawn by any call site")
     }
 
     /// A literal at a registered copy position, with the line it sits on.
@@ -682,6 +705,10 @@ final class LocalizationCatalogTests: XCTestCase {
         return found
     }
 
+    /// Same coverage guard as `testEveryUserFacingStringIsTranslatedIntoEveryTargetLanguage`,
+    /// for the `String(localized:)` call sites instead of SwiftUI literals —
+    /// see that test's doc comment for why this reports rather than fails by
+    /// default.
     func testRuntimeLocalizedCopyIsAlsoTranslated() throws {
         let catalog = try loadCatalog()
         var missing: [String] = []
@@ -702,12 +729,51 @@ final class LocalizationCatalogTests: XCTestCase {
                     .map { "[\($0)] \(candidate)" }
             }
         }
-        XCTAssertTrue(missing.isEmpty,
-                      "\(missing.count) `String(localized:)` key(s) are absent from the catalog:\n"
-                      + missing.prefix(40).joined(separator: "\n"))
-        XCTAssertTrue(untranslated.isEmpty,
-                      "\(untranslated.count) `String(localized:)` key/language pair(s) have no translation:\n"
-                      + untranslated.prefix(40).joined(separator: "\n"))
+        reportOrFailCoverage(
+            missing: missing,
+            missingLabel: "`String(localized:)` key(s) are absent from the catalog",
+            untranslated: untranslated,
+            untranslatedLabel: "`String(localized:)` key/language pair(s) have no translation")
+    }
+
+    /// Catalog DRIFT — a key that's missing, untranslated, or orphaned — is
+    /// enforced STRICTLY only when this is set: the `/release` checklist's
+    /// job, not every `swift test`. All three fall back gracefully rather
+    /// than crashing or misbehaving (missing/untranslated render the English
+    /// source at runtime; an orphan is inert JSON nobody reads), so none of
+    /// them is a correctness bug for a PR that only edits copy — changing a
+    /// blurb's WORDING orphans the old catalog entry and leaves the new one
+    /// unanswered in the SAME edit, and neither half should cost the person
+    /// editing English prose a trip through Chinese, or a blocked merge
+    /// waiting on someone who can make one. It is translation debt that has
+    /// to be paid before a release ships it silently untranslated (or, for
+    /// an orphan, cleaned up so a translator stops paying for dead copy).
+    /// Default runs still print exactly what's outstanding, so the debt
+    /// stays visible without blocking anyone who can't pay it down
+    /// themselves.
+    private var strictLocalizationCoverage: Bool {
+        ProcessInfo.processInfo.environment["MLX_SERVE_STRICT_LOCALIZATION"] == "1"
+    }
+
+    private func reportOrFail(_ entries: [String], label: String, file: StaticString = #filePath, line: UInt = #line) {
+        guard strictLocalizationCoverage else {
+            guard !entries.isEmpty else { return }
+            print("⚠️ [i18n] \(entries.count) \(label) "
+                + "— not blocking (set MLX_SERVE_STRICT_LOCALIZATION=1 to enforce, e.g. before a release):")
+            for entry in entries.prefix(40) { print("  \(entry)") }
+            return
+        }
+        XCTAssertTrue(entries.isEmpty, "\(entries.count) \(label):\n" + entries.prefix(40).joined(separator: "\n"),
+                      file: file, line: line)
+    }
+
+    private func reportOrFailCoverage(
+        missing: [String], missingLabel: String,
+        untranslated: [String], untranslatedLabel: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        reportOrFail(missing, label: missingLabel, file: file, line: line)
+        reportOrFail(untranslated, label: untranslatedLabel, file: file, line: line)
     }
 
     /// A catalog value is the FINISHED text — the escapes were already resolved
