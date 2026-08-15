@@ -11,6 +11,8 @@
 
 ### Fixes
 
+- Speculative decoding with a quantized KV cache collapsed past 8k context: 28 tok/s where the dense read does 60, because spec verify steps read the packed cache through a chain of small quantized matmuls. Verify steps now have their own packed-read kernel on the shapes it was measured to win on, and fall back to a plain dense read everywhere else. Measured on Qwen3.6-27B and Qwen3.8-27B with the draft head on: 28 to 61 tok/s at 11k context, and at 32k the quantized cache now decodes within 2% of running with no KV quantization at all, at half the memory.
+- The same pass found the quantized-KV fused read was also losing on Gemma 4 without speculation: its full-attention shape fell to the slow composed chain on every token and its sliding windows sat exactly at the engagement floor, together a 1.45x decode loss at 11k. Both read dense now, 21 to 30 tok/s.
 - LFM2 and Nemotron-H were billed a KV cache for every layer when only their attention layers keep one, which charged LFM2 3.75x the real bytes and shrank its auto-context for nothing.
 - A model loaded while a bigger one was resident kept its narrowed prefill width forever, even after the big one was evicted. It re-resolves on the next load.
 - A model served out of the Hugging Face cache showed its commit hash in the model pill instead of its name.

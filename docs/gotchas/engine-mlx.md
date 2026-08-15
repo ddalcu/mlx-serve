@@ -2343,3 +2343,109 @@ The bars that do hold, and that this change is pinned against:
 - **4-bit bit-identity across the refactor**: same binary except the kernel
   generator, same 4-bit pack, MTP engaged in both arms, 250 greedy tokens
   identical to the byte.
+
+## Fused kv-quant reads under spec decode: the verify widths were the whole bill (2026-08-15)
+
+**Symptom.** With `--kv-quant 8` (or 4) and `--kv-attn-mode auto`, decode on MTP
+models collapsed past 8k context: 28 tok/s where the dense read does 60
+(Qwen3.6-27B-oQ4e and Qwen3.8-27B, M4 Max). It read as a "long context
+regression" in llmprobe. It was NOT a regression — byte-identical behavior on
+fc6b5ce, 5d10cb7 and v26.8.6; the old llmprobe cards it was compared against
+had run kv-quant OFF. The repro needs all three legs: kv-quant on, ≥8K prompt,
+PREDICTABLE content (deep MTP rounds). Random filler shows no cliff because
+acceptance collapses and rounds stay cheap. Harness kept at
+`~/claude-tmp/kv8-cliff-20260815/`.
+
+**Mechanism.** `kvAttnFusedEligible` admitted `t_q <= 32` once the context
+passed the auto crossover. Inside the fused arm, decode width (t_q == 1) rides
+`qkvAttnDecodeKernel` — the measured +10..+56% serial win — but verify widths
+(T_q 2..7 under MTP) fell to `kv_quant.quantAttention`: a composed chain of
+quantized matmuls against the PACKED K and V, per layer, per spec round. qmm at
+M 2..7 over an 8k+ contraction is the exact dead zone the verifyQmm weight
+lanes exist for, except here it ran 16 attention layers x 2 packed matmuls
+every round. Round time measured 63 ms at 4k (below the crossover, dense path)
+vs 158 ms at 8k (composed packed path), flat to 16k. Under MTP nearly every
+trunk forward IS a verify, so the fused win case barely ran. The composed
+verify chain was a deliberate choice that predated deep-MTP defaults and was
+never A/B'd at spec depth.
+
+**Fix.** `kvAttnFusedEligible` requires `t_q == 1`. Verify and small-prefill
+widths fall through to the dense dequant + SDPA path — the reference semantics
+anyway. Decode-width eligibility is unchanged, so the serial fused win is
+untouched by construction; bits-agnostic, so kv4 and kv8 are both covered. Side
+effect, documented: a forced per-request `kv_attn_mode:"fused"` at verify width
+now gets the dense read too — honest, since the composed chain it used to get
+is the slow path this fix removes. The lazy sliding sel_mask null guard inside
+the fused arm stays (only t_q == 1 reaches it now, but the live failure it
+fixed was real and it costs nothing).
+
+**Guards.** `kvAttnFusedEligible` unit test (red-verified: pre-fix admits
+t_q == 2) + `tests/test_kv_quant_fused_equivalence.sh`, which gained a spec-on
+arm: PLD engagement (`[spec-stats] mode=pld`), fused engagement with the
+one-shot `[kv-attn]` line's `Tq=1` (no other width is eligible now), and greedy
+first-N equivalence vs the dense spec arm. The decode-rate recovery is NOT a
+shell-test assertion — a one-run spec cell is variance per /bench rules; it is
+pinned by same-boot interleaved perf A/Bs.
+
+**What Phase 2 would be (not built).** The dense fallback still pays a full-KV
+dequant transient per verify round. A real packed verify-attention kernel for
+M 2..8 (the verifyQmm move applied to attention) is the prize IF the dense-arm
+rate ever matters vs serial. Bars if attempted: fp32-dequant-reference parity
+per width, no-worse-than-dense same-boot A/B at 8k/16k/32k per arch,
+engagement log per width, kill switch, per-shape eligibility A/B. Non-goals,
+decided: the 8192 auto crossover stays (fine for the path that remains); no
+resident dense-KV cache to amortize verify dequants (it re-spends the memory
+kv-quant exists to save, exactly on the machines that need kv-quant).
+
+### Phase 2 follow-through: the verify widths got their own packed kernel, and two pre-existing losses surfaced on the way (2026-08-15)
+
+Sizing the prize before building (dense-fallback vs kv-off, spec-on,
+Qwen3.6-27B-oQ4e-mtp, same boot): −2% @ 8k, −7% @ 16k, −12.6% @ 32k — the
+full-KV dequant transient per verify round grows with context, so the plan's
+"only if it matters" bar was met.
+
+**`qkvAttnVerifyKernel`** (T_q 2..8, `MLX_SERVE_KV_ATTN_VERIFY=0` kills):
+QKV_DEC's two-phase block-parallel layout generalized to TQ query rows per
+head. q is read from DEVICE, not staged (LQ=GQA·TQ rows of DK f32 is up to
+49 KB of tg memory; the reads are lockstep-coalesced and L1-scale); the
+causal TAIL is applied from geometry (`gpos < Tk - TQ + 1 + tq`, the same
+end-aligned contract as SDPA "causal", which is what the dense path serves
+these widths — mutation-checked: dropping it fails parity at max_err 0.076);
+"array" (sliding) masks decline; scale folds at score write. Partials merge
+through the SAME `qkvMergePartials` carry (extracted from the decode wrapper,
+pure code motion), rows (head-major, tq inner) so [Hq·TQ, DV] reshapes
+straight to [1, Hq, TQ, DV]. Config cache is one slot per TQ — verify widths
+alternate round to round, a single-entry cache would rebuild per call.
+
+Measured (M4 Max, kv8, spec-on, same-boot per-request interleave, medians):
+qwen3.6-27B auto 60.7/49.1/40.5 vs dense 58.4/46.1/38.4 vs kv-off
+60.9/49.3/41.9 at 8k/16k/32k; qwen3.8-27B 66.0 vs 64.3 vs 67.2 at 8k. The
+kernel recovers most of the dense-fallback tax — kv8 now decodes ≈ kv-off at
+every rung with HALF the KV bytes. Engaged at Tq 5-7 live (auto-depth MTP).
+
+**Two pre-existing t_q==1 losses found by the gemma4 sanity pass** (auto was
+a 1.45x decode LOSS on gemma4-12B kv8 at 11k — 21.1 vs 30.5 tok/s, present
+before Phase 1):
+- gemma4's full-attention layers (gqa 16 × dk 512) overflow the decode
+  kernel's threadgroup q-staging budget, so EVERY decode step fell to the
+  composed chain: −17% alone. Fix: the fused arms are kernel-or-DENSE now;
+  `kv_quant.quantAttention` never serves (scan-pinned to its one parity
+  caller). A declined kernel falls through to the dense arms.
+- gemma4's window-1024 sliding layers sat exactly AT the 1024 per-layer kv
+  floor and engaged the masked kernel at ~1k KV: another ~4 tok/s. Fix:
+  `KV_ATTN_FUSED_MIN_TK` 1024 → 2048 (Laguna's 512-window calibration point
+  stays excluded either way).
+After both: gemma4 auto == dense (30.4/30.4), zero engagements — correct,
+its shapes are outside every measured adoption set. The verify kernel's
+gqa16×dk512 cell measured −1% at Tq 2, so the wrapper gates dk ≤ 256 — the
+mixedNaxShapeEnabled rule again: adoption is what was measured, per shape.
+
+Guards: `qkvVerParityCase` (TQ 2..8 × bits × GQA incl. the 24/4/256 live
+geometry, strided views, multi-block merge, vs dense SDPA over the SAME
+dequantized view), the decline test, the kernel-or-DENSE source scan, the
+verify-eligibility unit arms, and the shell script's third arm (qwen-shaped
+model, PLD on): verify-kernel ENGAGEMENT is the assertion — the dense
+fallback is output-equivalent, so a dispatch hole is invisible to equality.
+gemma-4-e4b deliberately has NO verify-engagement assertion: its shapes are
+outside the adoption set, and asserting one would be a checkpoint
+expectation.

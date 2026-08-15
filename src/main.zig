@@ -188,8 +188,8 @@ fn printUsage(io: std.Io) void {
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
-        \\                        the packed cache in place (custom kernel at
-        \\                        decode width, composed qmm at verify widths);
+        \\                        the packed cache in place at decode width
+        \\                        (spec verify + prefill always read dense);
         \\                        `auto` (default) picks fused from 8K prompt
         \\                        tokens. Only effective at --kv-quant 4 or 8;
         \\                        per-request `kv_attn_mode` field overrides.
