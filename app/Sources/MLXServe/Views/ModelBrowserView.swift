@@ -245,13 +245,13 @@ private struct RecommendedModelTable: View {
 
     private var families: [Family] {
         [
-            Family(id: "gemma", title: "Gemma 4", systemImage: "g.circle", tint: .blue,
+            Family(id: "gemma", title: String(localized: "Gemma 4"), systemImage: "g.circle", tint: .blue,
                    picks: RecommendedModelPick.gemmaCatalog),
-            Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
+            Family(id: "qwen", title: String(localized: "Qwen"), systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
-            Family(id: "laguna", title: "Laguna", systemImage: "chevron.left.forwardslash.chevron.right", tint: .purple,
+            Family(id: "laguna", title: String(localized: "Laguna"), systemImage: "chevron.left.forwardslash.chevron.right", tint: .purple,
                    picks: RecommendedModelPick.poolsideCatalog),
-            Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
+            Family(id: "largest", title: String(localized: "Largest models"), systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]
     }
@@ -826,16 +826,16 @@ private struct MediaPane: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 ModelGroupSection(
-                    title: "Image",
-                    subtitle: "Text-to-image generation and image editing.",
+                    title: String(localized: "Image"),
+                    subtitle: String(localized: "Text-to-image generation and image editing."),
                     systemImage: "photo",
                     tint: .pink
                 ) {
                     ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
-                    title: "Audio",
-                    subtitle: "Text-to-speech, with optional voice cloning.",
+                    title: String(localized: "Audio"),
+                    subtitle: String(localized: "Text-to-speech, with optional voice cloning."),
                     systemImage: "waveform",
                     tint: .green
                 ) {
@@ -845,16 +845,16 @@ private struct MediaPane: View {
                     ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
-                    title: "Video",
-                    subtitle: "Text/image-to-video, with optional audio.",
+                    title: String(localized: "Video"),
+                    subtitle: String(localized: "Text/image-to-video, with optional audio."),
                     systemImage: "film",
                     tint: .indigo
                 ) {
                     ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
-                    title: "Music",
-                    subtitle: "Text-to-music, with optional lyrics.",
+                    title: String(localized: "Music"),
+                    subtitle: String(localized: "Text-to-music, with optional lyrics."),
                     systemImage: "music.note",
                     tint: .orange
                 ) {
@@ -1124,9 +1124,9 @@ private struct ColumnHeaderRow: View {
         HStack(spacing: ModelBrowserMetrics.columnSpacing) {
             Text("Model")
                 .frame(maxWidth: .infinity, alignment: .leading)
-            SortableHeader("Quant", field: nil, searchService: searchService)
+            SortableHeader(String(localized: "Quant"), field: nil, searchService: searchService)
                 .frame(width: ModelBrowserMetrics.quantWidth, alignment: .leading)
-            SortableHeader("Size", field: nil, searchService: searchService)
+            SortableHeader(String(localized: "Size"), field: nil, searchService: searchService)
                 .frame(width: ModelBrowserMetrics.sizeWidth, alignment: .trailing)
             // HuggingFace pull count. Called "Pulls", NOT "Downloads": the
             // sidebar has a Downloads destination meaning "transferring right
@@ -1134,18 +1134,18 @@ private struct ColumnHeaderRow: View {
             // the old "Downloaded" toggle as a filter on this column. 64 wide
             // fits "Pulls" + the sort chevron.
             if tier.showsPulls {
-                SortableHeader("Pulls", field: .downloads, searchService: searchService)
+                SortableHeader(String(localized: "Pulls"), field: .downloads, searchService: searchService)
                     .frame(width: ModelBrowserMetrics.pullsWidth, alignment: .trailing)
                     .help("How many times this repo has been pulled from HuggingFace")
             }
             if tier.showsLikes {
-                SortableHeader("Likes", field: .likes, searchService: searchService)
+                SortableHeader(String(localized: "Likes"), field: .likes, searchService: searchService)
                     .frame(width: ModelBrowserMetrics.likesWidth, alignment: .trailing)
             }
-            SortableHeader("RAM Est.", field: .estimatedSize, searchService: searchService)
+            SortableHeader(String(localized: "RAM Est."), field: .estimatedSize, searchService: searchService)
                 .frame(width: ModelBrowserMetrics.ramWidth, alignment: .trailing)
             if tier.showsUpdated {
-                SortableHeader("Updated", field: .lastModified, searchService: searchService)
+                SortableHeader(String(localized: "Updated"), field: .lastModified, searchService: searchService)
                     .frame(width: ModelBrowserMetrics.updatedWidth, alignment: .trailing)
             }
             Text("")

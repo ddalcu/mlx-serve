@@ -202,7 +202,7 @@ struct SandboxTerminalView: View {
     /// same-node one, and silently never presents (live 2026-07-19).
     private func requestCloseTab(_ id: UUID) {
         if sessions.closeNeedsConfirmation(id) {
-            alert = SandboxAlert(message: "The session running inside the sandbox will be terminated. Files it wrote are kept.",
+            alert = SandboxAlert(message: String(localized: "The session running inside the sandbox will be terminated. Files it wrote are kept."),
                                  action: .confirmClose(id))
         } else {
             closeTab(id)

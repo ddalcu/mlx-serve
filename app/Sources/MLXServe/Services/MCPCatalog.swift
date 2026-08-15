@@ -186,14 +186,14 @@ enum MCPCatalog {
         .init(
             id: "github",
             name: "GitHub",
-            description: "Repos, issues, PRs, code search via the GitHub API",
+            description: String(localized: "Repos, issues, PRs, code search via the GitHub API"),
             icon: "chevron.left.forwardslash.chevron.right",
             command: "npx",
             args: ["-y", "@modelcontextprotocol/server-github"],
             inputs: [
                 .init(id: "github_token",
                       kind: .env(key: "GITHUB_PERSONAL_ACCESS_TOKEN"),
-                      label: "GitHub Personal Access Token",
+                      label: String(localized: "GitHub Personal Access Token"),
                       helpText: "Create at github.com/settings/tokens (needs repo + read:org)",
                       isSecret: true,
                       required: true,
@@ -204,7 +204,7 @@ enum MCPCatalog {
         .init(
             id: "azure-devops",
             name: "Azure DevOps",
-            description: "Work items, pull requests, builds, pipelines, wiki, test plans",
+            description: String(localized: "Work items, pull requests, builds, pipelines, wiki, test plans"),
             icon: "chart.bar.doc.horizontal",
             command: "npx",
             // Default args = interactive browser auth (no --authentication flag).
@@ -213,7 +213,7 @@ enum MCPCatalog {
             inputs: [
                 .init(id: "ado_org",
                       kind: .arg(placeholder: "<ORG>"),
-                      label: "Organization Name",
+                      label: String(localized: "Organization Name"),
                       helpText: "e.g. \"contoso\" (the part after dev.azure.com/)",
                       isSecret: false,
                       required: true,
@@ -223,11 +223,11 @@ enum MCPCatalog {
                       // --authentication pat is appended to args (via argsWhenPresent). When blank: server
                       // uses default interactive auth (browser login on first tool call).
                       kind: .envEncoded(key: "PERSONAL_ACCESS_TOKEN", encoding: .base64Pair(leftSide: "x")),
-                      label: "Personal Access Token (PAT) — optional",
+                      label: String(localized: "Personal Access Token (PAT) — optional"),
                       helpText: "Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens.",
                       isSecret: true,
                       required: false,
-                      placeholder: "Paste raw PAT for headless auth — we base64-encode it",
+                      placeholder: String(localized: "Paste raw PAT for headless auth — we base64-encode it"),
                       argsWhenPresent: ["--authentication", "pat"])
             ],
             notes: "Default: opens your browser on the first ADO tool call so you can log in with Microsoft. The token is cached for later runs. Fill in the PAT field instead if you can't use a browser (CI, sandboxed env)."
@@ -235,14 +235,14 @@ enum MCPCatalog {
         .init(
             id: "dbhub",
             name: "DBHub (Universal SQL)",
-            description: "Postgres, MySQL, SQLite, SQL Server — one MCP for all major SQL DBs (dbhub.ai)",
+            description: String(localized: "Postgres, MySQL, SQLite, SQL Server — one MCP for all major SQL DBs (dbhub.ai)"),
             icon: "cylinder.split.1x2",
             command: "npx",
             args: ["-y", "@bytebase/dbhub@latest", "--transport", "stdio", "--dsn", "<DSN>"],
             inputs: [
                 .init(id: "dsn",
                       kind: .arg(placeholder: "<DSN>"),
-                      label: "Connection String (DSN)",
+                      label: String(localized: "Connection String (DSN)"),
                       helpText: "e.g. postgres://user:pass@host:5432/db, mysql://..., sqlite:///path/to/db.sqlite",
                       isSecret: true,
                       required: true,
@@ -253,7 +253,7 @@ enum MCPCatalog {
         .init(
             id: "docker",
             name: "Docker",
-            description: "Manage containers, images, networks, volumes",
+            description: String(localized: "Manage containers, images, networks, volumes"),
             icon: "shippingbox",
             command: "npx",
             args: ["-y", "docker-mcp"],
@@ -263,7 +263,7 @@ enum MCPCatalog {
         .init(
             id: "kubernetes",
             name: "Kubernetes",
-            description: "Pods, deployments, services — uses your local kubeconfig",
+            description: String(localized: "Pods, deployments, services — uses your local kubeconfig"),
             icon: "circle.hexagongrid",
             command: "npx",
             args: ["-y", "mcp-server-kubernetes"],
@@ -273,7 +273,7 @@ enum MCPCatalog {
         .init(
             id: "playwright",
             name: "Playwright",
-            description: "Browser automation: navigate, click, screenshot, scrape",
+            description: String(localized: "Browser automation: navigate, click, screenshot, scrape"),
             icon: "safari",
             command: "npx",
             args: ["-y", "@playwright/mcp@latest"],
@@ -283,21 +283,21 @@ enum MCPCatalog {
         .init(
             id: "slack",
             name: "Slack",
-            description: "Read channels, post messages, search (Zencoder maintained fork)",
+            description: String(localized: "Read channels, post messages, search (Zencoder maintained fork)"),
             icon: "bubble.left.and.bubble.right",
             command: "npx",
             args: ["-y", "@zencoderai/slack-mcp-server"],
             inputs: [
                 .init(id: "slack_bot_token",
                       kind: .env(key: "SLACK_BOT_TOKEN"),
-                      label: "Slack Bot Token",
+                      label: String(localized: "Slack Bot Token"),
                       helpText: "Bot user OAuth token (xoxb-...)",
                       isSecret: true,
                       required: true,
                       placeholder: "xoxb-..."),
                 .init(id: "slack_team_id",
                       kind: .env(key: "SLACK_TEAM_ID"),
-                      label: "Slack Team ID",
+                      label: String(localized: "Slack Team ID"),
                       helpText: "Your workspace ID (T...)",
                       isSecret: false,
                       required: true,
@@ -308,14 +308,14 @@ enum MCPCatalog {
         .init(
             id: "notion",
             name: "Notion",
-            description: "Read & write pages, databases, search",
+            description: String(localized: "Read & write pages, databases, search"),
             icon: "doc.text",
             command: "npx",
             args: ["-y", "@notionhq/notion-mcp-server"],
             inputs: [
                 .init(id: "notion_token",
                       kind: .env(key: "OPENAPI_MCP_HEADERS"),
-                      label: "Authorization Header",
+                      label: String(localized: "Authorization Header"),
                       helpText: #"Paste: {"Authorization": "Bearer secret_...", "Notion-Version": "2022-06-28"}"#,
                       isSecret: true,
                       required: true,
@@ -326,14 +326,14 @@ enum MCPCatalog {
         .init(
             id: "filesystem",
             name: "Filesystem",
-            description: "Read, write, list files within a chosen root directory",
+            description: String(localized: "Read, write, list files within a chosen root directory"),
             icon: "folder",
             command: "npx",
             args: ["-y", "@modelcontextprotocol/server-filesystem", "<ROOT>"],
             inputs: [
                 .init(id: "root_path",
                       kind: .arg(placeholder: "<ROOT>"),
-                      label: "Root Directory",
+                      label: String(localized: "Root Directory"),
                       helpText: "Tools are confined to this path. Use an absolute path. Suggestion: ~/.mlx-serve/workspace (the default cwd for all MCP servers).",
                       isSecret: false,
                       required: true,
@@ -344,7 +344,7 @@ enum MCPCatalog {
         .init(
             id: "shell",
             name: "Shell",
-            description: "Run arbitrary shell commands (use with caution)",
+            description: String(localized: "Run arbitrary shell commands (use with caution)"),
             icon: "terminal",
             command: "npx",
             args: ["-y", "@mkusaka/mcp-shell-server"],

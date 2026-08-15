@@ -30,9 +30,9 @@ final class TaskNotifier: NSObject, UNUserNotificationCenterDelegate {
         center.delegate = self
         center.setNotificationCategories([
             UNNotificationCategory(identifier: Self.approvalCategory, actions: [
-                UNNotificationAction(identifier: Self.approveAction, title: "Approve",
+                UNNotificationAction(identifier: Self.approveAction, title: String(localized: "Approve"),
                                      options: [.authenticationRequired]),
-                UNNotificationAction(identifier: Self.denyAction, title: "Deny",
+                UNNotificationAction(identifier: Self.denyAction, title: String(localized: "Deny"),
                                      options: [.destructive]),
             ], intentIdentifiers: [], options: []),
             UNNotificationCategory(identifier: Self.completedCategory, actions: [],
@@ -47,20 +47,20 @@ final class TaskNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     func notifyCompleted(task: ScheduledTask, run: TaskRun) {
         post(title: "✓ \(task.title)",
-             body: run.summary ?? "Task completed.",
+             body: run.summary ?? String(localized: "Task completed."),
              category: Self.completedCategory, task: task, run: run)
     }
 
     func notifyFailed(task: ScheduledTask, run: TaskRun) {
-        post(title: "⚠ \(task.title) failed",
-             body: run.summary ?? "The task run failed.",
+        post(title: String(localized: "⚠ \(task.title) failed"),
+             body: run.summary ?? String(localized: "The task run failed."),
              category: Self.failedCategory, task: task, run: run)
     }
 
     func notifyNeedsApproval(task: ScheduledTask, run: TaskRun) {
-        let tool = run.pendingApproval?.toolName ?? "a tool"
-        post(title: "\(task.title) needs approval",
-             body: "Wants to run “\(tool)”. \(run.pendingApproval?.reason ?? "")",
+        let tool = run.pendingApproval?.toolName ?? String(localized: "a tool")
+        post(title: String(localized: "\(task.title) needs approval"),
+             body: String(localized: "Wants to run “\(tool)”. \(run.pendingApproval?.reason ?? "")"),
              category: Self.approvalCategory, task: task, run: run)
     }
 

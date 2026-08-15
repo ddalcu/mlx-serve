@@ -46,12 +46,12 @@ struct ChatErrorNotice: Codable, Equatable {
         guard overflowPhrases.contains(where: { lower.contains($0) }) else {
             return ChatErrorNotice(
                 kind: .generic,
-                message: trimmed.isEmpty ? "HTTP \(code) from mlx-serve" : "HTTP \(code): \(trimmed)",
+                message: trimmed.isEmpty ? String(localized: "HTTP \(code) from mlx-serve") : String(localized: "HTTP \(code): \(trimmed)"),
                 neededTokens: nil, contextLength: nil)
         }
         let counts = parseCounts(trimmed)
         return ChatErrorNotice(kind: .contextOverflow,
-                               message: trimmed.isEmpty ? "Prompt exceeds maximum context length" : trimmed,
+                               message: trimmed.isEmpty ? String(localized: "Prompt exceeds maximum context length") : trimmed,
                                neededTokens: counts?.needed, contextLength: counts?.limit)
     }
 
@@ -73,8 +73,8 @@ struct ChatErrorNotice: Codable, Equatable {
 
     var headline: String {
         switch kind {
-        case .contextOverflow: "Model ran out of context size"
-        case .generic: "Something went wrong"
+        case .contextOverflow: String(localized: "Model ran out of context size")
+        case .generic: String(localized: "Something went wrong")
         }
     }
 
@@ -83,10 +83,9 @@ struct ChatErrorNotice: Codable, Equatable {
         case .contextOverflow:
             guard let neededTokens, let contextLength else {
                 // Pre-counts server: say what happened without inventing figures.
-                return "This request was larger than the model's context window."
+                return String(localized: "This request was larger than the model's context window.")
             }
-            return "This request needed \(Self.grouped(neededTokens)) tokens, "
-                + "but the model's context window holds only \(Self.grouped(contextLength))."
+            return String(localized: "This request needed \(Self.grouped(neededTokens)) tokens, but the model's context window holds only \(Self.grouped(contextLength)).")
         case .generic:
             return message
         }
@@ -96,18 +95,22 @@ struct ChatErrorNotice: Codable, Equatable {
     /// can't fix the error it sits under is worse than no button.
     var offersContextAction: Bool { kind == .contextOverflow }
 
-    /// Thousands separators, so 4108 reads at a glance next to 4096. Pinned to
-    /// en_US rather than the user's locale because the sentence around it is an
-    /// English literal — a comma-grouped number in a period-grouping locale is
-    /// odd, but an English sentence with a German number is worse, and the copy
-    /// is not localized.
+    /// Thousands separators, so 4108 reads at a glance next to 4096.
+    ///
+    /// It used to be pinned to en_US on the grounds that the sentence around it
+    /// was an English literal, and an English sentence with a German number
+    /// reads worse than a comma in a period-grouping locale. That reason is
+    /// gone: the sentence is a catalog key now, so the number should follow the
+    /// same locale the words do — which is also what `String(localized:)` does
+    /// with an interpolated `Int` everywhere else in the app. No visible change
+    /// in either language we ship (en and zh-Hans both group with commas); it
+    /// matters the first time a period-grouping language is added.
     private static func grouped(_ n: Int) -> String {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         f.usesGroupingSeparator = true
-        f.groupingSeparator = ","
         f.groupingSize = 3
-        f.locale = Locale(identifier: "en_US")
+        f.locale = Locale.current
         return f.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 }

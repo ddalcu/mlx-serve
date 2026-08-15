@@ -122,7 +122,7 @@ struct Model3DGenView: View {
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             } else {
-                MediaDropWell(title: "Choose photo…",
+                MediaDropWell(title: String(localized: "Choose photo…"),
                               systemImage: "photo.badge.plus",
                               isTargeted: isDropTargeted) { choosePhoto() }
                 Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")

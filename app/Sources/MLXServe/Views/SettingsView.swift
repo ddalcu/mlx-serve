@@ -86,19 +86,19 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     SettingsSection(
                         category: .modelFolders,
-                        subtitle: "Choose where downloads are saved, and add a folder to scan if some of your models live elsewhere. Every folder listed here is served — restart the server after changing them."
+                        subtitle: String(localized: "Choose where downloads are saved, and add a folder to scan if some of your models live elsewhere. Every folder listed here is served — restart the server after changing them.")
                     ) {
                         ModelFoldersSectionContent()
                     }
                     SettingsSection(
                         category: .server,
-                        subtitle: "Server-launch flags. Restart the server to apply changes."
+                        subtitle: String(localized: "Server-launch flags. Restart the server to apply changes.")
                     ) {
                         ServerSectionContent()
                     }
                     SettingsSection(
                         category: .lanSharing,
-                        subtitle: "Share models with other Macs on your local network and use theirs — zero-setup discovery over Bonjour, everything off by default. Restart the server to apply."
+                        subtitle: String(localized: "Share models with other Macs on your local network and use theirs — zero-setup discovery over Bonjour, everything off by default. Restart the server to apply.")
                     ) {
                         LanSharingSectionContent()
                     }
@@ -109,14 +109,14 @@ struct SettingsView: View {
                     EngineAwareSections()
                     SettingsSection(
                         category: .requestDefaults,
-                        subtitle: "Apply on the next chat request — no restart needed."
+                        subtitle: String(localized: "Apply on the next chat request — no restart needed.")
                     ) {
                         RequestDefaultsSectionContent()
                     }
 
                     SettingsSection(
                         category: .voice,
-                        subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
+                        subtitle: String(localized: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed.")
                     ) {
                         WakePhraseSectionContent()
                         VoiceCloneSectionContent()
@@ -133,7 +133,7 @@ struct SettingsView: View {
 
                     SettingsSection(
                         category: .messaging,
-                        subtitle: "Message your local model from your phone via a Telegram bot. No public URL or port-forwarding needed — the app long-polls Telegram over your normal internet connection, so it works behind home Wi-Fi."
+                        subtitle: String(localized: "Message your local model from your phone via a Telegram bot. No public URL or port-forwarding needed — the app long-polls Telegram over your normal internet connection, so it works behind home Wi-Fi.")
                     ) {
                         MessagingSectionContent(bridge: appState.telegramBridge)
                     }
@@ -145,7 +145,7 @@ struct SettingsView: View {
                     if BuildFeatures.current.selfUpdate {
                         SettingsSection(
                             category: .updates,
-                            subtitle: "New versions ship on the project's GitHub releases page. Installing downloads the notarized app, swaps it in place, and relaunches — chats, models, and settings are untouched."
+                            subtitle: String(localized: "New versions ship on the project's GitHub releases page. Installing downloads the notarized app, swaps it in place, and relaunches — chats, models, and settings are untouched.")
                         ) {
                             UpdatesSectionContent(updates: appState.updates)
                         }
@@ -156,7 +156,7 @@ struct SettingsView: View {
                     // would never render.
                     SettingsSection(
                         category: .about,
-                        subtitle: "mlx-serve is free and open source, built by one person. Star it, follow along, or just say hello — questions and bug reports are welcome."
+                        subtitle: String(localized: "mlx-serve is free and open source, built by one person. Star it, follow along, or just say hello — questions and bug reports are welcome.")
                     ) {
                         ForEach(CommunityLinks.all) { item in
                             SettingsRow(title: item.title, explainer: item.explainer) {
@@ -463,7 +463,7 @@ private struct EngineAwareSections: View {
         if showMLX {
             SettingsSection(
                 category: .specDecode,
-                subtitle: "Big throughput wins on echo-heavy work; gates auto-disable on novel content. PLD, the drafter, and MTP are MLX-only — they no-op on GGUF / DSV4."
+                subtitle: String(localized: "Big throughput wins on echo-heavy work; gates auto-disable on novel content. PLD, the drafter, and MTP are MLX-only — they no-op on GGUF / DSV4.")
             ) {
                 SpecDecodeSectionContent()
             }
@@ -488,7 +488,7 @@ private struct EngineAwareSections: View {
         if showLlama {
             SettingsSection(
                 category: .ggufPerformance,
-                subtitle: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout."
+                subtitle: String(localized: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout.")
             ) {
                 LlamaPerformanceSectionContent()
             }
@@ -497,7 +497,7 @@ private struct EngineAwareSections: View {
         if showDs4 {
             SettingsSection(
                 category: .ds4,
-                subtitle: "Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines."
+                subtitle: String(localized: "Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines.")
             ) {
                 Ds4PerformanceSectionContent()
             }
@@ -651,7 +651,7 @@ private struct ModelFoldersSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var downloads: DownloadManager
 
-    private static let explainer = "Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json)."
+    private static let explainer = String(localized: "Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json).")
     private static let defaultExplainer = "Where new downloads are saved. Everything already downloaded keeps working — the old folder stays in the scan list. Restart the server to apply."
 
     /// Re-read after a pick so the row repaints without an @Published mirror of
@@ -1166,7 +1166,7 @@ private struct ContextSizeRow: View {
                 HStack(spacing: 12) {
                     if let modelMax = server.modelInfo?.modelMaxTokens, modelMax > 0 {
                         capPill(
-                            label: "Model max",
+                            label: String(localized: "Model max"),
                             value: Self.formatTokens(modelMax),
                             warn: false
                         )
@@ -1175,7 +1175,7 @@ private struct ContextSizeRow: View {
                         let chosen = appState.serverOptions.ctxSize
                         let exceeds = chosen > 0 && chosen > safeMax
                         capPill(
-                            label: "GPU-safe max",
+                            label: String(localized: "GPU-safe max"),
                             value: Self.formatTokens(safeMax),
                             warn: exceeds
                         )
@@ -1185,7 +1185,7 @@ private struct ContextSizeRow: View {
                     // so "Auto" must not look like a mystery.
                     if let inUse = ContextSizeDisplay.inUseValue(
                         contextLength: server.modelInfo?.contextLength) {
-                        capPill(label: "In use", value: inUse, warn: false)
+                        capPill(label: String(localized: "In use"), value: inUse, warn: false)
                     }
                 }
             }
@@ -1284,7 +1284,7 @@ private struct SpecDecodeSectionContent: View {
         // prompt) and from the drafter (a separate small model). It needs no
         // extra download and no compatible pairing: a Qwen 3.5/3.6 checkpoint
         // either ships the head or it doesn't.
-        SettingsSubheader("Multi-Token Prediction — Qwen 3.5 / 3.6")
+        SettingsSubheader(String(localized: "Multi-Token Prediction — Qwen 3.5 / 3.6"))
         if let m = meta["enableMTP"] {
             SettingsRow(
                 title: m.title,
@@ -1631,29 +1631,29 @@ private struct DrafterRow: View {
 
     private var explainer: String {
         if let r = recommended {
-            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). On automatically: \(r.url.lastPathComponent)."
+            return String(localized: "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). On automatically: \(r.url.lastPathComponent).")
         }
         // Server hasn't reported a model yet — either it's not started or
         // we're mid-handshake. Don't claim the architecture is wrong.
         if server.modelInfo == nil {
             if appState.selectedModelPath.isEmpty {
-                return "Select a model to check drafter compatibility."
+                return String(localized: "Select a model to check drafter compatibility.")
             }
-            return "Start the server to check drafter compatibility."
+            return String(localized: "Start the server to check drafter compatibility.")
         }
         // Server reported a model but didn't include `architecture` in its
         // /v1/models meta — that field landed in the same release that
         // unhid this row, so an older bundled binary will leave it empty.
         if (server.modelInfo?.architecture ?? "").isEmpty {
-            return "Drafter status unavailable (server build pre-dates this UI). Use --drafter via CLI."
+            return String(localized: "Drafter status unavailable (server build pre-dates this UI). Use --drafter via CLI.")
         }
         if !targetIsGemma4 {
-            return "Drafter is Gemma 4 only."
+            return String(localized: "Drafter is Gemma 4 only.")
         }
         if isMoeTarget {
-            return "No drafter for the MoE Gemma 4 — it regresses decode there. Use PLD instead."
+            return String(localized: "No drafter for the MoE Gemma 4 — it regresses decode there. Use PLD instead.")
         }
-        return "Drafter checkpoint not found. New Gemma 4 downloads bring it automatically."
+        return String(localized: "Drafter checkpoint not found. New Gemma 4 downloads bring it automatically.")
     }
 
     /// The drafter this target would pair with, whether or not it's on disk —
@@ -1925,7 +1925,7 @@ private struct RequestDefaultsSectionContent: View {
 private struct WakePhraseSectionContent: View {
     @EnvironmentObject var appState: AppState
 
-    private static let explainer = "What you say to address the assistant in hands-free voice mode. Case and punctuation don't matter, and common greetings (hey, hi, okay…) are accepted before the name. The assistant takes the last word as its name. Empty = \"Hey Loki\"."
+    private static let explainer = String(localized: "What you say to address the assistant in hands-free voice mode. Case and punctuation don't matter, and common greetings (hey, hi, okay…) are accepted before the name. The assistant takes the last word as its name. Empty = \"Hey Loki\".")
 
     var body: some View {
         SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer]) {
@@ -1958,7 +1958,7 @@ private struct VoiceCloneSectionContent: View {
     @StateObject private var previewer = VoicePreviewer()
     @EnvironmentObject private var downloads: DownloadManager
 
-    private static let explainer = "A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use)."
+    private static let explainer = String(localized: "A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use).")
     /// Per-engine blurb. The old single string described Kokoro AND cloning and
     /// was shown under every tab, so picking "System voice" read as advice about
     /// a model you had not chosen.
@@ -2182,8 +2182,8 @@ private struct SandboxSectionContent: View {
 
     var body: some View {
         SettingsRow(
-            title: "Only use tools when I ask",
-            explainer: "ON = tools are opt-in: a chat only gets them when you turn the wrench (or MCP) on yourself, and sending a message that looks like a task — \"make me a website\", \"npm install react\" — no longer stops to ask whether to enable Tools or MCP first. OFF = that suggestion still appears before such a message is sent. Either way the toolbar toggles, and any agent that decides them for its tab, are unchanged."
+            title: String(localized: "Only use tools when I ask"),
+            explainer: String(localized: "ON = tools are opt-in: a chat only gets them when you turn the wrench (or MCP) on yourself, and sending a message that looks like a task — \"make me a website\", \"npm install react\" — no longer stops to ask whether to enable Tools or MCP first. OFF = that suggestion still appears before such a message is sent. Either way the toolbar toggles, and any agent that decides them for its tab, are unchanged.")
         ) {
             Toggle("", isOn: $appState.serverOptions.toolsOnlyWhenAsked)
                 .labelsHidden()
@@ -2191,8 +2191,8 @@ private struct SandboxSectionContent: View {
         }
 
         SettingsRow(
-            title: "Agent workspace folder",
-            explainer: "The default working folder for the agent's tools (shell, readFile, writeFile, …) in every chat — and the folder shared into the sandbox VM at /workspace while the sandbox is on. Changing it moves chats still on the previous default, remounts a running sandbox, and restarts any open terminal sessions in the new folder; a chat with its own picked folder (the folder icon on the Agent pill) keeps it."
+            title: String(localized: "Agent workspace folder"),
+            explainer: String(localized: "The default working folder for the agent's tools (shell, readFile, writeFile, …) in every chat — and the folder shared into the sandbox VM at /workspace while the sandbox is on. Changing it moves chats still on the previous default, remounts a running sandbox, and restarts any open terminal sessions in the new folder; a chat with its own picked folder (the folder icon on the Agent pill) keeps it.")
         ) {
             HStack(spacing: 8) {
                 Text((currentWorkspace as NSString).abbreviatingWithTildeInPath)
@@ -2214,8 +2214,8 @@ private struct SandboxSectionContent: View {
         // a lie; the base image is likewise locked to the bundled guest.
         if BuildFeatures.current.hostShell {
             SettingsRow(
-                title: "Sandbox agent commands",
-                explainer: "OFF = the agent runs shell commands directly on macOS (fast, full access to your files). ON = commands run inside an isolated Linux sandbox that can only touch the current working folder, so a bad command can't harm the rest of your Mac. Costs a bit more memory while active because it spins up a lightweight virtual machine for the session."
+                title: String(localized: "Sandbox agent commands"),
+                explainer: String(localized: "OFF = the agent runs shell commands directly on macOS (fast, full access to your files). ON = commands run inside an isolated Linux sandbox that can only touch the current working folder, so a bad command can't harm the rest of your Mac. Costs a bit more memory while active because it spins up a lightweight virtual machine for the session.")
             ) {
                 Toggle("", isOn: $appState.serverOptions.sandbox.enabled)
                     .labelsHidden()
@@ -2224,8 +2224,8 @@ private struct SandboxSectionContent: View {
         }
 
         SettingsRow(
-            title: "Network + port mapping",
-            explainer: "ON = the sandbox has outbound internet (NAT), and any server the agent starts inside it is automatically reachable on this Mac at localhost with the same port — e.g. a dev server on 8080 appears at localhost:8080 (bound to localhost only, never your LAN). OFF = the sandbox gets no network device at all: fully isolated, but installs and downloads inside it will fail. Applies to the next sandbox session."
+            title: String(localized: "Network + port mapping"),
+            explainer: String(localized: "ON = the sandbox has outbound internet (NAT), and any server the agent starts inside it is automatically reachable on this Mac at localhost with the same port — e.g. a dev server on 8080 appears at localhost:8080 (bound to localhost only, never your LAN). OFF = the sandbox gets no network device at all: fully isolated, but installs and downloads inside it will fail. Applies to the next sandbox session.")
         ) {
             Toggle("", isOn: $appState.serverOptions.sandbox.network)
                 .labelsHidden()
@@ -2233,8 +2233,8 @@ private struct SandboxSectionContent: View {
         }
 
         SettingsRow(
-            title: "Reset sandbox",
-            explainer: "Deletes ALL sandbox data and returns it to factory state: the downloaded guest image and everything inside it (installed CLIs like pi/hermes, their configs and logins, any files created outside the shared workspace), the cached kernel, the sandbox ssh identity, and the activity transcript. Any running guest and live agent sessions are stopped immediately. Your workspace folder, models, and other app data on this Mac are not touched. The sandbox re-provisions itself on next use."
+            title: String(localized: "Reset sandbox"),
+            explainer: String(localized: "Deletes ALL sandbox data and returns it to factory state: the downloaded guest image and everything inside it (installed CLIs like pi/hermes, their configs and logins, any files created outside the shared workspace), the cached kernel, the sandbox ssh identity, and the activity transcript. Any running guest and live agent sessions are stopped immediately. Your workspace folder, models, and other app data on this Mac are not touched. The sandbox re-provisions itself on next use.")
         ) {
             Button(role: .destructive) {
                 showResetConfirm = true
@@ -2299,8 +2299,8 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Enable Telegram bot",
-            explainer: "Long-polls Telegram for messages and relays them to your local model. Needs a bot token (below) and a running model."
+            title: String(localized: "Enable Telegram bot"),
+            explainer: String(localized: "Long-polls Telegram for messages and relays them to your local model. Needs a bot token (below) and a running model.")
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.enabled)
                 .labelsHidden()
@@ -2308,8 +2308,8 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Bot token",
-            explainer: "Paste the token @BotFather gives you after /newbot. Stored locally on this Mac and sent only to Telegram's API."
+            title: String(localized: "Bot token"),
+            explainer: String(localized: "Paste the token @BotFather gives you after /newbot. Stored locally on this Mac and sent only to Telegram's API.")
         ) {
             TextField("", text: $appState.serverOptions.telegram.botToken,
                       prompt: Text("123456:ABC-DEF…"))
@@ -2319,8 +2319,8 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Tools",
-            explainer: "OFF = plain chat (safe). ON = the bot can run shell commands and read/write files on this Mac, triggered from your phone. Confined to ~/.mlx-serve/telegram-workspace. Only enable if you understand the risk — anyone who can message the locked chat gets this power."
+            title: String(localized: "Tools"),
+            explainer: String(localized: "OFF = plain chat (safe). ON = the bot can run shell commands and read/write files on this Mac, triggered from your phone. Confined to ~/.mlx-serve/telegram-workspace. Only enable if you understand the risk — anyone who can message the locked chat gets this power.")
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.agentMode)
                 .labelsHidden()
@@ -2328,8 +2328,8 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "MCP tools",
-            explainer: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Tools. Servers start on first use."
+            title: String(localized: "MCP tools"),
+            explainer: String(localized: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Tools. Servers start on first use.")
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.useMCP)
                 .labelsHidden()
@@ -2337,8 +2337,8 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Enable thinking",
-            explainer: "Send reasoning-enabled requests for models that support it. The bot replies with the final answer only (no thinking trace)."
+            title: String(localized: "Enable thinking"),
+            explainer: String(localized: "Send reasoning-enabled requests for models that support it. The bot replies with the final answer only (no thinking trace).")
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.enableThinking)
                 .labelsHidden()
@@ -2346,8 +2346,8 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Answer as agent",
-            explainer: "Reply as one of your agents (Chat window ▸ Agents): its prompt, tools, model and workspace. \"None\" uses the settings above."
+            title: String(localized: "Answer as agent"),
+            explainer: String(localized: "Reply as one of your agents (Chat window ▸ Agents): its prompt, tools, model and workspace. \"None\" uses the settings above.")
         ) {
             Picker("", selection: $appState.serverOptions.telegram.agentId) {
                 Text("None").tag(UUID?.none)
@@ -2463,8 +2463,8 @@ private struct UpdatesSectionContent: View {
 
     var body: some View {
         SettingsRow(
-            title: "Check for updates automatically",
-            explainer: "Checks the GitHub releases page once a day and shows an update banner in the menu bar tray when a newer version ships. No data beyond the version request leaves this Mac."
+            title: String(localized: "Check for updates automatically"),
+            explainer: String(localized: "Checks the GitHub releases page once a day and shows an update banner in the menu bar tray when a newer version ships. No data beyond the version request leaves this Mac.")
         ) {
             Toggle("", isOn: Binding(
                 get: { updates.autoCheckEnabled },
@@ -2474,7 +2474,7 @@ private struct UpdatesSectionContent: View {
         }
 
         SettingsRow(
-            title: "Installed version — v\(updates.currentVersion)",
+            title: String(localized: "Installed version — v\(updates.currentVersion)"),
             explainer: statusText
         ) {
             Button {
@@ -2507,8 +2507,8 @@ private struct UpdatesSectionContent: View {
 
         if let update = updates.available {
             SettingsRow(
-                title: "MLX Core v\(update.version) is available",
-                explainer: "Downloads MLXCore.dmg from the release, replaces the app, and relaunches."
+                title: String(localized: "MLX Core v\(update.version) is available"),
+                explainer: String(localized: "Downloads MLXCore.dmg from the release, replaces the app, and relaunches.")
             ) {
                 switch updates.phase {
                 case .downloading(let fraction):

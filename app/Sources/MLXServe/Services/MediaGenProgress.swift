@@ -29,7 +29,7 @@ struct MediaGenProgress: Equatable {
     /// steps to count.
     var detailText: String {
         guard total > 0 else { return message }
-        return "\(message) — step \(step) of \(total)"
+        return String(localized: "\(message) — step \(step) of \(total)")
     }
 
     /// `m:ss` since the generation started. Never negative: a startedAt in the
@@ -49,8 +49,8 @@ enum MediaGenError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .emptyInput(let what):  return "\(what) is empty."
-        case .notDownloaded(let n):  return "\(n) is not downloaded."
+        case .emptyInput(let what):  return String(localized: "\(what) is empty.")
+        case .notDownloaded(let n):  return String(localized: "\(n) is not downloaded.")
         case .server(let m):         return m
         }
     }
@@ -82,7 +82,7 @@ enum MediaSSE {
         case "error":
             // A typed error with no message is still an error — never silently
             // ignored, or the stream just ends and the caller reports "no data".
-            return .failed(ev["message"] as? String ?? "Generation failed.")
+            return .failed(ev["message"] as? String ?? String(localized: "Generation failed."))
         default:
             return .ignored
         }
@@ -92,11 +92,11 @@ enum MediaSSE {
     /// passed through verbatim — inventing a translation would mislabel it.
     static func stageLabel(_ stage: String) -> String {
         switch stage {
-        case "encode":  return "Encoding prompt"
-        case "prefill": return "Encoding prompt"
-        case "frames":  return "Composing frames"
-        case "diffuse": return "Composing"
-        case "decode":  return "Rendering audio"
+        case "encode":  return String(localized: "Encoding prompt")
+        case "prefill": return String(localized: "Encoding prompt")
+        case "frames":  return String(localized: "Composing frames")
+        case "diffuse": return String(localized: "Composing")
+        case "decode":  return String(localized: "Rendering audio")
         default:        return stage
         }
     }

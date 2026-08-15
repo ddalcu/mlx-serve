@@ -41,6 +41,28 @@ enum TruncationNotice {
     static func footnote(cause: Cause, maxTokens: Int) -> String {
         switch cause {
         case .maxTokens:
+            return String(localized: "Output truncated — max tokens (\(maxTokens)) reached. Try breaking the task into smaller steps, or raise “max tokens” in Settings.")
+        case .repetitionLoop:
+            return String(localized: "Stopped — the model started repeating itself and the server cut the reply. Try rephrasing, or ask for a smaller piece of the task.")
+        }
+    }
+
+    /// The English the sentence above USED to be, frozen.
+    ///
+    /// This is not copy — it is a description of bytes already sitting in
+    /// people's `chat-history.json`, appended there by builds before
+    /// 2026-08-11, always in English because nothing was localized then. The
+    /// displayed sentence is now translated, and `stripped(from:)` derives its
+    /// markers from this, so the two must be separate functions: derive the
+    /// scrubber from `footnote` and a Chinese app looks for a Chinese banner,
+    /// finds nothing, and feeds the English one back to the model as assistant
+    /// prose — the error-echo class the notice-as-data change fixed.
+    ///
+    /// Never edit these strings. A better wording belongs in `footnote`; a
+    /// change here just stops matching what is on disk.
+    private static func legacyFootnote(cause: Cause, maxTokens: Int) -> String {
+        switch cause {
+        case .maxTokens:
             return "Output truncated — max tokens (\(maxTokens)) reached. Try breaking the task into smaller steps, or raise “max tokens” in Settings."
         case .repetitionLoop:
             return "Stopped — the model started repeating itself and the server cut the reply. Try rephrasing, or ask for a smaller piece of the task."
@@ -52,7 +74,7 @@ enum TruncationNotice {
     /// `stripped(from:)`, which scrubs it out of saved sessions at history
     /// build time.
     static func text(cause: Cause, maxTokens: Int) -> String {
-        "\n\n⚠️ *\(footnote(cause: cause, maxTokens: maxTokens))*"
+        "\n\n⚠️ *\(legacyFootnote(cause: cause, maxTokens: maxTokens))*"
     }
 
     /// Removes a legacy banner an older build appended INTO content, so

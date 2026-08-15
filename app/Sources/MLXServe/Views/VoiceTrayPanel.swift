@@ -47,8 +47,8 @@ struct VoiceTrayPanel: View {
     private var header: some View {
         TrayFeatureRow(
             icon: "waveform",
-            title: "Voice",
-            subtitle: "Hands-free — no window needed",
+            title: String(localized: "Voice"),
+            subtitle: String(localized: "Hands-free — no window needed"),
             isOn: voice.isActive
         ) {
             Toggle("", isOn: activeBinding)
@@ -174,8 +174,8 @@ struct VoiceTrayPanel: View {
 
     private var controls: some View {
         HStack(spacing: 10) {
-            controlButton(system: "plus.bubble", label: "New",
-                          help: "Start a fresh conversation with this agent — the old one stays in the chat list") {
+            controlButton(system: "plus.bubble", label: String(localized: "New"),
+                          help: String(localized: "Start a fresh conversation with this agent — the old one stays in the chat list")) {
                 // Scoped: only the voice conversation's turn. Other chat tabs'
                 // streams keep running (multi-turn engine).
                 if let sid = appState.activeChatId {
@@ -187,9 +187,9 @@ struct VoiceTrayPanel: View {
                 // left in the sidebar, as it always has been.
                 _ = appState.newChatSession(agentId: appState.defaultAgentId)
             }
-            controlButton(system: "stop.fill", label: "Stop",
+            controlButton(system: "stop.fill", label: String(localized: "Stop"),
                           tint: voice.canInterrupt ? .red : nil,
-                          help: "Stop the assistant and listen again — cut off a long answer and move on") {
+                          help: String(localized: "Stop the assistant and listen again — cut off a long answer and move on")) {
                 voice.bargeIn()
             }
             .disabled(!voice.canInterrupt)

@@ -24,10 +24,25 @@ enum ChatSessionTitle {
         return trimmed == plain || trimmed == agent
     }
 
+    /// The placeholder as it is DRAWN, which is the only side of it that is
+    /// translated.
+    ///
+    /// `plain` and `agent` are two things at once: the text a fresh row shows,
+    /// and the sentinel `isPlaceholder` tests to decide whether the auto-titler
+    /// still owns the thread — and that sentinel is written to disk, in
+    /// whatever language the app was running when the session was created.
+    /// Localizing them at the source would mean a thread started in English is
+    /// no longer a placeholder to a Chinese app (it keeps "New Chat" forever)
+    /// and vice versa. So the stored value stays English and the translation
+    /// happens here, at the last possible moment.
+    static func localizedPlaceholder(hasAgent: Bool) -> String {
+        hasAgent ? String(localized: "New agent") : String(localized: "New Chat")
+    }
+
     /// What the sidebar actually draws.
     static func display(title: String, agentName: String?) -> String {
         if let named = agentName?.trimmedNonEmpty { return named }
-        return isPlaceholder(title) ? placeholder(hasAgent: agentName != nil) : title
+        return isPlaceholder(title) ? localizedPlaceholder(hasAgent: agentName != nil) : title
     }
 
     /// The caption under an agent thread's name: what that conversation is

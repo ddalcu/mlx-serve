@@ -110,9 +110,36 @@ final class TruncationNoticeTests: XCTestCase {
         msg.truncationNotice = TruncationNotice.Notice(cause: .repetitionLoop, maxTokens: 0)
         XCTAssertEqual(msg.content, "clean answer")
         XCTAssertTrue(msg.truncationNotice!.text.lowercased().contains("repeating"))
-        // The cap variant still names its cap.
+        // The cap variant still names its cap — as the user sees it. An `Int`
+        // interpolated into `String(localized:)` is formatted for the locale,
+        // so the displayed sentence says "16,384", not "16384". (The legacy
+        // banner `text(cause:maxTokens:)` keeps the raw interpolation, which is
+        // what `stripped(from:)` matches against on disk.)
         let cap = TruncationNotice.Notice(cause: .maxTokens, maxTokens: 16384)
-        XCTAssertTrue(cap.text.contains("16384"))
+        let shown = cap.text.replacingOccurrences(of: ",", with: "")
+            .replacingOccurrences(of: "\u{202F}", with: "")
+            .replacingOccurrences(of: "\u{00A0}", with: "")
+        XCTAssertTrue(shown.contains("16384"), "the cap must be named: \(cap.text)")
+    }
+
+    /// The scrubber is matching bytes that are ALREADY in people's
+    /// `chat-history.json`, written by builds that predate localization and
+    /// therefore always English. These literals are what is on disk — spelled
+    /// out here rather than built with `TruncationNotice.text`, because a test
+    /// that constructs its input from the same function it is testing agrees
+    /// with itself in every language and cannot see the divergence.
+    ///
+    /// If the displayed sentence is reworded or translated, THIS must still
+    /// pass: a saved session that stops being scrubbed feeds the banner back
+    /// to the model as assistant prose.
+    func testTheLegacyBannerOnDiskIsScrubbedByItsOwnFrozenEnglish() {
+        let loopOnDisk = "answer\n\n⚠️ *Stopped — the model started repeating itself and the "
+            + "server cut the reply. Try rephrasing, or ask for a smaller piece of the task.*"
+        XCTAssertEqual(TruncationNotice.stripped(from: loopOnDisk), "answer")
+
+        let capOnDisk = "done\n\n⚠️ *Output truncated — max tokens (4096) reached. Try breaking "
+            + "the task into smaller steps, or raise “max tokens” in Settings.*"
+        XCTAssertEqual(TruncationNotice.stripped(from: capOnDisk), "done")
     }
 
     func testStrippedRemovesBothLegacyBannersAndLeavesProseAlone() {

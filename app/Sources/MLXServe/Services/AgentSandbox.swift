@@ -977,7 +977,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                     guard self.transport == .vsock else {
                         let why = self.transportFallback ?? "the guest booted the legacy console shell"
                         throw SandboxError(message:
-                            "MCP servers need the vsock guest transport: \(why)")
+                            String(localized: "MCP servers need the vsock guest transport: \(why)"))
                     }
                     // Only the shared folder exists in the guest; anything else
                     // maps to /workspace rather than silently landing elsewhere.
@@ -1030,7 +1030,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         return (self.currentSshPort, self.rootfsPath)
                     }()
                     guard let sshPort = port, let rootfsDir = rootfs else {
-                        throw SandboxError(message: "the sandbox guest has no ssh channel — turn on guest networking in Settings → Agent Sandbox")
+                        throw SandboxError(message: String(localized: "the sandbox guest has no ssh channel — turn on guest networking in Settings → Agent Sandbox"))
                     }
                     // Stale-cache preflight: the ssh transport needs dropbear
                     // BAKED into the image; an old cached rootfs simply lacks
@@ -1043,7 +1043,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                     var remoteCommand: String?
                     if let agent {
                         guard let model, !model.isEmpty else {
-                            throw SandboxError(message: "no model is loaded — start the server before opening a \(agent.displayName) session")
+                            throw SandboxError(message: String(localized: "no model is loaded — start the server before opening a \(agent.displayName) session"))
                         }
                         let bootstrap = try SandboxAgentRegistry.materialize(
                             spec: agent, model: model, serverPort: serverPort,
@@ -1059,7 +1059,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         Thread.sleep(forTimeInterval: 0.1)
                     }
                     guard self.sshMirrorActive(port: sshPort) else {
-                        throw SandboxError(message: "the guest network never came up — no ssh mirror on localhost:\(sshPort)")
+                        throw SandboxError(message: String(localized: "the guest network never came up — no ssh mirror on localhost:\(sshPort)"))
                     }
 
                     let label = agent?.displayName ?? "shell"
@@ -1134,7 +1134,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         terminalCwd = "/workspace" // a fresh guest starts in its workdir
 
         #if !arch(arm64)
-        throw SandboxError(message: "the Agent Sandbox requires Apple Silicon (the guest kernel is arm64)")
+        throw SandboxError(message: String(localized: "the Agent Sandbox requires Apple Silicon (the guest kernel is arm64)"))
         #else
         // Developer ID fetches the kernel + rootfs; the App Store build unpacks
         // them from the bundle (guideline 2.5.2 forbids downloading them). Same
@@ -1175,7 +1175,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         // something is wrong with the bundle. Fail loudly rather than boot a VM
         // whose MCP servers can never connect.
         if BuildFeatures.current.isMAS && cfg.transport == .legacyConsole {
-            throw SandboxError(message: "the bundled guest is missing vsock support or the vz-agent binary — the app bundle is incomplete")
+            throw SandboxError(message: String(localized: "the bundled guest is missing vsock support or the vz-agent binary — the app bundle is incomplete"))
         }
         let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
         cfg.network = net
@@ -1269,7 +1269,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             forwarder?.stop(); forwarder = nil
             sshForwarder?.stop(); sshForwarder = nil
             NSLog("[sandbox] boot failed: \(error)\n--- guest console tail ---\n\(tail)\n--- end ---")
-            throw SandboxError(message: "sandbox failed to start: \(error). Turn off the Agent Sandbox in Settings to run on the host, or check the base image. (guest console tail written to the server log)")
+            throw SandboxError(message: String(localized: "sandbox failed to start: \(error). Turn off the Agent Sandbox in Settings to run on the host, or check the base image. (guest console tail written to the server log)"))
         }
         guest = g; sharedRoot = root
         currentSshPort = bootSshPort; rootfsPath = rootfs
@@ -1357,11 +1357,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
         let (gz, resp) = try OCIClient.httpGet(Self.kernelURL)
         guard resp.statusCode == 200 else {
-            throw SandboxError(message: "could not download the sandbox kernel (HTTP \(resp.statusCode))")
+            throw SandboxError(message: String(localized: "could not download the sandbox kernel (HTTP \(resp.statusCode))"))
         }
         let kernel = try OCIClient.gunzip(gz)
         guard Self.kernelHasVirtiofsSupport(kernel) else {
-            throw SandboxError(message: "downloaded sandbox kernel lacks virtiofs support — release asset mismatch")
+            throw SandboxError(message: String(localized: "downloaded sandbox kernel lacks virtiofs support — release asset mismatch"))
         }
         try kernel.write(to: dest, options: .atomic)
         return dest.path
@@ -1393,7 +1393,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                 NSLog("[sandbox] \(msg)")
             }
         } catch {
-            throw SandboxError(message: "could not pull the sandbox base image \"\(image)\" (\(Self.guestArch)): \(error.localizedDescription)")
+            throw SandboxError(message: String(localized: "could not pull the sandbox base image \"\(image)\" (\(Self.guestArch)): \(error.localizedDescription)"))
         }
         fm.createFile(atPath: marker.path, contents: Data())
         return dir.path

@@ -206,7 +206,7 @@ struct CodeBlockView: View {
     /// than the code in front of you.
     private var label: String {
         let trimmed = language.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? "Code" : trimmed
+        return trimmed.isEmpty ? String(localized: "Code") : trimmed
     }
 
     var body: some View {

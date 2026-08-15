@@ -105,7 +105,7 @@ struct MusicGenView: View {
             VStack(spacing: 12) {
                 previewArea
                 AudioHistoryShelf(
-                    title: "History",
+                    title: String(localized: "History"),
                     paths: service.recent,
                     playingPath: clipPlayer.playingPath,
                     onPlay: { play($0) },

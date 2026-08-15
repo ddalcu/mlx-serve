@@ -18,7 +18,7 @@ final class AgentEditorLayoutTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relativePath)
-        return try String(contentsOf: url, encoding: .utf8)
+        return SourceScan.normalizingLocalization(try String(contentsOf: url, encoding: .utf8))
     }
 
     private func agentsWindow() throws -> String {

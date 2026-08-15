@@ -251,13 +251,18 @@ for pat, what in ((r'install_name_tool -add_rpath @loader_path "\$CONTENTS/Frame
 # own .app rather than calling app/build.sh, so a step added to only one of
 # them ships a DMG that is English for every user while the local build looks
 # correct. Keys ARE the English source strings, so nothing crashes or blanks —
-# a Chinese user just never sees Chinese, which is invisible from here.
+# a translated user just never sees their language, which is invisible here.
 rruns = " ".join(str(s.get("run", "")) for j in wf["jobs"].values()
                  for s in j.get("steps", []))
 check("xcstringstool compile" in rruns,
       "release.yml compiles the String Catalog into the bundle")
-check("zh-Hans.lproj/Localizable.strings" in rruns,
-      "release.yml FAILS the build when the Chinese strings are missing")
+# The existence check must be driven BY the catalog, not by a language spelled
+# into the workflow: a hard-coded "zh-Hans.lproj" still passes on the day a
+# second language silently fails to compile.
+check(".lproj/Localizable.strings" in rruns and "for lang in" in rruns,
+      "release.yml FAILS the build when any catalog language is missing from the bundle")
+check("zh-Hans" not in rruns,
+      "release.yml names no single language — the check iterates the catalog's own list")
 
 build_sh = open("app/build.sh").read()
 check("xcstringstool compile" in build_sh,

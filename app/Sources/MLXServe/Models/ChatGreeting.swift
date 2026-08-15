@@ -3,9 +3,9 @@ import Foundation
 /// What an empty conversation says above its composer, and whether it offers
 /// the discovery chips underneath.
 enum ChatGreeting {
-    static let plainHeading = "How can I help you today?"
+    static let plainHeading = String(localized: "How can I help you today?")
     /// Outranks the brief: it is the one thing that must be acted on first.
-    static let serverStopped = "Start the server to begin."
+    static let serverStopped = String(localized: "Start the server to begin.")
 
     static func heading(agentName: String?) -> String {
         agentName?.trimmedNonEmpty ?? plainHeading

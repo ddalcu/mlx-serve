@@ -26,13 +26,13 @@ enum WelcomeModelPicks {
     /// absent — it's a niche that only fits very large Macs and the browser
     /// covers it.
     private static let categories: [Category] = [
-        Category(label: "General",
+        Category(label: String(localized: "General"),
                  strength: "Best all-rounder for everyday chat, writing, and quick questions.",
                  catalog: RecommendedModelPick.gemmaCatalog),
-        Category(label: "Coding & agents",
+        Category(label: String(localized: "Coding & agents"),
                  strength: "Strong at coding and multi-step agent work like using tools.",
                  catalog: RecommendedModelPick.qwenCatalog),
-        Category(label: "Coding specialist",
+        Category(label: String(localized: "Coding specialist"),
                  strength: "A focused coding model built for working across a whole project.",
                  catalog: RecommendedModelPick.poolsideCatalog),
     ]

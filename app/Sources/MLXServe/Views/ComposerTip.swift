@@ -29,33 +29,33 @@ struct ComposerTip: Equatable {
 
     static func attachments(audioSupported: Bool) -> ComposerTip {
         ComposerTip(
-            title: "Attach",
+            title: String(localized: "Attach"),
             body: audioSupported
-                ? "Image, PDF or audio — or a folder to ask questions about."
-                : "Image or PDF — or a folder to ask questions about.")
+                ? String(localized: "Image, PDF or audio — or a folder to ask questions about.")
+                : String(localized: "Image or PDF — or a folder to ask questions about."))
     }
 
     static func thinking(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
-        ComposerTip(title: "Thinking · \(state(isOn))",
+        ComposerTip(title: String(localized: "Thinking · \(state(isOn))"),
                     body: agent.map(locked)
-                        ?? "Reasoning trace before the answer. Click to turn it \(opposite(isOn)); right-click to set effort.")
+                        ?? String(localized: "Reasoning trace before the answer. Click to turn it \(opposite(isOn)); right-click to set effort."))
     }
 
     static func tools(isOn: Bool, workspace: String?, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(
-            title: "Tools · \(state(isOn))",
+            title: String(localized: "Tools · \(state(isOn))"),
             body: agent.map(locked)
-                ?? "Shell, files, web, media. Click to turn it \(opposite(isOn)); right-click to pick tools and set the workspace.",
+                ?? String(localized: "Shell, files, web, media. Click to turn it \(opposite(isOn)); right-click to pick tools and set the workspace."),
             // Still what every file and shell call resolves against, even when
             // it's the agent's folder rather than the chat's.
-            detail: "Workspace: \(workspace ?? "not set")")
+            detail: String(localized: "Workspace: \(workspace ?? String(localized: "not set"))"))
     }
 
     static func mcp(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(
-            title: "MCP · \(state(isOn))",
+            title: String(localized: "MCP · \(state(isOn))"),
             body: agent.map(locked)
-                ?? "Adds your enabled MCP servers' tools. Click to turn it \(opposite(isOn)); right-click for the Marketplace.")
+                ?? String(localized: "Adds your enabled MCP servers' tools. Click to turn it \(opposite(isOn)); right-click for the Marketplace."))
     }
 
     /// The body a control gets while its agent owns it. The title still carries
@@ -63,11 +63,18 @@ struct ComposerTip: Equatable {
     /// that can't happen is the dead-offer class, so this names the agent and
     /// where the setting actually lives instead.
     private static func locked(_ agent: String) -> String {
-        "Set by the agent \(agent). Edit the agent to change it."
+        String(localized: "Set by the agent \(agent). Edit the agent to change it.")
     }
 
-    private static func state(_ isOn: Bool) -> String { isOn ? "ON" : "OFF" }
-    private static func opposite(_ isOn: Bool) -> String { isOn ? "off" : "on" }
+    private static func state(_ isOn: Bool) -> String {
+        isOn ? String(localized: "ON") : String(localized: "OFF")
+    }
+    /// The action a click offers, which is the OPPOSITE of the state above —
+    /// a nested literal is an ARGUMENT to the sentence around it, so it stays
+    /// English inside a translated line unless it is localized here.
+    private static func opposite(_ isOn: Bool) -> String {
+        isOn ? String(localized: "off") : String(localized: "on")
+    }
 }
 
 // MARK: - Hover lifecycle

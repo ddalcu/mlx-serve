@@ -1,18 +1,22 @@
 import XCTest
 @testable import MLXCore
 
-/// Every user-facing string the app draws must exist in the String Catalog with
-/// a Simplified Chinese translation.
+/// Every user-facing string the app draws must exist in the String Catalog,
+/// translated into every language the catalog targets. Nothing here names a
+/// language: the target list is DERIVED from the catalog (`targetLanguages`),
+/// so adding one is a data change — translate, declare it in the two plists —
+/// and this audit begins enforcing it in the same commit. Today that list is
+/// Simplified Chinese.
 ///
 /// The app has no localization *call sites*: SwiftUI's `Text("…")`,
 /// `Button("…")`, `.help("…")` and friends take a `LocalizedStringKey` for a
 /// string LITERAL, so they already perform a `Bundle.main` lookup at render
-/// time. Adding `zh-Hans.lproj/Localizable.strings` to the bundle localizes
+/// time. Adding `<lang>.lproj/Localizable.strings` to the bundle localizes
 /// them with no code change, and a missing entry falls through to the key —
 /// which IS the English text. That fallback is what makes this class of bug
 /// silent: an untranslated string doesn't crash or blank out, it just renders
-/// in English inside a Chinese screen, and only a Chinese speaker looking at
-/// that exact pane would ever notice.
+/// in English inside an otherwise translated screen, and only someone reading
+/// that exact pane in that language would ever notice.
 ///
 /// So the guard is coverage, not behaviour: extract the keys from the sources
 /// the way SwiftUI does, and demand the catalog answer every one of them. The
@@ -44,13 +48,89 @@ final class LocalizationCatalogTests: XCTestCase {
     private static let localizedInitializers = [
         "Text", "Button", "Label", "Toggle", "Picker", "Section", "TextField",
         "SecureField", "Menu", "Stepper", "Link", "DisclosureGroup", "GroupBox",
-        "CommandMenu", "Alert",
+        "CommandMenu", "Alert", "ContentUnavailableView", "Window",
     ]
 
     /// Modifiers taking a `LocalizedStringKey` first argument.
     private static let localizedModifiers = [
         ".help", ".navigationTitle", ".navigationSubtitle", ".alert",
-        ".confirmationDialog",
+        ".confirmationDialog", ".accessibilityLabel",
+    ]
+
+    // MARK: - The call sites whose string literal is COPY HELD AS DATA
+
+    /// The other half of the app's copy: a literal that is stored in a `String`
+    /// and drawn later. `Text(item.title)` and `.help(row.help)` pick the
+    /// NON-localizing initializer — a `String` is drawn verbatim, so the bundle
+    /// is never asked — and the literal is nowhere near the view that draws it.
+    /// Those go through `String(localized:)` at the literal, which is a real
+    /// lookup, and `testRuntimeLocalizedCopyIsAlsoTranslated` then demands the
+    /// translation. Both lists are the audit's whole vocabulary for this class:
+    /// a helper or a field absent from them is invisible, so a new copy-bearing
+    /// row type gets added here rather than worked around.
+
+    /// App-local view builders whose FIRST positional argument is copy typed
+    /// `String` (`destinationRow("New Chat", icon:…)` → `Text(title)`).
+    private static let copyCarryingCalls = [
+        "destinationRow", "destinationLabel", "sectionHeader",
+        // The Agents editor's chrome and the panes that reuse it. Each takes
+        // its copy as `_ title: String` and draws it with `Text(title)`, which
+        // looks exactly like a `Text("…")` at the call site and localizes
+        // nothing.
+        "AgentSection", "AgentLabeledField", "AgentEditorRow",
+        "SortableHeader", "SettingsSubheader",
+    ]
+
+    /// `file → argument labels` whose value is copy typed `String`. Scoped per
+    /// file because the same word means different things elsewhere: a
+    /// `description:` in `BrowserManager` names a JS evaluation for a log line,
+    /// and `MCPCatalog`'s is a third party's own blurb.
+    private static let copyCarryingLabels: [String: [String]] = [
+        "Views/ChatEmptyState.swift": ["title", "help"],
+        "Views/ChatView.swift": ["help"],
+        "Views/StatusMenuView.swift": ["title", "subtitle", "help"],
+        "Views/TrayChrome.swift": ["title", "subtitle", "help"],
+        "Views/VoiceTrayPanel.swift": ["title", "subtitle", "help", "label"],
+        "Views/QuickLauncherView.swift": ["title", "subtitle", "help"],
+        "Views/AgentsWindow.swift": ["title", "subtitle", "help", "label", "caption"],
+        "Views/AgentViews.swift": ["title", "subtitle", "help"],
+        "Views/AgentEditorChrome.swift": ["title", "subtitle", "help"],
+        "Views/SettingsView.swift": ["title", "subtitle", "help", "label", "explainer"],
+        "Views/ModelBrowserView.swift": ["title", "subtitle", "help", "label"],
+        "Views/TasksView.swift": ["title", "subtitle", "label", "caption"],
+        "Views/ImageGenView.swift": ["title", "help", "label", "caption"],
+        "Views/VideoGenView.swift": ["title", "help", "label", "caption"],
+        "Views/AudioGenView.swift": ["title", "help", "label", "caption"],
+        "Views/MusicGenView.swift": ["title", "help", "label", "caption"],
+        "Views/Model3DGenView.swift": ["title", "help", "label", "caption"],
+        "Views/ContextPill.swift": ["label"],
+        "Views/CodeBlockView.swift": ["label"],
+        "Views/SandboxTerminalView.swift": ["message"],
+        // Pure data by design (`ComposerTipTests`), so every sentence the
+        // composer's four glyphs have is in this one type.
+        "Views/ComposerTip.swift": ["title", "body", "detail"],
+        // The example TITLES are menu labels; the BODIES are the model's own
+        // published phrasings and a reword is a quality regression, so `prompt`
+        // is deliberately not registered here.
+        "Views/H3PromptExamples.swift": ["title"],
+        "Models/SettingsCategory.swift": ["title"],
+        // Every server-launch knob's label and explainer, drawn by the
+        // Settings rows and read by its search index.
+        "Models/ServerOptions.swift": ["title", "explainer"],
+        "Models/RecommendedModels.swift": ["tagline", "blurb"],
+        "Models/WelcomeModelPicks.swift": ["label"],
+        "Models/CommunityLinks.swift": ["title", "explainer", "actionLabel"],
+        "Services/MediaGenProgress.swift": ["stage"],
+        "Services/MusicGenService.swift": ["message"],
+        // The sandbox's failures are shown to the user in an alert, not logged.
+        "Services/AgentSandbox.swift": ["message"],
+        // Our blurbs ABOUT third-party servers, drawn in the Marketplace list,
+        // and the field labels for the credentials each one needs. NOT
+        // `placeholder`: those are sample values (`ghp_...`, `<ORG>`,
+        // `postgres://user:pass@localhost:5432/mydb`) — a token format is not
+        // copy, and translating one would teach the user a credential that
+        // does not exist.
+        "Services/MCPCatalog.swift": ["description", "label"],
     ]
 
     // MARK: - Extraction
@@ -278,6 +358,34 @@ final class LocalizationCatalogTests: XCTestCase {
         var strings: [String: [String: (state: String, value: String)]]
     }
 
+    /// Every language the catalog translates INTO — the source language is the
+    /// keys themselves, so it is never a target.
+    ///
+    /// Derived rather than listed, because "which languages must be complete"
+    /// and "which languages ship" have to be the same answer: `xcstringstool`
+    /// compiles one `.lproj` per language it finds, both bundle paths call it
+    /// without naming one, and `tests/test_release_workflow_gates.sh` demands
+    /// both plists declare every language here. Adding a language is therefore
+    /// a DATA change — translate the catalog, declare it in the two plists —
+    /// and this audit starts enforcing it in the same commit. Half a language
+    /// is the silent-English bug per screen, which is the thing this file
+    /// exists to prevent, so there is deliberately no "draft" state: a language
+    /// the catalog carries is a language every key must answer.
+    private func targetLanguages(_ catalog: Catalog) -> [String] {
+        var found = Set<String>()
+        for localizations in catalog.strings.values { found.formUnion(localizations.keys) }
+        found.remove(catalog.sourceLanguage)
+        return found.sorted()
+    }
+
+    /// The target languages that have no usable translation for one key.
+    private func untranslatedLanguages(forKey key: String, in catalog: Catalog) -> [String] {
+        targetLanguages(catalog).filter { language in
+            guard let unit = catalog.strings[key]?[language] else { return true }
+            return unit.state != "translated" || unit.value.isEmpty
+        }
+    }
+
     private func loadCatalog() throws -> Catalog {
         let data = try Data(contentsOf: catalogURL)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -345,6 +453,43 @@ final class LocalizationCatalogTests: XCTestCase {
         XCTAssertFalse(found.contains("someVariable"), "A variable is not a LocalizedStringKey.")
     }
 
+    /// The data-copy scanner needs its own self-test for the same reason the
+    /// literal one does: it reports by finding NOTHING, so a rewrite that
+    /// stops matching turns the coverage assertion into a green no-op. It reads
+    /// three spellings of stored copy — the argument, the assignment and the
+    /// computed property — and must not read the localized form of any of them.
+    func testTheDataCopyScannerReadsAllThreeSpellingsAndSkipsLocalizedOnes() {
+        let sample = """
+        struct S {
+            let rows = [
+                Item(title: "Passed as an argument", help: "And its tooltip"),
+                Item(title: String(localized: "Already localized"), help: ""),
+            ]
+            init() {
+                title = "Assigned into a stored property"
+                other = "Not a registered label"
+            }
+            var title: String {
+                switch self {
+                case .a: "Returned from a computed property"
+                case .b: String(localized: "Localized in the same block")
+                }
+            }
+            // title: "commented out"
+        }
+        """
+        let found = bareCopyLiterals(in: sample, labels: ["title", "help"])
+        XCTAssertTrue(found.contains("Passed as an argument"))
+        XCTAssertTrue(found.contains("And its tooltip"))
+        XCTAssertTrue(found.contains("Assigned into a stored property"))
+        XCTAssertTrue(found.contains("Returned from a computed property"))
+        XCTAssertFalse(found.contains("Already localized"), "String(localized:) IS the fix.")
+        XCTAssertFalse(found.contains("Localized in the same block"),
+                       "Inside a block the call is the only thing marking copy as localized.")
+        XCTAssertFalse(found.contains("Not a registered label"))
+        XCTAssertFalse(found.contains("commented out"))
+    }
+
     func testThePunctuationOnlyFilterKeepsSentencesAndDropsBareValues() {
         XCTAssertTrue(carriesProse("Download"))
         XCTAssertTrue(carriesProse("Plan (\\(plan.steps.count) steps)"))
@@ -355,7 +500,7 @@ final class LocalizationCatalogTests: XCTestCase {
 
     /// The coverage guard. A new English string with no Chinese translation
     /// fails here, naming itself.
-    func testEveryUserFacingStringHasASimplifiedChineseTranslation() throws {
+    func testEveryUserFacingStringIsTranslatedIntoEveryTargetLanguage() throws {
         let catalog = try loadCatalog()
         var missing: [String] = []
         var untranslated: [String] = []
@@ -369,11 +514,8 @@ final class LocalizationCatalogTests: XCTestCase {
                     continue
                 }
                 for candidate in resolved {
-                    guard let zh = catalog.strings[candidate]?["zh-Hans"],
-                          zh.state == "translated", !zh.value.isEmpty else {
-                        untranslated.append("\(file.lastPathComponent): \"\(candidate)\"")
-                        continue
-                    }
+                    untranslated += untranslatedLanguages(forKey: candidate, in: catalog)
+                        .map { "[\($0)] \(file.lastPathComponent): \"\(candidate)\"" }
                 }
             }
         }
@@ -382,7 +524,7 @@ final class LocalizationCatalogTests: XCTestCase {
                       "\(missing.count) string(s) are drawn by the app but absent from Localization/Localizable.xcstrings:\n"
                       + missing.prefix(40).joined(separator: "\n"))
         XCTAssertTrue(untranslated.isEmpty,
-                      "\(untranslated.count) string(s) have no Simplified Chinese translation:\n"
+                      "\(untranslated.count) string/language pair(s) have no translation:\n"
                       + untranslated.prefix(40).joined(separator: "\n"))
     }
 
@@ -398,12 +540,126 @@ final class LocalizationCatalogTests: XCTestCase {
             }
         }
         // Copy held as data and localized through `String(localized:)` is
-        // reached by a runtime call the scanner cannot see, so it is declared.
-        let runtimeKeys = Set(try runtimeLocalizedKeys().map { unescape($0) })
-        let orphans = catalog.strings.keys.filter { !drawn.contains($0) && !runtimeKeys.contains($0) }.sorted()
+        // reached by a runtime call the scanner cannot see, so it is declared —
+        // and it interpolates the same way, so it resolves the same way too.
+        for key in try runtimeLocalizedKeys() {
+            for resolved in catalogKeys(matching: key, in: catalog) { drawn.insert(resolved) }
+        }
+        let orphans = catalog.strings.keys.filter { !drawn.contains($0) }.sorted()
         XCTAssertTrue(orphans.isEmpty,
                       "\(orphans.count) catalog entrie(s) are no longer drawn by any call site:\n"
                       + orphans.prefix(40).joined(separator: "\n"))
+    }
+
+    /// A literal at a registered copy position, with the line it sits on.
+    /// Deliberately blind to `String(localized: "…")`: the scan looks for a
+    /// quote where the localizing call would be, so a localized literal simply
+    /// isn't a match.
+    private func bareCopyLiterals(in source: String, labels: [String]) -> [String] {
+        let text = stripLineComments(source)
+        var found: [String] = []
+
+        func collect(_ marker: String, requiringWordBoundary: Bool) {
+            var search = text.startIndex
+            while let hit = text.range(of: marker, range: search ..< text.endIndex) {
+                search = hit.upperBound
+                if requiringWordBoundary, hit.lowerBound > text.startIndex {
+                    let before = text[text.index(before: hit.lowerBound)]
+                    if before.isLetter || before.isNumber || before == "_" || before == "." { continue }
+                }
+                var i = hit.upperBound
+                while i < text.endIndex, text[i] == " " || text[i] == "\n" { i = text.index(after: i) }
+                guard i < text.endIndex, text[i] == "\"" else { continue }
+                guard let key = literal(in: text, openingAt: i), carriesProse(key) else { continue }
+                found.append(key)
+            }
+        }
+
+        /// The literals inside `var <name>: String { … }` / `func <name>(…) -> String { … }`
+        /// — the third spelling of stored copy, and the only one where the
+        /// literal is nowhere near the field name.
+        func collectComputed(_ name: String) {
+            var search = text.startIndex
+            while let hit = text.range(of: "var \(name): String {", range: search ..< text.endIndex) {
+                search = hit.upperBound
+                var depth = 1
+                var i = hit.upperBound
+                while i < text.endIndex, depth > 0 {
+                    let c = text[i]
+                    if c == "{" { depth += 1 }
+                    if c == "}" { depth -= 1 }
+                    if c == "\"" {
+                        if let key = literal(in: text, openingAt: i) {
+                            // Inside a block the literal carries no label, so
+                            // the only thing separating localized copy from
+                            // bare copy is the call it sits in.
+                            let localizing = "String(localized: "
+                            let start = text.index(i, offsetBy: -localizing.count, limitedBy: text.startIndex)
+                            let wrapped = start.map { text[$0 ..< i] == localizing } ?? false
+                            if carriesProse(key), !wrapped { found.append(key) }
+                            i = text.index(i, offsetBy: key.count + 2)
+                            continue
+                        }
+                    }
+                    i = text.index(after: i)
+                }
+                search = i
+            }
+        }
+
+        for label in labels {
+            collect("\(label):", requiringWordBoundary: true)
+            // `control.title = "Start Server"` — an assignment into stored copy.
+            collect("\(label) =", requiringWordBoundary: true)
+            collectComputed(label)
+        }
+        return found
+    }
+
+    /// The coverage guard for copy held as DATA.
+    ///
+    /// The audit above reads SwiftUI literals, which are `LocalizedStringKey`s
+    /// and therefore already bundle lookups. This one reads the copy that is
+    /// stored in a `String` first — a row catalogue's `title`, a tooltip handed
+    /// to a helper — because `Text(someString)` picks the verbatim initializer
+    /// and never asks the bundle. Nothing about that is visible at the draw
+    /// site: it renders in English on a Chinese screen exactly like a missing
+    /// catalog entry, with the additional property that adding the entry does
+    /// not fix it. The fix is `String(localized:)` at the literal.
+    func testCopyDrawnFromAStringPropertyIsLocalizedWhereItIsWritten() throws {
+        var bare: [String] = []
+
+        for file in try swiftFiles(under: sourcesRoot) {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            let relative = file.path.replacingOccurrences(of: sourcesRoot.path + "/", with: "")
+
+            for key in bareCopyLiterals(in: source, labels: Self.copyCarryingLabels[relative] ?? []) {
+                bare.append("\(relative): \"\(key)\"")
+            }
+            // The positional helpers are app-local view builders, so they are
+            // looked for everywhere rather than per file.
+            let text = stripLineComments(source)
+            for call in Self.copyCarryingCalls {
+                var search = text.startIndex
+                while let hit = text.range(of: call + "(", range: search ..< text.endIndex) {
+                    search = hit.upperBound
+                    if hit.lowerBound > text.startIndex {
+                        let before = text[text.index(before: hit.lowerBound)]
+                        if before.isLetter || before.isNumber || before == "_" { continue }
+                    }
+                    var i = hit.upperBound
+                    while i < text.endIndex, text[i] == " " || text[i] == "\n" { i = text.index(after: i) }
+                    guard i < text.endIndex, text[i] == "\"" else { continue }
+                    guard let key = literal(in: text, openingAt: i), carriesProse(key) else { continue }
+                    bare.append("\(relative): \(call)(\"\(key)\")")
+                }
+            }
+        }
+
+        XCTAssertTrue(bare.isEmpty,
+                      "\(bare.count) literal(s) sit at a position that is drawn from a String, "
+                      + "where SwiftUI performs NO lookup. Wrap each in String(localized:):\n"
+                      + bare.prefix(40).joined(separator: "\n"))
     }
 
     /// Keys reached through `String(localized: "…")` rather than a SwiftUI
@@ -428,15 +684,29 @@ final class LocalizationCatalogTests: XCTestCase {
 
     func testRuntimeLocalizedCopyIsAlsoTranslated() throws {
         let catalog = try loadCatalog()
+        var missing: [String] = []
         var untranslated: [String] = []
-        for key in try runtimeLocalizedKeys().map({ unescape($0) }) where carriesProse(key) {
-            guard let zh = catalog.strings[key]?["zh-Hans"], zh.state == "translated", !zh.value.isEmpty else {
-                untranslated.append(key)
+        // Through `catalogKeys(matching:)`, not a direct subscript: a
+        // `String(localized:)` interpolates exactly like a `Text` literal, so
+        // `String(localized: "Delete “\(name)”?")` asks the bundle for
+        // `Delete “%@”?`. Looking up the SOURCE spelling passes only while the
+        // catalog carries a key no runtime lookup can ever ask for.
+        for key in try runtimeLocalizedKeys() where carriesProse(key) {
+            let resolved = catalogKeys(matching: key, in: catalog)
+            guard !resolved.isEmpty else {
+                missing.append(unescape(key))
                 continue
             }
+            for candidate in resolved {
+                untranslated += untranslatedLanguages(forKey: candidate, in: catalog)
+                    .map { "[\($0)] \(candidate)" }
+            }
         }
+        XCTAssertTrue(missing.isEmpty,
+                      "\(missing.count) `String(localized:)` key(s) are absent from the catalog:\n"
+                      + missing.prefix(40).joined(separator: "\n"))
         XCTAssertTrue(untranslated.isEmpty,
-                      "\(untranslated.count) `String(localized:)` key(s) have no Simplified Chinese translation:\n"
+                      "\(untranslated.count) `String(localized:)` key/language pair(s) have no translation:\n"
                       + untranslated.prefix(40).joined(separator: "\n"))
     }
 
@@ -495,29 +765,46 @@ final class LocalizationCatalogTests: XCTestCase {
 
         for (key, localizations) in catalog.strings {
             let keyTypes = types(in: key).map(\.type)
-            guard let zh = localizations["zh-Hans"] else { continue }
-            let valueSpecs = types(in: zh.value)
+            for (language, unit) in localizations where language != catalog.sourceLanguage {
+                let valueSpecs = types(in: unit.value)
 
-            if keyTypes.isEmpty {
-                XCTAssertTrue(valueSpecs.isEmpty,
-                              "\"\(key)\" takes no arguments, but its translation asks for \(valueSpecs.count).")
-                continue
-            }
-            for spec in valueSpecs {
-                guard let index = spec.index else {
-                    XCTFail("\"\(key)\": the translation uses a non-positional \"%\(spec.type)\". "
-                            + "Write \"%1$\(spec.type)\" — Chinese reorders and drops arguments.")
+                if keyTypes.isEmpty {
+                    XCTAssertTrue(valueSpecs.isEmpty,
+                                  "[\(language)] \"\(key)\" takes no arguments, "
+                                  + "but its translation asks for \(valueSpecs.count).")
                     continue
                 }
-                guard index >= 1, index <= keyTypes.count else {
-                    XCTFail("\"\(key)\": the translation reads argument \(index), but the string has \(keyTypes.count).")
-                    continue
+                for spec in valueSpecs {
+                    guard let index = spec.index else {
+                        XCTFail("[\(language)] \"\(key)\": the translation uses a non-positional "
+                                + "\"%\(spec.type)\". Write \"%1$\(spec.type)\" — a translation must "
+                                + "be free to reorder the arguments, and to drop the ones its "
+                                + "grammar has no use for.")
+                        continue
+                    }
+                    guard index >= 1, index <= keyTypes.count else {
+                        XCTFail("[\(language)] \"\(key)\": the translation reads argument \(index), "
+                                + "but the string has \(keyTypes.count).")
+                        continue
+                    }
+                    XCTAssertEqual(spec.type, keyTypes[index - 1],
+                                   "[\(language)] \"\(key)\": argument \(index) is "
+                                   + "%\(keyTypes[index - 1]), but the translation reads it as "
+                                   + "%\(spec.type).")
                 }
-                XCTAssertEqual(spec.type, keyTypes[index - 1],
-                               "\"\(key)\": argument \(index) is %\(keyTypes[index - 1]), "
-                               + "but the translation reads it as %\(spec.type).")
             }
         }
+    }
+
+    /// The audit's own blind spot: every coverage loop above iterates the
+    /// languages the catalog carries, so a catalog with NO target language
+    /// passes all of them by iterating nothing. That is the state this file was
+    /// written to end, and it is one careless delete away.
+    func testTheCatalogCarriesAtLeastOneTargetLanguage() throws {
+        let catalog = try loadCatalog()
+        XCTAssertFalse(targetLanguages(catalog).isEmpty,
+                       "The catalog translates into nothing, so every coverage assertion in this "
+                       + "file is vacuous. Restore the translations, or delete this file too.")
     }
 
     /// System prompts, tool names and tool descriptions are read by the MODEL,
@@ -528,6 +815,44 @@ final class LocalizationCatalogTests: XCTestCase {
     ///
     /// The user-visible half of that decision is the reply language, which is
     /// a line resolved INTO the prompt, never a translation of it.
+    /// Text that describes bytes ALREADY WRITTEN — a banner an older build
+    /// appended into saved chat content — is not copy, and translating it
+    /// breaks the only thing it does.
+    ///
+    /// `TruncationNotice.stripped(from:)` scrubs that banner out of sessions
+    /// on disk, and everything on disk is English (it was written before any
+    /// of this existed). Derive the scrubber from the sentence the app now
+    /// DISPLAYS and a Chinese app searches saved content for a Chinese banner,
+    /// finds nothing, and hands the English one back to the model as assistant
+    /// prose. An xctest binary has no `.lproj`, so `String(localized:)`
+    /// resolves to its key there and no behavioural test can tell the two
+    /// apart — which is why this is a scan.
+    func testTheFrozenLegacyBannerTextIsNeverLocalized() throws {
+        let url = sourcesRoot.appendingPathComponent("Services/TruncationNotice.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        guard let start = source.range(of: "private static func legacyFootnote(") else {
+            return XCTFail("TruncationNotice.legacyFootnote is gone — the scrubber's markers "
+                           + "must still come from frozen English, not from the displayed sentence.")
+        }
+        // The function body, to its closing brace at the same nesting level.
+        var depth = 0
+        var i = start.upperBound
+        var body = ""
+        var seenBrace = false
+        while i < source.endIndex {
+            let c = source[i]
+            if c == "{" { depth += 1; seenBrace = true }
+            if c == "}" { depth -= 1; if seenBrace, depth == 0 { break } }
+            body.append(c)
+            i = source.index(after: i)
+        }
+        XCTAssertFalse(body.contains("String(localized:"),
+                       "legacyFootnote describes bytes already saved to disk in English.")
+        XCTAssertTrue(source.contains("legacyFootnote(cause: cause, maxTokens: maxTokens)"),
+                      "the legacy banner text(…) must be built from legacyFootnote, never from "
+                      + "the localized footnote(…) the app displays.")
+    }
+
     func testModelFacingCopyIsNeverLocalized() throws {
         let modelFacing = [
             "Services/AgentPrompt.swift",
