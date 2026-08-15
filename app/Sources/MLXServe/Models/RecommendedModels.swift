@@ -290,8 +290,8 @@ extension RecommendedModelPick {
     static let qwen38_27b = RecommendedModelPick(
         id: "qwen38-27b",
         name: "Qwen 3.8 27B",
-        tagline: "One of the strongest models here",
-        blurb: "One of the most capable models this app can run — excellent at coding and at multi-step \u{201c}agent\u{201d} tasks like using tools and following a plan, and it reads images too. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size.",
+        tagline: String(localized: "One of the strongest models here"),
+        blurb: String(localized: "One of the most capable models this app can run — excellent at coding and at multi-step \u{201c}agent\u{201d} tasks like using tools and following a plan, and it reads images too. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size."),
         repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
         sizeGB: 18.2,
         family: .qwen,
