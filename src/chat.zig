@@ -68,12 +68,26 @@ pub const AudioData = struct {
     samples: []const u8, // Raw float32-LE bytes (n_samples * 4)
 };
 
+/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
+/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
+/// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
+/// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
+/// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
+/// are the shared per-frame patch grid every frame in the video was resized to.
+pub const VideoData = struct {
+    pixels: []const u8, // merge-order patches [grid_t*(grid_h*grid_w)*feat*4]
+    grid_t: u32,
+    grid_h: u32,
+    grid_w: u32,
+};
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
     images: ?[]const ImageData = null, // Preprocessed image data for vision
+    videos: ?[]const VideoData = null, // Preprocessed video data for vision
     audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
     /// Reasoning the client round-trips on assistant HISTORY messages
     /// (`reasoning_content`/`reasoning` on chat completions, `thinking`

@@ -840,6 +840,16 @@ pub const VisionImagePixels = struct {
     grid_w: u32 = 0,
 };
 
+/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
+/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo`). Borrowed;
+/// must outlive the encodeVision call.
+pub const VisionVideoPixels = struct {
+    pixels: []const u8,
+    grid_t: u32,
+    grid_h: u32,
+    grid_w: u32,
+};
+
 /// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
 /// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
 /// request and blocks until the inference thread fills `result` and signals
@@ -853,17 +863,23 @@ pub const VisionEncodeRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Per-image float32 CHW pixel buffers. Borrowed; must outlive the call.
     images: []const VisionImagePixels,
+    /// Per-video pre-patchified pixel buffers. Borrowed; must outlive the call.
+    /// Qwen-only (video_token_id != 0) — empty on every other arch.
+    videos: []const VisionVideoPixels = &.{},
     /// Gemma 4 12B unified audio: per-clip raw float32-LE 16 kHz mono sample
     /// buffers. Borrowed; must outlive the call. The inference thread frames
     /// each into 640-sample tokens and projects them through the audio embedder.
     audio: []const []const u8 = &.{},
-    /// Output: encoded embedding tensor on success — vision soft tokens followed
-    /// by audio soft tokens, concatenated along the token axis. Ownership
-    /// transfers to the caller.
+    /// Output: encoded embedding tensor on success — vision soft tokens, then
+    /// video soft tokens, then audio soft tokens, concatenated along the token
+    /// axis (matches the prompt's image/video/audio block insertion order).
+    /// Ownership transfers to the caller.
     result: ?mlx.mlx_array = null,
-    /// Output: number of vision / audio soft tokens in `result` (in that order).
-    /// The caller inserts exactly this many image / audio placeholders.
+    /// Output: number of vision / video / audio soft tokens in `result` (in
+    /// that order). The caller inserts exactly this many image / video / audio
+    /// placeholders.
     n_vision_tokens: usize = 0,
+    n_video_tokens: usize = 0,
     n_audio_tokens: usize = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
@@ -3882,14 +3898,15 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;
     };
-    if (req.images.len == 0 and req.audio.len == 0) {
+    if (req.images.len == 0 and req.videos.len == 0 and req.audio.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
 
-    // Encode all soft tokens into `emb_parts`: vision first, then audio, so the
-    // single splice channel scatters them in the same order as the placeholder
-    // blocks the conn thread injected (image block before audio block).
+    // Encode all soft tokens into `emb_parts`: vision, then video, then audio,
+    // so the single splice channel scatters them in the same order as the
+    // placeholder blocks the conn thread injected (image block, then video
+    // block, then audio block).
     var emb_parts = std.ArrayList(mlx.mlx_array).empty;
     defer emb_parts.deinit(req.allocator);
     const failParts = struct {
@@ -3927,6 +3944,26 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
         const es = mlx.getShape(emb);
         n_vision += @intCast(es[1]);
+        emb_parts.append(req.allocator, emb) catch |err| {
+            _ = mlx.mlx_array_free(emb);
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+    }
+
+    var n_video: usize = 0;
+    for (req.videos) |vid| {
+        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+        const feat: usize = (vid.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w) catch |err| {
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+        const es = mlx.getShape(emb);
+        n_video += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
             failParts(sch, req, emb_parts.items, @errorName(err));
@@ -3995,6 +4032,7 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     defer req.done_mu.unlock(sch.io);
     req.result = combined;
     req.n_vision_tokens = n_vision;
+    req.n_video_tokens = n_video;
     req.n_audio_tokens = n_audio;
     req.done = true;
     req.done_cond.broadcast(sch.io);

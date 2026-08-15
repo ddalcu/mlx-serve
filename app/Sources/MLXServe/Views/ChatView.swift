@@ -157,6 +157,7 @@ struct ToolApprovalSheet: View {
 private struct AttachmentPreviewRow: View {
     @Binding var images: [NSImage]
     @Binding var pdfs: [(name: String, text: String)]
+    @Binding var videos: [ChatVideo]
     @Binding var audio: [ChatAudio]
 
     var body: some View {
@@ -168,6 +169,10 @@ private struct AttachmentPreviewRow: View {
                 ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
                     fileChip(idx: idx, name: pdf.name, detail: "PDF · \(pdf.text.count) chars",
                              icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
+                }
+                ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
+                    fileChip(idx: idx, name: vid.name, detail: "Video · \(vid.frameCount) frames",
+                             icon: "video.fill", tint: .orange) { videos.remove(at: idx) }
                 }
                 ForEach(Array(audio.enumerated()), id: \.offset) { idx, clip in
                     fileChip(idx: idx, name: clip.name, detail: String(format: "Audio · %.1fs", clip.durationSeconds),
@@ -350,14 +355,15 @@ private struct MicButton: View {
 /// A top-level (non-`@MainActor`) type so the routing is unit-testable without
 /// the rendered view — it mirrors the attach button's dispatch (see ChatPasteTests).
 enum PasteFileKind: String, Equatable {
-    case folder, pdf, audio, image, unhandled
+    case folder, pdf, audio, video, image, unhandled
 
-    static func classify(ext: String, isDirectory: Bool, audioSupported: Bool) -> PasteFileKind {
+    static func classify(ext: String, isDirectory: Bool, audioSupported: Bool, videoSupported: Bool = false) -> PasteFileKind {
         if isDirectory { return .folder }
         let e = ext.lowercased()
         if e == "pdf" { return .pdf }
         if let ut = UTType(filenameExtension: e) {
             if ut.conforms(to: .audio) { return audioSupported ? .audio : .unhandled }
+            if ut.conforms(to: .movie) { return videoSupported ? .video : .unhandled }
             if ut.conforms(to: .image) { return .image }
         }
         return .unhandled
@@ -1543,6 +1549,7 @@ struct ChatDetailView: View {
     @State private var pasteMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
+    @State private var pendingVideos: [ChatVideo] = []
     @State private var pendingAudio: [ChatAudio] = []
     @StateObject private var recorder = AudioRecorder()
     // Tool-approval gate state. `pendingApproval` is set right before each
@@ -1722,16 +1729,15 @@ struct ChatDetailView: View {
     /// The agent this tab is talking to (nil = none).
     private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
 
-    /// Images/PDFs/audio for this message, or a folder to ask questions about.
-    /// Its own property (rather than inline in `composerControls`) so it carries
-    /// a hover card like every other glyph in the row.
+    /// Images/videos/PDFs/audio for this message, or a folder to ask questions
+    /// about. Its own property (rather than inline in `composerControls`) so
+    /// it carries a hover card like every other glyph in the row.
     private var attachmentMenu: some View {
         Menu {
             Button {
                 pickAttachment()
             } label: {
-                Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
-                      systemImage: "photo.on.rectangle")
+                Label(attachmentMenuLabel, systemImage: "photo.on.rectangle")
             }
             Button {
                 pickDocumentFolder()
@@ -1753,7 +1759,16 @@ struct ChatDetailView: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-        .composerTip(.attachments(audioSupported: audioSupported))
+        .composerTip(.attachments(audioSupported: audioSupported, videoSupported: videoSupported))
+    }
+
+    private var attachmentMenuLabel: String {
+        switch (videoSupported, audioSupported) {
+        case (true, true): return "Attach Image, Video, PDF, or Audio…"
+        case (true, false): return "Attach Image, Video, or PDF…"
+        case (false, true): return "Attach Image, PDF, or Audio…"
+        case (false, false): return "Attach Image or PDF…"
+        }
     }
 
     /// Shared look for the composer's icon-only mode controls.
@@ -2225,9 +2240,9 @@ struct ChatDetailView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
               } else {
-                // Pending attachment thumbnails (images + PDFs + audio)
-                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingAudio.isEmpty {
-                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, audio: $pendingAudio)
+                // Pending attachment thumbnails (images + PDFs + videos + audio)
+                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingVideos.isEmpty || !pendingAudio.isEmpty {
+                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, videos: $pendingVideos, audio: $pendingAudio)
                 }
 
                 // Attached document folder (mini RAG) — indexing progress / ready chip
@@ -2312,7 +2327,7 @@ struct ChatDetailView: View {
                 .frame(width: 0, height: 0)
                 .opacity(0)
         )
-        .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
+        .onDrop(of: [.image, .pdf, .audio, .movie], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { url, _ in
@@ -2337,6 +2352,20 @@ struct ChatDetailView: View {
                                 pendingAudio.append(ChatAudio(name: name, pcm: pcm))
                             } else {
                                 showAudioError(name)
+                            }
+                        }
+                    }
+                } else if videoSupported, provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                    // Decode inside the closure — the temp URL is only valid here.
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                        guard let url = url else { return }
+                        let name = url.lastPathComponent
+                        let frames = VideoPreprocessor.extractFrames(url: url)
+                        DispatchQueue.main.async {
+                            if let frames, !frames.isEmpty {
+                                pendingVideos.append(ChatVideo(name: name, frames: frames))
+                            } else {
+                                showVideoError(name)
                             }
                         }
                     }
@@ -2623,7 +2652,7 @@ struct ChatDetailView: View {
         .disabled(server.status != .running
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
+                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
         }
     }
 
@@ -2716,7 +2745,7 @@ struct ChatDetailView: View {
     private func attachFileURL(_ url: URL) -> Bool {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return false }
-        switch PasteFileKind.classify(ext: url.pathExtension, isDirectory: isDir.boolValue, audioSupported: audioSupported) {
+        switch PasteFileKind.classify(ext: url.pathExtension, isDirectory: isDir.boolValue, audioSupported: audioSupported, videoSupported: videoSupported) {
         case .folder:
             attachDocumentFolder(url)
         case .pdf:
@@ -2727,6 +2756,8 @@ struct ChatDetailView: View {
             }
         case .audio:
             addAudioAttachment(url)
+        case .video:
+            addVideoAttachment(url)
         case .image:
             guard let image = NSImage(contentsOf: url) else { return false }
             pendingImages.append(image)
@@ -2740,8 +2771,11 @@ struct ChatDetailView: View {
 
     private func pickAttachment() {
         let panel = NSOpenPanel()
-        // Only offer audio on models that can use it.
-        panel.allowedContentTypes = audioSupported ? [.image, .pdf, .audio] : [.image, .pdf]
+        // Only offer audio/video on models that can use them.
+        var types: [UTType] = [.image, .pdf]
+        if videoSupported { types.append(.movie) }
+        if audioSupported { types.append(.audio) }
+        panel.allowedContentTypes = types
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         AppActivation.beginPanel(panel) { response in
@@ -2755,6 +2789,8 @@ struct ChatDetailView: View {
                     }
                 } else if let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .audio) {
                     addAudioAttachment(url)
+                } else if videoSupported, let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .movie) {
+                    addVideoAttachment(url)
                 } else if let image = NSImage(contentsOf: url) {
                     pendingImages.append(image)
                 }
@@ -2786,6 +2822,30 @@ struct ChatDetailView: View {
         alert.runModal()
     }
 
+    /// Extract frames from a video file (off the main thread — AVFoundation
+    /// decode can be slow) and add it as a pending attachment.
+    private func addVideoAttachment(_ url: URL) {
+        let name = url.lastPathComponent
+        DispatchQueue.global(qos: .userInitiated).async {
+            let frames = VideoPreprocessor.extractFrames(url: url)
+            DispatchQueue.main.async {
+                if let frames, !frames.isEmpty {
+                    pendingVideos.append(ChatVideo(name: name, frames: frames))
+                } else {
+                    showVideoError(name)
+                }
+            }
+        }
+    }
+
+    private func showVideoError(_ name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't read video"
+        alert.informativeText = "\(name) couldn't be decoded."
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
     /// Convert pending audio clips to a ChatAudio array, clearing the list.
     private func consumePendingAudio() -> [ChatAudio]? {
         guard !pendingAudio.isEmpty else { return nil }
@@ -2798,6 +2858,19 @@ struct ChatDetailView: View {
     /// the mic button and audio-file attachment so they only appear where audio
     /// actually does something.
     private var audioSupported: Bool { server.chatModelInfo?.supportsAudio ?? false }
+
+    /// Whether the active model understands video (Qwen3-VL-family checkpoints
+    /// declaring `video_token_id`). Gates the video-attach option so it only
+    /// appears where the server can actually read it.
+    private var videoSupported: Bool { server.chatModelInfo?.supportsVideo ?? false }
+
+    /// Convert pending videos to a ChatVideo array, clearing the list.
+    private func consumePendingVideos() -> [ChatVideo]? {
+        guard !pendingVideos.isEmpty else { return nil }
+        let videos = pendingVideos
+        pendingVideos = []
+        return videos
+    }
 
     /// Mic tap handler: start recording (after a permission check), or stop and
     /// turn the captured PCM into a pending audio attachment.
@@ -3129,9 +3202,10 @@ struct ChatDetailView: View {
     private func proceedSend() {
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
+        let attachedVideos = consumePendingVideos()
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
+        guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
               composerState != .generatingHere, server.status == .running else { return }
         inputText = ""
         if !pdfText.isEmpty {
@@ -3247,10 +3321,11 @@ struct ChatDetailView: View {
               let idx = msgs.firstIndex(where: { $0.id == messageId })
         else { return }
         let images = msgs[idx].images
+        let videos = msgs[idx].videos
         let audio = msgs[idx].audio
         appState.truncateMessages(in: sessionId, keepingFirst: idx)
         chatEngine.runTurn(sessionId: sessionId, userText: trimmed,
-                           images: images, audio: audio,
+                           images: images, videos: videos, audio: audio,
                            config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
         // An edit is started from wherever that message sits, which is by

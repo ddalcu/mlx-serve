@@ -93,7 +93,7 @@ final class VoiceModeControllerTests: XCTestCase {
         private(set) var calls: [Call] = []
         private(set) var lastApproval: ((APIClient.ToolCall) async -> Bool)?
         private(set) var stopCount = 0
-        func runTurn(sessionId: UUID, userText: String, images: [ChatImage]?, audio: [ChatAudio]?,
+        func runTurn(sessionId: UUID, userText: String, images: [ChatImage]?, videos: [ChatVideo]?, audio: [ChatAudio]?,
                      config: ChatTurnEngine.TurnConfig,
                      approval: @escaping (APIClient.ToolCall) async -> Bool) {
             calls.append(Call(sessionId: sessionId, userText: userText, config: config))

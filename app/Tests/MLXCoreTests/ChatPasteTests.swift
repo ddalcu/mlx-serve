@@ -11,8 +11,8 @@ import XCTest
 /// import set, and string comparison sidesteps it entirely.
 final class ChatPasteTests: XCTestCase {
 
-    private func kind(_ ext: String, dir: Bool = false, audio: Bool = false) -> String {
-        PasteFileKind.classify(ext: ext, isDirectory: dir, audioSupported: audio).rawValue
+    private func kind(_ ext: String, dir: Bool = false, audio: Bool = false, video: Bool = false) -> String {
+        PasteFileKind.classify(ext: ext, isDirectory: dir, audioSupported: audio, videoSupported: video).rawValue
     }
 
     func testDirectoryIsFolderEvenWithAFileExtension() {
@@ -41,5 +41,18 @@ final class ChatPasteTests: XCTestCase {
     func testUnknownExtensionIsUnhandled() {
         XCTAssertEqual(kind("docx", audio: true), "unhandled")
         XCTAssertEqual(kind("", audio: true), "unhandled")
+    }
+
+    func testVideoIsGatedOnModelSupport() {
+        for ext in ["mov", "mp4", "m4v"] {
+            XCTAssertEqual(kind(ext, video: true), "video", "\(ext) should classify as video when supported")
+            // Model can't read video → don't attach it as video (and it isn't
+            // an image either, so it falls through to unhandled).
+            XCTAssertEqual(kind(ext, video: false), "unhandled", "\(ext) should be unhandled when unsupported")
+        }
+    }
+
+    func testDirectoryBeatsVideoSupportEvenWithAMovieExtension() {
+        XCTAssertEqual(kind("mov", dir: true, video: true), "folder")
     }
 }

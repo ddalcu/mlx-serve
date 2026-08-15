@@ -74,17 +74,20 @@ pub fn interleavedSelector(sel: []u8, mrope_section: [3]u32) void {
 }
 
 /// Faithful single-sequence, full-attention-mask port of `get_rope_index` for
-/// IMAGE inputs. `tokens` is the POST-EXPANSION id sequence (each image's single
-/// `<|image_pad|>` already expanded to its merged-grid token count). `images`
-/// lists the full patch grid per image in document order. Returns 3×seq position
-/// ids (caller owns via `RopeIndex.deinit`) and the decode delta.
-///
-/// Video tokens are not handled (returns error.VideoUnsupported) — the Qwen
-/// vision feature ships image-only in its first cut.
+/// IMAGE and VIDEO inputs. `tokens` is the POST-EXPANSION id sequence (each
+/// image/video's pad run already expanded to its merged-grid token count).
+/// `images`/`videos` list the full patch grid per block in DOCUMENT order
+/// within their own modality — the two lists are walked independently, and
+/// blocks are consumed in the order their markers appear in `tokens` (mirrors
+/// `language.py`'s `ed_image < ed_video` pick-first-marker loop: a video grid's
+/// `t` is its number of TEMPORAL PATCHES, not divided by `merge`; h/w are).
+/// Returns 3×seq position ids (caller owns via `RopeIndex.deinit`) and the
+/// decode delta.
 pub fn getRopeIndex(
     allocator: std.mem.Allocator,
     tokens: []const u32,
     images: []const ImageGrid,
+    videos: []const ImageGrid,
     image_token_id: u32,
     video_token_id: u32,
     vision_start_token_id: u32,
@@ -100,15 +103,18 @@ pub fn getRopeIndex(
     var last_max: i32 = -1;
     var st: usize = 0;
     var image_index: usize = 0;
+    var video_index: usize = 0;
 
-    // image_nums = number of vision_start tokens immediately followed by image_token.
+    // *_nums = number of vision_start tokens immediately followed by that
+    // modality's pad token.
     var image_nums: usize = 0;
+    var video_nums: usize = 0;
     {
         var i: usize = 0;
         while (i + 1 < seq) : (i += 1) {
             if (tokens[i] == vision_start_token_id) {
                 if (tokens[i + 1] == image_token_id) image_nums += 1;
-                if (tokens[i + 1] == video_token_id) return error.VideoUnsupported;
+                if (tokens[i + 1] == video_token_id) video_nums += 1;
             }
         }
     }
@@ -123,15 +129,42 @@ pub fn getRopeIndex(
         }
     }.f;
 
-    var img: usize = 0;
-    while (img < image_nums) : (img += 1) {
-        // First image-pad at/after st.
-        var ed: usize = st;
-        while (ed < seq and tokens[ed] != image_token_id) : (ed += 1) {}
-        if (ed >= seq) return error.MalformedVisionSequence;
-        if (image_index >= images.len) return error.MissingImageGrid;
-        const g = images[image_index];
-        image_index += 1;
+    var remain_images = image_nums;
+    var remain_videos = video_nums;
+    var blk: usize = 0;
+    while (blk < image_nums + video_nums) : (blk += 1) {
+        // First occurrence at/after st of each remaining modality's pad token;
+        // a modality with nothing left (or nothing found) sentinels past `seq`
+        // so it is never picked by the `<` comparison below.
+        var ed_image: usize = seq + 1;
+        if (remain_images > 0) {
+            var k = st;
+            while (k < seq and tokens[k] != image_token_id) : (k += 1) {}
+            if (k < seq) ed_image = k;
+        }
+        var ed_video: usize = seq + 1;
+        if (remain_videos > 0) {
+            var k = st;
+            while (k < seq and tokens[k] != video_token_id) : (k += 1) {}
+            if (k < seq) ed_video = k;
+        }
+        const use_image = ed_image < ed_video;
+        const ed = if (use_image) ed_image else ed_video;
+        if (ed > seq) return error.MalformedVisionSequence;
+
+        const g = if (use_image) g: {
+            if (image_index >= images.len) return error.MissingImageGrid;
+            const gg = images[image_index];
+            image_index += 1;
+            remain_images -= 1;
+            break :g gg;
+        } else g: {
+            if (video_index >= videos.len) return error.MissingVideoGrid;
+            const gg = videos[video_index];
+            video_index += 1;
+            remain_videos -= 1;
+            break :g gg;
+        };
 
         const llm_t: usize = g.t;
         const llm_h: usize = g.h / merge;
@@ -142,7 +175,7 @@ pub fn getRopeIndex(
         try appendText(&rows, allocator, st_idx, text_len);
         if (text_len > 0) last_max = st_idx + @as(i32, @intCast(text_len)) - 1;
 
-        // Image block: t = base+frame, h = base+row, w = base+col.
+        // Vision block: t = base+frame, h = base+row, w = base+col.
         const base: i32 = @as(i32, @intCast(text_len)) + st_idx;
         var ti: usize = 0;
         while (ti < llm_t) : (ti += 1) {
@@ -219,7 +252,7 @@ test "mrope get_rope_index single image text+image+text" {
     const VS = 248053;
     const tokens = [_]u32{ 10, 11, 12, VS, IMG, IMG, IMG, IMG, 248054, 20, 21 };
     const images = [_]ImageGrid{.{ .t = 1, .h = 4, .w = 4 }};
-    var ri = try getRopeIndex(a, &tokens, &images, IMG, 248057, VS, 2);
+    var ri = try getRopeIndex(a, &tokens, &images, &.{}, IMG, 248057, VS, 2);
     defer ri.deinit();
 
     const exp_t = [_]i32{ 0, 1, 2, 3, 4, 4, 4, 4, 6, 7, 8 };
@@ -234,12 +267,57 @@ test "mrope get_rope_index single image text+image+text" {
 test "mrope get_rope_index pure text is sequential on all axes" {
     const a = std.testing.allocator;
     const tokens = [_]u32{ 1, 2, 3, 4, 5 };
-    var ri = try getRopeIndex(a, &tokens, &.{}, 248056, 248057, 248053, 2);
+    var ri = try getRopeIndex(a, &tokens, &.{}, &.{}, 248056, 248057, 248053, 2);
     defer ri.deinit();
     inline for (0..3) |axis| {
         for (ri.pos[axis], 0..) |p, i| try std.testing.expectEqual(@as(i32, @intCast(i)), p);
     }
     try std.testing.expectEqual(@as(i32, 0), ri.delta); // 4+1-5
+}
+
+test "mrope get_rope_index video-only exercises the t>1 temporal loop" {
+    const a = std.testing.allocator;
+    // [A,B,C, vision_start, pad×8, TEXT, D,E] with video grid [2,4,4], merge 2 →
+    // llm_t=2 (t is NOT divided by merge), llm_h=llm_w=2 → 2*2*2=8 pad tokens.
+    // Hand-derived from get_rope_index's video branch (t,h,w = video_grid_thw[i]).
+    const VID = 248057;
+    const VS = 248053;
+    const tokens = [_]u32{ 10, 11, 12, VS, VID, VID, VID, VID, VID, VID, VID, VID, 248054, 20, 21 };
+    const videos = [_]ImageGrid{.{ .t = 2, .h = 4, .w = 4 }};
+    var ri = try getRopeIndex(a, &tokens, &.{}, &videos, 248056, VID, VS, 2);
+    defer ri.deinit();
+
+    const exp_t = [_]i32{ 0, 1, 2, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 7, 8 };
+    const exp_h = [_]i32{ 0, 1, 2, 3, 4, 4, 5, 5, 4, 4, 5, 5, 6, 7, 8 };
+    const exp_w = [_]i32{ 0, 1, 2, 3, 4, 5, 4, 5, 4, 5, 4, 5, 6, 7, 8 };
+    try std.testing.expectEqualSlices(i32, &exp_t, ri.pos[0]);
+    try std.testing.expectEqualSlices(i32, &exp_h, ri.pos[1]);
+    try std.testing.expectEqualSlices(i32, &exp_w, ri.pos[2]);
+    try std.testing.expectEqual(@as(i32, -6), ri.delta); // 9-15
+}
+
+test "mrope get_rope_index interleaved image-then-video picks the first marker" {
+    const a = std.testing.allocator;
+    // [A,B, VS, img_pad×4, VS, vid_pad×4, END]. Both grids [1,4,4] merge 2 → 4
+    // pads each, so the two blocks are shape-identical and the test isolates
+    // the interleave control flow (ed_image < ed_video picks image first, then
+    // falls through to the video block once remain_images hits 0).
+    const IMG = 248056;
+    const VID = 248057;
+    const VS = 248053;
+    const tokens = [_]u32{ 1, 2, VS, IMG, IMG, IMG, IMG, VS, VID, VID, VID, VID, 9 };
+    const images = [_]ImageGrid{.{ .t = 1, .h = 4, .w = 4 }};
+    const videos = [_]ImageGrid{.{ .t = 1, .h = 4, .w = 4 }};
+    var ri = try getRopeIndex(a, &tokens, &images, &videos, IMG, VID, VS, 2);
+    defer ri.deinit();
+
+    const exp_t = [_]i32{ 0, 1, 2, 3, 3, 3, 3, 5, 6, 6, 6, 6, 8 };
+    const exp_h = [_]i32{ 0, 1, 2, 3, 3, 4, 4, 5, 6, 6, 7, 7, 8 };
+    const exp_w = [_]i32{ 0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 6, 7, 8 };
+    try std.testing.expectEqualSlices(i32, &exp_t, ri.pos[0]);
+    try std.testing.expectEqualSlices(i32, &exp_h, ri.pos[1]);
+    try std.testing.expectEqualSlices(i32, &exp_w, ri.pos[2]);
+    try std.testing.expectEqual(@as(i32, -4), ri.delta); // 9-13
 }
 
 test "mrope computeInvFreq base case" {

@@ -522,7 +522,7 @@ final class VoiceModeController: ObservableObject {
             thinkingEnabled: enableThinking,
             workingDirectory: ctx.workingDirectory)
         let config = ChatTurnEngine.TurnConfig.from(resolved, voiceStyle: true)
-        runner.runTurn(sessionId: ctx.sessionId, userText: text, images: nil, audio: nil,
+        runner.runTurn(sessionId: ctx.sessionId, userText: text, images: nil, videos: nil, audio: nil,
                        config: config, approval: { [weak self] tc in
             await self?.approvalDecision(for: tc) ?? false
         })

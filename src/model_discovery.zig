@@ -998,6 +998,9 @@ pub const StubMeta = struct {
     quant_bits: u32 = 0,
     is_moe: bool = false,
     has_vision: bool = false,
+    /// Qwen3-VL-family video input: a `video_token_id` alongside `has_vision`
+    /// (video piggybacks the vision tower — see src/qwen_vision.zig).
+    has_video: bool = false,
     has_chat: bool = false,
     /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
     /// advertises "embeddings" and no chat capabilities.
@@ -1069,6 +1072,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
+    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
     const bidirectional = blk: {
         const cfgBool = struct {
             fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
