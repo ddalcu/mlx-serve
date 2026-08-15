@@ -5380,13 +5380,13 @@
         }
       }
     },
-    "One of the most capable models this app can run — excellent at coding and at multi-step “agent” tasks like using tools and following a plan. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size.": {
+    "One of the most capable models this app can run — excellent at coding and at multi-step “agent” tasks like using tools and following a plan, and it reads images too. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size.": {
       "extractionState": "manual",
       "localizations": {
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "本应用能运行的最强模型之一 — 在编程以及使用工具、按计划行事这类多步“智能体”任务上表现出色。它还自带一项加速机制，可以一次起草并校验多个词，因此比同体量的普通模型明显更快。"
+            "value": "本应用能运行的最强模型之一 — 在编程以及使用工具、按计划行事这类多步“智能体”任务上表现出色，还能读取图片。它还自带一项加速机制，可以一次起草并校验多个词，因此比同体量的普通模型明显更快。"
           }
         }
       }
