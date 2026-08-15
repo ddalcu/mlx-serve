@@ -553,26 +553,61 @@ class DownloadManager: ObservableObject {
         return candidate
     }
 
-    /// The Hugging Face hub cache root, resolved once at app launch — where
-    /// `huggingface_hub` (and therefore `mlx_lm.load` / `huggingface-cli`)
-    /// downloads by default. Honors `HF_HUB_CACHE`, then `$HF_HOME/hub`, then
-    /// `~/.cache/huggingface/hub`. nil when none exists on disk. Read-only: the
-    /// app scans + loads from it but never writes/deletes into its blob layout.
-    let huggingFaceRoot: String? = {
-        let env = ProcessInfo.processInfo.environment
-        let candidate: String = {
-            if let c = env["HF_HUB_CACHE"], !c.isEmpty {
-                return (c as NSString).expandingTildeInPath
-            }
-            if let home = env["HF_HOME"], !home.isEmpty {
-                return ((home as NSString).expandingTildeInPath as NSString).appendingPathComponent("hub")
-            }
-            return NSString(string: "~/.cache/huggingface/hub").expandingTildeInPath
-        }()
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else { return nil }
-        return candidate
-    }()
+    /// The Hugging Face hub cache root — where `huggingface_hub` (and therefore
+    /// `mlx_lm.load` / `huggingface-cli`) downloads. nil when it does not exist
+    /// on disk. Read-only: the app scans + loads from it but never
+    /// writes/deletes into its blob layout.
+    ///
+    /// A `var` because the cache is MOVABLE by environment and a Finder-
+    /// launched bundle cannot see the environment that moved it — the login
+    /// shell is asked off-main at launch (`refreshHuggingFaceRootFromLoginShell`).
+    var huggingFaceRoot: String? = DownloadManager.huggingFaceRootPath()
+
+    /// Resolve the hub cache the way `huggingface_hub` itself does:
+    /// `HF_HUB_CACHE` > `$HF_HOME/hub` > `$XDG_CACHE_HOME/huggingface/hub` >
+    /// `~/.cache/huggingface/hub`. A CONFIGURED root that is not on disk is nil
+    /// rather than a fall-through to the default cache — the whole point of the
+    /// variable is that the models live somewhere else, so serving the default
+    /// would be answering a question nobody asked.
+    nonisolated static func huggingFaceRootPath(
+        environment: [String: String] = LoginShellEnv.huggingFaceEnvironment(),
+        home: String = NSHomeDirectory()
+    ) -> String? {
+        func value(_ key: String) -> String? {
+            guard let raw = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { return nil }
+            return (raw as NSString).expandingTildeInPath
+        }
+        let candidate: String
+        if let hub = value("HF_HUB_CACHE") {
+            candidate = hub
+        } else if let hfHome = value("HF_HOME") {
+            candidate = (hfHome as NSString).appendingPathComponent("hub")
+        } else if let xdg = value("XDG_CACHE_HOME") {
+            candidate = (xdg as NSString).appendingPathComponent("huggingface/hub")
+        } else {
+            candidate = ((home as NSString).appendingPathComponent(".cache/huggingface/hub"))
+        }
+        return ModelRoots.existingDirectory(candidate)
+    }
+
+    /// Ask the login shell for the HF variables and re-resolve. Returns true
+    /// when the root MOVED, so the caller can rescan. Spawns a shell — call it
+    /// off the main thread.
+    nonisolated static func loginShellHuggingFaceRoot() -> String? {
+        LoginShellEnv.primeHuggingFace()
+        return huggingFaceRootPath()
+    }
+
+    /// Adopt the login shell's answer. True when the root changed.
+    func refreshHuggingFaceRootFromLoginShell() async -> Bool {
+        let resolved = await Task.detached(priority: .utility) {
+            DownloadManager.loginShellHuggingFaceRoot()
+        }.value
+        guard resolved != huggingFaceRoot else { return false }
+        huggingFaceRoot = resolved
+        return true
+    }
 
     /// Check if a model has all required files for loading.
     /// Verifies: config.json, tokenizer files, chat template, and ALL safetensors shards.
@@ -1963,7 +1998,7 @@ class DownloadManager: ObservableObject {
     /// `huggingface-cli login` writes is the one that actually works in the app,
     /// because a bundle launched from Finder has NO shell environment. Buys
     /// gated repos and a higher API rate limit — not speed.
-    nonisolated static func hfToken(environment: [String: String] = ProcessInfo.processInfo.environment,
+    nonisolated static func hfToken(environment: [String: String] = LoginShellEnv.huggingFaceEnvironment(),
                                     home: String = NSHomeDirectory()) -> String? {
         if let raw = environment["HF_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
             return raw
@@ -1971,6 +2006,10 @@ class DownloadManager: ObservableObject {
         var candidates: [String] = []
         if let hfHome = environment["HF_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines), !hfHome.isEmpty {
             candidates.append(((hfHome as NSString).expandingTildeInPath as NSString).appendingPathComponent("token"))
+        }
+        if let xdg = environment["XDG_CACHE_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines), !xdg.isEmpty {
+            candidates.append(((xdg as NSString).expandingTildeInPath as NSString)
+                .appendingPathComponent("huggingface/token"))
         }
         candidates.append(((home as NSString).appendingPathComponent(".cache/huggingface") as NSString)
             .appendingPathComponent("token"))
@@ -1983,7 +2022,7 @@ class DownloadManager: ObservableObject {
         return nil
     }
 
-    nonisolated static func hfHeaders(environment: [String: String] = ProcessInfo.processInfo.environment,
+    nonisolated static func hfHeaders(environment: [String: String] = LoginShellEnv.huggingFaceEnvironment(),
                                       home: String = NSHomeDirectory()) -> [String: String] {
         guard let token = hfToken(environment: environment, home: home) else { return [:] }
         return ["Authorization": "Bearer \(token)"]

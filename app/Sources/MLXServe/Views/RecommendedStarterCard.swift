@@ -127,7 +127,7 @@ struct RecommendedStarterCard: View {
         case "gemma-4-e2b":     what = "A small, quick assistant"
         case "gemma-4-e4b":     what = "A fast, capable assistant"
         case "gemma-4-12b":     what = "A capable all-round assistant"
-        case "qwen36-27b-mtp":  what = "A strong assistant, great at code"
+        case "qwen38-27b":      what = "A strong assistant, great at code"
         default:                what = "A local AI assistant"
         }
         return "\(what) · \(String(format: "%.1f GB", pick.sizeGB))"

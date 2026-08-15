@@ -149,7 +149,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// point of carrying the flag.
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
-        XCTAssertEqual(estimated, ["laguna-xs-2.1-nvfp4", "laguna-s-2.1-nvfp4", "hy3-oq2e"])
+        XCTAssertEqual(estimated, ["laguna-xs-2.1-nvfp4", "laguna-s-2.1-nvfp4", "hy3-oq2e", "qwen38-27b"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -174,7 +174,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.gemmaE2B.contextTokens, 131_072)
         XCTAssertEqual(RecommendedModelPick.gemmaE4B.contextTokens, 131_072)
         XCTAssertEqual(RecommendedModelPick.gemma31B.contextTokens, 262_144)
-        XCTAssertEqual(RecommendedModelPick.qwen36_27bMtp.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.qwen38_27b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.lagunaS21.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextTokens, 1_048_576)
     }
@@ -196,7 +196,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 8 * GiB).id, "gemma-4-e2b")
         XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 12 * GiB).id, "gemma-4-e4b")
         XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 24 * GiB).id, "gemma-4-12b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 64 * GiB).id, "qwen36-27b-mtp")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 64 * GiB).id, "qwen38-27b")
     }
 
     /// Bands are upper-inclusive, so a machine sitting exactly ON a boundary
@@ -205,7 +205,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 16 * GiB).id, "gemma-4-e4b")
         XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 17 * GiB).id, "gemma-4-12b")
         XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 32 * GiB).id, "gemma-4-12b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 33 * GiB).id, "qwen36-27b-mtp")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 33 * GiB).id, "qwen38-27b")
     }
 
     /// Every tier's pick actually runs on the SMALLEST Mac in its band — a
@@ -304,13 +304,15 @@ final class RecommendedModelsTests: XCTestCase {
 
     // MARK: - Known-good entries (regression pins)
 
-    /// The native-MTP Qwen 3.6 build is strictly better than a plain 4-bit
-    /// Qwen 3.6 27B at the same size (built-in speculative-decode speedup,
-    /// same weights) — it must be the catalog's Qwen 3.6 27B pick, not the
-    /// plain build.
-    func testQwen36TwentySevenBPickUsesTheMtpBuild() {
+    /// The Qwen 27B slot is the 3.8 build with the MTP head in the checkpoint —
+    /// the same geometry as the 3.6 27B it replaced, newer weights, vision, and
+    /// the built-in speculative-decode speedup. There is exactly ONE 27B pick:
+    /// two entries of the same size class in one section is a coin flip for a
+    /// beginner, which is what this pane exists to remove.
+    func testQwenTwentySevenBPickIsThe38MtpBuild() {
         let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
-        XCTAssertTrue(repoIds.contains("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"))
+        XCTAssertTrue(repoIds.contains("ddalcu/Qwen3.8-27B-MLX-Serve-4bit"))
+        XCTAssertFalse(repoIds.contains("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"))
     }
 
     func testGemma4EverydayPicksArePresent() {

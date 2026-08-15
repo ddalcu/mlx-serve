@@ -40,6 +40,6 @@ final class WelcomeRecommendationTests: XCTestCase {
         XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 8 * gib).pick.id, "gemma-4-e2b")
         XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 16 * gib).pick.id, "gemma-4-e4b")
         XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 32 * gib).pick.id, "gemma-4-12b")
-        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 64 * gib).pick.id, "qwen36-27b-mtp")
+        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 64 * gib).pick.id, "qwen38-27b")
     }
 }

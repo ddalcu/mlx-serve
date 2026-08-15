@@ -1406,11 +1406,17 @@ extension MediaGenServiceTests {
     func testMiniMaxH3ResolutionLabelsMatchTheirPixelCost() {
         let rs = VideoModelPreset.minimaxH3.resolutions
         XCTAssertTrue(rs.contains { $0.id == "960x544" }, "the long-form canvas is missing")
-        let cheapest = rs.min { $0.width * $0.height < $1.width * $1.height }!
-        XCTAssertEqual(cheapest.id, "960x544")
+        // The claim is about PIXEL COST, so the comparison is too — a rotation
+        // costs exactly the same, and the 9:16 portrait added in #177 ties the
+        // 16:9 landscape at 522,240. Comparing ids instead made that tie read
+        // as drift ("544x960 claims fastest but 960x544 has fewer pixels")
+        // while BOTH labels were true. The guard still catches the real thing:
+        // a genuinely cheaper canvas added below one still labelled fastest.
+        let cheapestPixels = rs.map { $0.width * $0.height }.min()!
+        XCTAssertEqual(cheapestPixels, 960 * 544, "the long-form canvas is no longer the floor")
         for r in rs where r.label.lowercased().contains("fastest") {
-            XCTAssertEqual(r.id, cheapest.id,
-                           "\(r.id) claims fastest but \(cheapest.id) has fewer pixels")
+            XCTAssertEqual(r.width * r.height, cheapestPixels,
+                           "\(r.id) claims fastest but a cheaper canvas exists")
         }
         // Every canvas stays inside the model's own area cap (768*1344): past
         // it the server's own normalize would scale the request down.

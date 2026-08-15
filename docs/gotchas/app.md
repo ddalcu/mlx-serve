@@ -652,3 +652,54 @@ target language every coverage loop passes by iterating an empty set, so
 `testTheCatalogCarriesAtLeastOneTargetLanguage` pins that the list is not
 empty. Verified red by injecting a one-key `fr` into the catalog: 666
 string/language pairs reported, each naming its language.
+## The Hugging Face cache was "supported" and never worked (2026-08-14)
+
+Reported as "we don't account for `HF_HOME`". We did — `DownloadManager.huggingFaceRoot`
+read `HF_HUB_CACHE`, then `$HF_HOME/hub`, then `~/.cache/huggingface/hub`. The code
+was right and the feature was dead, because the read was
+`ProcessInfo.processInfo.environment` and a bundle launched from Finder or the Dock
+has none of the user's shell environment. Anything exported from `~/.zshrc` is simply
+not there. So the env branches only ever fired when the binary was run from a terminal,
+and everyone else silently got the default cache — an empty folder if they had moved
+theirs to an external drive.
+
+The tell that this was already known and had been solved twice, in two other places:
+
+* `hfToken`'s own comment — *"the token file `huggingface-cli login` writes is the one
+  that actually works in the app, because a bundle launched from Finder has NO shell
+  environment"*.
+* `CLIInstaller.userShellPathEntries()` — spawns `$SHELL -l -i -c` to print `$PATH`,
+  because *"Finder-launched apps get a minimal PATH that never contains
+  `~/.local/bin`"*.
+
+Neither generalized, so the third instance shipped broken. `LoginShellEnv` is now the
+one probe and `CLIInstaller` delegates to it.
+
+Mechanics worth keeping:
+
+* **Markers, not line parsing.** An interactive rc file prints banners. Each value comes
+  back between `__MLX_ENV_<NAME>_BEGIN__` / `__MLX_ENV_<NAME>_END__`.
+* **An unset variable is omitted, never returned as `""`.** Otherwise the shell's empty
+  answer shadows a value the process genuinely has, and the merge inverts.
+* **Process env wins.** A launch that does carry the variable (terminal, or an explicit
+  override) is authoritative; the shell only fills gaps.
+* **Off-main, watchdogged.** The probe spawns a shell and can be wedged by a pathological
+  rc file, so it is primed from a detached task at launch with a 5 s terminate, and
+  `refreshModels()` re-runs only if the resolved root actually moved. `huggingFaceRoot`
+  had to stop being a `let` for that.
+* **A configured-but-missing root is nil.** Falling back to `~/.cache/huggingface/hub`
+  when `HF_HOME` points at an unmounted drive would list the wrong library and read as
+  "your models vanished" rather than "that drive isn't mounted".
+* **`XDG_CACHE_HOME` was missing entirely** — `huggingface_hub` defaults `HF_HOME` to
+  `$XDG_CACHE_HOME/huggingface`, so a user who moves only that var was in the same hole.
+  It is now in the precedence for both the cache root and the token file.
+
+Under MAS the probe is gated off (`BuildFeatures.customModelFolders`): the app is
+sandboxed, `~` is the container, and a cache outside it is unreadable no matter what the
+shell reports — so there is nothing to find and no reason to spawn `/bin/zsh` (which is
+also why `HostEscapeAuditTests` needed a disposition entry for the new file).
+
+The class guard is the one that matters: a source scan asserting no file outside
+`LoginShellEnv.swift` reads an HF variable straight from `ProcessInfo`. That is exactly
+how the bug got in, and it is what the next `HF_*` variable will trip over. Verified red
+by injecting a single direct read into `CLIInstaller.swift`.

@@ -1,5 +1,47 @@
 # Changelog
 
+## v26.8.7 — Qwen 3.8 27B, Ling 3.0, thinking that knows when to stop
+
+### Highlights
+
+- **Qwen 3.8 27B runs on your Mac**, hours after Qwen released it. Text, vision and tools, in an 18.2 GB 4-bit build with the draft head baked in: about **75 tok/s on code** and 40 on prose on an M4 Max.
+- **Ling 3.0 runs.** inclusionAI's hybrid model, a new attention design we hadn't served before. The 4-bit tiny build is 4.2 GB and does 96 tok/s.
+- **Thinking models stop thinking sooner.** Qwen 3.8 asked to think as hard as it can unless told otherwise, which on an agent turn meant 16k tokens of reasoning before the client gave up. It now thinks briefly by default, and a thinking cap shortens the thought instead of hiding it.
+- **The app finds your Hugging Face cache wherever you put it.** If you moved it with `HF_HOME` or `HF_HUB_CACHE`, the app never saw the variable and listed nothing. It asks your shell now.
+- **Drag files onto any Create pane.** Image, Video, Audio and 3D all take a dropped file, including the reference lists.
+
+### Qwen 3.8 27B
+
+- It is the app's default recommendation on any Mac with more than 32 GB, replacing Qwen 3.6 27B in the welcome card, the Model Browser and the menu-bar tray. `ddalcu/Qwen3.8-27B-MLX-Serve-4bit`, 18.2 GB, wants 24 GB+ of RAM.
+- Images work. Tools work. Thinking works, and the model ships its own draft head, so it is fast out of the box: 75.3 tok/s on code and 39.7 on prose against 26.3 / 26.7 with the draft head off, same Mac and same prompts.
+- Qwen 3.8 has its own words for how hard to think (`xhigh`, `medium`, `low`) and its template refuses anything else, so `reasoning_effort: "high"` from an OpenAI client is translated instead of rejected. Sending nothing gets `low`: the model's own default is unbounded, and asking for a short answer is not the same as cutting a long one off.
+- The bigger 2.4T-A95B sibling renders correctly too, including its refusal to turn thinking off.
+
+### Ling 3.0
+
+- Pick any `bailing_hybrid` build, such as `rapid-mlx/Ling-3.0-tiny-MLX-4bit` (4.2 GB). Measured on that build: 2320 tok/s on a prompt, 96 tok/s decoding, and a fact 30k tokens back recalled exactly.
+- Thinking is on by default, the way the model's own template asks for it. Tool calls, multi-turn and prompt reuse all work.
+- Thanks @justinluque (#166).
+
+### Create panes
+
+- Drop a file on any pane and it lands in the right slot: the Image source and its references, the Video first frame, the 3D photo, the reference voice clip, and the ref2va reference lists, which sort a mixed drop by type. A file the pane can't use is refused while it's still in the air instead of being swallowed. Thanks @justinluque (#139).
+- The Image pane's pictures are one numbered list, so the numbers match what your prompt refers to.
+- New **544 x 960 portrait** preset for MiniMax-H3, the fastest one for long clips. Thanks @Morac2 (#177).
+
+### App
+
+- New **Only use tools when I ask** setting in Settings, Agent Workspace. With it on, the composer stops offering to turn Tools or MCP on when your message looks like a task, and tools are only ever on because you turned them on. Thanks @justinluque (#174).
+- Models in your Hugging Face cache are listed wherever that cache lives. `HF_HUB_CACHE`, `HF_HOME` and `XDG_CACHE_HOME` are read from your login shell, since an app launched from Finder inherits none of them, and a cache you pointed elsewhere that isn't there is empty rather than quietly falling back to the default folder.
+
+### Fixes
+
+- A capped thought is now streamed as it is written. With tools in play, asking for a reasoning budget showed nothing at all until the model finished and then dumped the whole cut-down thought at once, so a capped agent session looked frozen.
+- Asking a model for `medium` effort could make it think longer, not shorter: the word went to the model and a token cap was derived from the same word, so the reply was cut where you could see it while generation ran on invisibly. On models whose template reads the word, the word is now the only lever, and an explicit `reasoning_budget_tokens` still caps.
+- A tool declared without a description, or without parameters, could silently drop the entire tool list from the prompt. Both are legal, and the model was left with no idea the tools existed.
+- LFM 2.5 VL read numbers in your prompt one digit at a time, which put every number off distribution, and its image tiles were resized with the wrong filter.
+- pi's own thinking-level picker reaches the server now. It was a label the client kept to itself, so every request arrived with no level set.
+
 ## v26.8.6 — LTX-Video 2.5, MiniMax Music 3, faster long chats
 
 ### Highlights

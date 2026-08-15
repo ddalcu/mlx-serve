@@ -388,6 +388,15 @@ class AppState: ObservableObject {
             .store(in: &cancellables)
 
         refreshModels()
+        // A Finder-launched bundle has no shell environment, so HF_HOME /
+        // HF_HUB_CACHE / XDG_CACHE_HOME are invisible until we ask the login
+        // shell. Off-main (it spawns one), and rescan only if the cache moved.
+        Task { [weak self] in
+            guard let self else { return }
+            if await self.downloads.refreshHuggingFaceRootFromLoginShell() {
+                self.refreshModels()
+            }
+        }
         loadChatHistory()
         // Start background task scheduling (catch-up + timer arming). Notifications
         // route back here to resume paused runs / deep-link into the Tasks window.

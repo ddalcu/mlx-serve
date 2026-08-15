@@ -110,6 +110,26 @@ final class AgentBudgetTests: XCTestCase {
     // configured `maxTokens` (a <=0 value is a config validation error), so a
     // file bigger than the response cap can only land via bash appends — the
     // 2026-07-20 loop re-issued an impossible one-shot `write` for hours.
+    func testPiSurfacesEnableReasoningEffortAndAgree() throws {
+        // pi picks a reasoning level in its own UI, but only SENDS it when the
+        // provider declares support. With this false the level was a local
+        // label: every request arrived with no `reasoning_effort`, so the
+        // server applied its own default and nothing pi showed could change it.
+        // The provider block in models.json and the per-model COMPAT in the
+        // extension are two copies of one contract (applyExtension does not
+        // inherit provider compat), so they are pinned together.
+        let json = AgentConfigs.piModelsJSON(
+            baseURL: "http://127.0.0.1:11234", model: "m",
+            budget: AgentBudget.Budget(context: 32768, output: 8192))
+        let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://127.0.0.1:11234")
+        XCTAssertTrue(json.contains("\"supportsReasoningEffort\": true"),
+                      "models.json must enable reasoning effort: \(json)")
+        XCTAssertTrue(js.contains("supportsReasoningEffort: true"),
+                      "extension COMPAT must enable reasoning effort: \(js)")
+        XCTAssertFalse(json.contains("\"supportsReasoningEffort\": false"))
+        XCTAssertFalse(js.contains("supportsReasoningEffort: false"))
+    }
+
     func testPiAgentsMDStatesTheCapAndTheChunkingRecovery() {
         let b = AgentBudget.forServerContext(262144)
         let md = AgentConfigs.piAgentsMD(budget: b)

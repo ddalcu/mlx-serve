@@ -1349,15 +1349,15 @@ fn splitRegexOf(node: std.json.Value) ?[]const u8 {
     return rx.string;
 }
 
+/// The digit rule is a BRANCH, not necessarily the whole pattern: DeepSeek-V4
+/// gives `\p{N}{1,3}` its own Split entry, while LFM2.5-VL / Llama-3 bury it in
+/// one combined alternation. An exact-match test reads the combined spelling as
+/// per-digit, which puts every number in the prompt off-distribution — and the
+/// style detector cannot stand in for it, since a checkpoint can carry this
+/// digit rule with a non-Llama-3 contraction group (LFM2.5-VL does).
 fn splitRegexIsDigits13(node: std.json.Value) bool {
-    const obj = node.object;
-    const ty = obj.get("type") orelse return false;
-    if (ty != .string or !std.mem.eql(u8, ty.string, "Split")) return false;
-    const pat = obj.get("pattern") orelse return false;
-    if (pat != .object) return false;
-    const rx = pat.object.get("Regex") orelse return false;
-    if (rx != .string) return false;
-    return std.mem.eql(u8, rx.string, "\\p{N}{1,3}");
+    const rx = splitRegexOf(node) orelse return false;
+    return std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null;
 }
 
 /// Parse one BPE merge entry, accepting both on-disk formats:
@@ -1906,6 +1906,32 @@ test "tokenizer.json digit-group parse: {1,3} Split rule sets digit_group 3" {
     var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_single, .{});
     defer p2.deinit();
     try testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(p2.value));
+}
+
+test "tokenizer.json digit-group parse: {1,3} inside a COMBINED Split regex" {
+    // LFM2.5-VL ships one alternation carrying the digit rule as a branch, so
+    // an exact-match detector reads it as per-digit and every number in the
+    // prompt goes off-distribution (live 2026-08-14: "973, 162" served as
+    // '9','7','3' / '1','6','2' against HF's '973' / '162', measured on the
+    // ScreenSpot-v2 grounding track). The contraction group is spelled
+    // `'(?i:[sdmt]|ll|ve|re)`, not Llama-3's, so the style detector does not
+    // cover it either — the digit rule is its own question.
+    const json_combined =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s"},"behavior":"Isolated","invert":false},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var p3 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_combined, .{});
+    defer p3.deinit();
+    try testing.expectEqual(@as(u8, 3), digitGroupFromPreTokenizer(p3.value));
+
+    // A tokenizer with no digit rule at all still groups per digit.
+    const json_no_digits =
+        \\{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"},"behavior":"Isolated","invert":false}
+    ;
+    var p4 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_no_digits, .{});
+    defer p4.deinit();
+    try testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(p4.value));
 }
 
 test "gpt2PreTokenize: newline run after whitespace" {

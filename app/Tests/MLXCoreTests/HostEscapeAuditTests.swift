@@ -28,6 +28,8 @@ final class HostEscapeAuditTests: XCTestCase {
             "login zsh to detect+launch claude/pi/opencode. Runtime-gated on the compile-time BuildFeatures.cliLauncher flag (false under MAS_BUILD); UI hidden with it.",
         "UpdateChecker.swift":
             "hdiutil/ditto to swap the installed .app. Runtime-gated on the compile-time BuildFeatures.selfUpdate flag (false under MAS_BUILD); UI hidden with it.",
+        "LoginShellEnv.swift":
+            "login zsh to read the user's HF_HOME / HF_HUB_CACHE / XDG_CACHE_HOME — a Finder-launched bundle has no shell environment. Callers gate it: primeHuggingFace() on the compile-time BuildFeatures.customModelFolders flag (false under MAS_BUILD, where an out-of-container cache is unreadable anyway); CLIInstaller on its own flag.",
         "MCPSpawner.swift":
             "HostMCPSpawner's login zsh, used only when the Agent Sandbox is OFF. Compiled out under MAS_BUILD.",
         "ProcessRegistry.swift":

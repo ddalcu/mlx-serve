@@ -94,6 +94,12 @@ enum AgentConfigs {
     /// `apiKey` defaults to the placeholder the loopback-trusted server
     /// ignores; the SANDBOXED session passes the real `--api-key` when one is
     /// set — guest→host traffic arrives non-loopback (via the NAT gateway).
+    /// `supportsReasoningEffort: true` is what lets pi's own reasoning-level
+    /// picker reach the server. With it false the level was a local label pi
+    /// never transmitted, so every request arrived effort-less and took the
+    /// server's default. It rides BOTH surfaces (here and the extension's
+    /// per-model COMPAT) because applyExtension does not inherit provider
+    /// compat — `AgentBudgetTests` pins the two together.
     static func piModelsJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
                              apiKey: String = "mlx-serve") -> String {
         """
@@ -105,7 +111,7 @@ enum AgentConfigs {
               "apiKey": "\(apiKey)",
               "compat": {
                 "supportsDeveloperRole": false,
-                "supportsReasoningEffort": false,
+                "supportsReasoningEffort": true,
                 "maxTokensField": "max_tokens",
                 "thinkingFormat": "qwen"
               },
@@ -170,7 +176,7 @@ enum AgentConfigs {
         const FALLBACK_CONTEXT = 32768;
         const COMPAT = {
           supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
+          supportsReasoningEffort: true,
           maxTokensField: "max_tokens",
           thinkingFormat: "qwen",
         };
