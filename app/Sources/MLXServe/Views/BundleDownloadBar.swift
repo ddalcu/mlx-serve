@@ -56,7 +56,7 @@ struct BundleDownloadBar: View {
     private func downloadingRow(_ a: (repo: String, index: Int, count: Int, state: DownloadManager.DownloadState)) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                ProgressView(value: a.state.fileProgress).frame(maxWidth: .infinity)
+                ProgressView(value: a.state.progress).frame(maxWidth: .infinity)
                 Text("\(a.state.percentFormatted) \(a.state.speedFormatted)")
                     .font(.system(size: 9).monospacedDigit()).foregroundStyle(.secondary)
                 Button { downloads.cancelBundle(bundle) } label: {

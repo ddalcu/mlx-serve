@@ -2259,3 +2259,87 @@ Failure now leaves the live cache exactly as it was — same scheme, same conten
 Two things make this a class rather than a bug. First, the symptom is maximally misleading: the stack names `mlx_array_free`, several frames and one full load-path unwind away from the refusal that caused it, so the natural first suspect is the MLA cache geometry or mlx's refcounting — anything but the four-line caller that printed the correct error message immediately before. Second, the shape recurs on its own: any future scheme that refuses an arch, at any of these sites, reopens it. So the guard is a source scan (`.cache = try` appears nowhere in transformer/scheduler/main, and `reinit`'s build precedes its free) rather than only the behavioral test, and the behavioral test is written against the testing allocator so the pre-fix order trips a double free on its own `defer` — verified red exactly that way, and red again with the helper's two statements transposed.
 
 The general rule: **when a fallible call sits after a `deinit` of the thing it replaces, the error path is a use-after-free.** Build, then swap — and when several call sites share the pattern, the ordering belongs inside one helper they all use, not repeated correctly four times.
+
+## The verify-qmm plain-SIMD tiles were a 4-bit specialization, and shape-gating is where the win lives (2026-08-15)
+
+`transformer.verifyQmm`'s split-K and msg tiles read weights as
+`w_q[(n0+j) * K_by_p + pack]` — one uint32, eight nibbles — so every non-4-bit
+pack fell through to stock MLX on the whole M1-M4 line. Only the NAX m16 tile
+(M5-class, `applegpu_g17`) handled 5/6-bit. The Qwen3.8-27B 6-bit pack is the
+best quality-per-byte build for a 36 GB Mac (95.0% top-1 against bf16 vs the
+4-bit pack's 83.6%) and paid the full lane-off penalty on every MTP round.
+
+Both tiles are now `BITS`-templated with the same byte-addressed unpack the NAX
+tile already validated: one `pack` iteration always covers 8 K values (that is
+the Vec8 activation load), so its weights are exactly BITS bytes at
+`w_q + n * K_bytes + pack * BITS` — 4 values per 3 bytes at 6 bits, 8 per 5
+bytes at 5, one byte per value at 8. 4-bit keeps its original aligned uint32
+read verbatim.
+
+### Three things that were not obvious
+
+**The kernel-cache key was a false alarm, and the reason is worth knowing.**
+`getVerifyQmmKernel(m, bn)` is not keyed by bits, which looks exactly like the
+`ShapeKey` collision class. It is not: MLX names its JIT'd custom kernel
+`custom_kernel_<name>_<template_hash>_<input dtypes>_<output dtypes>`
+(`backend/common/metal_kernel.cpp`), so template args ARE the cache key. That is
+the same mechanism that already lets one cached `mlx_fast_metal_kernel` handle
+serve GS 32/64/128. `BITS` rides in as a template arg and needs no key change —
+and the parity test drives every width through one cached handle in one process,
+which is the test that would have caught it.
+
+**Hoisting the POINTER is not hoisting the LOAD.** The tile's shape is "issue
+every column's weight word, then run one sequential chain per column", and the
+first cut hoisted only `const device uchar* wp{j}` — leaving the actual byte
+reads inside each chain, serialized behind the previous column's arithmetic.
+The widened arms hoist the WORDS, at the widest load each width's alignment
+allows: 8-bit takes two uints (`pack * 8`; not one ulong — 4-byte alignment is
+all the shipped 4-bit path assumes of this buffer), 6-bit three ushorts
+(`pack * 6` is only 2-aligned) re-assembled into two 3-byte words, 5-bit bytes.
+
+**Shape-gating is most of the result, not a detail.** Measured on an M4 Max
+(no NAX lane, so the plain-SIMD tiles are all this machine has), Qwen3.8-27B,
+MTP on, decode tok/s from the server's own `timings`, per-prompt medians over
+two passes with the CELL order reversed on the second:
+
+| arm | code | prose | agentish |
+|---|---|---|---|
+| 6-bit, every shape forced on (`MIXED_PLAIN=1`) | 1.03x | 1.05x | 1.03x |
+| 6-bit, `N >= 5120` (`mixedPlainShapeEnabled`) | **1.10x** | **1.22x** | **1.17x** |
+| 8-bit, `N >= 5120` | 1.03x | 1.04x | 1.01x |
+
+Adopting the 1024-wide K/V projections gives back ~10 of the ~20 points — the
+same split `mixedNaxShapeEnabled` encodes for the NAX tile, and the reason
+adoption is a measured predicate rather than a width list. For scale: killing
+the 4-bit lane outright on this box costs 1.09-1.12x, so the 6-bit lane is worth
+MORE than the 4-bit one it was modelled on.
+
+8-bit ships default OFF at 1.01-1.04x — inside what the harness resolves, and a
+lane that only adds dispatch surface for that is not worth defaulting. 5-bit has
+the kernel arm and the parity test but no pack on the measuring box, so it does
+not get to ride 6-bit's number either. `MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0|1`
+forces both arms.
+
+**Cell ORDER is a real bias in a paired sweep.** The first cell of a pass reads
+~2% fast; a control pack that ignores the lever entirely measured a 1.8-2.8%
+"gain" between two cells that differ in nothing. Reversing the cell order on the
+second pass (not just the pack order) cancels it — before that fix the 6-bit win
+read as +1 to +5%.
+
+### The end-to-end bar the plan asked for is not achievable, and the control says so
+
+"Greedy temp-0 continuation must be byte-identical with the lane on and off" is
+not a property this lane family has. The verify tile accumulates the fp32
+reduction in a different order than stock qmm, so near-tie argmaxes flip — the
+documented INT4-divergence class. The SHIPPED, unchanged 4-bit lane diverges
+from stock under exactly that test and diverges EARLIER (char 322 against the
+6-bit lane's 557), both continuations fluent and on-topic.
+
+The bars that do hold, and that this change is pinned against:
+- parity against an fp32 DEQUANT reference at real shapes, per width, never
+  kernel-vs-kernel (`verifyQmm: the plain-SIMD tiles match stock qmm at
+  5/6/8-bit affine too`, red-verified by flipping the 6-bit mask to 0x1F and by
+  reversing the 8-bit byte order);
+- **4-bit bit-identity across the refactor**: same binary except the kernel
+  generator, same 4-bit pack, MTP engaged in both arms, 250 greedy tokens
+  identical to the byte.

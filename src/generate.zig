@@ -32,6 +32,12 @@ const KVCache = transformer_mod.KVCache;
 /// `serve()` runs. Per-request reads happen on the same thread that did the
 /// CLI parse, so no atomicity needed.
 pub var prefill_chunk_override: usize = 8192;
+
+/// Set by `--prefill-chunk` in main.zig. An operator-chosen width outranks the
+/// per-model chunk the memory sizer pins (`ModelConfig.pinned_prefill_chunk`);
+/// without this flag the default 8192 is indistinguishable from a request.
+/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
+pub var prefill_chunk_explicit: bool = false;
 pub var prefill_trace_force: bool = false;
 
 /// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
@@ -144,10 +150,19 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
-pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool) usize {
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, pinned_chunk: usize) usize {
     const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
     if (env_chunk > 0) return env_chunk;
-    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe);
+    // `pinned_chunk` is the machine-sized cap frozen at load
+    // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
+    // the widest chunk whose one-off transient reserve still leaves this box a
+    // real KV budget. It NARROWS, never raises, and an explicit
+    // `--prefill-chunk` outranks it — the operator asked for a width.
+    const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
+        prefill_chunk_override
+    else
+        @min(prefill_chunk_override, pinned_chunk);
+    return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe);
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -1235,6 +1250,17 @@ pub const Generator = struct {
         /// (no-match) steps. The prompt-time gate disables PLD on novel content
         /// where cold-path dominates.
         pld_enabled: bool = false,
+        /// The machine-sized prefill chunk frozen at load
+        /// (`ModelConfig.pinned_prefill_chunk`, resolved by
+        /// `server.resolvePrefillChunk`). 0 = unpinned, keep the launch width.
+        ///
+        /// It arrives per REQUEST rather than off `xfm.config` because the
+        /// Transformer holds a COPY of the config taken when it was built, and
+        /// the pin is written to the registry's config after load — the copy
+        /// never sees it. The scheduler reads `slot.model.config`, which IS the
+        /// object the admission guard bills against, so bill and forward cannot
+        /// disagree. (Live 2026-08-14: pinned 4096, prefilled at 8192.)
+        pinned_prefill_chunk: usize = 0,
         /// Enable Gemma 4 assistant drafter. When set, `drafter` must be
         /// non-null and already `bind()`-ed to `xfm`. Init's prefill final-token
         /// forward captures the post-final-norm hidden state into
@@ -1533,6 +1559,7 @@ pub const Generator = struct {
             total_ctx_for_chunk,
             xfm.config.has_sliding_window,
             xfm.config.isMoe(),
+            options.pinned_prefill_chunk,
         );
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).

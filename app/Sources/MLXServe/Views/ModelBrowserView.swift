@@ -506,7 +506,7 @@ private struct RecommendedModelTableRow: View {
         } else if let state, state.status == .downloading {
             HStack(spacing: 6) {
                 VStack(alignment: .trailing, spacing: 1) {
-                    ProgressView(value: state.fileProgress)
+                    ProgressView(value: state.progress)
                         .frame(width: 70)
                     Text("\(state.percentFormatted) \(state.speedFormatted)")
                         .font(.system(size: 9).monospacedDigit())
@@ -996,7 +996,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         } else if let active, active.state.status == .downloading {
             HStack(spacing: 6) {
                 VStack(alignment: .trailing, spacing: 1) {
-                    ProgressView(value: active.state.fileProgress)
+                    ProgressView(value: active.state.progress)
                         .frame(width: 70)
                     Text("\(active.state.percentFormatted) \(active.state.speedFormatted)")
                         .font(.system(size: 9).monospacedDigit())
@@ -1316,7 +1316,7 @@ private struct ModelBrowserRow: View {
             isReady: isReady,
             status: state?.status,
             hasPartial: downloads.hasPartialDownload(model.id),
-            progress: state?.fileProgress ?? 0
+            progress: state?.progress ?? 0
         )
     }
 
@@ -1853,7 +1853,7 @@ private struct ActiveDownloadRow: View {
             if state.status == .downloading {
                 HStack(spacing: 4) {
                     VStack(alignment: .trailing, spacing: 1) {
-                        ProgressView(value: state.fileProgress)
+                        ProgressView(value: state.progress)
                             .frame(width: 80)
                         Text("\(state.percentFormatted) \(state.speedFormatted)")
                             .font(.system(size: 9).monospacedDigit())

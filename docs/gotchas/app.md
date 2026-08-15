@@ -446,3 +446,80 @@ The class guard is the one that matters: a source scan asserting no file outside
 `LoginShellEnv.swift` reads an HF variable straight from `ProcessInfo`. That is exactly
 how the bug got in, and it is what the next `HF_*` variable will trip over. Verified red
 by injecting a single direct read into `CLIInstaller.swift`.
+
+### The pill showed a commit hash, then kept showing the wrong model for a minute (2026-08-14)
+
+Two reports about the composer's model picker, one cause each.
+
+**A registry id is not a display name.** A model in the Hugging Face cache lives at
+`models--<org>--<repo>/snapshots/<commit>/`, and nothing points the server at that root:
+it reaches an HF model by absolute path, either `--model` at launch or `/v1/load-model`
+on a hot switch. Both key the entry by DIRECTORY BASENAME (`ModelRegistry.registerByPath`
+→ `std.fs.path.basename`), and for a snapshot dir that basename is the commit hash. So
+`/v1/models` reports `9f0ea3c1d2`, and the pill — which preferred `chatModelInfo?.name`
+over everything else, deliberately, because the resident model is the one answering —
+rendered a hex string. The tray was fine and that is the tell: its rows come from our own
+scan (`LocalModel.displayLabel`), which reads the repo id out of the cache dir name. The
+fix is not to stop trusting the server: where the resident id names the model we PICKED
+(its `name`, or its path's last component — the two shapes a registry id can take), our
+label wins; where it names something else, the server's id stays, because a model another
+surface loaded is not ours to rename.
+
+**A hot switch is invisible from the outside.** It never moves `server.status` off
+`.running` (the process doesn't restart), and `chatModelInfo` keeps reporting the OLD
+model until the new one is resident — which on a 27B is a minute. The pill therefore sat
+on the previous model's name with a green dot beside it while the menu's checkmark had
+already moved to the new one, and nothing anywhere said a load was running.
+`AppState.pendingModelLoadTask` knew, but it was private and unpublished. It is now
+`@Published var loadingModelPath`, set beside that task and cleared in its `defer`, and
+the pill names the model being loaded with a spinner in place of the dot. A RESTART is
+deliberately not tracked there: that one does move the status, and
+`ChatServerStartControl` already reports it.
+
+Both answers live in one pure function (`ChatModelSelection.pillState`), next to the tag
+rules, for the reason the tag rules are there: a second copy is how one picker starts
+naming a model the other doesn't.
+
+
+### The download bar filled up once per file (2026-08-14)
+
+`DownloadState` carried two fractions: `progress` (bytes banked across the whole repo over
+its total) and `fileProgress` (the file currently in flight). Every bar in the app —
+the model pill's hairline, the browser rows, the welcome card, the starter card, the
+bundle bar, the chat gate — rendered `fileProgress`, and so did `percentFormatted`. A
+four-shard 18 GB pack therefore ran 0→100% four times, and the reports were all the same
+shape: "it says 100% and starts again, I don't think it's working". The bigger the model,
+the worse it reads, because more shards means more resets.
+
+Nothing was wrong with the producer: `progress` was already live and correct, fed by
+`(baseDownloaded + fileBytesTotal) / totalSize` on every transfer callback. It was simply
+the field nobody rendered.
+
+The fix is a deletion. Keeping both fractions in the struct and pointing the views at the
+right one leaves the wrong one sitting there for the next surface to reach for — and eight
+independent sites had already made exactly that mistake, which says the reflex is stronger
+than the comment would be. With `fileProgress` gone the compiler names every site, and the
+per-file detail is carried where it belongs: `currentFile` and `fileIndex`/`fileCount`,
+words rather than a bar that appears to lose its place.
+
+Two details the deletion had to preserve. `ChunkedFileDownloader.onProgress` reports bytes
+*of this file including resumed ones*, so the callback's arithmetic is the transfer's true
+position and needed no change. And the resume branch, which used to set only the per-file
+number, now banks its existing bytes into `progress` — otherwise the bar sits at the last
+completed file's mark for the fraction of a second before the first callback, which is not
+wrong but is not where the disk already is.
+
+Same file, same round, the other half of the same class: the hairline drew for ANY chat
+transfer, so downloading a second model in the background put a progress bar under the
+model that was already answering. Excluding media bundles had fixed the loudest instance of
+that and left the general one, because both times the check was "is something downloading"
+rather than "is THIS model downloading". Every other surface in the app keys its download
+by its own repo id; the pill now does too, matching against `selectedModelPath` through the
+layout the downloader writes (`<root>/<org>/<name>`, one level up for a `.gguf` file) since
+a model still arriving has no `LocalModel` to match on. The one exception is what the
+hairline was added for: with nothing chat-pickable on disk, the composer cannot answer at
+all and whatever is arriving is the reason.
+
+Media BUNDLES stay per-component: a bundle is N repos and the manager learns a repo's total
+only when it starts, so a weighted bundle fraction would need sizes it doesn't have. That
+bar resets once per model, and its label already says which one ("Downloading model 1/2").

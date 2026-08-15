@@ -662,6 +662,8 @@
     { id: "gemma-4-26b-a4b",  name: "Gemma 4 26B-A4B",   params: "26B (4B act)", sizeGb: 15,  minRam: 24,  tags: ["moe", "vision", "fast"], downloads: 0, paramsB: 25.2, activeB: 3.8 },
     { id: "gemma-4-31b",      name: "Gemma 4 31B",       params: "31B",          sizeGb: 17.4, minRam: 32, tags: ["vision"], downloads: 0, paramsB: 30.7, activeB: 30.7 },
     { id: "qwen3.6-27b",      name: "Qwen3.6 27B",       params: "27B",          sizeGb: 15.5, minRam: 24, tags: [], downloads: 0, paramsB: 27.8, activeB: 27.8 },
+    { id: "qwen3.8-27b",      name: "Qwen3.8 27B",       params: "27B",          sizeGb: 18.2, minRam: 24, tags: ["vision"], downloads: 0, paramsB: 27.8, activeB: 27.8 },
+    { id: "muse-glimmer-30b", name: "Muse-Glimmer 30B",  params: "30B",          sizeGb: 21.4, minRam: 32, tags: ["vision"], downloads: 0, paramsB: 30, activeB: 30 },
     { id: "qwen3.6-35b-a3b",  name: "Qwen3.6 35B-A3B",   params: "35B (3B act)", sizeGb: 20,  minRam: 32,  tags: ["moe", "fast"], downloads: 0, paramsB: 36, activeB: 3 },
     { id: "llama-3.3-70b",    name: "Llama 3.3 70B",     params: "70B",          sizeGb: 40,  minRam: 64,  tags: [], downloads: 0, paramsB: 70,  activeB: 70 },
     { id: "ling-3.0-flash",   name: "Ling 3.0 Flash",    params: "124B (5B act)", sizeGb: 70, minRam: 96,  tags: ["moe", "fast"], downloads: 0, paramsB: 124, activeB: 5.1 },
@@ -683,7 +685,7 @@
   const HF_API = "https://huggingface.co/api/models";
   const OFFICIAL_ORGS = new Set(["qwen", "google", "meta-llama", "mistralai",
     "deepseek-ai", "liquidai", "nvidia", "tencent", "moonshotai", "microsoft",
-    "ibm-granite", "zai-org", "openai", "antirez",
+    "ibm-granite", "zai-org", "openai", "antirez", "meta-models", "inclusionai",
     "deepreinforce-ai", "prism-ml", "minimaxai"]);
   // Modern-generation architectures worth ranking. This is a POPULARITY
   // gate, not a runnability guarantee: most entries run in mlx-serve
@@ -693,7 +695,8 @@
   const LISTED_ARCHS = new Set(["gemma4", "gemma4_text", "diffusion_gemma",
     "gemma3", "gemma3_text", "qwen3", "qwen3_5", "qwen3_5_moe",
     "qwen3_5_moe_text", "qwen3_next", "qwen3_moe", "qwen3_vl", "qwen3_vl_moe",
-    "nemotron_h", "lfm2", "hy_v3", "llama", "mistral",
+    "nemotron_h", "lfm2", "lfm2_vl", "hy_v3", "llama", "mistral",
+    "muse_glimmer", "muse_glimmer_text", "bailing_hybrid",
     "gpt_oss", "deepseek_v4", "glm_moe_dsa", "glm4_moe_lite", "glm4_moe",
     "granite", "kimi_k2", "kimi_k25", "minimax_m2", "minimax_m3_vl"]);
   // no-legacy backstop: a group whose model launched before this never lists

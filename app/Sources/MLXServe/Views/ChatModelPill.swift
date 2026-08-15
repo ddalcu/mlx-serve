@@ -36,16 +36,15 @@ struct ChatModelPill: View {
     private var lanChatModels: [ModelInfo] { server.lanModels(capability: "chat") }
     private var pickableModels: [LocalModel] { appState.localModels.filter(\.isChatPickable) }
 
-    /// What to show on the pill. The LAN id wins for the same reason it wins in
-    /// the selection tag: while chatting over the network, the local model is
-    /// not the one answering.
-    private var displayName: String {
-        if let lanId = server.lanChatModelId { return lanId }
-        if let loaded = server.chatModelInfo?.name, !loaded.isEmpty { return loaded }
-        if let picked = pickableModels.first(where: { $0.path == appState.selectedModelPath }) {
-            return picked.displayLabel
-        }
-        return "Select a model"
+    /// The name and the in-flight state, decided in ONE pure place shared with
+    /// the tray's rules (`ChatModelSelection.pillState`) — a per-surface copy is
+    /// how one picker starts naming a model the other doesn't.
+    private var pill: ChatModelPillState {
+        ChatModelSelection.pillState(lanChatModelId: server.lanChatModelId,
+                                     residentName: server.chatModelInfo?.name,
+                                     loadingPath: appState.loadingModelPath,
+                                     selectedPath: appState.selectedModelPath,
+                                     models: pickableModels)
     }
 
     /// Green once the server is up AND a chat model is actually resident —
@@ -73,25 +72,53 @@ struct ChatModelPill: View {
         )
     }
 
-    /// A live transfer the CHAT could be waiting on, if any. The pill is where
-    /// the user is already looking when they wonder why nothing answers, so a
+    /// A live transfer THIS CHAT is waiting on, if any. The pill is where the
+    /// user is already looking when they wonder why nothing answers, so a
     /// download in flight belongs here rather than only in the browser two
-    /// clicks away — but never a media bundle's transfer: `.values.first` over
-    /// the unordered dictionary picked ANY in-flight download, so a 30 GB
-    /// video pack grew a progress hairline under the chat model's name (and
-    /// suppressed the download-arrow affordance while it ran).
+    /// clicks away — but it has to be the download that explains the silence.
+    /// Excluding media bundles was half of that (a 30 GB video pack grew a
+    /// hairline under the chat model's name); the other half is that a CHAT
+    /// model fetched in the background drew a bar under a different model that
+    /// was already answering perfectly well. It is keyed to the pill's own
+    /// model now, the way every other download surface keys its row.
+    ///
+    /// `hasChatModelOnDisk` is the exception, and the reason the hairline
+    /// exists: with nothing pickable on this Mac the composer cannot answer at
+    /// all, so whatever chat model is arriving IS what it is waiting for.
     static func chatDownload(in downloads: [String: DownloadManager.DownloadState],
-                             mediaRepos: Set<String>) -> DownloadManager.DownloadState? {
+                             mediaRepos: Set<String>,
+                             selectedModelPath: String,
+                             hasChatModelOnDisk: Bool) -> DownloadManager.DownloadState? {
         downloads
-            .filter { $0.value.status == .downloading && !mediaRepos.contains($0.key) }
+            .filter { repoId, state in
+                guard state.status == .downloading, !mediaRepos.contains(repoId) else { return false }
+                return hasChatModelOnDisk ? isTransfer(of: repoId, for: selectedModelPath) : true
+            }
             .min { $0.key < $1.key }?  // stable pick when two are running
             .value
+    }
+
+    /// Whether `repoId` is the model at `path`. A download has no `LocalModel`
+    /// until its files land, so the join is the layout the downloader writes:
+    /// `<root>/<org>/<name>`, i.e. the path's last two components ARE the repo
+    /// id. A GGUF selection points at the file inside that folder, so its repo
+    /// is one level further up.
+    static func isTransfer(of repoId: String, for path: String) -> Bool {
+        guard !repoId.isEmpty, !path.isEmpty else { return false }
+        var dir = path as NSString
+        while dir.hasSuffix("/") { dir = dir.deletingLastPathComponent as NSString }
+        if dir.pathExtension.lowercased() == "gguf" { dir = dir.deletingLastPathComponent as NSString }
+        let org = (dir.deletingLastPathComponent as NSString).lastPathComponent
+        let name = dir.lastPathComponent
+        return repoId == "\(org)/\(name)" || repoId == name
     }
 
     private var activeDownload: DownloadManager.DownloadState? {
         guard server.lanChatModelId == nil else { return nil }
         return Self.chatDownload(in: downloads.downloads,
-                                 mediaRepos: downloads.mediaBundleRepos)
+                                 mediaRepos: downloads.mediaBundleRepos,
+                                 selectedModelPath: appState.selectedModelPath,
+                                 hasChatModelOnDisk: !pickableModels.isEmpty)
     }
 
     /// True when this Mac has nothing chat-pickable on disk — the state where
@@ -101,7 +128,8 @@ struct ChatModelPill: View {
     }
 
     var body: some View {
-        Menu {
+        let pill = self.pill
+        return Menu {
             menuContent
         } label: {
             VStack(alignment: .leading, spacing: 3) {
@@ -112,7 +140,7 @@ struct ChatModelPill: View {
                     // The READABLE name (`ModelDisplayName`). The repo id it is
                     // built from stays the identity and is still what the menu
                     // rows carry underneath — this is the label, not a rename.
-                    Text(ModelDisplayName.pretty(displayName))
+                    Text(ModelDisplayName.pretty(pill.name))
                         .font(compact ? .callout.weight(.semibold) : .callout.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -122,7 +150,16 @@ struct ChatModelPill: View {
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(.secondary)
-                    if needsDownload {
+                    if pill.isLoading {
+                        // A switch in flight. The dot would say GREEN here —
+                        // the server is running and a model is resident, just
+                        // not this one — so the spinner replaces it rather than
+                        // sitting beside it.
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.6)
+                            .frame(width: 8, height: 8)
+                    } else if needsDownload {
                         // Nothing on disk: the one thing to do is get one, so
                         // say it with the symbol rather than a dot that only
                         // reports.
@@ -139,7 +176,7 @@ struct ChatModelPill: View {
                     // Deliberately wordless: a hairline that fills. The figures
                     // live in the browser; here it only has to say "something is
                     // arriving, that's why it can't answer yet".
-                    ProgressView(value: max(0, min(1, active.fileProgress)))
+                    ProgressView(value: max(0, min(1, active.progress)))
                         .progressViewStyle(.linear)
                         .tint(.green)
                         .frame(height: 3)
@@ -162,7 +199,9 @@ struct ChatModelPill: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("Chat model. Click to switch — models on this Mac and any shared by other Macs on your network.")
+        .help(pill.isLoading
+              ? "Loading \(ModelDisplayName.pretty(pill.name))…"
+              : "Chat model. Click to switch — models on this Mac and any shared by other Macs on your network.")
     }
 
     @ViewBuilder

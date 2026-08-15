@@ -29,7 +29,7 @@ struct ChatModelGateSheet: View {
         let active = downloads.downloads[pick.repoId]
         return ChatGateState.resolve(
             localModels: appState.localModels,
-            activeDownload: active?.status == .downloading ? active?.fileProgress : nil,
+            activeDownload: active?.status == .downloading ? active?.progress : nil,
             lanChatModelCount: server.lanModels(capability: "chat").count
         )
     }

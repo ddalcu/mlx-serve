@@ -51,7 +51,7 @@ struct RecommendedStarterCard: View {
     @ViewBuilder private var action: some View {
         if let state, state.status == .downloading {
             VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: state.fileProgress)
+                ProgressView(value: state.progress)
                 HStack(spacing: 6) {
                     Text("Downloading \(state.percentFormatted) \(state.speedFormatted)")
                         .font(.caption.monospacedDigit())

@@ -45,7 +45,23 @@ class AppState: ObservableObject {
                 // `.running` (the process itself never restarts), so
                 // polling status alone can't tell "old model still
                 // resident" from "new model resident".
+                // The pill names this model and spins while the load runs: a
+                // hot switch never moves `server.status` off `.running` and
+                // `chatModelInfo` keeps reporting the OLD model until the new
+                // one is resident, so without this a big checkpoint loads for a
+                // minute under the previous model's name and a green dot.
+                // Generation-tagged: a replaced task keeps running (nothing
+                // cancels it), and an unconditional clear in ITS defer would
+                // wipe the flag while a NEWER switch is still loading — the
+                // spinner vanishes and the pill goes back to the old model,
+                // the exact symptom this flag exists to fix. A path compare
+                // isn't enough (switch A→B→A: the stale A task's path matches
+                // the new flag), so only the LATEST switch's task clears it.
+                modelSwitchGeneration += 1
+                let generation = modelSwitchGeneration
+                loadingModelPath = selectedModelPath
                 pendingModelLoadTask = Task { @MainActor in
+                    defer { if self.modelSwitchGeneration == generation { self.loadingModelPath = nil } }
                     do {
                         _ = try await mgr.loadModel(id: id, drafterPath: drafterPath, setDefault: true)
                     } catch {
@@ -58,11 +74,16 @@ class AppState: ObservableObject {
                     }
                 }
             case .restart:
+                // A restart moves `server.status`, so `ChatServerStartControl`
+                // already reports it — this flag is only for the switch that
+                // leaves the status alone.
                 pendingModelLoadTask = nil
+                loadingModelPath = nil
                 server.stop()
                 server.start(modelPath: selectedModelPath, options: serverOptions)
             case .leaveStopped:
                 pendingModelLoadTask = nil
+                loadingModelPath = nil
             }
         }
     }
@@ -97,6 +118,16 @@ class AppState: ObservableObject {
     /// Set only while a hot-switch triggered by `selectedModelPath`'s `didSet`
     /// is in flight — see `useModelAndAwaitReady`.
     private var pendingModelLoadTask: Task<Void, Never>?
+    /// The model path a hot-switch is loading right now, or nil. Published so
+    /// the composer's picker can name the model it is switching TO and spin
+    /// while it arrives (`ChatModelSelection.pillState`): the server answers on
+    /// the previous model for the whole load, so nothing else says a switch is
+    /// in flight. A RESTART is not tracked here — that one moves the server
+    /// status, which the Start control already reports.
+    @Published var loadingModelPath: String?
+    /// Bumped per hot-switch; each switch task captures its value so only the
+    /// LATEST switch's completion clears `loadingModelPath` (see the didSet).
+    private var modelSwitchGeneration = 0
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
     /// Set when a task notification is tapped — the Tasks window observes this to

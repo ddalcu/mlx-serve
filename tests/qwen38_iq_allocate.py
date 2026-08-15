@@ -45,11 +45,25 @@ from convert_dsv4_weights import bf16_to_f32  # noqa: E402
 
 DEFAULT_SRC = "/Volumes/G Drive SSD/models-src/Qwen3.8-27B"
 GROUP_SIZES = (64, 128)
+# `dsv4_imatrix.pack_bits` implements 2/3/4/8; MLX's affine format also has 5 and
+# 6, and `transformer.verifyQmmLane` covers 4/5/6 ONLY — so an 8-bit weight loses
+# the spec-decode verify lanes exactly like a 2- or 3-bit one does. A pack aiming
+# between 4-bit and 8-bit quality without giving those lanes up needs 5/6-bit
+# packing implemented first.
 BIT_WIDTHS = (2, 3, 4)
 # Ordered cheapest-first; the greedy walk only ever steps forward through this.
-CANDIDATES = tuple(sorted(
-    ((b, g) for b in BIT_WIDTHS for g in GROUP_SIZES),
-    key=lambda bg: bg[0] + 32.0 / bg[1]))
+CANDIDATES = ()
+
+
+def set_bit_widths(widths):
+    global BIT_WIDTHS, CANDIDATES
+    BIT_WIDTHS = tuple(widths)
+    CANDIDATES = tuple(sorted(
+        ((b, g) for b in BIT_WIDTHS for g in GROUP_SIZES),
+        key=lambda bg: bg[0] + 32.0 / bg[1]))
+
+
+set_bit_widths(BIT_WIDTHS)
 
 
 def cand_key(bits, gs):
@@ -148,7 +162,8 @@ def read_rows(entry, row_idx):
 _JOB = {}
 
 
-def _init_worker(headers, imatrix_path, rows, seed):
+def _init_worker(headers, imatrix_path, rows, seed, widths):
+    set_bit_widths(widths)
     _JOB["headers"] = headers
     _JOB["rows"] = rows
     _JOB["seed"] = seed
@@ -182,17 +197,19 @@ def _measure_one(name):
         ch = im.astype(np.float32)
         calibrated = True
 
-    errs = {}
+    errs, rels = {}, {}
     for bits, gs in CANDIDATES:
         if in_dim % gs != 0:
             continue
         _, stats = weighted_affine_quant(w, bits, gs, ch, return_stats=True)
         errs[cand_key(bits, gs)] = stats["weighted_err"] * (out_dim / n_rows)
+        rels[cand_key(bits, gs)] = stats["weighted_rel_err"]
     return name, {"shape": [out_dim, in_dim], "params": out_dim * in_dim,
-                  "calibrated": calibrated, "err": errs}
+                  "calibrated": calibrated, "err": errs, "rel": rels}
 
 
 def cmd_measure(args):
+    set_bit_widths(int(b) for b in args.bits.split(","))
     headers = read_headers(args.src)
     todo, dense_bytes, skipped = [], 0, {}
     for name, (_, dtype, shape, _, nbytes) in sorted(headers.items()):
@@ -212,7 +229,8 @@ def cmd_measure(args):
     results = {}
     ctx = mp.get_context("fork")
     with ctx.Pool(args.jobs, initializer=_init_worker,
-                  initargs=(headers, args.imatrix, args.rows, args.seed)) as pool:
+                  initargs=(headers, args.imatrix, args.rows, args.seed,
+                            BIT_WIDTHS)) as pool:
         for i, (name, rec) in enumerate(pool.imap_unordered(_measure_one, todo, chunksize=1), 1):
             results[name] = rec
             if i % 25 == 0 or i == len(todo):
@@ -236,9 +254,34 @@ def cmd_measure(args):
 # allocate
 # ============================================================
 
+def objective_table(rec, mode):
+    """The number the greedy walk spends bytes to reduce.
+
+    `abs` is the imatrix-weighted squared error summed over the tensor —
+    proportional to the output-error ENERGY that weight contributes, and the
+    shape llama.cpp-style allocators use. It has one property worth knowing
+    before trusting it here: activation scale is not remotely uniform with
+    depth on this checkpoint (mean squared activation into `layers.0.mlp.down`
+    is 4.5e-5 against 2.7 at `layers.63`, a 6e4 ratio), so an absolute
+    objective is dominated by the late layers and starves the early ones.
+
+    `rel` divides each tensor's error by its own signal energy first and then
+    scales by parameter count: scale-free with depth, still size-aware."""
+    if mode == "abs":
+        return rec["err"]
+    return {k: v * rec["params"] for k, v in rec["rel"].items()}
+
+
 def cmd_allocate(args):
     data = json.loads(Path(os.path.expanduser(args.errors)).read_text())
     weights = data["weights"]
+    # The candidate set is a property of the ERRORS FILE, not of this module's
+    # default: allocating against a table measured at other widths would silently
+    # ignore every column it never heard of.
+    measured = sorted({int(k.split("x")[0]) for rec in weights.values() for k in rec["err"]})
+    set_bit_widths(measured)
+    for rec in weights.values():
+        rec["err"] = objective_table(rec, args.objective)
     budget = int(args.budget_gb * 1e9)
     floor = (args.floor_bits, args.floor_group)
     pin = (4, 64)
@@ -316,6 +359,7 @@ def cmd_allocate(args):
         "errors_from": args.errors,
         "budget_gb": args.budget_gb,
         "floor": list(floor),
+        "objective_mode": args.objective,
         "predicted_bytes": spent,
         "dense_bytes": data["dense_bytes"],
         "upgrades": bought,
@@ -347,6 +391,8 @@ def main():
     m.add_argument("--rows", type=int, default=512)
     m.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 8) - 2))
     m.add_argument("--seed", type=int, default=20260814)
+    m.add_argument("--bits", default="2,3,4",
+                   help="candidate bit widths (pack_bits implements 2,3,4,8)")
     m.set_defaults(fn=cmd_measure)
 
     a = sub.add_parser("allocate")
@@ -355,6 +401,7 @@ def main():
     a.add_argument("--budget-gb", type=float, default=9.0)
     a.add_argument("--floor-bits", type=int, default=2)
     a.add_argument("--floor-group", type=int, default=128)
+    a.add_argument("--objective", choices=("abs", "rel"), default="rel")
     a.set_defaults(fn=cmd_allocate)
 
     args = ap.parse_args()

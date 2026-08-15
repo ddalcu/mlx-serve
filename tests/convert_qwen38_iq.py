@@ -28,7 +28,7 @@ for an affine weight: `computeQuantParams` solves (bits, group_size) from the
 packed geometry at every call site that has an input-dim hint, and `--verify`
 below re-solves exactly that way and asserts it matches the allocation.
 
-  python3 tests/qwen38_iq_convert.py --src <bf16> --dst <out> \
+  python3 tests/convert_qwen38_iq.py --src <bf16> --dst <out> \
       --alloc alloc.json --imatrix imatrix.safetensors --verify
 """
 
@@ -60,6 +60,82 @@ COPY_FILES = ("generation_config.json", "tokenizer.json", "tokenizer_config.json
 # mlx-lm shifts, and the same exclusions: linear_attn.norm and the vision tower
 # are not delta-encoded. `mtp.*` is left raw on purpose — mlx-serve's MTP loader
 # detects and folds it itself, and double-shifting breaks drafting.
+
+# Card written beside the weights. Frontmatter is pinned by
+# tests/test_model_card_frontmatter.sh, which DISCOVERS converters by looking
+# for a module-level README constant — `base_model_relation: quantized` in
+# particular, because HF defaults a missing one to `finetune` and silently files
+# a quantized mirror in the wrong list on the base model's page.
+README = """---
+license: apache-2.0
+base_model: Qwen/Qwen3.8-27B
+base_model_relation: quantized
+library_name: mlx
+pipeline_tag: text-generation
+tags:
+- mlx
+- mlx-serve
+- qwen3_5
+- apple-silicon
+- mtp
+- speculative-decoding
+---
+
+# Qwen3.8-27B, {variant} for mlx-serve
+
+{headline} of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), built for **[mlx-serve](https://mlxserve.com)**, the native Zig MLX server for Apple Silicon.
+
+{size_gb:.1f} GB on disk, {bpw:.2f} bits per weight averaged over everything that is quantized. **Text only** — the vision tower is not included.
+
+## Allocation
+
+{method}
+
+{alloc_table}
+{battery_section}
+Attention q/k/v/o, the GatedDeltaNet `in_proj_a`/`in_proj_b` gates and the whole MTP head are pinned at 4-bit/gs-64 — cheap insurance, and the MTP head is the decode lever.
+
+## Serving
+
+```bash
+mlx-serve --model ddalcu/{repo_name} --serve --kv-quant 4
+```
+
+{serving_notes}
+
+## Conversion
+
+- Calibrated affine quantization on every matmul-read weight, widths per the table above.
+- Kept bf16: `mtp.fc` and every norm, bias, conv and SSM state. The vision tower is dropped.
+- The MTP head ships with the model; mlx-serve finds it in the shards and loads it with no flags.
+
+Same three raw-checkpoint fixes as the [4-bit](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) and [8-bit](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-8bit) builds: the delta-encoded norms get their `+1` folded in, the depthwise conv1d is transposed to MLX's `[C, K, 1]`, and (not needed here, since there is no tower) the Conv3d patch embed is channels-last.
+
+Weights, config, tokenizer and chat template are otherwise verbatim from the base repo.
+"""
+
+SERVING_NOTES = """\
+- **Which Mac.** This build exists for the 24 GB gap: the 4-bit pack needs about
+  18 GB of weights resident and does not fit there, and the 8-bit one needs a
+  48 GB machine. 13.0 GB of weights plus a ~1.4 GB prefill working set at
+  `--prefill-chunk 512` leaves roughly 1.5 GB for the cache inside a 24 GB Mac's
+  ~16 GB Metal working set, which is about 85k tokens at `--kv-quant 4`. A 16 GB
+  Mac is NOT covered — the budget that fits one is around 8.6 GB, and at that
+  size this model stops following instructions (measured: 46% top-1 agreement,
+  and two of three agent runs made no tool calls at all). Those figures are
+  computed from measurements taken on a 128 GB Mac, not from a run on a 24 GB one.
+- **`--kv-quant 4` is half the point.** At fp16 the cache is 64 KB per token
+  here; at 4-bit it is 18 KB. mlx-serve sizes its context window accordingly.
+- **Thinking** is on by default. `"enable_thinking": false` turns it off; depth is
+  `"reasoning_effort": "xhigh" | "medium" | "low"` (Qwen3.8's own vocabulary).
+- **Tools** use Qwen3.8's XML call format; mlx-serve parses, repairs and
+  schema-coerces it into standard OpenAI `tool_calls`.
+- **No images.** This build has no vision tower — use the
+  [4-bit](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) or
+  [8-bit](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-8bit) build for that.
+"""
+
+
 NORM_SHIFT_SUFFIXES = (
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
@@ -133,6 +209,14 @@ def _quantize_one(name):
     bits, gs = spec["bits"], spec["group_size"]
     w = read_tensor_f32(entry)
     ch = _JOB["im"].get(name)
+    # `dsv4_imatrix.pack_bits` implements MLX's affine layout for 2/3/4/8 bits.
+    # MLX's format also has 5 and 6 — and `transformer.verifyQmmLane` covers
+    # 4/5/6 ONLY, so those two widths are the ones that keep spec-decode's fast
+    # verify lanes — but reproducing their byte packing is not something to
+    # guess at. Until it is implemented and pinned, a 5- or 6-bit weight goes
+    # through `mx.quantize` UNCALIBRATED, and says so in the log.
+    if bits not in (2, 3, 4, 8):
+        ch = None
     if ch is None:
         triples = mlx_affine_quant(w, bits, group_size=gs)
         calibrated = False
@@ -166,6 +250,50 @@ def solve_geometry(w_cols, s_cols, in_dim):
 # Main
 # ============================================================
 
+def imatrix_tokens(path):
+    """`total_tokens` out of the imatrix's safetensors __metadata__."""
+    if not path:
+        return "0"
+    with open(path, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(hlen))
+    return header.get("__metadata__", {}).get("total_tokens", "0")
+
+
+def alloc_table(per_class, quant_bytes, quant_params):
+    label = {"mlp_gate_up": "MLP gate + up", "mlp_down": "MLP down",
+             "gdn_qkv": "GDN in_proj_qkv", "gdn_z": "GDN in_proj_z",
+             "gdn_out": "GDN out_proj", "gdn_ab": "GDN a/b gates",
+             "attn": "attention q/k/v/o", "lm_head": "lm_head",
+             "embed": "embed_tokens", "mtp": "MTP head"}
+    rows = ["| weight class | params | on disk | widths |", "|---|---|---|---|"]
+    for cls in sorted(per_class, key=lambda c: -per_class[c]["bytes"]):
+        d = per_class[cls]
+        widths = ", ".join(f"{k.replace('x', '-bit/gs-')} x{v}"
+                           for k, v in sorted(d["widths"].items()))
+        rows.append(f"| {label.get(cls, cls)} | {d['params']/1e9:.2f}B | "
+                    f"{d['bytes']/1e9:.2f} GB | {widths} |")
+    rows.append(f"| **total quantized** | **{quant_params/1e9:.2f}B** | "
+                f"**{quant_bytes/1e9:.2f} GB** | |")
+    return "\n".join(rows)
+
+
+def battery_section(path):
+    """Rendered only when there are measured numbers — a card never says pending."""
+    if not path:
+        return ""
+    data = json.loads(Path(os.path.expanduser(path)).read_text())
+    rows = ["", "## Measured against the 4-bit and 8-bit builds", "",
+            "| build | on disk | top-1 agreement vs bf16 | mean KL | worst repeated-call run | decode (MTP on) |",
+            "|---|---|---|---|---|---|"]
+    for r in data["rows"]:
+        rows.append("| {name} | {size} | {agree} | {kl} | {loop} | {decode} |".format(**r))
+    rows.append("")
+    rows.append(data.get("note", ""))
+    rows.append("")
+    return "\n".join(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
@@ -174,6 +302,9 @@ def main():
     ap.add_argument("--imatrix", default=None)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 8) // 2))
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--repo-name", default=None, help="HF repo name for the card")
+    ap.add_argument("--battery", default=None,
+                    help="tests/qwen38_iq_battery.py results JSON, rendered into the card")
     args = ap.parse_args()
 
     src, dst = Path(args.src), Path(os.path.expanduser(args.dst))
@@ -264,7 +395,17 @@ def main():
     # Text-only: `has_vision` is set from `vision_config` presence, so dropping
     # the block is what makes the pack honestly declare itself.
     cfg.pop("vision_config", None)
-    qb = {"group_size": 64, "bits": 4, "mode": "affine"}
+    # Declare the DOMINANT width, not a constant: mlx-serve solves every affine
+    # weight from packed geometry (`--verify` above pins that), but mlx-lm's
+    # `class_predicate` falls back to this block for any module the override map
+    # below does not name, and `mtpNaxProfileEnabledForTrunk` gates on it reading
+    # 4/gs-64. A uniform 5-bit pack declaring 4/64 is simply a false statement.
+    widths = {}
+    for spec in alloc.values():
+        widths[(spec["bits"], spec["group_size"])] = \
+            widths.get((spec["bits"], spec["group_size"]), 0) + 1
+    dom_bits, dom_gs = max(widths, key=widths.get)
+    qb = {"group_size": dom_gs, "bits": dom_bits, "mode": "affine"}
     for name, spec in sorted(alloc.items()):
         qb[rename(name)[:-len(".weight")]] = {
             "group_size": spec["group_size"], "bits": spec["bits"], "mode": "affine"}
@@ -275,6 +416,17 @@ def main():
     for f in COPY_FILES:
         if (src / f).exists():
             shutil.copy2(src / f, dst / f)
+
+    per_class = json.loads(Path(os.path.expanduser(args.alloc)).read_text())["per_class"]
+    q_bytes = sum(d["bytes"] for d in per_class.values())
+    q_params = sum(d["params"] for d in per_class.values())
+    (dst / "README.md").write_text(README.format(
+        size_gb=total / 1e9,
+        bpw=q_bytes * 8 / q_params,
+        alloc_table=alloc_table(per_class, q_bytes, q_params),
+        battery_section=battery_section(args.battery),
+        repo_name=args.repo_name or dst.name,
+        serving_notes=SERVING_NOTES))
 
     print(f"\ndone: {total/1e9:.2f} GB in {out_idx} shards, {time.time()-t0:.0f}s")
     print(f"  calibrated {stats['calibrated']}  plain mx.quantize {stats['plain']}  "

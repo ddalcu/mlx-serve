@@ -629,7 +629,7 @@ private struct WelcomeModelRow: View {
             .buttonStyle(.borderedProminent)
         } else if let state, state.status == .downloading {
             VStack(spacing: 2) {
-                ProgressView(value: state.fileProgress).frame(width: 58)
+                ProgressView(value: state.progress).frame(width: 58)
                 Text(state.percentFormatted)
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundStyle(.secondary)

@@ -216,18 +216,18 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
     </table>
 
     <h3><span class="method m-post">POST</span><code>/v1/audio/music-generations</code></h3>
-    <p>ACE-Step text-to-music — describe a track, get 48 kHz stereo WAV (<a href="../music-generation/">deep dive</a>). New in v26.7.2.</p>
+    <p>Text-to-music, WAV out (<a href="../music-generation/">deep dive</a>): <b>ACE-Step</b> (48 kHz stereo, fast) or <b>MiniMax Music 3</b> (sings full songs at 44.1 kHz, up to six minutes). On Music 3, <code>lyrics</code> is required and the musical-steering fields below don't exist; put tempo and key in the caption.</p>
     <table class="ep-table">
       <tr><th>Field</th><th>Meaning</th></tr>
       <tr><td><code>prompt</code></td><td>Style / genre / mood description. Required.</td></tr>
-      <tr><td><code>lyrics</code></td><td>Optional lyrics; empty means instrumental.</td></tr>
+      <tr><td><code>lyrics</code></td><td>Optional on ACE-Step (empty means instrumental); required on MiniMax Music 3, structure tags like <code>[verse]</code> on their own lines.</td></tr>
       <tr><td><code>duration_seconds</code></td><td>10–600, default 60.</td></tr>
-      <tr><td><code>bpm</code> / <code>keyscale</code> / <code>timesignature</code></td><td>Musical steering — e.g. <code>120</code>, <code>"C major"</code>, <code>"4/4"</code>.</td></tr>
+      <tr><td><code>bpm</code> / <code>keyscale</code> / <code>timesignature</code></td><td>Musical steering — e.g. <code>120</code>, <code>"C major"</code>, <code>"4/4"</code>. ACE-Step only.</td></tr>
       <tr><td><code>vocal_language</code>, <code>seed</code></td><td>Vocal language (default <code>"en"</code>); reproducibility.</td></tr>
     </table>
 
     <h3><span class="method m-post">POST</span><code>/v1/video/generations</code></h3>
-    <p>One endpoint, two backends: <b>LTX-Video</b> (text, image or audio to video with synced sound) and <b>MiniMax-H3 / Hailuo 3.0</b> (video and its stereo soundtrack denoised jointly in one pass). Whichever is loaded serves the request, and the field a backend can't honor is a named <code>400</code> rather than a silently dropped setting (<a href="../video-generation/">deep dive</a>).</p>
+    <p>One endpoint, two backends: <b>LTX-Video 2.3 / 2.5</b> (text, image or audio to video with synced sound; on 2.5, <code>"decoder": "diffusion"</code> picks its sharper diffusion decoder) and <b>MiniMax-H3 / Hailuo 3.0</b> (video and its stereo soundtrack denoised jointly in one pass, long clips chained via <code>chain_windows</code>). Whichever is loaded serves the request, and the field a backend can't honor is a named <code>400</code> rather than a silently dropped setting (<a href="../video-generation/">deep dive</a>).</p>
     <p>The response is raw frames plus raw audio, not a container: <code>{"frames": N, "width", "height", "fps": 24, "format": "rgb8", "data": "&lt;base64&gt;"}</code>, and when the model produced sound, <code>audio_format: "pcm_s16le"</code>, <code>audio_channels: 2</code>, <code>audio_sample_rate</code> and <code>audio_data</code> beside it. Mux to MP4 on your side. These runs take minutes, so use <code>"stream": true</code> for progress and give your client a generous timeout.</p>
 
     <p><b>LTX-Video</b></p>
@@ -271,8 +271,9 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
     <h2 id="management">Model management</h2>
     <table class="ep-table">
       <tr><th>Endpoint</th><th>What it does</th></tr>
-      <tr><td><span class="method m-post">POST</span><code>/v1/load-model</code></td><td><code>{"model": "&lt;id or absolute path&gt;"}</code> — load a discovered model, or register + load one from anywhere on disk. Multiple models stay resident (LRU-evicted under a memory cap).</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/load-model</code></td><td><code>{"model": "&lt;id or absolute path&gt;"}</code> — load a discovered model, or register + load one from anywhere on disk. Add <code>"default": true</code> to make it the serving default without a restart. Multiple models stay resident (LRU-evicted under a memory cap).</td></tr>
       <tr><td><span class="method m-post">POST</span><code>/v1/unload-model</code></td><td><code>{"model": "&lt;id&gt;"}</code> — free a model's memory now.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/models/rescan</code></td><td>Pick up models downloaded while the server runs; the app calls it after every download.</td></tr>
     </table>
     <p class="note">Requests are queued per model and batch-decode together where the architecture allows; a media generation runs on the same GPU and briefly pauses chat decode — one machine, one memory budget, no surprises.</p>
     <p><code>--model-dir</code> is repeatable, so a server can serve several folders at once. They merge first-wins, and every one of them shows up in <code>/v1/models</code>.</p>

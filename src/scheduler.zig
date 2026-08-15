@@ -4715,6 +4715,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            // The prefill width the admission guard billed for THIS model.
+            // Straight off `slot.model.config` — the same object
+            // `server.pinPrefillChunk` writes and `checkAttentionMemory`
+            // reads, so the forward can never run wider than the bill.
+            .pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,
             .dflash_ctx_restored = dflash_restored,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
             // when the client disconnects; the chunk loop checks it between

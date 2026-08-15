@@ -481,17 +481,116 @@ fn getGdnKernelBlocked(tb: u32) !mlx.mlx_fast_metal_kernel {
 /// `Vec8 v[MROWS]` form of this same kernel). GS and K_PARTS stay template
 /// ints; M is baked into the source (one cached kernel per M, distinct Metal
 /// host_names — two specializations sharing a name bind the wrong binary).
+/// The activation-FMA lines one output column contributes for a single K
+/// value: `wv` is the dequantized weight, `idx` the element inside the Vec8
+/// activation group. Shared by both plain-SIMD verify tiles so the two cannot
+/// drift.
+fn vqmmAccLines(comptime m: usize, comptime j: usize, comptime idx: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var out: []const u8 = "";
+        for (0..m) |r| {
+            out = out ++ std.fmt.comptimePrint("        acc[{d}] += float(v{d}[{s}]) * wv;\n", .{ j * m + r, r, idx });
+        }
+        return out;
+    }
+}
+
+/// Hoisted weight WORDS for one column, decoded per width.
+///
+/// One `pack` iteration always covers 8 K values (that is the Vec8 activation
+/// load), so its weights are exactly BITS bytes at
+/// `w_q + n * K_bytes + pack * BITS`. The loads stay HOISTED above the FMA
+/// chains — the tile's whole shape is "issue every column's weight word, then
+/// run one sequential chain per column", and leaving the load inside the chain
+/// serializes it behind the previous column's arithmetic. Hoisting only the
+/// POINTER is not enough: the widened arms must hoist the BYTES.
+///
+/// Widest load each width's alignment allows. 4-bit keeps its original aligned
+/// uint32 verbatim — that width must stay bit-identical, and it is this
+/// refactor's tripwire. 8-bit sits on `pack * 8` and takes two uints (not one
+/// ulong: 4-byte alignment is what the shipped 4-bit path already assumes of
+/// this buffer, and widening that assumption for one fused load buys nothing).
+/// 6-bit lands on `pack * 6`, only 2-aligned, so three ushorts re-assembled
+/// into two 3-byte words. 5-bit on `pack * 5` is 1-aligned and takes bytes.
+fn vqmmColumnLoad(comptime j: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        return std.fmt.comptimePrint(
+            \\  uint32_t p{d}; ulong r{d}; uint32_t a{d}0; uint32_t a{d}1;
+            \\  if constexpr (BITS == 4) {{ p{d} = w_q[(n0 + {d}) * K_by_p + pack]; }}
+            \\  else {{
+            \\    const device uchar* wp = ((const device uchar*)w_q) + (n0 + {d}) * K_bytes + pack * BITS;
+            \\    if constexpr (BITS == 8) {{
+            \\      const device uint* wu = (const device uint*)wp;
+            \\      r{d} = ulong(wu[0]) | (ulong(wu[1]) << 32);
+            \\    }} else if constexpr (BITS == 5) {{
+            \\      r{d} = ulong(wp[0]) | (ulong(wp[1]) << 8) | (ulong(wp[2]) << 16) |
+            \\             (ulong(wp[3]) << 24) | (ulong(wp[4]) << 32);
+            \\    }} else {{
+            \\      const device ushort* wh = (const device ushort*)wp;
+            \\      uint32_t h0 = uint32_t(wh[0]); uint32_t h1 = uint32_t(wh[1]); uint32_t h2 = uint32_t(wh[2]);
+            \\      a{d}0 = h0 | ((h1 & 0xFFu) << 16);
+            \\      a{d}1 = (h1 >> 8) | (h2 << 8);
+            \\    }}
+            \\  }}
+            \\
+        , .{ j, j, j, j, j, j, j, j, j, j, j });
+    }
+}
+
+/// Per-column dequant + FMA chain, one arm per supported affine width. The
+/// byte-addressed arms are lifted from the NAX m16 tile's validated unpack
+/// (4 values per 3 bytes at 6 bits, 8 per 5 bytes at 5, one byte per value at
+/// 8) — this is not a fresh reading of MLX's packing.
+fn vqmmColumnChain(comptime m: usize, comptime j: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        const acc_ki = vqmmAccLines(m, j, "ki");
+        const acc_hi = vqmmAccLines(m, j, "4 + ki");
+        return std.fmt.comptimePrint(
+            \\  {{
+            \\    float sj = s{d}; float bj = b{d};
+            \\    if constexpr (BITS == 4) {{
+            \\      for (int ki = 0; ki < 8; ++ki) {{
+            \\        float wv = float((p{d} >> (ki * 4)) & 0xFu) * sj + bj;
+            \\{s}      }}
+            \\    }} else if constexpr (BITS == 8) {{
+            \\      for (int ki = 0; ki < 8; ++ki) {{
+            \\        float wv = float(uint32_t((r{d} >> (ki * 8)) & 0xFFul)) * sj + bj;
+            \\{s}      }}
+            \\    }} else if constexpr (BITS == 5) {{
+            \\      for (int ki = 0; ki < 8; ++ki) {{
+            \\        float wv = float(uint32_t((r{d} >> (ki * 5)) & 0x1Ful)) * sj + bj;
+            \\{s}      }}
+            \\    }} else {{
+            \\      for (int ki = 0; ki < 4; ++ki) {{
+            \\        float wv = float((a{d}0 >> (ki * 6)) & 0x3Fu) * sj + bj;
+            \\{s}      }}
+            \\      for (int ki = 0; ki < 4; ++ki) {{
+            \\        float wv = float((a{d}1 >> (ki * 6)) & 0x3Fu) * sj + bj;
+            \\{s}      }}
+            \\    }}
+            \\  }}
+            \\
+        , .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
+    }
+}
+
+
 fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
     comptime {
+        // The per-width unpack ladder multiplies the comptime string work.
+        @setEvalBranchQuota(200_000);
         const nacc = bn * m;
         var body: []const u8 = "";
         // Row activation loads, all up front.
         for (0..m) |r| {
             body = body ++ std.fmt.comptimePrint("  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r });
         }
-        // Weight-word loads for the owned columns, then scales/biases.
+        // Weight handles for the owned columns, then scales/biases.
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  uint32_t p{d} = w_q[(n0 + {d}) * K_by_p + pack];\n", .{ j, j });
+            body = body ++ vqmmColumnLoad(j);
         }
         for (0..bn) |j| {
             body = body ++ std.fmt.comptimePrint("  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j });
@@ -499,11 +598,7 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
         // One sequential dequant+FMA chain per output column (column-major
         // construction; the interleaved form measurably loses).
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  {{\n    uint32_t packed = p{d}; float sj = s{d}; float bj = b{d};\n    for (int ki = 0; ki < 8; ++ki) {{\n      float wv = float((packed >> (ki * 4)) & 0xFu) * sj + bj;\n", .{ j, j, j });
-            for (0..m) |r| {
-                body = body ++ std.fmt.comptimePrint("      acc[{d}] += float(v{d}[ki]) * wv;\n", .{ j * m + r, r });
-            }
-            body = body ++ "    }\n  }\n";
+            body = body ++ vqmmColumnChain(m, j);
         }
         var acc_init: []const u8 = "";
         for (0..nacc) |i| {
@@ -521,6 +616,7 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
             \\int K = int(K_size);
             \\int N = int(N_size);
             \\int K_by_p = K / 8;
+            \\int K_bytes = (K * BITS) / 8;
             \\int K_by_gs = K / GS;
             \\int per_part = K_by_p / K_PARTS;
             \\int n0 = int(tg_n) * {d};
@@ -573,23 +669,21 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
 /// floor per the source ledger. Full-K per simdgroup, no barrier.
 fn verifyQmmMsgSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
     comptime {
+        // The per-width unpack ladder multiplies the comptime string work.
+        @setEvalBranchQuota(200_000);
         const nacc = bn * m;
         var body: []const u8 = "";
         for (0..m) |r| {
             body = body ++ std.fmt.comptimePrint("  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r });
         }
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  uint32_t p{d} = w_q[(n0 + {d}) * K_by_p + pack];\n", .{ j, j });
+            body = body ++ vqmmColumnLoad(j);
         }
         for (0..bn) |j| {
             body = body ++ std.fmt.comptimePrint("  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j });
         }
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  {{\n    uint32_t packed = p{d}; float sj = s{d}; float bj = b{d};\n    for (int ki = 0; ki < 8; ++ki) {{\n      float wv = float((packed >> (ki * 4)) & 0xFu) * sj + bj;\n", .{ j, j, j });
-            for (0..m) |r| {
-                body = body ++ std.fmt.comptimePrint("      acc[{d}] += float(v{d}[ki]) * wv;\n", .{ j * m + r, r });
-            }
-            body = body ++ "    }\n  }\n";
+            body = body ++ vqmmColumnChain(m, j);
         }
         var acc_init: []const u8 = "";
         for (0..nacc) |i| {
@@ -607,6 +701,7 @@ fn verifyQmmMsgSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
             \\int K = int(K_size);
             \\int N = int(N_size);
             \\int K_by_p = K / 8;
+            \\int K_bytes = (K * BITS) / 8;
             \\int K_by_gs = K / GS;
             \\int n0 = (int(tg_n) * NSG + int(sg)) * {d};
             \\if (n0 + {d} >= N) {{ return; }}
@@ -640,9 +735,12 @@ fn vqmmMsgBn(m: c_int) c_int {
     return if (m <= 6) 4 else 2;
 }
 
-const VQMM_MSG_SOURCES = [6][:0]const u8{
+const VQMM_MSG_SOURCES = blk: {
+    @setEvalBranchQuota(20_000_000);
+    break :blk [6][:0]const u8{
     verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
     verifyQmmMsgSource(5, 4), verifyQmmMsgSource(6, 4), verifyQmmMsgSource(7, 2),
+    };
 };
 const VQMM_MSG_NAMES = [6][*:0]const u8{
     "mlxserve_vqmm_msg_m2", "mlxserve_vqmm_msg_m3", "mlxserve_vqmm_msg_m4",
@@ -758,6 +856,8 @@ fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
 const VQMM_N_KERNELS = 6 * VQMM_BN_CHOICES.len;
 
 const VQMM_SOURCES = blk: {
+    // 18 tiles x a four-width unpack ladder is a lot of comptime string work.
+    @setEvalBranchQuota(20_000_000);
     var out: [VQMM_N_KERNELS][:0]const u8 = undefined;
     for (2..8) |m| {
         for (VQMM_BN_CHOICES, 0..) |bn, bi| {
@@ -929,6 +1029,77 @@ fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
     return (bits == 5 or bits == 6) and group_size == 64 and n >= 5120;
 }
 
+/// Whether the PLAIN-SIMD tiles (split-K / msg) adopt a non-4-bit affine
+/// weight. Profitability is a SEPARATE question from "the kernel is correct":
+/// the byte-addressed unpack does strictly more ALU per value than the 4-bit
+/// nibble path, so the shapes where it beats stock differ from the NAX tile's
+/// (`mixedNaxShapeEnabled` exists because that tile LOSES on the 1024-wide K/V
+/// projections). `MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0|1` forces the A/B arms.
+///
+/// MEASURED, Qwen3.8-27B on an M4 Max (no NAX lane, so the plain-SIMD tiles are
+/// all this machine has), MTP on, decode tok/s from the server's own timings,
+/// per-prompt medians over two passes with the CELL order reversed on the
+/// second (the first cell of a pass reads ~2% fast, which a control pack that
+/// ignores the lever entirely made visible):
+///
+/// | pack | code | prose | agentish |
+/// |---|---|---|---|
+/// | 6-bit gs64 | **1.10x** | **1.22x** | **1.17x** |
+/// | 8-bit gs64 | 1.03x | 1.04x | 1.01x |
+///
+/// For scale: killing the 4-bit lane outright on the same box costs
+/// 1.09-1.12x, so the 6-bit lane is worth MORE than the 4-bit one it was
+/// modelled on — stock's 6-bit qmm has more to give back at these widths.
+///
+/// So 6-bit is default-on and 8-bit is NOT: 0.7-3.7% is inside the noise this
+/// harness can resolve, and a lane that only adds dispatch surface for that is
+/// not worth defaulting. 5-bit has the kernel arm and the parity test but no
+/// pack on this box to measure, so it stays off for the same reason rather
+/// than riding 6-bit's number. Both flip with one env var.
+///
+/// The N floor is where the whole result lives: forcing every shape on
+/// (`MIXED_PLAIN=1`, which adopts the 1024-wide K/V projections too) measured
+/// only 1.01-1.05x on the same pack. Excluding them is worth ~10 points.
+pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
+    if (bits == 4) return true;
+    if (bits != 6) return false;
+    return group_size == 64 and n >= MIXED_PLAIN_MIN_N;
+}
+
+/// The N below which the byte-addressed unpack loses to stock — the same split
+/// the NAX tile measured, and the reason force-all-shapes gives back most of
+/// the win.
+pub const MIXED_PLAIN_MIN_N: c_int = 5120;
+
+var vqmm_mixed_plain_env_cache: ?u8 = null;
+/// 0 = forced off, 1 = forced on, 2 = follow `mixedPlainShapeEnabled`.
+fn mixedPlainEnvMode() u8 {
+    if (vqmm_mixed_plain_env_cache) |v| return v;
+    var mode: u8 = 2;
+    if (std.c.getenv("MLX_SERVE_VERIFY_QMM_MIXED_PLAIN")) |p| {
+        const val = std.mem.span(p);
+        if (val.len > 0 and val[0] == '0') mode = 0;
+        if (val.len > 0 and val[0] == '1') mode = 1;
+    }
+    vqmm_mixed_plain_env_cache = mode;
+    return mode;
+}
+
+var vqmm_mixed_plain_engaged: bool = false;
+
+/// Test seam: the parity test drives the plain-SIMD mixed-width arms without
+/// touching the process environment (correctness is not a perf question).
+pub var vqmm_mixed_plain_test_force: ?bool = null;
+
+fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
+    if (vqmm_mixed_plain_test_force) |v| return v;
+    return switch (mixedPlainEnvMode()) {
+        0 => false,
+        1 => bits == 5 or bits == 6 or bits == 8 or bits == 4,
+        else => mixedPlainShapeEnabled(bits, group_size, n),
+    };
+}
+
 /// Pure lane selection for the verify-qmm family (hermetically pinned by
 /// the NAX dispatch-table test). Shared floors: M 2..16, N >= 512 (tiny-N
 /// projections — GDN ba proj, MoE routers — gain nothing over stock qmv
@@ -969,7 +1140,7 @@ pub fn verifyQmm(
     // The M5 NAX tile additionally handles the 5/6-bit affine projections in
     // oQe checkpoints; those widths fall through to stock below the NAX
     // takeover row instead of entering a 4-bit kernel.
-    if (bits != 4 and bits != 5 and bits != 6) return null;
+    if (bits != 4 and bits != 5 and bits != 6 and bits != 8) return null;
     if (group_size != 32 and group_size != 64 and group_size != 128) return null;
     if (sc.ctx == null or bi.ctx == null) return null;
     const xd = mlx.mlx_array_dtype(x);
@@ -987,10 +1158,23 @@ pub fn verifyQmm(
     if (@as(i64, wsh[1]) * 32 != @as(i64, K) * @as(i64, bits)) return null;
     const nax_on = naxLaneEnvEnabled() and verifyQmmNaxAvailable();
     const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM());
-    if (bits != 4 and
-        (lane != .nax or
-            !naxMixedBitsEnvEnabled() or
-            !mixedNaxShapeEnabled(bits, group_size, N))) return null;
+    if (bits != 4) switch (lane) {
+        .nax => if (!naxMixedBitsEnvEnabled() or !mixedNaxShapeEnabled(bits, group_size, N)) return null,
+        // The plain-SIMD tiles now carry the same byte-addressed unpack the
+        // NAX tile validated, so 5/6/8-bit no longer fall through to stock on
+        // every M1-M4 machine — but adoption is per-shape and measured.
+        .splitk, .msg => {
+            if (!mixedPlainEnabled(bits, group_size, N)) return null;
+            // A lane that silently declines is indistinguishable from one that
+            // is merely slow, so every A/B arm has to be readable from its own
+            // log rather than from the env it was launched with.
+            if (!vqmm_mixed_plain_engaged) {
+                vqmm_mixed_plain_engaged = true;
+                log.info("[vqmm] plain-SIMD verify lane engaged at {d}-bit: lane={s} M={d} K={d} N={d} gs={d} (MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0 restores stock)\n", .{ bits, @tagName(lane), m, K, N, group_size });
+            }
+        },
+        .none => return null,
+    };
     switch (lane) {
         .none => return null,
         // NAX m16 tile (M5-class): M 8..16 by default — past the plain-SIMD
@@ -999,7 +1183,7 @@ pub fn verifyQmm(
         // Huge-N (lm_head class): the tiny-tile split-K grid thrashes the
         // scheduler there (measured 2.1x stock at M=4) — route through the
         // wide multi-simdgroup tile instead (2-column tile at M=7).
-        .msg => return try runVerifyQmmMsg(s, x, w, sc, bi, group_size, m, K, N, xd, xsh),
+        .msg => return try runVerifyQmmMsg(s, x, w, sc, bi, bits, group_size, m, K, N, xd, xsh),
         .splitk => {},
     }
 
@@ -1020,6 +1204,7 @@ pub fn verifyQmm(
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * k_parts, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K_PARTS", k_parts));
 
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
@@ -1055,6 +1240,7 @@ fn runVerifyQmmMsg(
     w: mlx.mlx_array,
     sc: mlx.mlx_array,
     bi: mlx.mlx_array,
+    bits: u32,
     group_size: u32,
     m: c_int,
     K: c_int,
@@ -1075,6 +1261,7 @@ fn runVerifyQmmMsg(
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * VQMM_MSG_NSG, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", VQMM_MSG_NSG));
 
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
@@ -24379,6 +24566,144 @@ fn expectVerifyQmmNoWorseThanStock(
     }
 }
 
+test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
+    // The split-K and msg tiles were 4-bit specializations by construction, so
+    // every non-4-bit pack fell through to stock on the whole M1-M4 line — the
+    // Qwen3.8-27B 6-bit pack (95.0% top-1 against bf16 vs the 4-bit pack's
+    // 83.6%) paid the full lane-off penalty on every MTP round. The byte-
+    // addressed unpack lifted from the NAX m16 tile fixes that; this pins it.
+    //
+    // Same bar as the 4-bit test: no worse than stock against an fp32 dequant
+    // reference, never kernel-vs-kernel. Parity is asserted independently of
+    // the PROFITABILITY predicate — `vqmm_mixed_plain_test_force` opens the
+    // gate so a shape the measurement later declines is still proven correct.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB175);
+    const rnd = prng.random();
+
+    vqmm_mixed_plain_test_force = true;
+    defer vqmm_mixed_plain_test_force = null;
+    // The NAX probe must not steal these rows on an M5 box: this test is about
+    // the plain-SIMD lanes, and M 2..7 is below the NAX takeover anyway.
+    vqmm_nax_probe_override = false;
+    defer vqmm_nax_probe_override = null;
+
+    const cases = [_]struct { k: c_int, n: c_int, gs: u32, label: []const u8 }{
+        .{ .k = 5120, .n = 17408, .gs = 64, .label = "mlp" }, // MLP gate/up, split-K
+        .{ .k = 2048, .n = 151936, .gs = 64, .label = "lm_head" }, // huge N, msg tile
+        // The unpack is independent of the group size (gs only indexes the
+        // scale/bias pair), but the forced-on A/B arm adopts every gs, so the
+        // other two are proven rather than argued.
+        .{ .k = 2048, .n = 5120, .gs = 32, .label = "gs32" },
+        .{ .k = 2048, .n = 5120, .gs = 128, .label = "gs128" },
+    };
+    for ([_]u32{ 5, 6, 8 }) |bits| {
+        for (cases) |cs| {
+            const wn: usize = @intCast(cs.n * cs.k);
+            const wbuf = try allocator.alloc(f32, wn);
+            defer allocator.free(wbuf);
+            for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const wshape = [_]c_int{ cs.n, cs.k };
+            const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(cs.gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+            var wq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq);
+            var wsc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wsc);
+            var wbi = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wbi);
+            try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+            var wdq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wdq);
+            try mlx.check(mlx.mlx_dequantize(&wdq, wq, wsc, wbi, mlx.mlx_optional_int.some(@intCast(cs.gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .has_value = true, .value = .float32 }, s));
+            var wdq_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wdq_t);
+            const t_axes = [_]c_int{ 1, 0 };
+            try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
+
+            for ([_]c_int{ 2, 4, 7 }) |m| {
+                const xn: usize = @intCast(m * cs.k);
+                const xbuf = try allocator.alloc(f32, xn);
+                defer allocator.free(xbuf);
+                for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+                const xshape = [_]c_int{ 1, m, cs.k };
+                const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+                defer _ = mlx.mlx_array_free(x32);
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+                const got_opt = try verifyQmm(s, x, wq, wsc, wbi, bits, cs.gs);
+                try testing.expect(got_opt != null);
+                const got = got_opt.?;
+                defer _ = mlx.mlx_array_free(got);
+                const gsh = mlx.getShape(got);
+                try testing.expectEqual(m, gsh[1]);
+                try testing.expectEqual(cs.n, gsh[2]);
+                try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, bits, cs.gs, wdq_t, got, cs.label);
+            }
+
+            // With the gate closed the same shape falls through to stock — the
+            // profitability predicate is what decides adoption, and a lane that
+            // cannot be declined is a lane that cannot be A/B'd.
+            {
+                vqmm_mixed_plain_test_force = false;
+                defer vqmm_mixed_plain_test_force = true;
+                const xbuf = try allocator.alloc(f32, @intCast(4 * cs.k));
+                defer allocator.free(xbuf);
+                for (xbuf) |*v| v.* = 0.1;
+                const xshape = [_]c_int{ 1, 4, cs.k };
+                const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+                defer _ = mlx.mlx_array_free(x32);
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+                try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x, wq, wsc, wbi, bits, cs.gs));
+            }
+        }
+    }
+}
+
+test "mixedPlainShapeEnabled: adoption is what was MEASURED, per width and per shape" {
+    const t = testing;
+    // 4-bit is the original specialization and is always in.
+    try t.expect(mixedPlainShapeEnabled(4, 64, 1024));
+
+    // 6-bit is the measured win (1.10-1.22x on the Qwen3.8-27B 6-bit pack).
+    try t.expect(mixedPlainShapeEnabled(6, 64, MIXED_PLAIN_MIN_N));
+    try t.expect(mixedPlainShapeEnabled(6, 64, 17408));
+    // Narrow projections (GDN ba, K/V) are where the byte-addressed unpack
+    // loses to stock — the same shape-dependence mixedNaxShapeEnabled encodes,
+    // and forcing them on gave back ~10 of the ~20 points.
+    try t.expect(!mixedPlainShapeEnabled(6, 64, MIXED_PLAIN_MIN_N - 1));
+    try t.expect(!mixedPlainShapeEnabled(6, 64, 1024));
+    // Only gs 64 was measured.
+    try t.expect(!mixedPlainShapeEnabled(6, 32, 17408));
+    try t.expect(!mixedPlainShapeEnabled(6, 128, 17408));
+
+    // 8-bit HAS a correct kernel arm and a parity test, and is still default
+    // OFF: measured 1.01-1.04x, inside what this harness resolves. 5-bit has
+    // the arm too but no pack on the measuring box, so it does not get to ride
+    // 6-bit's number. Both are one env var from on — an unmeasured default is
+    // the thing this predicate exists to prevent.
+    for ([_]u32{ 5, 8 }) |b| {
+        try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
+    }
+    // A width with no unpack arm is never adopted, whatever the shape.
+    for ([_]u32{ 2, 3, 7 }) |b| try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
+}
+
 test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit affine)" {
     // The spec-verify fast path: stock MLX qmm is tuned for M=1 (qmv) and
     // large M (steel); the 2..8-row verify shapes fall in a dead zone.
@@ -24687,7 +25012,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
             const xsh = mlx.getShape(x);
-            const got = (try runVerifyQmmMsg(s, x, wq, wsc, wbi, 64, m, mk, mn, .bfloat16, xsh)).?;
+            const got = (try runVerifyQmmMsg(s, x, wq, wsc, wbi, 4, 64, m, mk, mn, .bfloat16, xsh)).?;
             defer _ = mlx.mlx_array_free(got);
 
             try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, 64, wdq_t, got, "msg ragged-N");

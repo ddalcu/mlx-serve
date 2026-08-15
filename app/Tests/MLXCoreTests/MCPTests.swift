@@ -188,6 +188,66 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(MCPServerEntry(command: "", url: "").transport, .malformed)
     }
 
+    // MARK: - Remote entries with headers (live report 2026-08-15)
+
+    /// Regression: a remote entry's `headers` (and its `type` tag, which other MCP hosts write)
+    /// were unknown keys — JSONDecoder silently dropped them on load, and the next save DELETED
+    /// them from the user's hand-edited mcp.json. The Authorization token therefore never
+    /// reached the server, and the config could not even be kept on disk.
+    func testRemoteEntryHeadersAndTypeSurviveSaveAndLoad() throws {
+        let tmp = NSTemporaryDirectory().appending("mcp-headers-\(UUID().uuidString).json")
+        setenv("MCP_CONFIG_PATH", tmp, 1)
+        defer { unsetenv("MCP_CONFIG_PATH"); try? FileManager.default.removeItem(atPath: tmp) }
+
+        // The reporter's exact shape.
+        let source = #"""
+        {
+          "mcpServers": {
+            "simplemem": {
+              "type": "remote",
+              "url": "http://192.168.31.47:6810/mcp",
+              "headers": { "Authorization": "Bearer secret-token" }
+            }
+          }
+        }
+        """#
+        try source.data(using: .utf8)!.write(to: URL(fileURLWithPath: tmp))
+
+        let loaded = MCPConfigStore.load()
+        let entry = try XCTUnwrap(loaded.mcpServers["simplemem"])
+        XCTAssertEqual(entry.headers?["Authorization"], "Bearer secret-token")
+        XCTAssertEqual(entry.type, "remote")
+        XCTAssertEqual(entry.transport, .http)
+
+        // Saving must not strip what the user hand-wrote.
+        try MCPConfigStore.save(loaded)
+        let reloaded = MCPConfigStore.load()
+        let round = try XCTUnwrap(reloaded.mcpServers["simplemem"])
+        XCTAssertEqual(round.headers?["Authorization"], "Bearer secret-token")
+        XCTAssertEqual(round.type, "remote")
+    }
+
+    /// The parsed headers must actually ride every HTTP request the transport makes —
+    /// `connectHTTP` passes them through the SDK's `requestModifier` via this helper.
+    /// A header the transport already set (Accept, Mcp-Session-Id) wins over the user's:
+    /// clobbering the SDK's own Accept would break SSE streaming.
+    func testEntryHeadersAreAppliedToEveryHttpRequest() throws {
+        var base = URLRequest(url: try XCTUnwrap(URL(string: "http://192.168.31.47:6810/mcp")))
+        base.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let out = MCPManager.applying(headers: ["Authorization": "Bearer secret-token"], to: base)
+        XCTAssertEqual(out.value(forHTTPHeaderField: "Authorization"), "Bearer secret-token")
+        XCTAssertEqual(out.value(forHTTPHeaderField: "Content-Type"), "application/json")
+
+        var withAccept = base
+        withAccept.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let kept = MCPManager.applying(headers: ["Accept": "application/json"], to: withAccept)
+        XCTAssertEqual(kept.value(forHTTPHeaderField: "Accept"), "text/event-stream")
+
+        // No headers configured: the request passes through untouched.
+        let untouched = MCPManager.applying(headers: nil, to: base)
+        XCTAssertEqual(untouched, base)
+    }
+
     func testMCPServerEntryDisabledFlag() {
         let enabled = MCPServerEntry(command: "x", args: [], env: nil, disabled: nil)
         let off = MCPServerEntry(command: "x", args: [], env: nil, disabled: true)

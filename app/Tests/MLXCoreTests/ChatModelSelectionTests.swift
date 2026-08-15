@@ -52,6 +52,110 @@ final class ChatModelSelectionTests: XCTestCase {
                        .selectLocal("/Users/me/lan/models"))
     }
 
+    // MARK: - What the pill SHOWS
+    //
+    // The pill names the model answering this conversation and says whether it
+    // is ready. Two things it got wrong: a Hugging Face cache model is stored
+    // under `models--<org>--<repo>/snapshots/<commit>/`, so the server's id for
+    // it is the COMMIT HASH (registry ids are the dir basename) and the pill
+    // rendered a hex string where the tray — which reads our own scan — showed
+    // the repo id; and a hot switch keeps answering on the OLD model until the
+    // new one is resident, so a big model loaded for a minute with the pill
+    // still naming the previous one and a green dot beside it.
+
+    private func local(_ path: String, _ name: String) -> LocalModel {
+        LocalModel(id: name, name: name, path: path, sizeFormatted: "4 GB",
+                   modelType: "qwen3", source: .mlxServe, kind: .base)
+    }
+
+    private var hfCacheModel: LocalModel {
+        local("/Users/me/.cache/huggingface/hub/models--mlx-community--Qwen3.5-4B-MLX-4bit/snapshots/9f0ea3c1d2",
+              "mlx-community/Qwen3.5-4B-MLX-4bit")
+    }
+
+    func testAnHfCacheModelShowsItsRepoIdNotTheCommitHash() {
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: "9f0ea3c1d2",
+                                                 loadingPath: nil,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, "mlx-community/Qwen3.5-4B-MLX-4bit")
+        XCTAssertFalse(state.isLoading)
+    }
+
+    func testAResidentModelWeDidNotPickKeepsTheServersOwnName() {
+        // Another surface (a gen pane, a task) can leave a different model
+        // resident. We have no local label for it, and borrowing the selected
+        // model's label would name the wrong model — the server's id is honest.
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: "some/other-model",
+                                                 loadingPath: nil,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, "some/other-model")
+    }
+
+    func testASwitchInFlightNamesTheModelBeingLoadedAndSaysItIsLoading() {
+        // The server answers on the old model for the whole load, so
+        // `residentName` is the PREVIOUS one here — the pill must show what
+        // the user just picked, with the spinner.
+        let old = local("/models/mlx-community/gemma", "mlx-community/gemma-4-12b")
+        let new = local("/models/ddalcu/qwen38", "ddalcu/Qwen3.8-27B-MLX-Serve-4bit")
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: old.name,
+                                                 loadingPath: new.path,
+                                                 selectedPath: new.path,
+                                                 models: [old, new])
+        XCTAssertEqual(state.name, "ddalcu/Qwen3.8-27B-MLX-Serve-4bit")
+        XCTAssertTrue(state.isLoading)
+    }
+
+    func testALoadOfAPathWeHaveNoLabelForNamesThatPathNotTheOldModel() {
+        // A load can be in flight for a path outside the pickable list (the
+        // model turned non-pickable mid-session, a custom dir). Naming the
+        // still-resident PREVIOUS model beside the spinner says the wrong
+        // model is loading — the path's own basename is the honest fallback.
+        let old = local("/models/mlx-community/gemma", "mlx-community/gemma-4-12b")
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: old.name,
+                                                 loadingPath: "/models/custom/my-model",
+                                                 selectedPath: "/models/custom/my-model",
+                                                 models: [old])
+        XCTAssertEqual(state.name, "my-model")
+        XCTAssertTrue(state.isLoading)
+    }
+
+    func testALanPickIsNeverShownAsLoading() {
+        // A LAN model loads nothing here; a stale in-flight path must not make
+        // a conversation that is already answering look busy.
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: "qwen@studio",
+                                                 residentName: nil,
+                                                 loadingPath: m.path,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, "qwen@studio")
+        XCTAssertFalse(state.isLoading)
+    }
+
+    func testNothingSelectedAsksForAModel() {
+        let state = ChatModelSelection.pillState(lanChatModelId: nil, residentName: nil,
+                                                 loadingPath: nil, selectedPath: "", models: [])
+        XCTAssertEqual(state.name, ChatModelSelection.noModelPlaceholder)
+        XCTAssertFalse(state.isLoading)
+    }
+
+    func testASelectedButNotYetResidentModelStillReadsAsItself() {
+        // Server down, or the model picked before the first start: the pill
+        // names the pick rather than falling through to "Select a model".
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: nil, residentName: nil,
+                                                 loadingPath: nil, selectedPath: m.path, models: [m])
+        XCTAssertEqual(state.name, "mlx-community/Qwen3.5-4B-MLX-4bit")
+    }
+
     // MARK: - Header name
     //
     // The toolbar pill drops the org, which is the half of a Hugging Face id

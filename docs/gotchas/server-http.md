@@ -1208,3 +1208,150 @@ Note this also corrects the bill for the other hybrids (qwen3.5/3.6 GDN: 10 of 4
 Follow-up on the KV-bill class above. `prefillMemoryNeeded` took one `hdim` and used it twice: for the quantized-KV dequant transient (correct — that reads the STORED width) and for `prefillHeadDimFused(hdim)`, which decides whether the composed SDPA path materializes a `[heads, chunk, seq]` score tensor. Those are different numbers the moment an arch scores wider than it stores. `bailing_hybrid` declares `head_dim` 128, scores over 192, and its own MLA comment says mlx has a fused vector kernel for that pair at DECODE and "falls back to the composed path at prefill widths" — so the score tensor is real, while `prefillHeadDimFused(128)` is true and billed it at zero. At 32K with a 4096 chunk that is ~4 GB of scratch the admission guard could not see, and under-billing does not produce a 400: it produces an uncatchable Metal OOM, or all-zero logits at the working-set edge.
 
 The patch that introduced `ModelConfig.prefillScoreHeadDim()` wired it into the prefill CHUNK cap — the same rule, one call site short. The estimator now takes `score_hdim` beside `hdim`, and both are inside the string the call-site source scan pins, so neither can be quietly recomputed on the way in. Guard: `prefillMemoryNeeded: the SCORE width decides the score term, not the stored width`.
+
+## Auto-context billed a chunk-bounded transient per token, and the KV at fp16 (2026-08-14)
+
+Third bite of the KV-bill class, and this one is the sizer's own half. `computeMemoryContext` built a `per_tok` out of two terms and both were wrong for a machine where the ceiling actually binds:
+
+```
+kv_per_tok  = config.kvBytesPerToken()          // always fp16, --kv-quant invisible
+work_per_tok = 8 * max(hidden, ffn) * 2         // the PREFILL-CHUNK envelope, per TOKEN
+```
+
+On Qwen3.8-27B (hidden 5120, ffn 17408, 16 caching layers x 4 kv heads x head_dim 256) that is 64 KB/token of KV and **272 KB/token of activations** — 81% of the budget spent on a transient that does not scale with the context length at all. With a 10.6 GB working set and an 8.6 GB pack resident, the reported context was under 4k tokens, and no amount of shrinking the weights moved it, because the term that dominated never depended on them. The KV half compounded it: a server launched `--kv-quant 4` stores 18432 B/token, not 65536, and the sizer had no idea.
+
+The activation term being chunk-bounded is not an argument from the code, it is measured. On the shipped 4-bit pack, peak-above-steady-state for a single request, `--prefix-cache-entries 0`, prompts from 3k to 51k tokens:
+
+| chunk | 3.2k | 12.8k | 25.7k | 51.4k |
+|---|---|---|---|---|
+| 2048 | 3.35 GB | 3.35 | 3.33 | 3.34 |
+| 8192 | 4.78 | 10.09 | 10.97 | 10.89 |
+
+Flat in prompt length, and tracking the chunk once the prompt exceeds it (the 3.2k cells are narrower forwards — `fwd = min(chunk, seq)`). So it is a one-off RESERVE keyed on `--prefill-chunk`, subtracted alongside the hot-cache budget, never a multiplier on the context being solved for. `prefillTransientReserve` is the same `prefillMemoryNeeded` the admission guard calls, at the widest chunk any prompt can run (`effectivePrefillChunk(..., total_ctx = 0)` — every branch that narrows the chunk narrows it for LONGER contexts), with the KV term zeroed because the KV is the unknown. The KV half goes through `kvBytesPerTokenAtBits`, which both the sizer and the guard now call. Both reads are pinned by the existing call-site source scan, for the reason that scan already existed: an estimator that takes the right parameters proves nothing if a caller recomputes them on the way in.
+
+Corrected, the same 16 GB profile at `--kv-quant 4` and a 512-token chunk reports ~51k tokens instead of 3.7k.
+
+**What the same measurement said about the guard, which is fixed in the section below.** Fit the two rows above and the transient is `~0.8 GB + 1.24 MB per chunk-token`, while `prefillMemoryNeeded` billed `3 * 8 * chunk * max(hidden, ffn) * 2 * 5/4` = 1.04 MB per chunk-token and no constant: 2.14 GB against a measured 3.34 at chunk 2048, 8.55 against 10.95 at 8192. The sizer's own reserve is the same expression, so the two stayed consistent either way; the guard is a cross-arch number tuned over many releases, so retuning it got its own change with its own per-arch measurements.
+
+## The prefill admission guard billed one arch's envelope for every arch (2026-08-14)
+
+`prefillMemoryNeeded` models peak prefill memory and 400s a request that would not fit. Exceeding the Metal working set for real throws an uncatchable C++ exception on a completion-handler thread and kills the process, so this estimate is the only lever — and it estimated LOW on the archs that matter most.
+
+Measured across five checkpoints on an M4 Max (peak GPU bytes above steady state for ONE request on a clean boot, `--prefix-cache-entries 0 --no-mtp --no-drafter --no-pld`, `/props` `peak_bytes` minus `active_bytes`, one prompt per boot because `peak_bytes` is a high-water mark that never resets). Repeat boots return byte-identical peaks, so these are exact figures, not samples:
+
+| checkpoint | chunk 256 | 512 | 1024 | 2048 | 4096 | 8192 | old bill @2048 |
+|---|---|---|---|---|---|---|---|
+| lfm2 2.6B (conv hybrid) | 0.78 | 0.91 | 1.01 | 1.49 | 1.67 | 2.53 | 2.11 (1.42x) |
+| qwen3_5 4B (GatedDeltaNet) | | 1.04 | 1.65 | 2.03 | | 5.11 | 1.51 (0.75x) |
+| qwen3_5 27B (GatedDeltaNet) | | | | 3.98 | | 10.84 | 2.90 (0.73x) |
+| gemma4 26B-A4B (MoE) | | | | 2.95 | 3.96 | | 3.20 (1.08x) |
+| muse_glimmer 30B (dense) | | | | 2.18 | | 3.29 | 3.11 (1.43x) |
+
+Seven of those sixteen cells were billed SHORT, the worst at 0.58x — every GatedDeltaNet cell, and the MoE at its own chunk cap. (lfm2 escapes only because `attnCacheLayerCount` has no notion of `layer_block_types`, so its KV is billed at 30 caching layers when 8 cache: a 3.75x KV over-bill covering a slope under-bill. Same class as the bailing_hybrid KV fix, not fixed here.) The per-chunk-token slope is the whole story, and it is not proportional to `max(hidden, ffn)` at all: 15.9 bytes per unit of ffn on lfm2, 9.5 on muse, 55.7 on the 4B, 72.6 on the 27B, 86.4 on gemma4. One envelope cannot be stretched to cover a 9x spread — over-billing muse 5x to cover the 27B is what the old constant was already doing, and it still came up 33% short.
+
+**The hypothesis in the plan was wrong, and the kill switch is what said so.** The missing term was supposed to be the dequantized weight working set of a quantized checkpoint. Two experiments killed it: the same lfm2 in **dense bf16** peaks within 0.19 GB of the 8-bit build at both chunks (a dense checkpoint pays the constant too), and `MLX_SERVE_PREFILL_DQ_GEMM=0` accounts for exactly that 0.19 GB — +0.51 GB on the 27B at chunk 2048, +0.17-0.21 on lfm2, and ~0 at chunk 8192 where the envelope dominates. The dequant route is real, but it is a few hundred MB, chunk-independent, and only fires at forwards at least `PREFILL_DQ_GEMM_MIN_M` wide. It was never the 22%.
+
+**What the excess actually is: streams the envelope does not model.** Subtract ONE MLP envelope (`8 x max(hidden, ffn) x 2` per token) from each measured slope and the remainder lands on the arch's own geometry:
+
+- **Linear-attention hybrids hold one chunk-wide q/k/v stream per LINEAR layer** — all of them, not the ~3 the eval cadence bounds. The 27B: 48 GatedDeltaNet layers x (2x16x128 key + 48x128 value) elems x 2 B = 983,040 B/chunk-token against a measured excess of 985,172 (1.00x). The 4B: 24 layers x 8192 elems x 2 B = 393,216 against 366,044 (0.93x). Two independent checkpoints, both within 7%.
+- **A MoE prefill sorts and gathers**, which replicates the hidden stream `top_k` times per layer beside the expert rows, for the 4 layers `MOE_EVAL_EVERY_N_LAYERS` lets coexist: `4 x top_k x 2 x (hidden + moe_intermediate) x 2 B` = 450,560 B/chunk-token on gemma4 against a measured excess of 396,688 (1.14x).
+- **A plain attention arch has neither**, and its measured slope is at or below one envelope (lfm2 0.99x, muse 0.60x) — which is why the old three-envelope bill looked fine there and nowhere else.
+
+So the envelope became `max(3 x mlp, mlp + fwd x prefillStreamBytesPerToken(config))`. The `max` is load-bearing: it is a FLOOR at the historical bill, so no arch's admission can loosen, and the stream arm only ever raises it.
+
+**The chunk-independent part is a runtime floor, not a weight set.** Fitted intercepts across the five: 0.39 GB (27B), 0.67 (4B), 0.81 (lfm2), ~0.1 (gemma4), 1.27 (muse, most of it the dequant route). It does not scale with the weights in either direction, a dense checkpoint pays it, and it is what MLX's own scratch plus the KV cache's proportional capacity growth (old and new buffer coexist across a grow) costs. `PREFILL_RUNTIME_FLOOR_BYTES` bills it as what it measures as: a constant, 512 MiB, on both the guard and the sizer, and on the `deepseek_v4` sibling too (that arch was NOT re-measured — its own estimator was calibrated from a live false refusal, and the 2026-08-01 case still admits at 2984 MB against 3610 free).
+
+Corrected, every one of the sixteen measured cells is covered, 1.06x to 3.7x, with the widest slack exactly where it was already widest (muse). The cost is real and it is the sizer's: on the 16 GB profile the reported context for the 27B at chunk 512 goes from ~51k tokens to ~18k, because the machine genuinely peaks 1.06 GB above steady state there. A `--prefill-chunk` the machine can afford buys it straight back, which is the honest lever.
+
+Guards: `prefillMemoryNeeded: every MEASURED prefill peak on the box is billed for` (the table above, as assertions), `the new terms fire only where the measurement put them` (per-chunk-token vs per-prompt vs chunk-independent, and that a dense/non-affine checkpoint is billed nothing for dequant), `prefillStreamBytesPerToken`/`prefillDequantWeightBytes` unit tests, and the existing call-site scan extended to pin both new arguments at BOTH consumers.
+
+## The prefill chunk was never sized to the machine, and a hybrid's KV was billed for every layer (2026-08-15)
+
+Two defects, one symptom: 16 and 32 GB users running coding agents got
+`Prompt (N tokens) requires ~XMB GPU memory but only ~YMB available` — or an
+auto-context of 1024 — on prompts the box could actually serve.
+
+### The chunk
+
+`prefillMemoryNeeded` is dominated by the MLP envelope, `3 x 8 x chunk x
+max(hidden, ffn) x 2`. `chunk` came from `--prefill-chunk`, which defaults to
+8192 and which the app never passes, so a 16 GB Mac reserved the same 5-7 GB
+envelope a 128 GB one does.
+
+Measured (Mistral-7B-4bit, 10,348-token prompt, one request per boot,
+`--prefix-cache-entries 0 --no-pld --no-drafter --no-mtp`, `peak_bytes` minus
+boot `active_bytes`, M4 Max):
+
+| chunk | measured peak | billed | ratio |
+|---:|---:|---:|---:|
+| 512 | 1.875 GiB | 2.61 GiB | 1.39x |
+| 2048 | 2.262 GiB | 4.26 GiB | 1.88x |
+| 8192 | 2.391 GiB | 9.18 GiB | 3.84x |
+
+Slope 72,150 B/chunk-token against one envelope's 229,376 — the real envelope is
+0.31 of ONE and we bill three. Coefficients across the six archs measured so far
+(`measured / (8 x max(hidden, ffn) x 2)`): mistral 2.52, qwen3_5-4B 3.48,
+qwen3_5-27B 4.54, muse-30B 4.77, gemma4-26B-A4B 5.40, lfm2 7.96. `mlp + fwd x
+stream` covers every one of them; the `3 x mlp` floor is 1.7x-10x of it on plain
+attention. That floor was NOT loosened here — it stays as the conservative
+direction — but it is why sizing the chunk matters so much.
+
+On a 16 GB Mac (Metal recommended working set ~11.9 GiB, Mistral-7B-4bit at
+3.80 GiB resident, so 8.10 GiB free on a completely IDLE machine) the released
+v26.8.6 billed 8.14 GiB for that prompt and refused it; the tree with the
+runtime floor billed 9.18. Both against a measured 2.39.
+
+`resolvePrefillChunk` now walks `PREFILL_CHUNK_LADDER` (8192 -> 512) and takes
+the widest rung whose `prefillTransientReserve` is at most a QUARTER of what is
+left after the weights and the hot-cache budget — past that the machine is
+trading the whole session's context for one forward's speed. Frozen at load by
+`pinPrefillChunk` (which must run BEFORE the sizer, above the `--ctx-size`
+early-out, because the guard reads it on every request), and read by all three
+consumers so bill and forward cannot drift. Projected advertised context:
+Mistral-7B on 16 GB 1,024 -> 22,528; gemma3-12B on 32 GB 5,120 -> 20,480;
+Muse-30B on 32 GB 1,024 -> 7,168; Qwen3.8-27B on 32 GB 1,024 -> ~42,000.
+
+**The pin does not reach the forward through `xfm.config`.** `Transformer` holds
+a COPY of the ModelConfig taken when it was built, and the pin is written to the
+registry's config afterwards — reading it off the transformer is a silent no-op
+(live: pinned 4096, prefilled at 8192, caught only because `--prefill-trace`
+prints the width). It rides `InitOptions.pinned_prefill_chunk`, which the
+scheduler sources from `slot.model.config` — the same object
+`checkAttentionMemory` bills against. Source-scan-pinned both ways.
+
+**A vision prefill is UNCHUNKED** (`generate`: `if (has_vision) loop_end`), so
+the chunk-bounded envelope is not what it allocates. The guard billed the chunk
+unconditionally, which was already an under-bill for a >8192-token vision prompt
+and would have become one at every size once the chunk narrowed;
+`checkAttentionMemory` now takes `unchunked_prefill` (from `local_ve != null` at
+the three vision-capable surfaces) and bills the real width.
+
+### The hybrid KV
+
+`isLinearLayer` keys only on `full_attention_interval`. Two families never set
+it — lfm2/lfm2_vl (`layer_types`) and nemotron_h (`hybrid_override_pattern`) —
+so `attnCacheLayerCount` counted EVERY layer. LFM2.5-2.6B caches 8 of 30 and was
+billed 3.75x (61,440 vs 16,384 B/token); Nemotron-H, whose `*` layers are a
+handful of 52-98, worse. Only the `.attention` blocks reach `ctx.cache` in the
+hybrid forward — gated_conv and mamba2 hold a fixed-size recurrent state in
+`ssm_entries`. Independently confirmed by the peak table: lfm2 at chunk 512
+peaked 0.782 GB total for a 10,089-token prompt, and the billed KV alone would
+have been 0.62 GB of that. Layers past the 128-entry table keep the array's
+`.attention` default (the over-billing direction).
+
+### Not defects, checked
+
+- **Multi-turn re-bills the resident KV.** `active_bytes` retains the prompt's
+  KV in the hot prefix cache and the guard bills the full KV again on top;
+  measured overshoot is only 8-11% (Qwen3.5-4B, three growing turns to 56,729
+  tokens), and the re-bill doubles as cover for `nextCapacity`'s +25% growth
+  double-buffer.
+- **The advertised context is pinned at load; the guard reads LIVE memory.**
+  Pressure arriving after load (another app, a second model, the hot cache
+  filling) drops `available` below the bill while `/v1/models` still advertises
+  the load-time number. That is why users saw the MEMORY 400 rather than the
+  context-overflow one. Still open.
+- **Under `--kv-quant` the guard bills the dense-rebuild term per PROMPT token
+  while `prefillTransientReserve` bills it for one chunk** (1.44x disagreement
+  on Qwen3.5-4B at 4 bits). Absorbed by the sizer's 0.544 compound margin today;
+  it belongs in `per_tok`. Still open.

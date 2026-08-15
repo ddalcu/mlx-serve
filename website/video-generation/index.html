@@ -4,19 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Local AI Video Generation on Mac — Text, Photo, or Soundtrack to Video · mlx-serve</title>
-  <meta name="description" content="Generate video with synchronized audio entirely on your Apple Silicon Mac. LTX-Video 2.3 runs natively on MLX: text-to-video, animate your own photos, and talking characters driven by a real voice clip — original audio muxed into the mp4. Style LoRAs supported. No cloud, no Python.">
+  <meta name="description" content="Generate video with synchronized audio entirely on your Apple Silicon Mac. LTX-Video 2.5 and 2.3 plus MiniMax-H3 (Hailuo 3.0) run natively on MLX: text-to-video, animate your own photos, and talking characters driven by a real voice clip — original audio muxed into the mp4. Style LoRAs supported. No cloud, no Python.">
   <meta name="keywords" content="local video generation Mac, AI video generator offline, LTX-Video Mac, image to video AI Mac, animate photo AI, text to video Apple Silicon, talking character AI video, lip sync video generation local, audio to video AI, video LoRA">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://mlxserve.com/video-generation/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://mlxserve.com/video-generation/">
   <meta property="og:title" content="Text to video. Photo to video. Soundtrack to video. On your Mac.">
-  <meta property="og:description" content="LTX-Video 2.3 native on Apple Silicon: clips with synced audio, animated photos, and talking characters driven by a real voice clip. No cloud.">
+  <meta property="og:description" content="LTX-Video 2.5, 2.3 and MiniMax-H3 native on Apple Silicon: clips with synced audio, animated photos, and talking characters driven by a real voice clip. No cloud.">
   <meta property="og:image" content="https://mlxserve.com/screenshots/videogen-pane.png">
   <meta property="og:site_name" content="mlx-serve">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Text to video. Photo to video. Soundtrack to video. On your Mac.">
-  <meta name="twitter:description" content="LTX-Video 2.3 native on Apple Silicon — synced audio, animated photos, talking characters. No cloud, no Python.">
+  <meta name="twitter:description" content="LTX-Video 2.5, 2.3 and MiniMax-H3 native on Apple Silicon — synced audio, animated photos, talking characters. No cloud, no Python.">
   <meta name="twitter:image" content="https://mlxserve.com/screenshots/videogen-pane.png">
   <script type="application/ld+json">
   {
@@ -36,7 +36,7 @@
       {
         "@type": "Question",
         "name": "Can I generate AI video locally on a Mac?",
-        "acceptedAnswer": { "@type": "Answer", "text": "Yes. mlx-serve runs LTX-Video 2.3 natively on Apple Silicon — the full diffusion + 3D-VAE pipeline ported to MLX and validated tensor-by-tensor against the reference. Clips render with synchronized audio, muxed straight to an mp4. You'll want a 24 GB+ Mac and a one-time ~50 GB model download." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes. mlx-serve runs LTX-Video 2.5 and 2.3, plus MiniMax-H3 (Hailuo 3.0), natively on Apple Silicon — the full diffusion + 3D-VAE pipelines ported to MLX and validated tensor-by-tensor against the reference. Clips render with synchronized audio, muxed straight to an mp4. You'll want a 24 GB+ Mac; LTX 2.5 is a one-time 36 GB download in 4-bit with its text encoder included." }
       },
       {
         "@type": "Question",
@@ -91,7 +91,7 @@
     <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
     <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Deep dive · Video generation</span></div>
     <h1>Text to video. Photo to video.<br><span class="grad">Soundtrack to video.</span></h1>
-    <p class="hero-f-sub">LTX-Video 2.3 runs <b>natively on Apple Silicon</b> — clips with synchronized audio, muxed straight to an mp4 on your desk. Start from a prompt, from your own photo, or from a voice clip your characters perform to.</p>
+    <p class="hero-f-sub">LTX-Video 2.5, 2.3 and MiniMax-H3 run <b>natively on Apple Silicon</b> — clips with synchronized audio, muxed straight to an mp4 on your desk. Start from a prompt, from your own photo, or from a voice clip your characters perform to.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -168,6 +168,43 @@
     </div>
   </section>
 
+  <section class="section" id="models">
+    <div class="section-header reveal">
+      <div class="section-label">Model lineup</div>
+      <h2 class="section-title">LTX-Video 2.5 &amp; 2.3, and MiniMax-H3</h2>
+    </div>
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">LTX-Video 2.5</span>
+        <h3>Lightricks' newest, text encoder included</h3>
+        <p>LTX-Video 2.5 ships in a 4-bit pack (36 GB) and an 8-bit quality pack (59 GB) with its own text encoder bundled, so there is no separate download on first use. The 8-bit pack keeps faces, legs and fur that 4-bit loses, and adds a <b>Diffusion decoder</b> toggle: the decoder Lightricks' own published clips use, which denoises the frames for sharper texture and edges. The default canvas and frame ladder are sized to your Mac's memory, and 2.3 keeps working right beside it.</p>
+      </div>
+      <div class="split-visual reveal">
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Two packs</b> — 4-bit 36 GB, 8-bit 59 GB, encoder bundled.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Diffusion decoder</b> on the 8-bit pack (<code>"decoder": "diffusion"</code> over the API).</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Canvas sized to your Mac</b> — big machines get a big picture by default.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Everything works</b> — text, photo, audio input, and the two-stage pipelines.</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="split flip">
+      <div class="split-copy reveal">
+        <span class="split-kicker">MiniMax-H3</span>
+        <h3>Hailuo 3.0: the soundtrack is generated with the picture</h3>
+        <p>MiniMax-H3 denoises the clip and a stereo soundtrack together in one pass, so the sound is produced with the video rather than dubbed on after. Describe the scene, then what you want to hear after <code>overall_soundscape:</code>. The REF2VA build composes the clip around pictures, clips or audio you attach (<code>&lt;Picture 1&gt;</code>, <code>&lt;Video 1&gt;</code>, <code>&lt;Audio 1&gt;</code> in the prompt), and <b>Turbo</b> renders in 4 steps instead of 30.</p>
+      </div>
+      <div class="split-visual reveal">
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Video + stereo audio</b> in one denoise, never dubbed after.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Reference pictures, clips and audio</b> steer the shot (REF2VA).</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Turbo</b> — 4 steps instead of 30, about twice as fast end to end.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Long clips</b> chain window by window (<code>chain_windows</code>), LoRAs stack on top.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
   <section class="section">
     <div class="section-header reveal">
       <div class="section-label">Honest requirements</div>
@@ -176,11 +213,11 @@
     </div>
     <div class="stat-band reveal">
       <div class="stat"><div class="n">24 GB</div><div class="l">recommended unified memory</div></div>
-      <div class="stat"><div class="n">~50 GB</div><div class="l">one-time download — every quality preset included, switch offline</div></div>
+      <div class="stat"><div class="n">36–50 GB</div><div class="l">one-time download — LTX 2.5 with encoder included, or 2.3 with every preset</div></div>
       <div class="stat"><div class="n">1 click</div><div class="l">download lives right in the Video pane, resumable</div></div>
       <div class="stat"><div class="n">$0</div><div class="l">per clip, forever after</div></div>
     </div>
-    <p class="tbl-note reveal" style="margin-top: 28px;">The app checks free RAM before starting and offers to stop the chat server if it's competing for memory. Outputs land in <code>~/.mlx-serve/generations/videos/</code>, by date. API users: <code>POST /v1/video/generations</code> with <code>prompt</code>, optional <code>first_frame_image</code>, <code>audio</code>, <code>pipeline</code>, and <code>lora_path</code>.</p>
+    <p class="tbl-note reveal" style="margin-top: 28px;">The app checks free RAM before starting and offers to stop the chat server if it's competing for memory. Outputs land in <code>~/.mlx-serve/generations/videos/</code>, by date. API users: <code>POST /v1/video/generations</code> with <code>prompt</code>, optional <code>first_frame_image</code>, <code>audio</code>, <code>pipeline</code>, <code>lora_paths</code> (up to 8, stacked), and on LTX 2.5 <code>"decoder": "diffusion"</code>.</p>
   </section>
 
   <section class="section section-alt" id="faq">
@@ -191,7 +228,7 @@
     <div class="faq-wrap reveal">
       <details class="faq-item">
         <summary>Does it really run on-device — no cloud render farm?</summary>
-        <p>Really. The full LTX-Video 2.3 pipeline — diffusion transformer, 3D VAE, audio decoder — was ported natively to MLX and validated tensor-by-tensor against the reference implementation. Your prompts, photos, and clips never leave the Mac.</p>
+        <p>Really. The full LTX-Video pipelines (2.5 and 2.3) and MiniMax-H3 — diffusion transformers, 3D VAEs, audio decoders — were ported natively to MLX and validated tensor-by-tensor against the reference implementation. Your prompts, photos, and clips never leave the Mac.</p>
       </details>
       <details class="faq-item">
         <summary>How does the soundtrack feature work?</summary>
@@ -203,7 +240,7 @@
       </details>
       <details class="faq-item">
         <summary>Why is the download so big?</summary>
-        <p>The ~50 GB snapshot ships <b>both</b> transformer variants (one-stage distilled + two-stage dev, ~11 GB each), the upscaler, and the Gemma text encoder — so every quality preset works offline without re-downloading. The downloader pulls only the files the engine actually reads, not the repo's full ~70 GB.</p>
+        <p>The ~50 GB snapshot ships <b>both</b> transformer variants (one-stage distilled + two-stage dev, ~11 GB each), the upscaler, and the Gemma text encoder — so every quality preset works offline without re-downloading. The downloader pulls only the files the engine actually reads, not the repo's full ~70 GB. LTX 2.5 travels lighter: 36 GB in 4-bit or 59 GB in 8-bit, text encoder bundled.</p>
       </details>
     </div>
   </section>

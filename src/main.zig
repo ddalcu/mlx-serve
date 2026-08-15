@@ -628,8 +628,15 @@ pub fn main(init: std.process.Init) !void {
             warmup_eager = false;
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
-            const v = std.fmt.parseInt(usize, args[i], 10) catch 8192;
-            generate_mod.prefill_chunk_override = v;
+            // `explicit` disables the machine-sized pin, so only a real width
+            // earns it — a typo'd value keeps the defaults (flag-absent
+            // behavior), never a silent 8192 that also switches sizing off.
+            if (std.fmt.parseInt(usize, args[i], 10)) |v| {
+                if (v > 0) {
+                    generate_mod.prefill_chunk_override = v;
+                    generate_mod.prefill_chunk_explicit = true;
+                }
+            } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {

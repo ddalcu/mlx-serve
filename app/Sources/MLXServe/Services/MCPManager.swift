@@ -320,14 +320,31 @@ final class MCPManager: ObservableObject, MCPToolRouting {
 
     // MARK: - Internal: spawn
 
+    /// Apply an entry's configured `headers` to a transport request. Rides the SDK's
+    /// `requestModifier` — per-request, which is the supported path (Apple documents
+    /// `httpAdditionalHeaders` as unreliable for `Authorization`). A header the transport
+    /// already set (Accept, Mcp-Session-Id) wins over the user's: clobbering the SDK's own
+    /// Accept would break SSE streaming.
+    nonisolated static func applying(headers: [String: String]?, to request: URLRequest) -> URLRequest {
+        guard let headers, !headers.isEmpty else { return request }
+        var out = request
+        for (name, value) in headers where out.value(forHTTPHeaderField: name) == nil {
+            out.setValue(value, forHTTPHeaderField: name)
+        }
+        return out
+    }
+
     /// Connect to an HTTP-transport MCP server (no subprocess). Uses the SDK's `HTTPClientTransport`
-    /// with SSE streaming enabled. Caps the handshake + tool listing at 30s.
+    /// with SSE streaming enabled; the entry's `headers` ride every request. Caps the handshake +
+    /// tool listing at 30s.
     private func connectHTTP(id: String, entry: MCPServerEntry) async throws -> Session {
         guard let urlString = entry.url, !urlString.isEmpty,
               let url = URL(string: urlString) else {
             throw MCPSpawnError.malformedEntry
         }
-        let transport = HTTPClientTransport(endpoint: url, streaming: true)
+        let headers = entry.headers
+        let transport = HTTPClientTransport(endpoint: url, streaming: true,
+                                            requestModifier: { Self.applying(headers: headers, to: $0) })
         let client = Client(name: "mlx-serve-mcp", version: "1.0.0")
         do {
             _ = try await withTimeout(seconds: 30) {

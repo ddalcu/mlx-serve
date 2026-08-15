@@ -1,5 +1,22 @@
 # Changelog
 
+## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
+
+### Highlights
+
+- **6-bit builds decode faster with speculation.** Our verify kernels only served 4-bit weights, so every 6-bit model fell back to stock kernels on M1-M4 Macs. They now serve 5, 6 and 8-bit too: 10-22% faster decode with the draft head on the Qwen 3.8 27B 6-bit build, same output.
+- **Memory checks are honest in both directions.** The admission guard was measured against real prefill peaks on five checkpoints and came up short on 5 of 8 shapes, worst 42% under, which is the difference between a clean "prompt too large" and the whole server dying in a Metal abort. Every measured peak is billed now, hybrids and MoE included, and image prompts are billed at the width they actually run.
+- **Downloads stopped looking like they restart.** Every progress bar drew the current file, so a four-shard model filled 0-100% four times. Bars now show the whole transfer, resumed bytes included.
+- **Switching models shows a spinner.** A hot switch to a big checkpoint used to sit for a minute under the old model's name and a green dot. The pill now names the model it is loading and spins until it answers.
+
+### Fixes
+
+- LFM2 and Nemotron-H were billed a KV cache for every layer when only their attention layers keep one, which charged LFM2 3.75x the real bytes and shrank its auto-context for nothing.
+- A model loaded while a bigger one was resident kept its narrowed prefill width forever, even after the big one was evicted. It re-resolves on the next load.
+- A model served out of the Hugging Face cache showed its commit hash in the model pill instead of its name.
+- Remote MCP servers can send auth headers now: a `headers` block on a `url` entry in mcp.json (an `Authorization` token, an API version) was silently ignored, so the server got an unauthenticated connect, and saving any MCP change deleted the block from the file. Headers now ride every request and survive edits, and unknown fields like `type` are kept too.
+- `--prefill-chunk` with a typo in the value silently became 8192 and turned the machine sizing off. A bad value now keeps the defaults.
+
 ## v26.8.7 — Qwen 3.8 27B, Ling 3.0, thinking that knows when to stop
 
 ### Highlights

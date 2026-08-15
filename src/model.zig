@@ -382,6 +382,20 @@ pub const ModelConfig = struct {
     /// `--ctx-size` still wins over this.
     pinned_context: u32 = 0,
 
+    /// The prefill chunk this model was sized for, FROZEN at load
+    /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
+    /// launch/base chunk.
+    ///
+    /// The chunk is the multiplier on the biggest transient in the memory bill
+    /// (`8 x chunk x max(hidden, ffn) x 2`, three of them). Nothing used to size
+    /// it to the MACHINE, so a 16 GB Mac reserved the same 5-7 GB envelope a
+    /// 128 GB one does, which is most of its budget: the sizer then reported a
+    /// 1024-token context and the admission guard refused prompts whose real
+    /// peak was a third of the bill. The sizer, `checkAttentionMemory` and
+    /// `generate.effectivePrefillChunk` all read THIS field, so the bill and the
+    /// forward can never disagree. Explicit `--prefill-chunk` still wins.
+    pinned_prefill_chunk: u32 = 0,
+
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = @splat(0),
     num_eos_tokens: u32 = 0,
@@ -639,6 +653,25 @@ pub const ModelConfig = struct {
     /// the memory model charge a uniform arch's footprint for a model
     /// carrying a fraction of it (bailing_hybrid: 6 of 24).
     pub fn attnCacheLayerCount(self: *const ModelConfig) u32 {
+        // A `layer_block_types` hybrid (LFM2 via `layer_types`, Nemotron-H via
+        // `hybrid_override_pattern`) never sets `full_attention_interval`, so
+        // the interval arm below counted EVERY layer: lfm2 caches 8 of 30 and
+        // was billed 3.75x, Nemotron-H worse. Only the `.attention` blocks
+        // reach `ctx.cache` in the hybrid forward — gated_conv and mamba2 hold
+        // a fixed-size recurrent state in `ssm_entries` instead. Layers past
+        // the 128-entry table keep the array's `.attention` default, which is
+        // the direction that over-bills rather than OOMs.
+        if (self.has_hybrid_layers) {
+            var n: u32 = if (self.num_hidden_layers > self.layer_block_types.len)
+                self.num_hidden_layers - @as(u32, self.layer_block_types.len)
+            else
+                0;
+            var li: u32 = 0;
+            while (li < self.num_hidden_layers and li < self.layer_block_types.len) : (li += 1) {
+                if (self.layer_block_types[li] == .attention) n += 1;
+            }
+            return n;
+        }
         if (self.full_attention_interval == 0) return self.num_hidden_layers;
         var n: u32 = 0;
         var i: u32 = 0;
@@ -5642,4 +5675,46 @@ test "parseGenerationDefaultsFromJson: missing keys and malformed input give nul
     try testing.expectEqual(@as(?f32, null), insane.temperature);
     try testing.expectEqual(@as(?f32, null), insane.top_p);
     try testing.expectEqual(@as(?u32, null), insane.top_k);
+}
+
+test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION layers" {
+    // LFM2.5-2.6B's real shape: 30 layers, 22 gated-conv + 8 full-attention,
+    // 8 KV heads at head_dim 64. `isLinearLayer` keys on
+    // `full_attention_interval`, which this family never sets (it populates
+    // `layer_block_types` instead), so every memory estimate billed a KV cache
+    // for all 30 — 3.75x the bytes the model can ever store, spent out of the
+    // auto-context budget on exactly the arch small Macs are pointed at.
+    // Nemotron-H is the same class through `hybrid_override_pattern` (only its
+    // `*` layers cache) and over-bills harder still.
+    var config = ModelConfig{};
+    config.num_hidden_layers = 30;
+    config.num_key_value_heads = 8;
+    config.head_dim = 64;
+    config.has_hybrid_layers = true;
+    // The shipped LFM2.5-2.6B layer_types, verbatim.
+    const lfm2_attn = [_]u32{ 2, 5, 9, 13, 17, 21, 24, 27 };
+    for (0..30) |i| config.layer_block_types[i] = .gated_conv;
+    for (lfm2_attn) |i| config.layer_block_types[i] = .attention;
+    try testing.expectEqual(@as(u32, 8), config.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 8 * 8 * 2 * 64 * 2), config.kvBytesPerToken());
+
+    // Nemotron-H: mamba2 and mlp blocks hold a fixed-size recurrent state, not
+    // a per-token cache — only the attention blocks are billed.
+    var nemo = ModelConfig{};
+    nemo.num_hidden_layers = 12;
+    nemo.num_key_value_heads = 8;
+    nemo.head_dim = 128;
+    nemo.has_hybrid_layers = true;
+    const pattern = [_]LayerBlockType{ .mamba2, .mlp, .mamba2, .attention, .mamba2, .mlp, .mamba2, .mlp, .mamba2, .attention, .mamba2, .mlp };
+    for (pattern, 0..) |b, i| nemo.layer_block_types[i] = b;
+    try testing.expectEqual(@as(u32, 2), nemo.attnCacheLayerCount());
+
+    // A hybrid checkpoint that ships no layer_types leaves the array at its
+    // `.attention` default and keeps the whole-model bill — the safe direction.
+    var bare = ModelConfig{};
+    bare.num_hidden_layers = 16;
+    bare.num_key_value_heads = 4;
+    bare.head_dim = 128;
+    bare.has_hybrid_layers = true;
+    try testing.expectEqual(@as(u32, 16), bare.attnCacheLayerCount());
 }

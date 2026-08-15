@@ -20,6 +20,12 @@ class DownloadManager: ObservableObject {
     private var activeVariantDest: [String: String] = [:]
 
     struct DownloadState {
+        /// Fraction of the WHOLE transfer: bytes banked across every file
+        /// divided by the repo's total. There is deliberately no per-file
+        /// fraction to render — every bar in the app drew one, so a repo of
+        /// four shards ran 0→100% four times and read as a download that kept
+        /// restarting. The file being fetched is named by `currentFile` /
+        /// `fileIndex`, which is the honest way to say "still going".
         var progress: Double = 0
         var status: Status = .idle
         var statusText: String = ""
@@ -28,7 +34,6 @@ class DownloadManager: ObservableObject {
         var fileIndex: Int = 0
         var fileCount: Int = 0
         var bytesPerSecond: Double = 0
-        var fileProgress: Double = 0
 
         enum Status: Equatable {
             case idle, downloading, completed, failed
@@ -44,7 +49,7 @@ class DownloadManager: ObservableObject {
         }
 
         var percentFormatted: String {
-            String(format: "%.0f%%", fileProgress * 100)
+            String(format: "%.0f%%", progress * 100)
         }
     }
 
@@ -756,7 +761,6 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.currentFile = (filePath as NSString).lastPathComponent
                 downloads[repoId]?.fileIndex = idx + 1
                 downloads[repoId]?.fileCount = neededFiles.count
-                downloads[repoId]?.fileProgress = 0
                 downloads[repoId]?.bytesPerSecond = 0
                 downloads[repoId]?.statusText = "\(filePath) (\(sizeStr))"
 
@@ -772,7 +776,11 @@ class DownloadManager: ObservableObject {
                     let existingBytes = ChunkedFileDownloader.resumableBytes(partialPath: partialPath, fileSize: fileSize)
                     if existingBytes > 0 {
                         downloads[repoId]?.statusText = "Resuming \(filePath) from \(formatBytes(existingBytes))..."
-                        downloads[repoId]?.fileProgress = fileSize > 0 ? Double(existingBytes) / Double(fileSize) : 0
+                        // Bank the resumed bytes now: the first transfer
+                        // callback would count them anyway, and until it lands
+                        // the bar should already reflect what is on disk.
+                        downloads[repoId]?.progress = totalSize > 0
+                            ? Double(downloadedSize + existingBytes) / Double(totalSize) : 0
                     }
 
                     do {
@@ -808,7 +816,6 @@ class DownloadManager: ObservableObject {
 
                 downloadedSize += fileSize
                 downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
-                downloads[repoId]?.fileProgress = 1.0
             }
 
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
@@ -1415,7 +1422,8 @@ class DownloadManager: ObservableObject {
                     let existingBytes = ChunkedFileDownloader.resumableBytes(partialPath: partialPath, fileSize: fileSize)
                     if existingBytes > 0 {
                         downloads[repoId]?.statusText = "Resuming \(shardName) from \(formatBytes(existingBytes))..."
-                        downloads[repoId]?.fileProgress = fileSize > 0 ? Double(existingBytes) / Double(fileSize) : 0
+                        downloads[repoId]?.progress = totalSize > 0
+                            ? Double(baseDownloaded + existingBytes) / Double(totalSize) : 0
                     }
 
                     do {
@@ -1505,10 +1513,10 @@ class DownloadManager: ObservableObject {
             connections: DownloadChunking.configuredConnections()
         )
         downloader.onProgress = { [weak self] fileBytesTotal, speed in
-            let fileProgress = fileSize > 0 ? Double(fileBytesTotal) / Double(fileSize) : 0
+            // `fileBytesTotal` includes bytes resumed from a previous run, so
+            // this is the whole transfer's position, not this session's.
             let overallDownloaded = baseDownloaded + fileBytesTotal
             Task { @MainActor [weak self] in
-                self?.downloads[repoId]?.fileProgress = fileProgress
                 self?.downloads[repoId]?.bytesPerSecond = speed
                 self?.downloads[repoId]?.progress = totalSize > 0 ? Double(overallDownloaded) / Double(totalSize) : 0
             }
