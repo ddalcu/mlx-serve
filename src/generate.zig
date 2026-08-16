@@ -273,6 +273,14 @@ pub const MtpCacheRef = union(enum) {
         };
     }
 
+    /// The underlying KVCache — what the prefix cache's spec-snap machinery
+    /// snapshots and restores (every current variant is KVCache-backed).
+    pub fn kv(self: *MtpCacheRef) *KVCache {
+        return switch (self.*) {
+            .qwen => |*c| c,
+        };
+    }
+
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
@@ -298,6 +306,10 @@ pub const MtpCacheRef = union(enum) {
         }
     }
 };
+
+/// An MTP committed-history cache restored from the prefix cache, plus the
+/// absolute target position its index 0 represents.
+pub const MtpRestored = struct { cache: MtpCacheRef, base: usize };
 
 pub const Constraint = struct {
     grammar: *json_grammar.Grammar,
@@ -1353,6 +1365,12 @@ pub const Generator = struct {
         /// the offset (a restore forwards no trunk layers, so a cold context
         /// is what a reused prefix would otherwise get).
         dflash_ctx_restored: ?dflash_mod.DflashCtx = null,
+        /// An MTP committed-history cache restored from the prefix cache,
+        /// whose `base + cache.step()` already equals
+        /// `ssm_checkpoint_pos_offset`. Ownership transfers to the
+        /// Generator. Null = start the history blind at the offset (same
+        /// contract as `dflash_ctx_restored`).
+        mtp_cache_restored: ?MtpRestored = null,
         /// Cooperative abort for abandoned requests: checked between prefill
         /// chunks. The scheduler passes `&slot.cancelled`, set by the conn
         /// thread when the client disconnects mid-prefill. When it flips,
@@ -1622,10 +1640,23 @@ pub const Generator = struct {
         // forwarded tail — RoPE offsets are cache-relative, so a late-starting
         // history is self-consistent (sliding-window history semantics).
         const mtp_active = options.mtp_enabled and options.mtp != null;
-        var mtp_cache: ?MtpCacheRef = if (mtp_active) try options.mtp.?.makeCache(allocator) else null;
-        errdefer if (mtp_cache) |*mc| mc.deinit();
+        var mtp_cache: ?MtpCacheRef = null;
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
+        if (mtp_active) {
+            if (options.mtp_cache_restored) |restored| {
+                // A restored history already covers [base, ssm_cp_offset);
+                // the tail prefill APPENDS to it (RoPE offsets are
+                // cache-relative, so continuation is self-consistent).
+                std.debug.assert(restored.base + restored.cache.step() == ssm_cp_offset);
+                mtp_cache = restored.cache;
+                mtp_position_base = restored.base;
+                mtp_history_started = true;
+            } else {
+                mtp_cache = try options.mtp.?.makeCache(allocator);
+            }
+        }
+        errdefer if (mtp_cache) |*mc| mc.deinit();
 
         // DFlash: build the assistant's context cache during prefill — every
         // chunk's target_layer_ids captures project through the encoder and
@@ -3907,6 +3938,30 @@ pub const Generator = struct {
         return cache_step;
     }
 
+    /// Committed-history length actually IN the head cache at rest — what a
+    /// prefix-cache commit may snapshot. Everything past it is speculative:
+    /// a pending stash's entries are NOT in the cache yet (the cache past
+    /// `stash.off0` is the producing round's stale draft tail), and a built
+    /// cross-round pre-draft has already appended NEXT-round draft entries
+    /// past ITS `off0`. The min over both boundaries is always safe.
+    pub fn mtpCommittedLen(cache_step: usize, pre_draft_off0: ?usize, stash_off0: ?usize) usize {
+        var committed = cache_step;
+        if (pre_draft_off0) |o| committed = @min(committed, o);
+        if (stash_off0) |o| committed = @min(committed, o);
+        return committed;
+    }
+
+    /// `mtpCommittedLen` over this Generator's live state; 0 when MTP is
+    /// not active.
+    pub fn mtpCommittedHistoryLen(self: *const Generator) usize {
+        if (self.mtp_cache == null) return 0;
+        return mtpCommittedLen(
+            self.mtp_cache.?.step(),
+            if (self.mtp_pre_draft) |*pd| pd.off0 else null,
+            if (self.mtp_hist_stash) |*st| st.off0 else null,
+        );
+    }
+
     fn mtpMropeContext(self: *const Generator) ?mtp_mod.MropeContext {
         const positions = self.ctx.mrope_pos orelse return null;
         return .{
@@ -5186,21 +5241,27 @@ pub const Generator = struct {
         nax_from: u32 = 0,
         per_pos_nax: f32 = 0.0,
     };
-    /// 2026-07-22 refit #3, AFTER round pipelining (early draft dispatch +
-    /// cross-round pre-draft + GDN capture-tail trim): same-session
-    /// saturated ECHO sweep on the Jundot oQ4e 27B @8K, M4 Max — T(1)=45.4,
-    /// T(2)=53.3 (two fully-saturated m_avg=2.0 windows; deeper depths
-    /// can't saturate on this head, chained acceptance ~0.5) → floor
-    /// ≈ 37.9 ms, flat marginal ≈ 7.5 ms/pos = 0.20 floor units. The
-    /// pipelining hid the CPU graph-build (floor down from ~40), so
-    /// per-position marginals RISE in floor units (draft+lo 0.12 → 0.20).
-    /// per_pos_hi carries over from refit #2 (ramp unmeasurable on this
-    /// head; conservative — higher hi only raises tau). sync = 0.01: the
-    /// chunk-A boundary read is near-free now that pre-drafted ids are
-    /// materialized before the round starts.
-    /// (Refit #2, 2026-07-13, post-verify-qmm, for the record: T(1)=44.6,
-    /// T(3)=54.4, T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
-    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.24, .flat_max = 3, .sync = 0.01 };
+    /// 2026-08-15 refit #4, AFTER the hd-256 causal sdpa split
+    /// (`splitCausalSdpa` — dense verify q 6..9 now rides the vector path,
+    /// invalidating the ramp the old hi partially priced): same-session
+    /// saturated ECHO sweep, Jundot oQ4e 27B @8K cold reps
+    /// (--prefix-cache-entries 0), M4 Max, MLX_SERVE_MTP_ADAPTIVE=0 forced
+    /// depths, saturated (m_avg==N) trace windows only — T(1)=44.6,
+    /// T(2)=51.0, T(3)=59.2, T(4)=68.2, T(6)=95.4, T(8)=142.3 ms → floor
+    /// ≈ 38.2 ms. Composite marginals in floor units: k<=4 ≈ 0.20 (6.4-9.0
+    /// ms/pos — flat_max moves 3 → 4, the old hi over-priced k4 at 0.34 and
+    /// under-drafted it on moderate content), k5-6 ≈ 0.36 (13.6 ms/pos),
+    /// k7-8 ≈ 0.62 (23.5 ms/pos — the plain-SIMD verify-qmm register cliff
+    /// at M 8/9, expressed through the generic third region; only reachable
+    /// when --mtp-depth forces past the generic cap of 6). The G17 NAX
+    /// tables below predate the sdpa split — refit them on an M5 when one
+    /// is available. draft/verify split not separately identifiable; only
+    /// the sums enter the controller.
+    /// (Refit #3, 2026-07-22, post round-pipelining, for the record:
+    /// T(1)=45.4, T(2)=53.3 → .10/.10/.24@3/.01 on a ~37.9 ms floor.
+    /// Refit #2, 2026-07-13, post-verify-qmm: T(1)=44.6, T(3)=54.4,
+    /// T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
+    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52 };
     /// M5 Max/G17 refit (2026-07-17), same-session saturated fixed-depth
     /// sweep after the NAX m16 verify lane landed: T(1..4) ~= 41.35 ms,
     /// T(6)=62.15 ms, T(8)=68.39 ms. In floor units this identifies
@@ -5650,6 +5711,11 @@ pub const Generator = struct {
         c.per_pos_lo = values[1];
         c.per_pos_hi = values[2];
         c.sync = values[3];
+        // The override contract is the two-region surface: never inherit a
+        // third region (M5 NAX or the generic k>=7 cliff) the four values
+        // can't express.
+        c.nax_from = 0;
+        c.per_pos_nax = 0.0;
         return c;
     }
 
@@ -9773,32 +9839,30 @@ test "mtpEvPlanFor: unobserved deep indices at the prior still open the extensio
     try testing.expectApproxEqAbs(@as(f32, -0.1168), plan.tau_ln, 5e-3);
 }
 
-test "mtpEvPlanFor: DEFAULT costs carry the round-pipelined surface (2026-07-22 refit #3)" {
-    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER round
-    // pipelining (early dispatch + cross-round pre-draft + capture-tail
-    // trim; same-session saturated echo sweep, Jundot oQ4e 27B @8K,
-    // M4 Max: T(1)=45.4, T(2)=53.3 → floor ≈ 37.9 ms, flat marginal
-    // draft+lo ≈ 0.20; the ramp is unmeasurable on this head — chained
-    // acceptance can't saturate depth > 2 — so per_pos_hi carries over).
-    // The pipelining hid the CPU graph-build, so the FLOOR dropped and the
-    // per-position marginals grew in floor units (0.12 → 0.20): the
-    // controller now correctly prefers m_lo 2 on this head's decayed
-    // chain (~{0.78, 0.5, ...}) instead of riding a stale cheap flat region.
+test "mtpEvPlanFor: DEFAULT costs carry the post-sdpa-split surface (2026-08-15 refit #4)" {
+    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER the hd-256
+    // causal sdpa split (same-session saturated forced-depth echo sweep,
+    // Jundot oQ4e 27B @8K cold reps, M4 Max: T(1)=44.6 .. T(8)=142.3 →
+    // floor ≈ 38.2 ms, marginals k<=4 ≈ 0.20, k5-6 ≈ 0.36, k7-8 ≈ 0.62).
+    // flat_max 4: the old hi over-priced k4 at 0.34 (measured 0.24), so
+    // moderate content under-drafted it. The k>=7 third region carries the
+    // plain-SIMD verify-qmm register cliff — only reachable when
+    // --mtp-depth forces past the generic cap of 6.
     const costs = Generator.MTP_EV_DEFAULT_COSTS;
-    // Hot uniform 90%: base rides the flat region, extension into the ramp.
+    // Hot uniform 90%: base now rides the WIDER flat region (m_lo 4, was 3
+    // under refit #3), extension one step into the ramp.
     const hot = [_]f32{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 };
     const hot_plan = Generator.mtpEvPlanFor(&hot, 8, costs, 8);
-    try testing.expectEqual(@as(u32, 3), hot_plan.m_lo);
+    try testing.expectEqual(@as(u32, 4), hot_plan.m_lo);
     try testing.expectEqual(@as(u32, 5), hot_plan.m_hi);
-    try testing.expectApproxEqAbs(@as(f32, -0.1569), hot_plan.tau_ln, 5e-3);
-    // Marginal 75%: base stays 3 on the flat region, short extension.
+    try testing.expectApproxEqAbs(@as(f32, -0.0943), hot_plan.tau_ln, 5e-3);
+    // Marginal 75%: base stays 3, one cheap flat extension position.
     const mid = [_]f32{ 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75 };
     const mid_plan = Generator.mtpEvPlanFor(&mid, 8, costs, 8);
     try testing.expectEqual(@as(u32, 3), mid_plan.m_lo);
     try testing.expectEqual(@as(u32, 4), mid_plan.m_hi);
-    try testing.expectApproxEqAbs(@as(f32, -0.2552), mid_plan.tau_ln, 5e-3);
-    // The oQ4e head's measured decayed chain plans a 2-deep base — the
-    // shape the refit exists to unlock (d2 wins on the new cost surface).
+    try testing.expectApproxEqAbs(@as(f32, -0.786), mid_plan.tau_ln, 5e-3);
+    // The oQ4e head's measured decayed chain still plans a 2-deep base.
     const oq4e = [_]f32{ 0.78, 0.50, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45 };
     const oq4e_plan = Generator.mtpEvPlanFor(&oq4e, 8, costs, 8);
     try testing.expectEqual(@as(u32, 2), oq4e_plan.m_lo);
@@ -9946,6 +10010,16 @@ test "mtpEvPlanFor: cap 1 is a plain depth-1 round" {
     const plan = Generator.mtpEvPlanFor(&a, 1, costs, 8);
     try testing.expectEqual(@as(u32, 1), plan.m_lo);
     try testing.expectEqual(@as(u32, 1), plan.m_hi);
+}
+
+test "mtpCommittedLen: speculative tails (pre-draft, stash) bound the committable history" {
+    try testing.expectEqual(@as(usize, 42), Generator.mtpCommittedLen(42, null, null));
+    // Pending stash: the cache past off0 is the producing round's stale draft tail.
+    try testing.expectEqual(@as(usize, 40), Generator.mtpCommittedLen(46, null, 40));
+    // Built pre-draft: next-round draft entries sit past ITS off0.
+    try testing.expectEqual(@as(usize, 43), Generator.mtpCommittedLen(47, 43, null));
+    // Both live: the min wins.
+    try testing.expectEqual(@as(usize, 40), Generator.mtpCommittedLen(47, 43, 40));
 }
 
 test "mtpRoundOff0: a pending history stash overrides the stale cache length" {

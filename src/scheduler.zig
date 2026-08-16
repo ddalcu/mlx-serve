@@ -4049,7 +4049,23 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             null
     else
         null;
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit) catch |err| {
+    // MTP committed history: unlike dflash there is no exact-coverage
+    // requirement — the restore clamps to the matched length and declines a
+    // history that ends short, so a partial history (the deferred-stash lag,
+    // a runtime disable) is still worth committing. What MUST hold is that
+    // only COMMITTED entries are snapshotted: truncate off the speculative
+    // draft tail first (offset-only, cheap).
+    const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {
+        const mc = if (gen_ptr.mtp_cache) |*m| m else break :blk null;
+        const committed = gen_ptr.mtpCommittedHistoryLen();
+        if (committed == 0) break :blk null;
+        mc.truncate(committed, slot.model.transformer.?.s) catch |err| {
+            log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
+            break :blk null;
+        };
+        break :blk .{ .cache = mc.kv(), .base_pos = gen_ptr.mtp_position_base };
+    };
+    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4623,6 +4639,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // acceptance and 80.2 -> 60.9 tok/s. Adopted by the Generator below.
     var dflash_restored: ?dflash_mod.DflashCtx = null;
     errdefer if (dflash_restored) |*dc| dc.deinit();
+    // The MTP head's committed history rides the prefix cache the same way:
+    // it is built from trunk hiddens, a restore forwards nothing, and a
+    // blind start collapses acceptance (measured ~70 -> ~38 tok/s on warm
+    // Qwen3.6-27B echo). Adopted by the Generator below.
+    var mtp_restored: ?generate_mod.MtpRestored = null;
+    errdefer if (mtp_restored) |*mr| mr.cache.deinit();
     // Phase D: per-slot model — pull transformer + prefix cache off the
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
@@ -4638,6 +4660,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null;
             errdefer if (dfl_target) |*dc| dc.deinit();
             var dfl_base: usize = 0;
+            var mtp_target: ?generate_mod.MtpCacheRef = if (use_mtp and slot.mtp != null)
+                slot.mtp.?.makeCache(slot.allocator) catch null
+            else
+                null;
+            errdefer if (mtp_target) |*mc| mc.deinit();
+            var mtp_base: usize = 0;
             const lookup = hc.lookupAndRestore(
                 &slot.cache,
                 &slot.moe_seq_offset,
@@ -4646,6 +4674,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.full_prompt,
                 slot.has_tools,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
+                if (mtp_target) |*mc| .{ .cache = mc.kv(), .base_pos = &mtp_base } else null,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -4665,6 +4694,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     dc.deinit();
                 }
                 dfl_target = null;
+            }
+            if (mtp_target) |*mc| {
+                // Same exact-alignment rule (the Generator asserts
+                // `base + step == ssm_cp_offset` on adoption).
+                if (lookup.mtp_base != null and mtp_base + mc.step() == hot_matched) {
+                    mtp_restored = .{ .cache = mc.*, .base = mtp_base };
+                } else {
+                    mc.deinit();
+                }
+                mtp_target = null;
             }
         }
     }
@@ -4721,6 +4760,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // reads, so the forward can never run wider than the bill.
             .pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,
             .dflash_ctx_restored = dflash_restored,
+            .mtp_cache_restored = mtp_restored,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
             // when the client disconnects; the chunk loop checks it between
             // chunks so a ghost 40K prefill stops within one chunk.
@@ -4733,6 +4773,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         },
     );
     dflash_restored = null; // ownership transferred to the Generator
+    mtp_restored = null; // ownership transferred to the Generator
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
 

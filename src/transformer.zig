@@ -577,7 +577,6 @@ fn vqmmColumnChain(comptime m: usize, comptime j: usize) []const u8 {
     }
 }
 
-
 fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
     comptime {
         // The per-width unpack ladder multiplies the comptime string work.
@@ -738,8 +737,8 @@ fn vqmmMsgBn(m: c_int) c_int {
 const VQMM_MSG_SOURCES = blk: {
     @setEvalBranchQuota(20_000_000);
     break :blk [6][:0]const u8{
-    verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
-    verifyQmmMsgSource(5, 4), verifyQmmMsgSource(6, 4), verifyQmmMsgSource(7, 2),
+        verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
+        verifyQmmMsgSource(5, 4), verifyQmmMsgSource(6, 4), verifyQmmMsgSource(7, 2),
     };
 };
 const VQMM_MSG_NAMES = [6][*:0]const u8{
@@ -771,6 +770,186 @@ fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     vqmm_msg_kernels[idx] = kernel;
     return kernel;
+}
+
+/// Crossrow M 8-9 kernel body (4-bit g64 only): port of the
+/// qwen-3.8-mtp-challenge `qmv_fast_crossrow_affine4_g64` (see NOTICE) — a
+/// qmv-shaped tile where ONE packed-weight read serves TWO input rows, so
+/// the M 8/9 widths past the split-K register cliff keep qmv-class weight
+/// traffic. Grid: tgp.x = input pair (ceil(M/2) groups, M baked), tgp.y =
+/// 8-row output tile (2 simdgroups x 4 rows); 32 lanes x 16 values = one
+/// 512-wide k-block per iteration; each 4-lane cluster shares one g64
+/// scale group. Activations pre-scale /1,/16,/256,/4096 so the nibble dot
+/// runs on MASKED (unshifted) weights; the raw-x sum carries the affine
+/// bias term. Every loop bound is a literal constant (fully unrolled — the
+/// named-scalar rule is satisfied the way their C++ template satisfies it).
+/// Deviation from theirs: the odd-M tail group loads a ZEROED second row
+/// instead of a separate single-row dot — identical output, the unused
+/// half rides arithmetic the weight-bound kernel has free.
+fn verifyQmmCrossrowSource(comptime m: usize) [:0]const u8 {
+    comptime {
+        @setEvalBranchQuota(400_000);
+        return std.fmt.comptimePrint(
+            \\auto sg = simdgroup_index_in_threadgroup;
+            \\auto lane = thread_index_in_simdgroup;
+            \\auto tgp = threadgroup_position_in_grid;
+            \\
+            \\int K = int(K_size);
+            \\int N = int(N_size);
+            \\const int first_m = int(tgp.x) * 2;
+            \\const int out_row = int(tgp.y) * 8 + int(sg) * 4;
+            \\const int K_bytes = K / 2;
+            \\const int K_groups = K / 64;
+            \\const bool has_pair = (first_m + 1) < {d};
+            \\
+            \\const device uint8_t* wq8 = (const device uint8_t*)w_q;
+            \\float2 pres[4];
+            \\_Pragma("unroll")
+            \\for (int r = 0; r < 4; ++r) {{ pres[r] = float2(0.0f); }}
+            \\
+            \\for (int k = 0; k < K; k += 512) {{
+            \\  ushort pk[4][4];
+            \\  float sl[4]; float bl[4];
+            \\  _Pragma("unroll")
+            \\  for (int r = 0; r < 4; ++r) {{
+            \\    const int row = out_row + r;
+            \\    const device uint16_t* ws = (const device uint16_t*)(wq8 + row * K_bytes + (k >> 1) + int(lane) * 8);
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 4; ++i) {{ pk[r][i] = ws[i]; }}
+            \\    const int gi = row * K_groups + (k >> 6) + int(lane) / 4;
+            \\    sl[r] = float(scales[gi]);
+            \\    bl[r] = float(biases[gi]);
+            \\  }}
+            \\  const device T* xm0 = x + first_m * K + k + int(lane) * 16;
+            \\  float x0[16]; float x1[16];
+            \\  float sum0 = 0.0f; float sum1 = 0.0f;
+            \\  _Pragma("unroll")
+            \\  for (int i = 0; i < 16; i += 4) {{
+            \\    sum0 += float(xm0[i]) + float(xm0[i+1]) + float(xm0[i+2]) + float(xm0[i+3]);
+            \\    x0[i] = float(xm0[i]);
+            \\    x0[i+1] = float(xm0[i+1]) / 16.0f;
+            \\    x0[i+2] = float(xm0[i+2]) / 256.0f;
+            \\    x0[i+3] = float(xm0[i+3]) / 4096.0f;
+            \\  }}
+            \\  if (has_pair) {{
+            \\    const device T* xm1 = xm0 + K;
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 16; i += 4) {{
+            \\      sum1 += float(xm1[i]) + float(xm1[i+1]) + float(xm1[i+2]) + float(xm1[i+3]);
+            \\      x1[i] = float(xm1[i]);
+            \\      x1[i+1] = float(xm1[i+1]) / 16.0f;
+            \\      x1[i+2] = float(xm1[i+2]) / 256.0f;
+            \\      x1[i+3] = float(xm1[i+3]) / 4096.0f;
+            \\    }}
+            \\  }} else {{
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 16; ++i) {{ x1[i] = 0.0f; }}
+            \\  }}
+            \\  _Pragma("unroll")
+            \\  for (int r = 0; r < 4; ++r) {{
+            \\    float2 acc = float2(0.0f);
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 4; ++i) {{
+            \\      acc += float2(x0[4*i],   x1[4*i])   * float(pk[r][i] & 0x000f);
+            \\      acc += float2(x0[4*i+1], x1[4*i+1]) * float(pk[r][i] & 0x00f0);
+            \\      acc += float2(x0[4*i+2], x1[4*i+2]) * float(pk[r][i] & 0x0f00);
+            \\      acc += float2(x0[4*i+3], x1[4*i+3]) * float(pk[r][i] & 0xf000);
+            \\    }}
+            \\    pres[r] += sl[r] * acc + float2(sum0, sum1) * bl[r];
+            \\  }}
+            \\}}
+            \\
+            \\_Pragma("unroll")
+            \\for (int r = 0; r < 4; ++r) {{
+            \\  float r0 = simd_sum(pres[r].x);
+            \\  float r1 = simd_sum(pres[r].y);
+            \\  if (lane == 0) {{
+            \\    y[first_m * N + out_row + r] = T(r0);
+            \\    if (has_pair) {{ y[(first_m + 1) * N + out_row + r] = T(r1); }}
+            \\  }}
+            \\}}
+        , .{m});
+    }
+}
+
+const VQMM_XR_SOURCES = blk: {
+    @setEvalBranchQuota(20_000_000);
+    break :blk [2][:0]const u8{ verifyQmmCrossrowSource(8), verifyQmmCrossrowSource(9) };
+};
+const VQMM_XR_NAMES = [2][*:0]const u8{ "mlxserve_vqmm_xr_m8", "mlxserve_vqmm_xr_m9" };
+
+var vqmm_xr_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
+
+fn getVerifyQmmCrossrowKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
+    if (m < 8 or m > 9) return error.UnsupportedShape;
+    const idx: usize = @intCast(m - 8);
+    if (vqmm_xr_kernels[idx]) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "K_size", "N_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        VQMM_XR_NAMES[idx],
+        in_vec,
+        out_vec,
+        VQMM_XR_SOURCES[idx],
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    vqmm_xr_kernels[idx] = kernel;
+    return kernel;
+}
+
+fn runVerifyQmmCrossrow(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    m: c_int,
+    K: c_int,
+    N: c_int,
+    xd: mlx.mlx_dtype,
+    xsh: []const c_int,
+) !?mlx.mlx_array {
+    const K_arr = cachedScalarInt(K);
+    const N_arr = cachedScalarInt(N);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const y_shape = [_]c_int{ m, N };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
+    const n_pairs: c_int = @divTrunc(m + 1, 2);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 64 * n_pairs, @divExact(N, 8), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+
+    const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    const kernel = try getVerifyQmmCrossrowKernel(m);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y2);
+    try mlx.check(mlx.mlx_vector_array_get(&y2, outputs_vec, 0));
+
+    var out_shape_buf: [8]c_int = undefined;
+    const ndim = xsh.len;
+    if (ndim > out_shape_buf.len) return error.UnsupportedShape;
+    for (xsh[0 .. ndim - 1], 0..) |d, i| out_shape_buf[i] = d;
+    out_shape_buf[ndim - 1] = N;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_reshape(&y, y2, out_shape_buf[0..ndim].ptr, @intCast(ndim), s));
+    return y;
 }
 
 /// Column-tile width per M. A threadgroup owns `bn` output columns and
@@ -1019,7 +1198,27 @@ pub fn verifyQmmEnabled() bool {
     return on;
 }
 
-pub const VqmmLane = enum { none, splitk, msg, nax };
+pub const VqmmLane = enum { none, splitk, msg, nax, crossrow };
+
+/// Crossrow M 8-9 lane (plain-SIMD machines, 4-bit g64 only): OPT-IN via
+/// MLX_SERVE_VERIFY_QMM_CROSSROW=1 until its A/B wins. Port of the
+/// qwen-3.8-mtp-challenge `qmv_fast_crossrow_affine4_g64` (see NOTICE):
+/// one weight read serves TWO input rows, so the M 8/9 widths that
+/// stack-spill the split-K tile (the measured register cliff) ride a
+/// qmv-shaped kernel instead of stock. Test seam: `vqmm_crossrow_override`.
+pub var vqmm_crossrow_override: ?bool = null;
+var vqmm_crossrow_env_cached: ?bool = null;
+fn crossrowEnvEnabled() bool {
+    if (vqmm_crossrow_override) |v| return v;
+    if (vqmm_crossrow_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_VERIFY_QMM_CROSSROW") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    };
+    vqmm_crossrow_env_cached = v;
+    return v;
+}
+var vqmm_crossrow_engaged = false;
 
 /// The byte-unpack NAX tile is profitable for oQe's wide q5/q6 projections,
 /// but loses to stock MLX on the 1024-wide K/V projections. This threshold is
@@ -1112,11 +1311,17 @@ fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// - splitk/msg: the plain-SIMD M 2..7 lanes (K % 64 == 0, N % 4 == 0),
 ///   byte-identical to the pre-NAX dispatch; msg takes N >= 100000.
 /// - none: stock mlx_quantized_matmul.
-pub fn vqmmLaneFor(m: c_int, K: c_int, N: c_int, nax_on: bool, nax_min_m: c_int) VqmmLane {
+pub fn vqmmLaneFor(m: c_int, K: c_int, N: c_int, nax_on: bool, nax_min_m: c_int, crossrow_on: bool) VqmmLane {
     if (m < 2 or m > 16) return .none;
     if (N < 512) return .none;
     if (nax_on and m >= nax_min_m and @mod(K, 256) == 0 and @mod(N, 32) == 0) return .nax;
-    if (m > 7) return .none;
+    if (m > 7) {
+        // crossrow (opt-in, non-NAX): M 8..9 past the plain-SIMD register
+        // cliff. Its k-loop covers exactly 512 inputs per iteration and its
+        // row tiles are unguarded 8s; their host gate keeps out_vec >= 1024.
+        if (crossrow_on and m <= 9 and @mod(K, 512) == 0 and @mod(N, 8) == 0 and N >= 1024) return .crossrow;
+        return .none;
+    }
     if (@mod(K, 64) != 0 or @mod(N, 4) != 0) return .none;
     return if (N >= 100000) .msg else .splitk;
 }
@@ -1157,8 +1362,12 @@ pub fn verifyQmm(
     // values (5/6-bit rows are byte-packed but still exposed as uint32 arrays).
     if (@as(i64, wsh[1]) * 32 != @as(i64, K) * @as(i64, bits)) return null;
     const nax_on = naxLaneEnvEnabled() and verifyQmmNaxAvailable();
-    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM());
+    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM(), crossrowEnvEnabled());
+    // The crossrow kernel is a strict 4-bit/g64 specialization (masked-nibble
+    // dot with /16-prescaled activations) — other widths fall to stock.
+    if (lane == .crossrow and (bits != 4 or group_size != 64)) return null;
     if (bits != 4) switch (lane) {
+        .crossrow => return null, // unreachable after the gate above; explicit
         .nax => if (!naxMixedBitsEnvEnabled() or !mixedNaxShapeEnabled(bits, group_size, N)) return null,
         // The plain-SIMD tiles now carry the same byte-addressed unpack the
         // NAX tile validated, so 5/6/8-bit no longer fall through to stock on
@@ -1177,6 +1386,14 @@ pub fn verifyQmm(
     };
     switch (lane) {
         .none => return null,
+        // Crossrow M 8/9 (opt-in): one weight read serves two input rows.
+        .crossrow => {
+            if (!vqmm_crossrow_engaged) {
+                vqmm_crossrow_engaged = true;
+                log.info("[vqmm] crossrow verify lane engaged: M={d} K={d} N={d} (MLX_SERVE_VERIFY_QMM_CROSSROW=0 restores stock)\n", .{ m, K, N });
+            }
+            return try runVerifyQmmCrossrow(s, x, w, sc, bi, m, K, N, xd, xsh);
+        },
         // NAX m16 tile (M5-class): M 8..16 by default — past the plain-SIMD
         // register cliff. Construction stays strictly behind the probe.
         .nax => return try runVerifyQmmNax(s, x, w, sc, bi, bits, group_size, m, K, N, xd, xsh),
@@ -1476,7 +1693,7 @@ pub fn verifyQmmNaxEnabledForMFrom(
     available: bool,
     min_m: c_int,
 ) bool {
-    return verify_on and vqmmLaneFor(m, K, N, lane_on and available, min_m) == .nax;
+    return verify_on and vqmmLaneFor(m, K, N, lane_on and available, min_m, false) == .nax;
 }
 
 /// Runtime form of verifyQmmNaxEnabledForMFrom.
@@ -2401,6 +2618,107 @@ pub fn fusedSdpa256Prefill(
     fused256_last_dispatch_count = dispatches;
     return out;
 }
+
+/// Kill switch (MLX_SERVE_SDPA_SPLIT=0). Test seam: `sdpa_split_override`
+/// forces the arm on/off without the environment.
+pub var sdpa_split_override: ?bool = null;
+var sdpa_split_env_cached: ?bool = null;
+fn sdpaSplitEnabled() bool {
+    if (sdpa_split_override) |v| return v;
+    if (sdpa_split_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_SDPA_SPLIT") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    sdpa_split_env_cached = v;
+    return v;
+}
+
+/// One engagement log per width (6..9): the first engagement is usually the
+/// warmup's own 8-token prefill (kL==qL==8) — a per-width line is what
+/// witnesses the split at REAL verify shapes in an A/B arm's log.
+var sdpa_split_logged: [4]bool = .{ false, false, false, false };
+
+/// Width-wall query split for dense causal spec-verify blocks (B==1, hd 256,
+/// q_len 6..9). MLX's sdpa has no full-kernel arm at hd 256 and its vector
+/// kernel serves q_len * gqa <= 32, so a 6..9-row verify block otherwise runs
+/// the slow internal fallback on every machine. Splitting the queries at row
+/// 5 keeps both halves on the vector path with windows byte-identical to two
+/// consecutive <= 5-row rounds at the same offsets (bottom-right causal
+/// alignment): chunk A (rows 0..<5) over keys[0 .. kL-(qL-5)], chunk B
+/// (rows 5..) over the full keys, both "causal". K/V are re-sliced views,
+/// never recomputed. Returns null outside the envelope — the caller falls
+/// through to the single sdpa call. Port of the Layr-Labs
+/// qwen-3.8-mtp-challenge width-wall split (see NOTICE).
+pub fn splitCausalSdpa(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    scale: f32,
+) !?mlx.mlx_array {
+    if (!sdpaSplitEnabled()) return null;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const vs = mlx.getShape(v);
+    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    if (qs[0] != 1 or ks[0] != 1 or vs[0] != 1) return null;
+    if (qs[2] < 6 or qs[2] > 9) return null;
+    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1]) return null;
+
+    const qL = qs[2];
+    const kL = ks[2];
+    const split: c_int = 5;
+    const k_split: c_int = kL - (qL - split);
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+
+    // Chunk A: rows 0..<5 vs keys[0 .. kL-(qL-5)] — row i's bottom-right
+    // causal window is exactly the one a width-5 round at this offset gets.
+    var q_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_a);
+    var k_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_a);
+    var v_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_a);
+    const zero4 = [_]c_int{ 0, 0, 0, 0 };
+    const qa_stop = [_]c_int{ 1, qs[1], split, 256 };
+    const ka_stop = [_]c_int{ 1, ks[1], k_split, 256 };
+    try mlx.check(mlx.mlx_slice(&q_a, q, &zero4, 4, &qa_stop, 4, &strides, 4, s));
+    try mlx.check(mlx.mlx_slice(&k_a, k, &zero4, 4, &ka_stop, 4, &strides, 4, s));
+    try mlx.check(mlx.mlx_slice(&v_a, v, &zero4, 4, &ka_stop, 4, &strides, 4, s));
+
+    // Chunk B: rows 5.. vs the full keys — the follow-up width-(qL-5) round.
+    var q_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_b);
+    const qb_start = [_]c_int{ 0, 0, split, 0 };
+    const qb_stop = [_]c_int{ 1, qs[1], qL, 256 };
+    try mlx.check(mlx.mlx_slice(&q_b, q, &qb_start, 4, &qb_stop, 4, &strides, 4, s));
+
+    const none_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none_mask);
+    var out_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_a);
+    var out_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_b);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_a, q_a, k_a, v_a, scale, "causal", none_mask, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_b, q_b, k, v, scale, "causal", none_mask, .{ .ctx = null }, s));
+
+    const parts = [_]mlx.mlx_array{ out_a, out_b };
+    const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+
+    const log_idx: usize = @intCast(qL - 6);
+    if (!sdpa_split_logged[log_idx]) {
+        sdpa_split_logged[log_idx] = true;
+        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1] });
+    }
+    return out;
+}
+
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 
@@ -8760,6 +9078,11 @@ pub const Transformer = struct {
                 if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
+                } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
+                    // Verify-width (6..9) dense blocks: two vector-path halves
+                    // beat MLX's internal hd-256 fallback.
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = split_out;
                 } else {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
                 }
@@ -11203,6 +11526,11 @@ pub const Transformer = struct {
             if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
+            } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
+                // Verify-width (6..9) dense blocks: two vector-path halves
+                // beat MLX's internal hd-256 fallback.
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = split_out;
             } else {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
             }
@@ -25562,42 +25890,155 @@ test "vqmmLaneFor: NAX dispatch table (M 8..16 route to the m16 tile only when t
 
     // Plain-SIMD machine (probe false): the table is byte-identical to the
     // pre-NAX dispatch — M 8..16 fall through to stock.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 151936, nax_off, 8));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(16, 5120, 17408, nax_off, 8));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 151936, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(16, 5120, 17408, nax_off, 8, false));
     // Geometry floors shared by every lane.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 256, nax_off, 8)); // N < 512
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 100, 17408, nax_off, 8)); // K % 64 != 0
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 17409, nax_off, 8)); // N % 4 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 256, nax_off, 8, false)); // N < 512
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 100, 17408, nax_off, 8, false)); // K % 64 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 17409, nax_off, 8, false)); // N % 4 != 0
 
     // M5 (probe true), default takeover width 8: M 2..7 KEEP the plain-SIMD
     // lanes (MTPLX's own dispatcher keeps SIMD through M=6 with NAX lit —
     // 16-row padding waste makes SIMD competitive at small M).
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_on, 8));
-    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(7, 5120, 151936, nax_on, 8));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(7, 5120, 151936, nax_on, 8, false));
     // M 8..16 route to the NAX tile when its stricter geometry holds…
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8));
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(16, 5120, 17408, nax_on, 8));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(16, 5120, 17408, nax_on, 8, false));
     // …including the lm_head class natively (N=151936 % 32 == 0 — no msg
     // variant needed past M=7).
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(9, 5120, 151936, nax_on, 8));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(9, 5120, 151936, nax_on, 8, false));
     // Tile-ineligible geometry at M 8..16 stays stock: K % 256, N % 32.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_on, 8)); // 5184 % 256 == 64
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_on, 8)); // 17412 % 32 == 4
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(17, 5120, 17408, nax_on, 8)); // past every lane
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8)); // M=1 stays qmv
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8)); // tiny-N floor holds for NAX too
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_on, 8, false)); // 5184 % 256 == 64
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_on, 8, false)); // 17412 % 32 == 4
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(17, 5120, 17408, nax_on, 8, false)); // past every lane
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8, false)); // M=1 stays qmv
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8, false)); // tiny-N floor holds for NAX too
 
     // The M5-day A/B knob (MLX_SERVE_VERIFY_QMM_NAX_MIN_M=5): M 5..7 route
     // to NAX, M 4 keeps split-K, and the tile geometry is still required —
     // a lowered width never bypasses it, it falls back to the SIMD lanes.
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5));
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5)); // K % 256 fails, % 64 holds
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5, false));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5, false)); // K % 256 fails, % 64 holds
+
+    // Crossrow (opt-in): M 8..9 on plain-SIMD machines at its own geometry
+    // (K % 512, N % 8, N >= 1024); NAX outranks it, 2..7 stays split-K, and
+    // with the opt-in off the M 8..16 fall-through is unchanged.
+    try testing.expectEqual(VqmmLane.crossrow, vqmmLaneFor(8, 5120, 17408, nax_off, 8, true));
+    try testing.expectEqual(VqmmLane.crossrow, vqmmLaneFor(9, 5120, 17408, nax_off, 8, true));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(10, 5120, 17408, nax_off, 8, true)); // past the pair tile
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_off, 8, true)); // K % 512 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_off, 8, true)); // N % 8 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 1016, nax_off, 8, true)); // their host gate: N >= 1024
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8, true)); // NAX outranks
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8, true));
+}
+
+test "verifyQmm: crossrow M 8/9 lane matches stock qmm (4-bit g64, opt-in)" {
+    // Same bar as the split-K/msg/NAX parity test: no worse than stock
+    // against the fp32 dequant ground truth (reduction order differs, so
+    // agreement-with-stock is not the bar — the verify-lane rule).
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC805);
+    const rnd = prng.random();
+
+    vqmm_crossrow_override = true;
+    defer vqmm_crossrow_override = null;
+    vqmm_nax_probe_override = false; // pin the plain-SIMD dispatch on an M5 too
+    defer vqmm_nax_probe_override = null;
+
+    const cases = [_]struct { k: c_int, n: c_int }{
+        .{ .k = 5120, .n = 2048 }, // trunk-projection class
+        .{ .k = 1536, .n = 17408 }, // MLP-width class, K = 3 x 512
+    };
+    for (cases) |cs| {
+        const wn: usize = @intCast(cs.n * cs.k);
+        const wbuf = try allocator.alloc(f32, wn);
+        defer allocator.free(wbuf);
+        for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+        const wshape = [_]c_int{ cs.n, cs.k };
+        const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        var wsc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wsc);
+        var wbi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wbi);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+        var wdq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wdq);
+        try mlx.check(mlx.mlx_dequantize(&wdq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .has_value = true, .value = .float32 }, s));
+        var wdq_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wdq_t);
+        const t_axes = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
+
+        // M=8 exercises the all-pairs path, M=9 the zeroed-tail single arm.
+        for ([_]c_int{ 8, 9 }) |m| {
+            const xn: usize = @intCast(m * cs.k);
+            const xbuf = try allocator.alloc(f32, xn);
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const xshape = [_]c_int{ 1, m, cs.k };
+            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+            const got = (try verifyQmm(s, x, wq, wsc, wbi, 4, 64)) orelse return error.CrossrowDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            const gsh = mlx.getShape(got);
+            try testing.expectEqual(@as(c_int, 1), gsh[0]);
+            try testing.expectEqual(m, gsh[1]);
+            try testing.expectEqual(cs.n, gsh[2]);
+            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, 64, wdq_t, got, "crossrow");
+        }
+
+        // gs 32 must not enter the 4/g64 specialization even with the
+        // opt-in on (falls to stock = null at these M).
+        {
+            var t32 = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(t32);
+            try mlx.check(mlx.mlx_quantize(&t32, wb, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+            var wq32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq32);
+            var ws32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ws32);
+            var wb32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb32);
+            try mlx.check(mlx.mlx_vector_array_get(&wq32, t32, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&ws32, t32, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wb32, t32, 2));
+            const xbuf = try allocator.alloc(f32, @intCast(8 * cs.k));
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = 0.1;
+            const xshape = [_]c_int{ 1, 8, cs.k };
+            const x32b = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x32b);
+            var x8 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x8);
+            try mlx.check(mlx.mlx_astype(&x8, x32b, .bfloat16, s));
+            try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x8, wq32, ws32, wb32, 4, 32));
+        }
+    }
 }
 
 test "mixedNaxShapeEnabled keeps measured q5/q6 wins and rejects narrow regressions" {
@@ -27923,6 +28364,116 @@ test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged
 
     const max_diff = try attn256MaxDiff(fused, ref, s);
     try std.testing.expect(max_diff < 0.005);
+}
+
+/// Like attn256MaxDiff but errors on any non-finite element on either side —
+/// NaN > max_err is false, so an all-NaN pair would otherwise diff to 0.
+fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b32, b, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const bd = mlx.mlx_array_data_float32(b32) orelse return error.InvalidDtype;
+    const n = mlx.mlx_array_size(a32);
+    if (n != mlx.mlx_array_size(b32)) return error.ShapeMismatch;
+    var max_diff: f32 = 0;
+    for (0..n) |i| {
+        if (!std.math.isFinite(ad[i]) or !std.math.isFinite(bd[i])) return error.NonFinite;
+        max_diff = @max(max_diff, @abs(ad[i] - bd[i]));
+    }
+    return max_diff;
+}
+
+test "splitCausalSdpa: parity vs single causal sdpa at every verify width (q 6..9)" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5D9A);
+    const rnd = prng.random();
+
+    // Qwen3.6-27B verify geometry: gqa 6 (24/4 scaled to 6/2 hd 256), long-ish
+    // KV so the chunk-A window (kL - (qL-5)) differs measurably from full kL.
+    const kL: c_int = 193;
+    var qL: c_int = 6;
+    while (qL <= 9) : (qL += 1) {
+        const q_shape = [_]c_int{ 1, 6, qL, 256 };
+        const kv_shape = [_]c_int{ 1, 2, kL, 256 };
+        const q = try attn256RandBf16(rnd, &q_shape, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try attn256RandBf16(rnd, &kv_shape, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &kv_shape, s);
+        defer _ = mlx.mlx_array_free(v);
+        const scale: f32 = 1.0 / 16.0;
+
+        const split = (try splitCausalSdpa(s, q, k, v, scale)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(split);
+        const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+        defer _ = mlx.mlx_array_free(ref);
+
+        // Tolerance, not byte-identity: the split changes which sdpa kernel
+        // runs and therefore the reduction order (the verify-lane rule).
+        const max_diff = try attn256FiniteMaxDiff(split, ref, s);
+        try std.testing.expect(max_diff < 0.005);
+    }
+}
+
+test "splitCausalSdpa: declines outside its envelope" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5DEC);
+    const rnd = prng.random();
+
+    const kv_shape = [_]c_int{ 1, 2, 64, 256 };
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+
+    // q_len 5 (vector path already serves it) and 10 (above the split window).
+    const q5_shape = [_]c_int{ 1, 6, 5, 256 };
+    const q5 = try attn256RandBf16(rnd, &q5_shape, s);
+    defer _ = mlx.mlx_array_free(q5);
+    try std.testing.expect((try splitCausalSdpa(s, q5, k, k, 1.0)) == null);
+    const q10_shape = [_]c_int{ 1, 6, 10, 256 };
+    const q10 = try attn256RandBf16(rnd, &q10_shape, s);
+    defer _ = mlx.mlx_array_free(q10);
+    try std.testing.expect((try splitCausalSdpa(s, q10, k, k, 1.0)) == null);
+
+    // Batch 2 -> null (their gate; the exactness argument is B==1 only).
+    const qb_shape = [_]c_int{ 2, 6, 7, 256 };
+    const qb = try attn256RandBf16(rnd, &qb_shape, s);
+    defer _ = mlx.mlx_array_free(qb);
+    const kb_shape = [_]c_int{ 2, 2, 64, 256 };
+    const kb = try attn256RandBf16(rnd, &kb_shape, s);
+    defer _ = mlx.mlx_array_free(kb);
+    try std.testing.expect((try splitCausalSdpa(s, qb, kb, kb, 1.0)) == null);
+
+    // head_dim 128 -> null (MLX's own full kernel already covers it).
+    const q128_shape = [_]c_int{ 1, 6, 7, 128 };
+    const q128 = try attn256RandBf16(rnd, &q128_shape, s);
+    defer _ = mlx.mlx_array_free(q128);
+    const k128_shape = [_]c_int{ 1, 2, 64, 128 };
+    const k128 = try attn256RandBf16(rnd, &k128_shape, s);
+    defer _ = mlx.mlx_array_free(k128);
+    try std.testing.expect((try splitCausalSdpa(s, q128, k128, k128, 1.0)) == null);
+
+    // KV shorter than q -> null (no window to split).
+    const kshort_shape = [_]c_int{ 1, 2, 5, 256 };
+    const kshort = try attn256RandBf16(rnd, &kshort_shape, s);
+    defer _ = mlx.mlx_array_free(kshort);
+    const q7_shape = [_]c_int{ 1, 6, 7, 256 };
+    const q7 = try attn256RandBf16(rnd, &q7_shape, s);
+    defer _ = mlx.mlx_array_free(q7);
+    try std.testing.expect((try splitCausalSdpa(s, q7, kshort, kshort, 1.0)) == null);
+
+    // Kill switch -> null even for a conforming call.
+    sdpa_split_override = false;
+    try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
 }
 
 // ── KV cache growth policy (issue #110) ──────────────────────────────────────

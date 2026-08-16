@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Speculative decoding got faster without KV quantization: verify steps 6-9 tokens wide at head-dim 256 ran MLX's slow attention fallback on every machine. They now split into two fast passes, +4-9% decode with PLD or a deep draft head on Qwen-class models.
+- Draft heads that ship in bf16 (MTPLX packs, the stock Qwen MTP release) are now quantized to 4-bit at load. The head only proposes tokens and verification corrects them, so output quality is decided by the main model either way: measured +10% decode at equal acceptance on Qwen3.8-27B.
+- The speculative depth planner was re-measured against the faster verify steps: it now drafts one position deeper on predictable content, +3% decode on Qwen-class models with the draft head.
+- Warm requests kept the fast prefill but lost the draft head: reusing a cached prefix left the head's history empty, so follow-up turns decoded at almost half speed (38 vs 72 tok/s measured). The history is now saved and restored with the prefix, so warm turns decode as fast as cold ones.
+
 ## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
 
 ### Highlights

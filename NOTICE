@@ -210,6 +210,37 @@ angles; the lm_head prune is gated on argmax-only requests and ships opt-in
 behind `MLX_SERVE_LMHEAD_PRUNE=1` after our own A/B measured it slower in the
 live graph than in a microbenchmark.
 
+--------------------------------------------------------------------------------
+qwen-3.8-mtp-challenge
+https://github.com/Layr-Labs/qwen-3.8-mtp-challenge
+Copyright (c) 2026 Layr Labs, Inc. and the challenge submitters
+
+Ideas and code derived from validated challenge submissions at commit b6ce964,
+ported in August 2026 (each item names the submission's co-author handle):
+
+  * The hd-256 causal sdpa query split for 6-9-row verify blocks
+    (`splitCausalSdpa` in `src/transformer.zig`), from
+    `Vendor/mlx-swift-lm/.../AttentionUtils.swift` at b6ce964 (a-github-name):
+    split the queries at row 5 so both halves ride MLX's sdpa vector path,
+    with bottom-right causal alignment keeping each half's key window exact.
+  * Requantizing a dense bf16 MTP draft head at load time, from the 4-bit/g64
+    head declared in `mtp-head.manifest.json` at deb63ad (noskillcoding) — an
+    idea rather than code: the draft head only proposes tokens, verification
+    corrects them, so its weights can be served narrow.
+  * The crossrow multi-row QMV kernel (`verifyQmmCrossrowSource` in
+    `src/transformer.zig`), from `qmv_fast_crossrow_affine4_g64` in their
+    vendored `quantized.h` as widened to M 2..9 at 08897af (hadakang): one
+    packed-weight read serves two input rows, with /16-power prescaled
+    activations against masked (unshifted) nibbles. Ships opt-in
+    (`MLX_SERVE_VERIFY_QMM_CROSSROW=1`) — measured slower than stock in our
+    stack, retained as an A/B lever.
+
+Modifications by mlx-serve: reimplemented in Zig against mlx-c; the query
+split is gated per shape and kill-switched (`MLX_SERVE_SDPA_SPLIT`), the
+head requantization uses our existing per-weight quantization path, and the
+crossrow kernel is emitted by comptime codegen with our own host dispatch
+(paired input groups instead of their idle-odd-threadgroup reuse).
+
 
 ================================================================================
 Other licenses

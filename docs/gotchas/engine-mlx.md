@@ -2449,3 +2449,164 @@ fallback is output-equivalent, so a dispatch hole is invisible to equality.
 gemma-4-e4b deliberately has NO verify-engagement assertion: its shapes are
 outside the adoption set, and asserting one would be a checkpoint
 expectation.
+
+## MLX's sdpa width wall at hd 256: split dense verify blocks at row 5 (2026-08-15)
+
+Port from Layr-Labs/qwen-3.8-mtp-challenge @ b6ce964 (submitter a-github-name;
+see NOTICE). MLX's `scaled_dot_product_attention` has no full-kernel arm at
+head_dim 256, and its vector kernel serves only `q_len * gqa <= 32` — at gqa 6
+(Qwen 24h/4kv) that is q_len <= 5. Our own fused hd-256 kernel floors at
+`FUSED256_MIN_Q_LEN = 16` (dispatching verify widths there measured decode
+48 -> 18 tok/s), so every DENSE causal block at q_len 6..15 ran MLX's slow
+internal fallback: exactly the spec-verify widths of MTP depth >= 5, PLD
+draft-len >= 5, and DFlash blocks.
+
+`splitCausalSdpa` (transformer.zig) covers q 6..9: split the queries at row 5,
+run chunk A (rows 0..<5) against `keys[0 .. kL-(qL-5)]` and chunk B (rows 5..)
+against the full keys, both `"causal"`, concat on the sequence axis. With
+bottom-right causal alignment the two windows are BYTE-IDENTICAL to two
+consecutive <= 5-row rounds at the same offsets, and each half rides the fused
+vector path. K/V are re-sliced views — the only extra cost is one more pass
+over the KV rows, never over weights. Wired in the dense "causal" arms of
+`forwardStandardWith` and `gatedFullAttnWith` after `fusedSdpa256Prefill`
+declines; the quantized fused arms (`qkvAttnVerifyKernel`) are untouched — this
+serves kv-quant-off and dense-mode reads. Kill switch `MLX_SERVE_SDPA_SPLIT=0`;
+one `[sdpa-split] engaged` log per width 6..9 (the FIRST engagement is the
+warmup's own 8-token prefill at kL=8 — a single one-shot log would witness only
+that, never a real verify, which is why the log is per-width).
+
+Measured (M4 Max, Qwen3.6-27B-oQ4e, kv-quant off, PLD draft-len 6 on an 8k echo
+prompt, A/B/B/A boots, medians of 7 reps): split ON 63.3 / 66.7 tok/s, OFF
+60.9 / 61.3 — +4..9%. Engagement asserted per arm (`qL=7 kL=7430` in both ON
+arms, no line in OFF arms). Parity test tolerance-based, red-verified by
+widening the chunk-A key window.
+
+Two null results from the same round, recorded so nobody re-chases them:
+
+- **Their warm-at-real-KV-length warmup does NOT transfer**: MLX picks sdpa
+  variants by KV length (1-pass vs 2-pass at ~1k), and their stack pays a
+  0.368 s one-off JIT on the first long-KV decode. Ours does not: fresh boot,
+  first 32-token decode at 7.4k KV measured 505 ms vs 494 ms warm (~11 ms,
+  within noise) — our self-built metallib is AOT, so the variant's pipeline
+  already exists. No warmup change shipped.
+- **`--mtp-depth` is a CAP, not a force**: the EV controller still plans
+  per-round depth under it, so "force depth 6" content that drafts shallow
+  (random-word echo measured avg 1.4 drafts/round at 72% per-draft) never
+  reaches verify widths 6..9. An attention-lane A/B wants PLD at a fixed
+  draft-len instead — deterministic width every round, ~100% hit on echo.
+
+## Dense bf16 MTP head trunks are requantized at load; spec byte-bars need a tie-aware acquittal (2026-08-15)
+
+Idea from Layr-Labs/qwen-3.8-mtp-challenge @ deb63ad (noskillcoding; see
+NOTICE): the MTP head only PROPOSES tokens — verify corrects everything — so
+its weights can be served narrow, and a dense bf16 head pays its full read
+every draft step. `mtp.loadTrunkLinear` requantizes dense bf16 head-trunk
+weights (q/k/v/o, gate/up/down incl. the MoE shared expert) to
+`MLX_SERVE_MTP_HEAD_QUANT_BITS` (default 4) at group 64 through the ONE shared
+`requantizeRows`; indivisible contraction dims skip per weight; fc stays bf16
+BY CONTRACT (the m5Nax cost-profile validator demands it), norms/routers/
+embeddings never quantize. Log: `[mtp] head trunk quantized: 7 weights
+bf16→4b/g64 (710→199 MB)`.
+
+Measured (M4 Max, scottlowry Qwen3.8-27B-oQ4e trunk + the challenge's pinned
+EigenLabs bf16 head as sidecar, cold echo reps, both boot orders): 72.5/71.9
+vs 65.6/65.6 tok/s — **+9.6..10.5%** at equal acceptance (per_draft 96.4% vs
+94.5%). The MTPLX-Optimized pack ships a dense bf16 head too, so this engages
+on real packs. NOTE: a warm prefix-cache hit leaves the MTP history EMPTY, so
+warm reps measured ~38 tok/s vs ~65-72 cold on BOTH arms — a cold-rep A/B
+(`--prefix-cache-entries 0`) is the only clean instrument here (and that
+warm-restore acceptance collapse is its own open observation, dflash got a
+`DflashSnap` for exactly this).
+
+The byte-prefix bars in `tests/test_mtp_equivalence.sh` then tripped — and
+attribution showed the MTPLX pack was red on them EVEN WITH the requant off:
+the first-100-char spec-vs-serial equality was resting on near-tie luck. At
+temp 0, verify (qmm) and serial (qmv) reduce in different orders, and WHICH
+positions verify at which width depends on draft content, so ANY draft-side
+change can move a flip into the compared window. Live probe: `' canvas'` vs
+`' blank'` at token 13 of the test's own prompt is an EXACT 0.0000 top-2 tie.
+The test now (a) boots its servers with `--prefix-cache-entries 0` (the
+hybrid byte-stability rule — the warm-restore recurrence drift was flipping
+ties on its own) and (b) on a byte mismatch replays the prompt serially
+(enable_mtp:false, same server) with logprobs and ACQUITS only when the
+serial top-2 gap at the first divergent character is <= 0.15 nats — a
+plumbing bug that commits an unverified token diverges at a confident
+position and still fails.
+
+## EV refit #4, the GDN rollback audit, and the crossrow M 8/9 lane (2026-08-15)
+
+Three follow-ups to the sdpa-split round, same session, same instrument
+(saturated forced-depth echo traces on the Jundot oQ4e 27B @8K cold reps,
+M4 Max — the method refit #3 established, plus `--prefix-cache-entries 0`
+so every window is saturated).
+
+**EV refit #4** (`MTP_EV_DEFAULT_COSTS`): T(1)=44.6, T(2)=51.0, T(3)=59.2,
+T(4)=68.2, T(6)=95.4, T(8)=142.3 ms → floor ≈ 38.2 ms; marginals k<=4 ≈
+0.20 floor units, k5-6 ≈ 0.36, k7-8 ≈ 0.62. flat_max moved 3 → 4 (the old
+hi over-priced k4 at 0.34 vs its measured 0.24 and under-drafted moderate
+content); per_pos_hi 0.24 → 0.26; the k>=7 register cliff rides the struct's
+generic third region (`nax_from=7, per_pos_nax=0.52` — only reachable when
+--mtp-depth forces past the generic cap of 6). Measured on adaptive echo:
+69.6/69.4 vs 67.6/67.4 tok/s (+2.9%), planning 3.83 accepts/round vs 3.4.
+The env override (`MLX_SERVE_MTP_EV_COSTS`) now ZEROES the third region —
+it used to inherit DEFAULT's, which would have silently priced a cliff into
+every hand-tuned override. The challenge tree's 0.95-capped optimism
+transfer was evaluated and not needed: echo plans m_lo 4 with extensions
+firing — no under-drafting for the tau valve to miss. G17 NAX tables
+predate the sdpa split; refit on an M5.
+
+**GDN rollback audit (closed, no port)**: the challenge's checkpoint/replay
+tape (d819641) exists to avoid eager per-row capture cost. Ours measured:
+`corr=0.00 ms`, `hist=0.05`, `commit<=0.54` at depths 6/8 (142 ms rounds),
+and the GDN µbench already showed the capture-carrying recurrence dispatch
+at <1 ms/round. Capture share <1% — nothing for lazy replay to reclaim.
+
+**Crossrow M 8/9 verify lane (implemented, measured NEGATIVE, ships
+opt-in-off)**: port of their `qmv_fast_crossrow_affine4_g64` (08897af,
+hadakang) as the fourth `vqmmLaneFor` arm — one packed-weight read serves
+TWO input rows, M 8..9, 4-bit g64 only, `MLX_SERVE_VERIFY_QMM_CROSSROW=1`.
+Parity pinned no-worse-than-stock vs the fp32 dequant truth (red-verified
+by nibble-mask mutation). Same-boot forced-depth-8 echo A/B on the M4 Max:
+47.5 vs 49.4 tok/s, T(8) 152 vs 142 ms — a 4% LOSS. Why it won in THEIR
+stack and loses in ours: their host dispatches M independent qmv-shaped
+threadgroup columns (ntg.x = M), so pairing rows halves weight reads;
+our M 8/9 fall to stock `mlx_quantized_matmul`, whose gemm tile already
+reads each weight once. The lane stays as an A/B lever for other machines;
+its adoption predicate admits no shape by default.
+
+## The MTP committed history now rides the prefix cache (MtpSnap, 2026-08-15)
+
+Follow-up to the warm-restore observation in the head-requant story above:
+FIXED, same session. The head's committed-history KV cache is built from
+trunk hiddens and a prefix-cache restore forwards NOTHING, so every warm hit
+started the history empty and drafts went blind — measured ~72 cold vs ~38
+tok/s warm on the 8k echo (acceptance 95.9% vs an aggregate 0.96
+accepts/round). Exactly the dflash class; it now uses the SAME `DflashSnap`
+machinery as a second Entry field (`Entry.mtp`, billed into `kv_bytes`,
+restored via the shared `restoreSpecSnap`).
+
+The two asymmetries vs dflash, both load-bearing:
+
+- **Commit trims the speculative tail first**: at rest the head cache holds
+  the last round's stale DRAFT entries past the committed boundary (and a
+  built cross-round pre-draft has appended NEXT-round drafts), while a
+  pending `mtp_hist_stash`'s entries are NOT in the cache at all.
+  `Generator.mtpCommittedLen` = min(cache.step, pre_draft.off0, stash.off0)
+  is the committable length; `commitSlotIfApplicable` truncates to it
+  (offset-only) before the snapshot. Snapshotting past it would restore
+  draft garbage as history.
+- **No exact-coverage requirement at commit, a STRICT one at restore**: a
+  history that ends short (deferred-stash lag, runtime disable) is still
+  worth committing — the restore clamps to the matched length and DECLINES
+  when `matched > base + step` (the missing tail's hiddens are
+  unrecoverable, and a gap right below the generation point is worse than a
+  blind start; the decline is mutation-pinned in the round-trip test). On
+  the qwen hybrids the SSM-checkpoint clamp keeps the effective match below
+  the history's coverage anyway, so warm hits adopt in practice.
+
+Measured (same warm-echo instrument as the head-requant round, bf16-head 3.8
+pack): warm reps 72.2 tok/s vs ~38 before, equal to cold, `[hot-cache] mtp
+history restored: 7391 tokens from base 0` per warm request. Adoption is
+belt-and-braces exact (`base + step == hot_matched` in the scheduler AND
+asserted at Generator init), and every failure path starts blind, never
+wrong.
