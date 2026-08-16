@@ -486,6 +486,23 @@ fn buildRootHandle(b: *std.Build) std.Io.Dir {
     return b.root.root_dir.handle;
 }
 
+/// Absolute path to `sub_path` under the build root, for baking into an
+/// LC_RPATH. `b.path(sub_path)` looks like it would do this, but when `zig
+/// build` is invoked with cwd == build root (the normal `zig build
+/// -Doptimize=ReleaseFast` from CONTRIBUTING.md), `b.build_root.path` is
+/// null ("means cwd") and `Directory.join` returns the bare relative
+/// string with nothing prefixed. That relative string is exactly what
+/// ends up in the linked binary's LC_RPATH — fine for the linker
+/// (build-time cwd is the build root), wrong for the binary, whose
+/// LC_RPATH is resolved against cwd at process launch, which can be
+/// anywhere. Resolve to an absolute path once here so the rpath keeps
+/// working regardless of where the binary is later run from.
+fn absBuildPath(b: *std.Build, sub_path: []const u8) []const u8 {
+    return buildRootHandle(b).realPathFileAlloc(b.graph.io, sub_path, b.allocator) catch |err| {
+        std.debug.panic("failed to resolve '{s}' under the build root: {t}", .{ sub_path, err });
+    };
+}
+
 /// The llama.cpp tag staged by scripts/fetch-llama.sh (it writes LLAMA_TAG to
 /// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
 /// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
@@ -513,7 +530,7 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // would otherwise hijack this link (pulling in /opt/homebrew's version + its
     // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
     module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
-    module.addRPath(b.path("lib/llama/lib"));
+    module.addRPath(.{ .cwd_relative = absBuildPath(b, "lib/llama/lib") });
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
     // C11 for pthread_once-based one-time backend init.
@@ -538,7 +555,7 @@ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
     // link — we want exactly the staged NAX-enabled pair (same class as the
     // llama.pc hijack above).
     module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
-    module.addRPath(b.path("lib/mlx/lib"));
+    module.addRPath(.{ .cwd_relative = absBuildPath(b, "lib/mlx/lib") });
 }
 
 /// Configure-time check that scripts/build-mlx.sh has staged the pinned
