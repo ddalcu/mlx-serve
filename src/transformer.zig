@@ -1341,10 +1341,10 @@ pub fn verifyQmm(
     group_size: u32,
 ) !?mlx.mlx_array {
     if (!verifyQmmEnabled()) return null;
-    // The plain-SIMD split-K/msg kernels below remain 4-bit specializations.
-    // The M5 NAX tile additionally handles the 5/6-bit affine projections in
-    // oQe checkpoints; those widths fall through to stock below the NAX
-    // takeover row instead of entering a 4-bit kernel.
+    // The plain-SIMD split-K/msg kernels carry byte-addressed 5/6/8-bit unpack,
+    // but mixed-width adoption remains restricted to measured width/shape
+    // combinations. The M5 NAX tile additionally handles eligible mixed-bit
+    // projections at and above its takeover row.
     if (bits != 4 and bits != 5 and bits != 6 and bits != 8) return null;
     if (group_size != 32 and group_size != 64 and group_size != 128) return null;
     if (sc.ctx == null or bi.ctx == null) return null;
@@ -25868,8 +25868,9 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
                 if (bits == 5) "nax oQe q5" else "nax oQe q6",
             );
 
-            // Below the NAX takeover row these bit widths stay on stock qmm;
-            // the existing split-K/msg kernels remain exact q4 specializations.
+            // Below the NAX takeover row, default adoption remains the measured
+            // width/shape surface: this q6/gs64/N=5120 projection uses the
+            // plain-SIMD lane, while q5 still falls through to stock.
             const x6buf = try allocator.alloc(f32, 6 * @as(usize, @intCast(k)));
             defer allocator.free(x6buf);
             for (x6buf) |*v| v.* = 0.1;
@@ -25879,7 +25880,15 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             var x6 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x6);
             try mlx.check(mlx.mlx_astype(&x6, x6f, .bfloat16, s));
-            try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x6, wq, wsc, wbi, bits, gs));
+            const got6_opt = try verifyQmm(s, x6, wq, wsc, wbi, bits, gs);
+            if (bits == 6) {
+                try testing.expect(got6_opt != null);
+                const got6 = got6_opt.?;
+                defer _ = mlx.mlx_array_free(got6);
+                try expectVerifyQmmNoWorseThanStock(s, x6, wq, wsc, wbi, bits, gs, wdq_t, got6, "plain-SIMD q6");
+            } else {
+                try testing.expectEqual(@as(?mlx.mlx_array, null), got6_opt);
+            }
         }
     }
 

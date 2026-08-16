@@ -5295,22 +5295,21 @@ pub const Generator = struct {
         .nax_from = 7,
         .per_pos_nax = 0.02,
     };
-    /// M5 Max/G17 uniform affine-4/gs-64 Qwen3.8-27B validation
-    /// (2026-08-16). Clean deterministic fixed-width runs held saturated
-    /// T(6)=63.0-63.9 and T(8)=61.6-64.3 ms/round; width 8 carried no
-    /// measurable marginal penalty once M=8/M=9 entered the NAX tile. Keep
-    /// the positive .025 composite marginal from the neighboring measured
-    /// oQ4e surface as a conservative noise allowance, but retain a distinct
-    /// profile because the resident trunk fingerprint is uniform q4 rather
-    /// than mixed q4/q5/q6.
+    /// M5 Max/G17 uniform affine-4/gs-64 Qwen3.8-27B refit (2026-08-16).
+    /// Temperature-gated, reversed two-pass saturated echo gave T(1)=
+    /// 33.61-33.91, T(3)=38.455-38.465, T(6)=56.555-57.000, and NAX T(8)=
+    /// 61.890-61.925 ms/round. NAX-off T(8)=88.535-88.610 while depth-6
+    /// on/off stayed within 0.8%, isolating the M>=8 lane. A 31.4 ms fitted
+    /// floor gives rounded composite marginals .075/.195/.08. The profile
+    /// stays distinct because this trunk is uniform q4, not mixed q4/q5/q6.
     pub const MTP_EV_G17_NAX_Q4_GS64_COSTS: MtpEvCosts = .{
         .draft = 0.02,
-        .per_pos_lo = 0.075,
-        .per_pos_hi = 0.20,
+        .per_pos_lo = 0.055,
+        .per_pos_hi = 0.175,
         .flat_max = 3,
         .sync = 0.01,
         .nax_from = 7,
-        .per_pos_nax = 0.005,
+        .per_pos_nax = 0.06,
     };
     /// M5 Max/G17 oQ4e mixed affine q4/q5/q6, gs64 refit (2026-07-23).
     /// Saturated deterministic echo, same-session fixed widths:
@@ -9748,16 +9747,19 @@ test "MTP_EV_G17_NAX_Q4_GS32_COSTS encodes calibrated composite marginals" {
     try testing.expectApproxEqAbs(@as(f32, 2.03), Generator.mtpEvRoundCost(costs, 8, false), 1e-5);
 }
 
-test "MTP_EV_G17_NAX_Q4_GS64_COSTS conservatively opens the measured NAX widths" {
+test "MTP_EV_G17_NAX_Q4_GS64_COSTS reproduces the calibrated M5 surface" {
     const costs = Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS;
-    try testing.expectApproxEqAbs(@as(f32, 0.095), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.22), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.025), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.075), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.195), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.08), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
+    const t1 = Generator.mtpEvRoundCost(costs, 1, false);
+    const t3 = Generator.mtpEvRoundCost(costs, 3, false);
     const t6 = Generator.mtpEvRoundCost(costs, 6, false);
     const t8 = Generator.mtpEvRoundCost(costs, 8, false);
-    try testing.expectApproxEqAbs(@as(f32, 1.945), t6, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.995), t8, 1e-5);
-    try testing.expect(t8 / t6 <= 1.03);
+    try testing.expectApproxEqAbs(@as(f32, 1.075), t1, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.225), t3, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.81), t6, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.97), t8, 1e-5);
 }
 
 test "MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS reproduces the measured M5 surface" {
@@ -9791,11 +9793,18 @@ test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
     }
 
     const cold = [_]f32{ 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 };
-    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS }) |costs| {
+    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS }) |costs| {
         const cold_plan = Generator.mtpEvPlanFor(&cold, 8, costs, 8);
         try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
         try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
     }
+    // Qwen3.8's measured depth-1 marginal is cheap enough that even this
+    // synthetic 20% first-draft case clears the exploration floor narrowly.
+    // The base stays at one and only one confidence-gated position is exposed.
+    const q38_cold = Generator.mtpEvPlanFor(&cold, 8, Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, 8);
+    try testing.expectEqual(@as(u32, 1), q38_cold.m_lo);
+    try testing.expectEqual(@as(u32, 2), q38_cold.m_hi);
+    try testing.expect(q38_cold.tau_ln < 0.0);
 }
 
 test "mtpEvPlanFor: mid-decay acceptance picks a shallow base and a confidence-gated extension" {
