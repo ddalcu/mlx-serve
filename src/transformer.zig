@@ -4285,6 +4285,40 @@ const MtpNaxProfileInputs = struct {
     min_m: c_int,
 };
 
+fn mtpNaxBf16EmbeddingMatchesFrom(
+    dtype: mlx.mlx_dtype,
+    shape: []const c_int,
+    scales_present: bool,
+    biases_present: bool,
+    hidden_size: u32,
+    vocab_size: u32,
+) bool {
+    if (dtype != .bfloat16 or scales_present or biases_present) return false;
+    if (hidden_size == 0 or vocab_size == 0 or
+        hidden_size > std.math.maxInt(c_int) or vocab_size > std.math.maxInt(c_int)) return false;
+    return shape.len == 2 and
+        shape[0] == @as(c_int, @intCast(vocab_size)) and
+        shape[1] == @as(c_int, @intCast(hidden_size));
+}
+
+fn mtpNaxBf16EmbeddingMatches(
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    hidden_size: u32,
+    vocab_size: u32,
+) bool {
+    if (w.ctx == null) return false;
+    return mtpNaxBf16EmbeddingMatchesFrom(
+        mlx.mlx_array_dtype(w),
+        mlx.getShape(w),
+        sc.ctx != null,
+        bi.ctx != null,
+        hidden_size,
+        vocab_size,
+    );
+}
+
 fn mtpNaxCalibratedModelFrom(config: *const ModelConfig, lm_head_n: c_int) bool {
     return std.mem.eql(u8, config.model_type, "qwen3_5_moe") and
         !config.isMoe() and
@@ -5686,9 +5720,10 @@ pub const Transformer = struct {
     // after the first touch.
     bits_cache: BitsCache = .{},
 
-    // True only for the exact measured Qwen3.6-27B architecture when its token
-    // embedding and every resident trunk projection are homogeneous
-    // affine-4/gs-64. Computed once at load; mixed checkpoints keep this false.
+    // True only for the exact measured dense 27B architecture when every
+    // resident trunk projection is homogeneous affine-4/gs-64. Embedding
+    // storage is gated separately by each sidecar cost profile: the older
+    // Qwen3.6 surfaces use q4/gs64, Qwen3.8's measured surface uses bf16.
     mtp_uniform_affine_trunk: bool = false,
     // Exact oQ4e mixed q4/q5/q6 layer-role fingerprint. Kept separate from
     // the homogeneous profile because its measured NAX cost surface differs.
@@ -6215,13 +6250,11 @@ pub const Transformer = struct {
             config.quant_bits == 4 and
             config.quant_group_size == 64 and
             config.quant_mode == .affine and
-            mtpNaxAffineProjectionMatches(&config, emb_w, emb_s_arr, emb_b_arr, config.hidden_size, config.vocab_size) and
             mtpNaxUniformAffineTrunkFrom(&config, moe_layers);
         const mtp_oqe_affine_trunk = mtpNaxCalibratedModelFrom(&config, profile_head_n) and
             config.quant_bits == 4 and
             config.quant_group_size == 64 and
             config.quant_mode == .affine and
-            mtpNaxAffineProjectionMatches(&config, emb_w, emb_s_arr, emb_b_arr, config.hidden_size, config.vocab_size) and
             mtpNaxOqeAffineTrunkFrom(&config, moe_layers);
 
         return .{
@@ -7515,14 +7548,40 @@ pub const Transformer = struct {
     /// Homogeneous q4/gs64 target profile used by the existing q4/q8-gs32
     /// MTP sidecar cost surfaces.
     pub fn mtpNaxProfileEnabled(self: *const Transformer) bool {
-        return self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+        return mtpNaxAffineProjectionMatches(
+            &self.config,
+            self.emb_w,
+            self.emb_s,
+            self.emb_b,
+            self.config.hidden_size,
+            self.config.vocab_size,
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+    }
+
+    /// Uniform q4/gs64 Qwen3.8 target with its measured dense-bf16 token
+    /// embedding. Kept separate because every draft reads this table.
+    pub fn mtpNaxQ4Gs64ProfileEnabled(self: *const Transformer) bool {
+        return mtpNaxBf16EmbeddingMatches(
+            self.emb_w,
+            self.emb_s,
+            self.emb_b,
+            self.config.hidden_size,
+            self.config.vocab_size,
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
     }
 
     /// Exact oQ4e mixed q4/q5/q6 target profile. The q5/q6 lane kill switch
     /// also revokes the cost profile so auto depth never assumes unavailable
     /// mixed-bit acceleration.
     pub fn mtpOqeNaxProfileEnabled(self: *const Transformer) bool {
-        return self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk, true);
+        return mtpNaxAffineProjectionMatches(
+            &self.config,
+            self.emb_w,
+            self.emb_s,
+            self.emb_b,
+            self.config.hidden_size,
+            self.config.vocab_size,
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk, true);
     }
 
     /// rmsNorm with an explicit epsilon — muse_glimmer's post-attention /
@@ -26159,6 +26218,18 @@ test "mtpNaxCalibratedModelFrom pins the complete measured dense Qwen3.6-27B arc
     bad = good;
     bad.num_experts = 8;
     try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+}
+
+test "mtpNaxBf16EmbeddingMatchesFrom pins the measured Qwen3.8 embedding surface" {
+    const shape = [_]c_int{ 248320, 5120 };
+    try testing.expect(mtpNaxBf16EmbeddingMatchesFrom(.bfloat16, &shape, false, false, 5120, 248320));
+    try testing.expect(!mtpNaxBf16EmbeddingMatchesFrom(.float16, &shape, false, false, 5120, 248320));
+    try testing.expect(!mtpNaxBf16EmbeddingMatchesFrom(.bfloat16, &shape, true, false, 5120, 248320));
+    try testing.expect(!mtpNaxBf16EmbeddingMatchesFrom(.bfloat16, &shape, false, true, 5120, 248320));
+    const wrong_vocab = [_]c_int{ 248319, 5120 };
+    try testing.expect(!mtpNaxBf16EmbeddingMatchesFrom(.bfloat16, &wrong_vocab, false, false, 5120, 248320));
+    const wrong_hidden = [_]c_int{ 248320, 4096 };
+    try testing.expect(!mtpNaxBf16EmbeddingMatchesFrom(.bfloat16, &wrong_hidden, false, false, 5120, 248320));
 }
 
 test "mtpNaxAffineProjectionMatches rejects mixed storage and off-profile quant geometry" {

@@ -3271,7 +3271,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
                     mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
-                    log.info("MTP head ready (depth={d}).\n", .{generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile)});
+                    log.info("MTP head ready (depth={d}, profile={s}).\n", .{
+                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
+                        @tagName(mtp_cost_profile),
+                    });
                 } else |bind_err| {
                     log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
                     h.deinit();

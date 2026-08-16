@@ -24,10 +24,12 @@
 #      tails legitimately diverge — same as PLD/drafter, see CLAUDE.md.)
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
-# Default model: ~/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve (any Qwen 3.5/3.6
-# dir with an MTP sidecar — mtp/weights.safetensors, mtp.safetensors,
-# model-mtp.safetensors, or optiq/mtp.safetensors — works). This list mirrors
-# mtp.sidecar_rel_paths; keep them in sync.
+# Default model: ~/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve. A standalone
+# sidecar (every mtp.sidecar_rel_paths location) or a sharded/monolithic
+# checkpoint carrying one of mtp_marker_keys works.
+# Calibrated auto-depth surfaces can additionally pin their live dispatch arm:
+#   MTP_EXPECT_AUTO_PROFILE=g17_nax_q4_gs64 MTP_EXPECT_AUTO_DEPTH=8 \
+#     MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh
 #
 # MoE trunks (35B-A3B) keep MTP default-OFF per request; set MTP_FORCE_ENABLE=1
 # to inject "enable_mtp":true into every request body so engagement +
@@ -43,14 +45,62 @@ BIN="./zig-out/bin/mlx-serve"
 PREFIX_CHARS="${PREFIX_CHARS:-100}"
 MAX_TOKENS=120
 PROMPT="Write a short story about a robot learning to paint."
+EXPECT_AUTO_PROFILE="${MTP_EXPECT_AUTO_PROFILE:-}"
+EXPECT_AUTO_DEPTH="${MTP_EXPECT_AUTO_DEPTH:-}"
+if { [ -n "$EXPECT_AUTO_PROFILE" ] && [ -z "$EXPECT_AUTO_DEPTH" ]; } ||
+    { [ -z "$EXPECT_AUTO_PROFILE" ] && [ -n "$EXPECT_AUTO_DEPTH" ]; }; then
+    echo "ERROR: MTP_EXPECT_AUTO_PROFILE and MTP_EXPECT_AUTO_DEPTH must be set together"
+    exit 2
+fi
 # Injected into every request body; empty by default (server defaults apply).
 OPTIN=""
 if [ "${MTP_FORCE_ENABLE:-0}" = "1" ]; then
     OPTIN='"enable_mtp":true,'
 fi
 
-if [ ! -d "$MODEL" ] || { [ ! -f "$MODEL/mtp/weights.safetensors" ] && [ ! -f "$MODEL/mtp.safetensors" ] && [ ! -f "$MODEL/model-mtp.safetensors" ] && [ ! -f "$MODEL/optiq/mtp.safetensors" ]; }; then
-    echo "SKIP: model with MTP sidecar not found at $MODEL"
+checkpoint_has_mtp_head() {
+    [ -f "$MODEL/mtp/weights.safetensors" ] ||
+        [ -f "$MODEL/mtp.safetensors" ] ||
+        [ -f "$MODEL/model-mtp.safetensors" ] ||
+        [ -f "$MODEL/optiq/mtp.safetensors" ] ||
+        python3 - "$MODEL" <<'PY'
+import json
+import pathlib
+import sys
+
+model = pathlib.Path(sys.argv[1])
+markers = {
+    "mtp.fc.weight",
+    "language_model.mtp.fc.weight",
+    "mtp.eh_proj.weight",
+    "language_model.mtp.eh_proj.weight",
+}
+
+try:
+    weight_map = json.loads((model / "model.safetensors.index.json").read_text()).get("weight_map", {})
+    if markers.intersection(weight_map):
+        raise SystemExit(0)
+except (OSError, ValueError, AttributeError):
+    pass
+
+try:
+    with (model / "model.safetensors").open("rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        if header_len > 64 * 1024 * 1024:
+            raise ValueError("oversized safetensors header")
+        header = json.loads(f.read(header_len))
+    raise SystemExit(0 if markers.intersection(header) else 1)
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(1)
+PY
+}
+
+if [ ! -d "$MODEL" ] || ! checkpoint_has_mtp_head; then
+    if [ -n "$EXPECT_AUTO_PROFILE" ]; then
+        echo "FAIL: required MTP checkpoint not detected at $MODEL"
+        exit 1
+    fi
+    echo "SKIP: model with MTP head not found at $MODEL"
     exit 0
 fi
 
@@ -202,6 +252,16 @@ if ! grep -q "MTP head ready" "$LOG"; then
 else
     echo "PASS [mtp auto-load]"; PASS=$((PASS+1))
 fi
+if [ -n "$EXPECT_AUTO_PROFILE" ]; then
+    EXPECT_READY="MTP head ready (depth=$EXPECT_AUTO_DEPTH, profile=$EXPECT_AUTO_PROFILE)."
+    if grep -Fq "$EXPECT_READY" "$LOG"; then
+        echo "PASS [auto profile fingerprint] ($EXPECT_AUTO_PROFILE, depth=$EXPECT_AUTO_DEPTH)"; PASS=$((PASS+1))
+    else
+        echo "FAIL [auto profile fingerprint]: expected '$EXPECT_READY'"
+        grep "MTP head ready" "$LOG" | tail -1
+        FAIL=$((FAIL+1))
+    fi
+fi
 ENGAGE_BASE=0
 chat_nonstream > /tmp/mtp_on_chat.txt
 check "chat non-stream" /tmp/mtp_base_chat.txt /tmp/mtp_on_chat.txt yes
@@ -245,6 +305,16 @@ if [ "${EXT:-0}" -gt 0 ]; then
 else
     echo "FAIL [EV chunk-B extension]: ext_rounds=${EXT:-none} on a max-confidence echo — extension path never fired"
     FAIL=$((FAIL+1))
+fi
+if [ -n "$EXPECT_AUTO_DEPTH" ]; then
+    AUTO_STATS=$(grep -o '\[spec-stats\] mode=mtp.*' "$LOG" | tail -1)
+    AUTO_DEPTH=$(echo "$AUTO_STATS" | grep -o ' depth=[0-9]*' | grep -o '[0-9]*')
+    if [ "${AUTO_DEPTH:-0}" = "$EXPECT_AUTO_DEPTH" ]; then
+        echo "PASS [auto depth realized on echo] (depth=$AUTO_DEPTH)"; PASS=$((PASS+1))
+    else
+        echo "FAIL [auto depth realized on echo]: depth=${AUTO_DEPTH:-none}, expected $EXPECT_AUTO_DEPTH"
+        FAIL=$((FAIL+1))
+    fi
 fi
 stop_server
 
