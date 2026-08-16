@@ -1449,13 +1449,14 @@ pub fn serve(
         // Count the thread before spawning so the shutdown drain can't miss a
         // thread that's about to start; the thread decrements on return.
         _ = active_conn_threads.fetchAdd(1, .acq_rel);
-        _ = std.Thread.spawn(.{}, handleConnectionThread, .{args}) catch |err| {
+        const conn_thread = std.Thread.spawn(.{}, handleConnectionThread, .{args}) catch |err| {
             log.err("spawn conn thread failed: {}\n", .{err});
             _ = active_conn_threads.fetchSub(1, .acq_rel);
             accepted_stream.close(io);
             allocator.destroy(args);
             continue;
         };
+        conn_thread.detach();
     }
 
     // Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): the accept
@@ -8283,6 +8284,42 @@ test "the route-existence 404 is answered BEFORE the model is resolved" {
     // Exactly one gate — a second copy in an error arm is a second answer to
     // a question that has one.
     try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
+}
+
+test "each connection thread handle is detached after spawn" {
+    // A finished pthread keeps its stack mapping and kernel bookkeeping until
+    // its handle is joined or detached. The server cannot join per-request
+    // threads individually, so dropping this handle leaks one stack region per
+    // request even though `handleConnectionThread` has returned.
+    const src = @embedFile("server.zig");
+    const spawn = "std.Thread.spawn(.{}, handleConnection" ++ "Thread, .{args})";
+    const spawn_at = std.mem.indexOf(u8, src, spawn) orelse return error.ConnectionSpawnMissing;
+    const accept_end = std.mem.indexOfPos(
+        u8,
+        src,
+        spawn_at,
+        "\n    }\n\n    // Shutdown ordering",
+    ) orelse return error.AcceptLoopEndMissing;
+    const detach = "conn_thread." ++ "detach();";
+    try std.testing.expect(std.mem.indexOf(u8, src[spawn_at..accept_end], detach) != null);
+
+    // Class guard: no spawn site anywhere may discard its joinable handle —
+    // that is the exact pre-fix shape, and a new worker elsewhere would
+    // otherwise re-ship the leak unguarded.
+    const sources = [_][]const u8{
+        src,
+        @embedFile("scheduler.zig"),
+        @embedFile("lan.zig"),
+        @embedFile("main.zig"),
+        @embedFile("metrics.zig"),
+        @embedFile("vz_agent.zig"),
+    };
+    const discard = "_ = " ++ "std.Thread.spawn";
+    const discard_try = "_ = try " ++ "std.Thread.spawn";
+    for (sources) |s| {
+        try std.testing.expect(std.mem.indexOf(u8, s, discard) == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, discard_try) == null);
+    }
 }
 
 test "continuationRejectReason names the embedded engine, and only it" {
