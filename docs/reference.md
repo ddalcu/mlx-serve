@@ -6,8 +6,9 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 
 | Path | Role |
 |------|------|
-| `main.zig` | Entry, CLI flags + subcommands (`run`/`pull`/`list`/`serve`) |
+| `main.zig` | Entry, CLI flags + subcommands (`run`/`pull`/`list`/`serve`/`launch`) |
 | `cli.zig` | Ollama-grade CLI: short-name alias table → HF repo, curl-based resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, and the `run` chat REPL (drives the server's own `/api/chat`) |
+| `launch.zig` | `mlx-serve launch <agent>` (issue #188): claude/pi/omp/opencode/codex/hermes/aider. Probes the server (auto-starts the MLX Core app via `open -g -a` when down, instructions when the app isn't installed), reads `/v1/models` for the chat-capable list + advertised context (budget = clamp(ctx/4, 1024, 65536), the Swift `AgentBudget` formula), writes configs into dedicated `~/.mlx-serve/<agent>/` dirs, execs through a login zsh (user PATH). `--print` = write configs + print the script; `--` passes args through (`launch codex -- resume`). Contracts (measured): omp reads `PI_CODING_AGENT_DIR` and its models.yml gets a STATIC chat list (discovery would pull media models in at omp's 128k default); codex is Responses-wire-only (`CODEX_HOME`, keyless skips login); hermes rides `HERMES_HOME` (config.yaml + the `.env` wizard kill switch); aider gets a litellm metadata file. Swift twin: `CLILauncher`/`AgentConfigs`. User doc: `docs/integrations.md` |
 | `mlx.zig` | mlx-c FFI |
 | `model.zig` | Config + safetensors loading |
 | `tokenizer.zig` | BPE tokenizer |
