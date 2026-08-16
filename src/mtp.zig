@@ -1590,18 +1590,11 @@ const FrontOut = struct {
 /// input_norm, q/k/v projections, q/gate split, per-head norms, transposes.
 /// Offset-free — the body the compiled front closure traces AND the
 /// uncompiled fallback.
-fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array) !FrontOut {
+/// The fusion stub shared by the full layer forward and the KV-only history
+/// append: x = fc(concat([norm(embed ids), norm(hidden)])). Returns owned x.
+fn fcConcat(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, seq_len: c_int) !mlx.mlx_array {
     const s = self.s;
-    const cfg = &target.config;
-    const h_count: c_int = @intCast(cfg.num_attention_heads);
-    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
-    const hd: c_int = @intCast(cfg.head_dim);
-    const eps = cfg.rms_norm_eps;
-    const h_shape = mlx.getShape(hidden);
-    const seq_len: c_int = h_shape[1];
-    const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
-
-    // fc(concat([norm(embed), norm(hidden)]))
+    const eps = target.config.rms_norm_eps;
     const emb = try embedTargetTokens(target, id_arr, seq_len, s);
     defer _ = mlx.mlx_array_free(emb);
     const e_normed = try rmsNormFn(emb, self.pre_fc_norm_emb, eps, s);
@@ -1618,15 +1611,29 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
         _ = mlx.mlx_vector_array_append_value(vec, h_normed);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
     }
-    var x = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(x);
     if (self.eh_proj) |*ep| {
         // Hy3: the concat projection is quantized (mtp.eh_proj, 8-bit).
-        _ = mlx.mlx_array_free(x);
-        x = try qLinearFwd(self, cat, ep);
-    } else {
-        try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
+        return qLinearFwd(self, cat, ep);
     }
+    var x = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
+    return x;
+}
+
+fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array) !FrontOut {
+    const s = self.s;
+    const cfg = &target.config;
+    const h_count: c_int = @intCast(cfg.num_attention_heads);
+    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const eps = cfg.rms_norm_eps;
+    const h_shape = mlx.getShape(hidden);
+    const seq_len: c_int = h_shape[1];
+    const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
+
+    const x = try fcConcat(self, target, id_arr, hidden, seq_len);
+    errdefer _ = mlx.mlx_array_free(x);
 
     // ── Decoder layer: full attention (Qwen: gated q; Hy3: plain q) ──
     const normed = try rmsNormFn(x, self.input_norm, eps, s);
@@ -1804,6 +1811,101 @@ pub fn forward(
 /// to the target's M-RoPE positions. Image-prompt positions use the explicit
 /// three-axis table. Once decoding moves past that table, generated text uses
 /// the scalar `absolute + delta` fast-RoPE path.
+pub var mtp_kv_only_override: ?bool = null; // test seam
+var mtp_kv_only_env: ?bool = null;
+
+/// KV-only history rows ship ON (mlxfast-challenge lastHiddenWithKVOnlyHistory
+/// class): a committed-history row's layer OUTPUT has no consumer — only its
+/// K/V entries matter — so the q(+gate) projection, the attention, and the
+/// whole post-attention half are dead work for every row but the last.
+/// MLX_SERVE_MTP_KV_ONLY=0 restores the full-forward history path.
+fn mtpKvOnlyEnabled() bool {
+    if (mtp_kv_only_override) |v| return v;
+    if (mtp_kv_only_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MTP_KV_ONLY");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    mtp_kv_only_env = enabled;
+    return enabled;
+}
+
+/// Append `hidden`/`id_arr` rows to the head's cache through the K/V-only
+/// path: fc fusion + input_norm + K/V projections + k_norm + rope + cache
+/// update. No query, no attention, no MLP — nothing downstream reads those
+/// rows' outputs. Byte parity with the full path is NOT the bar (a different
+/// GEMM M reorders reductions); the head only proposes, so the cost of any
+/// near-tie flip is acceptance, which the live equivalence script gates.
+fn appendKvOnly(
+    self: *const MtpModel,
+    target: *Transformer,
+    cache: *KVCache,
+    id_arr: mlx.mlx_array,
+    hidden: mlx.mlx_array,
+    rope_offset: c_int,
+    mrope_ctx: ?MropeContext,
+) !void {
+    const s = self.s;
+    const cfg = &target.config;
+    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const eps = cfg.rms_norm_eps;
+    const h_shape = mlx.getShape(hidden);
+    const seq_len: c_int = h_shape[1];
+    const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
+
+    const x = try fcConcat(self, target, id_arr, hidden, seq_len);
+    defer _ = mlx.mlx_array_free(x);
+    const normed = try rmsNormFn(x, self.input_norm, eps, s);
+    defer _ = mlx.mlx_array_free(normed);
+
+    const k_proj = try qLinearFwd(self, normed, &self.k);
+    defer _ = mlx.mlx_array_free(k_proj);
+    const v_proj = try qLinearFwd(self, normed, &self.v);
+    defer _ = mlx.mlx_array_free(v_proj);
+
+    const kv_shape = [_]c_int{ 1, seq_len, kv_h, hd };
+    var k_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_r);
+    var v_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_r);
+    try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
+    try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
+
+    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
+    defer _ = mlx.mlx_array_free(k_normed);
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    var k_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_t);
+    var v_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_t);
+    try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, s));
+    try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, s));
+
+    var k_rope = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_rope);
+    const relative_offset: usize = @intCast(rope_offset);
+    const needs_explicit_mrope = if (mrope_ctx) |positions|
+        positions.absolutePosition(relative_offset) < positions.total
+    else
+        false;
+    if (needs_explicit_mrope) {
+        const positions = mrope_ctx.?;
+        const cs = try target.buildMropeCosSin(positions, relative_offset, @intCast(seq_len));
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        _ = mlx.mlx_array_free(k_rope);
+        k_rope = try target.applyMrope(k_t, cs.cos, cs.sin, rope_dims);
+    } else {
+        const effective_offset: c_int = if (mrope_ctx) |positions|
+            @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
+        else
+            rope_offset;
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+    }
+
+    var kv_view = try cache.update(0, k_rope, v_t, s, 0);
+    kv_view.deinit();
+}
+
 pub fn forwardWithMrope(
     self: *const MtpModel,
     target: *Transformer,
@@ -1819,6 +1921,42 @@ pub fn forwardWithMrope(
     const hidden_size: c_int = @intCast(cfg.hidden_size);
     const h_shape = mlx.getShape(hidden);
     const seq_len: c_int = h_shape[1];
+
+    // Merged history+draft forward: only the LAST row's output has a consumer
+    // (the logits slice below already said so). Flush the leading rows
+    // through the K/V-only path, then run the full layer on the last row
+    // alone — it attends the whole cache, so the math it feeds the draft
+    // chain sees the same history.
+    if (want_logits and seq_len > 1 and mtpKvOnlyEnabled()) {
+        const strides1 = [_]c_int{1};
+        var ids_head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_head);
+        var ids_last = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_last);
+        {
+            const start0 = [_]c_int{0};
+            const stop0 = [_]c_int{seq_len - 1};
+            try mlx.check(mlx.mlx_slice(&ids_head, id_arr, &start0, 1, &stop0, 1, &strides1, 1, s));
+            const start1 = [_]c_int{seq_len - 1};
+            const stop1 = [_]c_int{seq_len};
+            try mlx.check(mlx.mlx_slice(&ids_last, id_arr, &start1, 1, &stop1, 1, &strides1, 1, s));
+        }
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var hid_head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hid_head);
+        var hid_last = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hid_last);
+        {
+            const start0 = [_]c_int{ 0, 0, 0 };
+            const stop0 = [_]c_int{ 1, seq_len - 1, hidden_size };
+            try mlx.check(mlx.mlx_slice(&hid_head, hidden, &start0, 3, &stop0, 3, &strides3, 3, s));
+            const start1 = [_]c_int{ 0, seq_len - 1, 0 };
+            const stop1 = [_]c_int{ 1, seq_len, hidden_size };
+            try mlx.check(mlx.mlx_slice(&hid_last, hidden, &start1, 3, &stop1, 3, &strides3, 3, s));
+        }
+        try appendKvOnly(self, target, cache, ids_head, hid_head, rope_offset, mrope_ctx);
+        return forwardWithMrope(self, target, cache, ids_last, hid_last, rope_offset + seq_len - 1, true, mrope_ctx);
+    }
     const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
     const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
 
@@ -1933,6 +2071,10 @@ pub fn appendHistoryWithMrope(
     const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(id_arr);
 
+    // Pure history: EVERY row's output is dead — K/V-only for all of them.
+    if (mtpKvOnlyEnabled()) {
+        return appendKvOnly(self, target, cache, id_arr, hidden, rope_offset, mrope_ctx);
+    }
     // KVCache.update advances `cache.step` (layer 0) by the batch length.
     var out = try forwardWithMrope(self, target, cache, id_arr, hidden, rope_offset, false, mrope_ctx);
     _ = mlx.mlx_array_free(out.hidden_next);
@@ -2626,6 +2768,11 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+    // Pin the KV-only history path ON regardless of the env, so the merged
+    // and appendHistory arms below exercise it; the last arm flips it OFF
+    // for the full-path cross-check.
+    mtp_kv_only_override = true;
+    defer mtp_kv_only_override = null;
 
     // ── synthetic DENSE sidecar (random bf16; zeros would make every rms-norm
     // output zero and the equivalence trivially true) ──
@@ -2838,6 +2985,39 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     try testing.expectEqual(cache_b.step, cache_c.step);
     try close(positioned.logits, merged.logits, 16, s);
     try close(positioned.hidden_next, merged.hidden_next, 8, s);
+
+    // ── KV-only vs FULL history path: the committed rows' layer outputs are
+    // dead, so the KV-only append must leave the same cache length and a
+    // last-row result within reduction-order tolerance of the full forward
+    // (a different GEMM M reorders reductions — byte parity is not the bar).
+    mtp_kv_only_override = false;
+    var cache_d = try m.makeCache(allocator);
+    defer cache_d.deinit();
+    const full = try forward(&m, &xfm, &cache_d, ids3_arr, hidden3, 0, true);
+    defer {
+        _ = mlx.mlx_array_free(full.logits);
+        _ = mlx.mlx_array_free(full.hidden_next);
+    }
+    try testing.expectEqual(cache_b.step, cache_d.step);
+    try close(full.logits, merged.logits, 16, s);
+    try close(full.hidden_next, merged.hidden_next, 8, s);
+
+    // Same cross-check through the mrope table (appendKvOnly's explicit-table
+    // branch vs the full path's).
+    var cache_e = try m.makeCache(allocator);
+    defer cache_e.deinit();
+    const full_pos = try forwardWithMrope(&m, &xfm, &cache_e, ids3_arr, hidden3, 0, true, .{
+        .pos = &sequential_pos,
+        .total = 2,
+        .delta = 0,
+    });
+    defer {
+        _ = mlx.mlx_array_free(full_pos.logits);
+        _ = mlx.mlx_array_free(full_pos.hidden_next);
+    }
+    try testing.expectEqual(cache_c.step, cache_e.step);
+    try close(full_pos.logits, positioned.logits, 16, s);
+    try close(full_pos.hidden_next, positioned.hidden_next, 8, s);
 }
 
 test "mtp: index.json shard sweep is marker-gated (in-checkpoint heads)" {

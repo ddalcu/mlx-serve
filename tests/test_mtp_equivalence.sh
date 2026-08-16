@@ -219,6 +219,17 @@ else
     echo "FAIL [acceptance floor]: best avg_per_round=${BEST_ACCEPT:-none} < 0.5 — head is drafting garbage"
     FAIL=$((FAIL+1))
 fi
+# Fused-kernel engagement (anti-silent-no-op, kv-quant class): every qwen
+# 3.5/3.6 checkpoint is hd 256 with GDN layers, so both fusions must fire on
+# the verify widths this server just ran. Output equality alone is blind to a
+# decline gate quietly routing everything back to the composed chain.
+for ENGAGE_LINE in "\[attn\] fused QK-norm+RoPE (hd-256) engaged" "\[gdn\] packed prework engaged"; do
+    if grep -q "$ENGAGE_LINE" "$LOG"; then
+        echo "PASS [engaged: $ENGAGE_LINE]"; PASS=$((PASS+1))
+    else
+        echo "FAIL [not engaged: $ENGAGE_LINE] — fused path silently declined"; FAIL=$((FAIL+1))
+    fi
+done
 # Per-request opt-out must fall back to regular decode.
 ENGAGE_PRE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
 curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
