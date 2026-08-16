@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### App
+
+- Assistant responses render inline and display LaTeX natively with SwaTex, including `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation environments. Incomplete or invalid streamed TeX stays readable as source, fenced code and user prompts remain literal, and copying inline math restores its original delimiters. SwaTex is MIT-licensed; its bundled KaTeX fonts retain the SIL Open Font License 1.1.
+- Speculative decoding got faster without KV quantization: verify steps 6-9 tokens wide at head-dim 256 ran MLX's slow attention fallback on every machine. They now split into two fast passes, +4-9% decode with PLD or a deep draft head on Qwen-class models.
+- Draft heads that ship in bf16 (MTPLX packs, the stock Qwen MTP release) are now quantized to 4-bit at load. The head only proposes tokens and verification corrects them, so output quality is decided by the main model either way: measured +10% decode at equal acceptance on Qwen3.8-27B.
+- The speculative depth planner was re-measured against the faster verify steps: it now drafts one position deeper on predictable content, +3% decode on Qwen-class models with the draft head.
+- Warm requests kept the fast prefill but lost the draft head: reusing a cached prefix left the head's history empty, so follow-up turns decoded at almost half speed (38 vs 72 tok/s measured). The history is now saved and restored with the prefix, so warm turns decode as fast as cold ones.
+
+## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
+
+### Highlights
+
+- **6-bit builds decode faster with speculation.** Our verify kernels only served 4-bit weights, so every 6-bit model fell back to stock kernels on M1-M4 Macs. They now serve 5, 6 and 8-bit too: 10-22% faster decode with the draft head on the Qwen 3.8 27B 6-bit build, same output.
+- **Memory checks are honest in both directions.** The admission guard was measured against real prefill peaks on five checkpoints and came up short on 5 of 8 shapes, worst 42% under, which is the difference between a clean "prompt too large" and the whole server dying in a Metal abort. Every measured peak is billed now, hybrids and MoE included, and image prompts are billed at the width they actually run.
+- **Downloads stopped looking like they restart.** Every progress bar drew the current file, so a four-shard model filled 0-100% four times. Bars now show the whole transfer, resumed bytes included.
+- **Switching models shows a spinner.** A hot switch to a big checkpoint used to sit for a minute under the old model's name and a green dot. The pill now names the model it is loading and spins until it answers.
+
+### Fixes
+
+- Speculative decoding with a quantized KV cache collapsed past 8k context: 28 tok/s where the dense read does 60, because spec verify steps read the packed cache through a chain of small quantized matmuls. Verify steps now have their own packed-read kernel on the shapes it was measured to win on, and fall back to a plain dense read everywhere else. Measured on Qwen3.6-27B and Qwen3.8-27B with the draft head on: 28 to 61 tok/s at 11k context, and at 32k the quantized cache now decodes within 2% of running with no KV quantization at all, at half the memory.
+- The same pass found the quantized-KV fused read was also losing on Gemma 4 without speculation: its full-attention shape fell to the slow composed chain on every token and its sliding windows sat exactly at the engagement floor, together a 1.45x decode loss at 11k. Both read dense now, 21 to 30 tok/s.
+- LFM2 and Nemotron-H were billed a KV cache for every layer when only their attention layers keep one, which charged LFM2 3.75x the real bytes and shrank its auto-context for nothing.
+- A model loaded while a bigger one was resident kept its narrowed prefill width forever, even after the big one was evicted. It re-resolves on the next load.
+- A model served out of the Hugging Face cache showed its commit hash in the model pill instead of its name.
+- Remote MCP servers can send auth headers now: a `headers` block on a `url` entry in mcp.json (an `Authorization` token, an API version) was silently ignored, so the server got an unauthenticated connect, and saving any MCP change deleted the block from the file. Headers now ride every request and survive edits, and unknown fields like `type` are kept too.
+- `--prefill-chunk` with a typo in the value silently became 8192 and turned the machine sizing off. A bad value now keeps the defaults.
+
 ## v26.8.7 — Qwen 3.8 27B, Ling 3.0, thinking that knows when to stop
 
 ### Highlights

@@ -14,17 +14,25 @@ final class CLILauncher: ObservableObject {
     /// Keep rescanning off the initial launch path until we actually have a result.
     @Published private(set) var hasScanned = false
 
-    private static let candidates: [LauncherCLI] = [
+    private nonisolated static let candidates: [LauncherCLI] = [
         .claudeCode,
         .pi,
+        .omp,
         .opencode,
+        .codex,
+        .hermes,
+        .aider,
     ]
+
+    /// Stable id list — pinned against the MAS instructions panel's tabs
+    /// (same CLIs, same order) by `CLISetupInstructionsTests`.
+    nonisolated static var candidateIds: [String] { candidates.map(\.id) }
 
     init() {
         Task { await refresh() }
     }
 
-    /// Re-scan PATH. Cheap — three `which` calls in a single shell invocation.
+    /// Re-scan PATH. Cheap — one `command -v` sweep in a single shell invocation.
     func refresh() async {
         // The App Store build cannot detect or launch other apps (App Review
         // 2.5.2) — it has no host shell to scan PATH with, either. Stay empty.
@@ -83,11 +91,20 @@ final class CLILauncher: ObservableObject {
         }
 
         var result: [LauncherCLI] = []
+        let home = NSHomeDirectory()
         for cli in candidates {
-            guard let path = resolvedByName[cli.binaryName],
-                  FileManager.default.isExecutableFile(atPath: path) else { continue }
+            var path = resolvedByName[cli.binaryName]
+            if path == nil || !FileManager.default.isExecutableFile(atPath: path!) {
+                // Not on PATH — a desktop app may bundle it (codex inside
+                // ChatGPT.app/Codex.app).
+                path = cli.fallbackPaths
+                    .map { $0.replacingOccurrences(of: "$HOME", with: home) }
+                    .first { FileManager.default.isExecutableFile(atPath: $0) }
+            }
+            guard let resolved = path,
+                  FileManager.default.isExecutableFile(atPath: resolved) else { continue }
             var updated = cli
-            updated.resolvedPath = path
+            updated.resolvedPath = resolved
             result.append(updated)
         }
         return result
@@ -121,7 +138,7 @@ final class CLILauncher: ObservableObject {
         // own (pi's live list rides the extension we write), so the numbers
         // baked here ARE the contexts they believe the models have. `entries`
         // is the full chat-capable registry — the in-agent /model switch list.
-        cli.prepareConfig?(baseURL, servedModelId, budget)
+        cli.prepareConfig?(baseURL, servedModelId, budget, entries)
 
         let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
         let script = cli.scriptBody(baseURL, servedModelId, cdLine, budget, entries)
@@ -144,8 +161,15 @@ struct LauncherCLI: Identifiable, Equatable {
     let useClaudeIcon: Bool
     /// Optional side-effect invoked before the terminal script runs (e.g. write
     /// pi's `models.json` into its dedicated `~/.mlx-serve/pi/` config dir).
+    /// `entries` = the chat-capable registry snapshot, for configs that bake
+    /// the full model list (aider's metadata file).
     let prepareConfig: (@Sendable (_ baseURL: String, _ servedModelId: String,
-                                  _ budget: AgentBudget.Budget) -> Void)?
+                                  _ budget: AgentBudget.Budget,
+                                  _ entries: [AgentModelEntry]) -> Void)?
+    /// Absolute paths probed when the binary is NOT on PATH — for CLIs a
+    /// desktop app bundles (codex inside ChatGPT.app/Codex.app). `~` is not
+    /// expanded here; entries may start with `$HOME`, expanded at probe time.
+    var fallbackPaths: [String] = []
     /// Shell body that sets env vars and execs the CLI. Does NOT include the
     /// shebang. `entries` = the chat-capable registry snapshot (opencode bakes
     /// it into its inline config; pi/Claude Code ignore it — pi's list is
@@ -191,7 +215,7 @@ extension LauncherCLI {
         // the user already configured. Same isolation move as OPENCODE_CONFIG,
         // and the same dir the MAS instructions panel tells the user to create
         // (CLISetupInstructionsTests pins the two against each other).
-        prepareConfig: { baseURL, model, budget in
+        prepareConfig: { baseURL, model, budget, _ in
             let dir = NSString(string: "~/.mlx-serve/pi").expandingTildeInPath
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
@@ -217,6 +241,122 @@ extension LauncherCLI {
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
             \(cdLine)
             pi --provider mlx --model \(model)
+            """
+        }
+    )
+
+    /// oh-my-pi (https://github.com/can1357/oh-my-pi) — pi fork with its own
+    /// config tree: models.yml (YAML) under the agent dir. Dedicated dir,
+    /// never the user's real ~/.omp/agent — the same non-clobber move as pi.
+    /// The dir env var is still pi's spelling (PI_CODING_AGENT_DIR; measured
+    /// on omp v17 — the OMP_ rename reached only its help text), so the
+    /// script exports both spellings.
+    static let omp = LauncherCLI(
+        id: "omp",
+        displayName: "oh-my-pi",
+        binaryName: "omp",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/omp").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.ompModelsYML(baseURL: baseURL, defaultModel: model, entries: entries)
+                .write(toFile: (dir as NSString).appendingPathComponent("models.yml"),
+                       atomically: true, encoding: .utf8)
+        },
+        scriptBody: { _, model, cdLine, _, _ in
+            """
+            export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+            export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+            \(cdLine)
+            omp --model mlx/\(model)
+            """
+        }
+    )
+
+    /// codex (https://github.com/openai/codex) — Responses-wire only; config
+    /// rides a dedicated CODEX_HOME (the dir must exist before codex runs).
+    /// The script resolves the binary itself (PATH, then the desktop app's
+    /// bundled CLI) so a ChatGPT.app-only install still launches.
+    static let codex = LauncherCLI(
+        id: "codex",
+        displayName: "Codex",
+        binaryName: "codex",
+        iconSystemName: "chevron.left.forwardslash.chevron.right",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, _ in
+            let dir = NSString(string: "~/.mlx-serve/codex").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.codexConfigTOML(baseURL: baseURL, model: model, budget: budget)
+                .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
+                       atomically: true, encoding: .utf8)
+        },
+        fallbackPaths: [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "$HOME/Applications/ChatGPT.app/Contents/Resources/codex",
+            "$HOME/Applications/Codex.app/Contents/Resources/codex",
+        ],
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            export CODEX_HOME="$HOME/.mlx-serve/codex"
+            \(AgentConfigs.codexBinResolver)
+            \(cdLine)
+            "$CODEX_BIN"
+            """
+        }
+    )
+
+    /// hermes (Nous Research) — whole config tree rides HERMES_HOME
+    /// (hermes_constants.py), so the sandbox's config.yaml + .env pair lands
+    /// in a dedicated host dir instead of the user's real ~/.hermes.
+    static let hermes = LauncherCLI(
+        id: "hermes",
+        displayName: "hermes",
+        binaryName: "hermes",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, _ in
+            let dir = NSString(string: "~/.mlx-serve/hermes").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: "mlx-serve",
+                                               model: model, budget: budget, entries: [])
+                .write(toFile: (dir as NSString).appendingPathComponent("config.yaml"),
+                       atomically: true, encoding: .utf8)
+            try? AgentConfigs.hermesEnvFile(baseURL: baseURL)
+                .write(toFile: (dir as NSString).appendingPathComponent(".env"),
+                       atomically: true, encoding: .utf8)
+        },
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            export HERMES_HOME="$HOME/.mlx-serve/hermes"
+            \(cdLine)
+            hermes
+            """
+        }
+    )
+
+    /// aider (https://aider.chat) — pure env vars plus a litellm metadata
+    /// file carrying the real per-model context windows.
+    static let aider = LauncherCLI(
+        id: "aider",
+        displayName: "aider",
+        binaryName: "aider",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/aider").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.aiderModelMetadataJSON(model: model, budget: budget, entries: entries)
+                .write(toFile: (dir as NSString).appendingPathComponent("model-metadata.json"),
+                       atomically: true, encoding: .utf8)
+        },
+        scriptBody: { baseURL, model, cdLine, _, _ in
+            """
+            export OPENAI_API_BASE='\(baseURL)/v1'
+            export OPENAI_API_KEY=mlx-serve
+            \(cdLine)
+            aider --model openai/\(model) --weak-model openai/\(model) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
             """
         }
     )

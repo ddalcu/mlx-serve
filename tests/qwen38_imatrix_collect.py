@@ -50,6 +50,16 @@ DEFAULT_SRC = "/Volumes/G Drive SSD/models-src/Qwen3.8-27B"
 SWEBENCH_GLOB = str(Path.home() / ".cache/huggingface/datasets/princeton-nlp___swe-bench_lite"
                     / "**/swe-bench_lite-*.arrow")
 
+# One rule, both sides: every tenth rendered document is HELD OUT. The imatrix is
+# fit on the calibration half, so a token-agreement number measured on the same
+# documents flatters the pack it is judging. `tests/qwen38_iq_battery.py` calls
+# `split_docs(..., holdout=True)` and gets exactly what this file never saw.
+HOLDOUT_EVERY = 10
+
+
+def split_docs(docs, holdout):
+    return [d for i, d in enumerate(docs) if (i % HOLDOUT_EVERY == 0) == holdout]
+
 
 # ============================================================
 # Source-name mapping
@@ -59,7 +69,7 @@ def source_weight_name(module_path: str) -> str:
     """mlx_lm module path -> the weight key in the SOURCE checkpoint.
 
     Exactly the inverse of `mlx_lm.models.qwen3_5.Model.sanitize`, which is also
-    what `tests/qwen38_iq_convert.py`'s `rename()` reproduces forwards. Keying
+    what `tests/convert_qwen38_iq.py`'s `rename()` reproduces forwards. Keying
     the file by source names keeps it a description of the CHECKPOINT rather
     than of our converter's naming choices."""
     key = module_path + ".weight"
@@ -271,6 +281,8 @@ def main():
     ap.add_argument("--head-rows", type=int, default=64,
                     help="positions per forward projected through lm_head")
     ap.add_argument("--seed", type=int, default=20260814)
+    ap.add_argument("--holdout", action="store_true",
+                    help="collect on the HELD-OUT half instead (diagnostic only)")
     args = ap.parse_args()
 
     from mlx_lm.utils import load
@@ -304,12 +316,12 @@ def main():
 
     # Roughly equal token shares; document counts are generous and the token
     # budget is what actually stops each slice.
-    slices = {
-        "agent": slice_agent(tok, rng, traffic, sweb, 400),
-        "code": slice_code(tok, rng, sweb, 400),
-        "prose": slice_prose(tok, rng, sweb, 400),
-        "math": slice_math(tok, rng, 200),
-    }
+    slices = {name: split_docs(docs, args.holdout) for name, docs in (
+        ("agent", slice_agent(tok, rng, traffic, sweb, 400)),
+        ("code", slice_code(tok, rng, sweb, 400)),
+        ("prose", slice_prose(tok, rng, sweb, 400)),
+        ("math", slice_math(tok, rng, 200)),
+    )}
     per_slice_budget = args.max_tokens // len(slices)
 
     composition, total = {}, 0
@@ -365,6 +377,7 @@ def main():
         "values": "mean-squared activation per INPUT channel (sum(x^2)/rows)",
         "keys": "SOURCE checkpoint weight names",
         "note": "math slice is generated, not sampled from a dataset",
+        "holdout": "calibrated on split_docs(holdout=False); every 10th document withheld",
     }
     out = Path(os.path.expanduser(args.out))
     out.parent.mkdir(parents=True, exist_ok=True)

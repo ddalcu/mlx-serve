@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI Music Generation on Mac — Local Text-to-Music, No Cloud · mlx-serve</title>
-  <meta name="description" content="Generate original music on your Apple Silicon Mac: describe a style, optionally add lyrics, and ACE-Step 1.5 XL Turbo composes 48 kHz stereo tracks in 8 diffusion steps — entirely on-device. 10 seconds to 10 minutes, BPM/key/time-signature steerable, instrumental or vocal.">
-  <meta name="keywords" content="AI music generation Mac, local text to music, ACE-Step Mac, generate music offline, AI song generator local, music generation Apple Silicon, on-device music AI, suno alternative local">
+  <meta name="description" content="Generate original music on your Apple Silicon Mac: describe a style, optionally add lyrics, and ACE-Step 1.5 XL Turbo composes 48 kHz stereo tracks in 8 diffusion steps — entirely on-device. MiniMax Music 3 sings full songs from your lyrics, up to six minutes. BPM/key/time-signature steerable, instrumental or vocal.">
+  <meta name="keywords" content="AI music generation Mac, local text to music, ACE-Step Mac, MiniMax Music 3 Mac, generate music offline, AI song generator local, music generation Apple Silicon, on-device music AI, suno alternative local">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://mlxserve.com/music-generation/">
   <meta property="og:type" content="website">
@@ -36,7 +36,7 @@
       {
         "@type": "Question",
         "name": "Can I generate music locally on a Mac?",
-        "acceptedAnswer": { "@type": "Answer", "text": "Yes. mlx-serve runs ACE-Step 1.5 XL Turbo natively on Apple Silicon: describe a style, optionally add lyrics, and it composes original 48 kHz stereo music in 8 diffusion steps — entirely on-device. The model is a ~6.3 GB download and runs comfortably in about 9 GB of memory." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes, two ways. ACE-Step 1.5 XL Turbo composes original 48 kHz stereo music in 8 diffusion steps (a ~6.3 GB download, about 9 GB of memory). MiniMax Music 3 sings full songs from your lyrics for up to six minutes at 44.1 kHz (13.6 GB download, about 20 GB of memory). Both run natively on Apple Silicon, entirely on-device." }
       },
       {
         "@type": "Question",
@@ -91,7 +91,7 @@
     <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
     <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Deep dive · Music generation</span></div>
     <h1>Type a vibe.<br><span class="grad">Get a song.</span></h1>
-    <p class="hero-f-sub">"Upbeat synthwave with driving bass" — and ACE-Step 1.5 XL Turbo composes an <b>original 48 kHz stereo track</b> in 8 diffusion steps, entirely on your Mac. Paste lyrics and it sings them; leave them out for an instrumental. No cloud, no subscription, <b>no usage caps</b>.</p>
+    <p class="hero-f-sub">"Upbeat synthwave with driving bass" — and ACE-Step 1.5 XL Turbo composes an <b>original 48 kHz stereo track</b> in 8 diffusion steps, entirely on your Mac. Paste lyrics and it sings them; leave them out for an instrumental. No cloud, no subscription, <b>no usage caps</b>. And when the voice is the point, <b>MiniMax Music 3</b> sings your lyrics for up to six minutes.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -137,6 +137,23 @@
         </ul>
       </div>
     </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">MiniMax Music 3</span>
+        <h3>When the voice is the point</h3>
+        <p>MiniMax Music 3 writes full songs: an 8B language model composes the track frame by frame from your style caption and lyrics, then a diffusion decoder renders it at 44.1 kHz. It is the strongest vocal model in the lineup, with songs up to six minutes. Lyrics are required, and structure tags like <code>[verse]</code> and <code>[chorus]</code> go on their own lines; tempo, key and meter live in the caption rather than in controls.</p>
+        <p>Ask the chat for a song and the bundled <b>music3</b> skill writes the three-block caption format the model was trained on, plus original lyrics, instead of a one-liner. ACE-Step stays the fast option at 8 steps.</p>
+      </div>
+      <div class="split-visual reveal">
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Sings your lyrics</b> — the strongest vocals shipped here.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Songs up to 6 minutes</b> at 44.1 kHz.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>13.6 GB download</b>, about 20 GB of memory to run.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>music3 chat skill</b> writes the trained caption format for you.</span></li>
+        </ul>
+      </div>
+    </div>
   </section>
 
   <section class="section section-alt">
@@ -148,7 +165,7 @@
       <div class="mini-card reveal">
         <span class="mini-k">API</span>
         <h4>One endpoint for developers</h4>
-        <p><code>POST /v1/audio/music-generations</code> with a prompt, optional lyrics, duration, and musical steering — get a 48 kHz stereo WAV back, with per-step SSE progress. <a class="prose-link" href="../api/">Full API docs</a>.</p>
+        <p><code>POST /v1/audio/music-generations</code> with a prompt, optional lyrics, duration, and musical steering — get a stereo WAV back, with per-step SSE progress. MiniMax Music 3 uses the same endpoint; there <code>lyrics</code> is required. <a class="prose-link" href="../api/">Full API docs</a>.</p>
       </div>
       <div class="mini-card reveal">
         <span class="mini-k">Video</span>
@@ -185,6 +202,10 @@
       <details class="faq-item">
         <summary>How much control do I get over the music itself?</summary>
         <p>Style, mood, and instrumentation come from the prompt; BPM (30–300), key/scale, and time signature can be pinned exactly or left to the model. Track length runs from 10 seconds to 10 minutes, and a seed makes any generation repeatable.</p>
+      </details>
+      <details class="faq-item">
+        <summary>ACE-Step or MiniMax Music 3: which do I pick?</summary>
+        <p>ACE-Step is the fast one: 8 diffusion steps, instrumental or vocal, BPM/key/meter pinnable, ~6.3 GB. MiniMax Music 3 is the vocal one: it composes frame by frame and sings your lyrics for up to six minutes, at 13.6 GB down and about 20 GB of memory. Lyrics are required on Music 3, and the tempo/key controls don't exist there; put those facts in the caption instead.</p>
       </details>
       <details class="faq-item">
         <summary>Who owns the output?</summary>

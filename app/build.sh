@@ -95,13 +95,10 @@ fi
 
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
-# `-Xswiftc -swift-version -Xswiftc 5` forces Swift 5 language mode globally
-# across the build graph. The `swift-sdk` 0.10.x pin (kept for Swift 6.1 / macos-14
-# CI compat) declares `swift-tools-version:6.1`; under Swift 6.3 (current Xcode 26)
-# its NetworkTransport.swift hits `[#SendingRisksDataRace]` errors that didn't
-# exist in 6.1. Swift 5 mode downgrades those to warnings. Until the swift-sdk
-# pin can move past 0.11 (or CI moves to a Swift 6.3 runner), this flag keeps
-# the build green on both old and new toolchains.
+# SwiftPM owns each target's language mode. MLXCore's 5.9 manifest keeps the app
+# in Swift 5 mode, while modern dependencies (swift-sdk 0.12.x, SwaTex 0.5.x)
+# compile in the mode their own manifests declare. A global `-swift-version 5`
+# override reaches the whole graph and makes SwaTex's Swift 6.1 source invalid.
 #
 # The configuration is the single biggest lever in this script: `-c release`
 # turns on Whole Module Optimization, so touching one file recompiles the whole
@@ -114,11 +111,17 @@ if [ "$FAST_DEV" = "1" ]; then
 else
     SWIFT_CONFIG=release
 fi
-SWIFT_BUILD_FLAGS=(-c "$SWIFT_CONFIG" -Xswiftc -swift-version -Xswiftc 5 ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[@]}"})
+SWIFT_BUILD_FLAGS=(-c "$SWIFT_CONFIG" ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[@]}"})
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
-SWIFT_BIN="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)/MLXCore"
+SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
+SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"
+SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_DIR/SwaTex_SwaTexRender.bundle"
 if [ ! -f "$SWIFT_BIN" ]; then
     echo "ERROR: Swift build failed"
+    exit 1
+fi
+if [ ! -d "$SWATEX_RESOURCE_BUNDLE" ]; then
+    echo "ERROR: SwaTex font resource bundle missing"
     exit 1
 fi
 echo "  Swift binary: $(du -h "$SWIFT_BIN" | cut -f1)"
@@ -217,6 +220,10 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
+
+# SwiftPM does not embed resource bundles when we assemble the .app by hand.
+# SwaTex loads its KaTeX fonts from this bundle at runtime.
+cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"
 
 # License + third-party attributions. The bundled mlx-serve binary links
 # Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, jinja.cpp) whose section 4

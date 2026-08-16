@@ -46,6 +46,22 @@ enum CLISetupInstructions {
                 export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
                 pi --provider mlx --model \(servedModelId)
                 """),
+            // omp (oh-my-pi) — pi fork, own config tree: models.yml under the
+            // agent dir. The env read is still pi's PI_CODING_AGENT_DIR
+            // spelling (measured on omp v17); OMP_ exported too for when the
+            // rename completes. Same isolation move as pi.
+            Tab(id: "omp",
+                title: "oh-my-pi",
+                installHint: "Requires the omp CLI: curl -fsSL https://omp.sh/install | sh",
+                command: """
+                mkdir -p ~/.mlx-serve/omp
+                cat > ~/.mlx-serve/omp/models.yml <<'EOF'
+                \(AgentConfigs.ompModelsYML(baseURL: baseURL, model: servedModelId, budget: budget))
+                EOF
+                export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+                export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+                omp --model mlx/\(servedModelId)
+                """),
             // opencode needs no file at all: OPENCODE_CONFIG_CONTENT carries
             // the config inline and MERGES over the user's global/project
             // config, so their own settings and plugins keep working.
@@ -55,6 +71,53 @@ enum CLISetupInstructions {
                 command: """
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget))'
                 opencode --model mlx/\(servedModelId)
+                """),
+            // codex honors CODEX_HOME for its whole config tree; the dir must
+            // exist before codex runs. Responses wire API — our /v1/responses.
+            // The resolver line also finds the CLI the ChatGPT/Codex desktop
+            // app bundles, for installs with no codex on PATH.
+            Tab(id: "codex",
+                title: "Codex",
+                installHint: "Requires the codex CLI (npm install -g @openai/codex) or the ChatGPT desktop app, which bundles it",
+                command: """
+                mkdir -p ~/.mlx-serve/codex
+                cat > ~/.mlx-serve/codex/config.toml <<'EOF'
+                \(AgentConfigs.codexConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget))
+                EOF
+                export CODEX_HOME="$HOME/.mlx-serve/codex"
+                \(AgentConfigs.codexBinResolver)
+                "$CODEX_BIN"
+                """),
+            // hermes reads its whole tree from HERMES_HOME; the .env is the
+            // first-run wizard kill switch (OPENAI_BASE_URL set = configured).
+            Tab(id: "hermes",
+                title: "hermes",
+                installHint: "Requires the hermes CLI: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+                command: """
+                mkdir -p ~/.mlx-serve/hermes
+                cat > ~/.mlx-serve/hermes/config.yaml <<'EOF'
+                \(AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: "mlx-serve",
+                                                model: servedModelId, budget: budget, entries: []))
+                EOF
+                cat > ~/.mlx-serve/hermes/.env <<'ENVEOF'
+                \(AgentConfigs.hermesEnvFile(baseURL: baseURL))
+                ENVEOF
+                export HERMES_HOME="$HOME/.mlx-serve/hermes"
+                hermes
+                """),
+            // aider is pure env vars plus a litellm metadata file that tells
+            // it the real context window for openai/<id>.
+            Tab(id: "aider",
+                title: "aider",
+                installHint: "Requires the aider CLI: curl -LsSf https://aider.chat/install.sh | sh",
+                command: """
+                mkdir -p ~/.mlx-serve/aider
+                cat > ~/.mlx-serve/aider/model-metadata.json <<'EOF'
+                \(AgentConfigs.aiderModelMetadataJSON(model: servedModelId, budget: budget, entries: []))
+                EOF
+                export OPENAI_API_BASE='\(baseURL)/v1'
+                export OPENAI_API_KEY=mlx-serve
+                aider --model openai/\(servedModelId) --weak-model openai/\(servedModelId) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
                 """),
         ]
     }
@@ -88,7 +151,7 @@ struct CLISetupInstructionsButton: View {
         }
         .buttonStyle(.bordered)
         .disabled(!isEnabled)
-        .help("Connect a coding agent CLI (Claude Code, pi, OpenCode) to this server — shows the terminal commands to run")
+        .help("Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider) to this server — shows the terminal commands to run")
         .popover(isPresented: $showPanel, arrowEdge: .bottom) {
             CLISetupInstructionsView(
                 tabs: CLISetupInstructions.tabs(
@@ -120,12 +183,14 @@ struct CLISetupInstructionsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            // Menu picker — seven CLIs no longer fit a segmented control in
+            // this popover's width.
             Picker("", selection: $selectedId) {
                 ForEach(tabs) { tab in
                     Text(tab.title).tag(tab.id)
                 }
             }
-            .pickerStyle(.segmented)
+            .pickerStyle(.menu)
             .labelsHidden()
 
             if let tab = selected {

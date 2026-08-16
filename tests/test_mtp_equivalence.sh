@@ -61,8 +61,12 @@ LOG=/tmp/mtp_equiv_server.log
 start_server() { # $1 = extra flags
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
     sleep 1
+    # --prefix-cache-entries 0: byte-stable greedy on a HYBRID needs the
+    # prefix cache off (CLAUDE.md) — a warm restore re-runs the recurrence in
+    # a different block size and legitimately flips near-tie argmaxes inside
+    # the byte-compared prefix (the char-~116 drift noted above was this).
     # shellcheck disable=SC2086
-    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --log-level info $1 >"$LOG" 2>&1 &
+    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --prefix-cache-entries 0 --log-level info $1 >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
         curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
@@ -107,6 +111,46 @@ messages_nonstream() {
         python3 -c "import json,sys; print(''.join(b.get('text','') for b in json.load(sys.stdin)['content']), end='')"
 }
 
+# On a byte mismatch, decide TIE vs BUG: replay the prompt serially
+# (enable_mtp:false, adds no mode=mtp lines) on the SAME server with logprobs
+# and read the serial top-2 gap at the first divergent character. Verify
+# forwards (qmm) and serial decode (qmv) reduce in different orders, so a
+# near-tied argmax legitimately lands on either candidate — and WHICH
+# positions get verified at which width depends on draft content, so any
+# draft-side change can move the flip. A spec plumbing bug (committing a
+# token verify never approved) diverges at a CONFIDENT position and still
+# fails here. Observed live: an EXACT 0.0000 top-2 tie at token 13 of this
+# very prompt on Qwen3.8-27B.
+tie_gap_at_divergence() { # $1 expected-file, $2 actual-file → prints gap or "none"
+    python3 - "$1" "$2" "$PORT" "$MAX_TOKENS" "$PROMPT" <<'PYEOF'
+import json, sys, urllib.request
+expf, actf, port, max_tokens, prompt = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+exp = open(expf).read()
+act = open(actf).read()
+n = min(len(exp), len(act))
+i = next((k for k in range(n) if exp[k] != act[k]), n)
+body = {"model": "default", "stream": False, "temperature": 0, "max_tokens": max_tokens,
+        "enable_mtp": False, "logprobs": True, "top_logprobs": 2,
+        "messages": [{"role": "user", "content": prompt}]}
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+resp = json.load(urllib.request.urlopen(req, timeout=600))
+entries = (resp["choices"][0].get("logprobs") or {}).get("content") or []
+pos = 0
+for e in entries:
+    tok = e.get("token") or ""
+    if pos + len(tok) > i:
+        tops = e.get("top_logprobs") or []
+        if len(tops) >= 2:
+            print(f"{abs(tops[0]['logprob'] - tops[1]['logprob']):.4f}")
+        else:
+            print("none")
+        sys.exit(0)
+    pos += len(tok)
+print("none")
+PYEOF
+}
+
 check() { # $1 name, $2 expected-prefix-file, $3 actual-file, $4 expected new mtp engagements (log delta)
     local name="$1" expf="$2" actf="$3" want_engage="$4"
     local exp act
@@ -125,7 +169,13 @@ check() { # $1 name, $2 expected-prefix-file, $3 actual-file, $4 expected new mt
         ENGAGE_BASE=$stats
     fi
     if [ "$exp" != "$act" ]; then
-        echo "FAIL [$name]: first $PREFIX_CHARS chars differ from no-mtp baseline"
+        local gap
+        gap=$(tie_gap_at_divergence "$expf" "$actf")
+        if python3 -c "import sys; g='$gap'; sys.exit(0 if g not in ('', 'none') and float(g) <= 0.15 else 1)"; then
+            echo "PASS [$name] (spec/serial argmax flip at a near-tie, top-2 gap=$gap)"
+            PASS=$((PASS+1)); return
+        fi
+        echo "FAIL [$name]: first $PREFIX_CHARS chars differ from no-mtp baseline (top-2 gap at divergence: ${gap:-unreadable} — NOT a near-tie)"
         echo "  expected: $(echo "$exp" | head -c 80)..."
         echo "  actual:   $(echo "$act" | head -c 80)..."
         FAIL=$((FAIL+1)); return

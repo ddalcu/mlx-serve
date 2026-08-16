@@ -4,19 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Speculative Decoding on Apple Silicon — PLD, Drafters, Native MTP · mlx-serve</title>
-  <meta name="description" content="Three speculation engines make local LLMs decode up to 2.1× faster on Apple Silicon with mathematically exact output: Prompt Lookup Decoding (on by default, any model), the Gemma 4 cross-attention drafter, and Qwen 3.6's native multi-token-prediction head. Adaptive gates keep novel content at parity.">
+  <meta name="description" content="Four speculation engines make local LLMs decode up to 2.8× faster on Apple Silicon with mathematically exact output: Prompt Lookup Decoding (on by default, any model), draft companions that ship inside the checkpoint, the Gemma 4 cross-attention drafter, and Qwen's native multi-token-prediction head. Adaptive gates keep novel content at parity.">
   <meta name="keywords" content="speculative decoding Apple Silicon, prompt lookup decoding, PLD LLM, draft model speculative decoding Mac, multi-token prediction Qwen, MTP inference, faster local LLM decode, MLX speculative decoding, exact speculative sampling">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://mlxserve.com/speculative-decoding/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://mlxserve.com/speculative-decoding/">
   <meta property="og:title" content="Speculative decoding: same output, just faster">
-  <meta property="og:description" content="PLD, cross-attention drafters, and native MTP — up to 2.1× on the workloads that matter, with mathematically exact output and gates that know when to quit.">
+  <meta property="og:description" content="PLD, draft companions, cross-attention drafters, and native MTP — up to 2.8× on the workloads that matter, with mathematically exact output and gates that know when to quit.">
   <meta property="og:image" content="https://mlxserve.com/perf-vs-lmstudio-gemma-26.7.6.png">
   <meta property="og:site_name" content="mlx-serve">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Speculative decoding: same output, just faster">
-  <meta name="twitter:description" content="PLD, cross-attention drafters, and native MTP — up to 2.1× with mathematically exact output.">
+  <meta name="twitter:description" content="PLD, draft companions, cross-attention drafters, and native MTP — up to 2.8× with mathematically exact output.">
   <meta name="twitter:image" content="https://mlxserve.com/perf-vs-lmstudio-gemma-26.7.6.png">
   <script type="application/ld+json">
   {
@@ -46,7 +46,7 @@
       {
         "@type": "Question",
         "name": "What is native multi-token prediction (MTP)?",
-        "acceptedAnswer": { "@type": "Answer", "text": "Some Qwen 3.6 checkpoints ship a small trained head that predicts the next few tokens alongside the main forward pass. mlx-serve auto-loads it and speculates with the model's own predictions — 2.8x on code and agent-style edit loops (28 to 78 tok/s on Qwen3.6-27B, v26.7.12), with a controller that watches acceptance per request and adapts draft depth. Zero setup." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Some Qwen 3.6 and 3.8 checkpoints ship a small trained head that predicts the next few tokens alongside the main forward pass. mlx-serve auto-loads it and speculates with the model's own predictions — 2.8x on code and agent-style edit loops (28 to 78 tok/s on Qwen3.6-27B, v26.7.12), with a controller that watches acceptance per request and adapts draft depth. Zero setup." }
       },
       {
         "@type": "Question",
@@ -92,13 +92,13 @@
     <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
     <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Deep dive · Speculative decoding</span></div>
     <h1>Same output.<br><span class="grad">Just faster.</span></h1>
-    <p class="hero-f-sub">Three speculation engines draft tokens ahead and let the model <b>verify them exactly</b> — byte-identical greedy output, mathematically exact sampling. Up to <b>2.1×</b> on the workloads local models actually run.</p>
+    <p class="hero-f-sub">Four speculation engines draft tokens ahead and let the model <b>verify them exactly</b> — byte-identical greedy output, mathematically exact sampling. Up to <b>2.1×</b> on the workloads local models actually run.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         Download for Mac
       </a>
-      <a href="#engines" class="btn btn-secondary">The three engines</a>
+      <a href="#engines" class="btn btn-secondary">The four engines</a>
     </div>
     <div class="hero-f-meta">
       <span><b>On by default</b> — zero setup</span>
@@ -135,7 +135,7 @@
 
   <section class="section section-alt" id="engines">
     <div class="section-header reveal">
-      <div class="section-label">Three engines</div>
+      <div class="section-label">Four engines</div>
       <h2 class="section-title">Draft cheap. Verify exact. Keep what lands.</h2>
     </div>
     <div class="mini-grid">
@@ -150,14 +150,19 @@
         <p>Google's tiny 4-layer drafters propose token blocks by <b>cross-attending into the target model's own KV cache</b> — no duplicated context, block sizes tuned per target from E2B to 31B. Wins code completion.</p>
       </div>
       <div class="mini-card reveal">
-        <span class="mini-k">MTP · Qwen 3.6</span>
+        <span class="mini-k">Draft companion · ships with the model</span>
+        <h4>The checkpoint brings its own drafter</h4>
+        <p>A model folder can carry a <code>drafter/</code> block-draft companion — the server loads it whenever that model loads, the draft size adapts to your Mac, and switching models keeps the speedup. About <b>2×</b> on Muse-Glimmer 30B (up to 75 tok/s on M4 Max, ships in the ddalcu builds). <code>--no-drafter</code> turns it off.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">MTP · Qwen 3.6 / 3.8</span>
         <h4>The model drafts itself</h4>
-        <p>Checkpoints shipping a trained <code>mtp/</code> sidecar (or an oMLX oQ checkpoint with its MTP head baked in) speculate with <b>the model's own prediction head</b> — auto-loaded, self-tuning drafting, 2.8× on code and agent edits (28 → 78 tok/s on the 27B) — and it out-decodes both reference MTP runtimes, MTPLX and oMLX, at all 8 context rungs, 0.5K–64K. Zero setup.</p>
+        <p>Checkpoints shipping a trained <code>mtp/</code> sidecar (or an oMLX oQ checkpoint with its MTP head baked in) speculate with <b>the model's own prediction head</b> — auto-loaded, self-tuning drafting, 2.8× on code and agent edits (28 → 78 tok/s on the 27B) — and it out-decodes both reference MTP runtimes, MTPLX and oMLX, at all 8 context rungs, 0.5K–64K. The Qwen 3.8 27B build bakes the head straight into the checkpoint: 75 tok/s on code against 26 with it off. Zero setup.</p>
       </div>
     </div>
     <figure class="shot reveal" style="margin-top: 40px;">
       <div class="shot-frame"><img src="../perf-mtp-ladder-26.7.12.png" alt="Native MTP context ladder: mlx-serve vs oMLX and MTPLX on Qwen 3.6 27B, prefill and decode from 0.5K to 64K context" loading="lazy"></div>
-      <figcaption>The native-MTP context ladder, v26.7.12: same checkpoints, cold prompts, 0.5K–64K. mlx-serve out-decodes MTPLX 2.3.0 at all 8 rungs (+15–38%) and oMLX's Lightning MTP at all 8 on oMLX's own oQ4e checkpoint (+15–52%).</figcaption>
+      <figcaption>The native-MTP context ladder, v26.7.12: same checkpoints, cold prompts, 0.5K–64K. mlx-serve out-decodes MTPLX 2.3.0 at all 8 rungs (+15–38%) and oMLX's Lightning MTP at all 8 on oMLX's own oQ4e checkpoint (+15–52%). On v26.8.3 shipping defaults it also out-decodes MTPLX 2.5.3 by +10% with +17% prefill and a third of the TTFT.</figcaption>
     </figure>
   </section>
 
@@ -228,11 +233,11 @@
     <div class="faq-wrap reveal">
       <details class="faq-item">
         <summary>Does it change the model's output?</summary>
-        <p>No. Drafts are verified by the target model itself — greedy decoding is byte-identical over the verification window, and sampling is mathematically exact in distribution. Byte-equivalence suites for all three engines run on every release.</p>
+        <p>No. Drafts are verified by the target model itself — greedy decoding is byte-identical over the verification window, and sampling is mathematically exact in distribution. Byte-equivalence suites for all four engines run on every release.</p>
       </details>
       <details class="faq-item">
         <summary>Which engine should I use?</summary>
-        <p>Usually: don't think about it. PLD is on by default everywhere; Qwen 3.6 MTP checkpoints activate their own head automatically; and the Gemma 4 drafter is a one-toggle pairing in the app's Settings when you want the extra code-completion win.</p>
+        <p>Usually: don't think about it. PLD is on by default everywhere; Qwen 3.6/3.8 MTP checkpoints activate their own head automatically; a model that ships a draft companion (the Muse-Glimmer builds) loads it whenever the model loads; and the Gemma 4 drafter is a one-toggle pairing in the app's Settings when you want the extra code-completion win.</p>
       </details>
       <details class="faq-item">
         <summary>Will it slow down creative writing or Q&amp;A?</summary>

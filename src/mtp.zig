@@ -809,6 +809,32 @@ fn ownAndTranspose2D(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx
     return t;
 }
 
+/// Head-trunk requantization width (`MLX_SERVE_MTP_HEAD_QUANT_BITS`): dense
+/// bf16 trunk weights (q/k/v/o, gate/up/down) are affine-quantized to this
+/// width at group 64 during load — the head only PROPOSES tokens (verify
+/// corrects), so the cost is acceptance, never output. 0 disables. Idea from
+/// Layr-Labs/qwen-3.8-mtp-challenge @ deb63ad (see NOTICE). Test seam:
+/// `head_quant_override`.
+pub const DEFAULT_HEAD_QUANT_BITS: u32 = 4;
+pub const HEAD_QUANT_GROUP: u32 = 64;
+pub var head_quant_override: ?u32 = null;
+fn headQuantBits() u32 {
+    if (head_quant_override) |v| return v;
+    const p = std.c.getenv("MLX_SERVE_MTP_HEAD_QUANT_BITS") orelse return DEFAULT_HEAD_QUANT_BITS;
+    const v = std.fmt.parseInt(u32, std.mem.sliceTo(p, 0), 10) catch return DEFAULT_HEAD_QUANT_BITS;
+    return switch (v) {
+        0, 2, 3, 4, 5, 6, 8 => v,
+        else => DEFAULT_HEAD_QUANT_BITS,
+    };
+}
+
+/// Per-load accounting for the head-trunk requant log line.
+const HeadQuantStats = struct {
+    n: u32 = 0,
+    before_bytes: u64 = 0,
+    after_bytes: u64 = 0,
+};
+
 /// Load a (possibly quantized) linear `<prefix>.{weight,scales,biases}`.
 /// bf16 weights (no scales) are pre-transposed for plain matmul.
 fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u8, s: mlx.mlx_stream) !QLinear {
@@ -829,6 +855,37 @@ fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u
         .s = mlx.mlx_array_new(),
         .b = mlx.mlx_array_new(),
     };
+}
+
+/// Trunk flavor of `loadLinear` (q/k/v/o, gate/up/down): a dense bf16 weight
+/// whose contraction dim divides HEAD_QUANT_GROUP is requantized to
+/// `headQuantBits()`/g64 packed at load (`stats` accounts it for the one log
+/// line). Quantized checkpoints, indivisible widths and lever-off load
+/// exactly as `loadLinear` does. fc, norms, routers and embeddings never
+/// come through here (NEVER_QUANTIZE class / m5Nax fc contract).
+fn loadTrunkLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u8, s: mlx.mlx_stream, stats: *HeadQuantStats) !QLinear {
+    const bits = headQuantBits();
+    if (bits != 0) {
+        var key_buf: [256]u8 = undefined;
+        const scales_key = try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix});
+        if (w.get(scales_key) == null) {
+            const weight_key = try std.fmt.bufPrint(&key_buf, "{s}.weight", .{prefix});
+            if (w.get(weight_key)) |raw| {
+                const shape = mlx.getShape(raw);
+                if (shape.len == 2 and shape[1] > 0 and @rem(shape[1], @as(c_int, @intCast(HEAD_QUANT_GROUP))) == 0) {
+                    const none = mlx.mlx_array{ .ctx = null };
+                    const lin = try requantizeRows(s, raw, none, none, 0, 0, "affine", HEAD_QUANT_GROUP, bits, 4096);
+                    const rows: u64 = @intCast(shape[0]);
+                    const cols: u64 = @intCast(shape[1]);
+                    stats.n += 1;
+                    stats.before_bytes += rows * cols * 2;
+                    stats.after_bytes += rows * cols * bits / 8 + 2 * rows * (cols / HEAD_QUANT_GROUP) * 2;
+                    return lin;
+                }
+            }
+        }
+    }
+    return loadLinear(w, allocator, prefix, s);
 }
 
 /// Requantize a row-quantized affine weight `(w, scales, biases)` from
@@ -1093,6 +1150,7 @@ pub fn loadMtp(
     const fold_norms = mtpNormsAreDeltaEncoded(&weights, p, s);
     if (fold_norms) log.info("[mtp] delta-encoded norms detected; folding +1 at load\n", .{});
 
+    var hq_stats: HeadQuantStats = .{};
     var m = MtpModel{
         .allocator = allocator,
         .s = s,
@@ -1111,10 +1169,10 @@ pub fn loadMtp(
         .post_attn_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), ".post_attention_layernorm.weight", s, fold_norms),
         .q_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), ".self_attn.q_norm.weight", s, fold_norms),
         .k_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), ".self_attn.k_norm.weight", s, fold_norms),
-        .q = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s),
-        .k = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s),
-        .v = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s),
-        .o = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s),
+        .q = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s, &hq_stats),
+        .k = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s, &hq_stats),
+        .v = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s, &hq_stats),
+        .o = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s, &hq_stats),
         .mlp = if (is_moe) blk: {
             // Router (`mlp.gate`) via loadLinear: a bf16 router gets
             // pre-transposed for the trunk's dense-matmul fallback, a
@@ -1126,9 +1184,9 @@ pub fn loadMtp(
             const sg = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"));
             const su = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"));
             const sd = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"));
-            const shg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s);
-            const shu = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s);
-            const shd = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s);
+            const shg = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s, &hq_stats);
+            const shu = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s, &hq_stats);
+            const shd = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s, &hq_stats);
             const seg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert_gate"), s);
             break :blk .{ .moe = .{
                 .router_w = router.w,
@@ -1157,12 +1215,22 @@ pub fn loadMtp(
                 .shared_expert_gate_b = seg.b,
             } };
         } else .{ .dense = .{
-            .gate = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s),
-            .up = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s),
-            .down = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s),
+            .gate = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s, &hq_stats),
+            .up = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s, &hq_stats),
+            .down = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s, &hq_stats),
         } },
     };
     errdefer m.deinit();
+
+    if (hq_stats.n > 0) {
+        log.info("[mtp] head trunk quantized: {d} weights bf16→{d}b/g{d} ({d}→{d} MB)\n", .{
+            hq_stats.n,                           headQuantBits(),
+            HEAD_QUANT_GROUP,                     hq_stats.before_bytes / (1024 * 1024),
+            hq_stats.after_bytes / (1024 * 1024),
+        });
+    } else if (headQuantBits() != 0) {
+        log.debug("[mtp] head trunk already quantized — requant skipped\n", .{});
+    }
 
     // Sidecars carry no quant metadata — infer bits from packed-column
     // geometry against the hidden size (exact: the bf16 fc weight pins
@@ -3001,4 +3069,91 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
     try testing.expect(q_mean > 1.6 and q_mean < 1.8);
     const k_mean = try arrayMeanF32(m.k_norm, s);
     try testing.expect(k_mean > 1.45 and k_mean < 1.55);
+}
+
+test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible widths stay dense" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // Dense bf16 sidecar with a 64-divisible hidden (64): q/k/v/o + gate/up
+    // quantize; down's contraction dim is 96 (not 64-divisible) — per-weight
+    // skip, stays dense pre-transposed. fc stays bf16 by contract (the m5Nax
+    // cost profile demands it).
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn put(m2: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m2, key, bf);
+            }
+        };
+        try H.put(map, "mtp.fc.weight", &.{ 64, 128 }, s);
+        try H.put(map, "mtp.pre_fc_norm_embedding.weight", &.{64}, s);
+        try H.put(map, "mtp.pre_fc_norm_hidden.weight", &.{64}, s);
+        try H.put(map, "mtp.norm.weight", &.{64}, s);
+        try H.put(map, "mtp.layers.0.input_layernorm.weight", &.{64}, s);
+        try H.put(map, "mtp.layers.0.post_attention_layernorm.weight", &.{64}, s);
+        try H.put(map, "mtp.layers.0.self_attn.q_norm.weight", &.{32}, s);
+        try H.put(map, "mtp.layers.0.self_attn.k_norm.weight", &.{32}, s);
+        try H.put(map, "mtp.layers.0.self_attn.q_proj.weight", &.{ 128, 64 }, s);
+        try H.put(map, "mtp.layers.0.self_attn.k_proj.weight", &.{ 32, 64 }, s);
+        try H.put(map, "mtp.layers.0.self_attn.v_proj.weight", &.{ 32, 64 }, s);
+        try H.put(map, "mtp.layers.0.self_attn.o_proj.weight", &.{ 64, 64 }, s);
+        try H.put(map, "mtp.layers.0.mlp.gate_proj.weight", &.{ 96, 64 }, s);
+        try H.put(map, "mtp.layers.0.mlp.up_proj.weight", &.{ 96, 64 }, s);
+        try H.put(map, "mtp.layers.0.mlp.down_proj.weight", &.{ 64, 96 }, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    {
+        var m = try loadMtp(io, allocator, s, dir_path);
+        defer m.deinit();
+
+        // q packed to 4-bit g64: uint32 codes, geometry re-solves.
+        try testing.expect(m.q.s.ctx != null);
+        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(m.q.w));
+        const qp = transformer_mod.affineParamsFromGeometry(m.q.w, m.q.s, 64) orelse return error.NoGeometry;
+        try testing.expectEqual(@as(u32, 4), qp.bits);
+        try testing.expectEqual(@as(u32, 64), qp.group_size);
+        try testing.expect(m.mlp == .dense);
+        try testing.expect(m.mlp.dense.gate.s.ctx != null);
+        // down: contraction 96 not 64-divisible — stays dense pre-transposed.
+        try testing.expect(m.mlp.dense.down.s.ctx == null);
+        const down_shape = mlx.getShape(m.mlp.dense.down.w);
+        try testing.expectEqual(@as(c_int, 96), down_shape[0]);
+        // fc bf16 by contract.
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(m.fc_w_t));
+    }
+
+    // Lever off (0): everything stays dense.
+    head_quant_override = 0;
+    defer head_quant_override = null;
+    {
+        var m = try loadMtp(io, allocator, s, dir_path);
+        defer m.deinit();
+        try testing.expect(m.q.s.ctx == null);
+        try testing.expect(m.mlp.dense.gate.s.ctx == null);
+    }
 }

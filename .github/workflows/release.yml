@@ -180,18 +180,17 @@ jobs:
 
       - name: Build Swift app
         working-directory: app
-        # Xcode 26 on the macos-26 runner is Swift 6.3; the swift-sdk 0.10.x pin
-        # needs Swift 5 language mode (matches app/build.sh) or its
-        # NetworkTransport.swift fails to compile with [#SendingRisksDataRace].
+        # Package manifests own their language modes. A global Swift 5 override
+        # would also reach SwaTex, whose source correctly requires Swift 6.1.
         run: |
-          swift build -c release -Xswiftc -swift-version -Xswiftc 5
-          echo "SWIFT_BIN_PATH=$(swift build -c release -Xswiftc -swift-version -Xswiftc 5 --show-bin-path)" >> "$GITHUB_ENV"
+          swift build -c release
+          echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
 
       - name: Run Swift tests
         # Same rationale as the Zig tests — ci.yml covers the PR commit.
         if: github.event_name != 'pull_request'
         working-directory: app
-        run: swift test -Xswiftc -swift-version -Xswiftc 5
+        run: swift test
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary
@@ -284,6 +283,15 @@ jobs:
 
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
+
+          # This .app is assembled by hand, so SwiftPM's SwaTex font bundle
+          # must be embedded explicitly (Xcode normally does this for us).
+          SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_PATH/SwaTex_SwaTexRender.bundle"
+          if [ ! -d "$SWATEX_RESOURCE_BUNDLE" ]; then
+            echo "::error::SwaTex font resource bundle missing"
+            exit 1
+          fi
+          cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"
 
           # License + third-party attributions inside the bundle (same reason
           # as the CLI tarball above: the .app embeds the same Apache-2.0

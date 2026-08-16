@@ -481,17 +481,115 @@ fn getGdnKernelBlocked(tb: u32) !mlx.mlx_fast_metal_kernel {
 /// `Vec8 v[MROWS]` form of this same kernel). GS and K_PARTS stay template
 /// ints; M is baked into the source (one cached kernel per M, distinct Metal
 /// host_names — two specializations sharing a name bind the wrong binary).
+/// The activation-FMA lines one output column contributes for a single K
+/// value: `wv` is the dequantized weight, `idx` the element inside the Vec8
+/// activation group. Shared by both plain-SIMD verify tiles so the two cannot
+/// drift.
+fn vqmmAccLines(comptime m: usize, comptime j: usize, comptime idx: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var out: []const u8 = "";
+        for (0..m) |r| {
+            out = out ++ std.fmt.comptimePrint("        acc[{d}] += float(v{d}[{s}]) * wv;\n", .{ j * m + r, r, idx });
+        }
+        return out;
+    }
+}
+
+/// Hoisted weight WORDS for one column, decoded per width.
+///
+/// One `pack` iteration always covers 8 K values (that is the Vec8 activation
+/// load), so its weights are exactly BITS bytes at
+/// `w_q + n * K_bytes + pack * BITS`. The loads stay HOISTED above the FMA
+/// chains — the tile's whole shape is "issue every column's weight word, then
+/// run one sequential chain per column", and leaving the load inside the chain
+/// serializes it behind the previous column's arithmetic. Hoisting only the
+/// POINTER is not enough: the widened arms must hoist the BYTES.
+///
+/// Widest load each width's alignment allows. 4-bit keeps its original aligned
+/// uint32 verbatim — that width must stay bit-identical, and it is this
+/// refactor's tripwire. 8-bit sits on `pack * 8` and takes two uints (not one
+/// ulong: 4-byte alignment is what the shipped 4-bit path already assumes of
+/// this buffer, and widening that assumption for one fused load buys nothing).
+/// 6-bit lands on `pack * 6`, only 2-aligned, so three ushorts re-assembled
+/// into two 3-byte words. 5-bit on `pack * 5` is 1-aligned and takes bytes.
+fn vqmmColumnLoad(comptime j: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        return std.fmt.comptimePrint(
+            \\  uint32_t p{d}; ulong r{d}; uint32_t a{d}0; uint32_t a{d}1;
+            \\  if constexpr (BITS == 4) {{ p{d} = w_q[(n0 + {d}) * K_by_p + pack]; }}
+            \\  else {{
+            \\    const device uchar* wp = ((const device uchar*)w_q) + (n0 + {d}) * K_bytes + pack * BITS;
+            \\    if constexpr (BITS == 8) {{
+            \\      const device uint* wu = (const device uint*)wp;
+            \\      r{d} = ulong(wu[0]) | (ulong(wu[1]) << 32);
+            \\    }} else if constexpr (BITS == 5) {{
+            \\      r{d} = ulong(wp[0]) | (ulong(wp[1]) << 8) | (ulong(wp[2]) << 16) |
+            \\             (ulong(wp[3]) << 24) | (ulong(wp[4]) << 32);
+            \\    }} else {{
+            \\      const device ushort* wh = (const device ushort*)wp;
+            \\      uint32_t h0 = uint32_t(wh[0]); uint32_t h1 = uint32_t(wh[1]); uint32_t h2 = uint32_t(wh[2]);
+            \\      a{d}0 = h0 | ((h1 & 0xFFu) << 16);
+            \\      a{d}1 = (h1 >> 8) | (h2 << 8);
+            \\    }}
+            \\  }}
+            \\
+        , .{ j, j, j, j, j, j, j, j, j, j, j });
+    }
+}
+
+/// Per-column dequant + FMA chain, one arm per supported affine width. The
+/// byte-addressed arms are lifted from the NAX m16 tile's validated unpack
+/// (4 values per 3 bytes at 6 bits, 8 per 5 bytes at 5, one byte per value at
+/// 8) — this is not a fresh reading of MLX's packing.
+fn vqmmColumnChain(comptime m: usize, comptime j: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        const acc_ki = vqmmAccLines(m, j, "ki");
+        const acc_hi = vqmmAccLines(m, j, "4 + ki");
+        return std.fmt.comptimePrint(
+            \\  {{
+            \\    float sj = s{d}; float bj = b{d};
+            \\    if constexpr (BITS == 4) {{
+            \\      for (int ki = 0; ki < 8; ++ki) {{
+            \\        float wv = float((p{d} >> (ki * 4)) & 0xFu) * sj + bj;
+            \\{s}      }}
+            \\    }} else if constexpr (BITS == 8) {{
+            \\      for (int ki = 0; ki < 8; ++ki) {{
+            \\        float wv = float(uint32_t((r{d} >> (ki * 8)) & 0xFFul)) * sj + bj;
+            \\{s}      }}
+            \\    }} else if constexpr (BITS == 5) {{
+            \\      for (int ki = 0; ki < 8; ++ki) {{
+            \\        float wv = float(uint32_t((r{d} >> (ki * 5)) & 0x1Ful)) * sj + bj;
+            \\{s}      }}
+            \\    }} else {{
+            \\      for (int ki = 0; ki < 4; ++ki) {{
+            \\        float wv = float((a{d}0 >> (ki * 6)) & 0x3Fu) * sj + bj;
+            \\{s}      }}
+            \\      for (int ki = 0; ki < 4; ++ki) {{
+            \\        float wv = float((a{d}1 >> (ki * 6)) & 0x3Fu) * sj + bj;
+            \\{s}      }}
+            \\    }}
+            \\  }}
+            \\
+        , .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
+    }
+}
+
 fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
     comptime {
+        // The per-width unpack ladder multiplies the comptime string work.
+        @setEvalBranchQuota(200_000);
         const nacc = bn * m;
         var body: []const u8 = "";
         // Row activation loads, all up front.
         for (0..m) |r| {
             body = body ++ std.fmt.comptimePrint("  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r });
         }
-        // Weight-word loads for the owned columns, then scales/biases.
+        // Weight handles for the owned columns, then scales/biases.
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  uint32_t p{d} = w_q[(n0 + {d}) * K_by_p + pack];\n", .{ j, j });
+            body = body ++ vqmmColumnLoad(j);
         }
         for (0..bn) |j| {
             body = body ++ std.fmt.comptimePrint("  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j });
@@ -499,11 +597,7 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
         // One sequential dequant+FMA chain per output column (column-major
         // construction; the interleaved form measurably loses).
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  {{\n    uint32_t packed = p{d}; float sj = s{d}; float bj = b{d};\n    for (int ki = 0; ki < 8; ++ki) {{\n      float wv = float((packed >> (ki * 4)) & 0xFu) * sj + bj;\n", .{ j, j, j });
-            for (0..m) |r| {
-                body = body ++ std.fmt.comptimePrint("      acc[{d}] += float(v{d}[ki]) * wv;\n", .{ j * m + r, r });
-            }
-            body = body ++ "    }\n  }\n";
+            body = body ++ vqmmColumnChain(m, j);
         }
         var acc_init: []const u8 = "";
         for (0..nacc) |i| {
@@ -521,6 +615,7 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
             \\int K = int(K_size);
             \\int N = int(N_size);
             \\int K_by_p = K / 8;
+            \\int K_bytes = (K * BITS) / 8;
             \\int K_by_gs = K / GS;
             \\int per_part = K_by_p / K_PARTS;
             \\int n0 = int(tg_n) * {d};
@@ -573,23 +668,21 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
 /// floor per the source ledger. Full-K per simdgroup, no barrier.
 fn verifyQmmMsgSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
     comptime {
+        // The per-width unpack ladder multiplies the comptime string work.
+        @setEvalBranchQuota(200_000);
         const nacc = bn * m;
         var body: []const u8 = "";
         for (0..m) |r| {
             body = body ++ std.fmt.comptimePrint("  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r });
         }
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  uint32_t p{d} = w_q[(n0 + {d}) * K_by_p + pack];\n", .{ j, j });
+            body = body ++ vqmmColumnLoad(j);
         }
         for (0..bn) |j| {
             body = body ++ std.fmt.comptimePrint("  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j });
         }
         for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  {{\n    uint32_t packed = p{d}; float sj = s{d}; float bj = b{d};\n    for (int ki = 0; ki < 8; ++ki) {{\n      float wv = float((packed >> (ki * 4)) & 0xFu) * sj + bj;\n", .{ j, j, j });
-            for (0..m) |r| {
-                body = body ++ std.fmt.comptimePrint("      acc[{d}] += float(v{d}[ki]) * wv;\n", .{ j * m + r, r });
-            }
-            body = body ++ "    }\n  }\n";
+            body = body ++ vqmmColumnChain(m, j);
         }
         var acc_init: []const u8 = "";
         for (0..nacc) |i| {
@@ -607,6 +700,7 @@ fn verifyQmmMsgSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
             \\int K = int(K_size);
             \\int N = int(N_size);
             \\int K_by_p = K / 8;
+            \\int K_bytes = (K * BITS) / 8;
             \\int K_by_gs = K / GS;
             \\int n0 = (int(tg_n) * NSG + int(sg)) * {d};
             \\if (n0 + {d} >= N) {{ return; }}
@@ -640,9 +734,12 @@ fn vqmmMsgBn(m: c_int) c_int {
     return if (m <= 6) 4 else 2;
 }
 
-const VQMM_MSG_SOURCES = [6][:0]const u8{
-    verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
-    verifyQmmMsgSource(5, 4), verifyQmmMsgSource(6, 4), verifyQmmMsgSource(7, 2),
+const VQMM_MSG_SOURCES = blk: {
+    @setEvalBranchQuota(20_000_000);
+    break :blk [6][:0]const u8{
+        verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
+        verifyQmmMsgSource(5, 4), verifyQmmMsgSource(6, 4), verifyQmmMsgSource(7, 2),
+    };
 };
 const VQMM_MSG_NAMES = [6][*:0]const u8{
     "mlxserve_vqmm_msg_m2", "mlxserve_vqmm_msg_m3", "mlxserve_vqmm_msg_m4",
@@ -673,6 +770,186 @@ fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     vqmm_msg_kernels[idx] = kernel;
     return kernel;
+}
+
+/// Crossrow M 8-9 kernel body (4-bit g64 only): port of the
+/// qwen-3.8-mtp-challenge `qmv_fast_crossrow_affine4_g64` (see NOTICE) — a
+/// qmv-shaped tile where ONE packed-weight read serves TWO input rows, so
+/// the M 8/9 widths past the split-K register cliff keep qmv-class weight
+/// traffic. Grid: tgp.x = input pair (ceil(M/2) groups, M baked), tgp.y =
+/// 8-row output tile (2 simdgroups x 4 rows); 32 lanes x 16 values = one
+/// 512-wide k-block per iteration; each 4-lane cluster shares one g64
+/// scale group. Activations pre-scale /1,/16,/256,/4096 so the nibble dot
+/// runs on MASKED (unshifted) weights; the raw-x sum carries the affine
+/// bias term. Every loop bound is a literal constant (fully unrolled — the
+/// named-scalar rule is satisfied the way their C++ template satisfies it).
+/// Deviation from theirs: the odd-M tail group loads a ZEROED second row
+/// instead of a separate single-row dot — identical output, the unused
+/// half rides arithmetic the weight-bound kernel has free.
+fn verifyQmmCrossrowSource(comptime m: usize) [:0]const u8 {
+    comptime {
+        @setEvalBranchQuota(400_000);
+        return std.fmt.comptimePrint(
+            \\auto sg = simdgroup_index_in_threadgroup;
+            \\auto lane = thread_index_in_simdgroup;
+            \\auto tgp = threadgroup_position_in_grid;
+            \\
+            \\int K = int(K_size);
+            \\int N = int(N_size);
+            \\const int first_m = int(tgp.x) * 2;
+            \\const int out_row = int(tgp.y) * 8 + int(sg) * 4;
+            \\const int K_bytes = K / 2;
+            \\const int K_groups = K / 64;
+            \\const bool has_pair = (first_m + 1) < {d};
+            \\
+            \\const device uint8_t* wq8 = (const device uint8_t*)w_q;
+            \\float2 pres[4];
+            \\_Pragma("unroll")
+            \\for (int r = 0; r < 4; ++r) {{ pres[r] = float2(0.0f); }}
+            \\
+            \\for (int k = 0; k < K; k += 512) {{
+            \\  ushort pk[4][4];
+            \\  float sl[4]; float bl[4];
+            \\  _Pragma("unroll")
+            \\  for (int r = 0; r < 4; ++r) {{
+            \\    const int row = out_row + r;
+            \\    const device uint16_t* ws = (const device uint16_t*)(wq8 + row * K_bytes + (k >> 1) + int(lane) * 8);
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 4; ++i) {{ pk[r][i] = ws[i]; }}
+            \\    const int gi = row * K_groups + (k >> 6) + int(lane) / 4;
+            \\    sl[r] = float(scales[gi]);
+            \\    bl[r] = float(biases[gi]);
+            \\  }}
+            \\  const device T* xm0 = x + first_m * K + k + int(lane) * 16;
+            \\  float x0[16]; float x1[16];
+            \\  float sum0 = 0.0f; float sum1 = 0.0f;
+            \\  _Pragma("unroll")
+            \\  for (int i = 0; i < 16; i += 4) {{
+            \\    sum0 += float(xm0[i]) + float(xm0[i+1]) + float(xm0[i+2]) + float(xm0[i+3]);
+            \\    x0[i] = float(xm0[i]);
+            \\    x0[i+1] = float(xm0[i+1]) / 16.0f;
+            \\    x0[i+2] = float(xm0[i+2]) / 256.0f;
+            \\    x0[i+3] = float(xm0[i+3]) / 4096.0f;
+            \\  }}
+            \\  if (has_pair) {{
+            \\    const device T* xm1 = xm0 + K;
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 16; i += 4) {{
+            \\      sum1 += float(xm1[i]) + float(xm1[i+1]) + float(xm1[i+2]) + float(xm1[i+3]);
+            \\      x1[i] = float(xm1[i]);
+            \\      x1[i+1] = float(xm1[i+1]) / 16.0f;
+            \\      x1[i+2] = float(xm1[i+2]) / 256.0f;
+            \\      x1[i+3] = float(xm1[i+3]) / 4096.0f;
+            \\    }}
+            \\  }} else {{
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 16; ++i) {{ x1[i] = 0.0f; }}
+            \\  }}
+            \\  _Pragma("unroll")
+            \\  for (int r = 0; r < 4; ++r) {{
+            \\    float2 acc = float2(0.0f);
+            \\    _Pragma("unroll")
+            \\    for (int i = 0; i < 4; ++i) {{
+            \\      acc += float2(x0[4*i],   x1[4*i])   * float(pk[r][i] & 0x000f);
+            \\      acc += float2(x0[4*i+1], x1[4*i+1]) * float(pk[r][i] & 0x00f0);
+            \\      acc += float2(x0[4*i+2], x1[4*i+2]) * float(pk[r][i] & 0x0f00);
+            \\      acc += float2(x0[4*i+3], x1[4*i+3]) * float(pk[r][i] & 0xf000);
+            \\    }}
+            \\    pres[r] += sl[r] * acc + float2(sum0, sum1) * bl[r];
+            \\  }}
+            \\}}
+            \\
+            \\_Pragma("unroll")
+            \\for (int r = 0; r < 4; ++r) {{
+            \\  float r0 = simd_sum(pres[r].x);
+            \\  float r1 = simd_sum(pres[r].y);
+            \\  if (lane == 0) {{
+            \\    y[first_m * N + out_row + r] = T(r0);
+            \\    if (has_pair) {{ y[(first_m + 1) * N + out_row + r] = T(r1); }}
+            \\  }}
+            \\}}
+        , .{m});
+    }
+}
+
+const VQMM_XR_SOURCES = blk: {
+    @setEvalBranchQuota(20_000_000);
+    break :blk [2][:0]const u8{ verifyQmmCrossrowSource(8), verifyQmmCrossrowSource(9) };
+};
+const VQMM_XR_NAMES = [2][*:0]const u8{ "mlxserve_vqmm_xr_m8", "mlxserve_vqmm_xr_m9" };
+
+var vqmm_xr_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
+
+fn getVerifyQmmCrossrowKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
+    if (m < 8 or m > 9) return error.UnsupportedShape;
+    const idx: usize = @intCast(m - 8);
+    if (vqmm_xr_kernels[idx]) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "K_size", "N_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        VQMM_XR_NAMES[idx],
+        in_vec,
+        out_vec,
+        VQMM_XR_SOURCES[idx],
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    vqmm_xr_kernels[idx] = kernel;
+    return kernel;
+}
+
+fn runVerifyQmmCrossrow(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    m: c_int,
+    K: c_int,
+    N: c_int,
+    xd: mlx.mlx_dtype,
+    xsh: []const c_int,
+) !?mlx.mlx_array {
+    const K_arr = cachedScalarInt(K);
+    const N_arr = cachedScalarInt(N);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const y_shape = [_]c_int{ m, N };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
+    const n_pairs: c_int = @divTrunc(m + 1, 2);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 64 * n_pairs, @divExact(N, 8), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+
+    const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    const kernel = try getVerifyQmmCrossrowKernel(m);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y2);
+    try mlx.check(mlx.mlx_vector_array_get(&y2, outputs_vec, 0));
+
+    var out_shape_buf: [8]c_int = undefined;
+    const ndim = xsh.len;
+    if (ndim > out_shape_buf.len) return error.UnsupportedShape;
+    for (xsh[0 .. ndim - 1], 0..) |d, i| out_shape_buf[i] = d;
+    out_shape_buf[ndim - 1] = N;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_reshape(&y, y2, out_shape_buf[0..ndim].ptr, @intCast(ndim), s));
+    return y;
 }
 
 /// Column-tile width per M. A threadgroup owns `bn` output columns and
@@ -758,6 +1035,8 @@ fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
 const VQMM_N_KERNELS = 6 * VQMM_BN_CHOICES.len;
 
 const VQMM_SOURCES = blk: {
+    // 18 tiles x a four-width unpack ladder is a lot of comptime string work.
+    @setEvalBranchQuota(20_000_000);
     var out: [VQMM_N_KERNELS][:0]const u8 = undefined;
     for (2..8) |m| {
         for (VQMM_BN_CHOICES, 0..) |bn, bi| {
@@ -919,7 +1198,27 @@ pub fn verifyQmmEnabled() bool {
     return on;
 }
 
-pub const VqmmLane = enum { none, splitk, msg, nax };
+pub const VqmmLane = enum { none, splitk, msg, nax, crossrow };
+
+/// Crossrow M 8-9 lane (plain-SIMD machines, 4-bit g64 only): OPT-IN via
+/// MLX_SERVE_VERIFY_QMM_CROSSROW=1 until its A/B wins. Port of the
+/// qwen-3.8-mtp-challenge `qmv_fast_crossrow_affine4_g64` (see NOTICE):
+/// one weight read serves TWO input rows, so the M 8/9 widths that
+/// stack-spill the split-K tile (the measured register cliff) ride a
+/// qmv-shaped kernel instead of stock. Test seam: `vqmm_crossrow_override`.
+pub var vqmm_crossrow_override: ?bool = null;
+var vqmm_crossrow_env_cached: ?bool = null;
+fn crossrowEnvEnabled() bool {
+    if (vqmm_crossrow_override) |v| return v;
+    if (vqmm_crossrow_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_VERIFY_QMM_CROSSROW") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    };
+    vqmm_crossrow_env_cached = v;
+    return v;
+}
+var vqmm_crossrow_engaged = false;
 
 /// The byte-unpack NAX tile is profitable for oQe's wide q5/q6 projections,
 /// but loses to stock MLX on the 1024-wide K/V projections. This threshold is
@@ -927,6 +1226,77 @@ pub const VqmmLane = enum { none, splitk, msg, nax };
 fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (bits == 4) return true;
     return (bits == 5 or bits == 6) and group_size == 64 and n >= 5120;
+}
+
+/// Whether the PLAIN-SIMD tiles (split-K / msg) adopt a non-4-bit affine
+/// weight. Profitability is a SEPARATE question from "the kernel is correct":
+/// the byte-addressed unpack does strictly more ALU per value than the 4-bit
+/// nibble path, so the shapes where it beats stock differ from the NAX tile's
+/// (`mixedNaxShapeEnabled` exists because that tile LOSES on the 1024-wide K/V
+/// projections). `MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0|1` forces the A/B arms.
+///
+/// MEASURED, Qwen3.8-27B on an M4 Max (no NAX lane, so the plain-SIMD tiles are
+/// all this machine has), MTP on, decode tok/s from the server's own timings,
+/// per-prompt medians over two passes with the CELL order reversed on the
+/// second (the first cell of a pass reads ~2% fast, which a control pack that
+/// ignores the lever entirely made visible):
+///
+/// | pack | code | prose | agentish |
+/// |---|---|---|---|
+/// | 6-bit gs64 | **1.10x** | **1.22x** | **1.17x** |
+/// | 8-bit gs64 | 1.03x | 1.04x | 1.01x |
+///
+/// For scale: killing the 4-bit lane outright on the same box costs
+/// 1.09-1.12x, so the 6-bit lane is worth MORE than the 4-bit one it was
+/// modelled on — stock's 6-bit qmm has more to give back at these widths.
+///
+/// So 6-bit is default-on and 8-bit is NOT: 0.7-3.7% is inside the noise this
+/// harness can resolve, and a lane that only adds dispatch surface for that is
+/// not worth defaulting. 5-bit has the kernel arm and the parity test but no
+/// pack on this box to measure, so it stays off for the same reason rather
+/// than riding 6-bit's number. Both flip with one env var.
+///
+/// The N floor is where the whole result lives: forcing every shape on
+/// (`MIXED_PLAIN=1`, which adopts the 1024-wide K/V projections too) measured
+/// only 1.01-1.05x on the same pack. Excluding them is worth ~10 points.
+pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
+    if (bits == 4) return true;
+    if (bits != 6) return false;
+    return group_size == 64 and n >= MIXED_PLAIN_MIN_N;
+}
+
+/// The N below which the byte-addressed unpack loses to stock — the same split
+/// the NAX tile measured, and the reason force-all-shapes gives back most of
+/// the win.
+pub const MIXED_PLAIN_MIN_N: c_int = 5120;
+
+var vqmm_mixed_plain_env_cache: ?u8 = null;
+/// 0 = forced off, 1 = forced on, 2 = follow `mixedPlainShapeEnabled`.
+fn mixedPlainEnvMode() u8 {
+    if (vqmm_mixed_plain_env_cache) |v| return v;
+    var mode: u8 = 2;
+    if (std.c.getenv("MLX_SERVE_VERIFY_QMM_MIXED_PLAIN")) |p| {
+        const val = std.mem.span(p);
+        if (val.len > 0 and val[0] == '0') mode = 0;
+        if (val.len > 0 and val[0] == '1') mode = 1;
+    }
+    vqmm_mixed_plain_env_cache = mode;
+    return mode;
+}
+
+var vqmm_mixed_plain_engaged: bool = false;
+
+/// Test seam: the parity test drives the plain-SIMD mixed-width arms without
+/// touching the process environment (correctness is not a perf question).
+pub var vqmm_mixed_plain_test_force: ?bool = null;
+
+fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
+    if (vqmm_mixed_plain_test_force) |v| return v;
+    return switch (mixedPlainEnvMode()) {
+        0 => false,
+        1 => bits == 5 or bits == 6 or bits == 8 or bits == 4,
+        else => mixedPlainShapeEnabled(bits, group_size, n),
+    };
 }
 
 /// Pure lane selection for the verify-qmm family (hermetically pinned by
@@ -941,11 +1311,17 @@ fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// - splitk/msg: the plain-SIMD M 2..7 lanes (K % 64 == 0, N % 4 == 0),
 ///   byte-identical to the pre-NAX dispatch; msg takes N >= 100000.
 /// - none: stock mlx_quantized_matmul.
-pub fn vqmmLaneFor(m: c_int, K: c_int, N: c_int, nax_on: bool, nax_min_m: c_int) VqmmLane {
+pub fn vqmmLaneFor(m: c_int, K: c_int, N: c_int, nax_on: bool, nax_min_m: c_int, crossrow_on: bool) VqmmLane {
     if (m < 2 or m > 16) return .none;
     if (N < 512) return .none;
     if (nax_on and m >= nax_min_m and @mod(K, 256) == 0 and @mod(N, 32) == 0) return .nax;
-    if (m > 7) return .none;
+    if (m > 7) {
+        // crossrow (opt-in, non-NAX): M 8..9 past the plain-SIMD register
+        // cliff. Its k-loop covers exactly 512 inputs per iteration and its
+        // row tiles are unguarded 8s; their host gate keeps out_vec >= 1024.
+        if (crossrow_on and m <= 9 and @mod(K, 512) == 0 and @mod(N, 8) == 0 and N >= 1024) return .crossrow;
+        return .none;
+    }
     if (@mod(K, 64) != 0 or @mod(N, 4) != 0) return .none;
     return if (N >= 100000) .msg else .splitk;
 }
@@ -969,7 +1345,7 @@ pub fn verifyQmm(
     // The M5 NAX tile additionally handles the 5/6-bit affine projections in
     // oQe checkpoints; those widths fall through to stock below the NAX
     // takeover row instead of entering a 4-bit kernel.
-    if (bits != 4 and bits != 5 and bits != 6) return null;
+    if (bits != 4 and bits != 5 and bits != 6 and bits != 8) return null;
     if (group_size != 32 and group_size != 64 and group_size != 128) return null;
     if (sc.ctx == null or bi.ctx == null) return null;
     const xd = mlx.mlx_array_dtype(x);
@@ -986,20 +1362,45 @@ pub fn verifyQmm(
     // values (5/6-bit rows are byte-packed but still exposed as uint32 arrays).
     if (@as(i64, wsh[1]) * 32 != @as(i64, K) * @as(i64, bits)) return null;
     const nax_on = naxLaneEnvEnabled() and verifyQmmNaxAvailable();
-    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM());
-    if (bits != 4 and
-        (lane != .nax or
-            !naxMixedBitsEnvEnabled() or
-            !mixedNaxShapeEnabled(bits, group_size, N))) return null;
+    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM(), crossrowEnvEnabled());
+    // The crossrow kernel is a strict 4-bit/g64 specialization (masked-nibble
+    // dot with /16-prescaled activations) — other widths fall to stock.
+    if (lane == .crossrow and (bits != 4 or group_size != 64)) return null;
+    if (bits != 4) switch (lane) {
+        .crossrow => return null, // unreachable after the gate above; explicit
+        .nax => if (!naxMixedBitsEnvEnabled() or !mixedNaxShapeEnabled(bits, group_size, N)) return null,
+        // The plain-SIMD tiles now carry the same byte-addressed unpack the
+        // NAX tile validated, so 5/6/8-bit no longer fall through to stock on
+        // every M1-M4 machine — but adoption is per-shape and measured.
+        .splitk, .msg => {
+            if (!mixedPlainEnabled(bits, group_size, N)) return null;
+            // A lane that silently declines is indistinguishable from one that
+            // is merely slow, so every A/B arm has to be readable from its own
+            // log rather than from the env it was launched with.
+            if (!vqmm_mixed_plain_engaged) {
+                vqmm_mixed_plain_engaged = true;
+                log.info("[vqmm] plain-SIMD verify lane engaged at {d}-bit: lane={s} M={d} K={d} N={d} gs={d} (MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0 restores stock)\n", .{ bits, @tagName(lane), m, K, N, group_size });
+            }
+        },
+        .none => return null,
+    };
     switch (lane) {
         .none => return null,
+        // Crossrow M 8/9 (opt-in): one weight read serves two input rows.
+        .crossrow => {
+            if (!vqmm_crossrow_engaged) {
+                vqmm_crossrow_engaged = true;
+                log.info("[vqmm] crossrow verify lane engaged: M={d} K={d} N={d} (MLX_SERVE_VERIFY_QMM_CROSSROW=0 restores stock)\n", .{ m, K, N });
+            }
+            return try runVerifyQmmCrossrow(s, x, w, sc, bi, m, K, N, xd, xsh);
+        },
         // NAX m16 tile (M5-class): M 8..16 by default — past the plain-SIMD
         // register cliff. Construction stays strictly behind the probe.
         .nax => return try runVerifyQmmNax(s, x, w, sc, bi, bits, group_size, m, K, N, xd, xsh),
         // Huge-N (lm_head class): the tiny-tile split-K grid thrashes the
         // scheduler there (measured 2.1x stock at M=4) — route through the
         // wide multi-simdgroup tile instead (2-column tile at M=7).
-        .msg => return try runVerifyQmmMsg(s, x, w, sc, bi, group_size, m, K, N, xd, xsh),
+        .msg => return try runVerifyQmmMsg(s, x, w, sc, bi, bits, group_size, m, K, N, xd, xsh),
         .splitk => {},
     }
 
@@ -1020,6 +1421,7 @@ pub fn verifyQmm(
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * k_parts, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K_PARTS", k_parts));
 
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
@@ -1055,6 +1457,7 @@ fn runVerifyQmmMsg(
     w: mlx.mlx_array,
     sc: mlx.mlx_array,
     bi: mlx.mlx_array,
+    bits: u32,
     group_size: u32,
     m: c_int,
     K: c_int,
@@ -1075,6 +1478,7 @@ fn runVerifyQmmMsg(
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * VQMM_MSG_NSG, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", VQMM_MSG_NSG));
 
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
@@ -1289,7 +1693,7 @@ pub fn verifyQmmNaxEnabledForMFrom(
     available: bool,
     min_m: c_int,
 ) bool {
-    return verify_on and vqmmLaneFor(m, K, N, lane_on and available, min_m) == .nax;
+    return verify_on and vqmmLaneFor(m, K, N, lane_on and available, min_m, false) == .nax;
 }
 
 /// Runtime form of verifyQmmNaxEnabledForMFrom.
@@ -2214,6 +2618,107 @@ pub fn fusedSdpa256Prefill(
     fused256_last_dispatch_count = dispatches;
     return out;
 }
+
+/// Kill switch (MLX_SERVE_SDPA_SPLIT=0). Test seam: `sdpa_split_override`
+/// forces the arm on/off without the environment.
+pub var sdpa_split_override: ?bool = null;
+var sdpa_split_env_cached: ?bool = null;
+fn sdpaSplitEnabled() bool {
+    if (sdpa_split_override) |v| return v;
+    if (sdpa_split_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_SDPA_SPLIT") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    sdpa_split_env_cached = v;
+    return v;
+}
+
+/// One engagement log per width (6..9): the first engagement is usually the
+/// warmup's own 8-token prefill (kL==qL==8) — a per-width line is what
+/// witnesses the split at REAL verify shapes in an A/B arm's log.
+var sdpa_split_logged: [4]bool = .{ false, false, false, false };
+
+/// Width-wall query split for dense causal spec-verify blocks (B==1, hd 256,
+/// q_len 6..9). MLX's sdpa has no full-kernel arm at hd 256 and its vector
+/// kernel serves q_len * gqa <= 32, so a 6..9-row verify block otherwise runs
+/// the slow internal fallback on every machine. Splitting the queries at row
+/// 5 keeps both halves on the vector path with windows byte-identical to two
+/// consecutive <= 5-row rounds at the same offsets (bottom-right causal
+/// alignment): chunk A (rows 0..<5) over keys[0 .. kL-(qL-5)], chunk B
+/// (rows 5..) over the full keys, both "causal". K/V are re-sliced views,
+/// never recomputed. Returns null outside the envelope — the caller falls
+/// through to the single sdpa call. Port of the Layr-Labs
+/// qwen-3.8-mtp-challenge width-wall split (see NOTICE).
+pub fn splitCausalSdpa(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    scale: f32,
+) !?mlx.mlx_array {
+    if (!sdpaSplitEnabled()) return null;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const vs = mlx.getShape(v);
+    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    if (qs[0] != 1 or ks[0] != 1 or vs[0] != 1) return null;
+    if (qs[2] < 6 or qs[2] > 9) return null;
+    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1]) return null;
+
+    const qL = qs[2];
+    const kL = ks[2];
+    const split: c_int = 5;
+    const k_split: c_int = kL - (qL - split);
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+
+    // Chunk A: rows 0..<5 vs keys[0 .. kL-(qL-5)] — row i's bottom-right
+    // causal window is exactly the one a width-5 round at this offset gets.
+    var q_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_a);
+    var k_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_a);
+    var v_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_a);
+    const zero4 = [_]c_int{ 0, 0, 0, 0 };
+    const qa_stop = [_]c_int{ 1, qs[1], split, 256 };
+    const ka_stop = [_]c_int{ 1, ks[1], k_split, 256 };
+    try mlx.check(mlx.mlx_slice(&q_a, q, &zero4, 4, &qa_stop, 4, &strides, 4, s));
+    try mlx.check(mlx.mlx_slice(&k_a, k, &zero4, 4, &ka_stop, 4, &strides, 4, s));
+    try mlx.check(mlx.mlx_slice(&v_a, v, &zero4, 4, &ka_stop, 4, &strides, 4, s));
+
+    // Chunk B: rows 5.. vs the full keys — the follow-up width-(qL-5) round.
+    var q_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_b);
+    const qb_start = [_]c_int{ 0, 0, split, 0 };
+    const qb_stop = [_]c_int{ 1, qs[1], qL, 256 };
+    try mlx.check(mlx.mlx_slice(&q_b, q, &qb_start, 4, &qb_stop, 4, &strides, 4, s));
+
+    const none_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none_mask);
+    var out_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_a);
+    var out_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_b);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_a, q_a, k_a, v_a, scale, "causal", none_mask, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_b, q_b, k, v, scale, "causal", none_mask, .{ .ctx = null }, s));
+
+    const parts = [_]mlx.mlx_array{ out_a, out_b };
+    const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+
+    const log_idx: usize = @intCast(qL - 6);
+    if (!sdpa_split_logged[log_idx]) {
+        sdpa_split_logged[log_idx] = true;
+        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1] });
+    }
+    return out;
+}
+
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 
@@ -4402,8 +4907,8 @@ var qkv_dec_engaged: bool = false;
 
 /// Try the decode-width quantized-KV attention kernel. Returns null when a
 /// precondition doesn't hold — the caller falls back to the composed
-/// quantAttention (verify widths) or dense SDPA. Preconditions are the
-/// kernel's OWN requirements, never a model_type list.
+/// quantAttention. Preconditions are the kernel's OWN requirements, never a
+/// model_type list.
 pub fn qkvAttnDecodeKernel(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
@@ -4522,6 +5027,30 @@ pub fn qkvAttnDecodeKernel(
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qkv_dec_cfg.?, s));
+    const o_t = try qkvMergePartials(s, outputs_vec, qdt);
+    defer _ = mlx.mlx_array_free(o_t);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const out_shape = [_]c_int{ 1, h_q, 1, dv };
+    try mlx.check(mlx.mlx_reshape(&out, o_t, &out_shape, 4, s));
+    if (!qkv_dec_engaged) {
+        qkv_dec_engaged = true;
+        log.info("[kv-attn] decode kernel engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} mask={} (MLX_SERVE_KV_ATTN_KERNEL=0 restores composed)\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, block, has_mask });
+    }
+    return out;
+}
+
+/// Merge per-block split-KV partials (m, l, unnormalized O) into a typed
+/// [ROWS, DV] tensor — the standard flash-attention carry:
+///   M  = max_b m_b            [ROWS, 1]
+///   w  = exp(m_b - M)         [ROWS, NBLK]
+///   L  = Σ_b l_b · w          [ROWS, 1]
+///   O  = Σ_b o_b · w          [ROWS, DV]
+///   out = (O / L) as T.
+/// KB-scale tensors — a handful of elementwise/reduce ops per layer. Shared
+/// by the decode and verify packed-attention kernels; the op sequence is
+/// load-bearing (decode bit-identity across refactors is a bar).
+fn qkvMergePartials(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
     if (mlx.mlx_vector_array_size(outputs_vec) != 3) return error.MetalKernelBadOutputCount;
     var m_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_b);
@@ -4532,14 +5061,6 @@ pub fn qkvAttnDecodeKernel(
     try mlx.check(mlx.mlx_vector_array_get(&m_b, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&l_b, outputs_vec, 1));
     try mlx.check(mlx.mlx_vector_array_get(&o_b, outputs_vec, 2));
-
-    // Merge the per-block partials (standard flash split-KV carry):
-    //   M  = max_b m_b            [Hq, 1]
-    //   w  = exp(m_b - M)         [Hq, NBLK]
-    //   L  = Σ_b l_b · w          [Hq, 1]
-    //   O  = Σ_b o_b · w          [Hq, DV]
-    //   out = (O / L) as T, reshaped [1, Hq, 1, DV].
-    // KB-scale tensors — a handful of elementwise/reduce ops per layer.
     var m_max = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_max);
     try mlx.check(mlx.mlx_max_axis(&m_max, m_b, 1, true, s));
@@ -4554,39 +5075,356 @@ pub fn qkvAttnDecodeKernel(
     try mlx.check(mlx.mlx_multiply(&lw, l_b, w, s));
     var l_tot = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(l_tot);
-    try mlx.check(mlx.mlx_sum_axis(&l_tot, lw, 1, true, s)); // [Hq, 1]
+    try mlx.check(mlx.mlx_sum_axis(&l_tot, lw, 1, true, s)); // [ROWS, 1]
     var w3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w3);
-    try mlx.check(mlx.mlx_expand_dims(&w3, w, 2, s)); // [Hq, NBLK, 1]
+    try mlx.check(mlx.mlx_expand_dims(&w3, w, 2, s)); // [ROWS, NBLK, 1]
     var ow = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ow);
     try mlx.check(mlx.mlx_multiply(&ow, o_b, w3, s));
     var o_tot = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o_tot);
-    try mlx.check(mlx.mlx_sum_axis(&o_tot, ow, 1, false, s)); // [Hq, DV]
+    try mlx.check(mlx.mlx_sum_axis(&o_tot, ow, 1, false, s)); // [ROWS, DV]
     var o_norm = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o_norm);
-    try mlx.check(mlx.mlx_divide(&o_norm, o_tot, l_tot, s)); // [Hq,DV] / [Hq,1]
+    try mlx.check(mlx.mlx_divide(&o_norm, o_tot, l_tot, s)); // [ROWS,DV] / [ROWS,1]
     var o_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(o_t);
+    errdefer _ = mlx.mlx_array_free(o_t);
     try mlx.check(mlx.mlx_astype(&o_t, o_norm, qdt, s));
+    return o_t;
+}
+
+// ── Verify-width packed attention (kv8-fused-spec-plan.md Phase 2) ──
+//
+// Same two-phase block-parallel layout as QKV_DEC_KERNEL_SOURCE, generalized
+// to TQ (2..8) query rows per head — the spec-verify widths that Phase 1
+// routed to dense dequant + SDPA. Differences from the decode kernel:
+//   - q is read from DEVICE memory, not staged: LQ = GQA·TQ rows of DK f32
+//     is up to 49 KB of threadgroup memory at TQ 8. The reads are lockstep
+//     across threads (same element for every row of the block) and the whole
+//     q tensor is L1-scale.
+//   - the causal TAIL is applied from geometry: q row tq sees keys with
+//     global index < Tk - TQ + 1 + tq — the same end-aligned contract as
+//     SDPA "causal", which is what the dense path uses at these widths.
+//     "array" masks (sliding layers) decline to dense.
+//   - scale is folded at score write, not at q read.
+// Partials merge through the SAME qkvMergePartials carry; row order is
+// (head-major, tq inner) so the merged [Hq·TQ, DV] reshapes straight to
+// [1, Hq, TQ, DV].
+pub const QKV_VERIFY_MAX_TQ: c_int = 8;
+
+const QKV_VERIFY_KERNEL_SOURCE =
+    \\constexpr int VPW = 32 / BITS;
+    \\constexpr int NT = 128;
+    \\constexpr int LQ = GQA * TQ;
+    \\
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint hkv = threadgroup_position_in_grid.y;
+    \\const uint blk = threadgroup_position_in_grid.z;
+    \\const uint nblk = threadgroups_per_grid.z;
+    \\
+    \\const int Tk = tk[0];
+    \\const float scale = scl[0];
+    \\const uint mask_bits = (1u << BITS) - 1u;
+    \\const int t0 = int(blk) * BLOCK;
+    \\const int rows = min(BLOCK, Tk - t0);
+    \\
+    \\threadgroup float p_tg[LQ * BLOCK];
+    \\threadgroup float red[NT];
+    \\threadgroup float ml_tg[2 * LQ];
+    \\
+    \\const long kq_base = (long)hkv * (long)kq_strides[1];
+    \\const long ks_base = (long)hkv * (long)ksc_strides[1];
+    \\const long kb_base = (long)hkv * (long)kbi_strides[1];
+    \\
+    \\// Phase A: one thread per kv row (strided): dequant the row once, dot
+    \\// against all LQ q rows; causal tail from geometry at score write.
+    \\for (int t = int(tid); t < rows; t += NT) {
+    \\  const long row = kq_base + (long)(t0 + t) * (long)kq_strides[2];
+    \\  const long grow = ks_base + (long)(t0 + t) * (long)ksc_strides[2];
+    \\  const long brow = kb_base + (long)(t0 + t) * (long)kbi_strides[2];
+    \\  float sc[LQ];
+    \\  for (int r = 0; r < LQ; ++r) sc[r] = 0.0f;
+    \\  for (int wi = 0; wi < DK / VPW; ++wi) {
+    \\    const uint w = uint(kq[row + (long)wi]);
+    \\    const int g_idx = (wi * VPW) / GS;
+    \\    const float sj = float(ksc[grow + (long)g_idx]);
+    \\    const float bj = float(kbi[brow + (long)g_idx]);
+    \\    for (int u = 0; u < VPW; ++u) {
+    \\      const float kv = float((w >> (u * BITS)) & mask_bits) * sj + bj;
+    \\      const int e = wi * VPW + u;
+    \\      for (int gi = 0; gi < GQA; ++gi) {
+    \\        const long qh = ((long)hkv * GQA + gi) * (long)q_strides[1];
+    \\        for (int tq = 0; tq < TQ; ++tq)
+    \\          sc[gi * TQ + tq] += float(q[qh + (long)tq * (long)q_strides[2] + (long)e]) * kv;
+    \\      }
+    \\    }
+    \\  }
+    \\  const int gpos = t0 + t;
+    \\  for (int gi = 0; gi < GQA; ++gi)
+    \\    for (int tq = 0; tq < TQ; ++tq)
+    \\      p_tg[(gi * TQ + tq) * BLOCK + t] =
+    \\        (gpos < Tk - TQ + 1 + tq) ? sc[gi * TQ + tq] * scale : -INFINITY;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\// Phase M: per q row — block max, exp, row-weight sum (tree in red[]).
+    \\for (int r = 0; r < LQ; ++r) {
+    \\  float pm = -INFINITY;
+    \\  for (int t = int(tid); t < rows; t += NT) pm = max(pm, p_tg[r * BLOCK + t]);
+    \\  red[tid] = pm;
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (int off = NT / 2; off > 0; off >>= 1) {
+    \\    if (int(tid) < off) red[tid] = max(red[tid], red[tid + off]);
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  }
+    \\  // Clamp: a fully-tail-masked block row otherwise feeds exp(-inf - -inf).
+    \\  const float M = max(red[0], -1e30f);
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  float ls = 0.0f;
+    \\  for (int t = int(tid); t < rows; t += NT) {
+    \\    const float p = metal::exp(p_tg[r * BLOCK + t] - M);
+    \\    p_tg[r * BLOCK + t] = p;
+    \\    ls += p;
+    \\  }
+    \\  red[tid] = ls;
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (int off = NT / 2; off > 0; off >>= 1) {
+    \\    if (int(tid) < off) red[tid] += red[tid + off];
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  }
+    \\  if (tid == 0) { ml_tg[r] = M; ml_tg[LQ + r] = red[0]; }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\
+    \\// Partial m/l out: [Hq*TQ, NBLK], rows (head-major, tq inner).
+    \\if (tid < uint(LQ)) {
+    \\  const long r = (long)hkv * LQ + int(tid);
+    \\  m_out[r * (long)nblk + (long)blk] = ml_tg[tid];
+    \\  l_out[r * (long)nblk + (long)blk] = ml_tg[LQ + tid];
+    \\}
+    \\
+    \\const long vq_base = (long)hkv * (long)vq_strides[1];
+    \\const long vs_base = (long)hkv * (long)vsc_strides[1];
+    \\const long vb_base = (long)hkv * (long)vbi_strides[1];
+    \\
+    \\// Phase B: one thread per output element: walk the block's V rows,
+    \\// dequant each element ONCE, feed all LQ row accumulators.
+    \\for (int e = int(tid); e < DV; e += NT) {
+    \\  float accg[LQ];
+    \\  for (int r = 0; r < LQ; ++r) accg[r] = 0.0f;
+    \\  const int wi = e / VPW;
+    \\  const int sh = (e % VPW) * BITS;
+    \\  const int g_idx = e / GS;
+    \\  for (int t = 0; t < rows; ++t) {
+    \\    const long row = vq_base + (long)(t0 + t) * (long)vq_strides[2];
+    \\    const uint w = uint(vq[row + (long)wi]);
+    \\    const float vv = float((w >> sh) & mask_bits) * float(vsc[vs_base + (long)(t0 + t) * (long)vsc_strides[2] + (long)g_idx]) + float(vbi[vb_base + (long)(t0 + t) * (long)vbi_strides[2] + (long)g_idx]);
+    \\    for (int r = 0; r < LQ; ++r) accg[r] += p_tg[r * BLOCK + t] * vv;
+    \\  }
+    \\  for (int r = 0; r < LQ; ++r) {
+    \\    const long orow = (long)hkv * LQ + r;
+    \\    o_out[(orow * (long)nblk + (long)blk) * (long)DV + (long)e] = accg[r];
+    \\  }
+    \\}
+;
+
+var qkv_ver_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQkvVerifyKernel() !mlx.mlx_fast_metal_kernel {
+    if (qkv_ver_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk" };
+    const output_names = [_][*:0]const u8{ "m_out", "l_out", "o_out" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "qkv_attn_verify",
+        in_vec,
+        out_vec,
+        QKV_VERIFY_KERNEL_SOURCE,
+        "",
+        false, // K/V are cache VIEWS — see getQkvDecKernel.
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qkv_ver_kernel_cached = kernel;
+    return kernel;
+}
+
+pub var qkv_ver_override: ?bool = null; // test seam
+var qkv_ver_env: ?bool = null;
+fn qkvVerifyKernelEnabled() bool {
+    if (qkv_ver_override) |v| return v;
+    if (qkv_ver_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    qkv_ver_env = enabled;
+    return enabled;
+}
+
+/// Threadgroup budget for the verify kernel: scores only (q is device-read).
+/// 16 KB rather than decode's 10 KB — at TQ x the arithmetic intensity the
+/// occupancy loss buys more reuse per byte; the live A/B is the judge.
+fn qkvVerifyBlockFor(gqa: c_int, tq: c_int) ?c_int {
+    const lq: i64 = @as(i64, gqa) * @as(i64, tq);
+    const cands = [_]c_int{ 256, 128, 64 };
+    for (cands) |b| {
+        const bytes: i64 = lq * @as(i64, b) * 4 + QKV_DEC_NT * 4 + 8 * lq + 256;
+        if (bytes <= 16_000) return b;
+    }
+    return null;
+}
+
+const QkvVerCfgKey = struct {
+    hq: c_int,
+    dk: c_int,
+    dv: c_int,
+    bits: u8,
+    gs: u32,
+    gqa: c_int,
+    tq: c_int,
+    nblk: c_int,
+    dtype: mlx.mlx_dtype,
+};
+// Per-TQ config slots: verify widths alternate round to round (partial MTP
+// rounds, variable PLD match lengths), so a single-entry cache would rebuild
+// per call — the ShapeKey lesson, one slot per width instead.
+var qkv_ver_cfgs: [@intCast(QKV_VERIFY_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var qkv_ver_cfg_keys: [@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvVerCfgKey = @splat(std.mem.zeroes(QkvVerCfgKey));
+var qkv_ver_engaged_mask: u16 = 0; // one-shot log per TQ
+
+/// Try the verify-width packed-KV attention kernel (T_q 2..8, causal only).
+/// Returns null when a precondition doesn't hold — the caller falls back to
+/// dense SDPA. Preconditions are the kernel's OWN requirements.
+pub fn qkvAttnVerifyKernel(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    view: *const DenseKVView,
+    scale: f32,
+    mask_mode: []const u8,
+) !?mlx.mlx_array {
+    if (!qkvVerifyKernelEnabled()) return null;
+    if (!view.has_quant_triple) return null;
+    if (view.bits != 4 and view.bits != 8) return null;
+    if (view.group_size == 0) return null;
+    if (mlx.mlx_array_ndim(q) != 4) return null;
+    const qs = mlx.getShape(q);
+    const t_q: c_int = qs[2];
+    if (qs[0] != 1 or t_q < 2 or t_q > QKV_VERIFY_MAX_TQ) return null;
+    // The dense path masks these widths "causal" (end-aligned); the kernel
+    // applies exactly that tail from geometry. Anything else declines.
+    if (!std.mem.eql(u8, mask_mode, "causal")) return null;
+    const qdt = mlx.mlx_array_dtype(q);
+    if (qdt != .bfloat16 and qdt != .float16 and qdt != .float32) return null;
+    if (mlx.mlx_array_ndim(view.k_triple_q) != 4 or mlx.mlx_array_ndim(view.v_triple_q) != 4) return null;
+    const ks = mlx.getShape(view.k_triple_q);
+    const vs = mlx.getShape(view.v_triple_q);
+    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
+    const dk: c_int = ks[3] * vpw;
+    const dv: c_int = vs[3] * vpw;
+    if (qs[3] != dk) return null;
+    if (@rem(dk, 32) != 0 or @rem(dv, 32) != 0) return null;
+    // Shape gate is MEASURED adoption (the mixedNaxShapeEnabled rule): every
+    // win shape is dk <= 256 (qwen3_5 24/4 hd256: +4..+7% over dense at
+    // 8k/16k/32k spec-on); gemma4's full-attn gqa16 x dk512 measured a
+    // consistent −1% at Tq 2 (2026-08-15) and reads dense instead.
+    if (dk > 256) return null;
+    if (@rem(dk, @as(c_int, @intCast(view.group_size))) != 0 or @rem(dv, @as(c_int, @intCast(view.group_size))) != 0) return null;
+    const h_q: c_int = qs[1];
+    const h_kv: c_int = ks[1];
+    if (h_kv <= 0 or @rem(h_q, h_kv) != 0) return null;
+    if (vs[1] != h_kv or vs[2] != ks[2] or ks[0] != 1 or vs[0] != 1) return null;
+    const gqa: c_int = @divExact(h_q, h_kv);
+    const lq: c_int = gqa * t_q;
+    if (lq > QKV_DEC_NT) return null; // the m/l writer covers one row per thread
+    const t_k: c_int = ks[2];
+    if (t_k < t_q) return null;
+    const ksc_sh = mlx.getShape(view.k_triple_scales);
+    const vsc_sh = mlx.getShape(view.v_triple_scales);
+    if (ksc_sh.len != 4 or vsc_sh.len != 4) return null;
+    if (ksc_sh[3] != @divExact(dk, @as(c_int, @intCast(view.group_size)))) return null;
+    if (vsc_sh[3] != @divExact(dv, @as(c_int, @intCast(view.group_size)))) return null;
+
+    const kernel = getQkvVerifyKernel() catch return null;
+    const block = qkvVerifyBlockFor(gqa, t_q) orelse return null;
+    const nblk: c_int = @divTrunc(t_k + block - 1, block);
+
+    const slot: usize = @intCast(t_q);
+    const key = QkvVerCfgKey{
+        .hq = h_q,
+        .dk = dk,
+        .dv = dv,
+        .bits = view.bits,
+        .gs = view.group_size,
+        .gqa = gqa,
+        .tq = t_q,
+        .nblk = nblk,
+        .dtype = qdt,
+    };
+    if (qkv_ver_cfgs[slot] == null or !std.meta.eql(qkv_ver_cfg_keys[slot], key)) {
+        if (qkv_ver_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        const rows_total: c_int = h_q * t_q;
+        const ml_shape = [_]c_int{ rows_total, nblk };
+        const o_shape = [_]c_int{ rows_total, nblk, dv };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, QKV_DEC_NT, h_kv, nblk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, QKV_DEC_NT, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", qdt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(view.bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(view.group_size)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", dk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", dv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TQ", t_q));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BLOCK", block));
+        qkv_ver_cfgs[slot] = config;
+        qkv_ver_cfg_keys[slot] = key;
+    }
+
+    const one = [_]c_int{1};
+    const scl_data = [_]f32{scale};
+    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+    const tk_data = [_]i32{t_k};
+    const tk = mlx.mlx_array_new_data(&tk_data, &one, 1, .int32);
+    defer _ = mlx.mlx_array_free(tk);
+
+    const inputs_arr = [_]mlx.mlx_array{
+        q,
+        view.k_triple_q,
+        view.k_triple_scales,
+        view.k_triple_biases,
+        view.v_triple_q,
+        view.v_triple_scales,
+        view.v_triple_biases,
+        scl,
+        tk,
+    };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qkv_ver_cfgs[slot].?, s));
+    const o_t = try qkvMergePartials(s, outputs_vec, qdt);
+    defer _ = mlx.mlx_array_free(o_t);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    const out_shape = [_]c_int{ 1, h_q, 1, dv };
+    const out_shape = [_]c_int{ 1, h_q, t_q, dv };
     try mlx.check(mlx.mlx_reshape(&out, o_t, &out_shape, 4, s));
-    if (!qkv_dec_engaged) {
-        qkv_dec_engaged = true;
-        log.info("[kv-attn] decode kernel engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} mask={} (MLX_SERVE_KV_ATTN_KERNEL=0 restores composed)\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, block, has_mask });
+    const bit: u16 = @as(u16, 1) << @intCast(t_q);
+    if (qkv_ver_engaged_mask & bit == 0) {
+        qkv_ver_engaged_mask |= bit;
+        log.info("[kv-attn] verify kernel engaged: Tq={d} bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} (MLX_SERVE_KV_ATTN_VERIFY=0 restores dense)\n", .{ t_q, view.bits, view.group_size, dk, dv, h_q, h_kv, block });
     }
     return out;
 }
 
 // ── Fused quant-attention gate (docs/kv-quant-perf.md Phase 1) ──
-
-/// Composed quant attention materializes scores `[H_kv, g·T_q, T_k]` in HBM —
-/// KB–MB scale at decode/verify widths, GB scale at prefill widths. This cap
-/// keeps every prefill chunk on flash SDPA over the dense view.
-pub const KV_ATTN_FUSED_MAX_TQ: c_int = 32;
 
 var kv_attn_fused_env: ?bool = null;
 fn kvAttnFusedEnvEnabled() bool {
@@ -4599,11 +5437,14 @@ fn kvAttnFusedEnvEnabled() bool {
 
 /// Per-LAYER kv-length floor: below this the packed read cannot pay for the
 /// kernel's split-KV merge ops (~11 dispatches/layer) — Laguna's 512-window
-/// sliding layers measured a net −2% when they fused. Short-KV layers keep
-/// dense reads even inside a fused request. MLX_SERVE_KV_ATTN_MIN_TK
-/// overrides (correctness tests set 1 so short prompts still exercise the
-/// fused paths; the default is a PERF gate, not a correctness gate).
-pub const KV_ATTN_FUSED_MIN_TK: c_int = 1024;
+/// sliding layers measured a net −2% when they fused, and gemma4-12B's
+/// 1024-window sliding layers sat exactly AT the old 1024 floor and measured
+/// a ~4 tok/s decode loss fused (masked kernel at ~1k KV vs near-free dense
+/// SDPA, 2026-08-15). Short-KV layers keep dense reads even inside a fused
+/// request. MLX_SERVE_KV_ATTN_MIN_TK overrides (correctness tests set 1 so
+/// short prompts still exercise the fused paths; the default is a PERF
+/// gate, not a correctness gate).
+pub const KV_ATTN_FUSED_MIN_TK: c_int = 2048;
 var kv_attn_min_tk_env: ?c_int = null;
 fn kvAttnFusedMinTk() c_int {
     if (kv_attn_min_tk_env) |v| return v;
@@ -4621,8 +5462,27 @@ fn kvAttnFusedMinTk() c_int {
 /// dense-mode reads: batched decode is the packed-words-to-SDPA server-kill
 /// class (guarded by tests/test_batched_equivalence.sh), and diffusion
 /// canvas forwards are prefill-width by construction.
+///
+/// Decode width (t_q == 1) ONLY: that is the width `qkvAttnDecodeKernel`
+/// serves (the measured +10..+56% serial win). Verify widths (T_q 2..32
+/// under MTP/spec) used to be admitted and fell to the composed qmm chain —
+/// 2 packed matmuls x every attention layer per spec round at qmm's M 2..7
+/// dead zone, measured a 2.1x decode LOSS at 8k+ (2026-08-15). They read
+/// the dense view now, like prefill always has. A forced per-request
+/// `kv_attn_mode:"fused"` gets the dense read at those widths too.
 fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q <= KV_ATTN_FUSED_MAX_TQ and kvAttnFusedEnvEnabled())) return false;
+    if (!(view.has_quant_triple and t_q == 1 and kvAttnFusedEnvEnabled())) return false;
+    const ks = mlx.getShape(view.k_triple_q);
+    if (ks.len < 4) return false;
+    return ks[2] >= kvAttnFusedMinTk();
+}
+
+/// Verify-width packed-attention gate (Phase 2): T_q 2..8 served by
+/// `qkvAttnVerifyKernel`, same triple + per-layer kv floor as decode.
+/// Wider multi-token forwards (real prefill chunks) stay on dense SDPA;
+/// MLX_SERVE_KV_ATTN_VERIFY=0 kills the whole width class.
+fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
+    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyKernelEnabled())) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
     return ks[2] >= kvAttnFusedMinTk();
@@ -8178,46 +9038,51 @@ pub const Transformer = struct {
             }
 
             // Fused-attn opt-in: consume the cache's quant triples directly
-            // via mlx_quantized_matmul. Only when the request opts in AND
+            // via the packed decode kernel. Only when the request opts in AND
             // `kvAttnFusedEligible` passes (scheme .affine with triples,
-            // decode/verify widths only — TurboQuant + prefill fall through
-            // to dense SDPA).
+            // decode width only — verify/prefill widths read dense SDPA,
+            // TurboQuant always does). A DECLINED kernel falls through to
+            // the dense arms below: the composed qmm chain measured a −17%
+            // decode LOSS on the shapes the kernel does not serve (gemma4
+            // full-attn, gqa 16 x dk 512, 2026-08-15) and never serves now.
+            var kv_fused_done = false;
             if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
-                logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
-                // The sliding-window prefill mask is built LAZILY (deferred
-                // because the p256 kernel usually covers those layers) — a
-                // small (T_q <= 32) sliding prefill reaching this branch can
-                // therefore carry a null sel_mask. Build it now; passing a
-                // null array into the composed path is the empty-mlx_array
-                // request-kill this exact live failure produced.
+                // The sliding-window mask is built LAZILY (deferred because
+                // the p256 kernel usually covers those layers) — a forward
+                // reaching this branch can therefore carry a null sel_mask.
+                // Only t_q == 1 gets here now, but the guard stays: the
+                // kernel's "array" mode declines a null mask and the dense
+                // array arm below builds its own.
                 if (std.mem.eql(u8, sel_mode, "array") and sel_mask.ctx == null) {
                     local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding_kv_len, @intCast(cfg.sliding_window));
                     sel_mask = local_prefill_mask;
                 }
-                // Decode width rides the packed-read kernel; verify widths
-                // (T_q 2..32) keep the composed qmm chain.
                 if (try qkvAttnDecodeKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode, sel_mask)) |fused| {
+                    logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
-                } else {
-                    const fused = try kv_quant.quantAttention(
-                        q_rope,
-                        kv_view.kTriple(),
-                        kv_view.vTriple(),
-                        kv_view.bits,
-                        kv_view.group_size,
-                        attn_scale,
-                        sel_mode,
-                        sel_mask,
-                        self.s,
-                    );
-                    _ = mlx.mlx_array_free(attn_out);
-                    attn_out = fused;
+                    kv_fused_done = true;
                 }
+            } else if (ctx.kv_attn_fused and kvAttnVerifyEligible(&kv_view, seq_len)) {
+                // Spec-verify widths (Phase 2): packed reads via the TQ-wide
+                // kernel. "array" (sliding) declines inside; dense arms run.
+                if (try qkvAttnVerifyKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode)) |fused| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = fused;
+                    kv_fused_done = true;
+                }
+            }
+            if (kv_fused_done) {
+                // packed kernel handled this layer
             } else if (std.mem.eql(u8, sel_mode, "causal")) {
                 if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
+                } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
+                    // Verify-width (6..9) dense blocks: two vector-path halves
+                    // beat MLX's internal hd-256 fallback.
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = split_out;
                 } else {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
                 }
@@ -10635,32 +11500,37 @@ pub const Transformer = struct {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
 
-        // Fused-attn opt-in: see standard attention site for design notes.
+        // Fused-attn opt-in: see standard attention site for design notes
+        // (kernel-or-DENSE — a declined kernel falls to the arms below).
         const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
+        var kv_fused_done = false;
         if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
-            logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
             if (try qkvAttnDecodeKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe, none_mask)) |fused| {
+                logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
-            } else {
-                const fused = try kv_quant.quantAttention(
-                    q_rope,
-                    kv_view.kTriple(),
-                    kv_view.vTriple(),
-                    kv_view.bits,
-                    kv_view.group_size,
-                    attn_scale,
-                    sel_mode_moe,
-                    none_mask,
-                    self.s,
-                );
-                _ = mlx.mlx_array_free(attn_out);
-                attn_out = fused;
+                kv_fused_done = true;
             }
+        } else if (ctx.kv_attn_fused and kvAttnVerifyEligible(&kv_view, seq_len)) {
+            // Spec-verify widths (Phase 2): is_prefill is seq_len > 1, so
+            // sel_mode_moe is "causal" here — the mode the kernel serves.
+            if (try qkvAttnVerifyKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe)) |fused| {
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = fused;
+                kv_fused_done = true;
+            }
+        }
+        if (kv_fused_done) {
+            // packed kernel handled this layer
         } else if (is_prefill) {
             if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
+            } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
+                // Verify-width (6..9) dense blocks: two vector-path halves
+                // beat MLX's internal hd-256 fallback.
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = split_out;
             } else {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
             }
@@ -11166,11 +12036,10 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(attn_out);
         // Fused quant-KV opt-in (see forwardStandardWith's site for design
         // notes): resolve the SAME mode/mask the dense arms below would use,
-        // then decode width rides the packed-read kernel, verify widths the
-        // composed chain.
+        // then decode rides the packed-read kernel (kernel-or-DENSE — a
+        // declined kernel leaves kv_fused_done false and the dense arms run).
         var kv_fused_done = false;
         if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
-            logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
             var f_mode: []const u8 = "";
             var f_mask: mlx.mlx_array = none_mask;
             if (is_full) {
@@ -11194,11 +12063,7 @@ pub const Transformer = struct {
                 }
             }
             if (try qkvAttnDecodeKernel(self.s, q_rope, &kv_view, attn_scale, f_mode, f_mask)) |f| {
-                _ = mlx.mlx_array_free(attn_out);
-                attn_out = f;
-                kv_fused_done = true;
-            } else {
-                const f = try kv_quant.quantAttention(q_rope, kv_view.kTriple(), kv_view.vTriple(), kv_view.bits, kv_view.group_size, attn_scale, f_mode, f_mask, self.s);
+                logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = f;
                 kv_fused_done = true;
@@ -19224,6 +20089,158 @@ test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
     try qkvDecParityCase(8, 2, 128, 8, 700, true);
 }
 
+fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int) !void {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(bits));
+    defer cache.deinit();
+    const mkArr = struct {
+        fn f(str: mlx.mlx_stream, hh: c_int, tt: c_int, dd: c_int, seed: f32) !mlx.mlx_array {
+            const total: usize = @intCast(hh * tt * dd);
+            const buf = try testing.allocator.alloc(f32, total);
+            defer testing.allocator.free(buf);
+            for (buf, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.37 + seed) * 0.7;
+            const shape = [_]c_int{ 1, hh, tt, dd };
+            const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var bf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str));
+            return bf;
+        }
+    }.f;
+    if (t_prefill > 0) {
+        const k0 = try mkArr(s, h_kv, @intCast(t_prefill), d, 0.4);
+        defer _ = mlx.mlx_array_free(k0);
+        const v0 = try mkArr(s, h_kv, @intCast(t_prefill), d, 1.3);
+        defer _ = mlx.mlx_array_free(v0);
+        var dv0 = try cache.update(0, k0, v0, s, 0);
+        dv0.deinit();
+    }
+    // The verify chunk: t_q new K/V rows appended (the spec contract — the
+    // draft rows are in the cache when attention runs).
+    const k1 = try mkArr(s, h_kv, t_q, d, 2.9);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try mkArr(s, h_kv, t_q, d, 3.3);
+    defer _ = mlx.mlx_array_free(v1);
+    var dv = try cache.update(0, k1, v1, s, 0);
+    defer dv.deinit();
+    try testing.expect(dv.has_quant_triple);
+
+    const q = try mkArr(s, h_q, t_q, d, 5.1);
+    defer _ = mlx.mlx_array_free(q);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+
+    // Reference: dense SDPA over the view's own dequantized K/V, "causal"
+    // (end-aligned) — the exact mode the dense path serves these widths.
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, dv.k, dv.v, scale, "causal", none, .{ .ctx = null }, s));
+
+    const cand = (try qkvAttnVerifyKernel(s, q, &dv, scale, "causal")) orelse return error.KernelDeclined;
+    defer _ = mlx.mlx_array_free(cand);
+    const cand_shape = mlx.getShape(cand);
+    try testing.expectEqual(@as(c_int, 1), cand_shape[0]);
+    try testing.expectEqual(h_q, cand_shape[1]);
+    try testing.expectEqual(t_q, cand_shape[2]);
+    try testing.expectEqual(d, cand_shape[3]);
+
+    const readFlat = struct {
+        fn f(str: mlx.mlx_stream, arr: mlx.mlx_array, allocator: std.mem.Allocator) ![]f32 {
+            var f32v = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32v);
+            try mlx.check(mlx.mlx_astype(&f32v, arr, .float32, str));
+            const n: c_int = @intCast(mlx.mlx_array_size(f32v));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const sh = [_]c_int{n};
+            try mlx.check(mlx.mlx_reshape(&flat, f32v, &sh, 1, str));
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            _ = mlx.mlx_vector_array_append_value(ev, flat);
+            try mlx.check(mlx.mlx_eval(ev));
+            const ptr = mlx.mlx_array_data_float32(flat) orelse return error.NullData;
+            const out = try allocator.alloc(f32, @intCast(n));
+            @memcpy(out, ptr[0..@intCast(n)]);
+            return out;
+        }
+    }.f;
+    const ref_flat = try readFlat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readFlat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        // Finiteness BEFORE the diff (NaN > x is false — the composed causal
+        // arm shipped NaN for months behind exactly this hole).
+        try testing.expect(!std.math.isNan(c));
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    if (max_err >= 0.05) {
+        std.debug.print("qkvVerParityCase Hq={d} Hkv={d} D={d} bits={d} pre={d} Tq={d}: max_err={d}\n", .{ h_q, h_kv, d, bits, t_prefill, t_q, max_err });
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "qkv verify kernel parity: TQ 2..8 x bits x GQA (strided views, causal tail)" {
+    // Mutation-checked: dropping the in-kernel causal tail (gpos < lim) or
+    // mis-ordering the (head, tq) row layout fails the Tq>=2 cases — the
+    // reference is end-aligned SDPA over the SAME dequantized view, so the
+    // tail is load-bearing, not decorative. 37+Tq rows keeps views strided
+    // (capacity slack from the two-update sequence).
+    try qkvVerParityCase(8, 2, 64, 8, 37, 2);
+    try qkvVerParityCase(8, 2, 64, 4, 37, 3);
+    try qkvVerParityCase(12, 2, 128, 8, 37, 4);
+    try qkvVerParityCase(12, 2, 128, 4, 37, 5);
+    try qkvVerParityCase(4, 4, 128, 8, 21, 6); // MHA (GQA=1)
+    try qkvVerParityCase(6, 1, 256, 8, 21, 8); // hd-256, deepest width
+    try qkvVerParityCase(24, 4, 256, 8, 21, 4); // the qwen3_5 live geometry
+}
+
+test "qkv verify kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
+    // GQA 4 x TQ 2 → BLOCK 256; 700+2 rows exercises the multi-block carry,
+    // including a final block whose tail rows are causally -inf for tq 0.
+    try qkvVerParityCase(8, 2, 64, 8, 700, 2);
+    try qkvVerParityCase(8, 2, 128, 8, 700, 6);
+}
+
+test "qkv verify kernel declines non-verify widths and foreign masks" {
+    const s = mlx.gpuStream();
+    var view: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = false };
+    const shape = [_]c_int{ 1, 4, 2, 64 };
+    var q2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q2);
+    try mlx.check(mlx.mlx_ones(&q2, &shape, 4, .bfloat16, s));
+    // no triple → decline regardless of width
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnVerifyKernel(s, q2, &view, 1.0, "causal"));
+    // real triple, wrong widths / modes
+    var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
+    defer cache.deinit();
+    const kshape = [_]c_int{ 1, 2, 40, 64 };
+    var kv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kv);
+    try mlx.check(mlx.mlx_ones(&kv, &kshape, 4, .bfloat16, s));
+    var dv = try cache.update(0, kv, kv, s, 0);
+    defer dv.deinit();
+    var q1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q1);
+    const q1shape = [_]c_int{ 1, 4, 1, 64 };
+    try mlx.check(mlx.mlx_ones(&q1, &q1shape, 4, .bfloat16, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnVerifyKernel(s, q1, &dv, 1.0, "causal")); // T_q 1 belongs to the decode kernel
+    var q9 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q9);
+    const q9shape = [_]c_int{ 1, 4, QKV_VERIFY_MAX_TQ + 1, 64 };
+    try mlx.check(mlx.mlx_ones(&q9, &q9shape, 4, .bfloat16, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnVerifyKernel(s, q9, &dv, 1.0, "causal")); // past the width cap
+    var q4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q4);
+    const q4shape = [_]c_int{ 1, 4, 4, 64 };
+    try mlx.check(mlx.mlx_ones(&q4, &q4shape, 4, .bfloat16, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnVerifyKernel(s, q4, &dv, 1.0, "array")); // sliding masks read dense
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnVerifyKernel(s, q4, &dv, 1.0, "")); // unmasked multi-row is not this kernel's contract
+}
+
 fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize, t_chunk: c_int, mode: [:0]const u8) !void {
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(bits));
@@ -19335,21 +20352,39 @@ fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize
     try testing.expect(max_err < 0.05);
 }
 
-test "composed quantAttention is correct on STRIDED cache views (verify widths)" {
+test "composed quantAttention is correct on STRIDED cache views" {
     // Class guard (splitPackedGateUp rule): slice-born views into
     // mlx_quantized_matmul must compute correctly — the cache's packed views
     // are non-contiguous whenever buffer capacity > logical length. Covers
-    // verify widths, the gemma E4B live geometry (single 15-token chunk,
+    // multi-row widths, the gemma E4B live geometry (single 15-token chunk,
     // hd 256, 4-bit — the "<pad><pad>" shape), and the sliding "array" mask.
+    // (Serving only routes t_q == 1 here since 2026-08-15, but the helper's
+    // contract is width-agnostic and the strided-view class is the point.)
     try composedStridedCase(8, 2, 64, 4, 20, 4, "causal");
     try composedStridedCase(8, 2, 256, 4, 0, 15, "causal");
     try composedStridedCase(8, 2, 256, 4, 0, 15, "array");
     try composedStridedCase(8, 2, 256, 4, 20, 15, "array");
 }
 
+test "fused kv-quant serving arms are kernel-or-DENSE — composed attention never serves" {
+    // gemma4-12B measured (2026-08-15, kv8, 11k ctx): composed reads at
+    // t_q == 1 cost −17% decode on the full-attention layers where
+    // `qkvAttnDecodeKernel` declines (gqa 16 x dk 512 overflows the
+    // threadgroup q-staging budget), and Phase 1 already routes every other
+    // width dense. So a declined kernel falls through to the dense SDPA
+    // arms; the composed helper remains ONLY as the strided-view parity
+    // reference (`composedStridedCase`).
+    const src = @embedFile("transformer.zig");
+    const needle = "kv_quant.quant" ++ "Attention(";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, needle));
+    const only = std.mem.indexOf(u8, src, needle).?;
+    const helper = std.mem.indexOf(u8, src, "fn composedStridedCase(").?;
+    try testing.expect(only > helper);
+}
+
 test "qkv decode kernel declines non-decode widths and missing triples" {
     const s = mlx.gpuStream();
-    // T_q = 2 → decline (verify widths belong to the composed path).
+    // T_q = 2 → decline (only decode width may reach the kernel).
     var view: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = false };
     const shape = [_]c_int{ 1, 4, 2, 64 };
     var q2 = mlx.mlx_array_new();
@@ -19489,11 +20524,17 @@ test "qkv decode kernel µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
     }
 }
 
-test "kvAttnFusedEligible: quant triple + decode/verify widths + per-layer kv floor" {
-    // The ONE gate every fused call site reads. Composed attention
-    // materializes scores [H, g*T_q, T_k] in HBM — prefill widths must never
-    // route through it — and short-KV layers (sliding windows) stay dense:
-    // the kernel's split-KV merge overhead measured a net loss there.
+test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
+    // The ONE gate every fused call site reads. Verify widths (T_q 2..32
+    // under MTP/spec) used to be admitted and fell to the composed qmm
+    // chain — a deliberate choice that predates deep-MTP defaults and was
+    // never A/B'd at spec depth. Measured (M4 Max, 2026-08-15, 8k+ ctx,
+    // deep MTP rounds): 28 tok/s decode vs 60 on the dense read — the
+    // composed chain runs 2 packed matmuls x every attention layer per spec
+    // round, at qmm's M 2..7 dead zone. Decode width keeps the packed-read
+    // kernel win; every other width reads the dense view (the reference
+    // semantics). Short-KV layers (sliding windows) stay dense too: the
+    // kernel's split-KV merge overhead measured a net loss there.
     const s = mlx.gpuStream();
     const long_shape = [_]c_int{ 1, 2, KV_ATTN_FUSED_MIN_TK, 16 };
     var kq_long = mlx.mlx_array_new();
@@ -19508,12 +20549,20 @@ test "kvAttnFusedEligible: quant triple + decode/verify widths + per-layer kv fl
     var view_short: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = true, .k_triple_q = kq_short };
     var view_without: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = false };
     try testing.expect(kvAttnFusedEligible(&view_with, 1));
-    try testing.expect(kvAttnFusedEligible(&view_with, 9));
-    try testing.expect(kvAttnFusedEligible(&view_with, KV_ATTN_FUSED_MAX_TQ));
-    try testing.expect(!kvAttnFusedEligible(&view_with, KV_ATTN_FUSED_MAX_TQ + 1));
-    try testing.expect(!kvAttnFusedEligible(&view_with, 2048));
+    try testing.expect(!kvAttnFusedEligible(&view_with, 2)); // verify width
+    try testing.expect(!kvAttnFusedEligible(&view_with, 9));
+    try testing.expect(!kvAttnFusedEligible(&view_with, 32));
+    try testing.expect(!kvAttnFusedEligible(&view_with, 2048)); // prefill width
     try testing.expect(!kvAttnFusedEligible(&view_short, 1)); // below the kv floor
     try testing.expect(!kvAttnFusedEligible(&view_without, 1));
+    // Phase 2: verify widths (2..QKV_VERIFY_MAX_TQ) have their OWN gate,
+    // serving the TQ-wide packed kernel — never the composed chain.
+    try testing.expect(!kvAttnVerifyEligible(&view_with, 1)); // decode belongs to the decode kernel
+    try testing.expect(kvAttnVerifyEligible(&view_with, 2));
+    try testing.expect(kvAttnVerifyEligible(&view_with, QKV_VERIFY_MAX_TQ));
+    try testing.expect(!kvAttnVerifyEligible(&view_with, QKV_VERIFY_MAX_TQ + 1)); // prefill chunks stay dense
+    try testing.expect(!kvAttnVerifyEligible(&view_short, 4)); // below the kv floor
+    try testing.expect(!kvAttnVerifyEligible(&view_without, 4));
 }
 
 test "KVCache step resets on truncate" {
@@ -24379,6 +25428,144 @@ fn expectVerifyQmmNoWorseThanStock(
     }
 }
 
+test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
+    // The split-K and msg tiles were 4-bit specializations by construction, so
+    // every non-4-bit pack fell through to stock on the whole M1-M4 line — the
+    // Qwen3.8-27B 6-bit pack (95.0% top-1 against bf16 vs the 4-bit pack's
+    // 83.6%) paid the full lane-off penalty on every MTP round. The byte-
+    // addressed unpack lifted from the NAX m16 tile fixes that; this pins it.
+    //
+    // Same bar as the 4-bit test: no worse than stock against an fp32 dequant
+    // reference, never kernel-vs-kernel. Parity is asserted independently of
+    // the PROFITABILITY predicate — `vqmm_mixed_plain_test_force` opens the
+    // gate so a shape the measurement later declines is still proven correct.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB175);
+    const rnd = prng.random();
+
+    vqmm_mixed_plain_test_force = true;
+    defer vqmm_mixed_plain_test_force = null;
+    // The NAX probe must not steal these rows on an M5 box: this test is about
+    // the plain-SIMD lanes, and M 2..7 is below the NAX takeover anyway.
+    vqmm_nax_probe_override = false;
+    defer vqmm_nax_probe_override = null;
+
+    const cases = [_]struct { k: c_int, n: c_int, gs: u32, label: []const u8 }{
+        .{ .k = 5120, .n = 17408, .gs = 64, .label = "mlp" }, // MLP gate/up, split-K
+        .{ .k = 2048, .n = 151936, .gs = 64, .label = "lm_head" }, // huge N, msg tile
+        // The unpack is independent of the group size (gs only indexes the
+        // scale/bias pair), but the forced-on A/B arm adopts every gs, so the
+        // other two are proven rather than argued.
+        .{ .k = 2048, .n = 5120, .gs = 32, .label = "gs32" },
+        .{ .k = 2048, .n = 5120, .gs = 128, .label = "gs128" },
+    };
+    for ([_]u32{ 5, 6, 8 }) |bits| {
+        for (cases) |cs| {
+            const wn: usize = @intCast(cs.n * cs.k);
+            const wbuf = try allocator.alloc(f32, wn);
+            defer allocator.free(wbuf);
+            for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const wshape = [_]c_int{ cs.n, cs.k };
+            const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(cs.gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+            var wq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq);
+            var wsc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wsc);
+            var wbi = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wbi);
+            try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+            var wdq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wdq);
+            try mlx.check(mlx.mlx_dequantize(&wdq, wq, wsc, wbi, mlx.mlx_optional_int.some(@intCast(cs.gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .has_value = true, .value = .float32 }, s));
+            var wdq_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wdq_t);
+            const t_axes = [_]c_int{ 1, 0 };
+            try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
+
+            for ([_]c_int{ 2, 4, 7 }) |m| {
+                const xn: usize = @intCast(m * cs.k);
+                const xbuf = try allocator.alloc(f32, xn);
+                defer allocator.free(xbuf);
+                for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+                const xshape = [_]c_int{ 1, m, cs.k };
+                const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+                defer _ = mlx.mlx_array_free(x32);
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+                const got_opt = try verifyQmm(s, x, wq, wsc, wbi, bits, cs.gs);
+                try testing.expect(got_opt != null);
+                const got = got_opt.?;
+                defer _ = mlx.mlx_array_free(got);
+                const gsh = mlx.getShape(got);
+                try testing.expectEqual(m, gsh[1]);
+                try testing.expectEqual(cs.n, gsh[2]);
+                try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, bits, cs.gs, wdq_t, got, cs.label);
+            }
+
+            // With the gate closed the same shape falls through to stock — the
+            // profitability predicate is what decides adoption, and a lane that
+            // cannot be declined is a lane that cannot be A/B'd.
+            {
+                vqmm_mixed_plain_test_force = false;
+                defer vqmm_mixed_plain_test_force = true;
+                const xbuf = try allocator.alloc(f32, @intCast(4 * cs.k));
+                defer allocator.free(xbuf);
+                for (xbuf) |*v| v.* = 0.1;
+                const xshape = [_]c_int{ 1, 4, cs.k };
+                const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+                defer _ = mlx.mlx_array_free(x32);
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+                try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x, wq, wsc, wbi, bits, cs.gs));
+            }
+        }
+    }
+}
+
+test "mixedPlainShapeEnabled: adoption is what was MEASURED, per width and per shape" {
+    const t = testing;
+    // 4-bit is the original specialization and is always in.
+    try t.expect(mixedPlainShapeEnabled(4, 64, 1024));
+
+    // 6-bit is the measured win (1.10-1.22x on the Qwen3.8-27B 6-bit pack).
+    try t.expect(mixedPlainShapeEnabled(6, 64, MIXED_PLAIN_MIN_N));
+    try t.expect(mixedPlainShapeEnabled(6, 64, 17408));
+    // Narrow projections (GDN ba, K/V) are where the byte-addressed unpack
+    // loses to stock — the same shape-dependence mixedNaxShapeEnabled encodes,
+    // and forcing them on gave back ~10 of the ~20 points.
+    try t.expect(!mixedPlainShapeEnabled(6, 64, MIXED_PLAIN_MIN_N - 1));
+    try t.expect(!mixedPlainShapeEnabled(6, 64, 1024));
+    // Only gs 64 was measured.
+    try t.expect(!mixedPlainShapeEnabled(6, 32, 17408));
+    try t.expect(!mixedPlainShapeEnabled(6, 128, 17408));
+
+    // 8-bit HAS a correct kernel arm and a parity test, and is still default
+    // OFF: measured 1.01-1.04x, inside what this harness resolves. 5-bit has
+    // the arm too but no pack on the measuring box, so it does not get to ride
+    // 6-bit's number. Both are one env var from on — an unmeasured default is
+    // the thing this predicate exists to prevent.
+    for ([_]u32{ 5, 8 }) |b| {
+        try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
+    }
+    // A width with no unpack arm is never adopted, whatever the shape.
+    for ([_]u32{ 2, 3, 7 }) |b| try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
+}
+
 test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit affine)" {
     // The spec-verify fast path: stock MLX qmm is tuned for M=1 (qmv) and
     // large M (steel); the 2..8-row verify shapes fall in a dead zone.
@@ -24687,7 +25874,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
             const xsh = mlx.getShape(x);
-            const got = (try runVerifyQmmMsg(s, x, wq, wsc, wbi, 64, m, mk, mn, .bfloat16, xsh)).?;
+            const got = (try runVerifyQmmMsg(s, x, wq, wsc, wbi, 4, 64, m, mk, mn, .bfloat16, xsh)).?;
             defer _ = mlx.mlx_array_free(got);
 
             try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, 64, wdq_t, got, "msg ragged-N");
@@ -24703,42 +25890,155 @@ test "vqmmLaneFor: NAX dispatch table (M 8..16 route to the m16 tile only when t
 
     // Plain-SIMD machine (probe false): the table is byte-identical to the
     // pre-NAX dispatch — M 8..16 fall through to stock.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 151936, nax_off, 8));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, nax_off, 8));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(16, 5120, 17408, nax_off, 8));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 151936, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(16, 5120, 17408, nax_off, 8, false));
     // Geometry floors shared by every lane.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 256, nax_off, 8)); // N < 512
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 100, 17408, nax_off, 8)); // K % 64 != 0
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 17409, nax_off, 8)); // N % 4 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 256, nax_off, 8, false)); // N < 512
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 100, 17408, nax_off, 8, false)); // K % 64 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 17409, nax_off, 8, false)); // N % 4 != 0
 
     // M5 (probe true), default takeover width 8: M 2..7 KEEP the plain-SIMD
     // lanes (MTPLX's own dispatcher keeps SIMD through M=6 with NAX lit —
     // 16-row padding waste makes SIMD competitive at small M).
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_on, 8));
-    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(7, 5120, 151936, nax_on, 8));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(7, 5120, 151936, nax_on, 8, false));
     // M 8..16 route to the NAX tile when its stricter geometry holds…
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8));
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(16, 5120, 17408, nax_on, 8));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(16, 5120, 17408, nax_on, 8, false));
     // …including the lm_head class natively (N=151936 % 32 == 0 — no msg
     // variant needed past M=7).
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(9, 5120, 151936, nax_on, 8));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(9, 5120, 151936, nax_on, 8, false));
     // Tile-ineligible geometry at M 8..16 stays stock: K % 256, N % 32.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_on, 8)); // 5184 % 256 == 64
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_on, 8)); // 17412 % 32 == 4
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(17, 5120, 17408, nax_on, 8)); // past every lane
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8)); // M=1 stays qmv
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8)); // tiny-N floor holds for NAX too
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_on, 8, false)); // 5184 % 256 == 64
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_on, 8, false)); // 17412 % 32 == 4
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(17, 5120, 17408, nax_on, 8, false)); // past every lane
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8, false)); // M=1 stays qmv
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8, false)); // tiny-N floor holds for NAX too
 
     // The M5-day A/B knob (MLX_SERVE_VERIFY_QMM_NAX_MIN_M=5): M 5..7 route
     // to NAX, M 4 keeps split-K, and the tile geometry is still required —
     // a lowered width never bypasses it, it falls back to the SIMD lanes.
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5));
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5)); // K % 256 fails, % 64 holds
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5, false));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5, false)); // K % 256 fails, % 64 holds
+
+    // Crossrow (opt-in): M 8..9 on plain-SIMD machines at its own geometry
+    // (K % 512, N % 8, N >= 1024); NAX outranks it, 2..7 stays split-K, and
+    // with the opt-in off the M 8..16 fall-through is unchanged.
+    try testing.expectEqual(VqmmLane.crossrow, vqmmLaneFor(8, 5120, 17408, nax_off, 8, true));
+    try testing.expectEqual(VqmmLane.crossrow, vqmmLaneFor(9, 5120, 17408, nax_off, 8, true));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(10, 5120, 17408, nax_off, 8, true)); // past the pair tile
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_off, 8, true)); // K % 512 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_off, 8, true)); // N % 8 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 1016, nax_off, 8, true)); // their host gate: N >= 1024
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8, true)); // NAX outranks
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8, true));
+}
+
+test "verifyQmm: crossrow M 8/9 lane matches stock qmm (4-bit g64, opt-in)" {
+    // Same bar as the split-K/msg/NAX parity test: no worse than stock
+    // against the fp32 dequant ground truth (reduction order differs, so
+    // agreement-with-stock is not the bar — the verify-lane rule).
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC805);
+    const rnd = prng.random();
+
+    vqmm_crossrow_override = true;
+    defer vqmm_crossrow_override = null;
+    vqmm_nax_probe_override = false; // pin the plain-SIMD dispatch on an M5 too
+    defer vqmm_nax_probe_override = null;
+
+    const cases = [_]struct { k: c_int, n: c_int }{
+        .{ .k = 5120, .n = 2048 }, // trunk-projection class
+        .{ .k = 1536, .n = 17408 }, // MLP-width class, K = 3 x 512
+    };
+    for (cases) |cs| {
+        const wn: usize = @intCast(cs.n * cs.k);
+        const wbuf = try allocator.alloc(f32, wn);
+        defer allocator.free(wbuf);
+        for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+        const wshape = [_]c_int{ cs.n, cs.k };
+        const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        var wsc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wsc);
+        var wbi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wbi);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+        var wdq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wdq);
+        try mlx.check(mlx.mlx_dequantize(&wdq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .has_value = true, .value = .float32 }, s));
+        var wdq_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wdq_t);
+        const t_axes = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
+
+        // M=8 exercises the all-pairs path, M=9 the zeroed-tail single arm.
+        for ([_]c_int{ 8, 9 }) |m| {
+            const xn: usize = @intCast(m * cs.k);
+            const xbuf = try allocator.alloc(f32, xn);
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const xshape = [_]c_int{ 1, m, cs.k };
+            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+            const got = (try verifyQmm(s, x, wq, wsc, wbi, 4, 64)) orelse return error.CrossrowDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            const gsh = mlx.getShape(got);
+            try testing.expectEqual(@as(c_int, 1), gsh[0]);
+            try testing.expectEqual(m, gsh[1]);
+            try testing.expectEqual(cs.n, gsh[2]);
+            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, 64, wdq_t, got, "crossrow");
+        }
+
+        // gs 32 must not enter the 4/g64 specialization even with the
+        // opt-in on (falls to stock = null at these M).
+        {
+            var t32 = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(t32);
+            try mlx.check(mlx.mlx_quantize(&t32, wb, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+            var wq32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq32);
+            var ws32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ws32);
+            var wb32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb32);
+            try mlx.check(mlx.mlx_vector_array_get(&wq32, t32, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&ws32, t32, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wb32, t32, 2));
+            const xbuf = try allocator.alloc(f32, @intCast(8 * cs.k));
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = 0.1;
+            const xshape = [_]c_int{ 1, 8, cs.k };
+            const x32b = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x32b);
+            var x8 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x8);
+            try mlx.check(mlx.mlx_astype(&x8, x32b, .bfloat16, s));
+            try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x8, wq32, ws32, wb32, 4, 32));
+        }
+    }
 }
 
 test "mixedNaxShapeEnabled keeps measured q5/q6 wins and rejects narrow regressions" {
@@ -27064,6 +28364,116 @@ test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged
 
     const max_diff = try attn256MaxDiff(fused, ref, s);
     try std.testing.expect(max_diff < 0.005);
+}
+
+/// Like attn256MaxDiff but errors on any non-finite element on either side —
+/// NaN > max_err is false, so an all-NaN pair would otherwise diff to 0.
+fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b32, b, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const bd = mlx.mlx_array_data_float32(b32) orelse return error.InvalidDtype;
+    const n = mlx.mlx_array_size(a32);
+    if (n != mlx.mlx_array_size(b32)) return error.ShapeMismatch;
+    var max_diff: f32 = 0;
+    for (0..n) |i| {
+        if (!std.math.isFinite(ad[i]) or !std.math.isFinite(bd[i])) return error.NonFinite;
+        max_diff = @max(max_diff, @abs(ad[i] - bd[i]));
+    }
+    return max_diff;
+}
+
+test "splitCausalSdpa: parity vs single causal sdpa at every verify width (q 6..9)" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5D9A);
+    const rnd = prng.random();
+
+    // Qwen3.6-27B verify geometry: gqa 6 (24/4 scaled to 6/2 hd 256), long-ish
+    // KV so the chunk-A window (kL - (qL-5)) differs measurably from full kL.
+    const kL: c_int = 193;
+    var qL: c_int = 6;
+    while (qL <= 9) : (qL += 1) {
+        const q_shape = [_]c_int{ 1, 6, qL, 256 };
+        const kv_shape = [_]c_int{ 1, 2, kL, 256 };
+        const q = try attn256RandBf16(rnd, &q_shape, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try attn256RandBf16(rnd, &kv_shape, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &kv_shape, s);
+        defer _ = mlx.mlx_array_free(v);
+        const scale: f32 = 1.0 / 16.0;
+
+        const split = (try splitCausalSdpa(s, q, k, v, scale)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(split);
+        const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+        defer _ = mlx.mlx_array_free(ref);
+
+        // Tolerance, not byte-identity: the split changes which sdpa kernel
+        // runs and therefore the reduction order (the verify-lane rule).
+        const max_diff = try attn256FiniteMaxDiff(split, ref, s);
+        try std.testing.expect(max_diff < 0.005);
+    }
+}
+
+test "splitCausalSdpa: declines outside its envelope" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5DEC);
+    const rnd = prng.random();
+
+    const kv_shape = [_]c_int{ 1, 2, 64, 256 };
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+
+    // q_len 5 (vector path already serves it) and 10 (above the split window).
+    const q5_shape = [_]c_int{ 1, 6, 5, 256 };
+    const q5 = try attn256RandBf16(rnd, &q5_shape, s);
+    defer _ = mlx.mlx_array_free(q5);
+    try std.testing.expect((try splitCausalSdpa(s, q5, k, k, 1.0)) == null);
+    const q10_shape = [_]c_int{ 1, 6, 10, 256 };
+    const q10 = try attn256RandBf16(rnd, &q10_shape, s);
+    defer _ = mlx.mlx_array_free(q10);
+    try std.testing.expect((try splitCausalSdpa(s, q10, k, k, 1.0)) == null);
+
+    // Batch 2 -> null (their gate; the exactness argument is B==1 only).
+    const qb_shape = [_]c_int{ 2, 6, 7, 256 };
+    const qb = try attn256RandBf16(rnd, &qb_shape, s);
+    defer _ = mlx.mlx_array_free(qb);
+    const kb_shape = [_]c_int{ 2, 2, 64, 256 };
+    const kb = try attn256RandBf16(rnd, &kb_shape, s);
+    defer _ = mlx.mlx_array_free(kb);
+    try std.testing.expect((try splitCausalSdpa(s, qb, kb, kb, 1.0)) == null);
+
+    // head_dim 128 -> null (MLX's own full kernel already covers it).
+    const q128_shape = [_]c_int{ 1, 6, 7, 128 };
+    const q128 = try attn256RandBf16(rnd, &q128_shape, s);
+    defer _ = mlx.mlx_array_free(q128);
+    const k128_shape = [_]c_int{ 1, 2, 64, 128 };
+    const k128 = try attn256RandBf16(rnd, &k128_shape, s);
+    defer _ = mlx.mlx_array_free(k128);
+    try std.testing.expect((try splitCausalSdpa(s, q128, k128, k128, 1.0)) == null);
+
+    // KV shorter than q -> null (no window to split).
+    const kshort_shape = [_]c_int{ 1, 2, 5, 256 };
+    const kshort = try attn256RandBf16(rnd, &kshort_shape, s);
+    defer _ = mlx.mlx_array_free(kshort);
+    const q7_shape = [_]c_int{ 1, 6, 7, 256 };
+    const q7 = try attn256RandBf16(rnd, &q7_shape, s);
+    defer _ = mlx.mlx_array_free(q7);
+    try std.testing.expect((try splitCausalSdpa(s, q7, kshort, kshort, 1.0)) == null);
+
+    // Kill switch -> null even for a conforming call.
+    sdpa_split_override = false;
+    try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
 }
 
 // ── KV cache growth policy (issue #110) ──────────────────────────────────────

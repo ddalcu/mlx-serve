@@ -19,6 +19,7 @@ const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
+const launch_mod = @import("launch.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const version_mod = @import("version.zig");
@@ -77,6 +78,12 @@ fn printUsage(io: std.Io) void {
         \\  list                Show downloaded models
         \\  serve               Start the server over ~/.mlx-serve/models
         \\                      (every pulled model loads on demand by name)
+        \\  launch <agent>      Configure + launch a coding agent CLI against the
+        \\                      local server (claude, pi, omp, opencode, codex,
+        \\                      hermes, aider); starts the MLX Core app if the
+        \\                      server is down. `mlx-serve launch <agent> -h` for
+        \\                      options
+
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -188,8 +195,8 @@ fn printUsage(io: std.Io) void {
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
-        \\                        the packed cache in place (custom kernel at
-        \\                        decode width, composed qmm at verify widths);
+        \\                        the packed cache in place at decode width
+        \\                        (spec verify + prefill always read dense);
         \\                        `auto` (default) picks fused from 8K prompt
         \\                        tokens. Only effective at --kv-quant 4 or 8;
         \\                        per-request `kv_attn_mode` field overrides.
@@ -395,8 +402,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "serve")) {
             arg_start = 2;
             use_default_models_root = true;
+        } else if (std.mem.eql(u8, cmd, "launch")) {
+            if (args.len < 3) {
+                log.err("usage: mlx-serve launch <agent> — supported: {s}\n", .{launch_mod.AgentKind.names});
+                std.process.exit(1);
+            }
+            try launch_mod.cmdLaunch(allocator, io, args[2..]);
+            return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -628,8 +642,15 @@ pub fn main(init: std.process.Init) !void {
             warmup_eager = false;
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
-            const v = std.fmt.parseInt(usize, args[i], 10) catch 8192;
-            generate_mod.prefill_chunk_override = v;
+            // `explicit` disables the machine-sized pin, so only a real width
+            // earns it — a typo'd value keeps the defaults (flag-absent
+            // behavior), never a silent 8192 that also switches sizing off.
+            if (std.fmt.parseInt(usize, args[i], 10)) |v| {
+                if (v > 0) {
+                    generate_mod.prefill_chunk_override = v;
+                    generate_mod.prefill_chunk_explicit = true;
+                }
+            } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {

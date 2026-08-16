@@ -6,8 +6,8 @@ options:
 
 settings:
   base:
-    # swift-sdk 0.10.x breaks under Swift 6 language mode — same pin rationale
-    # as build.sh's `-swift-version 5`.
+    # Keep MLXCore itself in Swift 5 mode. SwiftPM dependencies retain the
+    # language modes declared by their own manifests (swift-sdk stays >= 0.12.1).
     SWIFT_VERSION: "5.0"
     # The script phases write into the built .app and read Homebrew paths.
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
@@ -27,6 +27,10 @@ packages:
     url: https://github.com/migueldeicaza/SwiftTerm.git
     minVersion: 1.14.0
     maxVersion: 2.0.0
+  SwaTex:
+    url: https://github.com/PhraseHQ/SwaTex
+    minVersion: 0.5.0
+    maxVersion: 0.6.0
 
 targets:
   MLXCore:
@@ -52,6 +56,8 @@ targets:
         product: SwiftOGG
       - package: SwiftTerm
         product: SwiftTerm
+      - package: SwaTex
+        product: SwaTexRender
     settings:
       base:
         # CFBundleExecutable in Info-MAS.plist is MLXCore.

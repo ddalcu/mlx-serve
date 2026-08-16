@@ -60,10 +60,17 @@ struct MCPServerEntry: Codable, Equatable {
     var command: String?
     /// Stdio transport — args passed to `command`.
     var args: [String]?
-    /// HTTP transport — the server URL. We accept and persist these so users can paste configs from
-    /// other MCP hosts, but we don't *spawn* HTTP servers yet (stdio only). The marketplace surfaces
-    /// these with an "HTTP transport — not yet supported" tag instead of silently dropping them.
+    /// HTTP transport — the server URL. Connected by `MCPManager.connectHTTP` (no subprocess,
+    /// the SDK's `HTTPClientTransport` with SSE streaming).
     var url: String?
+    /// HTTP transport — request headers sent on EVERY request (`Authorization` tokens, API
+    /// versions). This was an unknown key once: JSONDecoder dropped it silently, so the token
+    /// never reached the server, and the next save DELETED it from the user's hand-edited file.
+    var headers: [String: String]?
+    /// Pass-through transport tag other MCP hosts write ("remote", "http", "sse"). We do not
+    /// interpret it — transport derives from `url`/`command` presence — but a field we don't
+    /// model is a field save() strips, so it is kept for round-trip fidelity.
+    var type: String?
     var env: [String: String]?
     /// Our extension (Claude Desktop ignores unknown keys). Treat missing/false as enabled.
     var disabled: Bool?
@@ -73,10 +80,13 @@ struct MCPServerEntry: Codable, Equatable {
     var cwd: String?
 
     init(command: String? = nil, args: [String]? = nil, url: String? = nil,
+         headers: [String: String]? = nil, type: String? = nil,
          env: [String: String]? = nil, disabled: Bool? = nil, cwd: String? = nil) {
         self.command = command
         self.args = args
         self.url = url
+        self.headers = headers
+        self.type = type
         self.env = env
         self.disabled = disabled
         self.cwd = cwd

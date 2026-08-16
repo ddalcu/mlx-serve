@@ -85,13 +85,12 @@ jobs:
       - name: Run Zig tests
         run: zig build test --summary all
 
-      # Swift 5 language mode: the swift-sdk pin needs it under Xcode 26's
-      # Swift 6.3 or NetworkTransport.swift fails with SendingRisksDataRace
-      # (matches app/build.sh + release.yml).
+      # Do not force one Swift language mode through the dependency graph.
+      # Each package's manifest owns its mode (SwaTex requires Swift 6.1).
       - name: Build Swift app
         working-directory: app
-        run: swift build -c release -Xswiftc -swift-version -Xswiftc 5
+        run: swift build -c release
 
       - name: Run Swift tests
         working-directory: app
-        run: swift test -Xswiftc -swift-version -Xswiftc 5
+        run: swift test

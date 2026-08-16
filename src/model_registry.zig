@@ -460,6 +460,14 @@ pub const LoadedModel = struct {
         }
         self.drafter_block_size = 0;
         self.bytes_resident = 0;
+        // The prefill-chunk pin was resolved from LIVE memory at load, so it
+        // can be stale-narrow (pinned while a since-evicted model was
+        // resident). Widening a RESIDENT model's pin would let a prefill run
+        // wider than a bill the guard already issued, so the re-resolve rides
+        // the reload: clear it here and the next load's `server.pinPrefillChunk`
+        // re-pins from then-current memory. `pinned_context` stays — clients
+        // budget against it for the whole session.
+        if (self.config) |c| c.pinned_prefill_chunk = 0;
         self.state = .unloaded;
     }
 };
@@ -1279,6 +1287,30 @@ test "ModelRegistry: ensureLoaded + release refcount math" {
     try testing.expectEqual(@as(u32, 1), lm.refcount.load(.acquire));
     reg.release(b);
     try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
+}
+
+test "unloadResident resets the prefill-chunk pin but never the context pin" {
+    // The chunk is pinned from LIVE memory (server.pinPrefillChunk), so a
+    // model loaded while a bigger one was resident pins narrow — and the pin
+    // is idempotent, so without this reset it stays narrow for the rest of
+    // the session even after the pressure is gone. Widening a RESIDENT
+    // model's pin would let a prefill run wider than a bill the admission
+    // guard already issued, so the re-resolve rides the reload instead:
+    // eviction clears the pin and the next load re-pins from then-current
+    // memory. `pinned_context` is the number clients budget against for the
+    // whole session — that one stays frozen.
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+    const cfg = try testing.allocator.create(ModelConfig);
+    cfg.* = .{};
+    cfg.pinned_prefill_chunk = 512;
+    cfg.pinned_context = 8192;
+    lm.config = cfg;
+
+    lm.unloadResident();
+    try testing.expectEqual(@as(u32, 0), cfg.pinned_prefill_chunk);
+    try testing.expectEqual(@as(u32, 8192), cfg.pinned_context);
 }
 
 test "ModelRegistry: default routing on empty / mlx-serve" {

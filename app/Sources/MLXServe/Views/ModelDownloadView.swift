@@ -45,7 +45,7 @@ struct ModelDownloadRow: View {
                 } else if let state, state.status == .downloading {
                     HStack(spacing: 6) {
                         VStack(alignment: .trailing, spacing: 1) {
-                            ProgressView(value: state.fileProgress)
+                            ProgressView(value: state.progress)
                                 .frame(width: 60)
                             Text("\(state.percentFormatted) \(state.speedFormatted)")
                                 .font(.system(size: 8).monospacedDigit())

@@ -1,5 +1,14 @@
+import Combine
 import XCTest
 @testable import MLXCore
+
+/// Collects published progress values from a Combine sink.
+private final class ProgressSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Double] = []
+    func append(_ v: Double) { lock.withLock { storage.append(v) } }
+    var values: [Double] { lock.withLock { storage } }
+}
 
 /// Drives the REAL `DownloadManager.download(repoId:)` loop — tree listing,
 /// per-file retry, resume, commit, cancel — against a stub Hugging Face origin.
@@ -51,6 +60,38 @@ final class DownloadManagerTransferTests: XCTestCase {
         }
         XCTAssertTrue(Self.strays(in: dir).isEmpty, "left behind: \(Self.strays(in: dir))")
         XCTAssertTrue(manager.isReady(repoId))
+    }
+
+    func testTheProgressBarOnlyEverMovesForward() async throws {
+        // Every bar in the app used to render the CURRENT FILE's fraction, so a
+        // repo of N files ran 0→100% N times and people read the resets as a
+        // download that kept restarting. `progress` is the whole transfer, and
+        // the fixture is the shape that exposes the difference: two tiny files
+        // and then a 40 MB one, so per-file progress fills the bar twice before
+        // the real work starts.
+        HuggingFaceStubProtocol.serve(repo: repoId, files: Self.fixtureFiles())
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        let samples = ProgressSamples()
+        let repo = repoId
+        let sub = manager.$downloads.sink { d in
+            if let p = d[repo]?.progress { samples.append(p) }
+        }
+        defer { sub.cancel() }
+
+        await manager.download(repoId: repoId)
+        XCTAssertEqual(manager.downloads[repoId]?.status, .completed)
+
+        let values = samples.values
+        XCTAssertGreaterThan(values.count, 3, "no progress was published")
+        XCTAssertEqual(values, values.sorted(),
+                       "progress went backwards — the bar resets: \(values)")
+        // The two small files are ~40 bytes of a 40 MB transfer. Finishing them
+        // must barely move the bar; a per-file fraction would report 100%.
+        let firstMove = try XCTUnwrap(values.first { $0 > 0 })
+        XCTAssertLessThan(firstMove, 0.01,
+                          "finishing the first small file filled the bar (\(firstMove))")
+        XCTAssertEqual(values.last, 1.0)
     }
 
     func testTheBigFileActuallyUsedManyConnections() async throws {
