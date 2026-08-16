@@ -1394,6 +1394,20 @@ pub const Generator = struct {
         /// prefill saturates the GPU while both tiles read 0 / "—". The
         /// scheduler resets it to 0 when the prefill ends.
         prefill_progress: ?*std.atomic.Value(u64) = null,
+
+        /// Called once per completed prefill chunk boundary (chunk state
+        /// evaluated, allocator cache cleared), except the final one. The
+        /// scheduler runs decode ticks for the streams already decoding at
+        /// this seam, so a long cold prefill stalls them for at most one
+        /// chunk-forward instead of its whole duration. Null = the prefill
+        /// runs atomically (pre-interleave behavior, and the
+        /// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch).
+        interleave_hook: ?InterleaveHook = null,
+    };
+
+    pub const InterleaveHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) void,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -1871,6 +1885,11 @@ pub const Generator = struct {
                 // Publish progress once per chunk — same cadence discipline as
                 // `inflight_generated_tokens` (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
+                // Yield to the scheduler between chunks — never after the
+                // last (the post-prefill decode tick covers that boundary).
+                if (pos < loop_end) {
+                    if (options.interleave_hook) |hk| hk.call(hk.ctx);
+                }
             }
 
             // Phase 1: always-on snapshot at the post-prefill position
@@ -10862,4 +10881,20 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, gen.generated_ids.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
+}
+
+test "prefill chunk loop yields to the interleave hook between chunks, never after the last" {
+    // The scheduler runs decode ticks for active streams at this seam so a
+    // long prefill cannot stall them for its whole duration. The final
+    // boundary is excluded: the post-prefill decode tick covers it.
+    const src = @embedFile("generate.zig");
+    const progress = "if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);";
+    const at = std.mem.indexOf(u8, src, progress) orelse return error.ProgressPublishMissing;
+    const guard = "if (pos < loop_end) {";
+    const guard_at = std.mem.indexOfPos(u8, src, at, guard) orelse return error.InterleaveGuardMissing;
+    const call = "if (options.interleave" ++ "_hook) |hk| hk.call(hk.ctx);";
+    const call_at = std.mem.indexOfPos(u8, src, guard_at, call) orelse return error.InterleaveCallMissing;
+    // The call sits INSIDE the guard (same statement block, before the loop
+    // re-tests `pos`), not somewhere later in the file.
+    try std.testing.expect(call_at - guard_at < 200);
 }
