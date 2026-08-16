@@ -15,7 +15,7 @@ final class DownloadCompletionGateTests: XCTestCase {
             .deletingLastPathComponent()  // Tests
             .deletingLastPathComponent()  // app
             .appendingPathComponent(relativePath)
-        return try String(contentsOf: url, encoding: .utf8)
+        return SourceScan.normalizingLocalization(try String(contentsOf: url, encoding: .utf8))
     }
 
     /// Slice a function body out of a source file (from its declaration to the

@@ -11,7 +11,7 @@ final class AgentsPanelTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relativePath)
-        return try String(contentsOf: url, encoding: .utf8)
+        return SourceScan.normalizingLocalization(try String(contentsOf: url, encoding: .utf8))
     }
 
     /// Every affordance the old editor had. Named individually so a failure

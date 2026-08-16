@@ -483,7 +483,7 @@ struct VideoGenView: View {
             } else {
                 // The same well the Image and 3D panes' empty states draw —
                 // one shape for "a picture goes here" across the four panes.
-                MediaDropWell(title: "Choose image...",
+                MediaDropWell(title: String(localized: "Choose image..."),
                               systemImage: "photo.on.rectangle.angled",
                               isTargeted: isDropTargeted) { chooseFirstFrameImage() }
                     .help("Select an image to use as the first frame of the video.")
@@ -519,19 +519,19 @@ struct VideoGenView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
-                refList(title: "Images", limit: H3RefLimits.images, urls: $refImageURLs,
+                refList(title: String(localized: "Images"), limit: H3RefLimits.images, urls: $refImageURLs,
                         addLabel: "Add image...", systemImage: "photo.on.rectangle.angled") {
                     chooseRefFiles(types: [.image, .png, .jpeg, .heic],
                                    limit: refRemaining(perType: H3RefLimits.images, current: refImageURLs.count),
                                    into: $refImageURLs)
                 }
-                refList(title: "Clips", limit: H3RefLimits.videos, urls: $refVideoURLs,
+                refList(title: String(localized: "Clips"), limit: H3RefLimits.videos, urls: $refVideoURLs,
                         addLabel: "Add clip...", systemImage: "film") {
                     chooseRefFiles(types: [.movie, .mpeg4Movie, .quickTimeMovie],
                                    limit: refRemaining(perType: H3RefLimits.videos, current: refVideoURLs.count),
                                    into: $refVideoURLs)
                 }
-                refList(title: "Audio", limit: H3RefLimits.audios, urls: $refAudioURLs,
+                refList(title: String(localized: "Audio"), limit: H3RefLimits.audios, urls: $refAudioURLs,
                         addLabel: "Add audio...", systemImage: "waveform") {
                     chooseRefFiles(types: [.audio, .mp3, .wav, .mpeg4Audio],
                                    limit: refRemaining(perType: H3RefLimits.audios, current: refAudioURLs.count),
@@ -856,7 +856,7 @@ struct VideoGenView: View {
             }
             // Steps — more steps = more detail/smoother motion, but slower.
             intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
-                         help: "Denoising steps. More = more detail and smoother motion, but slower.")
+                         help: String(localized: "Denoising steps. More = more detail and smoother motion, but slower."))
             Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
                 .font(.caption2).foregroundStyle(.secondary)
 
@@ -865,14 +865,14 @@ struct VideoGenView: View {
             // would be a dead control (the Mage-Flow class).
             if model.supportsCFG {
                 sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
-                          help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
+                          help: String(localized: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest)."))
                 Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
             HStack {
-                SeedField(label: "Seed", placeholder: "42", range: 0...Int.max, value: $seed,
-                          help: "Same seed + same settings reproduces the clip. Paste one to rerun someone else's.")
+                SeedField(label: String(localized: "Seed"), placeholder: "42", range: 0...Int.max, value: $seed,
+                          help: String(localized: "Same seed + same settings reproduces the clip. Paste one to rerun someone else's."))
                 Spacer()
             }
             if model.supportsTurbo {

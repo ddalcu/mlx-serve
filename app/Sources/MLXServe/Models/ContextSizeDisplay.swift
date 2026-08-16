@@ -27,10 +27,11 @@ enum ContextSizeDisplay {
 
     /// Body copy under the slider. Shared with `ServerOptions.serverFlagFields`
     /// so the two descriptions of "Auto" cannot drift.
-    static let helpText =
-        "Maximum prompt + completion tokens. \"Auto\" fits the model to available "
-        + "memory when it loads — well under the model max — and holds that value "
-        + "until the server restarts. Higher values use more memory."
+    /// One literal, not a `+` chain: a catalog key is the whole finished
+    /// sentence, and a translator cannot be handed three fragments whose word
+    /// order Chinese does not keep.
+    static let helpText = String(localized:
+        "Maximum prompt + completion tokens. \"Auto\" fits the model to available memory when it loads — well under the model max — and holds that value until the server restarts. Higher values use more memory.")
 
     /// The context the RUNNING server settled on, formatted for the pill.
     /// nil until the server has reported a loaded model.

@@ -375,12 +375,12 @@ extension TaskAutonomy {
 extension RunStatus {
     var label: String {
         switch self {
-        case .scheduled: "Scheduled"
-        case .running: "Running…"
-        case .completed: "Completed"
-        case .failed: "Failed"
-        case .needsApproval: "Waiting for approval"
-        case .cancelled: "Cancelled"
+        case .scheduled: String(localized: "Scheduled")
+        case .running: String(localized: "Running…")
+        case .completed: String(localized: "Completed")
+        case .failed: String(localized: "Failed")
+        case .needsApproval: String(localized: "Waiting for approval")
+        case .cancelled: String(localized: "Cancelled")
         }
     }
     var iconName: String {

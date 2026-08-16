@@ -285,6 +285,25 @@ jobs:
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
 
+          # Localizations: the String Catalog compiled into <lang>.lproj inside
+          # Contents/Resources, where Bundle.main looks. Mirrors app/build.sh —
+          # this job assembles its own bundle, so a step that lives only in
+          # build.sh ships a release that is English for everyone. Hard failure
+          # rather than `|| true`: a silently English DMG is the whole bug.
+          xcrun xcstringstool compile app/Localization/Localizable.xcstrings \
+            --output-directory "$CONTENTS/Resources"
+          # One .lproj per language the catalog carries — asked FOR by the
+          # catalog rather than named here, so adding a language cannot leave
+          # this check still guarding only the first one.
+          for lang in $(python3 -c "
+          import json
+          c = json.load(open('app/Localization/Localizable.xcstrings'))
+          langs = {l for e in c['strings'].values() for l in e.get('localizations', {})}
+          print(' '.join(sorted(langs | {c['sourceLanguage']})))"); do
+            test -f "$CONTENTS/Resources/$lang.lproj/Localizable.strings" \
+              || { echo "::error::$lang.lproj missing from the bundle"; exit 1; }
+          done
+
           # License + third-party attributions inside the bundle (same reason
           # as the CLI tarball above: the .app embeds the same Apache-2.0
           # kernels and jinja.cpp). Mirrors app/build.sh.

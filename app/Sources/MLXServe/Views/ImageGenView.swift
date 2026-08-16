@@ -188,14 +188,14 @@ struct ImageGenView: View {
                 // is the numbering the prompt refers to — so they are one
                 // list, drawn by one row.
                 imageRow(url, number: numberedImageRows ? 1 : nil,
-                         help: "Remove the source image (back to text-to-image)") {
+                         help: String(localized: "Remove the source image (back to text-to-image)")) {
                     initImageURL = nil
                     refImageURLs = []
                 }
                 if effectiveEditMode {
                     ForEach(Array(refImageURLs.enumerated()), id: \.element) { i, ref in
                         imageRow(ref, number: numberedImageRows ? i + 2 : nil,
-                                 help: "Remove this reference image") {
+                                 help: String(localized: "Remove this reference image")) {
                             refImageURLs.removeAll { $0 == ref }
                         }
                     }
@@ -428,8 +428,8 @@ struct ImageGenView: View {
                 // -1 is the random sentinel and renders as an EMPTY box, so the
                 // placeholder explains it instead of a literal -1 that reads as
                 // a broken value.
-                SeedField(label: "Seed", placeholder: "random", range: -1...Int.max, value: $seed,
-                          help: "Same seed + same settings reproduces the image. Paste one to rerun someone else's; leave it empty for a new one each time.")
+                SeedField(label: String(localized: "Seed"), placeholder: "random", range: -1...Int.max, value: $seed,
+                          help: String(localized: "Same seed + same settings reproduces the image. Paste one to rerun someone else's; leave it empty for a new one each time."))
             }
             if model.stepsAreFixed {
                 Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")

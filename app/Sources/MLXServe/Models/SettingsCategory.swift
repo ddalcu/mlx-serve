@@ -38,19 +38,19 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// engine a knob applies to.
     var title: String {
         switch self {
-        case .modelFolders:      return "Model Folders"
-        case .server:            return "Server"
-        case .lanSharing:        return "LAN Sharing"
-        case .performance:       return "Performance"
-        case .specDecode:        return "Speculative Decoding (MLX only)"
-        case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
-        case .ds4:               return "DeepSeek-V4 (ds4 engine)"
-        case .requestDefaults:   return "Per-Request Defaults"
-        case .voice:             return "Voice"
-        case .sandbox:           return "Agent Sandbox"
-        case .messaging:         return "Messaging — Telegram bot"
-        case .updates:           return "Updates"
-        case .about:             return "About mlx-serve"
+        case .modelFolders:      return String(localized: "Model Folders")
+        case .server:            return String(localized: "Server")
+        case .lanSharing:        return String(localized: "LAN Sharing")
+        case .performance:       return String(localized: "Performance")
+        case .specDecode:        return String(localized: "Speculative Decoding (MLX only)")
+        case .ggufPerformance:   return String(localized: "GGUF Performance (llama.cpp)")
+        case .ds4:               return String(localized: "DeepSeek-V4 (ds4 engine)")
+        case .requestDefaults:   return String(localized: "Per-Request Defaults")
+        case .voice:             return String(localized: "Voice")
+        case .sandbox:           return String(localized: "Agent Sandbox")
+        case .messaging:         return String(localized: "Messaging — Telegram bot")
+        case .updates:           return String(localized: "Updates")
+        case .about:             return String(localized: "About mlx-serve")
         }
     }
 

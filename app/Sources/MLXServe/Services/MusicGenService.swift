@@ -112,7 +112,7 @@ final class MusicGenService: ObservableObject {
         }
 
         task?.cancel()
-        phase = .running(step: 0, total: 3, message: "Loading model…")
+        phase = .running(step: 0, total: 3, message: String(localized: "Loading model…"))
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)

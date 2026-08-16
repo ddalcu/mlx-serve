@@ -247,6 +247,42 @@ for pat, what in ((r'install_name_tool -add_rpath @loader_path "\$CONTENTS/Frame
             guarded = any('STAGE_FRAMEWORKS' in x for x in b_lines[max(0, i - 12):i])
             check(guarded, f"{what} runs only when the frameworks were restaged")
 
+# ── Localization ships on BOTH bundle-assembly paths. release.yml builds its
+# own .app rather than calling app/build.sh, so a step added to only one of
+# them ships a DMG that is English for every user while the local build looks
+# correct. Keys ARE the English source strings, so nothing crashes or blanks —
+# a translated user just never sees their language, which is invisible here.
+rruns = " ".join(str(s.get("run", "")) for j in wf["jobs"].values()
+                 for s in j.get("steps", []))
+check("xcstringstool compile" in rruns,
+      "release.yml compiles the String Catalog into the bundle")
+# The existence check must be driven BY the catalog, not by a language spelled
+# into the workflow: a hard-coded "zh-Hans.lproj" still passes on the day a
+# second language silently fails to compile.
+check(".lproj/Localizable.strings" in rruns and "for lang in" in rruns,
+      "release.yml FAILS the build when any catalog language is missing from the bundle")
+check("zh-Hans" not in rruns,
+      "release.yml names no single language — the check iterates the catalog's own list")
+
+build_sh = open("app/build.sh").read()
+check("xcstringstool compile" in build_sh,
+      "app/build.sh compiles the String Catalog into the bundle")
+
+# Every language the catalog translates must be declared in both plists, or
+# macOS won't offer the app in Language & Region's per-app list.
+import json, plistlib
+catalog = json.load(open("app/Localization/Localizable.xcstrings"))
+langs = {lang for e in catalog["strings"].values()
+         for lang in e.get("localizations", {})}
+langs.add(catalog["sourceLanguage"])
+for plist in ("app/Info.plist", "app/Info-MAS.plist"):
+    d = plistlib.load(open(plist, "rb"))
+    declared = set(d.get("CFBundleLocalizations", []))
+    check(langs <= declared,
+          f"{plist} declares every catalog language ({sorted(langs)})")
+    check(d.get("CFBundleDevelopmentRegion") == catalog["sourceLanguage"],
+          f"{plist} development region matches the catalog source language")
+
 # ── Homebrew push timing: the release is created as a DRAFT, so its assets
 # are not downloadable until it is published. The formula push must fire on
 # the publish transition ONLY — any other trigger reintroduces the window

@@ -218,6 +218,31 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
 
+# Localizations. The String Catalog is compiled into one .lproj per language
+# and copied into Contents/Resources, which is where `Bundle.main` looks —
+# SwiftUI's `Text("…")` is already a LocalizedStringKey lookup against the
+# MAIN bundle, so the ~500 call sites need no code change and no `bundle:`
+# argument. Deliberately NOT a SwiftPM resource: `Package.swift` excludes
+# Sources/MLXServe/Resources, and a SwiftPM resource would land in
+# MLXCore_MLXCore.bundle (`Bundle.module`), which those call sites never
+# consult. The MAS Xcode target gets there its own way — project.yml declares
+# the catalog in its resources build phase.
+#
+# Keys ARE the English source strings, so a `swift build` binary (no .lproj
+# beside it) and any language without a translation both fall through to
+# English rather than to a raw identifier.
+CATALOG="$SCRIPT_DIR/Localization/Localizable.xcstrings"
+if [ -f "$CATALOG" ]; then
+    echo "→ Compiling localizations..."
+    if xcrun --find xcstringstool > /dev/null 2>&1; then
+        xcrun xcstringstool compile "$CATALOG" \
+            --output-directory "$CONTENTS/Resources" >/dev/null
+    else
+        echo "   !! xcstringstool not found — the app will ship English only." >&2
+        echo "      (It comes with Xcode; check xcode-select -p.)" >&2
+    fi
+fi
+
 # License + third-party attributions. The bundled mlx-serve binary links
 # Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, jinja.cpp) whose section 4
 # wants the license text and NOTICE attributions to travel with the binary, not

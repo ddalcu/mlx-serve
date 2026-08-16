@@ -395,6 +395,263 @@ cases, a real pasteboard round-trip proving the read recovers a
 `public.file-url` item and skips a web URL, and a source scan pinning
 `.onDrop(of: [.fileURL]` + `validateDrop` in the modifier).
 
+## Simplified Chinese (2026-08-14): the localization that was mostly already there
+
+The app had no localization at all — no `.lproj`, no `.xcstrings`, no
+`NSLocalizedString`, no `CFBundleDevelopmentRegion` — and 205 Swift files with
+~615 user-facing string literals in `Views/`. The obvious estimate is a
+mechanical pass over every call site to wrap each string in something.
+
+That pass would have been wasted work. SwiftUI's `Text("…")` picks the
+`LocalizedStringKey` initializer for a string LITERAL, and a `LocalizedStringKey`
+is a `Bundle.main` lookup performed at render time. `Button`, `Label`, `Toggle`,
+`Picker`, `Section`, `TextField`, `Menu`, `.help`, `.navigationTitle` — all the
+same. The app was already asking the main bundle for a translation ~615 times
+per screen and getting the key back, because no bundle had one. Supplying
+`zh-Hans.lproj/Localizable.strings` localized all of it with no code change and
+no `bundle:` argument at any call site.
+
+The choice that makes that work is **keys are the English source strings**.
+A missing entry falls through to the key, which IS the English text, so:
+an untranslated string renders in English rather than as a raw identifier; a
+`swift build` binary (no `.lproj` beside it) is byte-identical to before; and
+the existing tests that assert on copy stayed green without edits.
+
+The same property is what makes the bug class silent. Nothing crashes, nothing
+blanks out — a missed string just renders in English inside a Chinese screen,
+and only a Chinese speaker on that exact pane would notice. So the guard is
+coverage: `LocalizationCatalogTests` re-extracts the keys from the sources the
+way SwiftUI does and demands the catalog answer every one. The extractor lives
+in the test rather than in a script, because a scan that runs when someone
+remembers to run it is not a guard; and it carries a self-test
+(`testTheExtractorReadsTheShapesTheAppActuallyUses`), because a rewrite that
+quietly starts returning nothing would make every coverage assertion pass
+forever.
+
+### Where it must NOT go
+
+`Package.swift` has `exclude: ["Resources"]`, so the target has no
+`Bundle.module`. Keeping it that way was load-bearing: a SwiftPM resource is
+placed in `MLXCore_MLXCore.bundle`, which `Bundle.main` lookups never consult,
+so routing the catalog through SwiftPM would have forced an explicit
+`bundle: .module` onto all ~615 call sites — the mechanical pass, reintroduced
+by the packaging decision. The catalog sits outside SwiftPM's view and is
+compiled into `Contents/Resources` by `build.sh` (`xcrun xcstringstool compile`)
+and by project.yml's resources phase for the MAS Xcode target.
+
+`release.yml` assembles its own bundle rather than calling `build.sh` (it has
+always mirrored it, step by step). A compile step added to only one path ships
+a DMG that is English for every user while the local build looks correct —
+and, per the fallback above, without a single error anywhere. The release step
+is a hard failure (`test -f …/zh-Hans.lproj/Localizable.strings`), not a
+`|| true`, and `tests/test_release_workflow_gates.sh` pins that both paths
+compile the catalog and that both plists declare every language the catalog
+translates.
+
+### Interpolation: the key is generated, not spelled
+
+`Text("Plan (\(n) steps)")` does not look up its source spelling — SwiftUI
+builds a FORMAT string and passes the values as arguments, so the key is
+`"Plan (%lld steps)"`. The specifier comes from the interpolated expression's
+TYPE, which a source scan cannot know. Read off
+`Mirror(reflecting: LocalizedStringKey(…))` rather than assumed:
+
+    Int, Int64 -> %lld     Int32 -> %d      UInt -> %llu
+    Double     -> %lf      Float -> %f
+    String, a ternary yielding String, a nested String(format:) -> %@
+    a literal % -> %% once the string has ANY formatting (plain literals keep %)
+
+Two consequences. First, a string literal nested INSIDE an interpolation is an
+argument, not part of the key, so it is not localizable at all —
+`ownedHere ? "ON in this chat" : "OFF"` inside a `.help` renders English inside
+a translated sentence. Four such sites existed; they now go through
+`String(localized:)`. Second, the guard can't verify an interpolated key by
+equality, so it builds the pattern every possible spelling would match
+(each `\(…)` becomes `%(?:lld|llu|lf|[dfu@])`, each literal `%` matches `%` or
+`%%`) and asks which catalog key answers it. A key that doesn't match degrades
+to English — safe, and visible — rather than to a wrong argument.
+
+Chinese translations use POSITIONAL specifiers (`%1$lld`) throughout, because
+Chinese moves word order and has no plural suffix: `"%lld tool%@"` has to
+become `"%1$lld 个工具"`, reordering nothing and DROPPING the second argument
+entirely. Both are only safe positionally.
+`testEveryTranslatedFormatSpecifierMatchesItsKey` pins that every specifier in
+a translation carries an index, that the index is in range, and that its type
+matches the key's at that position — `%lld` read as `%@` is a pointer
+dereference of an integer, which is a crash, not a typo.
+
+### Two escapes that shipped in the first draft
+
+A catalog value is finished text; its escapes were resolved when the key was
+authored. A translation written by copying the Swift source keeps that source's
+spelling, so `\n` arrived as a backslash and an `n` and rendered that way, and
+`\"` put a stray backslash in front of every quote. Both were invisible in
+review — the reviewer doesn't read the language. `testTranslationsCarryNoSourceSpellingEscapes`
+rejects `\n`, `\t`, `\r`, `\"` and `\u{` in any translation.
+
+Related: the catalog KEY is the resolved string (`Text("say \"hi\"")` looks up
+`say "hi"`), so the extractor unescapes source spellings before looking them up.
+
+### What is deliberately not translated
+
+`AgentPrompt`, `AgentWriter` and `Agent.starters` are read by the MODEL, not the
+user. Translating them breaks the three ported tests asserting exact prompt
+equality with the iPhone app, and a localized tool description measurably
+degrades tool calling on small models — the grammar a 2B model matches is the
+English one it was trained on. `testModelFacingCopyIsNeverLocalized` scans those
+files for `String(localized:`/`NSLocalizedString(`.
+
+The user-visible half of that decision — a Chinese UI still gets English
+answers — is a reply-language line resolved INTO the prompt at
+`AgentResolution`, and is not implemented yet.
+
+### The other half of the copy: strings that are drawn from a String (2026-08-14)
+
+Shipping the catalog left the app looking half-translated in a way the guard
+called complete: the menu bar, the composer and the chat body came up in
+Chinese while the sidebar still said "New Chat / Models / Settings", the tray
+said "Start Server", and the Agents editor labelled its fields "Name",
+"Description", "Prompt". Every one of those was already a `Text(…)` at the
+draw site. The difference is what `Text` was handed.
+
+`Text("Models")` picks `init(_ key: LocalizedStringKey)` and asks the bundle.
+`Text(item.title)` picks `init<S: StringProtocol>(_ content: S)` and draws the
+bytes. So a row catalogue holding `title: "Models"`, a helper spelled
+`destinationRow("Models", icon:)` whose parameter is `_ title: String`, and a
+`var title: String { case .image: "Image" }` are all copy that no bundle is
+ever asked about — and adding the catalog entry does not fix them, which is the
+part that makes this different from a missing translation. It renders in
+English on a Chinese screen exactly like an untranslated string, so the two
+failures are indistinguishable from the outside while only one of them has the
+obvious fix.
+
+The fix is `String(localized:)` at the literal — a real lookup, performed where
+the copy is written rather than where it is drawn. Chosen over retyping the
+parameters as `LocalizedStringKey` because these helpers are handed variables
+too (a model id, an agent's name), so the type change would have forced an
+explicit `LocalizedStringKey(…)` at the call sites that pass data, which is the
+same trap wearing the opposite coat.
+
+Three spellings carry stored copy, and the scanner reads all three because the
+literal is progressively further from the field name in each: the argument
+(`title: "…"`), the assignment (`title = "…"` in a `switch` inside an init),
+and the computed property (`var help: String { … }`, where the only thing
+marking a literal as localized is the call around it). Registration is explicit
+per file and per label — `description:` in `BrowserManager` names a JS snippet
+for a log line and `MCPCatalog`'s is a third party's own blurb — so a new
+copy-bearing row type is added to `copyCarryingLabels` / `copyCarryingCalls`
+rather than worked around. The scanner carries its own self-test for the reason
+the literal extractor does: it reports by finding NOTHING.
+
+Two things fell out of writing it.
+
+`String(localized:)` interpolates exactly like a `Text` literal, so
+`String(localized: "Delete “\(name)”?")` asks the bundle for `Delete “%@”?`.
+`testRuntimeLocalizedCopyIsAlsoTranslated` was looking the SOURCE spelling up
+in the catalog, which can only pass if the catalog carries a key no runtime
+lookup will ever ask for. Both runtime-key tests go through
+`catalogKeys(matching:)` now, the same tolerant pattern the literal audit uses.
+
+And a placeholder is a stored SENTINEL as well as drawn copy.
+`ChatSessionTitle.plain` is written into every new session on disk and is what
+`isPlaceholder` — the auto-titler's gate — tests against. Localizing it at the
+source would mean a thread created in English is not a placeholder to a Chinese
+app: the auto-titler never claims it, so it keeps the words "New Chat" for the
+rest of its life. The stored value stays English; `localizedPlaceholder` is a
+second function used only by `display`.
+
+Deliberately still English after this pass: `Views/H3PromptExamples`' prompt
+BODIES (the model's own published phrasings — a reword is a quality
+regression; only the menu titles are registered), the brand names in the model
+browser's family filters (registered, with the Chinese value equal to the
+English — a decision recorded rather than an omission), and the copy in
+`Services/` that reaches the user as an error message, which is the next pass.
+
+### Two more, from finishing the pass (2026-08-14)
+
+**An `Int` interpolated into `String(localized:)` is FORMATTED.** A plain
+`"max tokens (\(n))"` renders `16384`; the same literal wrapped for
+localization renders `16,384`, because the localization value formats its
+arguments for the locale. That is the right behaviour — the number should
+group the way the words around it do — but it is a rendering change that
+arrives silently with the wrapper, and it is what `TruncationNoticeTests`
+caught. `ChatErrorNotice.grouped(_:)` was pinned to `en_US` on the explicit
+grounds that "the copy is not localized"; once the copy IS localized that
+reason inverts, so it follows `Locale.current` now. No visible change in
+either language shipped — en and zh-Hans both group with commas — but the
+next language decides it.
+
+**A string that describes bytes already on disk is not copy.**
+`TruncationNotice.stripped(from:)` scrubs a banner that builds before
+2026-08-11 appended into saved chat content, and it derived its markers from
+the same function that produced the displayed sentence — correct then, a bug
+the moment that sentence is translated: a Chinese app looks for a Chinese
+banner, finds nothing, and feeds the English one back to the model as
+assistant prose (the error-echo class the notice-as-data change fixed). The
+displayed sentence and the frozen English are now two functions
+(`footnote` / `legacyFootnote`), and the frozen one must never be edited —
+a better wording belongs in the other. No behavioural test can see this
+(an xctest binary has no `.lproj`, so `String(localized:)` resolves to its
+key and both branches read English), so the guard is a scan:
+`testTheFrozenLegacyBannerTextIsNeverLocalized`.
+
+Same shape as the placeholder sentinel above, and worth stating as one rule:
+**when a string is both something the user reads and something the program
+compares against, the comparison keeps the original bytes and only the
+reading is translated.**
+
+### What stayed English after the second pass, and why
+
+Three kinds, and only the first is a judgement call worth re-opening:
+
+- **Dual-purpose strings.** `Agent.starters`' descriptions are drawn in the
+  Agents list AND resolved into the agent's system prompt
+  ("You are an assistant with this purpose: …"), so translating one changes
+  what the model is told. `ChatTurnEngine`'s "Generated a 512×512 image for: …"
+  is a tool RESULT fed back to the model, not a caption. Both stay English
+  with the rest of the model-facing copy; the user-visible half is the
+  reply-language line, still unimplemented.
+- **Sample values.** `MCPCatalog`'s `placeholder:` fields are `ghp_...`,
+  `<ORG>`, `postgres://user:pass@localhost:5432/mydb` — a credential format is
+  not a sentence, and a translated one teaches a token that does not exist.
+  Registered labels for that file are `description` and `label` only.
+- **Internal error text.** `OCIClient`, `TarReader`, `GuestChannel`,
+  `GuestProtocol` throw strings that reach a log, not a user
+  ("tar: malformed size field"). `AgentSandbox` is the exception in that
+  neighbourhood — its `SandboxError(message:)` is shown in an alert, so it is
+  registered and translated.
+
+The prompt-example CATALOGUES (`ImageEditExamples`, `MediaGen`'s style list,
+`H3PromptExamples`) are split down the middle on purpose: the menu title is UI
+and localized, the body is the model's own published phrasing and is pinned
+verbatim by its own test.
+
+### Adding the SECOND language (generalized 2026-08-14)
+
+The mechanism was never Chinese-specific — keys are English source strings and
+every draw is a `Bundle.main` lookup — but three things named zh-Hans, and one
+of them mattered: the audit asked `catalog.strings[key]["zh-Hans"]` at three
+sites, so a second language would have been entirely unenforced. Add `fr` with
+40 of 875 keys and every test stays green while most of the app renders
+English inside a French screen — the exact bug this file exists to catch,
+reintroduced by the guard's own spelling.
+
+The enforced set is now DERIVED (`targetLanguages`: every language the catalog
+carries, minus the source), which makes the three properties line up:
+`xcstringstool` compiles one `.lproj` per catalog language, the release gate
+requires one `.lproj` per catalog language, and the audit requires every key in
+every catalog language. Adding a language is translating it and declaring it in
+the two plists; nothing else changes, and the audit begins enforcing it in the
+same commit.
+
+Two consequences worth stating. There is no "draft" state — a language present
+in the catalog must be complete — which is a deliberate trade: partial
+translations are invisible from anywhere except the screen they are on. And
+the derivation creates a new blind spot in the opposite direction: with NO
+target language every coverage loop passes by iterating an empty set, so
+`testTheCatalogCarriesAtLeastOneTargetLanguage` pins that the list is not
+empty. Verified red by injecting a one-key `fr` into the catalog: 666
+string/language pairs reported, each naming its language.
 ## The Hugging Face cache was "supported" and never worked (2026-08-14)
 
 Reported as "we don't account for `HF_HOME`". We did — `DownloadManager.huggingFaceRoot`

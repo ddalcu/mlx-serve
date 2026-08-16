@@ -138,9 +138,9 @@ struct ContextWindowDetail: View {
             Divider()
 
             VStack(spacing: 6) {
-                row(icon: "arrow.up", label: "Prompt", value: stats.promptTokens)
-                row(icon: "sum", label: "Used", value: stats.usedTokens, emphasized: true)
-                row(icon: "ruler", label: "Remaining", value: stats.remainingTokens)
+                row(icon: "arrow.up", label: String(localized: "Prompt"), value: stats.promptTokens)
+                row(icon: "sum", label: String(localized: "Used"), value: stats.usedTokens, emphasized: true)
+                row(icon: "ruler", label: String(localized: "Remaining"), value: stats.remainingTokens)
             }
             .padding(12)
 
@@ -150,7 +150,7 @@ struct ContextWindowDetail: View {
             // has been timed, rather than a placeholder dash.
             if let speed = ContextWindowStats.speedText(decodeSpeed) {
                 Divider()
-                textRow(icon: "gauge.with.needle", label: "Decode speed", value: speed)
+                textRow(icon: "gauge.with.needle", label: String(localized: "Decode speed"), value: speed)
                     .padding(12)
             }
         }

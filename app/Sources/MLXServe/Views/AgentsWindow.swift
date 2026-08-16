@@ -241,7 +241,7 @@ struct AgentDetailPane: View {
                                 appState.startChat(withAgent: draft.id)
                             },
                             onDuplicate: { duplicate(draft) },
-                            onDelete: { model.alert = .init(title: "Delete “\(draft.name)”?",
+                            onDelete: { model.alert = .init(title: String(localized: "Delete “\(draft.name)”?"),
                                                             kind: .confirmDelete(draft)) },
                             onNotify: { model.message($0, $0) })
             } else {
@@ -535,7 +535,7 @@ private struct AgentEditor: View {
             symbolPicker
                 .padding(AgentEditorMetrics.avatarPadding)
                 .agentSurface(radius: AgentEditorMetrics.wellRadius)
-            AgentLabeledField("Name") { nameField }
+            AgentLabeledField(String(localized: "Name")) { nameField }
         }
     }
 
@@ -547,7 +547,7 @@ private struct AgentEditor: View {
     }
 
     private var descriptionField: some View {
-        AgentLabeledField("Description") { briefField }
+        AgentLabeledField(String(localized: "Description")) { briefField }
     }
 
     /// A built-in refuses every edit, so it says so where you would start
@@ -657,7 +657,7 @@ private struct AgentEditor: View {
     /// SOUNDS is the same kind of fact as what it's called and what wakes it,
     /// and all three are what you set when making one.
     private var identitySection: some View {
-        AgentSection("Identity") {
+        AgentSection(String(localized: "Identity")) {
             AgentCard {
                 wakePhraseRow
                 Divider()
@@ -667,8 +667,8 @@ private struct AgentEditor: View {
     }
 
     private var wakePhraseRow: some View {
-        AgentEditorRow("Wake phrase",
-                       caption: "Say this to hand the conversation to \(agent.name). Blank uses the app's own phrase.") {
+        AgentEditorRow(String(localized: "Wake phrase"),
+                       caption: String(localized: "Say this to hand the conversation to \(agent.name). Blank uses the app's own phrase.")) {
             // `prompt:`, not the title argument — a TextField's title is a
             // LABEL, so passing the app phrase there parked it beside the
             // field permanently instead of showing through an empty one.
@@ -727,7 +727,7 @@ private struct AgentEditor: View {
 
     /// The prompt, then the things you can do to it.
     private var promptSection: some View {
-        AgentSection("Prompt") {
+        AgentSection(String(localized: "Prompt")) {
             AgentCard {
                 promptEditor
                 promptActions
@@ -771,7 +771,7 @@ private struct AgentEditor: View {
     // MARK: Capabilities
 
     private var capabilitiesSection: some View {
-        AgentSection("Capabilities") {
+        AgentSection(String(localized: "Capabilities")) {
             AgentCard(spacing: 12) {
                 capabilityToggles
                 Divider()
@@ -787,7 +787,7 @@ private struct AgentEditor: View {
     /// the Form had been promoting these silently.
     @ViewBuilder
     private var capabilityToggles: some View {
-        AgentEditorRow("Tools") {
+        AgentEditorRow(String(localized: "Tools")) {
             Toggle("", isOn: Binding(get: { agent.capabilities.tools },
                                      set: { agent.capabilities.tools = $0 }))
                 .labelsHidden()
@@ -795,7 +795,7 @@ private struct AgentEditor: View {
                 .disabled(readOnly || showAdvancedTools)
                 .help("The tool-calling loop: shell, files, search, tasks, media generation.")
         }
-        AgentEditorRow("MCP") {
+        AgentEditorRow(String(localized: "MCP")) {
             Toggle("", isOn: Binding(get: { agent.capabilities.mcp },
                                      set: { agent.capabilities.mcp = $0 }))
                 .labelsHidden()
@@ -803,7 +803,7 @@ private struct AgentEditor: View {
                 .disabled(readOnly)
                 .help("Add the tools from every enabled Model Context Protocol server.")
         }
-        AgentEditorRow("Web") {
+        AgentEditorRow(String(localized: "Web")) {
             Toggle("", isOn: Binding(get: { agent.capabilities.web },
                                      set: { agent.capabilities.web = $0 }))
                 .labelsHidden()
@@ -811,7 +811,7 @@ private struct AgentEditor: View {
                 .disabled(readOnly || showAdvancedTools)
                 .help("Browse pages and search the web (browse + webSearch).")
         }
-        AgentEditorRow("Thinking") {
+        AgentEditorRow(String(localized: "Thinking")) {
             Picker("", selection: tristate($agent.enableThinking)) {
                 Text("App default").tag(TriChoice.appDefault)
                 Text("On").tag(TriChoice.on)
@@ -821,7 +821,7 @@ private struct AgentEditor: View {
             .frame(width: Self.triPickerWidth)
             .disabled(readOnly)
         }
-        AgentEditorRow("Approve tools") {
+        AgentEditorRow(String(localized: "Approve tools")) {
             Picker("", selection: tristate($agent.autoApproveTools)) {
                 Text("App default").tag(TriChoice.appDefault)
                 Text("Automatically").tag(TriChoice.on)
@@ -907,7 +907,7 @@ private struct AgentEditor: View {
     // MARK: Model
 
     private var modelSection: some View {
-        AgentSection("Model") {
+        AgentSection(String(localized: "Model")) {
             AgentCard(spacing: 12) {
                 modelPicker
                 modelState
@@ -916,7 +916,7 @@ private struct AgentEditor: View {
     }
 
     private var modelPicker: some View {
-        AgentEditorRow("Model") {
+        AgentEditorRow(String(localized: "Model")) {
             Picker("", selection: Binding(get: { agent.modelPath ?? "" },
                                           set: { agent.modelPath = $0.isEmpty ? nil : $0 })) {
                 Text("Current").tag("")
@@ -959,10 +959,10 @@ private struct AgentEditor: View {
     // MARK: Workspace
 
     private var workspaceSection: some View {
-        AgentSection("Workspace") {
+        AgentSection(String(localized: "Workspace")) {
             AgentCard(spacing: 12) {
-                AgentEditorRow("Folder",
-                               caption: "Where this agent's file and shell tools run. Several agents may share a folder.") {
+                AgentEditorRow(String(localized: "Folder"),
+                               caption: String(localized: "Where this agent's file and shell tools run. Several agents may share a folder.")) {
                     Text(agent.workingDirectory ?? "App default")
                         .font(.subheadline.monospaced())
                         .lineLimit(1).truncationMode(.head)
@@ -1001,7 +1001,7 @@ private struct AgentEditor: View {
 
     @ViewBuilder
     private var voiceRows: some View {
-        AgentEditorRow("Voice", caption: voiceCaption) {
+        AgentEditorRow(String(localized: "Voice"), caption: voiceCaption) {
             AgentVoiceMenu(voice: $agent.voice,
                            systemVoices: appState.voice.availableVoices,
                            clips: clips,
@@ -1096,7 +1096,7 @@ private struct AgentEditor: View {
     /// one place in the editor where a label sits in a different column from
     /// every other label.
     private var samplingSection: some View {
-        AgentSection("Sampling") {
+        AgentSection(String(localized: "Sampling")) {
             AgentCard(spacing: 12) {
                 sliderRow("Temperature", value: $agent.temperature,
                           seed: appState.serverOptions.defaultTemperature, in: 0...1.5, step: 0.05,
@@ -1224,7 +1224,7 @@ private struct AgentEditor: View {
         let isDefault = agent.reasoningBudget == nil
         let seedTokens = AgentReasoningEffort
             .nearest(to: appState.serverOptions.defaultReasoningBudget).budgetTokens
-        return AgentEditorRow("Reasoning budget", alignment: .center) {
+        return AgentEditorRow(String(localized: "Reasoning budget"), alignment: .center) {
             HStack(spacing: 10) {
                 Picker("", selection: Binding(
                     get: { AgentReasoningEffort.nearest(to: agent.reasoningBudget
@@ -1356,17 +1356,17 @@ private struct AgentVoiceMenu: View {
     private var label: String {
         switch voice {
         case .none:
-            return "App voice"
+            return String(localized: "App voice")
         case .kokoro(let v):
             return v.trimmingCharacters(in: .whitespaces).isEmpty
-                ? "App voice" : KokoroVoiceCatalog.displayName(for: v)
+                ? String(localized: "App voice") : KokoroVoiceCatalog.displayName(for: v)
         case .clone(let path):
             if path == globalClipPath {
-                return globalClipLabel.isEmpty ? "Settings clip" : globalClipLabel
+                return globalClipLabel.isEmpty ? String(localized: "Settings clip") : globalClipLabel
             }
             return VoiceClipLibrary.displayName(forPath: path)
         case .system(let id):
-            return systemVoices.first { $0.id == id }?.displayName ?? "System voice"
+            return systemVoices.first { $0.id == id }?.displayName ?? String(localized: "System voice")
         }
     }
 }

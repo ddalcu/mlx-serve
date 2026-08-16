@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
 	<key>CFBundleDisplayName</key>
 	<string>MLX Core</string>
 	<key>CFBundleExecutable</key>
@@ -12,6 +14,11 @@
 	<string>com.dalcu.mlx-core.mas</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>zh-Hans</string>
+	</array>
 	<key>CFBundleName</key>
 	<string>MLX Core</string>
 	<key>CFBundlePackageType</key>
@@ -33,14 +40,14 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSHumanReadableCopyright</key>
-	<string>Copyright 2026 David Dalcu. All rights reserved.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>MLX Core uses your local network only when LAN Sharing is enabled in Settings: to advertise the models you chose to share and to discover models other Macs share, over Bonjour. Nothing leaves your network.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_mlxserve._tcp</string>
 	</array>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 David Dalcu. All rights reserved.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MLX Core uses your local network only when LAN Sharing is enabled in Settings: to advertise the models you chose to share and to discover models other Macs share, over Bonjour. Nothing leaves your network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>MLX Core records audio from your microphone so multimodal models (like Gemma 4 12B) can listen to and respond to your voice.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

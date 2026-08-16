@@ -51,6 +51,28 @@ final class ChatSessionTitleTests: XCTestCase {
                        "Coder")
     }
 
+    /// The placeholder is a stored SENTINEL and drawn COPY at once, and only
+    /// the drawn half may be translated: `placeholder(hasAgent:)` is what
+    /// `AppState` writes into a new session and what `isPlaceholder` — the
+    /// auto-titler's gate — tests against, and that value lands in
+    /// `chat-history.json`. Localize it there and a thread created in one
+    /// language stops being a placeholder in another: the auto-titler never
+    /// claims it, so it keeps the word "New Chat" for the rest of its life.
+    func testTheStoredPlaceholderStaysEnglishWhileTheDrawnOneIsLocalized() {
+        XCTAssertEqual(ChatSessionTitle.placeholder(hasAgent: false), "New Chat")
+        XCTAssertEqual(ChatSessionTitle.placeholder(hasAgent: true), "New agent")
+        XCTAssertTrue(ChatSessionTitle.isPlaceholder(ChatSessionTitle.placeholder(hasAgent: false)))
+        XCTAssertTrue(ChatSessionTitle.isPlaceholder(ChatSessionTitle.placeholder(hasAgent: true)))
+        // The drawn value goes through the bundle. With no `.lproj` beside an
+        // xctest binary that resolves back to the key, so this asserts the
+        // ROUTE, not the language: display must not hand back the raw sentinel
+        // by a path that skipped the lookup.
+        XCTAssertEqual(ChatSessionTitle.display(title: "New Chat", agentName: nil),
+                       ChatSessionTitle.localizedPlaceholder(hasAgent: false))
+        XCTAssertEqual(ChatSessionTitle.display(title: "New Chat", agentName: "  "),
+                       ChatSessionTitle.localizedPlaceholder(hasAgent: true))
+    }
+
     // MARK: The subject moves to the caption
 
     /// With the agent's name on the title line, the conversation's own subject

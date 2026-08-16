@@ -101,13 +101,13 @@ enum H3PromptExamples {
     /// phrases, acting directions between them, per the official prompting
     /// guide) — without it the soundtrack is ambient noise only.
     static let ltx: [VideoPromptExample] = [
-        .init(title: "Talking character (dialogue)",
+        .init(title: String(localized: "Talking character (dialogue)"),
               body: "Medium close-up of a woman in her thirties with short auburn hair, seated at a kitchen table in warm morning light. She looks into the camera and says warmly, \"Good morning. I made coffee — it's still hot.\" She pauses, glancing toward the window, then adds with a small smile, \"Come sit with me for a minute.\" Her voice is clear and natural, speaking English. Soft room tone with a faint clink of a cup. The camera holds steady at eye level."),
-        .init(title: "Cinematic character",
+        .init(title: String(localized: "Cinematic character"),
               body: "Medium shot of a young woman with dark curly hair and freckles, wearing a beige wool coat, walking slowly down a rain-slicked cobblestone street at dusk. She holds a folded paper map in one hand and glances up at the glowing shop windows. The camera tracks her from the side at eye level, then slowly dollies in as she stops. Warm amber light spills from the windows onto the wet stones, contrasting with the deep blue-grey sky. Light rain falls continuously, catching the light."),
-        .init(title: "Nature aerial",
+        .init(title: String(localized: "Nature aerial"),
               body: "A wide aerial shot sweeps low over a pine forest at sunrise, mist clinging to the treetops in thick white ribbons. The camera glides forward steadily, revealing a narrow river cutting through the valley below, its surface catching the gold of the early sun. A flock of birds lifts off in a loose spiral. Lighting is soft, warm, and directional from the right. Colors are saturated emerald greens and amber golds."),
-        .init(title: "Product close-up",
+        .init(title: String(localized: "Product close-up"),
               body: "Close-up of hands in a sunlit kitchen kneading bread dough on a floured wooden counter. The camera holds steady at a low angle, focused tight on the rhythmic press-and-fold motion. Flour dust rises and catches in the shaft of morning light from a window on the left. The hands belong to an older man in a rolled blue shirt, skin weathered and dusted white. Warm natural backlight, muted earth tones."),
     ]
 
@@ -133,7 +133,7 @@ enum H3PromptExamples {
     /// The keyframe example is OURS — that mode needs a reference image, which
     /// Context-IR takes as a URL we have nothing to point at.
     static let h3Base: [VideoPromptExample] = [
-        .init(title: "Character speaking (dialogue)",
+        .init(title: String(localized: "Character speaking (dialogue)"),
               body: """
 integrated_multimodal_description:
 [Shot 1] Cinematic, medium close-up, static shot. An on-screen woman in her early thirties (S1) sits in the center of the frame at a rustic wooden kitchen table. She has warm brown eyes, loose wavy brunette hair tied in a messy bun, and wears an oversized, cream-colored chunky knit sweater. The modern farmhouse kitchen behind her features white subway tile, a silver espresso machine, and a hanging pothos plant softly blurred in the background. Bright, warm morning sunlight pours in from an off-frame window to the left, casting a soft, golden glow across the side of her face and illuminating the steam rising from a white ceramic mug resting on the table. Looking directly into the camera lens with a relaxed, welcoming smile, the woman (S1) leans forward slightly, gently resting her forearms on the table, and says in a warm, conversational tone, <d>[English] Good morning. I made coffee. Come sit with me.</d> As she finishes speaking, she tilts her head slightly and maintains her gaze, her shoulders visibly relaxing.
@@ -144,7 +144,7 @@ Faint, continuous ambient chirping of birds sets a morning tone, accompanied by 
 non_diegetic_music:
 Solo acoustic guitar, slow tempo, playing a sparse and repetitive fingerpicking pattern with soft dynamics that sits quietly beneath the dialogue.
 """),
-        .init(title: "Scene with its own soundtrack",
+        .init(title: String(localized: "Scene with its own soundtrack"),
               body: """
 integrated_multimodal_description:
 [Shot 1] Cinematic, low aerial wide shot, the camera continuously moving forward while it pedestals up and rolls gently clockwise over a rugged, dark volcanic coastline. Warm, low-angle golden hour sunlight streams in from the left, casting long shadows and highlighting the jagged textures of parallel black basalt ribs that stretch from the bottom foreground out into the vast, deep blue-green ocean. Heavy, rhythmic ocean swells roll in from the background, colliding violently with the solid rock formations. The continuous impact sends explosive bursts of bright white surf and fine, golden-lit mist high into the air. As the camera steadily climbs and banks, the turbulent white water churns vigorously, spilling back over the dark, grooved stones into the sea, revealing a wider expanse of the jagged shoreline fading into the horizon under the vibrant sunset light.
@@ -155,7 +155,7 @@ A pronounced, continuous roar of heavy wind rushing past the microphone, layered
 non_diegetic_music:
 N/A
 """),
-        .init(title: "Close-up with texture and sound",
+        .init(title: String(localized: "Close-up with texture and sound"),
               body: """
 integrated_multimodal_description:
 [Shot 1] Cinematic, close-up shot with a slow push in, framing a thick, worn oak wooden counter generously dusted with fine white flour. An older man's weathered, wrinkled hands, emerging from faded blue rolled-up linen sleeves, dominate the center of the frame. The hands rhythmically press into a smooth, elastic ball of bread dough with the heels of the palms, folding the soft mass over itself and giving it a quarter turn with steady, practiced precision. Strong, warm morning sunlight streams in diagonally from the upper left, casting deep, textured shadows and intensely backlighting the scene. The directional light catches vibrant, powdery clouds of flour dust that float and swirl gracefully in the air above the counter. With each firm push of the dough, a small puff of dry flour scatters across the wooden surface, and the elastic dough slightly springs back as the hands momentarily release their pressure, while the softly blurred background implies the rustic warmth of a traditional kitchen.
@@ -166,7 +166,7 @@ Rhythmic, heavy thuds of the dough impacting the solid wooden board dominate the
 non_diegetic_music:
 Solo acoustic guitar, slow tempo, featuring warm, steady fingerpicking that gently underscores the steady rhythm of the kneading.
 """),
-        .init(title: "From an attached first frame",
+        .init(title: String(localized: "From an attached first frame"),
               body: """
 For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 
@@ -199,7 +199,7 @@ N/A
     /// histogram correlation 0.81-0.95 against 0.56-0.67 without), and the
     /// effect scales with how many reference rows are attached.
     static let h3Reference: [VideoPromptExample] = [
-        .init(title: "Keep a subject (image reference)",
+        .init(title: String(localized: "Keep a subject (image reference)"),
               body: """
 subject_definitions:
 <Subject 1> is the young woman in <Picture 1>, with long dark hair, a blue cardigan and a thin silver necklace.
@@ -220,7 +220,7 @@ Quiet cafe room tone with the dry rustle of a turning page close to the camera, 
 non_diegetic_music:
 N/A
 """),
-        .init(title: "Follow a clip's look and pacing (video reference)",
+        .init(title: String(localized: "Follow a clip's look and pacing (video reference)"),
               body: """
 subject_definitions:
 <Subject 1> is the coastal landscape in <Video 1>, with dark ridged rock running seaward, white surf along its edges and deep blue-green water beyond.
@@ -243,7 +243,7 @@ A continuous roar of wind across the microphone over the deep booming impact of 
 non_diegetic_music:
 N/A
 """),
-        .init(title: "Reuse a soundtrack (audio reference)",
+        .init(title: String(localized: "Reuse a soundtrack (audio reference)"),
               body: """
 subject_definitions:
 <Audio 1> is the ambience reference for the target video, containing rain on glass, distant traffic and a low interior room tone.
@@ -264,7 +264,7 @@ Steady rain against glass in the near foreground with an irregular tap as heavie
 non_diegetic_music:
 N/A
 """),
-        .init(title: "Subject + clip + audio (all three)",
+        .init(title: String(localized: "Subject + clip + audio (all three)"),
               body: """
 subject_definitions:
 <Subject 1> is the young man in <Picture 1>, with short wavy brown hair, a dark-grey hooded jacket and a canvas bag over one shoulder.

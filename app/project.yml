@@ -43,6 +43,13 @@ targets:
         buildPhase: resources
       - path: PrivacyInfo.xcprivacy
         buildPhase: resources
+      # String Catalog. Xcode compiles it into <lang>.lproj/Localizable.strings
+      # inside Contents/Resources — the same place build.sh puts the output of
+      # `xcstringstool compile`, and the place `Bundle.main` looks. It is NOT a
+      # SwiftPM resource (Package.swift excludes Resources): a SwiftPM resource
+      # would land in Bundle.module, which SwiftUI's Text("…") never consults.
+      - path: Localization/Localizable.xcstrings
+        buildPhase: resources
     dependencies:
       - package: swift-sdk
         product: MCP

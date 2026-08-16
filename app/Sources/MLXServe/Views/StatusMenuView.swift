@@ -119,20 +119,20 @@ enum GenExperiment: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .image: "Image"
-        case .video: "Video"
-        case .audio: "Audio"
-        case .model3d: "3D"
+        case .image: String(localized: "Image")
+        case .video: String(localized: "Video")
+        case .audio: String(localized: "Audio")
+        case .model3d: String(localized: "3D")
         }
     }
 
     /// Tooltip for the tile.
     var help: String {
         switch self {
-        case .image: "Image Generation (FLUX.2 / Krea-2)"
-        case .video: "Video Generation (LTX-Video 2.3)"
-        case .audio: "Audio Generation — voice cloning & music"
-        case .model3d: "3D Generation — photo to mesh (Hunyuan3D 2.1)"
+        case .image: String(localized: "Image Generation (FLUX.2 / Krea-2)")
+        case .video: String(localized: "Video Generation (LTX-Video 2.3)")
+        case .audio: String(localized: "Audio Generation — voice cloning & music")
+        case .model3d: String(localized: "3D Generation — photo to mesh (Hunyuan3D 2.1)")
         }
     }
 }
@@ -259,7 +259,7 @@ struct StatusMenuView: View {
 
     private var serverSection: some View {
         VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
-            TraySectionHeader(title: "Server")
+            TraySectionHeader(title: String(localized: "Server"))
             TrayCard {
                 if hasNoUsableModels {
                     VStack(alignment: .leading, spacing: 3) {
@@ -425,7 +425,7 @@ struct StatusMenuView: View {
         // frees its memory. Unloaded stubs are hidden.
         let loadedModels = server.allModels.filter(\.loaded)
         return VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
-            TraySectionHeader(title: "In Memory",
+            TraySectionHeader(title: String(localized: "In Memory"),
                               detail: loadedModels.count > 1 ? "\(loadedModels.count) models" : nil)
             TrayCard {
                 if loadedModels.isEmpty {
@@ -462,7 +462,7 @@ struct StatusMenuView: View {
     /// fit, which is a layout admitting it has overflowed.
     private var mediaSection: some View {
         VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
-            TraySectionHeader(title: "Media Generation")
+            TraySectionHeader(title: String(localized: "Media Generation"))
             HStack(spacing: 6) {
                 ForEach(GenExperiment.allCases) { exp in
                     TrayTile(icon: exp.icon, title: exp.title, help: exp.help) { open(exp) }
@@ -493,9 +493,9 @@ struct StatusMenuView: View {
                 TrayRowSeparator()
             }
 
-            TrayDisclosureHeader(title: "Download Models", isExpanded: $showDownloads) {
-                TrayAccessoryButton(title: "Browse", icon: "magnifyingglass",
-                                    help: "Open the Model Browser") {
+            TrayDisclosureHeader(title: String(localized: "Download Models"), isExpanded: $showDownloads) {
+                TrayAccessoryButton(title: String(localized: "Browse"), icon: "magnifyingglass",
+                                    help: String(localized: "Open the Model Browser")) {
                     openModelBrowser()
                 }
             }
@@ -535,7 +535,7 @@ struct StatusMenuView: View {
                 } label: {
                     TrayFeatureRow(
                         icon: "shippingbox.fill",
-                        title: "Agent Sandbox",
+                        title: String(localized: "Agent Sandbox"),
                         // guestMemoryText is quantized + published only on
                         // change, so this row doesn't re-render per second.
                         subtitle: sandbox.guestRunning
@@ -880,25 +880,25 @@ struct ServerControlButtonPresentation: Equatable {
     init(status: ServerStatus) {
         switch status {
         case .starting:
-            title = "Loading Model..."
+            title = String(localized: "Loading Model...")
             systemImageName = nil
             showsProgress = true
             tint = .loading
-            help = "Loading model. Click to stop."
+            help = String(localized: "Loading model. Click to stop.")
             isProminent = true
         case .running:
-            title = "Stop Server"
+            title = String(localized: "Stop Server")
             systemImageName = "stop.fill"
             showsProgress = false
             tint = .red
-            help = "Stop the running server."
+            help = String(localized: "Stop the running server.")
             isProminent = false
         case .stopped, .error:
-            title = "Start Server"
+            title = String(localized: "Start Server")
             systemImageName = "play.fill"
             showsProgress = false
             tint = .accent
-            help = "Start the selected model."
+            help = String(localized: "Start the selected model.")
             isProminent = true
         }
     }
@@ -970,10 +970,10 @@ struct EndpointsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            TrayDisclosureHeader(title: "Endpoints", isExpanded: $isExpanded) {
+            TrayDisclosureHeader(title: String(localized: "Endpoints"), isExpanded: $isExpanded) {
                 if showsMetricsButton {
-                    TrayAccessoryButton(title: "Metrics", icon: "chart.bar.xaxis",
-                                        help: "Open the live metrics panel in your browser") {
+                    TrayAccessoryButton(title: String(localized: "Metrics"), icon: "chart.bar.xaxis",
+                                        help: String(localized: "Open the live metrics panel in your browser")) {
                         if let root = Self.rootURL(baseURL) {
                             NSWorkspace.shared.open(root)
                         }

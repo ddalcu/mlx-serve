@@ -616,12 +616,12 @@ struct ChatSidebar: View {
             let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
             LazyVStack(alignment: .leading, spacing: 2) {
                 if !groups.agents.isEmpty {
-                    sectionHeader("Agents")
+                    sectionHeader(String(localized: "Agents"))
                     ForEach(groups.agents) { session in
                         sessionRow(session)
                     }
                 }
-                sectionHeader("Chats")
+                sectionHeader(String(localized: "Chats"))
                 ForEach(groups.chats) { session in
                     sessionRow(session)
                 }
@@ -653,17 +653,17 @@ struct ChatSidebar: View {
         .safeAreaInset(edge: .top) {
             VStack(spacing: 2) {
                 // New Chat, and beside it the choice of WHO the chat is with.
-                destinationRow("New Chat", icon: "square.and.pencil",
+                destinationRow(String(localized: "New Chat"), icon: "square.and.pencil",
                                selected: false) {
                     appState.showConversation()
                     _ = appState.newChatSession()
                 }
-                destinationRow("Models", icon: "square.stack.3d.up",
+                destinationRow(String(localized: "Models"), icon: "square.stack.3d.up",
                                selected: appState.chatWorkspace.isModels,
                                badge: activeDownloadCount) {
                     appState.chatWorkspace.isModels ? appState.showConversation() : appState.showModels()
                 }
-                destinationRow("Settings", icon: "gearshape",
+                destinationRow(String(localized: "Settings"), icon: "gearshape",
                                selected: appState.chatWorkspace.isSettings) {
                     appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
                 }
@@ -672,7 +672,7 @@ struct ChatSidebar: View {
                 // and the Tools menu iterate (`sidebarCreateItems` — a filter on
                 // `mediaItems`, so the three surfaces cannot drift). Each row is
                 // the mode switch for its generator page, exactly like Models.
-                sectionHeader("Create")
+                sectionHeader(String(localized: "Create"))
                 ForEach(ChatEmptyState.sidebarCreateItems) { item in
                     if case .create(let experiment) = item.action {
                         destinationRow(item.title, icon: item.systemImage,
@@ -691,7 +691,7 @@ struct ChatSidebar: View {
                 // item, and proximity is what would say otherwise.
                 agentsRow
                     .padding(.top, 10)
-                destinationRow("Tasks", icon: "clock.badge.checkmark",
+                destinationRow(String(localized: "Tasks"), icon: "clock.badge.checkmark",
                                selected: appState.chatWorkspace.isTasks) {
                     appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
                 }
@@ -882,7 +882,7 @@ struct ChatSidebar: View {
     /// The Agents row. A MENU, because "Agents" is two things: the agents you
     /// can start a conversation as, and the editor for them.
     private var agentsRow: some View {
-        destinationRow("Agents", icon: "person.2",
+        destinationRow(String(localized: "Agents"), icon: "person.2",
                        selected: appState.chatWorkspace.isAgents) {
             appState.chatWorkspace.isAgents ? appState.showConversation() : appState.showAgents()
         }
@@ -907,7 +907,7 @@ struct ChatSidebar: View {
                     })
             } label: {
                 // "Code", matching the tray's own Code button over the same menu.
-                destinationLabel("Code", icon: "terminal", selected: false)
+                destinationLabel(String(localized: "Code"), icon: "terminal", selected: false)
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
@@ -1349,7 +1349,7 @@ struct ChatDetailView: View {
                         } else {
                             // The agent forbids it — say so rather than showing
                             // an off switch the user can't turn on.
-                            Text("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities")
+                            Text("\(tool.displayName) — not in \(activeAgent?.name ?? String(localized: "agent"))'s capabilities")
                         }
                     }
                     .disabled(!allowed || isExternalBridgeSession)
@@ -2836,9 +2836,9 @@ struct MessageBubble: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 2) {
-                footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                footerButton("doc.on.doc", help: String(localized: "Copy this reply")) { copyMessage() }
                 if let onDelete {
-                    footerButton("trash", help: "Delete this message from the conversation",
+                    footerButton("trash", help: String(localized: "Delete this message from the conversation"),
                                  action: onDelete)
                 }
             }

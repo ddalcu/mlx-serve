@@ -37,13 +37,13 @@ enum ChatEmptyState {
     /// The four generation windows behind the "Create Media" chip — and the
     /// Tools menu's media section (same array, deliberately).
     static let mediaItems: [Item] = [
-        Item(id: "media-image", title: "Image Generation", systemImage: "photo",
+        Item(id: "media-image", title: String(localized: "Image Generation"), systemImage: "photo",
              tint: .purple, action: .create(.image)),
-        Item(id: "media-video", title: "Video Generation", systemImage: "film",
+        Item(id: "media-video", title: String(localized: "Video Generation"), systemImage: "film",
              tint: .indigo, action: .create(.video)),
-        Item(id: "media-audio", title: "Audio & Music", systemImage: "waveform",
+        Item(id: "media-audio", title: String(localized: "Audio & Music"), systemImage: "waveform",
              tint: .pink, action: .create(.audio)),
-        Item(id: "media-3d", title: "3D Model", systemImage: "cube",
+        Item(id: "media-3d", title: String(localized: "3D Model"), systemImage: "cube",
              tint: .brown, action: .create(.model3d)),
     ]
 
@@ -61,20 +61,20 @@ enum ChatEmptyState {
     /// button), and a chip that can only fail is the dead-control class.
     static func chips(cliLauncherAvailable: Bool = BuildFeatures.current.cliLauncher) -> [Item] {
         var items: [Item] = [
-            Item(id: "create", title: "Create Media", systemImage: "wand.and.stars",
+            Item(id: "create", title: String(localized: "Create Media"), systemImage: "wand.and.stars",
                  tint: .purple, action: .mediaMenu,
-                 help: "Generate images, video, audio, or 3D models"),
-            Item(id: "models", title: "Browse Models", systemImage: "magnifyingglass",
+                 help: String(localized: "Generate images, video, audio, or 3D models")),
+            Item(id: "models", title: String(localized: "Browse Models"), systemImage: "magnifyingglass",
                  tint: .blue, action: .models,
-                 help: "Search and download models"),
-            Item(id: "tasks", title: "Tasks", systemImage: "clock.badge.checkmark",
+                 help: String(localized: "Search and download models")),
+            Item(id: "tasks", title: String(localized: "Tasks"), systemImage: "clock.badge.checkmark",
                  tint: .orange, action: .tasks,
-                 help: "Scheduled and background agent tasks"),
+                 help: String(localized: "Scheduled and background agent tasks")),
         ]
         if cliLauncherAvailable {
-            items.append(Item(id: "code", title: "Code Launcher", systemImage: "terminal",
+            items.append(Item(id: "code", title: String(localized: "Code Launcher"), systemImage: "terminal",
                               tint: .green, action: .codeLauncher,
-                              help: "Launch a coding agent against this server — on this Mac or inside the sandbox"))
+                              help: String(localized: "Launch a coding agent against this server — on this Mac or inside the sandbox")))
         }
         return items
     }
@@ -157,7 +157,7 @@ struct EmptyStateChipRow: View {
         .fixedSize()
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.4)
-        .help(enabled ? item.help : "Start the server to launch a coding agent")
+        .help(enabled ? item.help : String(localized: "Start the server to launch a coding agent"))
     }
 
     private func open(_ item: ChatEmptyState.Item) {
