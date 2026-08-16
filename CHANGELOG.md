@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### App
+
+- Assistant responses render inline and display LaTeX natively with SwaTex, including `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation environments. Incomplete or invalid streamed TeX stays readable as source, fenced code and user prompts remain literal, and copying inline math restores its original delimiters. SwaTex is MIT-licensed; its bundled KaTeX fonts retain the SIL Open Font License 1.1.
+
 ## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
 
 ### Highlights

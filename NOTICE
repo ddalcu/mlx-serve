@@ -106,6 +106,30 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
+SwaTex
+https://github.com/PhraseHQ/SwaTex
+Copyright (c) 2026 Phrase (https://phrase.so) and SwaTex contributors
+Licensed under the MIT License.
+
+Used by the MLX Core app to parse, lay out, and natively render LaTeX in
+assistant chat responses. SwaTex includes work derived from:
+
+  * RaTeX (https://github.com/erweixin/RaTeX), Copyright (c) erweixin,
+    licensed under the MIT License. SwaTex's engine architecture, layout
+    mathematics, generated tables, and golden corpus derive from RaTeX.
+  * KaTeX (https://katex.org), Copyright (c) 2013-2020 Khan Academy and other
+    contributors, licensed under the MIT License. Font metrics, symbols,
+    stretchy-SVG geometry, macros, and layout rules derive from KaTeX.
+  * mhchem for KaTeX, Copyright (c) Martin Hensel, licensed under the MIT
+    License. The chemistry command state machine reaches SwaTex through
+    RaTeX's Rust port.
+
+The KaTeX_*.ttf fonts bundled in SwaTexRender use the SIL Open Font License
+1.1. SwaTex_SwaTexRender.bundle includes the upstream OFL.txt and
+FONT_NOTICE.txt alongside those fonts, and the entire bundle is copied into the
+app's Resources directory by every packaging path.
+
+--------------------------------------------------------------------------------
 MLX
 https://github.com/ml-explore/mlx
 Copyright (c) 2023 Apple Inc.

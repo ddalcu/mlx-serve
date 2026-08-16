@@ -2,6 +2,7 @@ import SwiftUI
 import PDFKit
 import UniformTypeIdentifiers
 import AppKit
+import SwaTexRender
 
 /// A tool-call awaiting user approval. The agent loop suspends on
 /// `continuation` while the SwiftUI sheet shows the request; the sheet's
@@ -3104,6 +3105,7 @@ private struct ProcessKillButtons: View {
 // each Block becomes a styled fragment of the assembled NSAttributedString.
 struct MarkdownText: View {
     let source: String
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Tags emitted by models (thinking, planning, etc.) — rendered as XML blocks.
     /// Standard HTML tags (head, div, meta, etc.) are NOT included — they render as text.
@@ -3124,6 +3126,10 @@ struct MarkdownText: View {
         self.source = source
     }
 
+    private var latexTheme: LaTeXTheme {
+        colorScheme == .dark ? .dark : .light
+    }
+
     var body: some View {
         // Fenced code renders as its own view (colors, copy button);
         // everything between fences stays in ONE text view per run so
@@ -3133,7 +3139,16 @@ struct MarkdownText: View {
             ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .prose(let text):
-                    SelectableMarkdownNSText(attributed: Self.attributedString(for: text))
+                    ForEach(Array(Self.latexBlocks(in: text).enumerated()), id: \.offset) { _, block in
+                        switch block {
+                        case .prose(let prose):
+                            SelectableMarkdownNSText(
+                                attributed: Self.attributedString(for: prose, theme: latexTheme)
+                            )
+                        case .display(let latex, let raw):
+                            DisplayLaTeXView(latex: latex, raw: raw, theme: latexTheme)
+                        }
+                    }
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
                 }
@@ -3146,6 +3161,40 @@ struct MarkdownText: View {
                 NSPasteboard.general.setString(source, forType: .string)
             }
         }
+    }
+
+    private enum LaTeXBlock {
+        case prose(String)
+        case display(latex: String, raw: String)
+    }
+
+    /// Display formulas own a horizontally scrollable view. Text and inline
+    /// formulas remain one prose run so NSTextView can preserve native
+    /// selection across paragraphs, lists, and inline equations.
+    private static func latexBlocks(in source: String) -> [LaTeXBlock] {
+        var blocks: [LaTeXBlock] = []
+        var prose = ""
+
+        func flushProse() {
+            guard !prose.isEmpty else { return }
+            blocks.append(.prose(prose))
+            prose = ""
+        }
+
+        for segment in LaTeXSegmenter.segments(source) {
+            switch segment {
+            case .text(let text):
+                prose += text
+            case .inline(_, let raw):
+                prose += raw
+            case .display(let latex, let raw):
+                flushProse()
+                blocks.append(.display(latex: latex, raw: raw))
+            }
+        }
+        flushProse()
+        if blocks.isEmpty { blocks.append(.prose(source)) }
+        return blocks
     }
 
     enum TableAlignment { case left, right, center }
@@ -3441,7 +3490,8 @@ struct MarkdownText: View {
 
     // MARK: NSAttributedString assembly
 
-    /// Rendered prose runs, keyed by their source text.
+    /// Rendered prose runs, keyed by source + appearance because inline math
+    /// attachments are rasterized in the resolved label color.
     private static let renderCache: NSCache<NSString, NSAttributedString> = {
         let c = NSCache<NSString, NSAttributedString>()
         c.countLimit = 256
@@ -3451,21 +3501,28 @@ struct MarkdownText: View {
     /// Build the NSAttributedString fed to NSTextView. Public-static so the
     /// rendering path can be exercised by tests later if needed.
     static func attributedString(for source: String) -> NSAttributedString {
-        let key = source as NSString
+        attributedString(for: source, theme: .light)
+    }
+
+    static func attributedString(for source: String, theme: LaTeXTheme) -> NSAttributedString {
+        let key = "\(theme.rawValue)\u{0}\(source)" as NSString
         if let hit = renderCache.object(forKey: key) { return hit }
-        let built = buildAttributedString(for: source)
+        let built = buildAttributedString(for: source, theme: theme)
         renderCache.setObject(built, forKey: key)
         return built
     }
 
-    private static func buildAttributedString(for source: String) -> NSAttributedString {
+    private static func buildAttributedString(
+        for source: String,
+        theme: LaTeXTheme
+    ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let blocks = parseBlocks(source: source)
         for (idx, block) in blocks.enumerated() {
             if idx > 0 { result.append(blockSpacer()) }
             switch block {
             case .paragraph(let text):
-                result.append(renderInline(text))
+                result.append(renderInline(text, theme: theme))
 
             case .heading(let level, let text):
                 // Scaled from the body size, so raising the reading size
@@ -3475,12 +3532,15 @@ struct MarkdownText: View {
                 let p = NSMutableParagraphStyle()
                 p.paragraphSpacingBefore = 4
                 p.paragraphSpacing = 2
-                let attrs: [NSAttributedString.Key: Any] = [
+                let heading = NSMutableAttributedString(
+                    attributedString: renderInline(text, theme: theme, fontSize: size)
+                )
+                let full = NSRange(location: 0, length: heading.length)
+                heading.addAttributes([
                     .font: NSFont.systemFont(ofSize: size, weight: .bold),
-                    .foregroundColor: NSColor.labelColor,
                     .paragraphStyle: p,
-                ]
-                result.append(NSAttributedString(string: text, attributes: attrs))
+                ], range: full)
+                result.append(heading)
 
             case .code(_, let content):
                 let p = NSMutableParagraphStyle()
@@ -3506,7 +3566,7 @@ struct MarkdownText: View {
                 ])
                 let p = NSMutableParagraphStyle()
                 p.headIndent = 14
-                let inline = renderInline(text)
+                let inline = renderInline(text, theme: theme)
                 let combined = NSMutableAttributedString()
                 combined.append(bullet)
                 combined.append(inline)
@@ -3526,7 +3586,12 @@ struct MarkdownText: View {
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
             case .table(let headers, let rows, let alignments):
-                result.append(renderTable(headers: headers, rows: rows, alignments: alignments))
+                result.append(renderTable(
+                    headers: headers,
+                    rows: rows,
+                    alignments: alignments,
+                    theme: theme
+                ))
             }
         }
         return result
@@ -3551,17 +3616,100 @@ struct MarkdownText: View {
     /// can leave `**bold**` and link spans with a baked-in `NSColor` that
     /// doesn't adapt, so we overwrite missing-or-static colors with
     /// `.labelColor` (links keep their dynamic `linkColor`).
-    private static func renderInline(_ text: String) -> NSAttributedString {
-        let bodyFont = NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize)
-        let result: NSMutableAttributedString
+    private struct InlineMathReplacement {
+        let marker: String
+        let latex: String
+        let raw: String
+    }
+
+    private static func renderInline(
+        _ text: String,
+        theme: LaTeXTheme,
+        fontSize: CGFloat = ChatMetrics.transcriptFontSize
+    ) -> NSAttributedString {
+        let bodyFont = NSFont.systemFont(ofSize: fontSize)
+        let prepared = inlineMathPlaceholders(in: text)
+        var result = markdownAttributedString(prepared.source)
+
+        let located = prepared.replacements.compactMap { replacement -> (InlineMathReplacement, NSRange)? in
+            let range = (result.string as NSString).range(of: replacement.marker)
+            return range.location == NSNotFound ? nil : (replacement, range)
+        }
+        // Foundation should preserve private-use marker scalars. If a future
+        // parser version does not, keep every source byte visible instead of
+        // silently dropping an equation.
+        if located.count != prepared.replacements.count {
+            result = markdownAttributedString(text)
+            applyInlineTypography(to: result, bodyFont: bodyFont)
+            linkifyBareUrls(result)
+            return result
+        }
+
+        applyInlineTypography(to: result, bodyFont: bodyFont)
+        for (replacement, range) in located.reversed() {
+            let inherited = result.attributes(at: range.location, effectiveRange: nil)
+            let rendered = InlineLaTeXRenderer.attributedAttachment(
+                latex: replacement.latex,
+                raw: replacement.raw,
+                theme: theme,
+                fontSize: fontSize
+            )
+            let inserted: NSMutableAttributedString
+            if let rendered {
+                inserted = NSMutableAttributedString(attributedString: rendered)
+            } else {
+                inserted = NSMutableAttributedString(string: replacement.raw)
+            }
+            inserted.addAttributes(
+                inherited,
+                range: NSRange(location: 0, length: inserted.length)
+            )
+            result.replaceCharacters(in: range, with: inserted)
+        }
+        linkifyBareUrls(result)
+        return result
+    }
+
+    private static func inlineMathPlaceholders(
+        in text: String
+    ) -> (source: String, replacements: [InlineMathReplacement]) {
+        var source = ""
+        var replacements: [InlineMathReplacement] = []
+
+        for segment in LaTeXSegmenter.segments(text) {
+            switch segment {
+            case .text(let value):
+                source += value
+            case .display(_, let raw):
+                // Display equations are split into their own SwiftUI view by
+                // latexBlocks(in:). Direct renderer callers keep them literal.
+                source += raw
+            case .inline(let latex, let raw):
+                var marker = "\u{E000}mlxlatex\(replacements.count)\u{E001}"
+                while text.contains(marker) || source.contains(marker) {
+                    marker += "x"
+                }
+                source += marker
+                replacements.append(InlineMathReplacement(marker: marker, latex: latex, raw: raw))
+            }
+        }
+        return (source, replacements)
+    }
+
+    private static func markdownAttributedString(_ text: String) -> NSMutableAttributedString {
         if let attr = try? AttributedString(
             markdown: text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) {
-            result = NSMutableAttributedString(attr)
-        } else {
-            result = NSMutableAttributedString(string: text)
+            return NSMutableAttributedString(attr)
         }
+        return NSMutableAttributedString(string: text)
+    }
+
+    private static func applyInlineTypography(
+        to result: NSMutableAttributedString,
+        bodyFont: NSFont
+    ) {
         let full = NSRange(location: 0, length: result.length)
         // Default font for any character that didn't pick up an explicit font
         // from the markdown parser.
@@ -3592,8 +3740,6 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
-        linkifyBareUrls(result)
-        return result
     }
 
     /// Shared detector — creating an NSDataDetector is not free and renderInline
@@ -3638,7 +3784,8 @@ struct MarkdownText: View {
     private static func renderTable(
         headers: [String],
         rows: [[String]],
-        alignments: [TableAlignment]
+        alignments: [TableAlignment],
+        theme: LaTeXTheme
     ) -> NSAttributedString {
         let cols = headers.count
         var widths = [Int](repeating: 0, count: cols)
@@ -3701,7 +3848,94 @@ struct MarkdownText: View {
                 .foregroundColor: NSColor.labelColor,
             ]))
         }
+        replaceInlineMathAttachments(
+            in: result,
+            theme: theme,
+            fontSize: ChatMetrics.transcriptCodeFontSize
+        )
         return result
+    }
+
+    /// Tables deliberately keep their raw monospaced layout instead of going
+    /// through Foundation's Markdown parser. Replace only math segments after
+    /// that layout is assembled; backtick spans remain literal because the
+    /// segmenter excludes them before ranges are collected.
+    private static func replaceInlineMathAttachments(
+        in result: NSMutableAttributedString,
+        theme: LaTeXTheme,
+        fontSize: CGFloat
+    ) {
+        var utf16Offset = 0
+        var replacements: [(range: NSRange, latex: String, raw: String)] = []
+
+        for segment in LaTeXSegmenter.segments(result.string) {
+            switch segment {
+            case .text(let text):
+                utf16Offset += (text as NSString).length
+            case .inline(let latex, let raw):
+                let length = (raw as NSString).length
+                replacements.append((NSRange(location: utf16Offset, length: length), latex, raw))
+                utf16Offset += length
+            case .display(_, let raw):
+                utf16Offset += (raw as NSString).length
+            }
+        }
+
+        for replacement in replacements.reversed() {
+            guard let rendered = InlineLaTeXRenderer.attributedAttachment(
+                latex: replacement.latex,
+                raw: replacement.raw,
+                theme: theme,
+                fontSize: fontSize
+            ) else { continue }
+            let inherited = result.attributes(
+                at: replacement.range.location,
+                effectiveRange: nil
+            )
+            let inserted = NSMutableAttributedString(attributedString: rendered)
+            inserted.addAttributes(
+                inherited,
+                range: NSRange(location: 0, length: inserted.length)
+            )
+            result.replaceCharacters(in: replacement.range, with: inserted)
+        }
+    }
+}
+
+/// A complete display equation is its own horizontally scrollable surface.
+/// SwaTex's MathView performs all parsing/layout/drawing; malformed model
+/// output falls back to the exact delimiters and TeX the model streamed.
+fileprivate struct DisplayLaTeXView: View {
+    let latex: String
+    let raw: String
+    let theme: LaTeXTheme
+
+    private var fontSize: CGFloat { ChatMetrics.transcriptFontSize + 4 }
+
+    var body: some View {
+        if DisplayLaTeXRenderer.canRender(latex, theme: theme, fontSize: fontSize) {
+            ScrollView(.horizontal) {
+                MathView(latex)
+                    .font(size: fontSize)
+                    .mathColor(SwiftUI.Color.primary)
+                    .padding(.vertical, 2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contextMenu {
+                Button("Copy Equation") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(raw, forType: .string)
+                }
+            }
+        } else {
+            SelectableMarkdownNSText(attributed: NSAttributedString(
+                string: raw,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+            ))
+        }
     }
 }
 
@@ -3778,6 +4012,32 @@ fileprivate final class IntrinsicTextView: NSTextView {
     override func didChangeText() {
         super.didChangeText()
         invalidateIntrinsicContentSize()
+    }
+
+    override func copy(_ sender: Any?) {
+        let range = selectedRange()
+        guard range.length > 0, let textStorage else {
+            super.copy(sender)
+            return
+        }
+
+        var containsLaTeX = false
+        textStorage.enumerateAttribute(.mlxLaTeXSource, in: range) { value, _, stop in
+            if value != nil {
+                containsLaTeX = true
+                stop.pointee = true
+            }
+        }
+        guard containsLaTeX else {
+            super.copy(sender)
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(
+            LaTeXCopyText.string(from: textStorage, range: range),
+            forType: .string
+        )
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -3990,4 +4250,3 @@ fileprivate final class ComposerTextView: NSTextView {
         return ok
     }
 }
-

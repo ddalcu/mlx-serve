@@ -522,8 +522,8 @@ final class DocumentIndexTests: XCTestCase {
     /// finds no encoder → download the default encoder from HF (~35 MB) →
     /// register it by absolute path → embed. Gated (network + server):
     ///
-    ///   DOCS_RAG_AUTODL_PORT=11321 swift test -Xswiftc -swift-version \
-    ///     -Xswiftc 5 --filter testAutoProviderProvisionsEncoderEndToEnd
+    ///   DOCS_RAG_AUTODL_PORT=11321 swift test \
+    ///     --filter testAutoProviderProvisionsEncoderEndToEnd
     @MainActor
     func testAutoProviderProvisionsEncoderEndToEnd() async throws {
         guard let portStr = ProcessInfo.processInfo.environment["DOCS_RAG_AUTODL_PORT"],
