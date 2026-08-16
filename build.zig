@@ -486,23 +486,6 @@ fn buildRootHandle(b: *std.Build) std.Io.Dir {
     return b.root.root_dir.handle;
 }
 
-/// Absolute path to `sub_path` under the build root, for baking into an
-/// LC_RPATH. `b.path(sub_path)` looks like it would do this, but when `zig
-/// build` is invoked with cwd == build root (the normal `zig build
-/// -Doptimize=ReleaseFast` from CONTRIBUTING.md), `b.build_root.path` is
-/// null ("means cwd") and `Directory.join` returns the bare relative
-/// string with nothing prefixed. That relative string is exactly what
-/// ends up in the linked binary's LC_RPATH — fine for the linker
-/// (build-time cwd is the build root), wrong for the binary, whose
-/// LC_RPATH is resolved against cwd at process launch, which can be
-/// anywhere. Resolve to an absolute path once here so the rpath keeps
-/// working regardless of where the binary is later run from.
-fn absBuildPath(b: *std.Build, sub_path: []const u8) []const u8 {
-    return buildRootHandle(b).realPathFileAlloc(b.graph.io, sub_path, b.allocator) catch |err| {
-        std.debug.panic("failed to resolve '{s}' under the build root: {t}", .{ sub_path, err });
-    };
-}
-
 /// The llama.cpp tag staged by scripts/fetch-llama.sh (it writes LLAMA_TAG to
 /// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
 /// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
@@ -530,7 +513,27 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // would otherwise hijack this link (pulling in /opt/homebrew's version + its
     // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
     module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
-    module.addRPath(.{ .cwd_relative = absBuildPath(b, "lib/llama/lib") });
+    // @loader_path resolves against the BINARY's own location at launch,
+    // not the launching process's cwd. A bare relative string here (e.g.
+    // "lib/llama/lib") gets baked verbatim into LC_RPATH when `zig build`
+    // runs with cwd == build root (b.build_root.path is null in that case,
+    // so b.path() can't make it absolute) and dyld then resolves that
+    // relative string against argv[0]'s cwd, breaking any launch from
+    // outside the repo root. An absolute path avoids that but bakes in a
+    // machine-specific location, so the build isn't relocatable. This is
+    // relative to the binary itself, so it stays correct from any launch
+    // cwd and survives copying the whole zig-out + lib tree elsewhere.
+    //
+    // This module backs two different binaries at two different depths
+    // under the build root, so one entry can't serve both: the installed
+    // exe lands at zig-out/bin/mlx-serve (@loader_path = zig-out/bin/, 2
+    // levels up to root), while `zig build test` runs straight out of
+    // .zig-cache/o/<hash>/test (@loader_path = that dir, 3 levels up to
+    // root). dyld tries every LC_RPATH entry in order and silently skips
+    // ones that don't resolve, so listing both depths here is safe — each
+    // binary finds its own and ignores the other.
+    module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
+    module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
     // C11 for pthread_once-based one-time backend init.
@@ -555,7 +558,13 @@ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
     // link — we want exactly the staged NAX-enabled pair (same class as the
     // llama.pc hijack above).
     module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
-    module.addRPath(.{ .cwd_relative = absBuildPath(b, "lib/mlx/lib") });
+    // See addLlamaLib above: @loader_path is relative to the binary itself,
+    // so this stays correct regardless of the launching process's cwd and
+    // stays relocatable across machines. Two entries for the same reason —
+    // the installed exe and the `zig build test` binary sit at different
+    // depths under the build root.
+    module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/mlx/lib" });
+    module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/mlx/lib" });
 }
 
 /// Configure-time check that scripts/build-mlx.sh has staged the pinned
