@@ -1077,9 +1077,13 @@ private struct ContextSizeRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
 
+    // Powers of two plus 1.5× midpoints (issue #188: 32K→64K→128K jumps are
+    // too coarse on a memory-limited Mac). Every value is a multiple of 1024
+    // so formatTokens renders it exactly.
     private static let allPresets: [Int] = [
-        0, 4_096, 8_192, 16_384, 32_768, 65_536,
-        131_072, 262_144, 524_288, 1_048_576,
+        0, 4_096, 6_144, 8_192, 12_288, 16_384, 24_576, 32_768,
+        49_152, 65_536, 98_304, 131_072, 196_608, 262_144,
+        393_216, 524_288, 786_432, 1_048_576,
     ]
 
     /// Drop any preset larger than the model's `max_position_embeddings` so
@@ -1773,9 +1777,12 @@ private struct RequestDefaultsSectionContent: View {
     /// the request omits max_tokens and the server pegs generation to the
     /// remaining context window — the right cap on a small-RAM / small-context
     /// machine, where a fixed number would over- or under-shoot. The rest are
-    /// powers of 2 from 256 up to 256K.
+    /// powers of 2 from 256 up to 256K plus 1.5× midpoints from 3K up
+    /// (issue #188 — finer steps; every value formats exactly under the
+    /// 1024-division formatter).
     private static let maxTokensPresets: [Int] = [
-        0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+        0, 256, 512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
+        32768, 49152, 65536, 98304, 131072, 196608, 262144,
     ]
 
     /// Snapping presets for Reasoning Budget. Position 0 is the special

@@ -1355,3 +1355,36 @@ have been 0.62 GB of that. Layers past the 128-entry table keep the array's
   while `prefillTransientReserve` bills it for one chunk** (1.44x disagreement
   on Qwen3.5-4B at 4 bits). Absorbed by the sizer's 0.544 compound margin today;
   it belongs in `per_tok`. Still open.
+
+## opencode plan mode answered "What would you like to accomplish?" to every prompt: a content array's text parts were last-wins (2026-08-16, issue #195)
+
+A user in `mlx-serve launch opencode` put the session in plan mode and every
+first message was ignored — the model replied "I'll help you plan. What would
+you like to accomplish?" as if the prompt were empty, while the same model on
+LM Studio worked (issue #195; also reproduced locally — the SECOND plan-mode
+message worked, which was the tell).
+
+Opencode's `SessionReminders.apply` appends its "Plan Mode - System Reminder"
+block as a SECOND synthetic text part on the LAST user message when entering
+plan mode (and only then — later plan-mode turns get no reminder, which is why
+"asking again" worked). The AI SDK openai-compatible provider ships a
+multi-part user message as `content: [{type:"text",...},{type:"text",...}]`.
+Our `/v1/chat/completions` parser read that array with
+`if (text == .string) text_content = text.string;` — every text part
+OVERWROTE the previous one, so the model saw only the reminder and never the
+prompt. It then did exactly what the reminder asks with no task: offered to
+plan. Build mode sends ONE text part, so it never fired.
+
+Two more arms of the same class sat on `/v1/messages`: the top-level `system`
+array took only the FIRST text block (`break :blk text.string` on first hit
+— Claude Code sends identity + instructions as two blocks), and a
+`tool_result` content array took only its first text block. The Responses API
+parser already joined with `'\n'`, and the Anthropic user/assistant text
+blocks already accumulated — the bug was per-arm, which is what made it a
+class.
+
+Fix: ONE collector, `server.joinedTextParts` — every `{type:"text"}` part
+joined in order with `'\n'` (matching the Responses parser and the Anthropic
+user arm), single-part borrows the JSON's bytes / 2+ parts allocate
+(`{text, owned}`, the provenance rule), wired at all three sites. Guard:
+unit tests on the exact opencode two-part shape.

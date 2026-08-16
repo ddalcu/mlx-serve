@@ -22,8 +22,9 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh` — brew's 0.16.0 no longer 
 
 | File | Role |
 |---|---|
-| `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve`) |
+| `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch`) |
 | `cli.zig` | Ollama-grade CLI: alias table → HF repo, resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, `run` REPL |
+| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/codex/hermes/aider): reads `/v1/models` for the model list + ADVERTISED context, writes configs into dedicated `~/.mlx-serve/<agent>/` dirs (never a user's real agent config), starts the MLX Core app if the server is down, execs via login zsh. The Swift `CLILauncher`+`AgentConfigs` are the DMG twin — documented duplication, contracts kept in sync (omp reads `PI_CODING_AGENT_DIR`, codex is Responses-wire-only via `CODEX_HOME`, hermes rides `HERMES_HOME`) |
 | `mlx.zig` | mlx-c FFI |
 | `model.zig` | Config parse + safetensors loading |
 | `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |
@@ -142,6 +143,7 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 - **Context-overflow 400s name BOTH counts** (`contextOverflowMessage`; legacy sentence stays the prefix). The app renders it as a card.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl. `stop_sequence` echo (`anthropicStopReason`), full SSE content-block lifecycle. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`.
 - **Ollama `/api/*`**: pure translation (ollama.zig), NO duplicated inference; no-model endpoints answered pre-scheduler; `resolveName` handles `name:tag`. Discovery is two-level; one path must never register under TWO ids (`registry.peekByPath` — double-residency OOM class).
+- **`/v1/models` rows carry `context_length`+`max_model_len` at the TOP level, twinning `meta.context_length`** (issue #188): openai-models-list discovery clients (oh-my-pi, vLLM-shaped readers) never read `meta.*` and substitute their own defaults (omp: 128k) when the twins are absent. Both emitters (loaded + stub). Guard: `tests/test_models_capabilities.sh` [4b].
 - **LAN sharing**: proxy is a TRANSPORT; keyless gate = `routeClass` × `SharedSet`; `<id>@<peer>` mirroring; loops impossible by construction (self-token + tunnel marker, one-hop bound). Full design: `docs/reference.md`.
 - **Observability** (`--metrics`): zero cost when off; TTFT at prefill completion; live tok/s via ONE atomic per decode tick. `--api-key`: loopback exempt; `/health`+OPTIONS open; `constTimeEql`. No admin surface (deliberate).
 
@@ -234,6 +236,7 @@ With `tools` present, tokens buffer for detection (all tag families + raw JSON);
 - **The `include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`, chat + completions): restating `finish_reason`/`finish_details` beside the usage object made every per-event client render the ending twice (PR #147's doubled banner). The ending appears on exactly ONE chunk; `usage`+`timings` ride the empty-choices chunk, whose pending-logprobs drain moved to the final chunk. Guard: `tests/test_loop_stop_signal.sh` [2][4].
 - **Console media is ASKED for, not a form**: ONE media generation per user turn (budget, refusal must be a SENTENCE); tool `model` enum == resolution list (`editableIds`); rank candidates by usability; the system prompt is OURS, built from `/v1/models` + the API tab's own markup.
 - **A field DISPATCH reads must be readable from every body SHAPE**: `parseModelFromRequest(body, content_type)` feeds dispatch AND `lanShareDenial` (the multipart `model` field class); a guard for it needs a server with NO default model.
+- **A content array's text parts JOIN in order — a text arm never assigns** (`server.joinedTextParts`, the ONE collector, all three parse sites): opencode plan mode ships `[prompt, plan-reminder]` as TWO text parts and last-wins dropped the prompt — the model answered "What would you like to accomplish?" to every first plan-mode message (issue #195). Anthropic `system` arrays and `tool_result` arrays were FIRST-wins, same class.
 - **A header PARAMETER lookup keys on the parameter at a boundary, never a substring** (`name=` also matches inside `filename=`).
 - **A body log that was fine for JSON is not fine for BINARY**: text bodies whole, non-text a bounded sanitized preview (`bodyIsText`/`bodyPreview`).
 - **Auto-context bills the KV at the CONFIGURED width and the activations ONCE** (`kvBytesPerTokenAtBits` + `prefillTransientReserve`, both shared with the admission guard and pinned by its call-site scan): the sizer read the dense `kvBytesPerToken()` with `--kv-quant` invisible, and multiplied the PREFILL-CHUNK-bounded envelope `8 x max(hidden, ffn) x 2` by every token of CONTEXT — 81% of a qwen3_5 27B's budget on a transient that does not scale with context, so a 16 GB Mac reported under 4k tokens whatever the weights cost. Measured flat in prompt length and keyed on `--prefill-chunk`; the same measurement shows `prefillMemoryNeeded` UNDER-bills a quantized prefill ~22% (unmodelled dequantized-weight working set), deliberately not retuned here.

@@ -20,7 +20,7 @@ Yes. mlx-serve embeds llama.cpp's inference library (`libllama`) inside the same
 
 ## Does mlx-serve work with Claude Code?
 
-Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you.
+Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you, and `mlx-serve launch claude` does the same from the terminal. Other agents too: pi, oh-my-pi, OpenCode, Codex, hermes, aider, plus editors like Zed. Setup for each is in [integrations.md](integrations.md).
 
 ## Can my Macs share models over the network?
 

@@ -77,6 +77,7 @@ test {
     _ = @import("gen_sse.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");
+    _ = @import("launch.zig");
     _ = @import("lan.zig");
     _ = @import("mlx.zig");
 }

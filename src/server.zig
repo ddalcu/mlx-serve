@@ -3418,12 +3418,18 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
+            // Top-level twins of meta.context_length: openai-models-list
+            // discovery clients (oh-my-pi, vLLM-shaped readers) look for
+            // row-level max_model_len/context_length and substitute their own
+            // defaults when absent (issue #188).
+            ctx_str,
+            ctx_str,
             caps.items,
             mods.items,
             config.model_type,
@@ -3552,6 +3558,17 @@ fn renderModelEntry(
     });
     defer allocator.free(engine_part);
 
+    // Top-level twins of meta.context_length (issue #188): openai-models-list
+    // discovery clients read row-level max_model_len/context_length. Unloaded
+    // stubs advertise the architectural max — the same number meta carries here.
+    const top_ctx_part: []const u8 = if (sm.found) blk: {
+        break :blk try std.fmt.allocPrint(allocator, ",\"context_length\":{d},\"max_model_len\":{d}", .{
+            sm.max_position_embeddings,
+            sm.max_position_embeddings,
+        });
+    } else &[_]u8{};
+    defer if (top_ctx_part.len > 0) allocator.free(top_ctx_part);
+
     // Dimensions/context/quant/MoE — emitted only when config.json was readable.
     const dims_part: []const u8 = if (sm.found) blk: {
         break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{d}-bit\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},", .{
@@ -3567,8 +3584,8 @@ fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(
@@ -4573,6 +4590,41 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
+const JoinedText = struct { text: []const u8, owned: bool };
+
+/// Collect every `{"type":"text"}` part of a content array into one string,
+/// in order, '\n'-joined. A single (or no) text part borrows the JSON's
+/// bytes (`owned=false`); 2+ parts allocate (`owned=true`, caller frees).
+///
+/// Multiple text parts are real traffic: opencode plan mode appends its
+/// "Plan Mode - System Reminder" as a SECOND text part on the user message,
+/// and last-wins here dropped the user's actual prompt — the model answered
+/// "What would you like to accomplish?" to every first plan-mode message
+/// (issue #195).
+fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) !JoinedText {
+    var single: []const u8 = "";
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    var n: usize = 0;
+    for (parts) |part| {
+        if (part != .object) continue;
+        const ptype = part.object.get("type") orelse continue;
+        if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
+        const tv = part.object.get("text") orelse continue;
+        if (tv != .string or tv.string.len == 0) continue;
+        n += 1;
+        if (n == 1) {
+            single = tv.string;
+            continue;
+        }
+        if (n == 2) try buf.appendSlice(allocator, single);
+        try buf.append(allocator, '\n');
+        try buf.appendSlice(allocator, tv.string);
+    }
+    if (n <= 1) return .{ .text = single, .owned = false };
+    return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
+}
+
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -4646,6 +4698,14 @@ fn handleChatCompletions(
         tool_call_lists.deinit(allocator);
     }
 
+    // Joined multi-part text content (allocated only when a message carries
+    // 2+ text parts).
+    var content_allocs = std.ArrayList([]const u8).empty;
+    defer {
+        for (content_allocs.items) |s| allocator.free(s);
+        content_allocs.deinit(allocator);
+    }
+
     for (messages_val.array.items) |msg_val| {
         // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
         // `.object`. Skip it rather than crash — consistent with how malformed
@@ -4662,17 +4722,13 @@ fn handleChatCompletions(
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
-                var text_content: []const u8 = "";
                 var image_list = std.ArrayList(chat_mod.ImageData).empty;
                 var audio_list = std.ArrayList(chat_mod.AudioData).empty;
                 for (arr.items) |part| {
                     if (part != .object) continue;
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
-                    if (std.mem.eql(u8, ptype.string, "text")) {
-                        const text = part.object.get("text") orelse continue;
-                        if (text == .string) text_content = text.string;
-                    } else if (std.mem.eql(u8, ptype.string, "image_url")) {
+                    if (std.mem.eql(u8, ptype.string, "image_url")) {
                         // Parse image_url content block
                         const img_obj = part.object.get("image_url") orelse continue;
                         if (img_obj != .object) continue;
@@ -4705,7 +4761,9 @@ fn handleChatCompletions(
                 } else {
                     audio_list.deinit(allocator);
                 }
-                break :blk text_content;
+                const joined = try joinedTextParts(allocator, arr.items);
+                if (joined.owned) try content_allocs.append(allocator, joined.text);
+                break :blk joined.text;
             },
             .null => "",
             else => "",
@@ -10060,19 +10118,16 @@ fn handleAnthropicMessages(
         content_allocs.deinit(allocator);
     }
 
-    // System prompt (Anthropic puts it at top level)
+    // System prompt (Anthropic puts it at top level). Array form JOINS every
+    // text block — Claude Code sends 2+ (identity + the instructions block),
+    // and first-wins dropped everything after the first.
     if (root.get("system")) |sys_val| {
         const sys_text: []const u8 = switch (sys_val) {
             .string => |s| s,
             .array => |arr| blk: {
-                for (arr.items) |block| {
-                    if (block != .object) continue;
-                    const btype = block.object.get("type") orelse continue;
-                    if (btype != .string or !std.mem.eql(u8, btype.string, "text")) continue;
-                    const text = block.object.get("text") orelse continue;
-                    if (text == .string) break :blk text.string;
-                }
-                break :blk "";
+                const joined = try joinedTextParts(allocator, arr.items);
+                if (joined.owned) try content_allocs.append(allocator, joined.text);
+                break :blk joined.text;
             },
             else => "",
         };
@@ -10107,18 +10162,9 @@ fn handleAnthropicMessages(
                         if (block.object.get("content")) |rc| switch (rc) {
                             .string => |s| result_text = s,
                             .array => |result_arr| {
-                                for (result_arr.items) |rb| {
-                                    if (rb != .object) continue;
-                                    const rtype = if (rb.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-                                    if (std.mem.eql(u8, rtype, "text")) {
-                                        if (rb.object.get("text")) |t| {
-                                            if (t == .string) {
-                                                result_text = t.string;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                                const joined = try joinedTextParts(allocator, result_arr.items);
+                                if (joined.owned) try content_allocs.append(allocator, joined.text);
+                                result_text = joined.text;
                             },
                             else => {},
                         };
@@ -14698,6 +14744,38 @@ test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
 
     // 6 decoded bytes is not a whole number of float32s → rejected.
     try testing.expect(parseAudioContent(testing.allocator, "AAAAAAAA") == null);
+}
+
+test "content-array text parts JOIN in order — plan-mode's [prompt, reminder] shape (issue #195)" {
+    // opencode plan mode appends its system-reminder as a SECOND text part on
+    // the user message. Last-wins parsing kept only the reminder, so the model
+    // saw no user prompt at all.
+    const body =
+        \\[{"type":"text","text":"analyze project"},
+        \\ {"type":"image_url","image_url":{"url":"data:x"}},
+        \\ {"type":"text","text":"<system-reminder>plan mode</system-reminder>"}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const j = try joinedTextParts(testing.allocator, parsed.value.array.items);
+    defer if (j.owned) testing.allocator.free(j.text);
+    try testing.expect(j.owned);
+    try testing.expectEqualStrings("analyze project\n<system-reminder>plan mode</system-reminder>", j.text);
+}
+
+test "joinedTextParts: single text part borrows; empty and non-text parts ignored" {
+    const body =
+        \\[{"type":"text","text":""}, {"type":"input_audio"}, {"type":"text","text":"hello"}, {"nope":1}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const j = try joinedTextParts(testing.allocator, parsed.value.array.items);
+    try testing.expect(!j.owned);
+    try testing.expectEqualStrings("hello", j.text);
+
+    const none = try joinedTextParts(testing.allocator, &.{});
+    try testing.expect(!none.owned);
+    try testing.expectEqualStrings("", none.text);
 }
 
 // --- /props payload regression ------------------------------------------------
