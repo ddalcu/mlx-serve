@@ -47,25 +47,6 @@ final class LaTeXRenderingTests: XCTestCase {
         )
     }
 
-    func testInlineFormulaRendersInsideAMarkdownTable() {
-        let source = #"""
-        | Feature | Equation |
-        | :--- | :--- |
-        | Euler 🧠 | ($\text{e}^{i\pi} + 1 = 0$) |
-        | Code | `$HOME` stays literal |
-        """#
-        let rendered = MarkdownText.attributedString(for: source)
-
-        XCTAssertEqual(values(for: .attachment, in: rendered).count, 1)
-        XCTAssertEqual(
-            values(for: .mlxLaTeXSource, in: rendered) as? [String],
-            [#"$\text{e}^{i\pi} + 1 = 0$"#]
-        )
-        XCTAssertTrue(rendered.string.contains("Euler 🧠"))
-        XCTAssertTrue(rendered.string.contains("`$HOME`"))
-        XCTAssertTrue(LaTeXCopyText.string(from: rendered).contains(#"$\text{e}^{i\pi} + 1 = 0$"#))
-    }
-
     func testInvalidFormulaFallsBackToItsExactSource() {
         let source = #"Broken $\frac{$ stays readable."#
         let rendered = MarkdownText.attributedString(for: source)

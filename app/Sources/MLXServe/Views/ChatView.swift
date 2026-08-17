@@ -4192,7 +4192,6 @@ struct MarkdownText: View {
         case code(String, String)              // language, content
         case listItem(String)
         case xmlBlock(String)                  // raw XML/tag content
-        case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
     }
 
     fileprivate static func parseBlocks(source: String) -> [Block] {
@@ -4266,17 +4265,6 @@ struct MarkdownText: View {
                 }
                 i += 1 // skip closing ```
                 blocks.append(.code(lang, code.joined(separator: "\n")))
-                continue
-            }
-
-            // Markdown table: a `|`-leading row immediately followed by a separator
-            // row (`|---|---|`, optionally with `:` for alignment). We accept the
-            // looser "must have at least one `|`" form too — many models drop the
-            // leading pipe — but require the separator line to confirm intent so
-            // we don't misinterpret a stray pipe as a table header.
-            if let table = MarkdownTable.parse(lines: lines, start: i) {
-                blocks.append(.table(table.headers, table.rows, table.alignments))
-                i = table.end
                 continue
             }
 
@@ -4433,8 +4421,6 @@ struct MarkdownText: View {
                 ]
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
-            case .table(let headers, let rows, let alignments):
-                result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
             }
         }
         return result
@@ -4620,129 +4606,6 @@ struct MarkdownText: View {
         }
     }
 
-    /// Render a markdown table as monospaced columns padded to the widest cell
-    /// per column. Header row gets a bold font; a horizontal rule separates the
-    /// header from the data rows. Looks great in a chat bubble and stays
-    /// selectable as part of the surrounding text.
-    private static func renderTable(
-        headers: [String],
-        rows: [[String]],
-        alignments: [TableAlignment],
-        theme: LaTeXTheme
-    ) -> NSAttributedString {
-        let cols = headers.count
-        var widths = [Int](repeating: 0, count: cols)
-        let allRows = [headers] + rows
-        for row in allRows {
-            for (j, cell) in row.prefix(cols).enumerated() {
-                widths[j] = max(widths[j], cell.count)
-            }
-        }
-        // Pad cells with at least 1 space so columns don't visually merge.
-        for j in 0..<cols { widths[j] = max(widths[j], 1) }
-
-        func pad(_ cell: String, width: Int, align: TableAlignment) -> String {
-            let gap = width - cell.count
-            if gap <= 0 { return cell }
-            switch align {
-            case .left:   return cell + String(repeating: " ", count: gap)
-            case .right:  return String(repeating: " ", count: gap) + cell
-            case .center:
-                let l = gap / 2
-                return String(repeating: " ", count: l) + cell + String(repeating: " ", count: gap - l)
-            }
-        }
-
-        func formatRow(_ cells: [String]) -> String {
-            var padded = cells
-            while padded.count < cols { padded.append("") }
-            return padded.prefix(cols).enumerated().map { idx, cell in
-                let a = idx < alignments.count ? alignments[idx] : .left
-                return pad(cell, width: widths[idx], align: a)
-            }.joined(separator: "  ")
-        }
-
-        // A table is column-aligned with padded spaces, so it must be the same
-        // monospaced size as a fenced block or the columns stop lining up with
-        // the code around them.
-        let mono = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular)
-        let monoBold = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .semibold)
-        let result = NSMutableAttributedString()
-
-        // Header row (bold) + horizontal rule using box-drawing chars. Explicit
-        // `.foregroundColor: .labelColor` so the table flips light/dark with
-        // the system mode — without it some macOS versions render the cells
-        // in the captured static color from the AttributedString bridge.
-        let headerLine = formatRow(headers) + "\n"
-        result.append(NSAttributedString(string: headerLine, attributes: [
-            .font: monoBold,
-            .foregroundColor: NSColor.labelColor,
-        ]))
-        let rule = widths.map { String(repeating: "─", count: $0) }.joined(separator: "  ") + "\n"
-        result.append(NSAttributedString(string: rule, attributes: [
-            .font: mono,
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]))
-        // Data rows.
-        for (idx, row) in rows.enumerated() {
-            let line = formatRow(row) + (idx == rows.count - 1 ? "" : "\n")
-            result.append(NSAttributedString(string: line, attributes: [
-                .font: mono,
-                .foregroundColor: NSColor.labelColor,
-            ]))
-        }
-        replaceInlineMathAttachments(
-            in: result,
-            theme: theme,
-            fontSize: ChatMetrics.transcriptCodeFontSize
-        )
-        return result
-    }
-
-    /// Tables deliberately keep their raw monospaced layout instead of going
-    /// through Foundation's Markdown parser. Replace only math segments after
-    /// that layout is assembled; backtick spans remain literal because the
-    /// segmenter excludes them before ranges are collected.
-    private static func replaceInlineMathAttachments(
-        in result: NSMutableAttributedString,
-        theme: LaTeXTheme,
-        fontSize: CGFloat
-    ) {
-        var utf16Offset = 0
-        var replacements: [(range: NSRange, latex: String, raw: String)] = []
-
-        for segment in LaTeXSegmenter.segments(result.string) {
-            switch segment {
-            case .text(let text):
-                utf16Offset += (text as NSString).length
-            case .inline(let latex, let raw):
-                let length = (raw as NSString).length
-                replacements.append((NSRange(location: utf16Offset, length: length), latex, raw))
-                utf16Offset += length
-            case .display(_, let raw):
-                utf16Offset += (raw as NSString).length
-            }
-        }
-
-        for replacement in replacements.reversed() {
-            guard let rendered = InlineLaTeXRenderer.attributedAttachment(
-                latex: replacement.latex,
-                raw: replacement.raw,
-                theme: theme,
-                fontSize: fontSize
-            ) else { continue }
-            let inherited = result.attributes(
-                at: replacement.range.location,
-                effectiveRange: nil
-            )
-            let inserted = NSMutableAttributedString(attributedString: rendered)
-            inserted.addAttributes(
-                inherited,
-                range: NSRange(location: 0, length: inserted.length)
-            )
-            result.replaceCharacters(in: replacement.range, with: inserted)
-        }
-    }
 }
 
 /// A complete display equation is its own horizontally scrollable surface.
