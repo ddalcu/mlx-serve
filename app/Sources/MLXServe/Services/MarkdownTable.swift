@@ -140,23 +140,18 @@ enum MarkdownTable {
         }
     }
 
-    /// Relative column widths (fractions summing to `1.0`) computed from
-    /// content length: each column's share starts at its longest cell
-    /// (header or data), floored so an empty or all-short column still gets
-    /// a visible sliver instead of collapsing to zero. Pure, so
-    /// `MarkdownTableView`'s layout can be pinned without spinning up a view.
-    static func columnWidths(headers: [String], rows: [[String]]) -> [CGFloat] {
-        let cols = headers.count
-        guard cols > 0 else { return [] }
-        var longest = headers.map { CGFloat($0.count) }
-        for row in rows {
-            for (j, cell) in row.prefix(cols).enumerated() {
-                longest[j] = max(longest[j], CGFloat(cell.count))
-            }
-        }
-        let floor: CGFloat = 4
-        let weighted = longest.map { max($0, floor) }
-        let total = weighted.reduce(0, +)
-        return weighted.map { $0 / total }
+    /// Given each column's natural (unconstrained) content width and the
+    /// width available for the whole row, returns the actual per-column
+    /// widths: natural widths untouched when their sum already fits, or all
+    /// scaled down by the same factor — preserving their relative shares —
+    /// when the sum would overflow. Pure and view-independent so
+    /// `MarkdownTableView` can pin its layout to it without spinning up a
+    /// view, and so this rule has direct unit coverage.
+    static func layout(natural: [CGFloat], available: CGFloat) -> [CGFloat] {
+        guard available > 0, !natural.isEmpty else { return natural }
+        let total = natural.reduce(0, +)
+        guard total > available, total > 0 else { return natural }
+        let scale = available / total
+        return natural.map { $0 * scale }
     }
 }

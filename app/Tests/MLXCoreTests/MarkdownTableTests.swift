@@ -60,36 +60,34 @@ final class MarkdownTableTests: XCTestCase {
         XCTAssertEqual(t?.rows, [["`$@`", "preserve args with spaces in them"]])
     }
 
-    func testColumnWidthsSumToOne() {
-        let w = MarkdownTable.columnWidths(headers: ["Tip", "Explanation"],
-                                            rows: [["a", "b"], ["cc", "dddd"]])
-        XCTAssertEqual(w.reduce(0, +), 1.0, accuracy: 0.0001)
-        XCTAssertEqual(w.count, 2)
+    func testLayoutReturnsNaturalWidthsUnchangedWhenTheyFit() {
+        let w = MarkdownTable.layout(natural: [50, 100], available: 200)
+        XCTAssertEqual(w, [50, 100])
     }
 
-    func testWiderColumnGetsMoreShare() {
-        let w = MarkdownTable.columnWidths(
-            headers: ["Tip", "Explanation"],
-            rows: [["`$@`", "Use \"$@\" to preserve arguments with spaces"]])
-        XCTAssertGreaterThan(w[1], w[0])
+    func testLayoutScalesDownProportionallyOnOverflow() {
+        let w = MarkdownTable.layout(natural: [100, 300], available: 200)
+        XCTAssertEqual(w, [50, 150])
+        // Relative shares are preserved: the wider column stays 3x the narrower one.
+        XCTAssertEqual(w[1] / w[0], 3, accuracy: 0.0001)
+        XCTAssertEqual(w.reduce(0, +), 200, accuracy: 0.0001)
     }
 
-    func testSingleColumnTakesTheWholeWidth() {
-        XCTAssertEqual(MarkdownTable.columnWidths(headers: ["a"], rows: [["b"]]), [1.0])
+    func testLayoutEmptyColumnsReturnsEmpty() {
+        XCTAssertEqual(MarkdownTable.layout(natural: [], available: 200), [])
     }
 
-    func testEmptyColumnsStillGetAVisibleFloor() {
-        let w = MarkdownTable.columnWidths(headers: ["a", ""], rows: [["x", ""], ["y", ""]])
-        // Both columns bottom out at the same floor, so they split evenly.
-        XCTAssertEqual(w[0], w[1], accuracy: 0.0001)
+    func testLayoutSingleColumnFitsWithinAvailableStaysNatural() {
+        XCTAssertEqual(MarkdownTable.layout(natural: [50], available: 200), [50])
     }
 
-    func testRaggedRowsDoNotCrashAndReturnOneFractionPerHeader() {
-        let w = MarkdownTable.columnWidths(headers: ["a", "b", "c"], rows: [["x"], ["y", "z", "w", "extra"]])
-        XCTAssertEqual(w.count, 3)
+    func testLayoutSingleColumnOverflowClampsToAvailable() {
+        XCTAssertEqual(MarkdownTable.layout(natural: [300], available: 200), [200])
     }
 
-    func testNoHeadersReturnsEmpty() {
-        XCTAssertEqual(MarkdownTable.columnWidths(headers: [], rows: []), [])
+    func testLayoutZeroAvailableReturnsNaturalRatherThanCollapsing() {
+        // Guards the pre-first-measurement frame, where the caller hasn't
+        // measured a real width yet — this function must not divide by zero.
+        XCTAssertEqual(MarkdownTable.layout(natural: [50, 100], available: 0), [50, 100])
     }
 }
