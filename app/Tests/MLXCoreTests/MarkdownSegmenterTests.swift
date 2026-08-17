@@ -96,6 +96,8 @@ final class MarkdownSegmenterTests: XCTestCase {
                 switch seg {
                 case .prose(let t): return t
                 case .code(_, let c): return c
+                case .table(let headers, let rows, _):
+                    return ([headers] + rows).map { $0.joined(separator: " | ") }.joined(separator: "\n")
                 }
             }.joined(separator: "\n")
             for line in src.components(separatedBy: "\n")
@@ -104,5 +106,43 @@ final class MarkdownSegmenterTests: XCTestCase {
                               "line \(line.debugDescription) vanished from \(src.debugDescription)")
             }
         }
+    }
+
+    func testGfmTableBecomesItsOwnSegment() {
+        let s = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter"
+        XCTAssertEqual(segs(s), [
+            .prose("before"),
+            .table(headers: ["a", "b"], rows: [["1", "2"]], alignments: [.left, .left]),
+            .prose("after"),
+        ])
+    }
+
+    func testTableAtTheVeryStartHasNoLeadingEmptyProse() {
+        let s = "| a | b |\n|---|---|\n| 1 | 2 |"
+        XCTAssertEqual(segs(s), [.table(headers: ["a", "b"], rows: [["1", "2"]], alignments: [.left, .left])])
+    }
+
+    func testPipeWithoutSeparatorStaysOneProseSegment() {
+        XCTAssertEqual(segs("a | b\nplain"), [.prose("a | b\nplain")])
+    }
+
+    func testUnterminatedTableMidStreamStillRendersAsTable() {
+        let s = "| a | b |\n|---|---|\n| 1"
+        XCTAssertEqual(segs(s), [.table(headers: ["a", "b"], rows: [["1"]], alignments: [.left, .left])])
+    }
+
+    func testAsciiPseudoTableBecomesItsOwnSegment() {
+        let s = "Tip        Explanation\n─────────  ──────────────────\n`$@`       preserve args"
+        XCTAssertEqual(segs(s), [
+            .table(headers: ["Tip", "Explanation"], rows: [["`$@`", "preserve args"]], alignments: [.left, .left]),
+        ])
+    }
+
+    func testTableThenCodeFenceBothSplitOut() {
+        let s = "| a | b |\n|---|---|\n| 1 | 2 |\n```\nx\n```"
+        XCTAssertEqual(segs(s), [
+            .table(headers: ["a", "b"], rows: [["1", "2"]], alignments: [.left, .left]),
+            .code(language: "", code: "x"),
+        ])
     }
 }

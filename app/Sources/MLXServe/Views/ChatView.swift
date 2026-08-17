@@ -4138,6 +4138,11 @@ struct MarkdownText: View {
                     }
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
+                case .table(let headers, let rows, let alignments):
+                    SelectableMarkdownNSText(
+                        attributed: Self.renderTable(headers: headers, rows: rows,
+                                                      alignments: alignments, theme: latexTheme)
+                    )
                 }
             }
         }
