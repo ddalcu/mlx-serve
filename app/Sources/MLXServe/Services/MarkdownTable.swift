@@ -139,4 +139,24 @@ enum MarkdownTable {
             return .left
         }
     }
+
+    /// Relative column widths (fractions summing to `1.0`) computed from
+    /// content length: each column's share starts at its longest cell
+    /// (header or data), floored so an empty or all-short column still gets
+    /// a visible sliver instead of collapsing to zero. Pure, so
+    /// `MarkdownTableView`'s layout can be pinned without spinning up a view.
+    static func columnWidths(headers: [String], rows: [[String]]) -> [CGFloat] {
+        let cols = headers.count
+        guard cols > 0 else { return [] }
+        var longest = headers.map { CGFloat($0.count) }
+        for row in rows {
+            for (j, cell) in row.prefix(cols).enumerated() {
+                longest[j] = max(longest[j], CGFloat(cell.count))
+            }
+        }
+        let floor: CGFloat = 4
+        let weighted = longest.map { max($0, floor) }
+        let total = weighted.reduce(0, +)
+        return weighted.map { $0 / total }
+    }
 }
