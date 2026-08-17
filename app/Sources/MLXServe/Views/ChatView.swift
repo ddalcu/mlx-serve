@@ -4139,10 +4139,7 @@ struct MarkdownText: View {
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
                 case .table(let headers, let rows, let alignments):
-                    SelectableMarkdownNSText(
-                        attributed: Self.renderTable(headers: headers, rows: rows,
-                                                      alignments: alignments, theme: latexTheme)
-                    )
+                    MarkdownTableView(headers: headers, rows: rows, alignments: alignments)
                 }
             }
         }
@@ -4437,12 +4434,7 @@ struct MarkdownText: View {
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
             case .table(let headers, let rows, let alignments):
-                result.append(renderTable(
-                    headers: headers,
-                    rows: rows,
-                    alignments: alignments,
-                    theme: theme
-                ))
+                MarkdownTableView(headers: headers, rows: rows, alignments: alignments)
             }
         }
         return result
@@ -4472,13 +4464,13 @@ struct MarkdownText: View {
         let latex: String
         let raw: String
     }
-
-    private static func renderInline(
+    static func renderInline(
         _ text: String,
         theme: LaTeXTheme,
+        weight: NSFont.Weight = .regular,
         fontSize: CGFloat = ChatMetrics.transcriptFontSize
     ) -> NSAttributedString {
-        let bodyFont = NSFont.systemFont(ofSize: fontSize)
+        let bodyFont = NSFont.systemFont(ofSize: fontSize, weight: weight)
         let prepared = inlineMathPlaceholders(in: text)
         var result = markdownAttributedString(prepared.source)
 
