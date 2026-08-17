@@ -1219,13 +1219,16 @@ fn crossrowEnvEnabled() bool {
     return v;
 }
 var vqmm_crossrow_engaged = false;
+var vqmm_nax_engaged = false;
 
-/// The byte-unpack NAX tile is profitable for oQe's wide q5/q6 projections,
-/// but loses to stock MLX on the 1024-wide K/V projections. This threshold is
-/// the measured split on M5 Max at M=8; q4 keeps its existing full geometry.
+/// The byte-unpack NAX tile is profitable for wide q5/q6/q8 projections, but
+/// loses to stock MLX on the 1024-wide K/V projections. This threshold is the
+/// measured split on M5 Max at M=8; q4 keeps its existing full geometry.
+/// Qwen3.8-27B 8-bit/g64, forced depth 8, six paired settled boots: 89.81
+/// tok/s NAX vs 79.51 stock (+12.96%); every arm asserted its own engagement.
 fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (bits == 4) return true;
-    return (bits == 5 or bits == 6) and group_size == 64 and n >= 5120;
+    return (bits == 5 or bits == 6 or bits == 8) and group_size == 64 and n >= 5120;
 }
 
 /// Whether the PLAIN-SIMD tiles (split-K / msg) adopt a non-4-bit affine
@@ -1362,7 +1365,7 @@ pub fn verifyQmm(
     // values (5/6-bit rows are byte-packed but still exposed as uint32 arrays).
     if (@as(i64, wsh[1]) * 32 != @as(i64, K) * @as(i64, bits)) return null;
     const nax_on = naxLaneEnvEnabled() and verifyQmmNaxAvailable();
-    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM(), crossrowEnvEnabled());
+    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinMForBits(bits), crossrowEnvEnabled());
     // The crossrow kernel is a strict 4-bit/g64 specialization (masked-nibble
     // dot with /16-prescaled activations) — other widths fall to stock.
     if (lane == .crossrow and (bits != 4 or group_size != 64)) return null;
@@ -1639,9 +1642,9 @@ pub fn naxLaneEnvEnabled() bool {
 }
 
 var vqmm_nax_mixed_env_cache: ?bool = null;
-/// oQe A/B seam: keep the q4 NAX lane live while routing affine q5/q6 back
-/// through stock qmm. This isolates the mixed-bit kernel contribution without
-/// changing model/controller state or disabling NAX for q4 projections.
+/// Mixed-width NAX A/B seam: keep the q4 NAX lane live while routing affine
+/// q5/q6/q8 back through stock qmm. This isolates the byte-unpack kernel
+/// contribution without changing controller state or disabling q4 NAX.
 fn naxMixedBitsEnvEnabled() bool {
     if (vqmm_nax_mixed_env_cache) |v| return v;
     var on = true;
@@ -1660,24 +1663,42 @@ pub fn verifyQmmNaxEnabled() bool {
     return verifyQmmEnabled() and naxLaneEnvEnabled() and verifyQmmNaxAvailable();
 }
 
-/// MLX_SERVE_VERIFY_QMM_NAX_MIN_M parse: the M width where the NAX tile
-/// takes over from the plain-SIMD lanes. Default 8 (MTPLX's dispatcher
-/// keeps SIMD through M<=6 even with NAX lit — 16-row padding waste makes
-/// SIMD competitive at small M; our lanes cover 7). The M5-day A/B of
-/// routing M 5..7 to NAX (todo-m5-nax.md §7 step 2) sets 5 — same boot, no
-/// rebuild. Clamped to [2,16]; disabling is the kill switch's job.
-pub fn naxMinMFrom(val: ?[]const u8) c_int {
-    const v = val orelse return 8;
-    const parsed = std.fmt.parseInt(c_int, v, 10) catch return 8;
+/// MLX_SERVE_VERIFY_QMM_NAX_MIN_M parse: explicit M width where the NAX tile
+/// takes over from the plain-SIMD lanes. Without an override q4/q6 start at
+/// M=8 and q8 at its measured M=7. Clamped to [2,16]; disabling is the lane
+/// kill switch's job.
+fn naxMinMOverrideFrom(val: ?[]const u8) ?c_int {
+    const v = val orelse return null;
+    const parsed = std.fmt.parseInt(c_int, v, 10) catch return null;
     return @min(16, @max(2, parsed));
 }
 
+pub fn naxMinMForBitsFrom(bits: u32, val: ?[]const u8) c_int {
+    if (naxMinMOverrideFrom(val)) |m| return m;
+    // The byte-per-value q8 NAX tile wins already at M=7 (+6.09% over the
+    // plain lane, five thermally-settled counterbalanced pairs). Packed q4/q6
+    // still lose there, so their measured takeover remains M=8.
+    return if (bits == 8) 7 else 8;
+}
+
+pub fn naxMinMFrom(val: ?[]const u8) c_int {
+    return naxMinMForBitsFrom(4, val);
+}
+
 var vqmm_nax_min_m_cache: ?c_int = null;
+var vqmm_nax_min_m_env_checked = false;
+fn naxMinMForBits(bits: u32) c_int {
+    if (!vqmm_nax_min_m_env_checked) {
+        vqmm_nax_min_m_cache = naxMinMOverrideFrom(
+            if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX_MIN_M")) |p| std.mem.span(p) else null,
+        );
+        vqmm_nax_min_m_env_checked = true;
+    }
+    return vqmm_nax_min_m_cache orelse naxMinMForBitsFrom(bits, null);
+}
+
 fn naxMinM() c_int {
-    if (vqmm_nax_min_m_cache) |v| return v;
-    const m = naxMinMFrom(if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX_MIN_M")) |p| std.mem.span(p) else null);
-    vqmm_nax_min_m_cache = m;
-    return m;
+    return naxMinMForBits(4);
 }
 
 /// Exact NAX-dispatch predicate, pure over the runtime gates and shape. Keep
@@ -1720,7 +1741,7 @@ const VQMM_NAX_HEADER: [:0]const u8 =
 /// them as opaque and correct, do not re-derive. Geometry: threadgroup =
 /// 256 threads = 8 simdgroups; each simdgroup owns a K/8 chunk and stages
 /// a dequantized 16x32 B tile in threadgroup memory (each of its 32 lanes
-/// dequants ONE output column's 16 K-values — two 4-bit packs — per
+/// dequants ONE output column's 16 K-values from MLX's packed byte stream per
 /// iteration); matmul2d (16x32x16 multiply_accumulate, execution_simdgroup)
 /// multiplies the row-padded activation tile against it into a cooperative
 /// fp32 accumulator; after the K loop the 8 partial C tiles reduce across
@@ -1822,7 +1843,7 @@ const VQMM_NAX_SOURCE: [:0]const u8 =
     \\                    T(float(q) * scale + bias);
     \\            }
     \\        }
-    \\    } else {
+    \\    } else if constexpr (BITS == 6) {
     \\        _Pragma("unroll")
     \\        for (int pack = 0; pack < 4; ++pack) {
     \\            uint32_t p =
@@ -1835,6 +1856,14 @@ const VQMM_NAX_SOURCE: [:0]const u8 =
     \\                B_tile[sg_id][(pack * 4 + ki) * BN + int(lane)] =
     \\                    T(float(q) * scale + bias);
     \\            }
+    \\        }
+    \\    } else {
+    \\        static_assert(BITS == 8, "unsupported NAX affine width");
+    \\        _Pragma("unroll")
+    \\        for (int ki = 0; ki < BK; ++ki) {
+    \\            uint32_t q = uint32_t(wp[ki]);
+    \\            B_tile[sg_id][ki * BN + int(lane)] =
+    \\                T(float(q) * scale + bias);
     \\        }
     \\    }
     \\    simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1947,6 +1976,10 @@ fn runVerifyQmmNax(
     xd: mlx.mlx_dtype,
     xsh: []const c_int,
 ) !?mlx.mlx_array {
+    if (!vqmm_nax_engaged) {
+        vqmm_nax_engaged = true;
+        log.info("[vqmm] NAX verify lane engaged at {d}-bit: M={d} K={d} N={d} gs={d} min_m={d} (MLX_SERVE_VERIFY_QMM_NAX=0 restores stock)\n", .{ bits, m, K, N, group_size, naxMinMForBits(bits) });
+    }
     const x16 = try naxPadTo16(s, x, m, K, xd);
     defer _ = mlx.mlx_array_free(x16);
 
@@ -4343,12 +4376,14 @@ fn mtpNaxProfileEnabledFrom(input: MtpNaxProfileInputs) bool {
     if (!input.dense_model or !input.calibrated_model or !input.profiled_affine_trunk) return false;
     if (!input.weight_present or !input.packed_weight) return false;
     if (!input.scales_present or !input.biases_present) return false;
-    if (input.model_quant.bits != 4 or input.model_quant.mode != .affine) return false;
-    if (input.model_quant.group_size != 64) return false;
-    if (input.quant.bits != 4 or input.quant.mode != .affine) return false;
-    if (input.quant.group_size != 64) return false;
+    if (input.model_quant.mode != .affine or input.quant.mode != .affine) return false;
+    if (input.model_quant.group_size != 64 or input.quant.group_size != 64) return false;
+    if (input.model_quant.bits != input.quant.bits) return false;
+    if (input.quant.bits != 4 and input.quant.bits != 6 and input.quant.bits != 8) return false;
     if (input.K <= 0 or input.N <= 0 or input.packed_k <= 0) return false;
-    if (@mod(input.K, 8) != 0 or input.packed_k != @divExact(input.K, 8)) return false;
+    const packed_bits = @as(u64, @intCast(input.K)) * @as(u64, input.quant.bits);
+    if (@mod(packed_bits, 32) != 0 or
+        packed_bits / 32 != @as(u64, @intCast(input.packed_k))) return false;
 
     return verifyQmmNaxEnabledForMFrom(
         8,
@@ -5289,11 +5324,22 @@ fn getQkvVerifyKernel() !mlx.mlx_fast_metal_kernel {
 
 pub var qkv_ver_override: ?bool = null; // test seam
 var qkv_ver_env: ?bool = null;
+fn qkvVerifyKernelEnabledFrom(nax_available: bool, raw: ?[]const u8) bool {
+    if (raw) |v| return !std.mem.eql(u8, v, "0");
+    // The dk<=256 adoption set was calibrated on M4. The M5/G17 round found
+    // it slower at 9K KV for q4/q6/q8 targets, so G17 keeps dense verify
+    // attention by default while retaining the explicit force-on QA lever.
+    return !nax_available;
+}
+
 fn qkvVerifyKernelEnabled() bool {
     if (qkv_ver_override) |v| return v;
     if (qkv_ver_env) |v| return v;
     const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    const enabled = qkvVerifyKernelEnabledFrom(
+        verifyQmmNaxAvailable(),
+        if (raw) |v| std.mem.sliceTo(v, 0) else null,
+    );
     qkv_ver_env = enabled;
     return enabled;
 }
@@ -5330,8 +5376,9 @@ var qkv_ver_cfg_keys: [@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvVerCfgKey = @splat(std
 var qkv_ver_engaged_mask: u16 = 0; // one-shot log per TQ
 
 /// Try the verify-width packed-KV attention kernel (T_q 2..8, causal only).
-/// Returns null when a precondition doesn't hold — the caller falls back to
-/// dense SDPA. Preconditions are the kernel's OWN requirements.
+/// Returns null when a precondition or machine adoption gate doesn't hold —
+/// the caller falls back to dense SDPA. G17 defaults dense after its q4/q6/q8
+/// A/B; MLX_SERVE_KV_ATTN_VERIFY=1 retains an explicit force-on QA arm.
 pub fn qkvAttnVerifyKernel(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
@@ -5453,7 +5500,7 @@ pub fn qkvAttnVerifyKernel(
     const bit: u16 = @as(u16, 1) << @intCast(t_q);
     if (qkv_ver_engaged_mask & bit == 0) {
         qkv_ver_engaged_mask |= bit;
-        log.info("[kv-attn] verify kernel engaged: Tq={d} bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} (MLX_SERVE_KV_ATTN_VERIFY=0 restores dense)\n", .{ t_q, view.bits, view.group_size, dk, dv, h_q, h_kv, block });
+        log.info("[kv-attn] verify kernel engaged: Tq={d} bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} (G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces this arm, =0 forces dense)\n", .{ t_q, view.bits, view.group_size, dk, dv, h_q, h_kv, block });
     }
     return out;
 }
@@ -5514,7 +5561,8 @@ fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
 /// Verify-width packed-attention gate (Phase 2): T_q 2..8 served by
 /// `qkvAttnVerifyKernel`, same triple + per-layer kv floor as decode.
 /// Wider multi-token forwards (real prefill chunks) stay on dense SDPA;
-/// MLX_SERVE_KV_ATTN_VERIFY=0 kills the whole width class.
+/// G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces the kernel and =0
+/// kills the whole width class on every machine.
 fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
     if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyKernelEnabled())) return false;
     const ks = mlx.getShape(view.k_triple_q);
@@ -6246,8 +6294,9 @@ pub const Transformer = struct {
 
         const profile_head_shape = mlx.getShape(lm_head_w);
         const profile_head_n: c_int = if (profile_head_shape.len == 2) profile_head_shape[0] else 0;
+        const uniform_profile_bits = config.quant_bits == 4 or config.quant_bits == 6 or config.quant_bits == 8;
         const mtp_uniform_affine_trunk = mtpNaxCalibratedModelFrom(&config, profile_head_n) and
-            config.quant_bits == 4 and
+            uniform_profile_bits and
             config.quant_group_size == 64 and
             config.quant_mode == .affine and
             mtpNaxUniformAffineTrunkFrom(&config, moe_layers);
@@ -7497,7 +7546,8 @@ pub const Transformer = struct {
     fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool, mixed_bits: bool) bool {
         if (self.config.isMoe()) return false;
         if (self.config.hidden_size > std.math.maxInt(c_int)) return false;
-        if (self.config.quant_bits != 4 or self.config.quant_mode != .affine) return false;
+        if (self.config.quant_mode != .affine) return false;
+        if (self.config.quant_bits != 4 and self.config.quant_bits != 6 and self.config.quant_bits != 8) return false;
         if (self.config.quant_group_size != 64) return false;
         if (mixed_bits and !naxMixedBitsEnvEnabled()) return false;
         if (self.lm_head_w.ctx == null or
@@ -7507,10 +7557,9 @@ pub const Transformer = struct {
         const K: c_int = @intCast(self.config.hidden_size);
         const w_shape = mlx.getShape(self.lm_head_w);
         if (w_shape.len != 2) return false;
-        // The cost fit is intentionally narrower than kernel eligibility. It
-        // was measured on the dense Qwen3.6-27B class; other NAX-capable
-        // models retain auto cap 6 until their full-round surface is measured
-        // (explicit --mtp-depth 7/8 still works there).
+        // The cost fits are intentionally narrower than kernel eligibility:
+        // only the measured dense 27B geometry and exact quantized tensor
+        // surfaces reach cap 8. Other NAX-capable models retain cap 6.
         const calibrated_model = mtpNaxCalibratedModelFrom(&self.config, w_shape[0]);
         const calibrated_head = mtpNaxAffineProjectionMatches(
             &self.config,
@@ -7541,14 +7590,14 @@ pub const Transformer = struct {
             .verify_on = verifyQmmEnabled(),
             .lane_on = naxLaneEnvEnabled(),
             .available = verifyQmmNaxAvailable(),
-            .min_m = naxMinM(),
+            .min_m = naxMinMForBits(self.config.quant_bits),
         });
     }
 
     /// Homogeneous q4/gs64 target profile used by the existing q4/q8-gs32
     /// MTP sidecar cost surfaces.
     pub fn mtpNaxProfileEnabled(self: *const Transformer) bool {
-        return mtpNaxAffineProjectionMatches(
+        return self.config.quant_bits == 4 and mtpNaxAffineProjectionMatches(
             &self.config,
             self.emb_w,
             self.emb_s,
@@ -7561,7 +7610,7 @@ pub const Transformer = struct {
     /// Uniform q4/gs64 Qwen3.8 target with its measured dense-bf16 token
     /// embedding. Kept separate because every draft reads this table.
     pub fn mtpNaxQ4Gs64ProfileEnabled(self: *const Transformer) bool {
-        return mtpNaxBf16EmbeddingMatches(
+        return self.config.quant_bits == 4 and mtpNaxBf16EmbeddingMatches(
             self.emb_w,
             self.emb_s,
             self.emb_b,
@@ -7570,11 +7619,40 @@ pub const Transformer = struct {
         ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
     }
 
+    /// Uniform q6/gs64 Qwen3.8 target with a quantized token embedding. The
+    /// mixed-width kill switch revokes this profile because the measured
+    /// depth-8 surface depends on q6 NAX at M=8 and M=9.
+    pub fn mtpNaxQ6Gs64ProfileEnabled(self: *const Transformer) bool {
+        const embedding_match = mtpNaxAffineProjectionMatches(
+            &self.config,
+            self.emb_w,
+            self.emb_s,
+            self.emb_b,
+            self.config.hidden_size,
+            self.config.vocab_size,
+        );
+        const trunk = self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, true);
+        return self.config.quant_bits == 6 and embedding_match and trunk;
+    }
+
+    /// Uniform q8/gs64 Qwen3.8 target with its dense-bf16 token embedding.
+    /// NAX engagement is mandatory: without the q8 byte-unpack lane the same
+    /// depth-8 checkpoint is 12.96% slower and must stay on generic cap 6.
+    pub fn mtpNaxQ8Gs64ProfileEnabled(self: *const Transformer) bool {
+        return self.config.quant_bits == 8 and mtpNaxBf16EmbeddingMatches(
+            self.emb_w,
+            self.emb_s,
+            self.emb_b,
+            self.config.hidden_size,
+            self.config.vocab_size,
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, true);
+    }
+
     /// Exact oQ4e mixed q4/q5/q6 target profile. The q5/q6 lane kill switch
     /// also revokes the cost profile so auto depth never assumes unavailable
     /// mixed-bit acceleration.
     pub fn mtpOqeNaxProfileEnabled(self: *const Transformer) bool {
-        return mtpNaxAffineProjectionMatches(
+        return self.config.quant_bits == 4 and mtpNaxAffineProjectionMatches(
             &self.config,
             self.emb_w,
             self.emb_s,
@@ -20149,6 +20227,11 @@ test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
 }
 
 fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int) !void {
+    // Parity validates the explicit QA arm, independent of the measured
+    // per-machine default (G17 defaults this kernel off).
+    const old_qkv_ver_override = qkv_ver_override;
+    qkv_ver_override = true;
+    defer qkv_ver_override = old_qkv_ver_override;
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(bits));
     defer cache.deinit();
@@ -20257,6 +20340,13 @@ test "qkv verify kernel parity: TQ 2..8 x bits x GQA (strided views, causal tail
     try qkvVerParityCase(24, 4, 256, 8, 21, 4); // the qwen3_5 live geometry
 }
 
+test "qkv verify kernel defaults off on G17 but an explicit env value wins" {
+    try testing.expect(qkvVerifyKernelEnabledFrom(false, null));
+    try testing.expect(!qkvVerifyKernelEnabledFrom(true, null));
+    try testing.expect(qkvVerifyKernelEnabledFrom(true, "1"));
+    try testing.expect(!qkvVerifyKernelEnabledFrom(false, "0"));
+}
+
 test "qkv verify kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
     // GQA 4 x TQ 2 → BLOCK 256; 700+2 rows exercises the multi-block carry,
     // including a final block whose tail rows are causally -inf for tq 0.
@@ -20265,6 +20355,11 @@ test "qkv verify kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
 }
 
 test "qkv verify kernel declines non-verify widths and foreign masks" {
+    // Exercise the kernel's own decline predicates even where the machine
+    // adoption default declines the entire arm first.
+    const old_qkv_ver_override = qkv_ver_override;
+    qkv_ver_override = true;
+    defer qkv_ver_override = old_qkv_ver_override;
     const s = mlx.gpuStream();
     var view: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = false };
     const shape = [_]c_int{ 1, 4, 2, 64 };
@@ -20584,6 +20679,11 @@ test "qkv decode kernel µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
 }
 
 test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
+    // This is the explicit verify-kernel eligibility arm. G17's production
+    // default is dense, so force the QA seam before testing width/floor rules.
+    const old_qkv_ver_override = qkv_ver_override;
+    qkv_ver_override = true;
+    defer qkv_ver_override = old_qkv_ver_override;
     // The ONE gate every fused call site reads. Verify widths (T_q 2..32
     // under MTP/spec) used to be admitted and fell to the composed qmm
     // chain — a deliberate choice that predates deep-MTP defaults and was
@@ -25780,14 +25880,15 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         }
     }
 
-    // oQe mixed-precision trunk projections: only the M5 NAX lane adopts
-    // affine 5/6-bit weights. Keep this self-gated like the NAX rows above so
-    // non-G17 CI never attempts to compile an unavailable MPP kernel.
+    // Mixed-precision trunk projections: the M5 NAX lane adopts affine
+    // 5/6/8-bit weights on the measured wide shape class. Keep this self-gated
+    // like the NAX rows above so non-G17 CI never attempts to compile an
+    // unavailable MPP kernel.
     if (verifyQmmNaxEnabled()) {
         const k: c_int = 512;
         const n: c_int = 5120;
         const gs: u32 = 64;
-        for ([_]u32{ 5, 6 }) |bits| {
+        for ([_]u32{ 5, 6, 8 }) |bits| {
             const wn: usize = @intCast(n * k);
             const wbuf = try allocator.alloc(f32, wn);
             defer allocator.free(wbuf);
@@ -25865,7 +25966,11 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
                 gs,
                 wdq_t,
                 got,
-                if (bits == 5) "nax oQe q5" else "nax oQe q6",
+                switch (bits) {
+                    5 => "nax oQe q5",
+                    6 => "nax oQe q6",
+                    else => "nax q8 candidate",
+                },
             );
 
             // Below the NAX takeover row, default adoption remains the measured
@@ -26109,14 +26214,17 @@ test "verifyQmm: crossrow M 8/9 lane matches stock qmm (4-bit g64, opt-in)" {
     }
 }
 
-test "mixedNaxShapeEnabled keeps measured q5/q6 wins and rejects narrow regressions" {
+test "mixedNaxShapeEnabled keeps measured q5/q6/q8 wins and rejects narrow regressions" {
     try testing.expect(mixedNaxShapeEnabled(4, 32, 1024));
     try testing.expect(mixedNaxShapeEnabled(5, 64, 5120));
     try testing.expect(mixedNaxShapeEnabled(6, 64, 5120));
+    try testing.expect(mixedNaxShapeEnabled(8, 64, 5120));
     try testing.expect(!mixedNaxShapeEnabled(5, 64, 1024));
     try testing.expect(!mixedNaxShapeEnabled(6, 64, 1024));
+    try testing.expect(!mixedNaxShapeEnabled(8, 64, 1024));
     try testing.expect(!mixedNaxShapeEnabled(5, 32, 5120));
     try testing.expect(!mixedNaxShapeEnabled(6, 128, 5120));
+    try testing.expect(!mixedNaxShapeEnabled(8, 32, 5120));
 }
 
 test "oQ4e layer-role fingerprint pins every mixed override" {
@@ -26333,6 +26441,22 @@ test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and a
     };
     try testing.expect(mtpNaxProfileEnabledFrom(good));
 
+    var good6 = good;
+    good6.model_quant.bits = 6;
+    good6.quant.bits = 6;
+    good6.packed_k = 960;
+    try testing.expect(mtpNaxProfileEnabledFrom(good6));
+    var good8 = good;
+    good8.model_quant.bits = 8;
+    good8.quant.bits = 8;
+    good8.packed_k = 1280;
+    try testing.expect(mtpNaxProfileEnabledFrom(good8));
+    var unsupported = good;
+    unsupported.model_quant.bits = 5;
+    unsupported.quant.bits = 5;
+    unsupported.packed_k = 800;
+    try testing.expect(!mtpNaxProfileEnabledFrom(unsupported));
+
     var bad = good;
     bad.dense_model = false;
     try testing.expect(!mtpNaxProfileEnabledFrom(bad));
@@ -26485,6 +26609,15 @@ test "naxMinMFrom: default 8, clamped to [2,16], garbage ignored" {
     try testing.expectEqual(@as(c_int, 16), naxMinMFrom("99"));
     try testing.expectEqual(@as(c_int, 8), naxMinMFrom("abc"));
     try testing.expectEqual(@as(c_int, 8), naxMinMFrom(""));
+}
+
+test "naxMinMForBitsFrom: q8 defaults to measured M7 and explicit override wins" {
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(4, null));
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(6, null));
+    try testing.expectEqual(@as(c_int, 7), naxMinMForBitsFrom(8, null));
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(8, "8"));
+    try testing.expectEqual(@as(c_int, 6), naxMinMForBitsFrom(8, "6"));
+    try testing.expectEqual(@as(c_int, 7), naxMinMForBitsFrom(8, "garbage"));
 }
 
 test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off-M5)" {
