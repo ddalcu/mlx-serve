@@ -4184,8 +4184,6 @@ struct MarkdownText: View {
         return blocks
     }
 
-    enum TableAlignment { case left, right, center }
-
     fileprivate enum Block {
         case paragraph(String)
         case heading(Int, String)              // level, text
@@ -4274,7 +4272,7 @@ struct MarkdownText: View {
             // looser "must have at least one `|`" form too — many models drop the
             // leading pipe — but require the separator line to confirm intent so
             // we don't misinterpret a stray pipe as a table header.
-            if let table = Self.tryParseTable(lines: lines, start: i) {
+            if let table = MarkdownTable.parse(lines: lines, start: i) {
                 blocks.append(.table(table.headers, table.rows, table.alignments))
                 i = table.end
                 continue
@@ -4334,145 +4332,6 @@ struct MarkdownText: View {
         }
 
         return blocks
-    }
-
-    // MARK: Table parsing
-
-    private struct ParsedTable {
-        let headers: [String]
-        let rows: [[String]]
-        let alignments: [TableAlignment]
-        let end: Int  // index of the line *after* the table
-    }
-
-    /// Detect a GFM-style markdown table starting at `lines[start]`. Requires a
-    /// header row, a separator row of dashes (with optional colons for alignment),
-    /// and zero-or-more data rows. Returns nil if any structural check fails so
-    /// the caller falls through to paragraph handling.
-    private static func tryParseTable(lines: [String], start: Int) -> ParsedTable? {
-        guard start + 1 < lines.count else { return nil }
-        let headerLine = lines[start].trimmingCharacters(in: .whitespaces)
-        let sepLine = lines[start + 1].trimmingCharacters(in: .whitespaces)
-        // First try the strict GFM form (pipes + dashed separator).
-        if headerLine.contains("|"), isTableSeparator(sepLine) {
-            let headers = parseTableRow(headerLine)
-            let alignments = parseTableAlignments(sepLine)
-            guard !headers.isEmpty else { return nil }
-            var rows: [[String]] = []
-            var i = start + 2
-            while i < lines.count {
-                let r = lines[i].trimmingCharacters(in: .whitespaces)
-                guard r.contains("|") else { break }
-                if isTableSeparator(r) { break }
-                rows.append(parseTableRow(r))
-                i += 1
-            }
-            return ParsedTable(headers: headers, rows: rows, alignments: alignments, end: i)
-        }
-        // Fallback: ASCII pseudo-table — many smaller models emit
-        //   Header1   Header2   Header3
-        //   ---------------------------
-        //   value1    value2    value3
-        // i.e. multi-space column separators + a single row of dashes. Detect
-        // it by looking for a header line with at least two 2+-space gaps,
-        // followed by a row that's mostly dashes, followed by data rows that
-        // also have multi-space gaps. We split each row on `\s{2,}` to recover
-        // cells.
-        return tryParseAsciiPseudoTable(lines: lines, start: start)
-    }
-
-    /// Recognise the whitespace-aligned "table" shape smaller models emit when
-    /// asked for tabular data without using GFM pipe syntax. We require a
-    /// dashed-rule line within the next two lines and at least 3 columns in the
-    /// header so we don't false-positive a paragraph that happens to contain a
-    /// double space.
-    private static func tryParseAsciiPseudoTable(lines: [String], start: Int) -> ParsedTable? {
-        let header = lines[start]
-        let headerCells = splitOnDoubleSpace(header)
-        guard headerCells.count >= 2 else { return nil }
-        // Find the separator line — typically immediately next, sometimes after
-        // a blank line. Don't search far so paragraphs don't accidentally match.
-        var sepIdx = start + 1
-        while sepIdx < min(start + 3, lines.count) {
-            let candidate = lines[sepIdx].trimmingCharacters(in: .whitespaces)
-            if isAsciiRule(candidate) { break }
-            if !candidate.isEmpty { return nil }
-            sepIdx += 1
-        }
-        guard sepIdx < lines.count else { return nil }
-        guard isAsciiRule(lines[sepIdx].trimmingCharacters(in: .whitespaces)) else { return nil }
-        // Collect data rows: non-blank, with at least one 2+-space gap, and not
-        // another rule line.
-        var rows: [[String]] = []
-        var i = sepIdx + 1
-        while i < lines.count {
-            let raw = lines[i]
-            let t = raw.trimmingCharacters(in: .whitespaces)
-            if t.isEmpty { i += 1; break }
-            if isAsciiRule(t) { i += 1; break }
-            let cells = splitOnDoubleSpace(raw)
-            // Tolerate single-cell continuation lines (model wrapping a long
-            // cell to the next line) by appending to the previous row's last
-            // cell rather than starting a new row.
-            if cells.count == 1, !rows.isEmpty {
-                rows[rows.count - 1][rows[rows.count - 1].count - 1] += " " + cells[0]
-            } else {
-                rows.append(cells)
-            }
-            i += 1
-        }
-        guard !rows.isEmpty else { return nil }
-        // All-left alignment (we have no `:---:` markers in this format).
-        let alignments = [TableAlignment](repeating: .left, count: headerCells.count)
-        return ParsedTable(headers: headerCells, rows: rows, alignments: alignments, end: i)
-    }
-
-    /// Split on runs of two-or-more whitespace. Trims each cell. Drops the
-    /// empty leading element if the line was indented.
-    private static func splitOnDoubleSpace(_ line: String) -> [String] {
-        let parts = line.components(separatedBy: "  ")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        return parts
-    }
-
-    /// True if the (already-trimmed) line consists entirely of dashes / box-
-    /// drawing chars / spaces and is at least 3 chars long. Catches the
-    /// "----------" rule under header rows in pseudo-tables.
-    private static func isAsciiRule(_ line: String) -> Bool {
-        guard line.count >= 3 else { return false }
-        let allowed: Set<Character> = ["-", "─", "=", " ", "|"]
-        let allAllowed = line.allSatisfy { allowed.contains($0) }
-        let hasDash = line.contains("-") || line.contains("─") || line.contains("=")
-        return allAllowed && hasDash
-    }
-
-    private static func parseTableRow(_ line: String) -> [String] {
-        var t = line.trimmingCharacters(in: .whitespaces)
-        if t.hasPrefix("|") { t.removeFirst() }
-        if t.hasSuffix("|") { t.removeLast() }
-        return t.split(separator: "|", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-    }
-
-    private static func isTableSeparator(_ line: String) -> Bool {
-        let cells = parseTableRow(line)
-        guard !cells.isEmpty else { return false }
-        return cells.allSatisfy { cell in
-            let c = cell.replacingOccurrences(of: " ", with: "")
-            return c.range(of: "^:?-{3,}:?$", options: .regularExpression) != nil
-        }
-    }
-
-    private static func parseTableAlignments(_ line: String) -> [TableAlignment] {
-        return parseTableRow(line).map { cell in
-            let c = cell.replacingOccurrences(of: " ", with: "")
-            let leftColon = c.hasPrefix(":")
-            let rightColon = c.hasSuffix(":")
-            if leftColon && rightColon { return .center }
-            if rightColon { return .right }
-            return .left
-        }
     }
 
     // MARK: NSAttributedString assembly
