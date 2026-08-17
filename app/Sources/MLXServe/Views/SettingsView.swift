@@ -914,11 +914,29 @@ private struct ServerSectionContent: View {
         return "\(label) · \(model.engine.shortLabel)"
     }
 
+    /// What "Last model used" resolves to RIGHT NOW, worded for the quiet line
+    /// under the disabled dropdown. Asks `StartupModelChoice.resolved` — the
+    /// same question the launch gate asks — so this line cannot promise a model
+    /// that start would decline to load.
+    private var lastUsedResolution: String {
+        guard let path = StartupModelChoice.resolved(mode: .lastUsed,
+                                                     pinnedPath: nil,
+                                                     lastUsed: StartupModelChoice.lastUsed(),
+                                                     installedPaths: pickable.map(\.path)) else {
+            return "Nothing loaded yet — the server will start with no model."
+        }
+        let dupNames = LocalModel.duplicateNames(in: pickable)
+        guard let model = pickable.first(where: { $0.path == path }) else {
+            return "Nothing loaded yet — the server will start with no model."
+        }
+        return "Currently: \(startupModelLabel(model, dupNames: dupNames))"
+    }
+
     var body: some View {
-        // Startup. Deliberately the first two rows of the Server section: "Do
-        // you want the server?" is `autoStartServer` in the tray, and "do you
-        // want a model resident with it?" is here. They were one checkbox, and
-        // the merged one loaded whatever was selected — see `StartupModelChoice`.
+        // Startup, at the top of the Server section. "Do you want the server?"
+        // is `autoStartServer` in the tray; "do you want a model resident with
+        // it, and which one?" is these three rows. It was all one checkbox, and
+        // that checkbox loaded whatever was selected — see `StartupModelChoice`.
         SettingsRow(
             title: "Load a model at start",
             explainer: "Off by default. Auto-start brings the server up with no model resident; it loads one on demand at your first message, so login stays fast. Turn this on to pay for the load up front instead — a large checkpoint can take a while and holds the memory from the moment you log in."
@@ -927,32 +945,62 @@ private struct ServerSectionContent: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
         }
+        // WHICH model is a property of the selector, not one of its items: the
+        // dropdown below lists models and only models, so a rule ("follow the
+        // last one") can't sit in it pretending to be one.
         SettingsRow(
-            title: "Model to load at start",
-            explainer: "\"Last model used\" follows whatever you were last chatting with, decided when the app starts rather than when you set this. If that model has since been removed — or you have not loaded one yet — the server simply starts with nothing resident."
+            title: "Which model",
+            explainer: "\"Last model used\" follows whatever you were last chatting with, decided when the app starts rather than when you set this — so it keeps up as you switch models. \"Always this model\" pins one regardless."
         ) {
-            Picker("", selection: $appState.startupModelPath) {
-                // First, and the default: the model you want next is usually
-                // the one you just used.
-                Text("Last model used").tag(StartupModelChoice.lastUsedTag)
-                let dupNames = LocalModel.duplicateNames(in: pickable)
-                ForEach(pickable) { model in
-                    Text(startupModelLabel(model, dupNames: dupNames)).tag(model.path)
-                }
-                // A pick that has since been uninstalled matches no row, and a
-                // Picker whose selection matches no row renders BLANK — the
-                // dead-control class. Carry it as its own row so the setting
-                // still says what it holds and what launch will do about it.
-                if !appState.startupModelPath.isEmpty,
-                   !pickable.contains(where: { $0.path == appState.startupModelPath }) {
-                    Text("\((appState.startupModelPath as NSString).lastPathComponent) — no longer installed")
-                        .tag(appState.startupModelPath)
+            Picker("", selection: $appState.startupModelMode) {
+                ForEach(StartupModelChoice.Mode.allCases) { mode in
+                    Text(mode.label).tag(mode)
                 }
             }
             .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(minWidth: 180)
+            .pickerStyle(.segmented)
             .disabled(!appState.loadModelAtStart)
+        }
+        SettingsRow(
+            title: "Model",
+            explainer: "If the pinned model is removed later — or nothing has been loaded yet — the server simply starts with nothing resident, rather than substituting a model you did not choose."
+        ) {
+            VStack(alignment: .trailing, spacing: 4) {
+                Picker("", selection: $appState.startupModelPinnedPath) {
+                    let dupNames = LocalModel.duplicateNames(in: pickable)
+                    ForEach(pickable) { model in
+                        Text(startupModelLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                    // A pin that has since been uninstalled matches no row, and
+                    // a Picker whose selection matches no row renders BLANK —
+                    // the dead-control class. This row is still a MODEL (one
+                    // that used to be here), not a rule, so it belongs in the
+                    // list. It says what the setting holds and what start will
+                    // do about it.
+                    if !appState.startupModelPinnedPath.isEmpty,
+                       !pickable.contains(where: { $0.path == appState.startupModelPinnedPath }) {
+                        Text("\((appState.startupModelPinnedPath as NSString).lastPathComponent) — no longer installed")
+                            .tag(appState.startupModelPinnedPath)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 180)
+                // Disabled under "Last model used": the dropdown is not what
+                // decides then, and an enabled control that changes nothing is
+                // worse than one that is visibly not in play.
+                .disabled(!appState.loadModelAtStart || appState.startupModelMode == .lastUsed)
+
+                // Which model that rule resolves to today, so the answer is
+                // visible rather than something you find out at the next login.
+                if appState.startupModelMode == .lastUsed {
+                    Text(lastUsedResolution)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
         if let m = meta["host"] {
             SettingsRow(

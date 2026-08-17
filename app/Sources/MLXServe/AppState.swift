@@ -202,18 +202,37 @@ class AppState: ObservableObject {
     @Published var loadModelAtStart: Bool {
         didSet { UserDefaults.standard.set(loadModelAtStart, forKey: "loadModelAtStart") }
     }
-    /// WHICH model `loadModelAtStart` loads: `StartupModelChoice.lastUsedTag`
-    /// (the default — "Last model used", resolved at start) or a model's
-    /// absolute path.
+    /// WHICH model `loadModelAtStart` loads — follow the last one used, or
+    /// always `startupModelPinnedPath`. Stored as its own key rather than as a
+    /// magic value inside a path field, so no reader has to know a secret
+    /// string to tell a rule from a filename.
+    @Published var startupModelMode: StartupModelChoice.Mode {
+        didSet {
+            UserDefaults.standard.set(startupModelMode.rawValue, forKey: "startupModelMode")
+            // Switching to "Always this model" having never pinned one would
+            // leave the dropdown matching no row and rendering blank — the
+            // dead-control class. Seed it with the answer the other mode was
+            // already giving, so the control opens on what is about to happen.
+            guard startupModelMode == .pinned, startupModelPinnedPath.isEmpty else { return }
+            let pickable = localModels.filter(\.isChatPickable)
+            startupModelPinnedPath = StartupModelChoice.resolved(
+                mode: .lastUsed,
+                pinnedPath: nil,
+                lastUsed: StartupModelChoice.lastUsed(),
+                installedPaths: pickable.map(\.path)
+            ) ?? pickable.first?.path ?? ""
+        }
+    }
+    /// The model pinned by `startupModelMode == .pinned`. Empty means nothing
+    /// has been pinned yet — an absent optional, never a sentinel.
     ///
     /// Deliberately NOT `selectedModelPath`. That property is the model
     /// answering chats right now, so its `didSet` hot-switches or restarts a
     /// running server — editing a *startup* preference must not swap the model
-    /// under a conversation in progress, and it has no way to spell "whichever
-    /// one I used last" besides. `selectedModelPath` and its stored key are
-    /// left exactly as they were.
-    @Published var startupModelPath: String {
-        didSet { UserDefaults.standard.set(startupModelPath, forKey: "startupModelPath") }
+    /// out from under a conversation in progress. `selectedModelPath` and its
+    /// stored key are left exactly as they were.
+    @Published var startupModelPinnedPath: String {
+        didSet { UserDefaults.standard.set(startupModelPinnedPath, forKey: "startupModelPinnedPath") }
     }
     /// All server-launch flags + per-request defaults, mirrored to UserDefaults.
     /// Auto-saves on every mutation. Prefer this over the legacy single-key
@@ -460,8 +479,9 @@ class AppState: ObservableObject {
         // user whose "Auto-start on launch" used to eagerly load 26 GB must stop
         // doing that on the next launch. That is the whole point of the change.
         self.loadModelAtStart = UserDefaults.standard.bool(forKey: "loadModelAtStart")
-        self.startupModelPath = UserDefaults.standard.string(forKey: "startupModelPath")
-            ?? StartupModelChoice.lastUsedTag
+        self.startupModelMode = UserDefaults.standard.string(forKey: "startupModelMode")
+            .flatMap(StartupModelChoice.Mode.init(rawValue:)) ?? .default
+        self.startupModelPinnedPath = UserDefaults.standard.string(forKey: "startupModelPinnedPath") ?? ""
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated
@@ -567,7 +587,8 @@ class AppState: ObservableObject {
         switch StartupModelChoice.launch(
             autoStart: autoStartServer,
             loadModelAtStart: loadModelAtStart,
-            choice: startupModelPath,
+            mode: startupModelMode,
+            pinnedPath: startupModelPinnedPath,
             lastUsed: StartupModelChoice.lastUsed(),
             installedPaths: localModels.filter(\.isChatPickable).map(\.path)
         ) {
