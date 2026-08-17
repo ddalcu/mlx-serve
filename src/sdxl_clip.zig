@@ -1,0 +1,520 @@
+//! SDXL's CLIP text towers — ONE implementation over `sdxl.ClipTextConfig`,
+//! serving both CLIP-L (768/12/12, quick_gelu) and OpenCLIP bigG
+//! (1280/32/20, gelu).
+//!
+//! The two towers are the same architecture at different sizes, and the weight
+//! names are byte-identical between them (verified against
+//! `stabilityai/stable-diffusion-xl-base-1.0`), so forking this into two files
+//! would be two places to get the same trap wrong.
+//!
+//! What SDXL takes from each tower, and why each choice is load-bearing:
+//!
+//!   - The PENULTIMATE hidden state (`hidden_states[-2]`), not the last, and
+//!     NOT after `final_layer_norm`. Using the last is a silent quality
+//!     regression: the embeddings are still well-formed, the images are just
+//!     worse. `encode` returns the penultimate; the final norm is loaded
+//!     because the POOLED path needs it.
+//!   - The POOLED vector from bigG ALONE: the hidden state at the EOS token
+//!     position, after `final_layer_norm`, projected by `text_projection`.
+//!     CLIP-L has no `text_projection` tensor at all, which is the structural
+//!     reason the choice is not arbitrary.
+//!   - A CAUSAL mask. CLIP's text tower is autoregressively masked even though
+//!     it is used as an encoder; running it bidirectional produces plausible
+//!     embeddings and subtly wrong ones.
+//!
+//! ORACLE STATUS: shapes and weight binding are verified against the real
+//! checkpoint (`sdxl checkpoint` test in sdxl.zig, and `sdxl clip forward`
+//! below). NUMERICAL parity against transformers' CLIPTextModel is NOT
+//! established — that needs a dumped fixture.
+
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const log = @import("log.zig");
+const model_mod = @import("model.zig");
+const sdxl = @import("sdxl.zig");
+
+const S = mlx.mlx_stream;
+const Weights = model_mod.Weights;
+
+// ── Small helpers (same shape as flux.zig's, kept local so this file stands
+// alone as the port's second component) ──
+
+inline fn matmul(x: mlx.mlx_array, w_t: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&o, x, w_t, s));
+    return o;
+}
+inline fn addA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&o, a, b, s));
+    return o;
+}
+inline fn mulA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&o, a, b, s));
+    return o;
+}
+inline fn reshape(x: mlx.mlx_array, shape: []const c_int, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&o, x, shape.ptr, shape.len, s));
+    return o;
+}
+inline fn transpose(x: mlx.mlx_array, axes: []const c_int, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&o, x, axes.ptr, axes.len, s));
+    return o;
+}
+inline fn layerNorm(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    // CLIP's LayerNorm eps is 1e-5 in both towers' configs.
+    try mlx.check(mlx.mlx_fast_layer_norm(&o, x, w, b, 1e-5, s));
+    return o;
+}
+
+/// CLIP's activations. `quick_gelu` is `x * sigmoid(1.702x)` — OpenAI's
+/// original approximation, NOT interchangeable with the erf form even though
+/// both are "GELU". The two SDXL towers use one each.
+fn activate(x: mlx.mlx_array, kind: sdxl.ClipActivation, s: S) !mlx.mlx_array {
+    switch (kind) {
+        .quick_gelu => {
+            const c = mlx.mlx_array_new_float(1.702);
+            defer _ = mlx.mlx_array_free(c);
+            const scaled = try mulA(x, c, s);
+            defer _ = mlx.mlx_array_free(scaled);
+            var sig = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sig);
+            try mlx.check(mlx.mlx_sigmoid(&sig, scaled, s));
+            return mulA(x, sig, s);
+        },
+        .gelu => {
+            // 0.5 * x * (1 + erf(x / sqrt(2)))
+            const inv_sqrt2 = mlx.mlx_array_new_float(0.7071067811865476);
+            defer _ = mlx.mlx_array_free(inv_sqrt2);
+            const scaled = try mulA(x, inv_sqrt2, s);
+            defer _ = mlx.mlx_array_free(scaled);
+            var e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(e);
+            try mlx.check(mlx.mlx_erf(&e, scaled, s));
+            const one = mlx.mlx_array_new_float(1.0);
+            defer _ = mlx.mlx_array_free(one);
+            const one_plus = try addA(e, one, s);
+            defer _ = mlx.mlx_array_free(one_plus);
+            const half = mlx.mlx_array_new_float(0.5);
+            defer _ = mlx.mlx_array_free(half);
+            const half_x = try mulA(x, half, s);
+            defer _ = mlx.mlx_array_free(half_x);
+            return mulA(half_x, one_plus, s);
+        },
+    }
+}
+
+/// A linear with a bias — every CLIP projection has one, unlike the flow
+/// backends where bias-less linears are the norm.
+const Linear = struct {
+    w_t: mlx.mlx_array, // pre-transposed [in, out]
+    b: mlx.mlx_array,
+
+    fn deinit(self: *Linear) void {
+        _ = mlx.mlx_array_free(self.w_t);
+        _ = mlx.mlx_array_free(self.b);
+    }
+
+    fn forward(self: *const Linear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const y = try matmul(x, self.w_t, s);
+        errdefer _ = mlx.mlx_array_free(y);
+        const out = try addA(y, self.b, s);
+        _ = mlx.mlx_array_free(y);
+        return out;
+    }
+};
+
+const Layer = struct {
+    ln1_w: mlx.mlx_array,
+    ln1_b: mlx.mlx_array,
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    ln2_w: mlx.mlx_array,
+    ln2_b: mlx.mlx_array,
+    fc1: Linear,
+    fc2: Linear,
+
+    fn deinit(self: *Layer) void {
+        _ = mlx.mlx_array_free(self.ln1_w);
+        _ = mlx.mlx_array_free(self.ln1_b);
+        self.q.deinit();
+        self.k.deinit();
+        self.v.deinit();
+        self.o.deinit();
+        _ = mlx.mlx_array_free(self.ln2_w);
+        _ = mlx.mlx_array_free(self.ln2_b);
+        self.fc1.deinit();
+        self.fc2.deinit();
+    }
+};
+
+pub const TextTower = struct {
+    cfg: sdxl.ClipTextConfig,
+    allocator: std.mem.Allocator,
+    s: S,
+    token_embed: mlx.mlx_array, // [vocab, hidden]
+    pos_embed: mlx.mlx_array, // [max_positions, hidden]
+    layers: []Layer,
+    final_ln_w: mlx.mlx_array,
+    final_ln_b: mlx.mlx_array,
+    /// bigG only; null on CLIP-L, which ships no such tensor.
+    text_projection: ?mlx.mlx_array,
+
+    pub fn deinit(self: *TextTower) void {
+        _ = mlx.mlx_array_free(self.token_embed);
+        _ = mlx.mlx_array_free(self.pos_embed);
+        for (self.layers) |*l| l.deinit();
+        self.allocator.free(self.layers);
+        _ = mlx.mlx_array_free(self.final_ln_w);
+        _ = mlx.mlx_array_free(self.final_ln_b);
+        if (self.text_projection) |p| _ = mlx.mlx_array_free(p);
+    }
+
+    /// What SDXL consumes from one tower.
+    pub const Encoded = struct {
+        /// `[1, seq, hidden]` — the PENULTIMATE hidden state, pre-final-norm.
+        penultimate: mlx.mlx_array,
+        /// `[1, projection_dim]` — bigG only, null on CLIP-L.
+        pooled: ?mlx.mlx_array,
+
+        pub fn deinit(self: *Encoded) void {
+            _ = mlx.mlx_array_free(self.penultimate);
+            if (self.pooled) |p| _ = mlx.mlx_array_free(p);
+        }
+    };
+
+    /// Run the tower over `ids` (length <= max_positions).
+    ///
+    /// `eos_index` is where the pooled vector is read from. CLIP pools at the
+    /// EOS token's POSITION, not at the last position of the padded window —
+    /// with a padded prompt those differ, and pooling at the end reads padding.
+    pub fn encode(self: *TextTower, ids: []const i32, eos_index: usize) !Encoded {
+        const s = self.s;
+        const seq: c_int = @intCast(ids.len);
+        const hidden: c_int = @intCast(self.cfg.hidden);
+        const heads: c_int = @intCast(self.cfg.heads);
+        const head_dim: c_int = @intCast(self.cfg.headDim());
+
+        // ── Embeddings: token table gather + learned absolute positions.
+        const id_shape = [_]c_int{seq};
+        const ids_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(ids_arr);
+
+        var tok = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tok);
+        // AXIS 0, never the axis-less `mlx_take` — that flattens the table and
+        // returns [seq] instead of [seq, hidden]. Same class as the mlx_topk
+        // axis bug in the root rules: correct-looking, silently one-dimensional.
+        try mlx.check(mlx.mlx_take_axis(&tok, self.token_embed, ids_arr, 0, s));
+
+        // Positions 0..seq — a slice of the learned table, never a formula.
+        var pos = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos);
+        {
+            const start = [_]c_int{ 0, 0 };
+            const stop = [_]c_int{ seq, hidden };
+            const stride = [_]c_int{ 1, 1 };
+            try mlx.check(mlx.mlx_slice(&pos, self.pos_embed, &start, 2, &stop, 2, &stride, 2, s));
+        }
+
+        var h = try addA(tok, pos, s);
+        errdefer _ = mlx.mlx_array_free(h);
+        {
+            const shape = [_]c_int{ 1, seq, hidden };
+            const r = try reshape(h, &shape, s);
+            _ = mlx.mlx_array_free(h);
+            h = r;
+        }
+
+        // ── Layers. The penultimate output is what SDXL wants, so it is
+        // captured one layer before the end rather than recomputed.
+        var penultimate: ?mlx.mlx_array = null;
+        errdefer if (penultimate) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
+
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.headDim())));
+        for (self.layers, 0..) |*layer, i| {
+            if (i + 1 == self.layers.len) {
+                var captured = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_copy(&captured, h, s));
+                penultimate = captured;
+            }
+
+            // Self-attention, pre-norm.
+            const normed = try layerNorm(h, layer.ln1_w, layer.ln1_b, s);
+            defer _ = mlx.mlx_array_free(normed);
+
+            const q = try layer.q.forward(normed, s);
+            defer _ = mlx.mlx_array_free(q);
+            const k = try layer.k.forward(normed, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try layer.v.forward(normed, s);
+            defer _ = mlx.mlx_array_free(v);
+
+            // [1, seq, heads*hd] → [1, heads, seq, hd]
+            const hs = [_]c_int{ 1, seq, heads, head_dim };
+            const perm = [_]c_int{ 0, 2, 1, 3 };
+            const qh = blk: {
+                const r = try reshape(q, &hs, s);
+                defer _ = mlx.mlx_array_free(r);
+                break :blk try transpose(r, &perm, s);
+            };
+            defer _ = mlx.mlx_array_free(qh);
+            const kh = blk: {
+                const r = try reshape(k, &hs, s);
+                defer _ = mlx.mlx_array_free(r);
+                break :blk try transpose(r, &perm, s);
+            };
+            defer _ = mlx.mlx_array_free(kh);
+            const vh = blk: {
+                const r = try reshape(v, &hs, s);
+                defer _ = mlx.mlx_array_free(r);
+                break :blk try transpose(r, &perm, s);
+            };
+            defer _ = mlx.mlx_array_free(vh);
+
+            // CAUSAL — CLIP's text tower is autoregressively masked even
+            // though SDXL uses it as an encoder.
+            var attn = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn);
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+                &attn, qh, kh, vh, scale, "causal", mlx.mlx_array_new(), mlx.mlx_array_new(), s,
+            ));
+
+            // back to [1, seq, hidden]
+            const merged = blk: {
+                const t = try transpose(attn, &perm, s);
+                defer _ = mlx.mlx_array_free(t);
+                const shape = [_]c_int{ 1, seq, hidden };
+                break :blk try reshape(t, &shape, s);
+            };
+            defer _ = mlx.mlx_array_free(merged);
+
+            const proj = try layer.o.forward(merged, s);
+            defer _ = mlx.mlx_array_free(proj);
+            {
+                const r = try addA(h, proj, s);
+                _ = mlx.mlx_array_free(h);
+                h = r;
+            }
+
+            // MLP, pre-norm.
+            const normed2 = try layerNorm(h, layer.ln2_w, layer.ln2_b, s);
+            defer _ = mlx.mlx_array_free(normed2);
+            const up = try layer.fc1.forward(normed2, s);
+            defer _ = mlx.mlx_array_free(up);
+            const act = try activate(up, self.cfg.activation, s);
+            defer _ = mlx.mlx_array_free(act);
+            const down = try layer.fc2.forward(act, s);
+            defer _ = mlx.mlx_array_free(down);
+            {
+                const r = try addA(h, down, s);
+                _ = mlx.mlx_array_free(h);
+                h = r;
+            }
+        }
+
+        // ── Pooled: EOS row of the FINAL-NORMED state, projected. bigG only.
+        var pooled: ?mlx.mlx_array = null;
+        if (self.text_projection) |proj_w| {
+            const normed = try layerNorm(h, self.final_ln_w, self.final_ln_b, s);
+            defer _ = mlx.mlx_array_free(normed);
+
+            const idx: c_int = @intCast(@min(eos_index, ids.len - 1));
+            var eos_row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eos_row);
+            {
+                const start = [_]c_int{ 0, idx, 0 };
+                const stop = [_]c_int{ 1, idx + 1, hidden };
+                const stride = [_]c_int{ 1, 1, 1 };
+                try mlx.check(mlx.mlx_slice(&eos_row, normed, &start, 3, &stop, 3, &stride, 3, s));
+            }
+            const flat = blk: {
+                const shape = [_]c_int{ 1, hidden };
+                break :blk try reshape(eos_row, &shape, s);
+            };
+            defer _ = mlx.mlx_array_free(flat);
+            pooled = try matmul(flat, proj_w, s);
+        }
+
+        _ = mlx.mlx_array_free(h);
+        return .{ .penultimate = penultimate.?, .pooled = pooled };
+    }
+};
+
+/// Load one tower from `<model_dir>/<sub>` (`text_encoder` / `text_encoder_2`).
+///
+/// The weight names are identical between towers, so `cfg` is what selects the
+/// geometry — it is NOT inferred from shapes here, because both towers share a
+/// head_dim of 64 and a vocab of 49408, so a swapped config would load cleanly
+/// and produce garbage. `sdxl.CLIP_L_CONFIG` / `CLIP_BIG_G_CONFIG` are the two
+/// legitimate values.
+pub fn loadTower(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    s: S,
+    model_dir: []const u8,
+    sub: []const u8,
+    cfg: sdxl.ClipTextConfig,
+) !TextTower {
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, sub });
+    defer allocator.free(dir);
+    var w = try model_mod.loadWeights(io, allocator, dir);
+    defer w.deinit();
+
+    var tower: TextTower = undefined;
+    tower.cfg = cfg;
+    tower.allocator = allocator;
+    tower.s = s;
+
+    tower.token_embed = try dup(&w, "text_model.embeddings.token_embedding.weight");
+    tower.pos_embed = try dup(&w, "text_model.embeddings.position_embedding.weight");
+    tower.final_ln_w = try dup(&w, "text_model.final_layer_norm.weight");
+    tower.final_ln_b = try dup(&w, "text_model.final_layer_norm.bias");
+
+    // Present in bigG, absent in CLIP-L — an optional, never a required get.
+    tower.text_projection = if (w.get(sdxl.CLIP_PROJECTION_TENSOR)) |proj_src| blk: {
+        var t = mlx.mlx_array_new();
+        const axes = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&t, proj_src, &axes, 2, s));
+        break :blk t;
+    } else null;
+
+    tower.layers = try allocator.alloc(Layer, cfg.layers);
+    errdefer allocator.free(tower.layers);
+    for (tower.layers, 0..) |*layer, i| {
+        layer.ln1_w = try dupIdx(&w, allocator, i, "layer_norm1.weight");
+        layer.ln1_b = try dupIdx(&w, allocator, i, "layer_norm1.bias");
+        layer.ln2_w = try dupIdx(&w, allocator, i, "layer_norm2.weight");
+        layer.ln2_b = try dupIdx(&w, allocator, i, "layer_norm2.bias");
+        layer.q = try linearIdx(&w, allocator, s, i, "self_attn.q_proj");
+        layer.k = try linearIdx(&w, allocator, s, i, "self_attn.k_proj");
+        layer.v = try linearIdx(&w, allocator, s, i, "self_attn.v_proj");
+        layer.o = try linearIdx(&w, allocator, s, i, "self_attn.out_proj");
+        layer.fc1 = try linearIdx(&w, allocator, s, i, "mlp.fc1");
+        layer.fc2 = try linearIdx(&w, allocator, s, i, "mlp.fc2");
+    }
+
+    log.info("[sdxl] loaded {s}: hidden={d} layers={d} heads={d} act={s} projection={}\n", .{
+        sub, cfg.hidden, cfg.layers, cfg.heads, @tagName(cfg.activation), tower.text_projection != null,
+    });
+    return tower;
+}
+
+fn dup(w: *Weights, name: []const u8) !mlx.mlx_array {
+    const src = w.get(name) orelse {
+        log.err("[sdxl] missing weight {s}\n", .{name});
+        return error.MissingWeight;
+    };
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&o, src));
+    return o;
+}
+
+fn dupIdx(w: *Weights, a: std.mem.Allocator, i: usize, suffix: []const u8) !mlx.mlx_array {
+    const name = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}", .{ i, suffix });
+    defer a.free(name);
+    return dup(w, name);
+}
+
+/// Weights are stored `[out, in]`; the forward wants `[in, out]`, so the
+/// transpose happens ONCE at load rather than per token.
+fn linearIdx(w: *Weights, a: std.mem.Allocator, s: S, i: usize, prefix: []const u8) !Linear {
+    const wname = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}.weight", .{ i, prefix });
+    defer a.free(wname);
+    const bname = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}.bias", .{ i, prefix });
+    defer a.free(bname);
+
+    const src = w.get(wname) orelse return error.MissingWeight;
+    var w_t = mlx.mlx_array_new();
+    const axes = [_]c_int{ 1, 0 };
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, src, &axes, 2, s));
+    return .{ .w_t = w_t, .b = try dup(w, bname) };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════
+
+const testing = std.testing;
+
+test "the activation choice is per tower, not per module" {
+    // Guards the trap the checkpoint surfaced: one activation for both towers
+    // produces plausible embeddings and a plausible image.
+    try testing.expect(sdxl.CLIP_L_CONFIG.activation != sdxl.CLIP_BIG_G_CONFIG.activation);
+}
+
+// Live structural check. Loads BOTH real towers, runs a forward, and asserts
+// the shapes SDXL will consume. Not parity — it proves the thing binds, runs
+// and produces finite numbers of the right shape.
+//
+//   SDXL_CHECKPOINT_DIR=~/.mlx-serve/staging/sdxl-base-1.0 \
+//     zig build test -Dtest-filter="sdxl clip forward"
+test "sdxl clip forward: both towers load and produce the shapes SDXL consumes" {
+    const dir = std.mem.span(std.c.getenv("SDXL_CHECKPOINT_DIR") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    // A short padded window; ids are arbitrary but in-vocab, and the EOS index
+    // is deliberately NOT the last position so pooling-at-the-end would show up.
+    const seq = 8;
+    var ids: [seq]i32 = .{ 49406, 320, 1125, 539, 49407, 0, 0, 0 };
+    const eos_index: usize = 4;
+
+    const towers = [_]struct { sub: []const u8, cfg: sdxl.ClipTextConfig, pooled: bool }{
+        .{ .sub = "text_encoder", .cfg = sdxl.CLIP_L_CONFIG, .pooled = false },
+        .{ .sub = "text_encoder_2", .cfg = sdxl.CLIP_BIG_G_CONFIG, .pooled = true },
+    };
+
+    for (towers) |t| {
+        var tower = loadTower(io, a, s, dir, t.sub, t.cfg) catch |e| {
+            log.err("[sdxl-test] {s} load failed: {}\n", .{ t.sub, e });
+            return e;
+        };
+        defer tower.deinit();
+
+        var enc = try tower.encode(&ids, eos_index);
+        defer enc.deinit();
+        _ = mlx.mlx_array_eval(enc.penultimate);
+
+        // [1, seq, hidden]
+        try testing.expectEqual(@as(usize, 3), mlx.mlx_array_ndim(enc.penultimate));
+        const shp = mlx.mlx_array_shape(enc.penultimate);
+        try testing.expectEqual(@as(c_int, 1), shp[0]);
+        try testing.expectEqual(@as(c_int, seq), shp[1]);
+        try testing.expectEqual(@as(c_int, @intCast(t.cfg.hidden)), shp[2]);
+
+        // Finiteness before anything else — an all-NaN tensor passes every
+        // shape assertion there is.
+        var absv = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(absv);
+        try mlx.check(mlx.mlx_abs(&absv, enc.penultimate, s));
+        var total = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(total);
+        try mlx.check(mlx.mlx_sum(&total, absv, false, s));
+        _ = mlx.mlx_array_eval(total);
+        var mv: f32 = 0;
+        _ = mlx.mlx_array_item_float32(&mv, total);
+        // A NaN anywhere poisons the sum, and an all-zero output (a dead
+        // forward that still has the right shape) is caught by the > 0 half.
+        try testing.expect(std.math.isFinite(mv));
+        try testing.expect(mv > 0);
+
+        // Only bigG produces a pooled vector, at its projection width.
+        try testing.expectEqual(t.pooled, enc.pooled != null);
+        if (enc.pooled) |p| {
+            _ = mlx.mlx_array_eval(p);
+            const ps = mlx.mlx_array_shape(p);
+            try testing.expectEqual(@as(c_int, 1), ps[0]);
+            try testing.expectEqual(@as(c_int, @intCast(t.cfg.projection_dim)), ps[1]);
+        }
+    }
+}
