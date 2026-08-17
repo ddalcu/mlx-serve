@@ -895,7 +895,65 @@ private struct ServerSectionContent: View {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
+    /// Chat models only — the same `isChatPickable` filter every other model
+    /// picker in the app uses (tray, composer pill, ⌘L palette). A Mac with only
+    /// media/drafter downloads has a NON-EMPTY `localModels` and nothing
+    /// offerable, which is why no surface may filter on its own.
+    private var pickable: [LocalModel] {
+        appState.localModels.filter(\.isChatPickable)
+    }
+
+    /// Same rule as the tray picker: `displayLabel`, not `name` (a GGUF repo
+    /// ships several quants, each its own row, and siblings share a name), plus
+    /// an engine suffix where two labels would otherwise be identical — macOS
+    /// `.menu` Pickers key the checkmark by item TITLE, so duplicates both
+    /// render selected.
+    private func startupModelLabel(_ model: LocalModel, dupNames: Set<String>) -> String {
+        let label = model.displayLabel
+        guard dupNames.contains(label) else { return label }
+        return "\(label) · \(model.engine.shortLabel)"
+    }
+
     var body: some View {
+        // Startup. Deliberately the first two rows of the Server section: "Do
+        // you want the server?" is `autoStartServer` in the tray, and "do you
+        // want a model resident with it?" is here. They were one checkbox, and
+        // the merged one loaded whatever was selected — see `StartupModelChoice`.
+        SettingsRow(
+            title: "Load a model at start",
+            explainer: "Off by default. Auto-start brings the server up with no model resident; it loads one on demand at your first message, so login stays fast. Turn this on to pay for the load up front instead — a large checkpoint can take a while and holds the memory from the moment you log in."
+        ) {
+            Toggle("", isOn: $appState.loadModelAtStart)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+        SettingsRow(
+            title: "Model to load at start",
+            explainer: "\"Last model used\" follows whatever you were last chatting with, decided when the app starts rather than when you set this. If that model has since been removed — or you have not loaded one yet — the server simply starts with nothing resident."
+        ) {
+            Picker("", selection: $appState.startupModelPath) {
+                // First, and the default: the model you want next is usually
+                // the one you just used.
+                Text("Last model used").tag(StartupModelChoice.lastUsedTag)
+                let dupNames = LocalModel.duplicateNames(in: pickable)
+                ForEach(pickable) { model in
+                    Text(startupModelLabel(model, dupNames: dupNames)).tag(model.path)
+                }
+                // A pick that has since been uninstalled matches no row, and a
+                // Picker whose selection matches no row renders BLANK — the
+                // dead-control class. Carry it as its own row so the setting
+                // still says what it holds and what launch will do about it.
+                if !appState.startupModelPath.isEmpty,
+                   !pickable.contains(where: { $0.path == appState.startupModelPath }) {
+                    Text("\((appState.startupModelPath as NSString).lastPathComponent) — no longer installed")
+                        .tag(appState.startupModelPath)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(minWidth: 180)
+            .disabled(!appState.loadModelAtStart)
+        }
         if let m = meta["host"] {
             SettingsRow(
                 title: m.title,

@@ -191,6 +191,30 @@ class AppState: ObservableObject {
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
     }
+    /// Should the launch gate pass `--model` (an EAGER, BLOCKING load) instead
+    /// of starting headless? Separate from `autoStartServer` on purpose:
+    /// "run the server" and "resident a checkpoint" are different decisions,
+    /// and folding them into one checkbox made "Auto-start on launch" read tens
+    /// of gigabytes off disk at login with nothing in the UI saying so
+    /// (issue #214). Default OFF, including for existing users — that IS the
+    /// fix. The server still comes up, and the first chat turn hot-loads the
+    /// selected model via `ServerManager.ensureDefaultChatModel`.
+    @Published var loadModelAtStart: Bool {
+        didSet { UserDefaults.standard.set(loadModelAtStart, forKey: "loadModelAtStart") }
+    }
+    /// WHICH model `loadModelAtStart` loads: `StartupModelChoice.lastUsedTag`
+    /// (the default — "Last model used", resolved at start) or a model's
+    /// absolute path.
+    ///
+    /// Deliberately NOT `selectedModelPath`. That property is the model
+    /// answering chats right now, so its `didSet` hot-switches or restarts a
+    /// running server — editing a *startup* preference must not swap the model
+    /// under a conversation in progress, and it has no way to spell "whichever
+    /// one I used last" besides. `selectedModelPath` and its stored key are
+    /// left exactly as they were.
+    @Published var startupModelPath: String {
+        didSet { UserDefaults.standard.set(startupModelPath, forKey: "startupModelPath") }
+    }
     /// All server-launch flags + per-request defaults, mirrored to UserDefaults.
     /// Auto-saves on every mutation. Prefer this over the legacy single-key
     /// `maxTokens`/`contextSize` defaults — those forward into here.
@@ -426,12 +450,18 @@ class AppState: ObservableObject {
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
         // read a never-set key as false, which is why a fresh install used to
         // download a model and then sit there with the server stopped. The
-        // launch gate below is `autoStartServer && !selectedModelPath.isEmpty`,
-        // so this stays a no-op until a model exists; the first download's
-        // completion hook is what actually starts it. No migration: existing
-        // users who never touched the toggle get it turned on, which is the
-        // intent.
+        // launch gate below now starts the server HEADLESS on its own, so this
+        // no longer waits for a model to exist; what it starts is a server, not
+        // a load. No migration: existing users who never touched the toggle get
+        // it turned on, which is the intent.
         self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
+        // Both default OFF / "Last model used" via the absent-key reads, and
+        // deliberately WITHOUT a migration from the old behaviour: an upgrading
+        // user whose "Auto-start on launch" used to eagerly load 26 GB must stop
+        // doing that on the next launch. That is the whole point of the change.
+        self.loadModelAtStart = UserDefaults.standard.bool(forKey: "loadModelAtStart")
+        self.startupModelPath = UserDefaults.standard.string(forKey: "startupModelPath")
+            ?? StartupModelChoice.lastUsedTag
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated
@@ -529,9 +559,24 @@ class AppState: ObservableObject {
             }
         }
 
-        // Auto-start server if enabled and a model is available
-        if autoStartServer, !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, options: serverOptions)
+        // Auto-start. "Start the server" and "load a model" are two decisions
+        // (`StartupModelChoice.launch`): auto-start on its own brings the server
+        // up HEADLESS, and only Settings ▸ Server ▸ "Load a model at start" —
+        // default OFF — makes launch pay for a checkpoint. `refreshModels()`
+        // above is what makes the installed-library check below meaningful.
+        switch StartupModelChoice.launch(
+            autoStart: autoStartServer,
+            loadModelAtStart: loadModelAtStart,
+            choice: startupModelPath,
+            lastUsed: StartupModelChoice.lastUsed(),
+            installedPaths: localModels.filter(\.isChatPickable).map(\.path)
+        ) {
+        case .doNothing:
+            break
+        case .headless:
+            server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        case .load(let path):
+            server.start(modelPath: path, options: serverOptions)
         }
         // LAN sharing/discovery lives in the server process — with either
         // enabled the server should be up (headless when nothing was
