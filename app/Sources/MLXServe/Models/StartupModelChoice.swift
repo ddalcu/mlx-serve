@@ -1,7 +1,6 @@
 import Foundation
 
-/// What launch does with the server, and where "the last model used" comes
-/// from.
+/// What launch does with the server, and which model — if any — it loads.
 ///
 /// Startup is TWO decisions, not one: whether the server comes up, and whether
 /// a checkpoint goes resident before anybody has asked for one. They used to be
@@ -17,15 +16,30 @@ import Foundation
 /// behind a checkbox that promised a server.
 enum StartupModelChoice {
 
-    /// The startup dropdown's first entry: load whatever loaded LAST, resolved
-    /// at start time rather than at the moment the setting was saved. The model
-    /// you want next is usually the one you just used, and pinning a path when
-    /// the setting was written would freeze that answer forever.
-    ///
-    /// Empty, so it is also the default for a key that was never set — a fresh
-    /// install has no last model, and "load the last one" then correctly
-    /// resolves to loading nothing.
-    static let lastUsedTag = ""
+    /// WHICH model start loads. A mode, stored separately from any path — the
+    /// rule is not one of the models, so it must not be spelled as a magic path
+    /// value in a field that otherwise holds real ones. A sentinel in a path
+    /// field is the same defect in different clothes: every reader has to know
+    /// the secret, and one that doesn't treats it as a filename.
+    enum Mode: String, CaseIterable, Identifiable, Hashable {
+        /// Follow whatever was loaded last, resolved at START time rather than
+        /// pinned when the setting was saved. The model you want next is
+        /// usually the one you just used.
+        case lastUsed
+        /// Always this one, whatever has been used since.
+        case pinned
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .lastUsed: return "Last model used"
+            case .pinned:   return "Always this model"
+            }
+        }
+
+        static let `default`: Mode = .lastUsed
+    }
 
     // MARK: - Last model used
 
@@ -50,6 +64,33 @@ enum StartupModelChoice {
         return stored.isEmpty ? nil : stored
     }
 
+    // MARK: - Resolving the choice
+
+    /// The model a start would load right now, or nil for "none — headless".
+    ///
+    /// The ONE resolution: the launch gate and the Settings readout both ask
+    /// this question, so the secondary text under the control cannot promise a
+    /// model the gate would decline to load.
+    ///
+    /// `installedPaths` is the chat-pickable library (`LocalModel.isChatPickable`).
+    /// A model that is no longer on disk — uninstalled between launches, or a
+    /// last-used one since deleted — resolves to nil. It must not become
+    /// `--model <gone>`, an instant FileNotFound, and it must not quietly
+    /// promote some other model in its place: a startup that loads a model the
+    /// user never chose is worse than one that loads none.
+    static func resolved(mode: Mode,
+                         pinnedPath: String?,
+                         lastUsed: String?,
+                         installedPaths: [String]) -> String? {
+        let wanted: String?
+        switch mode {
+        case .lastUsed: wanted = lastUsed
+        case .pinned:   wanted = pinnedPath
+        }
+        guard let wanted, !wanted.isEmpty, installedPaths.contains(wanted) else { return nil }
+        return wanted
+    }
+
     // MARK: - The launch gate
 
     /// What `AppState.init` should do with the server.
@@ -64,24 +105,18 @@ enum StartupModelChoice {
         case load(path: String)
     }
 
-    /// `choice` is the saved dropdown pick: `lastUsedTag` for "Last model used",
-    /// otherwise a model's absolute path. `installedPaths` is the chat-pickable
-    /// library (`LocalModel.isChatPickable`).
-    ///
-    /// A pick that is no longer on disk — uninstalled between launches, or a
-    /// last-used model that has since been deleted — starts the server HEADLESS.
-    /// It must not send `--model <gone>` into an instant FileNotFound, and it
-    /// must not quietly promote some other model in its place: a startup that
-    /// loads a model the user never chose is worse than one that loads none.
     static func launch(autoStart: Bool,
                        loadModelAtStart: Bool,
-                       choice: String,
+                       mode: Mode,
+                       pinnedPath: String?,
                        lastUsed: String?,
                        installedPaths: [String]) -> Launch {
         guard autoStart else { return .doNothing }
         guard loadModelAtStart else { return .headless }
-        let wanted = choice == lastUsedTag ? lastUsed : choice
-        guard let wanted, installedPaths.contains(wanted) else { return .headless }
-        return .load(path: wanted)
+        guard let path = resolved(mode: mode,
+                                  pinnedPath: pinnedPath,
+                                  lastUsed: lastUsed,
+                                  installedPaths: installedPaths) else { return .headless }
+        return .load(path: path)
     }
 }
