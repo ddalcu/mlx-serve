@@ -45,16 +45,45 @@ const model_mod = @import("model.zig");
 
 const S = mlx.mlx_stream;
 
-/// SDXL's scheduler config: `timestep_spacing: leading`, `steps_offset: 1`.
+/// SDXL base's scheduler config: `timestep_spacing: leading`, `steps_offset: 1`.
+/// The distilled variants override both — see `SchedulerConfig`.
 pub const STEPS_OFFSET: usize = 1;
+
+/// What `scheduler/scheduler_config.json` declares. This is the ENTIRE
+/// difference between base SDXL, SDXL-Turbo and SDXL-Lightning: same UNet,
+/// same VAE, same text towers, different schedule. Reading it rather than
+/// hardcoding base's values is what lets one engine serve all three.
+pub const SchedulerConfig = struct {
+    spacing: sdxl.TimestepSpacing = .leading,
+    /// Applied ONLY on `leading` — diffusers adds it in that branch alone, and
+    /// applying it to `trailing` would shift a distill's carefully placed
+    /// 1-4 timesteps off the values it was trained on.
+    steps_offset: usize = STEPS_OFFSET,
+    prediction: sdxl.PredictionType = .epsilon,
+    /// `EulerAncestralDiscreteScheduler` (SDXL-Turbo's declared sampler) adds
+    /// fresh noise each step; plain Euler does not.
+    ancestral: bool = false,
+    /// Guidance the checkpoint expects when the request says nothing. Base
+    /// wants ~5; the distills are trained guidance-free, and at <= 1 the
+    /// pipeline skips the unconditional forward entirely — half the work.
+    default_guidance: f32 = 5.0,
+
+    /// Only `leading` carries the offset.
+    pub fn effectiveOffset(self: SchedulerConfig) usize {
+        return if (self.spacing == .leading) self.steps_offset else 0;
+    }
+};
 
 pub const GenOpts = struct {
     width: u32 = 1024,
     height: u32 = 1024,
     steps: u32 = 30,
-    /// `guidance_scale`. SDXL base's documented default is 5.0; diffusers ships
-    /// 5.0 for this checkpoint. 1.0 disables guidance and halves the cost.
-    guidance: f32 = 5.0,
+    /// `guidance_scale`. NULL means "whatever this checkpoint was distilled
+    /// for" (`SchedulerConfig.default_guidance`): ~5 on base, 1.0 on Turbo and
+    /// Lightning. At <= 1 the unconditional forward is skipped entirely, which
+    /// is half the work — so a distill is twice as fast per step as well as
+    /// needing an order of magnitude fewer steps.
+    guidance: ?f32 = null,
     seed: u64 = 0,
     /// ABSENT (null) and EMPTY ("") are different requests, and diffusers
     /// draws the line in the same place: `zero_out_negative_prompt` is
@@ -65,6 +94,16 @@ pub const GenOpts = struct {
     /// and 75 pads through both towers. Collapsing the two to `""` silently
     /// picks one behaviour for both.
     negative_prompt: ?[]const u8 = null,
+    /// Override the checkpoint's declared timestep spacing.
+    ///
+    /// Needed because SDXL-Lightning ships as a LoRA over BASE SDXL, and the
+    /// base pack's `scheduler_config.json` says `leading` — the adapter
+    /// changes the weights, not the config beside them. Lightning is trained
+    /// for `trailing`, and at 4 steps the difference is not subtle: leading
+    /// starts at t=751 and never sees the top of the schedule. diffusers users
+    /// do the same thing by hand (`EulerDiscreteScheduler.from_config(...,
+    /// timestep_spacing="trailing")`).
+    spacing: ?sdxl.TimestepSpacing = null,
     /// Micro-conditioning overrides; null means `sdxl.defaultTimeIds`.
     original_size: ?[2]u32 = null,
     crop_top_left: ?[2]u32 = null,
@@ -176,6 +215,9 @@ pub const Engine = struct {
     vae: vae_mod.Decoder,
     /// From `model_index.json`; see the file header.
     force_zeros_for_empty_prompt: bool,
+    /// From `scheduler/scheduler_config.json` — what makes this base, Turbo
+    /// or Lightning.
+    sched_cfg: SchedulerConfig,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
         const s = mlx.mlx_default_gpu_stream_new();
@@ -184,6 +226,11 @@ pub const Engine = struct {
         self.allocator = allocator;
         self.s = s;
         self.force_zeros_for_empty_prompt = readForceZeros(io, allocator, model_dir);
+        self.sched_cfg = readSchedulerConfig(io, allocator, model_dir);
+        log.info("[sdxl] schedule: spacing={s} offset={d} prediction={s} ancestral={} guidance={d:.1}\n", .{
+            @tagName(self.sched_cfg.spacing), self.sched_cfg.effectiveOffset(),
+            @tagName(self.sched_cfg.prediction), self.sched_cfg.ancestral, self.sched_cfg.default_guidance,
+        });
 
         self.tok_l = try clip_tok.load(io, allocator, model_dir, "tokenizer");
         errdefer self.tok_l.deinit();
@@ -274,7 +321,14 @@ pub const Engine = struct {
         const dims = sdxl.latentDims(opts.width, opts.height) orelse return error.UnsupportedResolution;
         if (opts.steps == 0) return error.ZeroSteps;
 
-        var sched = try buildSchedule(a, opts.steps, .leading, STEPS_OFFSET);
+        var scfg = self.sched_cfg;
+        if (opts.spacing) |sp| {
+            scfg.spacing = sp;
+            // A caller asking for trailing is asking for a distilled schedule,
+            // which is guidance-free unless they also named a guidance.
+            if (sp == .trailing) scfg.default_guidance = 1.0;
+        }
+        var sched = try buildSchedule(a, opts.steps, scfg.spacing, scfg.effectiveOffset());
         defer sched.deinit();
 
         var cond = if (opts.cond_override) |ov| Conditioning{
@@ -311,8 +365,11 @@ pub const Engine = struct {
         };
         defer _ = mlx.mlx_array_free(latent);
 
-        const do_cfg = opts.guidance > 1.0;
-        const mix = sdxl.cfgMix(opts.guidance);
+        // A request that says nothing takes the CHECKPOINT's own default, so a
+        // Turbo pack runs guidance-free without the caller having to know.
+        const guidance = opts.guidance orelse scfg.default_guidance;
+        const do_cfg = guidance > 1.0;
+        const mix = sdxl.cfgMix(guidance);
 
         if (std.c.getenv("MLX_SERVE_SDXL_TRACE") != null) {
             std.debug.print("[sdxl-trace] init sigma={d:.6} latent_std={d:.6} ctx_std={d:.6} pooled_std={d:.6}\n", .{
@@ -357,16 +414,57 @@ pub const Engine = struct {
             } else try nn.dupA(eps_cond);
             defer _ = mlx.mlx_array_free(eps);
 
-            // Euler: next = sample + eps * (sigma_next - sigma). The step is
-            // taken on the RAW latent, not the scaled one handed to the UNet.
-            const step = sdxl.eulerStep(sigma, sigma_next);
+            // Euler on the RAW latent, not the scaled one handed to the UNet.
+            //
+            //   derivative = latent*c.latent + model_out*c.model
+            //   next       = latent + derivative * (sigma_target - sigma)
+            //
+            // The coefficients are what the prediction type changes; for
+            // epsilon they are (0, 1) and this reduces to the original
+            // `latent + eps*dt`.
+            const c = sdxl.derivativeCoeffs(scfg.prediction, sigma);
+            const anc = sdxl.ancestralSigmas(sigma, sigma_next);
+            const sigma_target = if (scfg.ancestral) anc.sigma_down else sigma_next;
+
             const eps_f32 = try nn.astype(eps, .float32, s);
             defer _ = mlx.mlx_array_free(eps_f32);
-            const dc = mlx.mlx_array_new_float(@floatCast(step.eps));
+            const deriv = blk: {
+                const cm = mlx.mlx_array_new_float(@floatCast(c.model));
+                defer _ = mlx.mlx_array_free(cm);
+                const from_model = try nn.mulA(eps_f32, cm, s);
+                if (c.latent == 0.0) break :blk from_model;
+                defer _ = mlx.mlx_array_free(from_model);
+                const cl = mlx.mlx_array_new_float(@floatCast(c.latent));
+                defer _ = mlx.mlx_array_free(cl);
+                const from_latent = try nn.mulA(latent, cl, s);
+                defer _ = mlx.mlx_array_free(from_latent);
+                break :blk try nn.addA(from_model, from_latent, s);
+            };
+            defer _ = mlx.mlx_array_free(deriv);
+
+            const dc = mlx.mlx_array_new_float(@floatCast(sigma_target - sigma));
             defer _ = mlx.mlx_array_free(dc);
-            const delta = try nn.mulA(eps_f32, dc, s);
+            const delta = try nn.mulA(deriv, dc, s);
             defer _ = mlx.mlx_array_free(delta);
             nn.replace(&latent, try nn.addA(latent, delta, s));
+
+            // Ancestral (Turbo): the deterministic part only reached
+            // `sigma_down`; fresh noise at `sigma_up` makes up the rest. Zero
+            // on the final step, so a finished image is never re-noised.
+            if (scfg.ancestral and anc.sigma_up > 0.0) {
+                var key = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(key);
+                try mlx.check(mlx.mlx_random_key(&key, opts.seed +% i +% 1));
+                const shape = mlx.getShape(latent);
+                var noise = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(noise);
+                try mlx.check(mlx.mlx_random_normal(&noise, shape.ptr, shape.len, .float32, 0.0, 1.0, key, s));
+                const su = mlx.mlx_array_new_float(@floatCast(anc.sigma_up));
+                defer _ = mlx.mlx_array_free(su);
+                const scaled_noise = try nn.mulA(noise, su, s);
+                defer _ = mlx.mlx_array_free(scaled_noise);
+                nn.replace(&latent, try nn.addA(latent, scaled_noise, s));
+            }
             _ = mlx.mlx_array_eval(latent);
 
             // `MLX_SERVE_SDXL_TRACE=1` prints the per-step latent statistics.
@@ -437,6 +535,65 @@ fn stdOf(x: mlx.mlx_array, s: S) !f64 {
         acc += dv * dv;
     }
     return @sqrt(acc / @as(f64, @floatFromInt(n)));
+}
+
+/// Read `scheduler/scheduler_config.json`.
+///
+/// Absent or unreadable falls back to base SDXL's values, which is the right
+/// default: a pack missing the file is far more likely to be a base mirror
+/// than a distill, and a distill run on base's schedule looks obviously wrong
+/// (soft, washed) rather than subtly so.
+fn readSchedulerConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) SchedulerConfig {
+    const cfg = SchedulerConfig{};
+    const path = std.fmt.allocPrint(allocator, "{s}/scheduler/scheduler_config.json", .{model_dir}) catch return cfg;
+    defer allocator.free(path);
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return cfg;
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return cfg;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return cfg;
+    defer allocator.free(content);
+    return parseSchedulerConfig(allocator, content);
+}
+
+/// The pure half of `readSchedulerConfig`, split out so the three variants'
+/// real config bytes can be pinned without a checkpoint on disk.
+pub fn parseSchedulerConfig(allocator: std.mem.Allocator, content: []const u8) SchedulerConfig {
+    var cfg = SchedulerConfig{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return cfg;
+    defer parsed.deinit();
+    if (parsed.value != .object) return cfg;
+    const o = parsed.value.object;
+
+    if (o.get("timestep_spacing")) |v| {
+        if (v == .string) {
+            if (std.mem.eql(u8, v.string, "trailing")) cfg.spacing = .trailing
+            else if (std.mem.eql(u8, v.string, "linspace")) cfg.spacing = .linspace
+            else cfg.spacing = .leading;
+        }
+    }
+    if (o.get("steps_offset")) |v| {
+        if (v == .integer and v.integer >= 0) cfg.steps_offset = @intCast(v.integer);
+    }
+    if (o.get("prediction_type")) |v| {
+        if (v == .string) {
+            // An UNKNOWN prediction type keeps epsilon rather than guessing:
+            // the three are different quantities, and a wrong one is noise.
+            if (sdxl.PredictionType.fromString(v.string)) |pt| cfg.prediction = pt;
+        }
+    }
+    // The declared sampler class decides whether noise is injected each step.
+    if (o.get("_class_name")) |v| {
+        if (v == .string) cfg.ancestral = std.mem.indexOf(u8, v.string, "Ancestral") != null;
+    }
+
+    // Guidance is NOT in this file — it is a property of how the checkpoint was
+    // distilled, so it is inferred from the schedule. `trailing` at these step
+    // counts is the distills' signature, and both are trained guidance-free.
+    if (cfg.spacing == .trailing) cfg.default_guidance = 1.0;
+
+    return cfg;
 }
 
 /// Read `force_zeros_for_empty_prompt` from `model_index.json`. Absent means
@@ -779,4 +936,63 @@ test "sdxl pipeline: cfg mix is a partition of unity" {
     const one = sdxl.cfgMix(1.0);
     try testing.expectApproxEqAbs(@as(f64, 0.0), one.uncond, 1e-12);
     try testing.expectApproxEqAbs(@as(f64, 1.0), one.cond, 1e-12);
+}
+
+test "sdxl turbo: the schedule comes from the checkpoint, not from base's defaults" {
+    const a = testing.allocator;
+
+    // stabilityai/sdxl-turbo's actual scheduler_config.json.
+    const turbo =
+        \\{"_class_name":"EulerAncestralDiscreteScheduler","_diffusers_version":"0.24.0.dev0",
+        \\"beta_end":0.012,"beta_schedule":"scaled_linear","beta_start":0.00085,
+        \\"interpolation_type":"linear","num_train_timesteps":1000,"prediction_type":"epsilon",
+        \\"steps_offset":1,"timestep_spacing":"trailing"}
+    ;
+    const t = parseSchedulerConfig(a, turbo);
+    try testing.expectEqual(sdxl.TimestepSpacing.trailing, t.spacing);
+    // Ancestral, from the DECLARED sampler class — Turbo re-noises each step.
+    try testing.expect(t.ancestral);
+    try testing.expectEqual(sdxl.PredictionType.epsilon, t.prediction);
+    // `steps_offset: 1` is present and must be IGNORED: diffusers applies it
+    // only on `leading`, and shifting Turbo's 1-4 timesteps off 999/749/... is
+    // exactly the kind of change that still renders.
+    try testing.expectEqual(@as(usize, 0), t.effectiveOffset());
+    // Distilled => guidance-free, which also skips the unconditional forward.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), t.default_guidance, 1e-6);
+
+    // Base SDXL, for contrast: leading, offset APPLIED, guided, not ancestral.
+    const base =
+        \\{"_class_name":"EulerDiscreteScheduler","prediction_type":"epsilon",
+        \\"steps_offset":1,"timestep_spacing":"leading"}
+    ;
+    const b = parseSchedulerConfig(a, base);
+    try testing.expectEqual(sdxl.TimestepSpacing.leading, b.spacing);
+    try testing.expectEqual(@as(usize, 1), b.effectiveOffset());
+    try testing.expect(!b.ancestral);
+    try testing.expect(b.default_guidance > 1.0);
+
+    // A missing/garbage file falls back to BASE's values — a pack without the
+    // file is far more likely to be a base mirror, and a distill run on base's
+    // schedule looks obviously wrong rather than subtly so.
+    const fallback = parseSchedulerConfig(a, "not json");
+    try testing.expectEqual(sdxl.TimestepSpacing.leading, fallback.spacing);
+    try testing.expectEqual(sdxl.PredictionType.epsilon, fallback.prediction);
+
+    // An unknown prediction type keeps epsilon rather than guessing: the three
+    // are different quantities and a wrong one is noise, not a worse image.
+    const weird = parseSchedulerConfig(a, "{\"prediction_type\":\"flow_matching\"}");
+    try testing.expectEqual(sdxl.PredictionType.epsilon, weird.prediction);
+}
+
+test "sdxl turbo: a trailing schedule needs no offset and starts at the top" {
+    const a = testing.allocator;
+    // Turbo's real shape: 4 steps, trailing, no offset.
+    var sched = try buildSchedule(a, 4, .trailing, 0);
+    defer sched.deinit();
+    try testing.expectEqualSlices(f32, &[_]f32{ 999, 749, 499, 249 }, sched.timesteps);
+    // 1 step is the headline case and must still reach the noisiest timestep.
+    var one = try buildSchedule(a, 1, .trailing, 0);
+    defer one.deinit();
+    try testing.expectEqualSlices(f32, &[_]f32{999}, one.timesteps);
+    try testing.expectEqual(@as(f64, 0.0), one.sigmas[1]);
 }

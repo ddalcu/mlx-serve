@@ -67,7 +67,7 @@ let supportedModelTypes: Set<String> = [
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
-private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "hunyuan3d"]
+private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "hunyuan3d", "sdxl"]
 // Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
@@ -186,6 +186,7 @@ struct HFConfigMeta: Codable {
 /// served, so their classes deliberately map nowhere.
 private let servedDiffusersClasses: [String: String] = [
     "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+    "StableDiffusionXLPipeline": "sdxl",
 ]
 
 struct HFModel: Identifiable, Codable {

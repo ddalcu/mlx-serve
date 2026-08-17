@@ -20,6 +20,7 @@ const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const sdxl_mod = @import("sdxl.zig");
 const sdxl_pipeline = @import("sdxl_pipeline.zig");
+const sdxl_unet = @import("sdxl_unet.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -521,14 +522,21 @@ pub const ImageGenOpts = struct {
     /// ("the backend's own default") rather than to a number that would be
     /// meaningless on three of the four arms.
     guidance: ?f32 = null,
+    /// `"leading"` | `"trailing"` | `"linspace"` — overrides the checkpoint's
+    /// declared timestep spacing. Needed for SDXL-Lightning, which is a LoRA
+    /// over base SDXL and therefore inherits base's `leading` config while
+    /// being trained for `trailing`.
+    spacing: ?[]const u8 = null,
     /// Negative prompt. ABSENT (null) and EMPTY ("") are different requests on
     /// SDXL — absent zeroes the unconditional branch, empty encodes the empty
     /// string. See `sdxl_pipeline.GenOpts.negative_prompt`.
     negative_prompt: ?[]const u8 = null,
 };
 
-/// SDXL base's documented guidance default, and what diffusers ships for this
-/// checkpoint.
+/// SDXL base's documented guidance default. The PIPELINE owns the real
+/// default now (it reads the checkpoint's own scheduler config, so Turbo and
+/// Lightning resolve to 1.0 without the caller knowing); this stays as the
+/// documented value for the base model.
 pub const SDXL_DEFAULT_GUIDANCE: f32 = 5.0;
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -651,7 +659,7 @@ pub const ImageEngine = struct {
                 .flux => .flux2,
                 .krea => .krea2,
                 .mage_flow => .generic,
-                .sdxl => .generic,
+                .sdxl => .sdxl,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -663,7 +671,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
-            .sdxl => 0, // SDXL LoRA is a separate key grammar; not wired yet
+            .sdxl => |x| sdxl_unet.attachLora(&x.unet, &stack),
         };
         if (matched == 0) {
             stack.deinit();
@@ -679,7 +687,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
-            .sdxl => {},
+            .sdxl => |x| sdxl_unet.detachLora(&x.unet),
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -720,9 +728,15 @@ pub const ImageEngine = struct {
                     .width = width,
                     .height = height,
                     .steps = steps,
-                    .guidance = opts.guidance orelse SDXL_DEFAULT_GUIDANCE,
+                    .guidance = opts.guidance,
                     .seed = seed,
                     .negative_prompt = opts.negative_prompt,
+                    .spacing = if (opts.spacing) |sp|
+                        (if (std.mem.eql(u8, sp, "trailing")) sdxl_mod.TimestepSpacing.trailing
+                         else if (std.mem.eql(u8, sp, "linspace")) sdxl_mod.TimestepSpacing.linspace
+                         else sdxl_mod.TimestepSpacing.leading)
+                    else
+                        null,
                 }, progress);
             },
         };
@@ -2073,6 +2087,33 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
+    // `negative_prompt` and `guidance` are read ONLY here — every other image
+    // backend runs guidance-free and ignores both, so `condWeightCount`-style
+    // per-backend gating would be noise. A model that cannot use them simply
+    // does not look at them.
+    //
+    // The ABSENT/EMPTY distinction is load-bearing on SDXL and is preserved
+    // all the way from the wire: a body with no `negative_prompt` key leaves
+    // this null (zeroed unconditional branch), while `"negative_prompt": ""`
+    // arrives as an empty slice and gets ENCODED. Collapsing the two is worth
+    // cos 0.975 vs 0.997 against diffusers — see sdxl_pipeline.GenOpts.
+    const negative_prompt: ?[]const u8 = extractJsonString(body, "negative_prompt");
+    const spacing: ?[]const u8 = blk: {
+        const sp = extractJsonString(body, "timestep_spacing") orelse break :blk null;
+        if (!std.mem.eql(u8, sp, "leading") and !std.mem.eql(u8, sp, "trailing") and !std.mem.eql(u8, sp, "linspace"))
+            return sendError(conn, 400, "'timestep_spacing' must be 'leading', 'trailing' or 'linspace'");
+        break :blk sp;
+    };
+    var guidance: ?f32 = null;
+    if (extractJsonFloat(body, "guidance")) |gv| {
+        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance' must be in [1,30]");
+        guidance = @floatCast(gv);
+    } else if (extractJsonFloat(body, "guidance_scale")) |gv| {
+        // diffusers' own spelling, accepted so a pasted script works.
+        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance_scale' must be in [1,30]");
+        guidance = @floatCast(gv);
+    }
+
     const gen_opts = ImageGenOpts{
         .init_image = init_img, // null in edit mode
         .strength = strength,
@@ -2080,6 +2121,9 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
+        .negative_prompt = negative_prompt,
+        .guidance = guidance,
+        .spacing = spacing,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and

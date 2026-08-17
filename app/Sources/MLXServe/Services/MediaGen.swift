@@ -134,6 +134,8 @@ enum FluxVariant: String, Hashable, Codable {
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
+    case sdxlBase10          // Stable Diffusion XL base 1.0 — served by the sdxl backend
+    case sdxlTurbo         // Stable Diffusion XL Turbo
 }
 
 struct ImageQualitySettings: Hashable {
@@ -168,6 +170,21 @@ struct ImageModelPreset: Identifiable, Hashable {
     func settings(_ quality: QualityPreset) -> ImageQualitySettings {
         qualityProfiles[quality] ?? qualityProfiles[defaultQuality]!
     }
+
+    /// Whether this model reads a negative prompt and a guidance scale.
+    ///
+    /// True for exactly the backends that run real classifier-free guidance.
+    /// Every other image model here is DISTILLED and generates guidance-free,
+    /// so it has no unconditional branch for a negative prompt to steer — the
+    /// field would be decoration, which is why the Advanced panel deliberately
+    /// carried neither before SDXL arrived.
+    var supportsNegativePrompt: Bool { variant == .sdxlBase10 }
+
+    /// SDXL is trained on a fixed list of ~1 MP buckets, every one a multiple
+    /// of 64. It is the SAME bucket list FLUX uses (that list came from here),
+    /// so the two share it rather than keeping two copies that can drift.
+    /// Sizes between buckets are off-distribution: they generate, just worse.
+    static let sdxlResolutions: [ResolutionOption] = fluxResolutions
 
     // FLUX is trained at ~1 MP across a stable bucket of aspect ratios.
     // The architecture is shared across versions, so the bucket is too.
@@ -403,11 +420,64 @@ struct ImageModelPreset: Identifiable, Hashable {
 
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
+    /// Stable Diffusion XL base 1.0 — the full base model, not a distill.
+    ///
+    /// The odd one out in this list: everything else here is a few-step
+    /// distilled flow model, while SDXL is epsilon-prediction on a discrete
+    /// beta schedule and needs REAL classifier-free guidance — two UNet
+    /// forwards per step. That is why its step counts are 20-50 rather than
+    /// 4-12, and why it is the only preset that reads a negative prompt.
+    ///
+    /// Its repertoire is the reason to carry it: SDXL has by far the largest
+    /// LoRA ecosystem of any open image model, and those adapters work here
+    /// (verified against nerijs/pixel-art-xl — 722/722 modules bound).
+    static let sdxlBase10 = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-xl-base-1.0",
+        name: "Stable Diffusion XL 1.0 (~7 GB)",
+        variant: .sdxlBase10,
+        configName: "sdxl",
+        repo: "stabilityai/stable-diffusion-xl-base-1.0",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 30),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "The classic Stable Diffusion XL. Slower than the distilled models here because it runs real guidance, but it takes a negative prompt and has the widest LoRA ecosystem of any open image model."
+    )
+
+    static let sdxlTurbo = ImageModelPreset(
+    id: "stabilityai/sdxl-turbo",
+    name: "Stable Diffusion XL Turbo (~7 GB)",
+    variant: .sdxlTurbo,          // use the new case
+    configName: "sdxl",           // still routes to the same server backend
+    repo: "stabilityai/sdxl-turbo",
+    approxDownloadGB: 7,
+    approxRAMGB: 10,
+    resolutions: sdxlResolutions,
+    defaultResolution: sdxlResolutions[0],
+    qualityProfiles: [
+        .fast:         .init(steps: 1),
+        .good:         .init(steps: 2),
+        .quality:      .init(steps: 4),
+        .superQuality: .init(steps: 8),
+    ],
+    defaultQuality: .good,
+    description: "Distilled few‑step SDXL — generates in 1‑4 steps with no CFG."
+    )
+
     static let all: [ImageModelPreset] = [
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
         .krea2Turbo,                                   // 15
+        .sdxlBase10,                                   // 10
+        .sdxlTurbo,
     ]
 }
 
@@ -1769,6 +1839,16 @@ struct ImageGenRequest {
     /// image 2". Sent as `ref_images` beside the primary source; the server
     /// takes at most 3.
     var refImagePaths: [String] = []
+    /// What to steer AWAY from. Only models with `supportsNegativePrompt`
+    /// read it; the rest generate guidance-free and have no unconditional
+    /// branch for it to act on.
+    ///
+    /// EMPTY MEANS ABSENT here, and the two are genuinely different on the
+    /// wire: an omitted `negative_prompt` zeroes SDXL's unconditional branch,
+    /// while `""` gets encoded (BOS + EOS + 75 pads through both text towers)
+    /// and is NOT the same tensor. `requestJson` therefore omits the key
+    /// entirely when this is blank rather than sending an empty string.
+    var negativePrompt: String = ""
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
     var condGain: Double = 1.0
@@ -1808,7 +1888,11 @@ extension ImageModelPreset {
         // widest preset edge.
         case .flux2Klein4B, .flux2Klein9B:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+
+        case .sdxlTurbo, .sdxlBase10:
+            return ResolutionGrid(alignment: 16, minDim: 512, maxDim:1536)
         }
+
     }
 
     /// Instruction editing (in-context reference conditioning) is a trained

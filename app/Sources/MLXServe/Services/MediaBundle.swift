@@ -438,6 +438,50 @@ extension MediaBundle {
         )
     }
 
+    /// Stable Diffusion XL (stability's own diffusers-multifolder repos:
+    /// `stable-diffusion-xl-base-1.0`, `sdxl-turbo`). The engine reads
+    /// `unet/`, `vae/`, `text_encoder/`, `text_encoder_2/`, `tokenizer/`,
+    /// `tokenizer_2/`, and `scheduler/` — but the repo itself is ~77 GB: it
+    /// also carries a fp32 duplicate of every subfolder weight file, root-level
+    /// single-file merged checkpoints (`sd_xl_base_1.0.safetensors`,
+    /// `..._0.9vae.safetensors`, an offset-LoRA), and an `onnx/`/`openvino/`
+    /// export tree. A plain recursive fetch (the `.flux` default) has no
+    /// basename allowlist, so it pulls all of that — the "downloads the whole
+    /// HF repo" bug. `.bin`/`.msgpack`/`.onnx` are already dropped by
+    /// `selectNeededFiles`'s extension allowlist; `keepSafetensors` here does
+    /// the rest by basename: `diffusion_pytorch_model.fp16.safetensors` keeps
+    /// only the UNet+VAE fp16 weights (the fp32 sibling shares the same
+    /// subfolder but a different basename), `model.fp16.safetensors` keeps
+    /// only the two CLIP towers' fp16 weights — both root-level single-file
+    /// checkpoints have neither basename, so neither is pulled.
+    /// `onnx/`/`openvino/` are excluded outright since a recursive scan would
+    /// otherwise still walk their config/json sidecar files.
+    static func sdxlDiffusers(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sdxl:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: ["onnx/", "openvino/"],
+                        keepSafetensors: [
+                            "diffusion_pytorch_model.fp16.safetensors",
+                            "model.fp16.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "model_index.json", "unet", "vae",
+                        "text_encoder", "text_encoder_2",
+                        "tokenizer", "tokenizer_2", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -466,6 +510,13 @@ extension ImageModelPreset {
         case .flux2Klein9B:
             // The one MLX conversion of klein 9B ships no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
+        case .sdxlBase10, .sdxlTurbo:
+            // NOT a flux-shaped repo — stability's own diffusers-multifolder
+            // layout (unet/vae/text_encoder/text_encoder_2), and unlike the
+            // FLUX mirrors it isn't a bundle we control: it carries fp32
+            // duplicates, single-file checkpoints, and onnx/openvino exports
+            // the `.flux` default has no allowlist to skip.
+            return .sdxlDiffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }

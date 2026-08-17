@@ -42,6 +42,7 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const nn = @import("sdxl_nn.zig");
 const sdxl = @import("sdxl.zig");
+const lora_mod = @import("lora.zig");
 
 const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
@@ -1247,4 +1248,113 @@ test "sdxl unet: timestep embedding puts cos first and is bounded" {
     timestepEmbedding(0.0, 320, &zero);
     for (0..160) |i| try testing.expectApproxEqAbs(@as(f32, 1.0), zero[i], 1e-6);
     for (160..320) |i| try testing.expectApproxEqAbs(@as(f32, 0.0), zero[i], 1e-6);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Runtime LoRA
+// ════════════════════════════════════════════════════════════════════════
+
+/// Install a LoRA stack on every linear the adapters name, and report how many
+/// (module, adapter) attachments landed.
+///
+/// The module keys built here are the FLAT diffusers names
+/// (`down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q`), which is
+/// exactly what `lora.canonicalizeSdxl` translates a Kohya LDM key into. The
+/// two must agree literally — a canonicalization that lands on a name nothing
+/// queries is indistinguishable, from the outside, from an adapter that simply
+/// did not match, so the count returned here is the only observable.
+///
+/// SCOPE: attention and feed-forward linears plus the transformer's
+/// `proj_in`/`proj_out`. Resnet convolutions are deliberately NOT covered —
+/// LoRA here rides `nn.Linear`, and a conv adapter would need its own path.
+/// Every SDXL adapter in circulation trains this set (verified against
+/// nerijs/pixel-art-xl: 722 modules, all of them in it), and a file that
+/// carries resnet keys simply matches fewer modules rather than misapplying.
+pub fn attachLora(u: *Unet, stack: *const lora_mod.Stack) u32 {
+    detachLora(u);
+    var matched: u32 = 0;
+    var kbuf: [256]u8 = undefined;
+    var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+
+    const Bind = struct {
+        fn one(st: *const lora_mod.Stack, key: []const u8, lin: *nn.Linear, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, acc: *u32) void {
+            const refs = st.findAll(key, rb);
+            if (refs.len == 0) return;
+            lin.setLoraRefs(refs);
+            acc.* += @intCast(refs.len);
+        }
+
+        fn transformer(st: *const lora_mod.Stack, prefix: []const u8, t: *Transformer2D, kb: *[256]u8, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, acc: *u32) void {
+            {
+                const k = std.fmt.bufPrint(kb, "{s}_proj_in", .{prefix}) catch return;
+                one(st, k, &t.proj_in, rb, acc);
+            }
+            {
+                const k = std.fmt.bufPrint(kb, "{s}_proj_out", .{prefix}) catch return;
+                one(st, k, &t.proj_out, rb, acc);
+            }
+            for (t.blocks, 0..) |*b, bi| {
+                const leaves = .{
+                    .{ "attn1_to_q", &b.attn1.q }, .{ "attn1_to_k", &b.attn1.k },
+                    .{ "attn1_to_v", &b.attn1.v }, .{ "attn1_to_out", &b.attn1.o },
+                    .{ "attn2_to_q", &b.attn2.q }, .{ "attn2_to_k", &b.attn2.k },
+                    .{ "attn2_to_v", &b.attn2.v }, .{ "attn2_to_out", &b.attn2.o },
+                    .{ "ff_net_0_proj", &b.ff_proj }, .{ "ff_net_2", &b.ff_out },
+                };
+                inline for (leaves) |lf| {
+                    // `catch continue` would be COMPTIME control flow inside an
+                    // unrolled `inline for`; fall back to an empty key and skip
+                    // it at runtime instead.
+                    const k = std.fmt.bufPrint(kb, "{s}_transformer_blocks_{d}_{s}", .{ prefix, bi, lf[0] }) catch "";
+                    if (k.len != 0) one(st, k, lf[1], rb, acc);
+                }
+            }
+        }
+    };
+
+    for (u.down, 0..) |*blk, bi| {
+        const attns = blk.attns orelse continue;
+        for (attns, 0..) |*t, ai| {
+            var pbuf: [64]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&pbuf, "down_blocks_{d}_attentions_{d}", .{ bi, ai }) catch continue;
+            Bind.transformer(stack, prefix, t, &kbuf, &rbuf, &matched);
+        }
+    }
+    Bind.transformer(stack, "mid_block_attentions_0", &u.mid.attn, &kbuf, &rbuf, &matched);
+    for (u.up, 0..) |*blk, bi| {
+        const attns = blk.attns orelse continue;
+        for (attns, 0..) |*t, ai| {
+            var pbuf: [64]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&pbuf, "up_blocks_{d}_attentions_{d}", .{ bi, ai }) catch continue;
+            Bind.transformer(stack, prefix, t, &kbuf, &rbuf, &matched);
+        }
+    }
+
+    log.info("[sdxl] lora attached: {d} module bindings\n", .{matched});
+    return matched;
+}
+
+pub fn detachLora(u: *Unet) void {
+    const clearT = struct {
+        fn go(t: *Transformer2D) void {
+            t.proj_in.clearLoraRefs();
+            t.proj_out.clearLoraRefs();
+            for (t.blocks) |*b| {
+                b.attn1.q.clearLoraRefs();
+                b.attn1.k.clearLoraRefs();
+                b.attn1.v.clearLoraRefs();
+                b.attn1.o.clearLoraRefs();
+                b.attn2.q.clearLoraRefs();
+                b.attn2.k.clearLoraRefs();
+                b.attn2.v.clearLoraRefs();
+                b.attn2.o.clearLoraRefs();
+                b.ff_proj.clearLoraRefs();
+                b.ff_out.clearLoraRefs();
+            }
+        }
+    }.go;
+
+    for (u.down) |*blk| if (blk.attns) |attns| for (attns) |*t| clearT(t);
+    clearT(&u.mid.attn);
+    for (u.up) |*blk| if (blk.attns) |attns| for (attns) |*t| clearT(t);
 }

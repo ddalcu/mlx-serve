@@ -25,6 +25,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const lora_mod = @import("lora.zig");
 
 const S = mlx.mlx_stream;
 pub const Weights = model_mod.Weights;
@@ -262,6 +263,12 @@ pub fn upsample2x(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, s: S)
 pub const Linear = struct {
     w_t: mlx.mlx_array,
     b: ?mlx.mlx_array,
+    /// Attached adapters, summed at forward time and never merged into
+    /// `w_t` — the base weight stays pristine so a second request with a
+    /// different stack costs a re-attach rather than a reload. Non-owning:
+    /// the `lora.Stack` owns the arrays these point at.
+    lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
+    lora_count: u8 = 0,
 
     pub fn deinit(self: *Linear) void {
         _ = mlx.mlx_array_free(self.w_t);
@@ -269,12 +276,29 @@ pub const Linear = struct {
     }
 
     pub fn forward(self: *const Linear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const y = try matmul(x, self.w_t, s);
+        var y = try matmul(x, self.w_t, s);
+        errdefer _ = mlx.mlx_array_free(y);
+        // The delta rides on the PRE-bias product, matching mflux's
+        // `FusedLoRALinear`: bias is not part of the low-rank update.
+        if (self.lora_count > 0) {
+            const d = try lora_mod.deltaSum(x, self.lora_refs[0..self.lora_count], s);
+            defer _ = mlx.mlx_array_free(d);
+            replace(&y, try addA(y, d, s));
+        }
         if (self.b) |bb| {
             defer _ = mlx.mlx_array_free(y);
             return addA(y, bb, s);
         }
         return y;
+    }
+
+    pub fn setLoraRefs(self: *Linear, refs: []const lora_mod.Ref) void {
+        self.lora_count = @intCast(refs.len);
+        @memcpy(self.lora_refs[0..refs.len], refs);
+    }
+
+    pub fn clearLoraRefs(self: *Linear) void {
+        self.lora_count = 0;
     }
 };
 

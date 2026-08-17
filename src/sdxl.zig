@@ -871,3 +871,149 @@ test "sdxl vae shares FLUX's decoder architecture" {
     try testing.expectEqual(@as(u32, 140), sd.count());
     _ = flux_dir; // the FLUX side is compared by the harness script; see the note above
 }
+
+// ── Distilled variants: Turbo and Lightning ──
+//
+// Both are SDXL's UNet with a different SCHEDULE, not a different architecture,
+// so they load through the same engine and differ only in what
+// `scheduler_config.json` declares. Three fields carry the whole difference:
+//
+//   `timestep_spacing`  base is "leading"; both distills are "trailing", which
+//                       starts at 999 instead of 751 and matters enormously at
+//                       1-4 steps (leading's first step would skip the noisiest
+//                       part of the schedule entirely).
+//   `prediction_type`   base and most distills are "epsilon"; SDXL-Lightning's
+//                       1-STEP checkpoint is "sample" — the UNet returns the
+//                       clean image directly. Reading that as epsilon produces
+//                       noise, not a worse image.
+//   guidance            base wants ~5; both distills are trained to run
+//                       guidance-free (Turbo 0.0, Lightning 1.0), which also
+//                       halves the cost because the unconditional forward is
+//                       skipped entirely.
+
+/// What the UNet's output MEANS. Getting this wrong is not a quality
+/// regression — epsilon and sample are different quantities.
+pub const PredictionType = enum {
+    epsilon,
+    /// The clean latent directly (SDXL-Lightning 1-step).
+    sample,
+    /// Velocity parameterization.
+    v_prediction,
+
+    pub fn fromString(s: []const u8) ?PredictionType {
+        if (std.mem.eql(u8, s, "epsilon")) return .epsilon;
+        if (std.mem.eql(u8, s, "sample") or std.mem.eql(u8, s, "original_sample")) return .sample;
+        if (std.mem.eql(u8, s, "v_prediction")) return .v_prediction;
+        return null;
+    }
+};
+
+/// The Euler derivative `(sample - pred_x0) / sigma`, expressed as the two
+/// coefficients that build it from the latent and the model output:
+///
+///     derivative = latent * `latent` + model_out * `model`
+///
+/// Returned as coefficients so the caller applies them to whole tensors, and
+/// so the three prediction types differ by ARITHMETIC here rather than by
+/// three copies of the denoise loop.
+///
+/// Derivations (diffusers `EulerDiscreteScheduler.step`):
+///   epsilon       pred_x0 = latent - sigma*out   =>  derivative = out
+///   sample        pred_x0 = out                  =>  derivative = (latent - out)/sigma
+///   v_prediction  pred_x0 = out*(-sigma/sqrt(s2+1)) + latent/(s2+1)
+pub const Derivative = struct { latent: f64, model: f64 };
+
+pub fn derivativeCoeffs(kind: PredictionType, sigma: f64) Derivative {
+    return switch (kind) {
+        .epsilon => .{ .latent = 0.0, .model = 1.0 },
+        .sample => .{ .latent = 1.0 / sigma, .model = -1.0 / sigma },
+        .v_prediction => blk: {
+            const s2p1 = sigma * sigma + 1.0;
+            // pred_x0 = out*(-sigma/sqrt(s2p1)) + latent/s2p1
+            // derivative = (latent - pred_x0)/sigma
+            //            = latent*(1 - 1/s2p1)/sigma + out*(1/sqrt(s2p1))
+            break :blk .{
+                .latent = (1.0 - 1.0 / s2p1) / sigma,
+                .model = 1.0 / @sqrt(s2p1),
+            };
+        },
+    };
+}
+
+/// Ancestral (SDE) step split, as `EulerAncestralDiscreteScheduler` computes it
+/// — SDXL-Turbo's declared scheduler. The deterministic part integrates to
+/// `sigma_down` instead of `sigma_next`, and fresh noise at `sigma_up` makes up
+/// the difference.
+///
+/// `sigma_up` is CLAMPED to `sigma_next`: at the final step `sigma_next` is 0,
+/// which makes both terms 0 and the step purely deterministic — without the
+/// clamp a rounding wobble there injects noise into the finished image.
+pub const AncestralStep = struct { sigma_down: f64, sigma_up: f64 };
+
+pub fn ancestralSigmas(sigma: f64, sigma_next: f64) AncestralStep {
+    if (sigma <= 0.0) return .{ .sigma_down = sigma_next, .sigma_up = 0.0 };
+    const s2 = sigma * sigma;
+    const n2 = sigma_next * sigma_next;
+    const up_sq = n2 * (s2 - n2) / s2;
+    const up = if (up_sq > 0.0) @min(sigma_next, @sqrt(up_sq)) else 0.0;
+    const down_sq = n2 - up * up;
+    return .{ .sigma_down = if (down_sq > 0.0) @sqrt(down_sq) else 0.0, .sigma_up = up };
+}
+
+test "sdxl distilled: trailing spacing starts at the noisiest timestep" {
+    // The whole reason the distills use it: at 1-4 steps, `leading` would
+    // start at 751 and never see the top of the schedule.
+    var out: [4]usize = undefined;
+    timestepIndices(.trailing, 4, &out);
+    try testing.expectEqualSlices(usize, &[_]usize{ 999, 749, 499, 249 }, &out);
+
+    var one: [1]usize = undefined;
+    timestepIndices(.trailing, 1, &one);
+    try testing.expectEqual(@as(usize, 999), one[0]);
+
+    // Contrast with leading, which is what base SDXL uses.
+    var lead: [4]usize = undefined;
+    timestepIndices(.leading, 4, &lead);
+    try testing.expectEqual(@as(usize, 750), lead[0]);
+}
+
+test "sdxl distilled: the derivative reduces to the model output for epsilon" {
+    // Epsilon is the case the original loop hardcoded; the generalization must
+    // not move it.
+    const e = derivativeCoeffs(.epsilon, 4.1167);
+    try testing.expectEqual(@as(f64, 0.0), e.latent);
+    try testing.expectEqual(@as(f64, 1.0), e.model);
+
+    // `sample` (Lightning 1-step) is the OPPOSITE sign on the model term —
+    // reading one as the other is noise, not a worse image.
+    const s = derivativeCoeffs(.sample, 2.0);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), s.latent, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, -0.5), s.model, 1e-12);
+
+    // v_prediction at sigma -> 0 leans entirely on the model term.
+    const v = derivativeCoeffs(.v_prediction, 1.0);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), v.latent, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 1.0 / @sqrt(2.0)), v.model, 1e-12);
+}
+
+test "sdxl distilled: the ancestral split conserves variance and ends clean" {
+    // Mid-schedule: down and up together account for sigma_next.
+    const a = ancestralSigmas(4.0, 2.0);
+    try testing.expect(a.sigma_up > 0.0);
+    try testing.expectApproxEqAbs(2.0 * 2.0, a.sigma_down * a.sigma_down + a.sigma_up * a.sigma_up, 1e-9);
+
+    // FINAL step: sigma_next is 0, so nothing may be injected — an image that
+    // ends with added noise is the visible failure here.
+    const last = ancestralSigmas(0.041314, 0.0);
+    try testing.expectEqual(@as(f64, 0.0), last.sigma_up);
+    try testing.expectEqual(@as(f64, 0.0), last.sigma_down);
+
+    try testing.expectEqual(@as(f64, 0.0), ancestralSigmas(0.0, 0.0).sigma_up);
+}
+
+test "sdxl distilled: prediction types parse by their diffusers spelling" {
+    try testing.expectEqual(PredictionType.epsilon, PredictionType.fromString("epsilon").?);
+    try testing.expectEqual(PredictionType.sample, PredictionType.fromString("sample").?);
+    try testing.expectEqual(PredictionType.v_prediction, PredictionType.fromString("v_prediction").?);
+    try testing.expect(PredictionType.fromString("flow_matching") == null);
+}

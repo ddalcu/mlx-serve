@@ -44,6 +44,9 @@ struct ImageGenView: View {
     /// keeps the subject), false = variation (renoise remix).
     @State private var editMode: Bool = true
     /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
+    /// What to steer away from. Only shown for models that read it — see
+    /// `ImageModelPreset.supportsNegativePrompt`.
+    @State private var negativePrompt: String = ""
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
     @State private var condWeightsText: String = ""
@@ -85,6 +88,7 @@ struct ImageGenView: View {
         .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: negativePrompt) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
@@ -473,11 +477,25 @@ struct ImageGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            // No CFG field and no negative prompt: NO image backend reads either
-            // one (`handleImage` parses neither, and the app never sent
-            // guidance), so both were pure decoration on every model, not just
-            // the distilled ones. Steps stay overridable even where the schedule
-            // is fixed — it's the Advanced panel, and the hint says the cost.
+            // The negative prompt is shown only for models that actually read
+            // one. Every distilled backend here generates guidance-free and
+            // has no unconditional branch for it to steer, so showing the box
+            // on those would be decoration — which is exactly why this panel
+            // carried neither a CFG nor a negative field before SDXL landed.
+            if model.supportsNegativePrompt {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Negative prompt (optional)").font(.caption.weight(.semibold))
+                    TextField("things to avoid — e.g. blurry, extra fingers, watermark", text: $negativePrompt)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.callout)
+                    Text("Steered away from, not banned. Leaving this empty is not the same as typing nothing into it — empty means the model gets a blank unconditional pass, which is the usual default.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Divider()
+            }
+            // Steps stay overridable even where the schedule is fixed — it's
+            // the Advanced panel, and the hint says the cost.
             HStack {
                 numberField("Steps", value: $steps, step: 1)
                 // -1 is the random sentinel and renders as an EMPTY box, so the
@@ -874,6 +892,7 @@ struct ImageGenView: View {
             strength: strength,
             editMode: effectiveEditMode,
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
+            negativePrompt: model.supportsNegativePrompt ? negativePrompt : "",
             condGain: condGain,
             condWeightsText: condWeightsText,
             loras: loras
