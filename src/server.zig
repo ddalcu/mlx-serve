@@ -3900,6 +3900,43 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     // The job body wrote the full HTTP/SSE response on the inference thread.
 }
 
+/// Does an unload body carry keys but no usable `"model"`? `{"model_id": id}`
+/// and `{"id": id}` parse fine, leave the id empty, and so resolve to the
+/// DEFAULT model — which, when that default is already unloaded, answers 200
+/// with `{"id":"mlx-serve","state":"unloaded"}`. That is a success-shaped
+/// payload for an unload that never happened, and no client can tell it apart
+/// from a real one (and on a server whose default IS resident, it unloads the
+/// wrong model). Same class as the context-overflow 400: an unload that did
+/// not do what was asked has to say so.
+///
+/// An EMPTY object (or no body at all) is left alone — "the default model" is
+/// the documented shorthand this endpoint has always taken.
+fn unloadBodyNamesNoModel(obj: std.json.ObjectMap) bool {
+    if (obj.count() == 0) return false;
+    if (obj.get("model")) |m| return m != .string;
+    return true;
+}
+
+test "an unload body naming an unrecognised key is a 400, not the default model" {
+    const Case = struct { body: []const u8, rejected: bool };
+    for ([_]Case{
+        .{ .body = "{\"model\":\"org/repo\"}", .rejected = false },
+        .{ .body = "{\"model\":\"/abs/path/org-repo\"}", .rejected = false },
+        // The shorthand every other endpoint honours must keep working.
+        .{ .body = "{}", .rejected = false },
+        // The live bug: 200 + "mlx-serve" with the named model still resident.
+        .{ .body = "{\"model_id\":\"org/repo\"}", .rejected = true },
+        .{ .body = "{\"id\":\"org/repo\"}", .rejected = true },
+        // A present-but-unusable `model` took the same silent path.
+        .{ .body = "{\"model\":123}", .rejected = true },
+        .{ .body = "{\"model\":null}", .rejected = true },
+    }) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(c.rejected, unloadBodyNamesNoModel(parsed.value.object));
+    }
+}
+
 /// `POST /v1/unload-model` `{"model": id}`. Frees the model's resident GPU
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
@@ -3917,6 +3954,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
     if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
         parsed_body = parsed;
         if (parsed.value == .object) {
+            if (unloadBodyNamesNoModel(parsed.value.object)) {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Unload requires the model id as a string under the \"model\" key", 400);
+                return;
+            }
             if (parsed.value.object.get("model")) |m| {
                 if (m == .string) requested_id = m.string;
             }
