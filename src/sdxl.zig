@@ -198,6 +198,91 @@ pub fn defaultTimeIds(height: u32, width: u32) TimeIds {
     return addTimeIds(height, width, 0, 0, height, width);
 }
 
+// ── Geometry ──
+//
+// Fixed by the architecture, not read from a checkpoint: every SDXL build
+// shares them, and a repo that disagrees is not SDXL. They live here so the
+// encoder/UNet/VAE files can assert against ONE copy.
+
+/// The VAE's spatial downsample. A 1024x1024 image is a 128x128 latent.
+pub const VAE_SCALE_FACTOR: u32 = 8;
+
+/// Latent channels the UNet works in.
+pub const LATENT_CHANNELS: u32 = 4;
+
+/// SDXL's VAE scaling factor. **0.13025**, NOT SD 1.5's 0.18215 — the two are
+/// the same field in the same place in `vae/config.json` and differ by 40%, so
+/// pasting the familiar number produces images that decode with visibly wrong
+/// contrast rather than failing. Read from the checkpoint when present; this is
+/// the fallback for a pack that ships no vae config.
+pub const VAE_SCALING_FACTOR: f32 = 0.13025;
+
+/// The two text encoders. SDXL concatenates their PENULTIMATE hidden states
+/// along the feature axis (768 + 1280 = 2048, the UNet's cross-attention dim)
+/// and takes the POOLED output from the bigG tower ALONE for the micro-
+/// conditioning embedding. Using the last hidden state instead of the
+/// penultimate is a silent quality regression, not an error.
+pub const CLIP_L_HIDDEN: u32 = 768;
+pub const CLIP_BIG_G_HIDDEN: u32 = 1280;
+pub const CROSS_ATTENTION_DIM: u32 = CLIP_L_HIDDEN + CLIP_BIG_G_HIDDEN;
+
+/// The pooled projection fed to the micro-conditioning embedder — bigG's
+/// projection dim, which happens to equal its hidden size.
+pub const POOLED_PROJECTION_DIM: u32 = CLIP_BIG_G_HIDDEN;
+
+/// Both towers are trained at 77 tokens; longer prompts are truncated by the
+/// pipeline (weighted-embedding tricks are a downstream concern).
+pub const MAX_PROMPT_TOKENS: u32 = 77;
+
+/// Latent grid for an image of this size. Returns null when the size is not a
+/// clean multiple of the VAE scale — the caller decides whether that is a
+/// refusal or a snap, exactly as `clampFluxDim` does for FLUX.
+pub fn latentDims(width: u32, height: u32) ?struct { w: u32, h: u32 } {
+    if (width == 0 or height == 0) return null;
+    if (width % VAE_SCALE_FACTOR != 0 or height % VAE_SCALE_FACTOR != 0) return null;
+    return .{ .w = width / VAE_SCALE_FACTOR, .h = height / VAE_SCALE_FACTOR };
+}
+
+// ── Repo fingerprint ──
+//
+// DELIBERATELY NOT WIRED into `model_discovery` or `gen.peekModelType` yet.
+// A model the server discovers and then cannot load is the incomplete-media-pack
+// class: discovery registers it, the loader falls through to something that was
+// never meant to read it, and the failure surfaces as a crash rather than a
+// named refusal. This predicate lands in discovery in the same change as the
+// `ImageBackend` arm that can serve it, never before.
+
+/// diffusers `_class_name` values that describe a checkpoint our SDXL engine
+/// would load. The plain and img2img/inpaint pipelines share one UNet, one VAE
+/// and the same pair of text encoders — they differ only in how the initial
+/// latent is prepared, which is a request-shape question, not a checkpoint one.
+pub fn isSdxlPipelineClass(class_name: []const u8) bool {
+    const known = [_][]const u8{
+        "StableDiffusionXLPipeline",
+        "StableDiffusionXLImg2ImgPipeline",
+        "StableDiffusionXLInpaintPipeline",
+    };
+    for (known) |k| if (std.mem.eql(u8, class_name, k)) return true;
+    return false;
+}
+
+/// True when `model_index.json` bytes describe an SDXL pipeline.
+///
+/// Keyed on the DECLARED class, never on directory shape: `unet/` + `vae/` +
+/// `text_encoder/` describes most of diffusers, and SD 1.5 has all three with
+/// only ONE text encoder. The `text_encoder_2` entry is what separates XL from
+/// its predecessor, so it is required too — a repo declaring the XL class
+/// without it cannot be loaded by an XL engine.
+pub fn indexDeclaresSdxl(allocator: std.mem.Allocator, index_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, index_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = parsed.value.object;
+    const cn = obj.get("_class_name") orelse return false;
+    if (cn != .string or !isSdxlPipelineClass(cn.string)) return false;
+    return obj.get("text_encoder_2") != null;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Tests — invariants and hand-computable values only. See ORACLE STATUS above:
 // none of this is yet pinned against an executed diffusers reference.
@@ -341,4 +426,78 @@ test "explicit crop coords survive into the vector" {
     try testing.expectEqual(@as(f32, 32), ids[3]);
     try testing.expectEqual(@as(f32, 768), ids[4]);
     try testing.expectEqual(@as(f32, 512), ids[5]);
+}
+
+test "the two encoder widths sum to the UNet's cross-attention dim" {
+    try testing.expectEqual(@as(u32, 2048), CROSS_ATTENTION_DIM);
+    try testing.expectEqual(CLIP_L_HIDDEN + CLIP_BIG_G_HIDDEN, CROSS_ATTENTION_DIM);
+    // The pooled vector comes from bigG ALONE, so it is 1280 and not 2048 —
+    // wiring the concatenated width here is the mistake this pins.
+    try testing.expectEqual(@as(u32, 1280), POOLED_PROJECTION_DIM);
+}
+
+test "the VAE scaling factor is SDXL's, not SD 1.5's" {
+    // Same field, same place in vae/config.json, 40% apart. Pasting the
+    // familiar 0.18215 decodes with visibly wrong contrast rather than failing.
+    try testing.expectApproxEqAbs(@as(f32, 0.13025), VAE_SCALING_FACTOR, 1e-9);
+    try testing.expect(VAE_SCALING_FACTOR != 0.18215);
+}
+
+test "latent dims divide by 8 and refuse a size that does not" {
+    const a = latentDims(1024, 1024).?;
+    try testing.expectEqual(@as(u32, 128), a.w);
+    try testing.expectEqual(@as(u32, 128), a.h);
+    const b = latentDims(1344, 768).?;
+    try testing.expectEqual(@as(u32, 168), b.w);
+    try testing.expectEqual(@as(u32, 96), b.h);
+    try testing.expect(latentDims(1023, 1024) == null);
+    try testing.expect(latentDims(0, 512) == null);
+}
+
+test "the sdxl fingerprint keys on the declared class plus the second encoder" {
+    const a = testing.allocator;
+    const xl =
+        \\{"_class_name":"StableDiffusionXLPipeline","unet":["diffusers","UNet2DConditionModel"],
+        \\ "text_encoder":["transformers","CLIPTextModel"],
+        \\ "text_encoder_2":["transformers","CLIPTextModelWithProjection"]}
+    ;
+    try testing.expect(indexDeclaresSdxl(a, xl));
+
+    // SD 1.5 has unet + vae + text_encoder and is NOT XL — the directory shape
+    // alone cannot tell them apart, which is why the class is the key.
+    const sd15 =
+        \\{"_class_name":"StableDiffusionPipeline","unet":["diffusers","UNet2DConditionModel"],
+        \\ "text_encoder":["transformers","CLIPTextModel"]}
+    ;
+    try testing.expect(!indexDeclaresSdxl(a, sd15));
+
+    // Declaring the XL class without the second tower is not loadable by an XL
+    // engine, so it is not a match.
+    const half =
+        \\{"_class_name":"StableDiffusionXLPipeline","unet":["diffusers","UNet2DConditionModel"]}
+    ;
+    try testing.expect(!indexDeclaresSdxl(a, half));
+
+    try testing.expect(!indexDeclaresSdxl(a, "not json"));
+    try testing.expect(!indexDeclaresSdxl(a, "[]"));
+    try testing.expect(!indexDeclaresSdxl(a, "{}"));
+}
+
+test "img2img and inpaint share the checkpoint, so they share the fingerprint" {
+    try testing.expect(isSdxlPipelineClass("StableDiffusionXLPipeline"));
+    try testing.expect(isSdxlPipelineClass("StableDiffusionXLImg2ImgPipeline"));
+    try testing.expect(isSdxlPipelineClass("StableDiffusionXLInpaintPipeline"));
+    try testing.expect(!isSdxlPipelineClass("StableDiffusionPipeline"));
+    try testing.expect(!isSdxlPipelineClass("FluxPipeline"));
+    try testing.expect(!isSdxlPipelineClass(""));
+}
+
+test "SDXL is not yet reachable from discovery or the gen dispatch" {
+    // Class guard, not a feature test: this file is deliberately unwired until
+    // an ImageBackend arm exists. If someone adds the model_type without the
+    // engine, discovery registers a model whose load falls through to a reader
+    // that was never meant to see it — the incomplete-media-pack class.
+    const gen = @import("gen.zig");
+    try testing.expect(gen.modalityFromType("sdxl") == null);
+    try testing.expect(gen.modalityFromType("stable_diffusion_xl") == null);
 }
