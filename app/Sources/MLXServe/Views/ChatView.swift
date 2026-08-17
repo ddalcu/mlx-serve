@@ -1555,6 +1555,16 @@ struct ChatDetailView: View {
     // it back into this flag. The Cmd+V attach monitor reads it; on-appear and
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
+    /// The detail column's measured width — the panel next to the session
+    /// sidebar, not the whole window. Drives `contentWidth` below. Zero until
+    /// `body`'s root view reports its first `onGeometryChange`.
+    @State private var columnWidth: CGFloat = 0
+
+    /// The shared reading measure all three capped sites (transcript,
+    /// composer, empty-state greeting) apply. See `ChatMetrics.contentWidthFraction`.
+    private var contentWidth: CGFloat {
+        columnWidth > 0 ? columnWidth * ChatMetrics.contentWidthFraction : ChatMetrics.contentFallbackWidth
+    }
     @State private var composerHeight: CGFloat = 36
     // The composer's "create mode" (the chip rewired the composer into a
     // generator) is GONE: a media chip navigates to the Create pane, exactly
@@ -2048,7 +2058,7 @@ struct ChatDetailView: View {
         }
         // Same column as the transcript and the composer below it, so the
         // greeting sits over the field rather than spanning the window.
-        .frame(maxWidth: ChatMetrics.contentMaxWidth)
+        .frame(maxWidth: contentWidth)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, ChatMetrics.gutter)
         .padding(.bottom, 22)
@@ -2143,7 +2153,7 @@ struct ChatDetailView: View {
                     }
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
-                    .frame(maxWidth: ChatMetrics.contentMaxWidth)
+                    .frame(maxWidth: contentWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
@@ -2277,7 +2287,7 @@ struct ChatDetailView: View {
                 .composerTipOverlay()
               }   // end else (non-Telegram composer)
             }
-            .frame(maxWidth: ChatMetrics.contentMaxWidth)
+            .frame(maxWidth: contentWidth)
             .frame(maxWidth: .infinity)
             .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 10)
@@ -2486,6 +2496,9 @@ struct ChatDetailView: View {
             // thing I said HERE".
             composerWalk = .idle
         }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { columnWidth = $0 }
     }
 
     /// The input field. No background or border of its own — the composer
