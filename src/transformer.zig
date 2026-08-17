@@ -4631,6 +4631,12 @@ pub const ForwardCtx = struct {
     /// `Transformer.spec_capture_ssm`.
     capture_ssm_seq: bool = false,
     vision_embeddings: ?mlx.mlx_array,
+    /// Chunked vision prefill (issue #197): number of image/audio placeholder
+    /// tokens already spliced by earlier chunks of this prefill. The splice's
+    /// row lookup is a cumsum over the CURRENT forward's placeholder mask, so
+    /// without this every chunk would restart at vision row 0. Set per chunk
+    /// by the generate.zig prefill loop; 0 for unchunked/decode forwards.
+    vision_splice_offset: usize = 0,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens
@@ -7682,7 +7688,17 @@ pub const Transformer = struct {
     /// Returns new h with vision embeddings replacing image token positions.
     /// masked_scatter: replaces image token positions with vision features.
     /// Matches Python reference: cumsum-based indexing into flattened source.
-    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32) !mlx.mlx_array {
+    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32, row_offset: usize) !mlx.mlx_array {
+        return spliceVisionRows(h, token_ids, vision_emb, image_token_id, audio_token_id, row_offset, self.s);
+    }
+
+    /// Scatter vision/audio embedding rows into `h` at placeholder-token
+    /// positions. `row_offset` is the number of placeholder tokens earlier
+    /// chunks of this prefill already consumed (chunked vision prefill): the
+    /// row lookup is a cumsum over THIS forward's mask, so the offset is what
+    /// keeps a chunk boundary inside an image from restarting the scatter at
+    /// row 0. Frees `h` and returns the spliced replacement.
+    pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32, row_offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
         const h_shape = mlx.getShape(h);
 
         // mask = (token_ids == image_token_id) [| (token_ids == audio_token_id)].
@@ -7694,15 +7710,15 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(img_id_arr);
         var mask_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_2d);
-        try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, self.s));
+        try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, s));
         if (audio_token_id > 0) {
             const aud_id_arr = mlx.mlx_array_new_int(@intCast(audio_token_id));
             defer _ = mlx.mlx_array_free(aud_id_arr);
             var aud_mask = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(aud_mask);
-            try mlx.check(mlx.mlx_equal(&aud_mask, token_ids, aud_id_arr, self.s));
+            try mlx.check(mlx.mlx_equal(&aud_mask, token_ids, aud_id_arr, s));
             var combined = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_logical_or(&combined, mask_2d, aud_mask, self.s));
+            try mlx.check(mlx.mlx_logical_or(&combined, mask_2d, aud_mask, s));
             _ = mlx.mlx_array_free(mask_2d);
             mask_2d = combined;
         }
@@ -7711,7 +7727,7 @@ pub const Transformer = struct {
         const expand_shape = [_]c_int{ h_shape[0], h_shape[1], 1 };
         var mask_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_3d);
-        try mlx.check(mlx.mlx_reshape(&mask_3d, mask_2d, &expand_shape, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&mask_3d, mask_2d, &expand_shape, 3, s));
 
         // Broadcast to full shape via logical and with ones
         var mask_expanded = mlx.mlx_array_new();
@@ -7719,8 +7735,8 @@ pub const Transformer = struct {
         {
             var ones_h = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ones_h);
-            try mlx.check(mlx.mlx_ones(&ones_h, h_shape.ptr, 3, .bool_, self.s));
-            try mlx.check(mlx.mlx_multiply(&mask_expanded, mask_3d, ones_h, self.s));
+            try mlx.check(mlx.mlx_ones(&ones_h, h_shape.ptr, 3, .bool_, s));
+            try mlx.check(mlx.mlx_multiply(&mask_expanded, mask_3d, ones_h, s));
         }
 
         // Flatten everything
@@ -7729,22 +7745,26 @@ pub const Transformer = struct {
 
         var mask_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_flat);
-        try mlx.check(mlx.mlx_reshape(&mask_flat, mask_expanded, &flat_shape, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&mask_flat, mask_expanded, &flat_shape, 1, s));
 
         // mask_int = mask_flat.astype(int32)
         var mask_int = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_int);
-        try mlx.check(mlx.mlx_astype(&mask_int, mask_flat, .int32, self.s));
+        try mlx.check(mlx.mlx_astype(&mask_int, mask_flat, .int32, s));
 
-        // indices = cumsum(mask_int, axis=0) - 1
+        // indices = cumsum(mask_int, axis=0) - 1 + row_offset*hidden. The
+        // cumsum counts masked ELEMENTS of this forward (hidden consecutive
+        // per placeholder token); earlier chunks consumed row_offset rows of
+        // the flat source, i.e. row_offset*hidden elements.
         var cumsum_arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cumsum_arr);
-        try mlx.check(mlx.mlx_cumsum(&cumsum_arr, mask_int, 0, false, true, self.s));
-        const one_i = mlx.mlx_array_new_int(1);
-        defer _ = mlx.mlx_array_free(one_i);
+        try mlx.check(mlx.mlx_cumsum(&cumsum_arr, mask_int, 0, false, true, s));
+        const elem_offset: i64 = @as(i64, @intCast(row_offset)) * @as(i64, @intCast(h_shape[2]));
+        const off_i = mlx.mlx_array_new_int(@intCast(elem_offset - 1));
+        defer _ = mlx.mlx_array_free(off_i);
         var indices = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(indices);
-        try mlx.check(mlx.mlx_subtract(&indices, cumsum_arr, one_i, self.s));
+        try mlx.check(mlx.mlx_add(&indices, cumsum_arr, off_i, s));
 
         // source = vision_emb.flatten()
         const ve_shape = mlx.getShape(vision_emb);
@@ -7752,38 +7772,38 @@ pub const Transformer = struct {
         const source_shape = [_]c_int{source_size};
         var source_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(source_flat);
-        try mlx.check(mlx.mlx_reshape(&source_flat, vision_emb, &source_shape, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&source_flat, vision_emb, &source_shape, 1, s));
 
         // indices_mod = indices % source_size
         const source_size_arr = mlx.mlx_array_new_int(source_size);
         defer _ = mlx.mlx_array_free(source_size_arr);
         var indices_mod = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(indices_mod);
-        try mlx.check(mlx.mlx_remainder(&indices_mod, indices, source_size_arr, self.s));
+        try mlx.check(mlx.mlx_remainder(&indices_mod, indices, source_size_arr, s));
 
         // aligned = source[indices_mod]
         var aligned = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(aligned);
-        try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, self.s));
+        try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, s));
 
         // Cast aligned to bf16 to match h
         var aligned_bf = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(aligned_bf);
-        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, s));
 
         // input_flat = h.flatten()
         var input_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(input_flat);
-        try mlx.check(mlx.mlx_reshape(&input_flat, h, &flat_shape, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&input_flat, h, &flat_shape, 1, s));
 
         // result_flat = where(mask_flat, aligned_bf, input_flat)
         var result_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(result_flat);
-        try mlx.check(mlx.mlx_where(&result_flat, mask_flat, aligned_bf, input_flat, self.s));
+        try mlx.check(mlx.mlx_where(&result_flat, mask_flat, aligned_bf, input_flat, s));
 
         // Reshape back to [B, seq_len, hidden]
         var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, s));
         _ = mlx.mlx_array_free(h);
         return result;
     }
@@ -7803,7 +7823,7 @@ pub const Transformer = struct {
         // mlx-vlm does NOT re-scale them by sqrt(hidden) the way text embeddings are scaled
         // at LM embedding time. Splice directly — scaling here corrupts the MoE router's
         // magnitude assumptions (visible as "please provide an image" responses on 26B MoE).
-        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id, cfg.audio_token_id);
+        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id, cfg.audio_token_id, ctx.vision_splice_offset);
     }
 
     // ── Activation functions ──
@@ -30588,4 +30608,114 @@ test "every generative forward arm splices vision embeddings" {
     }
     // A scan that matches nothing passes vacuously.
     try testing.expect(checked >= 3);
+}
+
+// ── Chunked vision splice (issue #197) ───────────────────────────────────────
+// A vision prompt prefills in chunks; the splice's row lookup is a cumsum over
+// the CURRENT forward's placeholder mask, so each chunk passes the rows earlier
+// chunks consumed as `row_offset` — a restarted scatter silently reuses the
+// first image rows in every chunk (coherent output, wrong image content).
+
+test "spliceVisionRows: two chunks with row offsets equal the whole-prompt splice" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const hidden: c_int = 4;
+    const seq: c_int = 6;
+    const img_id: u32 = 99;
+    // token ids: [7, 99, 99, 8, 99, 9] — placeholders at 1, 2 (chunk A) and 4
+    // (chunk B), so the boundary lands INSIDE the image row sequence.
+    const ids = [_]i32{ 7, 99, 99, 8, 99, 9 };
+    // h rows: row i filled with i+1 (bf16-exact values).
+    var h_data: [6 * 4]f32 = undefined;
+    for (0..6) |r| for (0..4) |c| {
+        h_data[r * 4 + c] = @floatFromInt(r + 1);
+    };
+    // vision rows: row k filled with 100+k — distinct per row, so a restarted
+    // scatter (row 0 reused in chunk B) produces different bytes.
+    var ve_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        ve_data[r * 4 + c] = @floatFromInt(100 + r);
+    };
+    const ve_shape = [_]c_int{ 1, 3, hidden };
+    const ve = mlx.mlx_array_new_data(&ve_data, &ve_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(ve);
+
+    const readRow = struct {
+        fn f(arr: mlx.mlx_array, row: usize, out: *[4]f32, st: mlx.mlx_stream) !void {
+            var f32arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32arr);
+            try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, st));
+            try mlx.check(mlx.mlx_array_eval(f32arr));
+            const ptr = mlx.mlx_array_data_float32(f32arr).?;
+            for (0..4) |c| out[c] = ptr[row * 4 + c];
+        }
+    }.f;
+
+    // Whole-prompt splice (the reference: what the unchunked path computes).
+    var full_rows: [6][4]f32 = undefined;
+    {
+        const h_shape = [_]c_int{ 1, seq, hidden };
+        const h = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+        const ids_shape = [_]c_int{ 1, seq };
+        const tid = mlx.mlx_array_new_data(&ids, &ids_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tid);
+        const spliced = try Transformer.spliceVisionRows(h, tid, ve, img_id, 0, 0, s);
+        defer _ = mlx.mlx_array_free(spliced);
+        for (0..6) |r| try readRow(spliced, r, &full_rows[r], s);
+    }
+
+    // Chunk A = tokens [0..3), offset 0; chunk B = tokens [3..6), offset 2
+    // (chunk A consumed 2 placeholder rows).
+    const chunks = [_]struct { start: usize, len: c_int, off: usize }{
+        .{ .start = 0, .len = 3, .off = 0 },
+        .{ .start = 3, .len = 3, .off = 2 },
+    };
+    for (chunks) |ck| {
+        const h_shape = [_]c_int{ 1, ck.len, hidden };
+        const h = mlx.mlx_array_new_data(h_data[ck.start * 4 ..].ptr, &h_shape, 3, .float32);
+        const ids_shape = [_]c_int{ 1, ck.len };
+        const tid = mlx.mlx_array_new_data(ids[ck.start..].ptr, &ids_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tid);
+        const spliced = try Transformer.spliceVisionRows(h, tid, ve, img_id, 0, ck.off, s);
+        defer _ = mlx.mlx_array_free(spliced);
+        for (0..@intCast(ck.len)) |r| {
+            var got: [4]f32 = undefined;
+            try readRow(spliced, r, &got, s);
+            for (0..4) |c| try std.testing.expectEqual(full_rows[ck.start + r][c], got[c]);
+        }
+    }
+}
+
+test "spliceVisionRows: audio placeholders share the row stream in prompt order" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const hidden: c_int = 4;
+    const img_id: u32 = 99;
+    const aud_id: u32 = 88;
+    // [99, 7, 88] — image row then audio row from ONE concatenated source.
+    const ids = [_]i32{ 99, 7, 88 };
+    var h_data: [12]f32 = @splat(0);
+    var ve_data: [2 * 4]f32 = undefined;
+    for (0..2) |r| for (0..4) |c| {
+        ve_data[r * 4 + c] = @floatFromInt(50 + r);
+    };
+    const ve_shape = [_]c_int{ 1, 2, hidden };
+    const ve = mlx.mlx_array_new_data(&ve_data, &ve_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(ve);
+    const h_shape = [_]c_int{ 1, 3, hidden };
+    const h = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const ids_shape = [_]c_int{ 1, 3 };
+    const tid = mlx.mlx_array_new_data(&ids, &ids_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tid);
+    const spliced = try Transformer.spliceVisionRows(h, tid, ve, img_id, aud_id, 0, s);
+    defer _ = mlx.mlx_array_free(spliced);
+    var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
+    try mlx.check(mlx.mlx_astype(&f32arr, spliced, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32arr));
+    const ptr = mlx.mlx_array_data_float32(f32arr).?;
+    try std.testing.expectEqual(@as(f32, 50), ptr[0]); // image row 0
+    try std.testing.expectEqual(@as(f32, 0), ptr[4]); // text untouched
+    try std.testing.expectEqual(@as(f32, 51), ptr[8]); // audio row 1
 }

@@ -58,6 +58,16 @@ Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. T
 
 For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with the long-tail divergence inherent to INT4 float-reduction order (documented in `CLAUDE.md`). For temp > 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by `tests/test_pld_equivalence.sh`, `test_drafter_equivalence.sh`, and `test_kv_quant_equivalence.sh`.
 
+## Can I get byte-identical greedy output across runs and settings?
+
+Yes, if you turn off the things that legitimately reorder float math. Speculative decoding verifies several tokens in one forward, and a wider forward picks different Metal kernels than a one-token forward, so near-tie argmaxes can flip. That's not corruption and not a seed issue (`seed` does nothing at temp 0); it's the same batch-width property every serving engine has. The byte-stable recipe:
+
+- disable speculation: `enable_mtp: false` in the request (or launch with `--no-mtp`), plus `--no-drafter` and no `--pld` if you enabled those
+- `--kv-quant off` or `8`
+- on hybrid architectures (Qwen 3.5/3.6/3.8, LFM2, Nemotron-H): `--prefix-cache-entries 0`, since a cache hit re-runs the recurrence in a different block size
+
+If your test gate needs exact-string matches, run it with this recipe. Making the speculative path itself byte-identical would mean forcing every kernel's reduction order to be independent of batch width, which is exactly what the fast verify kernels trade away.
+
 ## Where does my data go?
 
 Nowhere off your machines. Everything runs locally — no analytics, no telemetry, no cloud calls. The HTTP server listens on your local network interface by default (`--host 0.0.0.0`) so your own devices can reach it; set `--host 127.0.0.1` to make it strictly local, or `--api-key` to gate every non-localhost request. With LAN Sharing on, prompts sent to a shared model travel only across your local network to the Mac hosting that model. Open source under MIT.

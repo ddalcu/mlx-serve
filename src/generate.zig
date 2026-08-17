@@ -628,13 +628,45 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
-/// Vision embeddings are scattered from the beginning of their source tensor
-/// within a forward pass, so checkpoint-aligned chunk boundaries would restart
-/// that scatter and reuse the first image features in every chunk. Keep vision
-/// prefill single-pass; image-bearing prompts are excluded from prefix reuse
-/// independently because equal placeholder IDs do not imply equal images.
+/// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
+/// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
+/// equal images) — so vision prefills skip checkpointing even now that they
+/// chunk (the splice scatter itself is chunk-safe via vision_splice_offset).
 pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
     return stride > 0 and has_ssm and !has_vision;
+}
+
+/// Chunked vision prefill (issue #197). Default ON: the splice resumes its
+/// row index across chunk boundaries via `ForwardCtx.vision_splice_offset`,
+/// so an image-bearing prompt prefills under the same chunk-bounded memory
+/// envelope as text. MLX_SERVE_VISION_CHUNKED=0 restores the whole-prompt
+/// single forward (and the memory guard's full-width bill with it).
+var vision_chunked_cached: ?bool = null;
+pub fn visionChunkedPrefillEnabled() bool {
+    if (vision_chunked_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_VISION_CHUNKED");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    vision_chunked_cached = on;
+    return on;
+}
+
+/// What the memory guard should bill a prefill at: full width only for a
+/// vision prompt with chunking killed. The guard and this loop must agree or
+/// admission either over-refuses (bills seq for a chunked prefill) or
+/// under-bills (uncatchable Metal OOM).
+pub fn visionPrefillUnchunked(has_vision: bool) bool {
+    return has_vision and !visionChunkedPrefillEnabled();
+}
+
+/// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
+/// source rows a chunk's splice consumes. Host-side count, no GPU sync.
+pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32) usize {
+    var n: usize = 0;
+    for (ids) |id| {
+        if (id == @as(i32, @intCast(image_token_id)) or
+            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id)))) n += 1;
+    }
+    return n;
 }
 
 /// Number of chunks a cold prefill of `prefix_len` tokens splits into for the
@@ -1702,13 +1734,22 @@ pub const Generator = struct {
         // ssmSnapshotBackoff), and the final forward covers the held-back
         // tail + the last token in the same weight sweep.
         var final_start: usize = prompt_ids.len - 1;
+        // Chunked vision prefill (issue #197): placeholder rows consumed by
+        // completed chunks, fed to ctx.vision_splice_offset per forward
+        // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
+        // so that path is byte-identical to the old whole-prompt behavior.
+        const vision_chunked = has_vision and visionChunkedPrefillEnabled();
+        var vision_rows_consumed: usize = 0;
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
-            const default_chunk = if (has_vision) loop_end else PREFILL_CHUNK;
+            // Vision prompts chunk like text (issue #197) — the splice offset
+            // below keeps the row scatter chunk-exact. Kill switch restores
+            // the whole-prompt forward.
+            const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
@@ -1733,6 +1774,7 @@ pub const Generator = struct {
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
                 const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                if (vision_chunked) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -1880,6 +1922,13 @@ pub const Generator = struct {
                     }
                 }
 
+                if (vision_chunked) {
+                    vision_rows_consumed += countSpliceRows(
+                        ids_i32[pos..end],
+                        xfm.config.image_token_id,
+                        xfm.config.audio_token_id,
+                    );
+                }
                 pos = end;
                 n_chunks += 1;
                 // Publish progress once per chunk — same cadence discipline as
@@ -1931,6 +1980,15 @@ pub const Generator = struct {
                     }
                 }
             }
+        }
+
+        // Chunked vision: the final-span forward continues the row scatter
+        // where the chunk loop left it (an image ending in the final span
+        // otherwise re-splices from row 0). One-shot engagement line — the
+        // silent-no-op class; tests grep for it per arm.
+        if (vision_chunked) {
+            ctx.vision_splice_offset = vision_rows_consumed;
+            if (n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
         }
 
         // Process the final span — the last token, plus (under SSM
@@ -10897,4 +10955,24 @@ test "prefill chunk loop yields to the interleave hook between chunks, never aft
     // The call sits INSIDE the guard (same statement block, before the loop
     // re-tests `pos`), not somewhere later in the file.
     try std.testing.expect(call_at - guard_at < 200);
+}
+
+test "countSpliceRows counts image and audio placeholders, audio only when declared" {
+    const ids = [_]i32{ 7, 99, 99, 8, 88, 9 };
+    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
+    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88));
+    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88));
+}
+
+test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
+    // Source scan: the chunk-size pick keys on the kill switch (not bare
+    // has_vision), the chunk loop and the final-span forward both set
+    // ctx.vision_splice_offset, and the loop advances the consumed-row count.
+    const src = @embedFile("generate.zig");
+    const marker = "const default_chunk = if (has_vision and !vision" ++ "_chunked) loop_end else PREFILL_CHUNK;";
+    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
+    const set_off = "ctx.vision_splice" ++ "_offset = vision_rows_consumed;";
+    const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
+    try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
+    try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
 }

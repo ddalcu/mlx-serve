@@ -9,6 +9,7 @@
 - Draft heads that ship in bf16 (MTPLX packs, the stock Qwen MTP release) are now quantized to 4-bit at load. The head only proposes tokens and verification corrects them, so output quality is decided by the main model either way: measured +10% decode at equal acceptance on Qwen3.8-27B.
 - The speculative depth planner was re-measured against the faster verify steps: it now drafts one position deeper on predictable content, +3% decode on Qwen-class models with the draft head.
 - Warm requests kept the fast prefill but lost the draft head: reusing a cached prefix left the head's history empty, so follow-up turns decoded at almost half speed (38 vs 72 tok/s measured). The history is now saved and restored with the prefix, so warm turns decode as fast as cold ones.
+- Images stopped failing in long conversations (#197). A prompt with an image ran as one whole-prompt forward, so the memory check billed the full width and past roughly 40k tokens on Qwen 3.8 27B every screenshot got a 400 no flag could fix. Vision prompts now prefill in the same memory-bounded chunks text uses, with the image splice resuming exactly across chunk boundaries: a 51k-token conversation with a screenshot that used to be refused (82 GB billed against 67 available) now runs, output is unchanged on LFM2.5-VL, Gemma 4 and Muse, and time to first token stays within 3% either way. Cancelling mid-prefill now also stops a vision prompt within one chunk instead of running it to the end.
 
 ## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
 

@@ -3087,12 +3087,12 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
         (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    // A vision prefill forwards the WHOLE prompt in one pass (generate.zig:
-    // `if (has_vision) loop_end`) — image token positions have to be visible to
-    // the splice — so the chunk-bounded envelope is not what it allocates. The
-    // guard billed the chunk unconditionally, which was already an under-bill
-    // for a >8192-token vision prompt and becomes one at every size once the
-    // chunk is machine-sized down. `unchunked_prefill` bills the real width.
+    // A vision prefill chunks like text since issue #197 (the splice resumes
+    // its row index across chunks), so it bills the chunk-bounded envelope —
+    // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
+    // whole-prompt forward, in which case `unchunked_prefill` bills the real
+    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
+    // so the guard and the prefill loop cannot disagree.
     const chunk: u64 = if (unchunked_prefill)
         @max(seq, 1)
     else
@@ -5293,7 +5293,7 @@ fn handleChatCompletions(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, local_ve != null)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -10764,7 +10764,7 @@ fn handleAnthropicMessages(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm, local_ve != null)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -12311,7 +12311,7 @@ fn handleResponses(
     }
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, local_ve != null)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // ── sampling ──
@@ -17055,4 +17055,22 @@ test "the 413 names both counts it compared" {
     const msg = payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, msg, "98 MB") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "64 MB") != null);
+}
+
+test "the memory guard's vision billing routes through visionPrefillUnchunked at every call site" {
+    // The guard and the prefill loop must read the SAME predicate: a call
+    // site passing the raw has-vision bool bills full width for a prefill
+    // that chunks (over-refusal), and one passing false under the kill
+    // switch under-bills straight into an uncatchable Metal OOM.
+    const src = @embedFile("server.zig");
+    const raw = "lm, local_ve" ++ " != null))";
+    try std.testing.expect(std.mem.indexOf(u8, src, raw) == null);
+    const routed = "lm, generate_mod.visionPrefill" ++ "Unchunked(local_ve != null)))";
+    var n: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, routed)) |i| {
+        n += 1;
+        at = i + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
 }
