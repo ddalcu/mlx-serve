@@ -4434,7 +4434,7 @@ struct MarkdownText: View {
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
             case .table(let headers, let rows, let alignments):
-                MarkdownTableView(headers: headers, rows: rows, alignments: alignments)
+                result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
             }
         }
         return result
