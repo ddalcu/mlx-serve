@@ -420,6 +420,11 @@ pub const Slot = struct {
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
     prefill_ns: u64,
+    /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
+    /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
+    /// that received the tokens; subtracted from this slot's `prefill_ns` so
+    /// prefill_tps stays a statement about the prefill forward.
+    prefill_interleaved_ns: u64,
     /// Wall-clock nanoseconds the slot spent in decode ticks. For batched
     /// decode the full tick wall-clock is added to every participating slot,
     /// so this matches the per-slot throughput a user actually observes
@@ -571,6 +576,7 @@ pub const Slot = struct {
             .request_start_ts = std.Io.Timestamp.now(io, .boot),
             .first_token_ns = 0,
             .prefill_ns = 0,
+            .prefill_interleaved_ns = 0,
             .decode_ns = 0,
             .generated_ids = null,
             .was_pad_only = true,
@@ -3582,7 +3588,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         //    The inference thread is the sole mlx caller post-cleanup, so
         //    no per-tick stream rebind / mutex coexistence is needed.
         if (n_prefill > 0) {
-            for (to_prefill[0..n_prefill]) |slot| {
+            for (to_prefill[0..n_prefill], 0..) |slot, pi| {
+                // Between the slots of one admitted batch, tick the streams
+                // that just started decoding — a single-chunk prefill exposes
+                // no chunk-boundary yield, so without this every slot's first
+                // token waits for the LAST slot's prefill (the TTFT
+                // staircase collapse).
+                if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
                 if (slot.cancelled.load(.acquire)) {
                     // finishSlot (not raw markFinished) so the metrics sink
                     // counts the cancellation; safe pre-prefill — commit
@@ -3604,7 +3616,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     slot.markError(@errorName(err));
                     continue;
                 };
-                slot.prefill_ns = prefill_sw.read();
+                slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
                 // here rather than derived by subtraction in finishSlot, so a
@@ -4533,6 +4545,61 @@ fn dflashGateMinimum(block_size: u32, enable_thinking: bool) f32 {
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
 /// slot. After return, the slot is ready for decode ticks.
+/// Kill switch for prefill-side interleaving (MLX_SERVE_PREFILL_INTERLEAVE=0
+/// restores whole-prefill-then-decode scheduling). Default ON: the hook
+/// no-ops when nothing is decoding, so an idle or single-stream server never
+/// pays for it.
+var prefill_interleave_cached: ?bool = null;
+pub fn prefillInterleaveEnabled() bool {
+    if (prefill_interleave_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_INTERLEAVE");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    prefill_interleave_cached = on;
+    return on;
+}
+
+const InterleaveCtx = struct {
+    sch: *Scheduler,
+    decode_ns: u64 = 0,
+    ticks: u32 = 0,
+};
+
+fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
+    const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    if (ic.ticks == 0) {
+        log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
+    }
+    ic.ticks += 1;
+    ic.decode_ns +|= interleaveDecodeTick(ic.sch);
+}
+
+/// One decode tick for the streams currently decoding, run from INSIDE a
+/// prefill (between chunks, and between the slots of one admitted batch).
+/// Returns the tick's wall-clock ns (0 when no stream is active). The
+/// prefilling slot is not in `decoding` yet, so the tick only advances OTHER
+/// requests' Generators — same-thread MLX, no reentrancy into this prefill.
+fn interleaveDecodeTick(sch: *Scheduler) u64 {
+    var buf: [32]*Slot = undefined;
+    var n: usize = 0;
+    sch.queue_mu.lockUncancelable(sch.io);
+    for (sch.decoding.items) |s| {
+        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+        if (n >= buf.len) break;
+        buf[n] = s;
+        n += 1;
+    }
+    sch.queue_mu.unlock(sch.io);
+    if (n == 0) return 0;
+    var sw = io_util.Stopwatch.init(sch.io);
+    runDecodeTick(sch, buf[0..n]) catch |err| {
+        log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
+        for (buf[0..n]) |s| s.markError(@errorName(err));
+    };
+    const tick_ns = sw.read();
+    for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+    return tick_ns;
+}
+
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
@@ -4717,6 +4784,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
     const cp_max: u32 = slot.model.ssm_checkpoint_max;
 
+    // Chunk-boundary decode yields: the hook advances already-decoding
+    // streams between this prefill's chunks. Ticks hosted here are billed
+    // out of prefill_ns below (the decoding slots got the time).
+    var interleave_ctx = InterleaveCtx{ .sch = sch };
+
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -4766,6 +4838,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // chunks so a ghost 40K prefill stops within one chunk.
             .cancel_flag = &slot.cancelled,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            .interleave_hook = if (prefillInterleaveEnabled())
+                .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
+            else
+                null,
             // Init's argmax-only gate must see logprobs BEFORE the split-
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
@@ -4774,6 +4850,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     );
     dflash_restored = null; // ownership transferred to the Generator
     mtp_restored = null; // ownership transferred to the Generator
+    slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
 
@@ -5380,6 +5457,18 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 }
 
 const testing = std.testing;
+
+test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
+    const src = @embedFile("scheduler.zig");
+    // The hook is wired at the ONE Generator construction site, env-gated.
+    const wire = ".interleave" ++ "_hook = if (prefillInterleaveEnabled())";
+    try testing.expect(std.mem.indexOf(u8, src, wire) != null);
+    // Interleaved decode time is charged to the DECODING slots (they got the
+    // tokens), so the prefilling slot's prefill_ns must exclude it or
+    // prefill_tps under-reports on every interleaved prefill.
+    const bill = "slot.prefill_ns = prefill_sw.read() -| slot.prefill_" ++ "interleaved_ns;";
+    try testing.expect(std.mem.indexOf(u8, src, bill) != null);
+}
 
 test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
     {

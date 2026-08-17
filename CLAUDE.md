@@ -99,6 +99,7 @@ Key hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-fil
 - Minimal DRY Zig; tests at the bottom of each source file; shell integration tests in `tests/`.
 - Inference thread is the SOLE mlx caller (even array frees) — media gen posts to `gen_queue`, never a gpu mutex. A long gen blocks chat decode (accepted; single GPU).
 - Concurrent requests batch-decode on pure-attention archs; `--max-concurrent` sizes the submit queue, not a decode gate. Slots entering a batch mid-generation drain lazy pipeline state first.
+- A cold prefill YIELDS to decode ticks at chunk boundaries and between admitted slots (`scheduler.interleaveDecodeTick`), so concurrent streams stall at most one chunk-forward instead of the whole prefill; greedy output is byte-identical, idle/single-stream cost is zero, `MLX_SERVE_PREFILL_INTERLEAVE=0` restores whole-prefill scheduling. Guard: `tests/test_prefill_interleave.sh`.
 - KV reuse via prompt-prefix matching; invalidated after tool calls + pad-only gens; hot cache spills to SSD tier; RAM invalidation propagates to disk.
 - Chat templates live in model dirs; Jinja renders with fallback formatting.
 
