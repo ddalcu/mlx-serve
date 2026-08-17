@@ -1,7 +1,8 @@
 import XCTest
 @testable import MLXCore
 
-/// The launch gate: what auto-start actually starts.
+/// The launch gate: what auto-start actually starts, and which model — if any —
+/// comes up with it.
 ///
 /// The bug this pins (issue #214): "Auto-start on launch" passed `--model`,
 /// which the server treats as an eager, blocking load, so one checkbox labelled
@@ -24,7 +25,8 @@ final class StartupModelChoiceTests: XCTestCase {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: false,
                                       loadModelAtStart: true,
-                                      choice: "/models/qwen",
+                                      mode: .pinned,
+                                      pinnedPath: "/models/qwen",
                                       lastUsed: "/models/qwen",
                                       installedPaths: installed),
             .doNothing)
@@ -36,43 +38,93 @@ final class StartupModelChoiceTests: XCTestCase {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: false,
-                                      choice: "/models/qwen",
+                                      mode: .pinned,
+                                      pinnedPath: "/models/qwen",
                                       lastUsed: "/models/gemma",
                                       installedPaths: installed),
             .headless)
     }
 
-    func testLoadAtStartWithAnExplicitPickLoadsThatModel() {
+    func testPinnedModeLoadsThePinnedModel() {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: "/models/gemma",
+                                      mode: .pinned,
+                                      pinnedPath: "/models/gemma",
                                       lastUsed: "/models/qwen",
                                       installedPaths: installed),
             .load(path: "/models/gemma"))
     }
 
-    // MARK: - "Last model used"
+    /// A pin is a pin: what has been used since must not move it.
+    func testPinnedModeIgnoresTheLastUsedModel() {
+        XCTAssertEqual(
+            StartupModelChoice.resolved(mode: .pinned,
+                                        pinnedPath: "/models/gemma",
+                                        lastUsed: "/models/qwen",
+                                        installedPaths: installed),
+            "/models/gemma")
+    }
 
-    /// Resolved at START time, not when the setting was saved — the saved value
-    /// is the sentinel, so a different last-used model gives a different answer
-    /// from the same stored preference.
-    func testLastUsedResolvesAtStartTime() {
+    /// "Always this model" selected before anything was pinned.
+    func testPinnedModeWithNothingPinnedResolvesToNothing() {
+        XCTAssertNil(
+            StartupModelChoice.resolved(mode: .pinned,
+                                        pinnedPath: "",
+                                        lastUsed: "/models/qwen",
+                                        installedPaths: installed))
+    }
+
+    // MARK: - "Last model used" is a MODE, not a magic path
+
+    /// Resolved at START time, so the same stored preference gives a different
+    /// answer as the last-used model moves. Nothing about the stored value
+    /// changes between these two cases.
+    func testLastUsedModeResolvesAtStartTime() {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: StartupModelChoice.lastUsedTag,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
                                       lastUsed: "/models/qwen",
                                       installedPaths: installed),
             .load(path: "/models/qwen"))
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: StartupModelChoice.lastUsedTag,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
                                       lastUsed: "/models/gemma",
                                       installedPaths: installed),
             .load(path: "/models/gemma"))
     }
+
+    /// The mode wins over a pin that happens to still be stored — the pinned
+    /// path is inert data under `.lastUsed`, not a fallback.
+    func testLastUsedModeIgnoresAStoredPin() {
+        XCTAssertEqual(
+            StartupModelChoice.resolved(mode: .lastUsed,
+                                        pinnedPath: "/models/gemma",
+                                        lastUsed: "/models/qwen",
+                                        installedPaths: installed),
+            "/models/qwen")
+    }
+
+    /// No mode is spelled as a path, so no path can be mistaken for a mode.
+    /// A raw value that collides with an absolute path would put the sentinel
+    /// straight back.
+    func testNoModeIsSpelledAsAPath() {
+        for mode in StartupModelChoice.Mode.allCases {
+            XCTAssertFalse(mode.rawValue.hasPrefix("/"), "\(mode) reads as a path")
+            XCTAssertFalse(mode.rawValue.isEmpty, "\(mode) reads as an absent value")
+        }
+    }
+
+    func testTheDefaultModeIsLastUsed() {
+        XCTAssertEqual(StartupModelChoice.Mode.default, .lastUsed)
+    }
+
+    // MARK: - Nothing to load
 
     /// Fresh install. Not an error, and emphatically not "pick one for them" —
     /// a startup that loads a model the user never chose is worse than one that
@@ -81,7 +133,8 @@ final class StartupModelChoiceTests: XCTestCase {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: StartupModelChoice.lastUsedTag,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
                                       lastUsed: nil,
                                       installedPaths: installed),
             .headless)
@@ -93,17 +146,19 @@ final class StartupModelChoiceTests: XCTestCase {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: StartupModelChoice.lastUsedTag,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
                                       lastUsed: "/models/deleted",
                                       installedPaths: installed),
             .headless)
     }
 
-    func testUninstalledExplicitPickStartsHeadless() {
+    func testUninstalledPinStartsHeadless() {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: "/models/deleted",
+                                      mode: .pinned,
+                                      pinnedPath: "/models/deleted",
                                       lastUsed: "/models/qwen",
                                       installedPaths: installed),
             .headless)
@@ -114,7 +169,8 @@ final class StartupModelChoiceTests: XCTestCase {
         XCTAssertEqual(
             StartupModelChoice.launch(autoStart: true,
                                       loadModelAtStart: true,
-                                      choice: StartupModelChoice.lastUsedTag,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
                                       lastUsed: "/models/qwen",
                                       installedPaths: []),
             .headless)
