@@ -4135,7 +4135,7 @@ struct MarkdownText: View {
         // everything between fences stays in ONE text view per run so
         // drag-selection still crosses paragraphs, lists and tables. See
         // `MarkdownSegmenter` for why the split is at fences, not at blocks.
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .prose(let text):
