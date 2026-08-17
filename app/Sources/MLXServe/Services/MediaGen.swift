@@ -543,6 +543,37 @@ struct VideoModelPreset: Identifiable, Hashable {
         qualityProfiles[q] ?? qualityProfiles[defaultQuality]!
     }
 
+    /// The grid this backend samples on. Unlike the image side this is a
+    /// FUNCTION, not a property, because LTX's alignment depends on the
+    /// PIPELINE: `handleVideo` refuses a non-/32 canvas outright ("width and
+    /// height must be multiples of 32"), and a two-stage pipeline denoises at
+    /// half the canvas so it demands /64 as its own named 400. Same model, two
+    /// grids — a constant could only ever be right for one of them.
+    ///
+    /// Video is also where this matters most: the image backends silently
+    /// rewrite an off-grid size, so a bad guess costs a slightly different
+    /// picture. Here it costs the whole generation.
+    ///
+    /// The ceiling is the largest canvas the preset itself ships; the real
+    /// bound past that is memory and time, which `H3Plan`/`H3TimeEstimate` and
+    /// the frame ladder already model and surface.
+    func resolutionGrid(twoStage: Bool) -> ResolutionGrid {
+        let maxDim = resolutions.map { max($0.width, $0.height) }.max() ?? 1024
+        switch backend {
+        // H3 has no two-stage pipeline at all, and its own fastest canvases
+        // (544, 672, 960) are /32 and not /64 — applying LTX's two-stage grid
+        // here would refuse the model's own shipped rows.
+        case .minimaxH3:
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: maxDim)
+        case .ltx:
+            return ResolutionGrid(alignment: twoStage ? 64 : 32, minDim: 256, maxDim: maxDim)
+        }
+    }
+
+    /// The picker's rows plus the Custom… sentinel, which goes last so the
+    /// tuned canvases stay the obvious pick.
+    func resolutionOptions() -> [ResolutionOption] { resolutions + [.custom] }
+
     /// Which prompt FORMAT this model expects — the one chokepoint the pane's
     /// examples, placeholder, hint and tips link all read. Derived from the
     /// capabilities the preset already declares, never sniffed from the id.

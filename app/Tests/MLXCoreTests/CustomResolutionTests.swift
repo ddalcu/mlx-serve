@@ -145,6 +145,98 @@ final class CustomResolutionTests: XCTestCase {
         }
     }
 
+    // MARK: - Video grids
+
+    /// Video is where the grid EARNS its keep: the image backends silently
+    /// rewrite an off-grid size, but `handleVideo` returns a hard 400
+    /// ("width and height must be multiples of 32"), so an unvalidated size is
+    /// a failed generation rather than a slightly different picture.
+    func testVideoGridsMatchTheServersOwnRefusals() {
+        // H3 has no two-stage pipeline; /32 always.
+        XCTAssertEqual(VideoModelPreset.minimaxH3.resolutionGrid(twoStage: false).alignment, 32)
+        XCTAssertEqual(VideoModelPreset.minimaxH3.resolutionGrid(twoStage: true).alignment, 32)
+        // LTX one-stage is /32…
+        XCTAssertEqual(VideoModelPreset.ltx25Q8.resolutionGrid(twoStage: false).alignment, 32)
+        // …and two-stage denoises at HALF the canvas, which is why the server
+        // demands /64 there ("two-stage pipelines need width/height divisible
+        // by 64"). Same model, different grid — so the grid cannot be a
+        // constant on the preset.
+        XCTAssertEqual(VideoModelPreset.ltx25Q8.resolutionGrid(twoStage: true).alignment, 64)
+    }
+
+    /// Every shipped video row must clear its own model's ONE-STAGE grid, or
+    /// the menu offers a size the server refuses outright.
+    func testEveryVideoPresetRowIsOnItsOwnGrid() {
+        for p in VideoModelPreset.all {
+            let g = p.resolutionGrid(twoStage: false)
+            for r in p.resolutions {
+                XCTAssertEqual(g.resolve(width: r.width, height: r.height),
+                               .ok(width: r.width, height: r.height),
+                               "\(p.id) row \(r.id) is off its own grid")
+            }
+        }
+    }
+
+    /// LTX's shipped rows are all /64 on purpose — every one of them has to
+    /// survive being picked with a two-stage tier selected. H3's do not, which
+    /// is exactly why the two backends cannot share one alignment.
+    func testEveryLtxRowAlsoSurvivesTwoStageWhileH3RowsNeedNot() {
+        for p in VideoModelPreset.all where p.backend != .minimaxH3 {
+            let g = p.resolutionGrid(twoStage: true)
+            for r in p.resolutions {
+                XCTAssertEqual(g.resolve(width: r.width, height: r.height),
+                               .ok(width: r.width, height: r.height),
+                               "\(p.id) row \(r.id) would be refused by a two-stage pipeline")
+            }
+        }
+        // Documents the asymmetry rather than asserting H3 is broken: 544 and
+        // 672 are /32 and not /64, so applying LTX's two-stage grid to H3 would
+        // refuse the model's own fastest canvas.
+        let h3 = VideoModelPreset.minimaxH3
+        let offBy64 = h3.resolutions.filter { $0.width % 64 != 0 || $0.height % 64 != 0 }
+        XCTAssertFalse(offBy64.isEmpty, "H3 rows are all /64 — the per-pipeline grid may be unnecessary")
+    }
+
+    /// The same off-grid size is corrected differently depending on the
+    /// pipeline, and the note names the step that actually applied.
+    func testTwoStageCorrectsToACoarserGridThanOneStage() {
+        let p = VideoModelPreset.ltx25Q8
+        guard case let .corrected(w1, _, _) = p.resolutionGrid(twoStage: false)
+            .resolve(width: 700, height: 448) else { return XCTFail("expected a correction") }
+        XCTAssertEqual(w1, 704) // /32
+        guard case let .corrected(w2, _, note) = p.resolutionGrid(twoStage: true)
+            .resolve(width: 700, height: 448) else { return XCTFail("expected a correction") }
+        XCTAssertEqual(w2, 704) // /64 too, as it happens
+        XCTAssertTrue(note.contains("64"), "the note must name the step in force: \(note)")
+        // A size that is fine one-stage and NOT fine two-stage is the case the
+        // whole per-pipeline split exists for.
+        XCTAssertEqual(p.resolutionGrid(twoStage: false).resolve(width: 736, height: 448),
+                       .ok(width: 736, height: 448))
+        guard case .corrected = p.resolutionGrid(twoStage: true)
+            .resolve(width: 736, height: 448) else {
+            return XCTFail("736 is /32 but not /64 — two-stage must correct it")
+        }
+    }
+
+    func testVideoCustomIsOfferedLastForEveryVideoModel() {
+        for p in VideoModelPreset.all {
+            XCTAssertTrue(p.resolutionOptions().last?.isCustom == true, "\(p.id) does not end with Custom")
+        }
+    }
+
+    /// Same sentinel hazard as the image path: the chat's `generate_video`
+    /// passes the saved bucket straight through when the model names no size.
+    func testVideoCustomSentinelResolvesForNonUIConsumers() {
+        var s = VideoGenSettings()
+        s.resolutionId = ResolutionOption.custom.id
+        s.customWidth = 704
+        s.customHeight = 448
+        let c = s.concreteResolution(for: .ltx25Q8)
+        XCTAssertFalse(c.isCustom)
+        XCTAssertEqual(c.width, 704)
+        XCTAssertEqual(c.height, 448)
+    }
+
     // MARK: - The sentinel must never reach a consumer that wants a SIZE
 
     /// `ResolutionOption.custom` carries -1 × -1 by design — it is a menu row,

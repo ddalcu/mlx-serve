@@ -30,6 +30,9 @@ struct VideoGenView: View {
     @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     @State private var resolution: ResolutionOption = VideoModelPreset.ltx23Q4.defaultResolution
+    // Held as text so a half-typed size is allowed while editing.
+    @State private var customWidthText: String = "704"
+    @State private var customHeightText: String = "448"
     @State private var numFrames: Int = 97
     @State private var fps: Int = 24
     @State private var mode: VideoPipelineMode = .oneStage
@@ -103,6 +106,8 @@ struct VideoGenView: View {
         }
         // Persist the fields not owned by the model/quality/resolution sections.
         .onChange(of: numFrames) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
+        .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
         .onChange(of: fps) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: mode) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
@@ -319,22 +324,70 @@ struct VideoGenView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
-                ForEach(model.resolutions) { r in
+                ForEach(model.resolutionOptions()) { r in
                     Text(r.label).tag(r)
                 }
             }
             .labelsHidden()
             .pickerStyle(.menu)
             .onChange(of: resolution) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
+            if resolution.isCustom { customResolutionFields }
             // A two-stage tier denoises at HALF this canvas and upscales, so on
             // a small pick "Quality" is softer than the one-stage tiers above
             // it in the same menu. Only shown when that tier is selected — the
             // note is about the combination, not the resolution.
             if model.settings(quality).mode != .oneStage,
-               let note = model.twoStageCanvasNote(width: resolution.width, height: resolution.height) {
+               let note = model.twoStageCanvasNote(width: effectiveSize.width, height: effectiveSize.height) {
                 Text(note).font(.caption2).foregroundStyle(.orange)
             }
         }
+    }
+
+    /// Width/height for the Custom… row. The server REFUSES an off-grid video
+    /// canvas outright (unlike the image path, which quietly rewrites it), so
+    /// this is the difference between a hint and a failed generation.
+    @ViewBuilder
+    private var customResolutionFields: some View {
+        let verdict = customResolutionVerdict
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                labelledSizeField("Width", text: $customWidthText)
+                Text("×").foregroundStyle(.secondary)
+                labelledSizeField("Height", text: $customHeightText)
+            }
+            if let hint = verdict.hint {
+                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
+            }
+        }
+    }
+
+    private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            TextField("", text: text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
+        }
+    }
+
+    /// A two-stage tier denoises at HALF the canvas, so the server tightens its
+    /// refusal to /64 there. The grid follows the SELECTED tier, or the hint
+    /// would name a step the request will not be judged by.
+    private var customResolutionVerdict: CustomResolution {
+        model.resolutionGrid(twoStage: model.settings(quality).mode != .oneStage)
+            .resolve(width: Int(customWidthText) ?? 0, height: Int(customHeightText) ?? 0)
+    }
+
+    private var customSizeValid: Bool {
+        !resolution.isCustom || customResolutionVerdict.isValid
+    }
+
+    /// The canvas the request should carry.
+    private var effectiveSize: (width: Int, height: Int) {
+        guard resolution.isCustom else { return (resolution.width, resolution.height) }
+        return customResolutionVerdict.size ?? (resolution.width, resolution.height)
     }
 
     private var framesSection: some View {
@@ -382,7 +435,7 @@ struct VideoGenView: View {
     /// pick longer than RAM suggests — we just hint at it in the warning
     /// below the dropdown rather than removing the option.
     private var availableFrameOptions: [Int] {
-        model.frameOptions(width: resolution.width, height: resolution.height)
+        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
     }
 
     /// Soft hint when the chosen length looks too aggressive for the Mac's
@@ -402,8 +455,8 @@ struct VideoGenView: View {
         let total = RAMChecker.totalGB
         let cap = RAMChecker.safeFrameCap(
             model: model,
-            width: resolution.width,
-            height: resolution.height,
+            width: effectiveSize.width,
+            height: effectiveSize.height,
             available: total,
             fast: effectiveFast
         )
@@ -415,17 +468,17 @@ struct VideoGenView: View {
         // the cap: the cap has a floor, so "cap == 124" means both "124 frames
         // fits" and "nothing fits", and a Mac too small to load the pack saw
         // no warning at all at exactly 124 frames.
-        guard !H3Plan.fits(model: model, width: resolution.width, height: resolution.height,
+        guard !H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
                            frames: numFrames, fast: effectiveFast, turbo: turboEngaged, availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
-        let need = Double(H3Plan.peakBytes(model: model, width: resolution.width, height: resolution.height,
+        let need = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                            frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
-        let floorFits = H3Plan.fits(model: model, width: resolution.width, height: resolution.height,
+        let floorFits = H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                     frames: cap, fast: effectiveFast, turbo: turboEngaged, availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
         if effectiveFast {
-            let slow = Double(H3Plan.peakBytes(model: model, width: resolution.width, height: resolution.height,
+            let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                frames: numFrames, fast: false)) / gib
             if slow < need - 2 {
                 out += String(format: ", or turn on Max quality to drop the step cache (%.0f GB, but several times slower)", slow)
@@ -438,7 +491,7 @@ struct VideoGenView: View {
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         return H3TimeEstimate.describeBest(
-            model: model, width: resolution.width, height: resolution.height,
+            model: model, width: effectiveSize.width, height: effectiveSize.height,
             frames: numFrames, steps: steps, fast: effectiveFast
         )
     }
@@ -1136,7 +1189,7 @@ struct VideoGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !customSizeValid)
                 }
             }
             if !service.isRunning, let est = timeEstimate {
@@ -1235,6 +1288,8 @@ struct VideoGenView: View {
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
+        customWidthText = String(s.customWidth)
+        customHeightText = String(s.customHeight)
         numFrames = s.numFrames
         fps = s.fps
         mode = s.mode
@@ -1262,6 +1317,8 @@ struct VideoGenView: View {
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.quality = quality
         s.resolutionId = resolution.id
+        s.customWidth = Int(customWidthText) ?? VideoGenSettings().customWidth
+        s.customHeight = Int(customHeightText) ?? VideoGenSettings().customHeight
         s.numFrames = numFrames
         s.fps = fps
         s.mode = mode
@@ -1348,8 +1405,8 @@ struct VideoGenView: View {
             model: model,
             prompt: prompt,
             seed: seed,
-            width: resolution.width,
-            height: resolution.height,
+            width: effectiveSize.width,
+            height: effectiveSize.height,
             numFrames: numFrames,
             fps: fps,
             mode: mode,
