@@ -408,6 +408,10 @@ struct StatusMenuView: View {
             Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+                // Says what this checkbox does NOW: it starts a server, not a
+                // multi-gigabyte load. Whether a model comes with it moved to
+                // its own setting, so the tooltip names where it went.
+                .help("Start the server when the app launches. It comes up with no model resident — models load on demand. To load one at start instead, see Settings ▸ Server.")
             Spacer()
             // Which embedded engine the selected model routes to (MLX
             // safetensors, llama.cpp GGUF, or ds4 GGUF).
