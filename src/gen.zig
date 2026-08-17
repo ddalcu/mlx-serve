@@ -18,6 +18,8 @@ const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
+const sdxl_mod = @import("sdxl.zig");
+const sdxl_pipeline = @import("sdxl_pipeline.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -93,13 +95,14 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "sdxl",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
+    if (std.mem.eql(u8, model_type, "sdxl")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -168,12 +171,31 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
     // the "mage_flow" marker so routing + the backend dispatch light up.
     if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    // SDXL is the same shape — a diffusers repo whose identity lives only in
+    // model_index.json. Same predicate discovery uses (`sdxl.indexDeclaresSdxl`),
+    // so `list` and the loader cannot disagree about whether a dir is a model.
+    if (isSdxlRepo(io, allocator, model_dir)) return allocator.dupe(u8, "sdxl") catch null;
     // Same for an mflux FLUX.2 conversion with no config.json at all (the only
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
     // the loader end up disagreeing about whether a dir is a model.
     if (isMfluxFlux2Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux2-klein") catch null;
     return null;
+}
+
+/// True when `model_dir/model_index.json` declares an SDXL pipeline. Shares
+/// `sdxl.indexDeclaresSdxl` with `model_discovery.peekSdxlIndex` — documented
+/// duplication of the CALL, never of the rule.
+fn isSdxlRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+    defer allocator.free(content);
+    return sdxl_mod.indexDeclaresSdxl(allocator, content);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -443,6 +465,7 @@ const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
+    sdxl: *sdxl_pipeline.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -493,7 +516,20 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
+    /// Classifier-free guidance scale. Only SDXL uses it: the distilled flow
+    /// backends here run guidance-free, which is why this defaults to null
+    /// ("the backend's own default") rather than to a number that would be
+    /// meaningless on three of the four arms.
+    guidance: ?f32 = null,
+    /// Negative prompt. ABSENT (null) and EMPTY ("") are different requests on
+    /// SDXL — absent zeroes the unconditional branch, empty encodes the empty
+    /// string. See `sdxl_pipeline.GenOpts.negative_prompt`.
+    negative_prompt: ?[]const u8 = null,
 };
+
+/// SDXL base's documented guidance default, and what diffusers ships for this
+/// checkpoint.
+pub const SDXL_DEFAULT_GUIDANCE: f32 = 5.0;
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
 /// internals are swappable per architecture (`ImageBackend`).
@@ -521,6 +557,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "sdxl")) {
+                self.backend = .{ .sdxl = try sdxl_pipeline.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -532,6 +572,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
+            .sdxl => |x| x.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -541,6 +582,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.s,
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
+            .sdxl => |x| x.s,
         };
     }
 
@@ -550,6 +592,7 @@ pub const ImageEngine = struct {
             .flux => 3,
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
+            .sdxl => 0, // SDXL taps no intermediate encoder layers
         };
     }
 
@@ -559,6 +602,9 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
+            // Only the DECODER half of SDXL's VAE is bound; img2img needs the
+            // encoder, which is in the same file and simply not read yet.
+            .sdxl => false,
         };
     }
 
@@ -569,6 +615,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
+            .sdxl => false, // base SDXL has no instruction-edit training
         };
     }
 
@@ -604,6 +651,7 @@ pub const ImageEngine = struct {
                 .flux => .flux2,
                 .krea => .krea2,
                 .mage_flow => .generic,
+                .sdxl => .generic,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -615,6 +663,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
+            .sdxl => 0, // SDXL LoRA is a separate key grammar; not wired yet
         };
         if (matched == 0) {
             stack.deinit();
@@ -630,6 +679,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
+            .sdxl => {},
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -663,6 +713,18 @@ pub const ImageEngine = struct {
                 m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
             else
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            .sdxl => |x| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                if (opts.init_image != null) break :blk error.Img2ImgUnsupported;
+                break :blk x.generate(prompt, .{
+                    .width = width,
+                    .height = height,
+                    .steps = steps,
+                    .guidance = opts.guidance orelse SDXL_DEFAULT_GUIDANCE,
+                    .seed = seed,
+                    .negative_prompt = opts.negative_prompt,
+                }, progress);
+            },
         };
     }
 
@@ -682,6 +744,10 @@ pub const ImageEngine = struct {
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // SDXL's VAE downsamples by 8, but the model is TRAINED on a /64
+            // bucket list and drifts off-distribution between them, so the snap
+            // is to 64 rather than to the 8 the latent arithmetic would allow.
+            .sdxl => .{ .w = clampSdxlDim(req_w), .h = clampSdxlDim(req_h) },
         };
     }
 
@@ -693,6 +759,7 @@ pub const ImageEngine = struct {
         return switch (kind) {
             .flux => 1536,
             .krea, .mage_flow => 2048,
+            .sdxl => 2048,
         };
     }
 
@@ -708,6 +775,20 @@ pub fn clampFluxDim(v: u32) u32 {
     if (v == 0) return 1024;
     const rounded = ((v + 31) / 32) * 32;
     return std.math.clamp(rounded, 256, 1536);
+}
+
+/// Round a requested dimension to a multiple of 64 in [512, 2048], defaulting
+/// to SDXL's native 1024.
+///
+/// The VAE only needs a multiple of 8, and `sdxl.latentDims` enforces exactly
+/// that. 64 is the TRAINING bucket granularity: SDXL's micro-conditioning is
+/// fit on a fixed list of /64 resolutions, and sizes between them are
+/// off-distribution — they generate, they just look worse. The floor is 512
+/// rather than 256 for the same reason.
+pub fn clampSdxlDim(v: u32) u32 {
+    if (v == 0) return 1024;
+    const rounded = ((v + 63) / 64) * 64;
+    return std.math.clamp(rounded, 512, 2048);
 }
 
 /// Round a requested dimension to a multiple of 16 in [256, 2048] (Krea's

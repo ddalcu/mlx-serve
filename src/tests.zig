@@ -31,6 +31,11 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("sdxl.zig");
     _ = @import("sdxl_clip.zig");
+    _ = @import("sdxl_nn.zig");
+    _ = @import("sdxl_unet.zig");
+    _ = @import("sdxl_vae.zig");
+    _ = @import("sdxl_tokenizer.zig");
+    _ = @import("sdxl_pipeline.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");

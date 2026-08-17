@@ -285,7 +285,7 @@ pub const TextTower = struct {
             var attn = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn);
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
-                &attn, qh, kh, vh, scale, "causal", mlx.mlx_array_new(), mlx.mlx_array_new(), s,
+                &attn, qh, kh, vh, scale, "causal", mlx.mlx_array_new(), mlx.mlx_array_new(), false, s,
             ));
 
             // back to [1, seq, hidden]
@@ -356,6 +356,19 @@ pub const TextTower = struct {
 /// head_dim of 64 and a vocab of 49408, so a swapped config would load cleanly
 /// and produce garbage. `sdxl.CLIP_L_CONFIG` / `CLIP_BIG_G_CONFIG` are the two
 /// legitimate values.
+/// The width the towers are served at. The checkpoint ships fp16 and that is
+/// the default, but the dtype is a PARAMETER because it is measurable at the
+/// pipeline level: the towers' ~0.3% fp16 RMS error is multiplied by the
+/// guidance scale and compounded over every denoising step, so widening them
+/// is how an end-to-end parity gap gets attributed rather than guessed at.
+pub const DEFAULT_DTYPE: mlx.mlx_dtype = .float16;
+
+/// `SDXL_CLIP_F32=1` widens the text towers. Shared by the pipeline and the
+/// parity tests so both arms of an attribution run agree on what they mean.
+pub fn towerDtype() mlx.mlx_dtype {
+    return if (std.c.getenv("SDXL_CLIP_F32") != null) .float32 else DEFAULT_DTYPE;
+}
+
 pub fn loadTower(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -363,6 +376,7 @@ pub fn loadTower(
     model_dir: []const u8,
     sub: []const u8,
     cfg: sdxl.ClipTextConfig,
+    dtype: mlx.mlx_dtype,
 ) !TextTower {
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, sub });
     defer allocator.free(dir);
@@ -374,32 +388,35 @@ pub fn loadTower(
     tower.allocator = allocator;
     tower.s = s;
 
-    tower.token_embed = try dup(&w, "text_model.embeddings.token_embedding.weight");
-    tower.pos_embed = try dup(&w, "text_model.embeddings.position_embedding.weight");
-    tower.final_ln_w = try dup(&w, "text_model.final_layer_norm.weight");
-    tower.final_ln_b = try dup(&w, "text_model.final_layer_norm.bias");
+    tower.token_embed = try dup(&w, "text_model.embeddings.token_embedding.weight", dtype, s);
+    tower.pos_embed = try dup(&w, "text_model.embeddings.position_embedding.weight", dtype, s);
+    tower.final_ln_w = try dup(&w, "text_model.final_layer_norm.weight", dtype, s);
+    tower.final_ln_b = try dup(&w, "text_model.final_layer_norm.bias", dtype, s);
 
     // Present in bigG, absent in CLIP-L — an optional, never a required get.
     tower.text_projection = if (w.get(sdxl.CLIP_PROJECTION_TENSOR)) |proj_src| blk: {
+        var cast = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&cast, proj_src, dtype, s));
+        defer _ = mlx.mlx_array_free(cast);
         var t = mlx.mlx_array_new();
         const axes = [_]c_int{ 1, 0 };
-        try mlx.check(mlx.mlx_transpose_axes(&t, proj_src, &axes, 2, s));
+        try mlx.check(mlx.mlx_transpose_axes(&t, cast, &axes, 2, s));
         break :blk t;
     } else null;
 
     tower.layers = try allocator.alloc(Layer, cfg.layers);
     errdefer allocator.free(tower.layers);
     for (tower.layers, 0..) |*layer, i| {
-        layer.ln1_w = try dupIdx(&w, allocator, i, "layer_norm1.weight");
-        layer.ln1_b = try dupIdx(&w, allocator, i, "layer_norm1.bias");
-        layer.ln2_w = try dupIdx(&w, allocator, i, "layer_norm2.weight");
-        layer.ln2_b = try dupIdx(&w, allocator, i, "layer_norm2.bias");
-        layer.q = try linearIdx(&w, allocator, s, i, "self_attn.q_proj");
-        layer.k = try linearIdx(&w, allocator, s, i, "self_attn.k_proj");
-        layer.v = try linearIdx(&w, allocator, s, i, "self_attn.v_proj");
-        layer.o = try linearIdx(&w, allocator, s, i, "self_attn.out_proj");
-        layer.fc1 = try linearIdx(&w, allocator, s, i, "mlp.fc1");
-        layer.fc2 = try linearIdx(&w, allocator, s, i, "mlp.fc2");
+        layer.ln1_w = try dupIdx(&w, allocator, i, "layer_norm1.weight", dtype, s);
+        layer.ln1_b = try dupIdx(&w, allocator, i, "layer_norm1.bias", dtype, s);
+        layer.ln2_w = try dupIdx(&w, allocator, i, "layer_norm2.weight", dtype, s);
+        layer.ln2_b = try dupIdx(&w, allocator, i, "layer_norm2.bias", dtype, s);
+        layer.q = try linearIdx(&w, allocator, s, i, "self_attn.q_proj", dtype);
+        layer.k = try linearIdx(&w, allocator, s, i, "self_attn.k_proj", dtype);
+        layer.v = try linearIdx(&w, allocator, s, i, "self_attn.v_proj", dtype);
+        layer.o = try linearIdx(&w, allocator, s, i, "self_attn.out_proj", dtype);
+        layer.fc1 = try linearIdx(&w, allocator, s, i, "mlp.fc1", dtype);
+        layer.fc2 = try linearIdx(&w, allocator, s, i, "mlp.fc2", dtype);
     }
 
     log.info("[sdxl] loaded {s}: hidden={d} layers={d} heads={d} act={s} projection={}\n", .{
@@ -408,35 +425,38 @@ pub fn loadTower(
     return tower;
 }
 
-fn dup(w: *Weights, name: []const u8) !mlx.mlx_array {
+fn dup(w: *Weights, name: []const u8, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     const src = w.get(name) orelse {
         log.err("[sdxl] missing weight {s}\n", .{name});
         return error.MissingWeight;
     };
     var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&o, src));
+    try mlx.check(mlx.mlx_astype(&o, src, dt, s));
     return o;
 }
 
-fn dupIdx(w: *Weights, a: std.mem.Allocator, i: usize, suffix: []const u8) !mlx.mlx_array {
+fn dupIdx(w: *Weights, a: std.mem.Allocator, i: usize, suffix: []const u8, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     const name = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}", .{ i, suffix });
     defer a.free(name);
-    return dup(w, name);
+    return dup(w, name, dt, s);
 }
 
 /// Weights are stored `[out, in]`; the forward wants `[in, out]`, so the
 /// transpose happens ONCE at load rather than per token.
-fn linearIdx(w: *Weights, a: std.mem.Allocator, s: S, i: usize, prefix: []const u8) !Linear {
+fn linearIdx(w: *Weights, a: std.mem.Allocator, s: S, i: usize, prefix: []const u8, dt: mlx.mlx_dtype) !Linear {
     const wname = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}.weight", .{ i, prefix });
     defer a.free(wname);
     const bname = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}.bias", .{ i, prefix });
     defer a.free(bname);
 
     const src = w.get(wname) orelse return error.MissingWeight;
+    var cast = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&cast, src, dt, s));
+    defer _ = mlx.mlx_array_free(cast);
     var w_t = mlx.mlx_array_new();
     const axes = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&w_t, src, &axes, 2, s));
-    return .{ .w_t = w_t, .b = try dup(w, bname) };
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, cast, &axes, 2, s));
+    return .{ .w_t = w_t, .b = try dup(w, bname, dt, s) };
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -475,7 +495,7 @@ test "sdxl clip forward: both towers load and produce the shapes SDXL consumes" 
     };
 
     for (towers) |t| {
-        var tower = loadTower(io, a, s, dir, t.sub, t.cfg) catch |e| {
+        var tower = loadTower(io, a, s, dir, t.sub, t.cfg, DEFAULT_DTYPE) catch |e| {
             log.err("[sdxl-test] {s} load failed: {}\n", .{ t.sub, e });
             return e;
         };
@@ -566,7 +586,7 @@ test "sdxl clip parity: both towers match transformers" {
     };
 
     for (towers) |t| {
-        var tower = try loadTower(io, a, s, dir, t.sub, t.cfg);
+        var tower = try loadTower(io, a, s, dir, t.sub, t.cfg, towerDtype());
         defer tower.deinit();
         var enc = try tower.encode(ids, eos_index);
         defer enc.deinit();

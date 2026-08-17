@@ -1691,3 +1691,127 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+---
+## SDXL: four components that are each individually right
+
+The SDXL port (`src/sdxl*.zig`, 2026-08-17) is the repo's first EPSILON-prediction
+diffusion backend and its first with real classifier-free guidance. Every trap
+below produces a RUNNING model and a plausible image, which is why each one is
+pinned against an executed diffusers reference rather than argued from the paper.
+
+### `attention_head_dim` is the head COUNT
+
+diffusers' field name has been wrong for years. SDXL's `[5, 10, 20]` are head
+COUNTS against block widths `[320, 640, 1280]`, so the head DIM is 64 at every
+stage. Reading it as a dim gives 5 heads of 5 channels: shapes divide, the model
+runs, attention is nonsense. `UnetConfig.num_heads` carries the corrected name
+and the config test asserts `width / heads == 64` at all three stages, which is
+the invariant a future size (the refiner is 384-wide) also has to satisfy.
+
+### `use_linear_projection` reorders the transformer entry
+
+With it true (SDXL), `Transformer2DModel` flattens the spatial tensor to tokens
+and THEN applies a linear. With it false (SD 2.x), a 1x1 conv projects first and
+the flatten follows. A `[640, 640]` tensor is a valid kernel for both, so the
+wrong order is a silent transpose of the projection. `parseConfig` REFUSES a
+config that declares `false` by name instead of running the branch it has.
+
+### Two group-norm epsilons in one forward
+
+Resnets and the output norm take the config's `norm_eps` (1e-5).
+`Transformer2DModel`'s input norm hardcodes 1e-6 upstream. One value for both is
+a small, uniform, entirely invisible error, so `sdxl_nn.groupNorm` takes eps as a
+PARAMETER and the two call sites pass different constants. The VAE is a third
+value again (1e-6 everywhere), which is why `sdxl_vae.VAE_EPS` is its own
+constant with a test asserting it differs from the UNet's.
+
+### The ninth skip is `conv_in`'s output
+
+The up path pops nine skip connections; only eight come from the down blocks
+(2 resnets + 1 downsampler, 2 + 1, then 2 with no downsampler). The ninth is the
+output of `conv_in`, pushed before the down loop starts. Losing it still
+type-checks, because every up block pops the same count either way — the error
+surfaces as a wrong image, and `forward` asserts `SkipLeftover` at the end so a
+miscount is named rather than absorbed.
+
+### A random-conditioning fixture cannot see a cross-attention bug
+
+The first UNet fixture used `torch.randn` for `encoder_hidden_states`. With noise
+there, cross-attention has nothing coherent to attend to and its contribution to
+the output is small — a defect on that path still scores cos ~1.0. The fixture
+set now carries a SECOND UNet case driven by real text embeddings from
+`encode_prompt` (`sdxl unet real conditioning`), and a third driven by the ZERO
+conditioning the unconditional branch actually uses. Both measured cos 0.999999;
+the point is that the first test could not have told you.
+
+### `force_upcast: true` is not advice
+
+SDXL's VAE overflows fp16 — its mid-block activations pass 65504 — and the
+failure is a black or banded image, not an error. The checkpoint's own
+`vae/config.json` says so, diffusers carries the same flag, and
+`sdxl_vae.DEFAULT_DTYPE` is float32 while the UNet serves fp16 beside it. The two
+dtypes in one pipeline are deliberate.
+
+### ABSENT and EMPTY negative prompts are different requests
+
+This is the one that survived every component test. diffusers zeroes the
+unconditional branch only when
+
+    zero_out_negative_prompt = negative_prompt is None and force_zeros_for_empty_prompt
+
+so `negative_prompt=""` takes the OTHER branch and encodes the empty string —
+which is not zero, because "" still carries BOS, EOS and 75 pads through both
+towers. Our `GenOpts.negative_prompt` was `[]const u8 = ""`, collapsing the two.
+
+End to end against `StableDiffusionXLPipeline` on an injected latent, that scored
+**cos 0.975 / mae 0.091** while the UNet, the VAE, the tokenizer, the schedule,
+the conditioning and the Euler+CFG algebra were each verified exact. Making the
+field `?[]const u8` (null = absent = zeros) took it to **cos 0.997 / mae 0.027**.
+The lesson generalizes past SDXL: when every part is right and the whole is not,
+suspect a place where the API collapsed a distinction the reference draws.
+
+### How that was localized, in order
+
+Worth recording because the bisect is reusable for any diffusion port:
+
+1. Widen the dtype (`SDXL_UNET_F32=1`). It did not move — precision was out.
+2. Compare per-step latent statistics against the reference's own
+   `callback_on_step_end` (`MLX_SERVE_SDXL_TRACE=1`). The divergence appeared at
+   step 0 and compounded, so the schedule was not drifting.
+3. Verify the schedule numerically against `EulerDiscreteScheduler.set_timesteps`
+   — timesteps exact, sigmas exact.
+4. Re-derive the step in numpy from the dumped eps tensors. `cos 1.0000` against
+   the reference's step-0 latent, so the ALGEBRA was right and the INPUTS were
+   not.
+5. Inject diffusers' own conditioning (`GenOpts.cond_override`). The image jumped
+   to cos 0.997, which named the conditioning as the differing input — and from
+   there the unconditional branch as the specific half.
+
+### The two tokenizers pad differently
+
+`tokenizer/` and `tokenizer_2/` ship byte-identical `vocab.json` and `merges.txt`
+and different `pad_token`s: `<|endoftext|>` (49407) for CLIP-L, `!` (0) for bigG.
+Every id is in-vocab either way and every shape is right either way, so padding
+both alike is invisible — and it changes the embeddings at most of a short
+prompt's 77 positions. The pad id is read from each tokenizer's own config.
+
+Related: CLIP's pretokenizer splits `[\p{N}]` with NO quantifier, so "42" is TWO
+tokens. The LM tokenizers' `\p{N}{1,3}` grouping would merge it, and
+mis-grouping digits presents as a model-quality bug rather than a tokenizer one.
+
+### Conv weights need permuting; flux's do not
+
+PyTorch stores conv weights `[out, in, kh, kw]`; MLX wants `[out, kh, kw, in]`.
+`flux.zig` loads its conv weights with a plain copy because the mflux CONVERSION
+already permuted them — SDXL is a raw diffusers repo and needs the transpose at
+load. A mis-permuted conv weight is a valid tensor of the right element count, so
+nothing errors and the image is noise. Everything goes through
+`sdxl_nn.loadConvWeight`, and the permutation itself has a unit test.
+
+### `zig build test` caches the RUN step
+
+Not SDXL-specific, but it cost real time here: env vars are not part of the cache
+key, so re-running a fixture-gated test with a different `*_FIXTURE` path reports
+the PREVIOUS run's result and prints nothing. `touch` does not help either — Zig
+hashes content. `rm -rf .zig-cache/h` forces it. A parity test that prints
+nothing has not necessarily passed; check for its output line, not its silence.

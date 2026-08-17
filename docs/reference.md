@@ -444,3 +444,91 @@ Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/e
 - **A pinned second ANE is DEFAULT on M3 Ultra (+7.1%), opt-in elsewhere; a SILENTLY ignored affinity hint is undetectable in-process** (`MLX_SERVE_ANE_DUAL`): `kANEFAneInstanceHint` AND `kANEFProcedureVariantHint` together at compile+load+eval; instance 0 keeps `@{}`; verify with `macpow --dump | grep ANE0_`. Per-unit planes; input packed once then memcpy'd.
 - **The ANE program is a procedure BANK (runtime caps ~121 handles)**: symbol indices READ from `procedureInfoForProcedureIndex:` on the `_ANEModel` behind `-model` (NOT `inputSymbolIndicesForProcedureIndex:`, which answers 0 and fails every procedure >0 as a swallowed slowdown; `eval_failures` is the tell). Cap `MLX_SERVE_ANE_BANK_MAX_BYTES` 2 GiB, halves down a ladder; never a coverage decision.
 - **The ANE split's optimum is per SILICON** (`ane.defaultShare`; M4 channel 0.45 → 311/304, 0.50 regresses; M3 Ultra 0.45 ≈ nothing, 0.35 +8.5%/+13.7%). A share change needs its own A/B, never interpolation. fp16 down-conv wears the (1/16..x16) pow2 wrap.
+
+## Stable Diffusion XL (`sdxl*.zig`)
+
+The first EPSILON-prediction image backend here, and the first with real
+classifier-free guidance. Serves `stabilityai/stable-diffusion-xl-base-1.0` and
+any diffusers repo declaring an SDXL pipeline class.
+
+### Files
+
+| File | Role |
+|---|---|
+| `sdxl.zig` | Scheduler math (scaled-linear betas, `alphas_cumprod`, sigma ladder, Euler step, CFG mix), micro-conditioning `add_time_ids`, geometry constants, the repo fingerprint (`indexDeclaresSdxl`). Pure arithmetic — no MLX import, which is what lets `model_discovery` call it |
+| `sdxl_nn.zig` | Shared layers: NHWC conv2d/downsample/upsample, GroupNorm (eps a PARAMETER), LayerNorm, SiLU, exact-erf GELU, `Linear`, `Resnet`, weight loaders |
+| `sdxl_clip.zig` | Both text towers over one `ClipTextConfig` (CLIP-L 768/12/12 quick_gelu; bigG 1280/32/20 gelu). Penultimate hidden state, causal mask, pooled-from-bigG-only |
+| `sdxl_tokenizer.zig` | CLIP BPE over `vocab.json` + `merges.txt` (the older pair, not `tokenizer.json`), `</w>` word-final convention, per-tower pad ids |
+| `sdxl_unet.zig` | `UNet2DConditionModel`: conv_in, time + `text_time` add-embedding, 3 down blocks, mid, 3 up, out. Geometry parsed from the checkpoint's own config |
+| `sdxl_vae.zig` | `AutoencoderKL` DECODER (float32 — `force_upcast`). The encoder half is unread; img2img would bind it |
+| `sdxl_pipeline.zig` | `Engine`: schedule composition, prompt encoding, the Euler + CFG loop, VAE decode, PNG |
+
+### Why the VAE is not `flux.Vae`
+
+An earlier note proposed reusing it, on the measurement that 138 of 140 decoder
+tensor NAMES match. The names do; the forward does not. `flux.Vae.decode` opens
+with an `unpatchify` hardcoded to 128→32 channels (FLUX.2's latent is
+patchified; SDXL's is a plain `[1,4,h,w]`), denormalizes with `bn.running_mean`/
+`running_var` (SDXL ships no `bn.*` and scales by `scaling_factor` instead), and
+reads its attention through `QLinear` (SDXL's VAE is dense fp16). Reusing it
+would thread three conditionals through the hot path of the one decoder in that
+file with an oracle behind it. The topology IS shared — via `sdxl_nn.Resnet`.
+
+### Conditioning
+
+Both towers run over the same prompt. Their PENULTIMATE hidden states are
+concatenated on the feature axis in the order (CLIP-L 768, bigG 1280) = 2048,
+which is the UNet's `cross_attention_dim`. The pooled vector comes from bigG
+alone — CLIP-L has no `text_projection` tensor at all, which is the structural
+reason the choice is not arbitrary. Pooled is concatenated with six sinusoidally
+expanded `add_time_ids` (256 each) to make the 2816 the add-embedding reads.
+
+`add_time_ids` order is `original_size(h,w) ++ crops_coords_top_left ++
+target_size(h,w)` — height before width in every pair, the opposite of the `WxH`
+spelling the HTTP surface uses, and a transposed pair produces a coherent image
+framed for the wrong aspect.
+
+### Request surface
+
+`POST /v1/images/generations` with `model` naming an SDXL repo. Honored:
+`prompt`, `size` (snapped to /64 in [512, 2048]; SDXL is trained on /64 buckets
+and drifts off-distribution between them), `steps`, `seed`, `n:1`. Through
+`gen.ImageGenOpts`: `guidance` (default 5.0) and `negative_prompt`, where ABSENT
+and EMPTY are deliberately different requests. Refused by name: img2img
+(`init_image`) and instruction edit — the VAE encoder is unbound and base SDXL
+has no edit training. LoRA is not wired (SDXL's key grammar is its own).
+
+### Parity
+
+Every stage is pinned against an executed diffusers/transformers reference, not
+against the paper. Measured on `sdxl-base-1.0`, fp16 weights unless noted:
+
+| Stage | Result |
+|---|---|
+| CLIP-L / bigG penultimate + pooled | cos 1.000000 / 0.999986 / 0.999983 |
+| Tokenizer | ids EXACTLY equal to `CLIPTokenizer` across 7 prompts |
+| UNet, random conditioning | cos 0.999998, rms 1.000021 |
+| UNet, real conditioning | cos 0.999999, rms 1.000094 |
+| UNet, zero (unconditional) | cos 0.999999, rms 1.000072 |
+| VAE decode (f32) | cos 0.999996, rms 1.001023 |
+| Euler schedule | timesteps EXACT; sigmas to 1e-5 |
+| Full denoise vs `StableDiffusionXLPipeline` | cos 0.9971, mae 0.027 (f32: 0.9982 / 0.020) |
+
+The end-to-end number is honest about its own limit: injecting diffusers' own
+conditioning barely moves it (0.9972), so the towers are not the limiting term,
+and widening to float32 does move it — the residual is precision. Fixtures come
+from `tests/dump_sdxl_clip_fixtures.py`, `dump_sdxl_unet_fixtures.py` and
+`dump_sdxl_pipeline_fixture.py`; the oracle env is any Python with torch +
+diffusers + transformers.
+
+### Known gaps
+
+- **img2img / inpaint**: the VAE encoder is in the same file and simply not read.
+- **LoRA**: SDXL adapters use their own key grammar (`lora_unet_*`); the stacking
+  machinery in `lora.zig` is arch-keyed and would need an `sdxl` arm.
+- **Refiner**: the geometry is parsed from the checkpoint, so a 384-wide 4-stage
+  refiner should load, but nothing has run one — `up_has_attn`/`down_has_attn`
+  come from the block-type names, and an unknown type is refused BY NAME.
+- **Batch-2 CFG**: guidance runs as two batch-1 forwards. One batch-2 forward
+  would be the obvious speedup; every reshape in `sdxl_unet.zig` assumes batch 1,
+  so widening it is a real change with its own parity risk.

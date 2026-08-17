@@ -1050,9 +1050,9 @@ fn isMark(cp: u21) bool {
     return false;
 }
 
-const CpInfo = struct { cp: u21, len: usize };
+pub const CpInfo = struct { cp: u21, len: usize };
 
-fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
+pub fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     if (pos >= text.len) return null;
     const byte_len = std.unicode.utf8ByteSequenceLength(text[pos]) catch return CpInfo{ .cp = text[pos], .len = 1 };
     const end = @min(pos + byte_len, text.len);
@@ -1060,7 +1060,7 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     return CpInfo{ .cp = cp, .len = end - pos };
 }
 
-fn isLetter(cp: u21) bool {
+pub fn isLetter(cp: u21) bool {
     // ASCII letters
     if (cp >= 'A' and cp <= 'Z') return true;
     if (cp >= 'a' and cp <= 'z') return true;
@@ -1076,7 +1076,7 @@ fn isLetter(cp: u21) bool {
     return false;
 }
 
-fn isDigit(cp: u21) bool {
+pub fn isDigit(cp: u21) bool {
     return cp >= '0' and cp <= '9';
 }
 
@@ -1085,7 +1085,7 @@ fn isWhitespace(c: u8) bool {
 }
 
 /// Build the GPT-2 bytes_to_unicode mapping (256 entries).
-fn buildBytesToUnicode() [256]u21 {
+pub fn buildBytesToUnicode() [256]u21 {
     var table: [256]u21 = undefined;
     var n: u21 = 256; // Next available unicode codepoint for unmapped bytes
 

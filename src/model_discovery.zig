@@ -17,6 +17,7 @@ const log = @import("log.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
+const sdxl = @import("sdxl.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -88,6 +89,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "sdxl") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -143,6 +145,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // gen.peekModelType's fallback (kept in sync — the routing side must agree).
         if (peekMageFlowIndex(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "mage_flow") catch return .missing_or_unparseable };
+        // SDXL is the same shape: a diffusers repo whose identity lives only in
+        // `model_index.json`. Same fallback, keyed on the declared pipeline
+        // class (`sdxl.indexDeclaresSdxl`, shared with gen.peekModelType).
+        if (peekSdxlIndex(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "sdxl") catch return .missing_or_unparseable };
         // …and an mflux FLUX.2 conversion may carry nothing at all (the only
         // MLX build of klein 9B ships no config.json). Same fallback, keyed on
         // the DiT's own weight names.
@@ -207,6 +214,24 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// True when `sub/model_index.json` declares an SDXL pipeline.
+///
+/// Delegates to `sdxl.indexDeclaresSdxl` rather than re-reading the class
+/// name here: `gen.peekModelType` asks the same question on the routing side,
+/// and the MageFlow precedent is that two private copies of "is this a model?"
+/// end up disagreeing, leaving a checkpoint the server can load but cannot see.
+/// `sdxl.zig` is pure arithmetic and JSON with no mlx import, so this does not
+/// drag the FFI into a filesystem-only module.
+pub fn peekSdxlIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    return sdxl.indexDeclaresSdxl(allocator, bytes);
 }
 
 /// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
@@ -829,6 +854,7 @@ fn tryAddModel(
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config and
             !peekMageFlowIndex(io, allocator, sub) and
+            !peekSdxlIndex(io, allocator, sub) and
             !peekMfluxFlux2(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:

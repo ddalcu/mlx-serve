@@ -553,14 +553,73 @@ test "img2img and inpaint share the checkpoint, so they share the fingerprint" {
     try testing.expect(!isSdxlPipelineClass(""));
 }
 
-test "SDXL is not yet reachable from discovery or the gen dispatch" {
-    // Class guard, not a feature test: this file is deliberately unwired until
-    // an ImageBackend arm exists. If someone adds the model_type without the
-    // engine, discovery registers a model whose load falls through to a reader
-    // that was never meant to see it — the incomplete-media-pack class.
+test "SDXL routes to the image modality on every side that must agree" {
+    // This was the "not yet reachable" tripwire, and it fired exactly as
+    // intended when the `ImageBackend` arm landed. It now guards the OTHER
+    // direction of the same class: routing, discovery and the media-type table
+    // must move TOGETHER. Registering the model_type without an engine gives
+    // discovery a model whose load falls through to a reader that was never
+    // meant to see it; shipping the engine without discovery gives a
+    // checkpoint the server can load but cannot list.
     const gen = @import("gen.zig");
-    try testing.expect(gen.modalityFromType("sdxl") == null);
+    const discovery = @import("model_discovery.zig");
+
+    try testing.expect(gen.modalityFromType("sdxl") == .image);
+    try testing.expect(discovery.isMediaModelType("sdxl"));
+
+    // The marker is our OWN spelling, synthesized from `model_index.json`;
+    // "stable_diffusion_xl" is not a `model_type` any checkpoint declares, so
+    // it must not resolve — a near-miss that routes is worse than one that
+    // does not.
     try testing.expect(gen.modalityFromType("stable_diffusion_xl") == null);
+    try testing.expect(!discovery.isMediaModelType("stable_diffusion_xl"));
+
+    // SDXL ships no single "everything is here" weight file the way LTX/H3 do
+    // (its four components live in four subdirectories), so it declares no
+    // required marker rather than declaring one that cannot be checked.
+    try testing.expect(discovery.requiredMediaMarker("sdxl") == null);
+}
+
+test "an SDXL repo is recognized by its declared pipeline class, not its shape" {
+    const a = testing.allocator;
+    // The real `model_index.json` from stabilityai/stable-diffusion-xl-base-1.0,
+    // trimmed to the keys the predicate reads.
+    const real =
+        \\{"_class_name":"StableDiffusionXLPipeline","_diffusers_version":"0.19.0.dev0",
+        \\"force_zeros_for_empty_prompt":true,
+        \\"text_encoder":["transformers","CLIPTextModel"],
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"],
+        \\"unet":["diffusers","UNet2DConditionModel"],"vae":["diffusers","AutoencoderKL"]}
+    ;
+    try testing.expect(indexDeclaresSdxl(a, real));
+
+    // SD 1.5 has unet + vae + ONE text encoder and the same directory shape.
+    // The second tower is what separates XL from its predecessor.
+    const sd15 =
+        \\{"_class_name":"StableDiffusionPipeline",
+        \\"text_encoder":["transformers","CLIPTextModel"],
+        \\"unet":["diffusers","UNet2DConditionModel"],"vae":["diffusers","AutoencoderKL"]}
+    ;
+    try testing.expect(!indexDeclaresSdxl(a, sd15));
+
+    // Declaring the XL class without the second tower cannot be loaded by an
+    // XL engine, so it must not be claimed.
+    const truncated =
+        \\{"_class_name":"StableDiffusionXLPipeline",
+        \\"unet":["diffusers","UNet2DConditionModel"],"vae":["diffusers","AutoencoderKL"]}
+    ;
+    try testing.expect(!indexDeclaresSdxl(a, truncated));
+
+    // The img2img/inpaint siblings are the same checkpoint with a different
+    // request shape, so they load.
+    const img2img =
+        \\{"_class_name":"StableDiffusionXLImg2ImgPipeline",
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"]}
+    ;
+    try testing.expect(indexDeclaresSdxl(a, img2img));
+
+    try testing.expect(!indexDeclaresSdxl(a, "not json"));
+    try testing.expect(!indexDeclaresSdxl(a, "[]"));
 }
 
 test "the two towers disagree about GELU" {
