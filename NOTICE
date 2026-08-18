@@ -106,6 +106,27 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
+h3.c-ane (Apple Neural Engine port of h3.c)
+https://github.com/maderix/h3.c-ane
+https://github.com/maderix/ANE
+Copyright (c) 2026 Manjeet Singh (maderix)
+Licensed under the MIT License.
+
+Vendored into `lib/ane/ane_bridge.{h,m}` (from `h3_ane_bridge.{h,m}`): the
+objc-runtime bridge to the private AppleNeuralEngine framework — in-memory
+MIL model compile/load/evaluate, IOSurface I/O binding, and the
+content-addressed compile cache. The ANE port is maderix's addition to a
+fork of antirez's h3.c (whose own code is Metal/GPU only and none of which
+is vendored here), building on the private-API groundwork in
+https://github.com/maderix/ANE. mlx-serve changes: the persistent cache
+entries move to `~/.mlx-serve/ane-cache` (staging stays in $TMPDIR — the
+compile runs inside aned, which cannot read a home-directory path) and the
+cache env var is renamed `MLX_SERVE_ANE_CACHE`. `lib/ane/ane_mlp.m` (the
+per-layer SwiGLU-MLP MIL program builder used by `--ane-prefill`) is an
+mlx-serve addition modeled on the same project's `h3_ane_linear.m` blob
+layout and int8 constexpr-dequantize idioms.
+
+--------------------------------------------------------------------------------
 SwaTex
 https://github.com/PhraseHQ/SwaTex
 Copyright (c) 2026 Phrase (https://phrase.so) and SwaTex contributors

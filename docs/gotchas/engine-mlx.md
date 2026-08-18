@@ -2648,3 +2648,315 @@ held the same 31 accepts and 68.9% per-draft rate at 249.9/247.1 tok/s, with
 identical output plus a restore line and preserved warm throughput—not
 identical speculative round partitioning, which may legitimately improve
 when the restored history extends the accepted chain.
+
+## ANE prefill-MLP offload (`--ane-prefill`, 2026-08-17, perf-plan-aug-17 P5)
+
+Splits each FULL-width prefill chunk's dense SwiGLU MLP rows between the GPU
+and the Apple Neural Engine (private AppleNeuralEngine.framework via the
+bridge vendored from maderix/h3.c-ane in `lib/ane/`, int8 per-row weights, fp16 datapath).
+Measured M4 Max, Qwen3.8-27B MTPLX 6-bit, ABA-counterbalanced boots vs the
+same binary without the flag: prefill **+12% median at 16k, +18% at 32k**
+(best boots +15/+20), decode byte-flat, greedy echo output byte-identical
+on/off at 200 tokens, prose coherent. Opt-in, default OFF, lossy by design
+(decode-attn-quant precedent).
+
+War stories, each of which cost real time:
+
+- **`ANECCompile() FAILED` bare on every layer, while the identical program
+  compiled in the standalone harness.** The only difference was the staging
+  directory: the compile runs inside `aned`, a separate daemon that cannot
+  read `~/.mlx-serve/...`. Staging must stay in `$TMPDIR`; only the
+  content-addressed cache entries persist under `~/.mlx-serve/ane-cache`
+  (same APFS Data volume, so the bridge's hardlink mirror still costs
+  nothing). The error string carries NO reason — if every layer fails
+  instantly, suspect the path before the program.
+- **A single K=17408 down conv runs the whole MLP at 4.3 TFLOPS; K-chunking
+  it into 4x4352 in-graph slabs (slice_by_size + partial convs + adds)
+  restores 11.8 TFLOPS** — flat across rows 512-4096, above the stage-1
+  blended GEMM estimate. ANE convs fall off a cliff somewhere past K~14336
+  (h3's own fc2 width, which works). The weight blob must be re-packed as
+  contiguous [out, K/n] slabs — BLOBFILE reads are contiguous.
+- **The share optimum is a measured hump, not a rate ratio**: 0.30 → +10/+14,
+  0.40 → +12/+18, 0.50 → back to the 0.30 level (ANE becomes the critical
+  path; its 11.8 TFLOPS vs the GPU's effective MLP rate would have predicted
+  ~0.45). `MLX_SERVE_ANE_SPLIT` overrides the 0.40 default.
+- **Stage-A parity method that made this safe to ship**: real layer-0 weights
+  from the bf16 source pack, int8-per-row requant, numpy fp32 ground truth,
+  cos >= 0.999 AND rms_ratio ~1 (cosine alone cannot see scale errors), THEN
+  16x amplitude probes for fp16 range. Per-row int8 alone is ~free
+  (cos 1.0000); the fp16 datapath lands at cos 0.99993. The down conv always
+  wears h3's (1/16..x16) power-of-two wrap: exact in fp16, zero measured
+  cost, 16x accumulator headroom against later-layer activation outliers.
+- **Fixed shapes bind the whole design**: one compiled program per layer per
+  ROW TILE; the forward seam (`denseMLPMaybeAne`) engages only when
+  `seq_len == chunk_rows` exactly, so tail chunks and short prompts run
+  GPU-only by construction, and the tile must be derived from the SAME
+  chunk resolver the forward uses (`server.pinPrefillChunk`, passed into the
+  scheduler as a function pointer — the scheduler deliberately has no
+  server.zig import). The build runs on the inference thread (mlx dequant =
+  sole-MLX-caller rule); only `msv_ane_mlp_eval` runs on the dedicated ANE
+  thread.
+- **`msv_ane_model_eval` (h3_ane_* before the 2026-08-18 rename) returns 1 on SUCCESS** — the
+  stage-1 spike lost an hour to reading it as a C error code.
+- Boot cost: cold build ~80-95 s for 64 layers (compile + dequant + host int8
+  quant), warm cache ~25-60 s; int8 copy ~16.3 GB wired for the 27B, hence
+  the >= 96 GB total-RAM gate (named refusal, GPU-only serve).
+- **Addendum (2026-08-18): the compile cache is content-addressed and NOTHING
+  invalidates it** — every distinct (weights x rows) combination adds a
+  ~250 MB entry forever. One evening's share sweep left 221 entries / 49 GB,
+  the Data volume hit 100%, and the NEXT model's ANE build failed from layer
+  17 on with a bare `ANECCompile() FAILED` — the server came up happily
+  advertising `[ane] prefill offload ready: 19/64 layers` and ran the A/B at
+  30% coverage. Two lessons: (a) `bridge_cache_prune` now LRU-prunes past
+  `MLX_SERVE_ANE_CACHE_CAP_GB` (default 40) on the cold-compile path, with
+  restores touching the entry mtime; (b) when ANE compiles fail with no
+  error text, check DISK before blaming the program — the same bare failure
+  spelling covers both the unreadable-staging-path and the no-space cases.
+- **Cross-engine note (same pack, same instrument, M4 Max, 2026-08-18)**:
+  oMLX 0.6.1's ANE prefill uses the SAME private-API technique
+  (byte-identical MIL boilerplate) but splits each projection's OUTPUT
+  CHANNELS (fraction 0.53) and also offloads GDN input projections; ours
+  splits TOKEN ROWS through one fused MLP graph. On 
+  Qwen3.8-27B-oQ4e-mtp, TTFT-measured: their on/off +21.0/+21.1% at
+  16k/32k, ours +14.1/+19.6% from MLP-only — absolute prefill near-tie at
+  16k (298.4 vs 294.5), ours ahead at 32k (285.2 vs 277.9), and our OFF
+  baseline is 4-5% faster to begin with. Their `dual_ane` default FAILS its
+  bank compile on single-ANE Macs and falls back slower — set it false
+  there. GDN-prework offload is the coverage we lack; it is the v2 lever.
+
+## ANE prefill v2: fp16 planes, GDN offload, int4 NO-GO (2026-08-18)
+
+- **fp16 I/O planes are NOT bit-lossless vs the f32 planes, and the reason is
+  the COMPILER, not the seam**: bf16→fp16 is exact in fp16's normal range and
+  the graph computed fp16 either way, so the v2 plan assumed byte-identity.
+  Measured (production emitter vs the validated Stage-A f32-plane dump, same
+  weights, same input, rows=1024): 8 of 5,242,880 values differ by exactly
+  one fp16 ulp (1.5e-5). With a trailing cast-to-fp32 in the graph,
+  ANECCompile evidently keeps the last op(s) wider before the output cast;
+  with a bare fp16 output it rounds earlier — double-rounding on near-tie
+  values. Consequence: greedy 16k output on the 6-bit 27B is no longer
+  byte-identical ANE-on vs off (v1's byte-identity was one prompt's luck on
+  a LOSSY-by-design path — ane.zig's own header always said bytes are not
+  expected to match). The bars that survive: reference parity per program
+  (cos/rms vs fp32) + perceived-content equivalence of greedy output. Both
+  live arms summarized the same text the same way with synonym-level drift.
+- **GDN input projections ride ONE fused conv**: in_proj_qkv + in_proj_z are
+  per-token-independent linears over the same input, so stacking rows into a
+  single [qkv_out+z_out, hidden] weight is byte-equivalent to two convs +
+  concat with one op fewer. K=5120 needs no chunking (the cliff was 17408)
+  and |y| < 1 measured needs no accumulator wrap — the gate/up regime.
+  Parity on real layer-0 27B weights: cos 0.999955 / rms 1.0001 vs fp32,
+  cos 1.000000 vs the int8-dequant reference; 11.2 TFLOPS eval. The seam
+  (`gdnProjMaybeAne`) mirrors `denseMLPMaybeAne`; a/b projections (48-wide)
+  stay GPU; qwen3_next's combined-proj arm stays GPU. `MLX_SERVE_ANE_GDN=0`
+  = MLP-only mode (the attribution lever), and each seam logs ITS OWN
+  one-shot engagement line — a single shared line can't tell a dead seam
+  from a live one when the other seam logs first.
+- **ANE compile failures late in a long sequential build are usually the
+  BUILD's OWN disk growth, and they are TRANSIENT either way**: a fresh
+  64-layer 27B build writes ~17 GB of cache entries AS IT GOES (~267 MB per
+  layer), so a boot started with 12-16 GB free fails from layer ~59 on with
+  the same bare "compile failed: ?" the full-disk class produces — the disk
+  was fine at boot and full by layer 59. One later boot failed 3 mid-run
+  layers with space apparently available (aned/staging transients at the
+  margin); every failed layer succeeded on the next attempt in both cases.
+  `buildAnePrefill` now runs ONE retry pass over still-null layers (2 s
+  beat first); dequant failures are deterministic and deliberately don't
+  trigger it. A partial build used to stay partial for the whole serve.
+  Budget rule: a cold build needs `entry_bytes(config) + staging` FREE
+  BEFORE it starts (the `MLX_SERVE_ANE_CACHE_CAP_GB` prune only bounds the
+  steady state, not the burst), and clearing `~/.mlx-serve/ane-cache/
+  entries/` is always safe — it is a pure compile cache.
+- **int4 ANE weights are a NO-GO on this OS build (macOS 26.x aned), fully
+  bisected**: with the int8 control compiling in the same session,
+  (a) `constexpr_affine_dequantize` with int4 data → clean `ANECCompile()
+  FAILED` (the op is int8/uint8-only by spec); (b)
+  `constexpr_blockwise_shift_scale` (ios18, the int4 op) → "Couldn't
+  communicate with a helper application" in EVERY form (int4, uint4+offset,
+  per-row or g64 scales) — the in-memory compile path's MIL parser predates
+  the op and crashes; (c) ios16 `constexpr_lut_to_dense` (16-entry palette =
+  4-bit) → `ANECCompile() FAILED` too. No sub-byte constexpr form exists
+  here, so the ANE copy stays int8 (~20.2 GB wired with GDN on the 27B:
+  16.3 MLP + 3.9 GDN). Memory parity with
+  oMLX's channel-split (~5-9 GB) is NOT reachable by width on this OS;
+  channel-split redesign is the separate decision the plan named. The
+  ADMISSION side was fixed instead (2026-08-18, follow-up): the flat
+  96 GB total-RAM gate refused a 1 GB bill on a 64 GB Mac and said
+  nothing about why — it is now a per-model bill (`ane.engineBillBytes`:
+  int8 copies + the per-layer fp16 IOSurface planes, ~32 GB on the 27B
+  at rows 3264 — the planes are ~11 GB of that, a shared-plane
+  optimization candidate) admitted by `gateAllows(total, resident,
+  bill)` with 12 GB headroom, resident read from mlx active memory at
+  build time. The refusal quotes every number it compared (the
+  context-overflow-400 rule). Any affine pack width feeds the build
+  (4/6/8-bit measured; the dequant→int8 path is width-blind); only
+  dense bf16 declines. Probes:
+  ~/claude-tmp/perf-aug17/p5-ane-v2/probe_int4.c + probe_lut4.c. Also
+  learned there: a probe conv at ROWS=16 reads garbage columns — the
+  IOSurface plane row pitch wants 64-byte alignment, so probe shapes use
+  ROWS≥32 (fp16) before concluding anything about op semantics.
+
+## ANE staging leak + the compile-budget mystery, RESOLVED (2026-08-18, late)
+
+The "transient aned pressure" and "build fails itself with entry bytes"
+stories above were both wrong about the mechanism (kept for the record; the
+numbers were real). One night of declining coverage (112 → 63 → 36 → 29
+programs per boot) bisected to TWO interacting facts:
+
+- **A killed ANE server leaks its staging.** Nothing frees
+  `$TMPDIR/<identifier>` when the process dies (h3-era free() only runs on
+  clean deinit), so every killed `--ane-prefill` boot left 8-20 GB of
+  orphans, and internal free disk marched to zero across the night.
+- **A compile session's budget IS the internal free disk at boot.** The
+  compiler service keeps per-connection intermediates (root tmp, invisible
+  to the user) for the client's LIFETIME: ~260 MB per program. When they
+  exhaust free space, `saveModelFiles`/`ANECCompile` fail — the unified log
+  says `Write weightsFilePath failed` (our pid), our error string is the
+  bare "compile failed: ?" — and IN-SESSION retries can never succeed, which
+  is why the escalating-drain retry experiment recovered almost nothing.
+  A fresh process gets a fresh connection and a fresh budget.
+
+Consequences and fixes:
+- Marker + reap: every staging dir gets `msv-ane.pid`; the first create of a
+  process removes marked dirs whose owner is dead. (Path-scoping is
+  impossible: `_ANEInMemoryModel` operates at `$TMPDIR/<identifier>`
+  EXACTLY — a subdirectory fails every compile.)
+- Weights blob + MIL text are deleted post-load (compile inputs only —
+  proven by warm mirrors, which never had them). The COMPILED artifacts
+  must stay: aned demand-reads them during serving; deleting them passes an
+  immediate eval and then fails later evals with "ANEProgramProcessRequest
+  ... Program Inference error" (352 failures over one benchmark serve).
+- Cold builds bigger than free-disk/260MB converge ACROSS boots via the
+  entries cache (warm restores consume no compile budget). Bench harness:
+  `converge_boot.sh` boots until the ready line reports full coverage, then
+  the measured boot runs warm. `MLX_SERVE_ANE_CACHE_DIR` + TMPDIR can both
+  point at an external volume (aned reads it fine; same-volume hardlinks
+  keep restores free) — but the SERVICE's own intermediates stay internal,
+  so internal headroom still bounds fresh compiles per boot.
+- Dead theories, tested: not the compiler-service lifetime (fresh service
+  via the int4 poison-MIL crash still failed), not wired/kernel ANE memory
+  (ioclasscount clean), not TM snapshots (none), not external-SSD latency.
+
+## ANE v3 (ane-plan-aug-18): the 0.35 "tiling cliff" was eval-death, shared planes, and the channel split (2026-08-18)
+
+### A3 — the share-0.35 collapse was never a rate cliff: fp16 plane pitch must sit on the 64-byte grid
+
+The v2 sweep's share-0.35 cell (rows 2864) landed BELOW the off arm at full
+coverage and was recorded as a "suspected ANE tiling cliff on non-64-multiple
+row tiles". The standalone harness answered it in minutes and the suspicion
+was wrong twice over:
+
+- Rows 2864 and 2896 (both ≡ 16 mod 32) do not run slow — their compiled
+  programs FAIL EVERY EVAL with a bare `ANEProgramProcessRequestDirect ...
+  Program Inference error` (status 0x1d). The compile succeeds silently.
+- Rows 2880, 2912, 3264 and 3680 (all ≡ 0 mod 32, including two that are
+  NOT 64-multiples) all run at the same flat ~11.7–11.9 TFLOPS. There is no
+  rate cliff among legal tiles at all.
+
+The mechanism is the plane layout: a channel-major fp16 plane's per-channel
+pitch is `rows × 2` bytes, and the ANE wants each channel row on a 64-byte
+boundary → rows ≡ 0 mod 32 for fp16. v1's f32 planes only needed rows ≡ 0
+mod 16 (`16 × 4 = 64`), which is why v1's 0.30 arm (rows 2448, ≡ 16 mod 32)
+worked and v2's fp16 planes broke exactly when the share sweep left the
+64-multiple rows. The 16-row probe-conv garbage-columns note from v2 is the
+same rule one octave down.
+
+What made the live cell collapse below OFF: the engine's per-chunk fallback.
+Every chunk paid pack + kick + failed eval + a full GPU recompute of the ANE
+rows, serially — 448 `[ane] eval failed` lines in the 0.35 sweep log, zero
+in 0.40's. An eval-time failure that presents as a perf number is the
+worst-dressed dispatch hole yet.
+
+Fixes: `aneShareRows` floors to 32-row multiples; both C emitters REFUSE
+rows % 32 by name at create time ("the fp16 plane pitch (rows x 2 bytes)
+must sit on the 64-byte grid") so the class dies at build, not at serve.
+The second A3 loose end also closed: row-mode share 0.45 at FULL coverage
+(the v2 sweep's 0.45 ran partial GDN) measured 294.8/291.3 vs row-0.40's
+304.3/294.6 same-session — 0.40 stays the row-mode optimum.
+
+### A9 — shared I/O planes: evals are serial, so planes are per SHAPE CLASS
+
+Every compiled program allocated its own input + output IOSurface pair
+(~11 GB across 112 programs on the 27B at rows 3264) while evals are
+strictly serial — one in-flight kick/wait. Three surfaces serve everything:
+one input (hidden × rows — MLP and GDN read the same shape), one MLP output
+(hidden × rows), one GDN output ((qkv+z) × rows). Proven by harness before
+wiring: two programs with DIFFERENT weights bound to the same pair,
+interleaved evals A/B/A, each matching its own fp32 reference
+(~/claude-tmp/ane-v3/probe_shared.c). The engine (`AnePrefill.init`) owns
+the planes (`msv_ane_plane_create`), creates retain them, `engineBillBytes`
+bills per shape class — the 27B's row-mode bill fell ~32 GB → ~20 GB in the
+same change (the gate must not keep billing memory the engine stopped
+using). One care point inherited by the C side: `mlp_bind_planes` must not
+memset a SHARED plane (that would wipe another program's live contents);
+only fresh per-program surfaces are cleared.
+
+### A1 — channel split: same speed as row at 40% of the bytes, and it wins the sweep at 0.45
+
+Design shipped behind `MLX_SERVE_ANE_MODE` (channel is now the DEFAULT; row
+remains selectable): the ANE holds output channels [0..k) of gate/up (and
+qkv/z), the GPU the rest, both units see ALL chunk rows; the down projection
+contributes a PARTIAL sum over the ANE's K-slabs, added to the GPU partial
+at the seam (one extra add per layer). Key implementation facts:
+
+- **The spike needed no new MIL**: a channel-slice MLP program IS
+  `msv_ane_mlp_create` at `ffn' = k` with sliced weights (gate[:k,:],
+  up[:k,:], down[:,:k]) — the emitter already K-chunks the down conv and
+  wraps the accumulator. Slice-width rates measured flat (11.6–12.3 TFLOPS
+  at k ∈ {5184, 6912, 8704, 12160} × S 8192); the share-0.4-equivalent cell
+  is ~3% FASTER than row-split's same-FLOPs tile.
+- **The GPU complement's gate/up/qkv/z rests are zero-copy axis-0 slice
+  VIEWS of the resident packed weights** — pinned bit-exact through
+  quantized_matmul against both the materialized copy and the full-output
+  slice (the "axis-0 slice VIEW" test in transformer.zig). Only the down
+  rest (axis-1, not contiguous) is materialized (~1.7 GB at share 0.45 on
+  the 27B). Slice boundaries align to 128 (`CHANNEL_ALIGN`) so every quant
+  geometry's group and packed-word grids divide.
+- **Counterbalanced A/B** (27B oQ4e, M4 Max, 2 boots/arm, 2 reps/cell,
+  medians): channel-0.45 **306.4/301.1**, row-0.40 300.7/294.3, off
+  258.2/239.0 at 16k/32k → channel +18.7%/+26.0% over off at 9.3 GB ANE
+  bytes (9.0 int8 + 0.27 planes) vs row's 20.4 GB. Channel share sweep:
+  0.40 → 305.4/291.4, 0.45 → 310.8/303.6, 0.50 → 296.9/289.9 (same
+  ANE-becomes-critical-path rollover as row, one notch later; per-mode
+  defaults: channel 0.45, row 0.40). Greedy 16k perceived-content
+  equivalence held (summaries fork at a mid-sentence near-tie — the
+  lossy-by-design signature). RSS on-arm ≈ off + 5–9 GB vs row's +12–20.
+- **Failure containment**: a failed channel eval cannot use the GPU rest
+  partial alone — the whole layer recomputes from the ORIGINAL weights
+  (denseMLP(x, dw)); same for GDN.
+
+### A7 + the chunk-policy dispatch hole — MoE gets GDN-only coverage, and the ANE tile must be sized by effectivePrefillChunk
+
+The A7 arithmetic spike on the 35B-A3B: offloadable per-token weight MACs
+are 37.5% — but the shared expert is only 5.4% (stays GPU, as the plan
+guessed) while the separate-proj GDN input projections are 32.1% (hidden
+2048 × qkv+z 12288 vs tiny 512-wide expert MLPs). So `buildAnePrefill` now
+accepts MoE qwen3_5_moe checkpoints for GDN-ONLY coverage (the dense-MLP
+loop finds no .dense arms; routed experts can never ride fixed shapes).
+
+First live run: 30 GDN programs built, ZERO engagements, on == off. The
+engine compiled its tile at the PINNED chunk (8192) while the MoE forward
+chunks at 4096 — `boundedPrefillChunk`'s MoE cap, applied per request by
+`effectivePrefillChunk`, which the build never consulted. Built-but-never-
+dispatched, invisible to everything but the engagement count (and latent
+for DENSE models under an explicit `--prefill-chunk` narrower than the
+pin). The scheduler's build site now resolves the tile through
+`generate.effectivePrefillChunk` with a representative-large total_ctx
+(ctx-independent under the default fused-causal mode), source-scan-pinned.
+Fixed: 35B-A3B GDN-only measured **+3.9% at 16k** (median 1767 vs 1701,
+counterbalanced, engagement-verified) for 315 MB int8 + ~230 MB planes.
+
+### A8 — observability + the disk floor
+
+`/props` gains an `"ane"` object (mode, mlp/gdn layer counts, rows,
+chunk_rows, share, int8_bytes) and `--metrics` the gauge pair
+`mlx_serve:ane_int8_bytes` / `mlx_serve:ane_layers`, fed by process-global
+atomics the engines publish (`ane.publishLive` / deinit — zero-when-off
+holds by construction). Pre-build, `buildAnePrefill` probes internal free
+disk (`msv_ane_internal_free_disk`, /private/tmp — aned's scratch volume
+regardless of TMPDIR): under a 1 GiB hard floor the build is REFUSED by
+name (below it even cache restores and the framework's own saves fail bare
+and coverage ships partial — the 2026-08-18 class); under a fully-cold
+build's budget it logs the convergence expectation instead. Still open
+from A8: building in the background after serving starts (the dequant
+stage is inference-thread-bound; queue it between requests).

@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v26.8.10 — Faster Neural Engine prefill, Custom resolutions, LaTeX in chat
+
+- **Neural Engine prefill got a second gear, then a third.** `--ane-prefill` now offloads the GatedDeltaNet input projections beside the MLP (`MLX_SERVE_ANE_GDN=0` restores MLP-only), and the split itself was redesigned: instead of sending some prompt rows through a full copy of the weights, the ANE now owns a slice of each projection's output channels — so its weight copy shrinks from ~20 GB to ~9 GB on Qwen 3.8 27B while getting faster. Long-prompt prefill is +19% at 16k and +26% at 32k over ANE-off (306/301 tok/s on an M4 Max), ahead of oMLX 0.6.1's ANE mode at both lengths; decode is untouched. `MLX_SERVE_ANE_MODE=row` restores the old split.
+- Neural Engine fixes and coverage along the way: I/O buffers are now shared across the compiled programs instead of allocated per layer (~11 GB back on a 27B); a share setting whose row count fell off the ANE's 64-byte alignment grid used to fail every offloaded step and run SLOWER than off — those tile sizes are refused up front now; MoE checkpoints (35B-A3B) get their GatedDeltaNet projections offloaded too (+4% prefill at 16k for ~0.5 GB); a build that would run the internal disk out is refused by name instead of shipping partial coverage; and `/props` + `/metrics` now report what the Neural Engine is holding.
 
 ### App
 

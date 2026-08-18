@@ -137,7 +137,6 @@ pub const EngineOptions = extern struct {
     ssd_streaming_full_layers_set: bool = false,
     inspect_only: bool = false,
     placement_ctx_hint: c_int = 0,
-    placement_session_count_hint: c_int = 0,
     share_session_prefill_workspace: bool = false,
     first_token_test: bool = false,
     metal_graph_test: bool = false,

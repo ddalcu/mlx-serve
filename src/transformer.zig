@@ -2754,6 +2754,19 @@ pub fn splitCausalSdpa(
 
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+// NB `ane_offload`, not `*_mod`: the `?*<x>_mod.<Y>` field convention marks
+// module-owned ARCH state (the dsv4 class — single-flight + spec-off); the
+// ANE engine is a load-time accelerator with no per-request decode state.
+const ane_offload = @import("ane.zig");
+
+/// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
+/// consume this must treat 0 as "unknown", never as "tiny machine").
+fn totalMemBytes() u64 {
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    return mem;
+}
 
 const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
@@ -4153,6 +4166,43 @@ const DenseMlpWeights = struct {
     down_w: mlx.mlx_array,
     down_s: mlx.mlx_array,
     down_b: mlx.mlx_array,
+};
+
+/// ANE channel-split GPU complement for one layer (A1): the output-channel
+/// rest-slices the GPU computes while the ANE runs channels [0..k). The
+/// mlp arm reuses DenseMlpWeights so denseMLP serves it unchanged (its
+/// down slice yields the rest PARTIAL sum, added to the ANE partial at the
+/// seam); the gdn arm carries only the projection slices gdnProjGpu reads.
+const AneChanRest = struct {
+    mlp: ?DenseMlpWeights = null,
+    gdn_qkv_w: mlx.mlx_array = .{ .ctx = null },
+    gdn_qkv_s: mlx.mlx_array = .{ .ctx = null },
+    gdn_qkv_b: mlx.mlx_array = .{ .ctx = null },
+    gdn_z_w: mlx.mlx_array = .{ .ctx = null },
+    gdn_z_s: mlx.mlx_array = .{ .ctx = null },
+    gdn_z_b: mlx.mlx_array = .{ .ctx = null },
+
+    fn deinit(self: *AneChanRest) void {
+        if (self.mlp) |*m| {
+            inline for (.{ m.gate_w, m.gate_s, m.gate_b, m.up_w, m.up_s, m.up_b, m.down_w, m.down_s, m.down_b }) |a| {
+                if (a.ctx != null) _ = mlx.mlx_array_free(a);
+            }
+            self.mlp = null;
+        }
+        self.deinitGdn();
+    }
+
+    fn deinitGdn(self: *AneChanRest) void {
+        inline for (.{ self.gdn_qkv_w, self.gdn_qkv_s, self.gdn_qkv_b, self.gdn_z_w, self.gdn_z_s, self.gdn_z_b }) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+        self.gdn_qkv_w = .{ .ctx = null };
+        self.gdn_qkv_s = .{ .ctx = null };
+        self.gdn_qkv_b = .{ .ctx = null };
+        self.gdn_z_w = .{ .ctx = null };
+        self.gdn_z_s = .{ .ctx = null };
+        self.gdn_z_b = .{ .ctx = null };
+    }
 };
 
 pub const MoeMlpWeights = struct {
@@ -5636,6 +5686,17 @@ pub const Transformer = struct {
     /// Concatenated q/k/v weights, built lazily per layer on first use (see
     /// buildFusedQkv). Additive memory, so opt-in via MLX_SERVE_FUSED_QKV=1.
     qkv_fused: ?[]?FusedQkv = null,
+    /// ANE prefill-MLP engine (`--ane-prefill`, perf-plan-aug-17 P5). Owned;
+    /// null unless the flag is on AND the arch/machine passed the build
+    /// gates in `buildAnePrefill`. Read only by `denseMLPMaybeAne`.
+    ane_prefill: ?*ane_offload.AnePrefill = null,
+    /// Channel-mode GPU complements (A1): per layer, the rest-channel
+    /// slices the GPU computes while the ANE runs its slice. gate/up/qkv/z
+    /// rests are zero-copy axis-0 VIEWS of the resident packed weights
+    /// (pinned bit-exact by the "axis-0 slice VIEW" test); the down rest is
+    /// an axis-1 slice, materialized at build. Owned; freed beside
+    /// ane_prefill. null in row mode.
+    ane_chan: ?[]AneChanRest = null,
     /// Decode-only INT8 side copies of dense (bf16/f16) attention projection
     /// weights, keyed by the source weight's ctx pointer (mlxfast native-affine
     /// class). null value = probed and ineligible, don't re-probe. Built
@@ -6952,6 +7013,15 @@ pub const Transformer = struct {
     }
 
     pub fn deinit(self: *Transformer) void {
+        if (self.ane_prefill) |eng| {
+            eng.deinit();
+            self.ane_prefill = null;
+        }
+        if (self.ane_chan) |rests| {
+            for (rests) |*r| r.deinit();
+            self.allocator.free(rests);
+            self.ane_chan = null;
+        }
         if (self.dsv4) |mdl| {
             mdl.deinit();
             self.allocator.destroy(mdl);
@@ -10030,7 +10100,7 @@ pub const Transformer = struct {
 
             // Attention: linear (GatedDeltaNet) or full
             const attn_out = switch (lw.attn) {
-                .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], batch, seq_len),
+                .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], layer_idx, batch, seq_len, is_prefill),
                 .full => |fa| if (is_inkling) blk: {
                     const r = try self.inklingAttnWith(ctx, normed, &fa, &ctx.ssm_entries.?[layer_idx], li, @intCast(offset), batch, seq_len, is_prefill);
                     ink_k_state = r.k_state;
@@ -10147,7 +10217,9 @@ pub const Transformer = struct {
                 }
                 const mlp_out = switch (lw.mlp) {
                     .moe => |*mw| try self.moeMLP(ff_normed, mw),
-                    .dense => |*dw| try self.denseMLP(ff_normed, dw),
+                    // ANE prefill split rides here when armed (--ane-prefill);
+                    // everything else is plain denseMLP.
+                    .dense => |*dw| try self.denseMLPMaybeAne(ff_normed, dw, layer_idx, is_prefill, seq_len),
                 };
                 defer _ = mlx.mlx_array_free(mlp_out);
 
@@ -12697,8 +12769,10 @@ pub const Transformer = struct {
         x: mlx.mlx_array,
         la: *const LinearAttnWeights,
         ssm: *SSMCacheEntry,
+        layer_idx: usize,
         batch: c_int,
         seq_len: c_int,
+        is_prefill: bool,
     ) !mlx.mlx_array {
         const cfg = &self.config;
         const num_k_heads: c_int = @intCast(cfg.linear_num_key_heads);
@@ -12794,8 +12868,9 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&b_proj, b_g, &flat3_ba, 3, self.s));
             try mlx.check(mlx.mlx_reshape(&a_proj, a_g, &flat3_ba, 3, self.s));
         } else {
-            qkv = try self.qmatmul(x, la.qkv_w, la.qkv_s, la.qkv_b);
-            z_proj = try self.qmatmul(x, la.z_w, la.z_s, la.z_b);
+            const proj = try self.gdnProjMaybeAne(x, la, layer_idx, is_prefill, seq_len);
+            qkv = proj.qkv;
+            z_proj = proj.z;
             a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
             b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
         }
@@ -13119,6 +13194,800 @@ pub const Transformer = struct {
         const activated = try self.computeGeglu(gate, up);
         defer _ = mlx.mlx_array_free(activated);
         return self.qmatmul(activated, dw.down_w, dw.down_s, dw.down_b);
+    }
+
+    // ── ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5) ──
+
+    /// Dense-MLP dispatch with the optional ANE row split: engages only on a
+    /// full-width prefill chunk of a covered layer; everything else (decode,
+    /// verify widths, tail chunks, uncovered layers, no engine) runs the
+    /// plain GPU chain. Fixed shapes are an ANE constraint — the compiled
+    /// programs only accept exactly `eng.rows` rows.
+    fn denseMLPMaybeAne(self: *Transformer, x: mlx.mlx_array, dw: *const DenseMlpWeights, layer_idx: usize, is_prefill: bool, seq_len: c_int) !mlx.mlx_array {
+        const eng = self.ane_prefill orelse return self.denseMLP(x, dw);
+        if (!is_prefill or seq_len != @as(c_int, @intCast(eng.chunk_rows))) return self.denseMLP(x, dw);
+        if (layer_idx >= eng.layers.len or eng.layers[layer_idx] == null) return self.denseMLP(x, dw);
+        const xsh = mlx.getShape(x);
+        if (xsh.len != 3 or xsh[0] != 1 or xsh[2] != @as(c_int, @intCast(eng.hidden))) return self.denseMLP(x, dw);
+        if (eng.mode == .channel) {
+            const rests = self.ane_chan orelse return self.denseMLP(x, dw);
+            const rest = if (rests[layer_idx].mlp) |*m| m else return self.denseMLP(x, dw);
+            return self.denseMLPAneChannel(eng, x, dw, rest, layer_idx) catch |err| {
+                log.warn("[ane] channel split failed on layer {d} ({s}) — GPU fallback\n", .{ layer_idx, @errorName(err) });
+                return self.denseMLP(x, dw);
+            };
+        }
+        return self.denseMLPAneSplit(eng, x, dw, layer_idx) catch |err| {
+            // An ANE failure is never a request failure — whole chunk on GPU.
+            log.warn("[ane] split failed on layer {d} ({s}) — GPU fallback\n", .{ layer_idx, @errorName(err) });
+            return self.denseMLP(x, dw);
+        };
+    }
+
+    /// The split itself: the FIRST `eng.rows` chunk rows ride the compiled
+    /// ANE program (fp16/int8, lossy by design) while the GPU runs the rest;
+    /// results concatenate back in row order. The inference thread stays the
+    /// sole MLX caller — it packs/reads the IOSurface planes and only the
+    /// eval runs on the ANE thread (kick/wait). One per-layer sync each way:
+    /// the pack needs the post-norm hidden materialized, and the join needs
+    /// the ANE output before the next layer's attention.
+    fn denseMLPAneSplit(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, dw: *const DenseMlpWeights, layer_idx: usize) !mlx.mlx_array {
+        const h_dim: c_int = @intCast(eng.hidden);
+        const rows_a: c_int = @intCast(eng.rows);
+        const xsh = mlx.getShape(x); // [1, S, H], S == eng.chunk_rows
+        const seq = xsh[1];
+
+        const zero3 = [_]c_int{ 0, 0, 0 };
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var x_ane = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_ane);
+        const a_stop = [_]c_int{ 1, rows_a, h_dim };
+        try mlx.check(mlx.mlx_slice(&x_ane, x, &zero3, 3, &a_stop, 3, &strides3, 3, self.s));
+        var x_gpu = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_gpu);
+        const g_start = [_]c_int{ 0, rows_a, 0 };
+        const g_stop = [_]c_int{ 1, seq, h_dim };
+        try mlx.check(mlx.mlx_slice(&x_gpu, x, &g_start, 3, &g_stop, 3, &strides3, 3, self.s));
+
+        // Pack fp16 channel-major (anePackPlane): bf16→fp16 is exact in
+        // fp16's normal range and the ANE graph computes fp16 anyway.
+        const plane = eng.inputPlane(layer_idx) orelse return error.AnePlaneMissing;
+        try self.anePackPlane(x_ane, plane);
+
+        eng.kick(eng.layers[layer_idx].?);
+        var waited = false;
+        errdefer if (!waited) {
+            _ = eng.wait();
+        };
+
+        // GPU share: build AND submit its graph so it computes while the ANE
+        // runs (a lazy graph left unsubmitted would serialize the two).
+        const y_gpu = try self.denseMLP(x_gpu, dw);
+        defer _ = mlx.mlx_array_free(y_gpu);
+        {
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            _ = mlx.mlx_vector_array_append_value(ev, y_gpu);
+            _ = mlx.mlx_async_eval(ev);
+        }
+
+        const ok = eng.wait();
+        waited = true;
+        // Failed eval: recompute those rows on the GPU — correctness first,
+        // the warn came from the eval thread.
+        const y_ane = if (ok) blk: {
+            const out_plane = eng.outputPlane(layer_idx) orelse return error.AnePlaneMissing;
+            break :blk try self.aneReadPlane(out_plane, h_dim, rows_a, mlx.mlx_array_dtype(x));
+        } else try self.denseMLP(x_ane, dw);
+        defer _ = mlx.mlx_array_free(y_ane);
+
+        const parts = [_]mlx.mlx_array{ y_ane, y_gpu };
+        const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, self.s));
+        eng.logEngagedOnce();
+        return out;
+    }
+
+    const GdnProj = struct { qkv: mlx.mlx_array, z: mlx.mlx_array };
+
+    fn gdnProjGpu(self: *Transformer, x: mlx.mlx_array, la: *const LinearAttnWeights) !GdnProj {
+        return self.gdnProjArrays(x, la.qkv_w, la.qkv_s, la.qkv_b, la.z_w, la.z_s, la.z_b);
+    }
+
+    /// GDN separate-arm input-projection dispatch with the optional ANE row
+    /// split (v2 beside the MLP seam): same engagement conditions — a
+    /// full-width prefill chunk of a covered layer; everything else runs the
+    /// plain GPU projections.
+    fn gdnProjMaybeAne(self: *Transformer, x: mlx.mlx_array, la: *const LinearAttnWeights, layer_idx: usize, is_prefill: bool, seq_len: c_int) !GdnProj {
+        const eng = self.ane_prefill orelse return self.gdnProjGpu(x, la);
+        if (!is_prefill or seq_len != @as(c_int, @intCast(eng.chunk_rows))) return self.gdnProjGpu(x, la);
+        if (layer_idx >= eng.gdn_layers.len or eng.gdn_layers[layer_idx] == null) return self.gdnProjGpu(x, la);
+        const xsh = mlx.getShape(x);
+        if (xsh.len != 3 or xsh[0] != 1 or xsh[2] != @as(c_int, @intCast(eng.hidden))) return self.gdnProjGpu(x, la);
+        if (eng.mode == .channel) {
+            const rests = self.ane_chan orelse return self.gdnProjGpu(x, la);
+            const rest = &rests[layer_idx];
+            if (rest.gdn_qkv_w.ctx == null or rest.gdn_z_w.ctx == null) return self.gdnProjGpu(x, la);
+            return self.gdnProjAneChannel(eng, x, la, rest, layer_idx) catch |err| {
+                log.warn("[ane] gdn channel split failed on layer {d} ({s}) — GPU fallback\n", .{ layer_idx, @errorName(err) });
+                return self.gdnProjGpu(x, la);
+            };
+        }
+        return self.gdnProjAneSplit(eng, x, la, layer_idx) catch |err| {
+            // An ANE failure is never a request failure — whole chunk on GPU.
+            log.warn("[ane] gdn split failed on layer {d} ({s}) — GPU fallback\n", .{ layer_idx, @errorName(err) });
+            return self.gdnProjGpu(x, la);
+        };
+    }
+
+    /// The GDN split: first `eng.rows` chunk rows ride the fused qkv+z ANE
+    /// program while the GPU projects the rest; the ANE output plane is
+    /// [(qkv_out + z_out)][rows] channel-major with qkv rows first. Same
+    /// pack/kick/async/join discipline as denseMLPAneSplit.
+    fn gdnProjAneSplit(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, la: *const LinearAttnWeights, layer_idx: usize) !GdnProj {
+        const h_dim: c_int = @intCast(eng.hidden);
+        const rows_a: c_int = @intCast(eng.rows);
+        const qkv_w: c_int = @intCast(eng.gdn_qkv_out);
+        const z_w: c_int = @intCast(eng.gdn_z_out);
+        const out_w: c_int = qkv_w + z_w;
+        const xsh = mlx.getShape(x); // [1, S, H], S == eng.chunk_rows
+        const seq = xsh[1];
+        const handle = eng.gdn_layers[layer_idx].?;
+
+        const zero3 = [_]c_int{ 0, 0, 0 };
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var x_ane = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_ane);
+        const a_stop = [_]c_int{ 1, rows_a, h_dim };
+        try mlx.check(mlx.mlx_slice(&x_ane, x, &zero3, 3, &a_stop, 3, &strides3, 3, self.s));
+        var x_gpu = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_gpu);
+        const g_start = [_]c_int{ 0, rows_a, 0 };
+        const g_stop = [_]c_int{ 1, seq, h_dim };
+        try mlx.check(mlx.mlx_slice(&x_gpu, x, &g_start, 3, &g_stop, 3, &strides3, 3, self.s));
+
+        // Pack (fp16 channel-major, the denseMLPAneSplit pattern).
+        const plane = ane_offload.AnePrefill.planeInput(handle) orelse return error.AnePlaneMissing;
+        try self.anePackPlane(x_ane, plane);
+
+        eng.kick(handle);
+        var waited = false;
+        errdefer if (!waited) {
+            _ = eng.wait();
+        };
+
+        // GPU share: build AND submit so it computes while the ANE runs.
+        const gpu = try self.gdnProjGpu(x_gpu, la);
+        defer _ = mlx.mlx_array_free(gpu.qkv);
+        defer _ = mlx.mlx_array_free(gpu.z);
+        {
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            _ = mlx.mlx_vector_array_append_value(ev, gpu.qkv);
+            _ = mlx.mlx_vector_array_append_value(ev, gpu.z);
+            _ = mlx.mlx_async_eval(ev);
+        }
+
+        const ok = eng.wait();
+        waited = true;
+        var qkv_ane: mlx.mlx_array = undefined;
+        var z_ane: mlx.mlx_array = undefined;
+        if (ok) {
+            const out_plane = ane_offload.AnePrefill.planeOutput(handle) orelse return error.AnePlaneMissing;
+            const y_all = try self.aneReadPlane(out_plane, out_w, rows_a, mlx.mlx_array_dtype(x));
+            defer _ = mlx.mlx_array_free(y_all);
+            const sl3 = [_]c_int{ 1, 1, 1 };
+            qkv_ane = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(qkv_ane);
+            try mlx.check(mlx.mlx_slice(&qkv_ane, y_all, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, rows_a, qkv_w }, 3, &sl3, 3, self.s));
+            z_ane = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(z_ane);
+            try mlx.check(mlx.mlx_slice(&z_ane, y_all, &[_]c_int{ 0, 0, qkv_w }, 3, &[_]c_int{ 1, rows_a, out_w }, 3, &sl3, 3, self.s));
+        } else {
+            // Failed eval: recompute those rows on the GPU.
+            const redo = try self.gdnProjGpu(x_ane, la);
+            qkv_ane = redo.qkv;
+            z_ane = redo.z;
+        }
+        defer _ = mlx.mlx_array_free(qkv_ane);
+        defer _ = mlx.mlx_array_free(z_ane);
+
+        var out_qkv = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out_qkv);
+        {
+            const parts = [_]mlx.mlx_array{ qkv_ane, gpu.qkv };
+            const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&out_qkv, vec, 1, self.s));
+        }
+        var out_z = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out_z);
+        {
+            const parts = [_]mlx.mlx_array{ z_ane, gpu.z };
+            const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&out_z, vec, 1, self.s));
+        }
+        eng.logGdnEngagedOnce();
+        return .{ .qkv = out_qkv, .z = out_z };
+    }
+
+    /// Pack a [1, R, H] hidden tensor into an fp16 CHANNEL-major ANE input
+    /// plane ([H][R], element (r, c) at plane[c*R + r]): transpose + astype
+    /// flattened 1-D to force a row-major materialization (the raw-read
+    /// contiguity rule), then one contiguous memcpy.
+    fn anePackPlane(self: *Transformer, x_rows: mlx.mlx_array, plane: [*]f16) !void {
+        const sh = mlx.getShape(x_rows); // [1, R, H]
+        const rows = sh[1];
+        const h_dim = sh[2];
+        var x_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_flat);
+        {
+            var x2d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x2d);
+            const shape2 = [_]c_int{ rows, h_dim };
+            try mlx.check(mlx.mlx_reshape(&x2d, x_rows, &shape2, 2, self.s));
+            var xt_view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xt_view);
+            const perm = [_]c_int{ 1, 0 };
+            try mlx.check(mlx.mlx_transpose_axes(&xt_view, x2d, &perm, 2, self.s));
+            var xf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xf);
+            try mlx.check(mlx.mlx_astype(&xf, xt_view, .float16, self.s));
+            const flat_shape = [_]c_int{h_dim * rows};
+            try mlx.check(mlx.mlx_reshape(&x_flat, xf, &flat_shape, 1, self.s));
+        }
+        try mlx.check(mlx.mlx_array_eval(x_flat));
+        const src = mlx.mlx_array_data_float16(x_flat) orelse return error.AnePackReadFailed;
+        const count: usize = @intCast(h_dim * rows);
+        @memcpy(plane[0..count], src[0..count]);
+    }
+
+    /// Read an ANE output plane ([width][R] fp16 channel-major) back as a
+    /// [1, R, width] tensor in `dtype`.
+    fn aneReadPlane(self: *Transformer, plane: [*]f16, width: c_int, rows: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+        const t_shape = [_]c_int{ width, rows };
+        // mlx_array_new_data COPIES at construction, so the plane is free
+        // for the next program the moment this returns.
+        const y_f16 = mlx.mlx_array_new_data(plane, &t_shape, 2, .float16);
+        defer _ = mlx.mlx_array_free(y_f16);
+        var y_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y_t);
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&y_t, y_f16, &perm, 2, self.s));
+        var y_cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y_cast);
+        try mlx.check(mlx.mlx_astype(&y_cast, y_t, dtype, self.s));
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        const shape3 = [_]c_int{ 1, rows, width };
+        try mlx.check(mlx.mlx_reshape(&out, y_cast, &shape3, 3, self.s));
+        return out;
+    }
+
+    // ── ANE channel-split (A1, MLX_SERVE_ANE_MODE=channel) ──
+
+    /// Channel-mode dense MLP: both units see ALL chunk rows — the ANE
+    /// computes output channels [0..k) of gate/up and the matching down
+    /// K-slabs (a PARTIAL down sum), the GPU the rest via the stored
+    /// complement slices; the two partials ADD at the seam. Same
+    /// pack/kick/async/join discipline as the row split.
+    fn denseMLPAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, dw: *const DenseMlpWeights, rest: *const DenseMlpWeights, layer_idx: usize) !mlx.mlx_array {
+        const handle = eng.layers[layer_idx].?;
+        const plane = ane_offload.AnePrefill.planeInput(handle) orelse return error.AnePlaneMissing;
+        try self.anePackPlane(x, plane);
+        eng.kick(handle);
+        var waited = false;
+        errdefer if (!waited) {
+            _ = eng.wait();
+        };
+
+        // GPU rest-channel partial: build AND submit so it computes while
+        // the ANE runs.
+        const y_gpu = try self.denseMLP(x, rest);
+        defer _ = mlx.mlx_array_free(y_gpu);
+        {
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            _ = mlx.mlx_vector_array_append_value(ev, y_gpu);
+            _ = mlx.mlx_async_eval(ev);
+        }
+
+        const ok = eng.wait();
+        waited = true;
+        if (!ok) {
+            // Failed eval: the rest partial alone is not an answer — the
+            // whole layer recomputes on the GPU from the original weights.
+            return self.denseMLP(x, dw);
+        }
+        const out_plane = ane_offload.AnePrefill.planeOutput(handle) orelse return error.AnePlaneMissing;
+        const y_ane = try self.aneReadPlane(out_plane, @intCast(eng.hidden), @intCast(eng.rows), mlx.mlx_array_dtype(x));
+        defer _ = mlx.mlx_array_free(y_ane);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_add(&out, y_ane, y_gpu, self.s));
+        eng.logEngagedOnce();
+        return out;
+    }
+
+    /// GDN projections through explicit weight arrays (the channel rest
+    /// slices ride this; gdnProjGpu delegates for the full weights).
+    fn gdnProjArrays(self: *Transformer, x: mlx.mlx_array, qkv_w: mlx.mlx_array, qkv_s: mlx.mlx_array, qkv_b: mlx.mlx_array, z_w: mlx.mlx_array, z_s: mlx.mlx_array, z_b: mlx.mlx_array) !GdnProj {
+        const qkv = try self.qmatmul(x, qkv_w, qkv_s, qkv_b);
+        errdefer _ = mlx.mlx_array_free(qkv);
+        const z = try self.qmatmul(x, z_w, z_s, z_b);
+        return .{ .qkv = qkv, .z = z };
+    }
+
+    /// Channel-mode GDN projections: the ANE computes output channels
+    /// [0..kq) of qkv and [0..kz) of z (one fused program), the GPU the
+    /// rest; each tensor CONCATENATES on the channel axis.
+    fn gdnProjAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, la: *const LinearAttnWeights, rest: *const AneChanRest, layer_idx: usize) !GdnProj {
+        const rows_a: c_int = @intCast(eng.rows);
+        const kq: c_int = @intCast(eng.gdn_qkv_out);
+        const kz: c_int = @intCast(eng.gdn_z_out);
+        const out_w: c_int = kq + kz;
+        const handle = eng.gdn_layers[layer_idx].?;
+        const plane = ane_offload.AnePrefill.planeInput(handle) orelse return error.AnePlaneMissing;
+        try self.anePackPlane(x, plane);
+        eng.kick(handle);
+        var waited = false;
+        errdefer if (!waited) {
+            _ = eng.wait();
+        };
+
+        const gpu = try self.gdnProjArrays(x, rest.gdn_qkv_w, rest.gdn_qkv_s, rest.gdn_qkv_b, rest.gdn_z_w, rest.gdn_z_s, rest.gdn_z_b);
+        defer _ = mlx.mlx_array_free(gpu.qkv);
+        defer _ = mlx.mlx_array_free(gpu.z);
+        {
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            _ = mlx.mlx_vector_array_append_value(ev, gpu.qkv);
+            _ = mlx.mlx_vector_array_append_value(ev, gpu.z);
+            _ = mlx.mlx_async_eval(ev);
+        }
+
+        const ok = eng.wait();
+        waited = true;
+        if (!ok) return self.gdnProjGpu(x, la);
+        const out_plane = ane_offload.AnePrefill.planeOutput(handle) orelse return error.AnePlaneMissing;
+        const y_all = try self.aneReadPlane(out_plane, out_w, rows_a, mlx.mlx_array_dtype(x));
+        defer _ = mlx.mlx_array_free(y_all);
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var qkv_ane = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qkv_ane);
+        try mlx.check(mlx.mlx_slice(&qkv_ane, y_all, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, rows_a, kq }, 3, &strides3, 3, self.s));
+        var z_ane = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(z_ane);
+        try mlx.check(mlx.mlx_slice(&z_ane, y_all, &[_]c_int{ 0, 0, kq }, 3, &[_]c_int{ 1, rows_a, out_w }, 3, &strides3, 3, self.s));
+
+        var out_qkv = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out_qkv);
+        {
+            const parts = [_]mlx.mlx_array{ qkv_ane, gpu.qkv };
+            const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&out_qkv, vec, 2, self.s));
+        }
+        var out_z = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out_z);
+        {
+            const parts = [_]mlx.mlx_array{ z_ane, gpu.z };
+            const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&out_z, vec, 2, self.s));
+        }
+        eng.logGdnEngagedOnce();
+        return .{ .qkv = out_qkv, .z = out_z };
+    }
+
+    /// Axis-0 (output-channel) slice [from..n) of a packed weight or its
+    /// scales/biases as a zero-copy VIEW — pinned bit-exact through qmm by
+    /// the "axis-0 slice VIEW" test. A null-sentinel input stays null.
+    fn aneSliceRowsView(self: *Transformer, a: mlx.mlx_array, from: c_int) !mlx.mlx_array {
+        if (a.ctx == null) return a;
+        const sh = mlx.getShape(a);
+        if (sh.len != 2) return error.AneWeightShape;
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        const start = [_]c_int{ from, 0 };
+        const stop = [_]c_int{ sh[0], sh[1] };
+        const strides = [_]c_int{ 1, 1 };
+        try mlx.check(mlx.mlx_slice(&out, a, &start, 2, &stop, 2, &strides, 2, self.s));
+        return out;
+    }
+
+    /// Axis-1 (input-channel) slice [from..m) of a packed weight or its
+    /// scales/biases, MATERIALIZED (the splitPackedGateUp rule — an axis-1
+    /// slice is not contiguous). A null-sentinel input stays null.
+    fn aneSliceColsCopy(self: *Transformer, a: mlx.mlx_array, from: c_int) !mlx.mlx_array {
+        if (a.ctx == null) return a;
+        const sh = mlx.getShape(a);
+        if (sh.len != 2) return error.AneWeightShape;
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        const start = [_]c_int{ 0, from };
+        const stop = [_]c_int{ sh[0], sh[1] };
+        const strides = [_]c_int{ 1, 1 };
+        try mlx.check(mlx.mlx_slice(&view, a, &start, 2, &stop, 2, &strides, 2, self.s));
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_contiguous(&out, view, false, self.s));
+        try mlx.check(mlx.mlx_array_eval(out));
+        return out;
+    }
+
+    /// Dequantize one [out, in] weight to a host f32 buffer (caller frees).
+    /// v1 serves quantized packs only — a dense bf16 checkpoint declines
+    /// (its ANE copy would want the transpose-back path; add when a real
+    /// pack needs it).
+    fn dequantToHostF32(self: *Transformer, allocator: std.mem.Allocator, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, in_dim: u32, out_dim: u32) ![]f32 {
+        if (sc.ctx == null) return error.AneDenseBf16Unsupported;
+        const qp = self.quantParamsHinted(w, sc, in_dim);
+        var deq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(deq);
+        try mlx.check(mlx.mlx_dequantize(
+            &deq,
+            w,
+            sc,
+            bi,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            .{}, // global_scale
+            .{ .value = .float32, .has_value = true },
+            self.s,
+        ));
+        const sh = mlx.getShape(deq);
+        if (sh.len != 2 or sh[0] != @as(c_int, @intCast(out_dim)) or sh[1] != @as(c_int, @intCast(in_dim))) return error.AneWeightShape;
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const n: c_int = @intCast(out_dim * in_dim);
+        const fs = [_]c_int{n};
+        try mlx.check(mlx.mlx_reshape(&flat, deq, &fs, 1, self.s));
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const ptr = mlx.mlx_array_data_float32(flat) orelse return error.AneDequantRead;
+        const out = try allocator.alloc(f32, @intCast(n));
+        @memcpy(out, ptr[0..@intCast(n)]);
+        return out;
+    }
+
+    /// Build the per-layer ANE MLP programs (`--ane-prefill`). Never fails
+    /// the load: every refusal is a NAMED `[ane]` line and the model serves
+    /// GPU-only. v1 scope: qwen3_5-family DENSE MLP (data-dependent MoE
+    /// routing is not expressible as a fixed-shape ANE graph).
+    pub fn buildAnePrefill(self: *Transformer, io: std.Io, chunk_rows: u32, share: f32) void {
+        if (self.ane_prefill != null) return;
+        if (!ane_offload.available()) {
+            log.warn("[ane] unavailable: AppleNeuralEngine framework not present — --ane-prefill disabled\n", .{});
+            return;
+        }
+        const cfg = &self.config;
+        const ml = self.moe_layers orelse {
+            log.warn("[ane] --ane-prefill: {s} is outside the v1 scope (qwen3_5-family dense MLP) — disabled\n", .{cfg.model_type});
+            return;
+        };
+        if (!std.mem.eql(u8, cfg.model_type, "qwen3_5_moe")) {
+            log.warn("[ane] --ane-prefill: {s} is outside the qwen3_5-family scope — disabled\n", .{cfg.model_type});
+            return;
+        }
+        // A MoE checkpoint's routed experts are data-dependent and can never
+        // ride a fixed-shape ANE graph, and its shared-expert MLP measured a
+        // ~5% FLOPs ceiling (A7 spike, 35B-A3B) — but the GDN input
+        // projections are per-token dense and a 32% ceiling there, so a MoE
+        // target gets GDN-ONLY coverage (the dense-MLP loop below simply
+        // finds no .dense arms).
+        const hidden = cfg.hidden_size;
+        const ffn = cfg.intermediate_size;
+        var dense_layer_count: u64 = 0;
+        for (ml) |*lw| {
+            switch (lw.mlp) {
+                .dense => dense_layer_count += 1,
+                .moe => {},
+            }
+        }
+        // GDN input projections (v2): separate-proj GDN layers only
+        // (qwen3_next's combined arm stays GPU). MLX_SERVE_ANE_GDN=0 keeps
+        // the offload MLP-only for attribution A/Bs.
+        const gdn_qkv_out: u32 = @intCast(2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + cfg.linear_num_value_heads * cfg.linear_value_head_dim);
+        const gdn_z_out: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
+        var gdn_target_layers: u64 = if (ane_offload.gdnEnabled() and gdn_qkv_out > 0 and gdn_z_out > 0) blk: {
+            var n: u64 = 0;
+            for (ml) |*lw| {
+                switch (lw.attn) {
+                    .linear => |*la| {
+                        if (!la.combined_proj) n += 1;
+                    },
+                    else => {},
+                }
+            }
+            break :blk n;
+        } else 0;
+        // Mode geometry (A1): row mode tiles TOKEN rows through full-width
+        // programs; channel mode runs ALL chunk rows through OUTPUT-channel
+        // slices (the engine widths become the sliced widths and the GPU
+        // serves the complement).
+        const mode = ane_offload.splitMode();
+        var rows: u32 = undefined;
+        var eng_ffn: u32 = ffn;
+        var eng_qkv: u32 = gdn_qkv_out;
+        var eng_z: u32 = gdn_z_out;
+        if (mode == .row) {
+            rows = ane_offload.aneShareRows(chunk_rows, share);
+            if (rows == 0) {
+                log.warn("[ane] --ane-prefill: share {d:.2} of chunk {d} leaves no usable ANE tile — disabled\n", .{ share, chunk_rows });
+                return;
+            }
+        } else {
+            if (chunk_rows % 32 != 0) {
+                log.warn("[ane] --ane-prefill: channel mode needs a 32-multiple prefill chunk (got {d}) — disabled\n", .{chunk_rows});
+                return;
+            }
+            rows = chunk_rows;
+            eng_ffn = ane_offload.channelSliceWidth(ffn, share);
+            if (eng_ffn == 0 and dense_layer_count > 0) {
+                log.warn("[ane] --ane-prefill: share {d:.2} of ffn {d} leaves no usable channel slice — disabled\n", .{ share, ffn });
+                return;
+            }
+            eng_qkv = ane_offload.channelSliceWidth(gdn_qkv_out, share);
+            eng_z = ane_offload.channelSliceWidth(gdn_z_out, share);
+            if (eng_qkv == 0 or eng_z == 0) gdn_target_layers = 0;
+        }
+        const gdn_on = gdn_target_layers > 0;
+        // Per-model admission (replaces the v1 flat 96 GB total-RAM gate):
+        // bill the int8 copies + fp16 planes THIS config will build — plus,
+        // in channel mode, the materialized GPU-side down-rest slices —
+        // against what is already resident. A 27B bills ~20 GB row / ~10 GB
+        // channel and needs a big Mac; a 0.8B bills ~1 GB and runs on a
+        // small one.
+        {
+            var chan_rest_bytes: u64 = 0;
+            if (mode == .channel and eng_ffn > 0) for (ml) |*lw| {
+                switch (lw.mlp) {
+                    .dense => |*dw| {
+                        const down_bytes = mlx.mlx_array_size(dw.down_w) * mlx.mlx_array_itemsize(dw.down_w) +
+                            mlx.mlx_array_size(dw.down_s) * mlx.mlx_array_itemsize(dw.down_s) +
+                            (if (dw.down_b.ctx != null) mlx.mlx_array_size(dw.down_b) * mlx.mlx_array_itemsize(dw.down_b) else 0);
+                        chan_rest_bytes += down_bytes * (ffn - eng_ffn) / ffn;
+                    },
+                    .moe => {},
+                }
+            };
+            const bill = ane_offload.engineBillBytes(dense_layer_count, gdn_target_layers, hidden, eng_ffn, eng_qkv, eng_z, rows) + chan_rest_bytes;
+            const total_mem = totalMemBytes();
+            var resident: usize = 0;
+            _ = mlx.mlx_get_active_memory(&resident);
+            if (!ane_offload.gateAllows(total_mem, resident, bill)) {
+                const gib = 1024 * 1024 * 1024;
+                log.warn("[ane] --ane-prefill: the {s}-mode offload bills ~{d:.1} GB (int8 copies + I/O planes{s}) on top of {d:.1} GB resident + {d} GB headroom, exceeding {d} GB total RAM — disabled\n", .{
+                    @tagName(mode),
+                    @as(f64, @floatFromInt(bill)) / gib,
+                    if (mode == .channel) " + GPU rest slices" else "",
+                    @as(f64, @floatFromInt(resident)) / gib,
+                    ane_offload.GATE_HEADROOM_BYTES / gib,
+                    total_mem / gib,
+                });
+                return;
+            }
+        }
+        // Pre-build disk check (A8): under the hard floor even cache
+        // restores and the framework's own saves fail bare, and the build
+        // ships silent partial coverage — refuse by name and serve GPU-only
+        // instead. Above the floor but under the full cold-build budget is
+        // only a WARNING: warm cache entries need ~no scratch and a cold
+        // build converges across boots.
+        {
+            const free_disk = ane_offload.internalFreeDiskBytes();
+            const gib = 1024 * 1024 * 1024;
+            if (free_disk > 0 and free_disk < ane_offload.BUILD_DISK_FLOOR_BYTES) {
+                log.warn("[ane] --ane-prefill: only {d:.1} GB free on the internal disk — below the {d} GB build floor, where ANE compiles fail bare and coverage ships partial; build skipped (free disk, then reload)\n", .{
+                    @as(f64, @floatFromInt(free_disk)) / gib,
+                    ane_offload.BUILD_DISK_FLOOR_BYTES / gib,
+                });
+                return;
+            }
+            const cold_budget: u64 = @as(u64, cfg.num_hidden_layers) * 3 * hidden * eng_ffn;
+            if (free_disk > 0 and free_disk < cold_budget) {
+                log.info("[ane] internal free disk {d:.1} GB is under a fully-cold build's ~{d:.1} GB compiler-scratch budget — a cold build will converge across boots (warm cache entries are unaffected)\n", .{
+                    @as(f64, @floatFromInt(free_disk)) / gib,
+                    @as(f64, @floatFromInt(cold_budget)) / gib,
+                });
+            }
+        }
+        const eng = ane_offload.AnePrefill.init(self.allocator, io, cfg.num_hidden_layers, hidden, eng_ffn, rows, chunk_rows, if (gdn_on) eng_qkv else 0, if (gdn_on) eng_z else 0, mode) catch |err| {
+            log.warn("[ane] engine init failed ({s}) — disabled\n", .{@errorName(err)});
+            return;
+        };
+        if (mode == .channel) {
+            const rests = self.allocator.alloc(AneChanRest, cfg.num_hidden_layers) catch {
+                log.warn("[ane] channel rest table alloc failed — disabled\n", .{});
+                eng.deinit();
+                return;
+            };
+            @memset(rests, .{});
+            self.ane_chan = rests;
+        }
+        var built: usize = 0;
+        var gdn_built: usize = 0;
+        var int8_bytes: u64 = 0;
+        const build_start = std.Io.Timestamp.now(io, .awake);
+        // A failed layer compile is worth ONE retry pass: the dominant
+        // cause is the build's own staging burst running the disk out
+        // (bounded now that compile inputs are deleted post-load, and a
+        // partial build's cache entries make the NEXT boot converge), and
+        // the rare aned-margin failure heals on a second attempt. A partial
+        // build otherwise stays partial for the whole serve.
+        var pass: usize = 0;
+        while (pass < 2) : (pass += 1) {
+            var failed: usize = 0;
+            for (ml, 0..) |*lw, i| {
+                switch (lw.mlp) {
+                    .dense => |*dw| {
+                        if (eng.layers[i] != null) continue;
+                        const gate = self.dequantToHostF32(self.allocator, dw.gate_w, dw.gate_s, dw.gate_b, hidden, ffn) catch |err| {
+                            log.warn("[ane] layer {d} gate dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                            continue;
+                        };
+                        defer self.allocator.free(gate);
+                        const up = self.dequantToHostF32(self.allocator, dw.up_w, dw.up_s, dw.up_b, hidden, ffn) catch |err| {
+                            log.warn("[ane] layer {d} up dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                            continue;
+                        };
+                        defer self.allocator.free(up);
+                        const down = self.dequantToHostF32(self.allocator, dw.down_w, dw.down_s, dw.down_b, ffn, hidden) catch |err| {
+                            log.warn("[ane] layer {d} down dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                            continue;
+                        };
+                        defer self.allocator.free(down);
+                        if (mode == .channel) {
+                            const k = eng_ffn;
+                            self.ane_chan.?[i].mlp = self.aneBuildMlpRest(dw, k, ffn) catch |err| {
+                                log.warn("[ane] layer {d} channel rest slicing failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                                continue;
+                            };
+                            // ANE slice of the dequant buffers: gate/up rows
+                            // [0..k) are contiguous; down repacks [:, 0..k).
+                            const kh: usize = @as(usize, k) * @as(usize, hidden);
+                            const down_slice = self.allocator.alloc(f32, @as(usize, hidden) * k) catch {
+                                self.ane_chan.?[i].deinit();
+                                continue;
+                            };
+                            defer self.allocator.free(down_slice);
+                            for (0..hidden) |r| @memcpy(down_slice[r * k ..][0..k], down[r * ffn ..][0..k]);
+                            eng.buildLayer(i, gate[0..kh], up[0..kh], down_slice) catch {
+                                self.ane_chan.?[i].deinit();
+                                failed += 1;
+                                continue;
+                            };
+                            built += 1;
+                            int8_bytes += 3 * @as(u64, hidden) * @as(u64, k);
+                        } else {
+                            eng.buildLayer(i, gate, up, down) catch {
+                                failed += 1;
+                                continue;
+                            };
+                            built += 1;
+                            int8_bytes += 3 * @as(u64, hidden) * @as(u64, ffn);
+                        }
+                    },
+                    .moe => {},
+                }
+            }
+            if (gdn_on and gdn_qkv_out > 0 and gdn_z_out > 0) for (ml, 0..) |*lw, i| {
+                switch (lw.attn) {
+                    .linear => |*la| {
+                        if (la.combined_proj or eng.gdn_layers[i] != null) continue;
+                        const qkv = self.dequantToHostF32(self.allocator, la.qkv_w, la.qkv_s, la.qkv_b, hidden, gdn_qkv_out) catch |err| {
+                            log.warn("[ane] layer {d} gdn qkv dequant failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
+                            continue;
+                        };
+                        defer self.allocator.free(qkv);
+                        const z = self.dequantToHostF32(self.allocator, la.z_w, la.z_s, la.z_b, hidden, gdn_z_out) catch |err| {
+                            log.warn("[ane] layer {d} gdn z dequant failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
+                            continue;
+                        };
+                        defer self.allocator.free(z);
+                        if (mode == .channel) {
+                            self.aneBuildGdnRest(&self.ane_chan.?[i], la, eng_qkv, eng_z) catch |err| {
+                                log.warn("[ane] layer {d} gdn channel rest slicing failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
+                                continue;
+                            };
+                            eng.buildGdnLayer(i, eng_qkv, eng_z, qkv[0 .. @as(usize, eng_qkv) * hidden], z[0 .. @as(usize, eng_z) * hidden]) catch {
+                                self.ane_chan.?[i].deinitGdn();
+                                failed += 1;
+                                continue;
+                            };
+                            gdn_built += 1;
+                            int8_bytes += @as(u64, eng_qkv + eng_z) * @as(u64, hidden);
+                        } else {
+                            eng.buildGdnLayer(i, gdn_qkv_out, gdn_z_out, qkv, z) catch {
+                                failed += 1;
+                                continue;
+                            };
+                            gdn_built += 1;
+                            int8_bytes += @as(u64, gdn_qkv_out + gdn_z_out) * @as(u64, hidden);
+                        }
+                    },
+                    else => {},
+                }
+            };
+            if (failed == 0) break;
+            if (pass == 0) {
+                log.warn("[ane] {d} layer program builds failed — one retry pass\n", .{failed});
+                std.Io.sleep(io, .fromMilliseconds(2000), .real) catch {};
+            }
+        }
+        if (built == 0 and gdn_built == 0) {
+            log.warn("[ane] no layer produced an ANE program — disabled\n", .{});
+            eng.deinit();
+            if (self.ane_chan) |rests| {
+                for (rests) |*r| r.deinit();
+                self.allocator.free(rests);
+                self.ane_chan = null;
+            }
+            return;
+        }
+        const secs: f64 = @as(f64, @floatFromInt(@as(u64, @intCast(build_start.untilNow(io, .awake).nanoseconds)))) / 1e9;
+        eng.publishLive(share, int8_bytes);
+        self.ane_prefill = eng;
+        log.info("[ane] prefill offload ready: mode={s} {d}/{d} mlp + {d} gdn layers, rows={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ @tagName(mode), built, ml.len, gdn_built, rows, chunk_rows, share, int8_bytes / (1024 * 1024), secs });
+    }
+
+    /// Channel-mode GPU MLP complement for one layer: gate/up rest-channel
+    /// VIEWS (rows [k..ffn) of the packed weights — axis-0, pinned safe) +
+    /// the down rest-K slice MATERIALIZED (axis-1). The slice boundary must
+    /// sit on the down weight's quant-group and packed-word grid, else the
+    /// layer declines by name.
+    fn aneBuildMlpRest(self: *Transformer, dw: *const DenseMlpWeights, k: u32, ffn: u32) !DenseMlpWeights {
+        const qp = self.quantParamsHinted(dw.down_w, dw.down_s, ffn);
+        if (qp.group_size == 0 or k % @as(u32, @intCast(qp.group_size)) != 0 or (k * @as(u32, @intCast(qp.bits))) % 32 != 0)
+            return error.AneChanAlignment;
+        const kk: c_int = @intCast(k);
+        var rest: DenseMlpWeights = undefined;
+        rest.gate_w = try self.aneSliceRowsView(dw.gate_w, kk);
+        errdefer _ = mlx.mlx_array_free(rest.gate_w);
+        rest.gate_s = try self.aneSliceRowsView(dw.gate_s, kk);
+        errdefer if (rest.gate_s.ctx != null) {
+            _ = mlx.mlx_array_free(rest.gate_s);
+        };
+        rest.gate_b = try self.aneSliceRowsView(dw.gate_b, kk);
+        errdefer if (rest.gate_b.ctx != null) {
+            _ = mlx.mlx_array_free(rest.gate_b);
+        };
+        rest.up_w = try self.aneSliceRowsView(dw.up_w, kk);
+        errdefer _ = mlx.mlx_array_free(rest.up_w);
+        rest.up_s = try self.aneSliceRowsView(dw.up_s, kk);
+        errdefer if (rest.up_s.ctx != null) {
+            _ = mlx.mlx_array_free(rest.up_s);
+        };
+        rest.up_b = try self.aneSliceRowsView(dw.up_b, kk);
+        errdefer if (rest.up_b.ctx != null) {
+            _ = mlx.mlx_array_free(rest.up_b);
+        };
+        rest.down_w = try self.aneSliceColsCopy(dw.down_w, @intCast(k * @as(u32, @intCast(qp.bits)) / 32));
+        errdefer _ = mlx.mlx_array_free(rest.down_w);
+        const g_from: c_int = @intCast(k / @as(u32, @intCast(qp.group_size)));
+        rest.down_s = try self.aneSliceColsCopy(dw.down_s, g_from);
+        errdefer if (rest.down_s.ctx != null) {
+            _ = mlx.mlx_array_free(rest.down_s);
+        };
+        rest.down_b = try self.aneSliceColsCopy(dw.down_b, g_from);
+        return rest;
+    }
+
+    /// Channel-mode GPU GDN complement: qkv/z rest-channel views written
+    /// into the layer's AneChanRest entry (all axis-0, zero-copy).
+    fn aneBuildGdnRest(self: *Transformer, entry: *AneChanRest, la: *const LinearAttnWeights, kq: u32, kz: u32) !void {
+        errdefer entry.deinitGdn();
+        entry.gdn_qkv_w = try self.aneSliceRowsView(la.qkv_w, @intCast(kq));
+        entry.gdn_qkv_s = try self.aneSliceRowsView(la.qkv_s, @intCast(kq));
+        entry.gdn_qkv_b = try self.aneSliceRowsView(la.qkv_b, @intCast(kq));
+        entry.gdn_z_w = try self.aneSliceRowsView(la.z_w, @intCast(kz));
+        entry.gdn_z_s = try self.aneSliceRowsView(la.z_s, @intCast(kz));
+        entry.gdn_z_b = try self.aneSliceRowsView(la.z_b, @intCast(kz));
     }
 
     // ── Sparse MoE MLP ──
@@ -30931,4 +31800,90 @@ test "spliceVisionRows: audio placeholders share the row stream in prompt order"
     try std.testing.expectEqual(@as(f32, 50), ptr[0]); // image row 0
     try std.testing.expectEqual(@as(f32, 0), ptr[4]); // text untouched
     try std.testing.expectEqual(@as(f32, 51), ptr[8]); // audio row 1
+}
+
+test "ane channel-split GPU complement: axis-0 slice VIEW of a packed weight through qmm vs its materialized copy" {
+    // The channel-split GPU complement wants the rest-channel gate/up/qkv/z
+    // weights as zero-copy axis-0 slice views of the resident packed
+    // buffers (the down slice is axis-1 and always materialized). The
+    // splitPackedGateUp rule says slice-born weights are materialized at
+    // load — this pins whether an OFFSET row-contiguous view is in that
+    // class on the current mlx pin, and the channel-mode design follows
+    // the verdict.
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xA1C4);
+    const rnd = prng.random();
+    const n_out: c_int = 256;
+    const k_in: c_int = 512;
+    const half: c_int = n_out / 2;
+
+    const w_shape = [_]c_int{ n_out, k_in };
+    const w = try attn256RandBf16(rnd, &w_shape, s);
+    defer _ = mlx.mlx_array_free(w);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var wq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wq);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+
+    const x_shape = [_]c_int{ 1, 8, k_in };
+    const x = try attn256RandBf16(rnd, &x_shape, s);
+    defer _ = mlx.mlx_array_free(x);
+
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_quantized_matmul(&full, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    // Reference tail: output channels [half..n_out) of the FULL qmm.
+    var ref_tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_tail);
+    {
+        const start = [_]c_int{ 0, 0, half };
+        const stop = [_]c_int{ 1, 8, n_out };
+        const strides = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&ref_tail, full, &start, 3, &stop, 3, &strides, 3, s));
+    }
+
+    // Axis-0 slice VIEWS of the packed weight + scales + biases.
+    var wq_v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wq_v);
+    var sc_v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc_v);
+    var bi_v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi_v);
+    inline for (.{ .{ &wq_v, wq }, .{ &sc_v, sc }, .{ &bi_v, bi } }) |pair| {
+        const src_shape = mlx.getShape(pair[1]);
+        const start = [_]c_int{ half, 0 };
+        const stop = [_]c_int{ n_out, src_shape[1] };
+        const strides = [_]c_int{ 1, 1 };
+        try mlx.check(mlx.mlx_slice(pair[0], pair[1], &start, 2, &stop, 2, &strides, 2, s));
+    }
+    var y_view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_view);
+    try mlx.check(mlx.mlx_quantized_matmul(&y_view, x, wq_v, sc_v, bi_v, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+
+    // Materialized copies of the same slices.
+    var y_copy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_copy);
+    {
+        const wq_c = try materializedOwnedCopy(s, wq_v);
+        defer _ = mlx.mlx_array_free(wq_c);
+        const sc_c = try materializedOwnedCopy(s, sc_v);
+        defer _ = mlx.mlx_array_free(sc_c);
+        const bi_c = try materializedOwnedCopy(s, bi_v);
+        defer _ = mlx.mlx_array_free(bi_c);
+        try mlx.check(mlx.mlx_quantized_matmul(&y_copy, x, wq_c, sc_c, bi_c, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    }
+
+    const copy_err = try maxAbsDiffF32(y_copy, ref_tail, s);
+    const view_err = try maxAbsDiffF32(y_view, ref_tail, s);
+    std.debug.print("[ane-chan] qmm slice: copy_err={d} view_err={d}\n", .{ copy_err, view_err });
+    try std.testing.expectEqual(@as(f32, 0), copy_err);
+    try std.testing.expectEqual(@as(f32, 0), view_err);
 }

@@ -39,6 +39,7 @@ const generate_mod = @import("generate.zig");
 const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
@@ -118,6 +119,15 @@ pub const LoadParams = struct {
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
+    /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
+    /// perf-plan-aug-17 P5). Opt-in, lossy by design; every refusal is a
+    /// named `[ane]` line and the model serves GPU-only.
+    ane_prefill: bool = false,
+    /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
+    /// pointer because the scheduler deliberately has no server.zig import.
+    /// The ANE build compiles fixed-shape tiles against THIS width — resolving
+    /// it any other way would let the tile and the forward's chunk drift.
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -936,6 +946,9 @@ pub const LoadRequest = struct {
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
+    /// `--ane-prefill` survives cold loads (the flag-eater class).
+    ane_prefill: bool = false,
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
 
     load_vision: bool = false,
     warmup_eager: bool = true,
@@ -1088,6 +1101,9 @@ pub const Scheduler = struct {
     ds4_mtp: bool,
     ds4_dspark: bool,
     ds4_ssd_streaming: bool,
+    /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
+    ane_prefill: bool,
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
     /// became load-bearing on this path the moment `dflash.resolveInDirDrafter`
     /// started probing `<model_dir>/drafter` at load: without it here, a server
@@ -1258,6 +1274,8 @@ pub const Scheduler = struct {
             .ds4_mtp = params.ds4_mtp,
             .ds4_dspark = params.ds4_dspark,
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
+            .ane_prefill = params.ane_prefill,
+            .ane_chunk_resolver = params.ane_chunk_resolver,
             .no_drafter = params.no_drafter,
             .drafter_dir = params.drafter_dir,
             .primary_model_dir = params.model_dir,
@@ -1741,6 +1759,8 @@ pub const Scheduler = struct {
             .ds4_mtp = self.ds4_mtp,
             .ds4_dspark = self.ds4_dspark,
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
+            .ane_prefill = self.ane_prefill,
+            .ane_chunk_resolver = self.ane_chunk_resolver,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -2673,7 +2693,8 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "mtp_enabled",             "mtp_depth",                 "llama_cache_entries",
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
-        "draft_block_size",        "draft_block_size_explicit",
+        "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
+        "ane_chunk_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3296,6 +3317,39 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         h.deinit();
         sch.allocator.destroy(h);
     };
+
+    // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
+    // HERE because the mlx dequant must run on the inference thread (sole
+    // MLX caller), with the chunk width resolved through the server's own
+    // pin (idempotent — the later pinAutoContext keeps this value), so the
+    // compiled fixed-shape tile matches the width the forward will run.
+    if (params.ane_prefill) {
+        if (params.ane_chunk_resolver) |resolve| {
+            const pinned = resolve(@constCast(params.config));
+            // The forward's chunk is the pinned width run through the SAME
+            // per-request policy every prefill applies (effectivePrefillChunk:
+            // the MoE 4096 / dense-hd-256 8192 caps + the --prefill-chunk and
+            // env overrides) — compiling the tile at the pinned width alone
+            // left every MoE program built at 8192 while the forward chunked
+            // at 4096: built, never dispatched (A7, 2026-08-18). total_ctx is
+            // representative-large: under the default fused-causal mode the
+            // policy arm is ctx-independent, and under the composed fallback
+            // the chunk is ctx-dependent anyway (fixed shapes cannot follow
+            // it, and the seam's width equality just never engages).
+            const cfg = params.config;
+            const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+                cfg.prefillScoreHeadDim(),
+                cfg.num_attention_heads,
+                1 << 20,
+                cfg.has_sliding_window,
+                cfg.isMoe(),
+                pinned,
+            ));
+            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare());
+        } else {
+            log.warn("[ane] --ane-prefill: no prefill-chunk resolver on this load path — disabled\n", .{});
+        }
+    }
 
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
@@ -5985,4 +6039,25 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
+}
+
+test "the ANE build resolves its chunk through effectivePrefillChunk, never the pin alone" {
+    // The compiled ANE tile only serves chunks of EXACTLY its width, and the
+    // forward's chunk is the pin run through effectivePrefillChunk's
+    // per-arch policy (MoE caps at 4096 where the pin says 8192) — building
+    // at the bare pin left every MoE program built-but-never-dispatched
+    // (A7, 2026-08-18). The needle is split so this test's own text cannot
+    // satisfy it.
+    const src = @embedFile("scheduler.zig");
+    const needle = "effectivePrefillChunk" ++ "(";
+    var it = std.mem.splitSequence(u8, src, "xfm_ptr.buildAnePrefill");
+    _ = it.first();
+    const before_call = it.rest();
+    _ = before_call;
+    // The call site's chunk value must be produced by effectivePrefillChunk
+    // in the same block: find the buildAnePrefill call and scan the 1200
+    // bytes before it for the resolver.
+    const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
+    const window_start = call_at -| 1200;
+    try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
 }

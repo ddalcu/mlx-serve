@@ -28,6 +28,7 @@ const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -2802,7 +2803,7 @@ pub fn resolvePrefillChunk(
 /// transient reserve, and `checkAttentionMemory` and
 /// `generate.effectivePrefillChunk` then read the same frozen value, so the
 /// bill and the forward cannot drift.
-fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
+pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
@@ -4027,6 +4028,7 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
+    ane_json: []const u8,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
@@ -4038,7 +4040,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -4048,7 +4050,17 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
+        ane_json,
     });
+}
+
+/// The /props "ane" object (A8): mode, coverage, geometry and the int8
+/// bill of the resident ANE prefill engine, so "what is the Neural Engine
+/// holding" is answerable without log-grepping. Pure — the handler feeds
+/// it the engine's fields; returns a leading-comma fragment spliced before
+/// the props root close (empty when there is no engine).
+fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d}}}", .{ mode_name, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes });
 }
 
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
@@ -4100,7 +4112,18 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem);
+    // ANE prefill engine state (A8) — absent when the offload is off.
+    const ane_json = blk: {
+        if (lm.transformer) |x| {
+            if (x.ane_prefill) |eng| {
+                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes);
+            }
+        }
+        break :blk try allocator.dupe(u8, "");
+    };
+    defer allocator.free(ane_json);
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -7917,6 +7940,10 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     _ = mlx.mlx_get_cache_memory(&mlx_cache);
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
+    // ANE prefill offload totals — published by the engines themselves
+    // (ane.publishLive / deinit), so this is a lock-free read.
+    ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
+    ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -15119,10 +15146,30 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
+    // No ANE engine => no ane object, and the body is still valid JSON.
+    try testing.expect(std.mem.indexOf(u8, body, "\"ane\"") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    parsed.deinit();
+}
+
+test "anePropsJson: the /props ane object carries mode, coverage and the int8 bill" {
+    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104);
+    defer testing.allocator.free(frag);
+    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104}", frag);
+    // Spliced into a props body it stays valid JSON with the object present.
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const ane = parsed.value.object.get("ane") orelse return error.MissingAne;
+    try testing.expectEqualStrings("channel", ane.object.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 48), ane.object.get("gdn_layers").?.integer);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
@@ -15138,7 +15185,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
