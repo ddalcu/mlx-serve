@@ -4459,8 +4459,28 @@ struct MarkdownText: View {
     /// stopping at the table's edge. `NSTextTable` has no "tight to content"
     /// sizing mode — every column is a percentage of the available width —
     /// so columns are weighted by content length
-    /// (`MarkdownTable.columnFractions`) and the table always fills the
     /// reading column.
+    ///
+    /// Cell content is rendered through `renderCell`, memoized by cell text
+    /// - a table's earlier rows/cells don't change once streamed, only the
+    /// actively-growing last cell does, so this amortizes the per-cell
+    /// markdown/LaTeX-segmentation cost to near zero after the first full
+    /// render instead of repeating it for every unchanged cell on every
+    /// token.
+    private static let cellRenderCache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 2048
+        return c
+    }()
+
+    private static func renderCell(_ text: String, theme: LaTeXTheme, bold: Bool) -> NSAttributedString {
+        let key = "\(theme.rawValue)\u{0}\(bold)\u{0}\(text)" as NSString
+        if let hit = cellRenderCache.object(forKey: key) { return hit }
+        let rendered = renderInline(text, theme: theme, weight: bold ? .semibold : .regular)
+        cellRenderCache.setObject(rendered, forKey: key)
+        return rendered
+    }
+
     private static func renderTable(
         headers: [String],
         rows: [[String]],
@@ -4504,9 +4524,7 @@ struct MarkdownText: View {
                 let pStyle = NSMutableParagraphStyle()
                 pStyle.textBlocks = [block]
                 pStyle.alignment = textAlignment(column)
-                let cell = NSMutableAttributedString(
-                    attributedString: renderInline(text, theme: theme, weight: bold ? .semibold : .regular)
-                )
+                let cell = NSMutableAttributedString(attributedString: renderCell(text, theme: theme, bold: bold))
                 cell.append(NSAttributedString(string: "\n"))
                 cell.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: cell.length))
                 result.append(cell)
