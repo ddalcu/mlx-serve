@@ -7,6 +7,130 @@ struct TokenUsage {
     let tokensPerSecond: Double
 }
 
+
+/// Decodes OpenAI Harmony channel markers emitted by gpt-oss when the
+/// server exposes them as ordinary `delta.content`.
+///
+/// The model's emitted channel is authoritative: an `analysis` channel is
+/// reasoning even when the request did not opt into thinking. Markers can be
+/// split across SSE chunks, so this is intentionally a streaming state
+/// machine rather than a model-name or request-flag check.
+struct HarmonyChannelStream {
+    private enum Mode {
+        case plain
+        case header
+        case analysis
+        case commentary
+        case final
+    }
+
+    private static let channel = "<|channel|>"
+    private static let message = "<|message|>"
+    private static let end = "<|end|>"
+    private static let startAssistant = "<|start|>assistant"
+
+    private var mode: Mode = .plain
+    private var pending = ""
+
+    mutating func feed(_ text: String) -> (content: String, reasoning: String) {
+        pending += text
+        var content = ""
+        var reasoning = ""
+
+        while true {
+            switch mode {
+            case .plain:
+                if pending.hasPrefix(Self.startAssistant) {
+                    pending.removeFirst(Self.startAssistant.count)
+                    continue
+                }
+                if let r = pending.range(of: Self.channel) {
+                    content += String(pending[..<r.lowerBound])
+                    pending.removeSubrange(..<r.upperBound)
+                    mode = .header
+                    continue
+                }
+                let keep = max(
+                    Self.partialPrefixLength(in: pending, prefix: Self.channel),
+                    Self.partialPrefixLength(in: pending, prefix: Self.startAssistant)
+                )
+                let emit = pending.count - keep
+                if emit > 0 {
+                    content += String(pending.prefix(emit))
+                    pending.removeFirst(emit)
+                }
+                return (content, reasoning)
+
+            case .header:
+                guard let r = pending.range(of: Self.message) else {
+                    return (content, reasoning)
+                }
+                let channel = String(pending[..<r.lowerBound])
+                pending.removeSubrange(..<r.upperBound)
+                switch channel {
+                case "analysis": mode = .analysis
+                case "final": mode = .final
+                case "commentary": mode = .commentary
+                default: mode = .commentary
+                }
+                continue
+
+            case .analysis, .commentary, .final:
+                if let r = pending.range(of: Self.end) {
+                    let body = String(pending[..<r.lowerBound])
+                    pending.removeSubrange(..<r.upperBound)
+                    switch mode {
+                    case .analysis: reasoning += body
+                    case .commentary, .final: content += body
+                    case .plain, .header: break
+                    }
+                    mode = .plain
+                    continue
+                }
+                let keep = Self.partialPrefixLength(in: pending, prefix: Self.end)
+                let emit = pending.count - keep
+                if emit > 0 {
+                    let body = String(pending.prefix(emit))
+                    switch mode {
+                    case .analysis: reasoning += body
+                    case .commentary, .final: content += body
+                    case .plain, .header: break
+                    }
+                    pending.removeFirst(emit)
+                }
+                return (content, reasoning)
+            }
+        }
+    }
+
+    mutating func finish() -> (content: String, reasoning: String) {
+        var result = (content: "", reasoning: "")
+        switch mode {
+        case .analysis:
+            result.reasoning = pending
+        case .commentary, .final, .plain:
+            result.content = pending
+        case .header:
+            // An incomplete Harmony header is structural and must not leak.
+            break
+        }
+        pending.removeAll(keepingCapacity: true)
+        mode = .plain
+        return result
+    }
+
+    private static func partialPrefixLength(in value: String, prefix: String) -> Int {
+        let maxLength = min(value.count, prefix.count - 1)
+        guard maxLength > 0 else { return 0 }
+        for length in stride(from: maxLength, through: 1, by: -1) {
+            if value.suffix(length) == prefix.prefix(length) {
+                return length
+            }
+        }
+        return 0
+    }
+}
+
 enum SSEEvent {
     case content(String)
     case reasoning(String)
@@ -603,12 +727,12 @@ class APIClient {
         // recovery when the server streams <tool_call> blocks as plain content
         // (e.g. some Qwen MoE outputs an older binary failed to parse).
         var contentAccumulator = ""
+        var harmonyStream = HarmonyChannelStream()
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data: ") else { continue }
             let payload = String(line.dropFirst(6))
             if payload == "[DONE]" {
-                continuation.yield(.done)
                 break
             }
 
@@ -661,9 +785,18 @@ class APIClient {
             }
 
             if let content = delta["content"] as? String, !content.isEmpty {
-                contentAccumulator += content
-                continuation.yield(.content(content))
+                let decoded = harmonyStream.feed(content)
+                if !decoded.content.isEmpty {
+                    contentAccumulator += decoded.content
+                    continuation.yield(.content(decoded.content))
+                }
+                if !decoded.reasoning.isEmpty {
+                    continuation.yield(.reasoning(decoded.reasoning))
+                }
             }
+            // Normal servers already expose reasoning_content. Keep that
+            // explicit channel authoritative while Harmony decoding covers
+            // gpt-oss streams that put analysis into delta.content.
             if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
                 continuation.yield(.reasoning(reasoning))
             }
@@ -744,6 +877,15 @@ class APIClient {
         // Last-resort: server emitted no tool_calls deltas at all but the
         // assistant content contains <tool_call>...</tool_call> blocks (older
         // server binary / unrecognized format). Recover them from content.
+        let harmonyTail = harmonyStream.finish()
+        if !harmonyTail.content.isEmpty {
+            contentAccumulator += harmonyTail.content
+            continuation.yield(.content(harmonyTail.content))
+        }
+        if !harmonyTail.reasoning.isEmpty {
+            continuation.yield(.reasoning(harmonyTail.reasoning))
+        }
+
         if !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
             let recovered = Self.extractToolCallsFromContent(contentAccumulator)
             if !recovered.isEmpty {
@@ -752,6 +894,7 @@ class APIClient {
             }
         }
 
+        continuation.yield(.done)
         continuation.finish()
     }
 
