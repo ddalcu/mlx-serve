@@ -75,6 +75,11 @@ struct ImageGenSettings: Codable, Equatable {
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
     /// Empty = none attached.
     var loras: [LoraAdapter] = []
+    /// The size last typed into the Custom… fields. Kept even while a fixed
+    /// bucket is selected, so switching back to Custom restores what you had —
+    /// the same convention as the H3 reference lists surviving a preset switch.
+    var customWidth: Int = 1024
+    var customHeight: Int = 1024
 
     private static let storageKey = "imageGenSettings"
 
@@ -109,7 +114,32 @@ extension ImageGenSettings {
     /// The persisted resolution revalidated against `m`'s buckets — unknown ids
     /// (e.g. carried over from a different model) fall back to the model default.
     func resolvedResolution(for m: ImageModelPreset) -> ResolutionOption {
-        m.resolutions.first { $0.id == resolutionId } ?? m.defaultResolution
+        // Custom is a sentinel, not a row in `resolutions` — the size it means
+        // lives in `customWidth`/`customHeight`, so it has to be recognised
+        // here or a saved custom pick reopens on the model's default.
+        if resolutionId == ResolutionOption.custom.id { return .custom }
+        return m.resolutions.first { $0.id == resolutionId } ?? m.defaultResolution
+    }
+
+    /// The same answer as `resolvedResolution`, with the Custom sentinel turned
+    /// into the size it stands for. Every consumer that wants NUMBERS reads this;
+    /// only the pane's picker wants the sentinel, because it has to select the
+    /// "Custom…" row.
+    ///
+    /// This exists because `MediaToolArgs.resolution` returns `saved` VERBATIM
+    /// when the model named no size — its own `width > 0` filters only guard the
+    /// pixel/aspect paths — so handing it the sentinel puts -1 × -1 on the wire.
+    /// A size the current model cannot honor falls back to that model's default:
+    /// the settings blob is shared across presets, so a 2048 saved on Krea is
+    /// simply not a thing FLUX can be asked for.
+    func concreteResolution(for m: ImageModelPreset) -> ResolutionOption {
+        let picked = resolvedResolution(for: m)
+        guard picked.isCustom else { return picked }
+        guard let size = m.resolutionGrid.resolve(width: customWidth, height: customHeight).size else {
+            return m.defaultResolution
+        }
+        return ResolutionOption(width: size.width, height: size.height,
+                                label: "\(size.width) × \(size.height)")
     }
 
     /// Migration-safe decode (see type doc). Declared in an extension so the
@@ -138,6 +168,8 @@ extension ImageGenSettings {
             let ls = try legacy.decodeIfPresent(Double.self, forKey: .loraScale) ?? 1.0
             if !lp.isEmpty { loras = [LoraAdapter(path: lp, scale: ls)] }
         }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .customWidth) { customWidth = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .customHeight) { customHeight = v }
     }
 }
 
@@ -252,6 +284,10 @@ struct VideoGenSettings: Codable, Equatable {
     var loras: [LoraAdapter] = []
     /// Height of the drag-resizable prompt editor.
     var promptHeight: Double = PromptEditorHeight.defaultHeight
+    /// The size last typed into the Custom… fields, kept across preset switches
+    /// like the image pane's.
+    var customWidth: Int = 704
+    var customHeight: Int = 448
 
     private static let storageKey = "videoGenSettings"
 
@@ -298,8 +334,29 @@ extension VideoGenSettings {
     /// `VideoModelPreset.recommendedResolution`) — a static default meant a
     /// 128 GB machine opened on a preview-sized render.
     func resolvedResolution(for m: VideoModelPreset) -> ResolutionOption {
-        m.resolutions.first { $0.id == resolutionId }
+        if resolutionId == ResolutionOption.custom.id { return .custom }
+        return m.resolutions.first { $0.id == resolutionId }
             ?? m.recommendedResolution(totalGB: RAMChecker.totalGB)
+    }
+
+    /// `resolvedResolution` with the Custom sentinel turned into the size it
+    /// stands for — read by every consumer that wants NUMBERS. Same hazard as
+    /// the image side: `MediaToolArgs.resolution` hands `saved` back verbatim
+    /// when the model names no size, so the sentinel's -1 would ride the wire
+    /// from the chat's `generate_video`.
+    ///
+    /// Resolved against the ONE-STAGE grid: the saved size is a canvas, and the
+    /// pipeline is chosen by the quality tier at request time. A two-stage tier
+    /// tightens the grid to /64 in the pane, where the user can see the note.
+    func concreteResolution(for m: VideoModelPreset) -> ResolutionOption {
+        let picked = resolvedResolution(for: m)
+        guard picked.isCustom else { return picked }
+        guard let size = m.resolutionGrid(twoStage: false)
+            .resolve(width: customWidth, height: customHeight).size else {
+            return m.recommendedResolution(totalGB: RAMChecker.totalGB)
+        }
+        return ResolutionOption(width: size.width, height: size.height,
+                                label: "\(size.width) × \(size.height)")
     }
 
     init(from decoder: Decoder) throws {
@@ -321,6 +378,8 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .promptHeight) {
             promptHeight = PromptEditorHeight.clamp(v)
         }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .customWidth) { customWidth = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .customHeight) { customHeight = v }
         if let v = try c.decodeIfPresent([LoraAdapter].self, forKey: .loras), !v.isEmpty {
             loras = v
         } else {

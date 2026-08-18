@@ -32,9 +32,14 @@ if [ "$ZIG_DEBUG" = "1" ] && [ "$FAST_DEV" != "1" ]; then
     exit 1
 fi
 
-# Signing identity from env (set in ~/.zshrc or CI)
-IDENTITY="${APPLE_DEVELOPER_ID:?Set APPLE_DEVELOPER_ID in env (e.g. 'Developer ID Application: Name (TEAMID)')}"
-TEAM_ID="${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in env}"
+# Signing identity from env (set in ~/.zshrc or CI). Unset = ad-hoc ("-"), so
+# anyone can build without an Apple Developer account; a release sets the real
+# identity (release.yml does).
+IDENTITY="${APPLE_DEVELOPER_ID:--}"
+TEAM_ID="${APPLE_TEAM_ID:--}"
+if [ "$IDENTITY" = "-" ]; then
+    echo "→ APPLE_DEVELOPER_ID not set — building with ad-hoc signing (dev build, not distributable)"
+fi
 
 cd "$SCRIPT_DIR"
 
@@ -507,6 +512,10 @@ fi
 # ── Phase 6: Notarize ──
 if [ "${SKIP_NOTARIZE:-}" = "1" ]; then
     echo "→ Skipping notarization (SKIP_NOTARIZE=1)"
+elif [ "$IDENTITY" = "-" ]; then
+    # An ad-hoc signed app can't be notarized (notarization requires a real
+    # Developer ID signature), so don't fail a no-account build at the finish line.
+    echo "→ Skipping notarization (ad-hoc signing)"
 else
     echo "→ Notarizing..."
     APPLE_ID="${APPLE_ID:?Set APPLE_ID in env for notarization}"

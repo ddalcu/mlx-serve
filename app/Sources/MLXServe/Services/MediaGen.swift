@@ -44,6 +44,84 @@ struct ResolutionOption: Hashable, Identifiable {
     static let matchSource = ResolutionOption(width: 0, height: 0, label: "Match source (keep the original size)")
 
     var isMatchSource: Bool { width == 0 && height == 0 }
+
+    /// Sentinel: the menu row that reveals the width/height fields. Carries no
+    /// size of its own — the pane holds the typed values, because they must
+    /// survive a preset switch the way the reference lists do.
+    static let custom = ResolutionOption(width: -1, height: -1, label: "Custom…")
+
+    var isCustom: Bool { width == -1 && height == -1 }
+}
+
+// MARK: - Custom resolution
+
+/// The resolution grid a backend actually samples on.
+///
+/// This MIRRORS `clampFluxDim` / `clampKreaDim` in `src/gen.zig` — the server
+/// stays the authority and rewrites anything off-grid regardless of what the
+/// app sends. The mirror exists so the pane can say what will happen BEFORE
+/// the request, instead of the user reading a size back off a finished image.
+/// Documented duplication in the `isMediaModelType` / `modalityFromType`
+/// mould; `CustomResolutionTests` is what keeps the two from drifting.
+struct ResolutionGrid: Hashable {
+    /// Every dimension must be a multiple of this.
+    let alignment: Int
+    let minDim: Int
+    let maxDim: Int
+
+    /// Round onto the grid the way the server does — UP, never to nearest
+    /// (`((v + 31) / 32) * 32`). Rounding the friendly way would print a hint
+    /// naming a size the server does not generate.
+    func snap(_ v: Int) -> Int {
+        guard v > 0 else { return minDim }
+        return ((v + alignment - 1) / alignment) * alignment
+    }
+
+    /// Classify a typed size. In-range-but-off-grid is a CORRECTION (the model
+    /// can nearly do it, so do it and say so); out-of-range is a REFUSAL, since
+    /// silently clamping 4000 to 1536 hands back a picture a third of the
+    /// requested size with nothing explaining why.
+    func resolve(width: Int, height: Int) -> CustomResolution {
+        for v in [width, height] where v <= 0 {
+            return .invalid(message: "Width and height must be whole numbers above zero.")
+        }
+        for v in [width, height] where v < minDim || v > maxDim {
+            return .invalid(message: "This model samples between \(minDim) and \(maxDim) px per side. \(v) is outside that.")
+        }
+        let w = snap(width), h = snap(height)
+        guard w != width || h != height else { return .ok(width: width, height: height) }
+        return .corrected(width: w, height: h,
+                          note: "Rounded to \(w) × \(h) — this model samples in steps of \(alignment) px.")
+    }
+}
+
+/// What the pane does with a typed size.
+enum CustomResolution: Equatable {
+    /// Already on the grid — send it as typed.
+    case ok(width: Int, height: Int)
+    /// Nudged onto the grid. `note` is the small hint shown under the fields.
+    case corrected(width: Int, height: Int, note: String)
+    /// Cannot be honored at all; Generate stays disabled and `message` says why.
+    case invalid(message: String)
+
+    /// The size to actually send, or nil when there is nothing to send.
+    var size: (width: Int, height: Int)? {
+        switch self {
+        case let .ok(w, h), let .corrected(w, h, _): return (w, h)
+        case .invalid: return nil
+        }
+    }
+
+    var isValid: Bool { size != nil }
+
+    /// The line shown under the fields — nil when there is nothing to say.
+    var hint: String? {
+        switch self {
+        case .ok: return nil
+        case let .corrected(_, _, note): return note
+        case let .invalid(message): return message
+        }
+    }
 }
 
 // MARK: - Image presets
@@ -95,6 +173,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     // The architecture is shared across versions, so the bucket is too.
     private static let fluxResolutions: [ResolutionOption] = [
         .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        // The server has always taken this (`clampFluxDim` accepts any multiple
+        // of 32 from 256 up) — it was a missing menu row, not a missing
+        // capability. Below the ~1MP trained scale, so quality falls off; it is
+        // here for speed and for Macs that cannot hold a 1024² working set.
+        .init(width: 512,  height: 512,  label: "512 × 512 (fast, low RAM)"),
         .init(width: 1152, height: 896,  label: "1152 × 896 (landscape 4:3)"),
         .init(width: 896,  height: 1152, label: "896 × 1152 (portrait 3:4)"),
         .init(width: 1216, height: 832,  label: "1216 × 832 (landscape 3:2)"),
@@ -459,6 +542,37 @@ struct VideoModelPreset: Identifiable, Hashable {
     func settings(_ q: QualityPreset) -> VideoQualitySettings {
         qualityProfiles[q] ?? qualityProfiles[defaultQuality]!
     }
+
+    /// The grid this backend samples on. Unlike the image side this is a
+    /// FUNCTION, not a property, because LTX's alignment depends on the
+    /// PIPELINE: `handleVideo` refuses a non-/32 canvas outright ("width and
+    /// height must be multiples of 32"), and a two-stage pipeline denoises at
+    /// half the canvas so it demands /64 as its own named 400. Same model, two
+    /// grids — a constant could only ever be right for one of them.
+    ///
+    /// Video is also where this matters most: the image backends silently
+    /// rewrite an off-grid size, so a bad guess costs a slightly different
+    /// picture. Here it costs the whole generation.
+    ///
+    /// The ceiling is the largest canvas the preset itself ships; the real
+    /// bound past that is memory and time, which `H3Plan`/`H3TimeEstimate` and
+    /// the frame ladder already model and surface.
+    func resolutionGrid(twoStage: Bool) -> ResolutionGrid {
+        let maxDim = resolutions.map { max($0.width, $0.height) }.max() ?? 1024
+        switch backend {
+        // H3 has no two-stage pipeline at all, and its own fastest canvases
+        // (544, 672, 960) are /32 and not /64 — applying LTX's two-stage grid
+        // here would refuse the model's own shipped rows.
+        case .minimaxH3:
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: maxDim)
+        case .ltx:
+            return ResolutionGrid(alignment: twoStage ? 64 : 32, minDim: 256, maxDim: maxDim)
+        }
+    }
+
+    /// The picker's rows plus the Custom… sentinel, which goes last so the
+    /// tuned canvases stay the obvious pick.
+    func resolutionOptions() -> [ResolutionOption] { resolutions + [.custom] }
 
     /// Which prompt FORMAT this model expects — the one chokepoint the pane's
     /// examples, placeholder, hint and tips link all read. Derived from the
@@ -1524,6 +1638,22 @@ extension ImageModelPreset {
         }
     }
 
+    /// The grid this backend samples on, mirroring `gen.zig`'s per-backend
+    /// clamps. Derived from the variant, never from the id: a new preset of an
+    /// existing variant inherits the right grid instead of defaulting to one.
+    var resolutionGrid: ResolutionGrid {
+        switch variant {
+        // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
+        // with a ×16 VAE downsample and shares the same clamp server-side.
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
+        // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
+        // widest preset edge.
+        case .flux2Klein4B, .flux2Klein9B:
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+        }
+    }
+
     /// Instruction editing (in-context reference conditioning) is a trained
     /// capability: FLUX.2-klein, and the Mage-Flow-Edit checkpoint. Krea and
     /// Mage-Flow Turbo (txt2img) can only do renoise variations.
@@ -1584,7 +1714,10 @@ extension ImageModelPreset {
     /// model offers "Match source" first — the reference pipeline's default and
     /// the only choice that can't distort the picture the user handed over.
     func resolutionOptions(editMode: Bool) -> [ResolutionOption] {
-        (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
+        let base = (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
+        // Last, so the fixed buckets stay the obvious pick and the fields only
+        // appear for someone who went looking for them.
+        return base + [.custom]
     }
 
     /// Keep a persisted selection valid when the mode changes (leaving edit mode
