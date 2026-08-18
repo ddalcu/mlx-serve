@@ -410,6 +410,12 @@ pub const ModelConfig = struct {
     gen_top_p: ?f32 = null,
     gen_top_k: ?u32 = null,
 
+    // The checkpoint's OWN thinking default, from generation_config.json's
+    // `default_chat_template_kwargs.enable_thinking`. null = the file or key
+    // is absent. Read by `defaultEnableThinking` for requests that name no
+    // thinking preference; an explicit request value still outranks it.
+    gen_enable_thinking: ?bool = null,
+
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = @splat(false),
@@ -869,10 +875,15 @@ pub const ModelConfig = struct {
     /// value always outranks this (see `server.resolveEnableThinking`); it
     /// only fills a silent request.
     ///
-    /// Opt-in per arch, and only where the vendor documents thinking-on AND
-    /// the shipped template agrees — never inferred from "the template mentions
-    /// enable_thinking".
+    /// First the checkpoint's OWN declaration
+    /// (`generation_config.json` -> `default_chat_template_kwargs.enable_thinking`),
+    /// then the per-arch allowlist below, which stays opt-in and only where the
+    /// vendor documents thinking-on AND the shipped template agrees — never
+    /// inferred from "the template mentions enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
+        // The checkpoint's own declared default outranks the arch allowlist:
+        // it is the model author speaking, not our guess about the family.
+        if (self.gen_enable_thinking) |v| return v;
         // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
         // header, so the recipient must stay free and the reasoning is
         // delivered rather than paid-and-dropped). A plain chat request
@@ -1067,6 +1078,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             config.gen_temperature = gd.temperature;
             config.gen_top_p = gd.top_p;
             config.gen_top_k = gd.top_k;
+            config.gen_enable_thinking = gd.enable_thinking;
         } else |_| {}
     } else |_| {}
     // Pooling (issue #116), priority: explicit config.json `pooling_mode`
@@ -1150,6 +1162,9 @@ pub const GenerationDefaults = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?u32 = null,
+    /// `default_chat_template_kwargs.enable_thinking` — the checkpoint's own
+    /// thinking default. null when absent or not a bool.
+    enable_thinking: ?bool = null,
 };
 
 /// Image-area limits parsed from a Qwen processor configuration.
@@ -1246,6 +1261,15 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
                 gd.top_k = @intCast(i);
             },
             else => {},
+        }
+    }
+    // The checkpoint's own chat-template kwargs. Only a real bool counts —
+    // anything else leaves the field null and the arch default in charge.
+    if (root.get("default_chat_template_kwargs")) |v| {
+        if (v == .object) {
+            if (v.object.get("enable_thinking")) |et| {
+                if (et == .bool) gd.enable_thinking = et.bool;
+            }
         }
     }
     return gd;
@@ -3453,6 +3477,41 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const ling = ModelConfig{ .model_type = "bailing_hybrid" };
     try testing.expect(ling.defaultEnableThinking(false));
     try testing.expect(ling.defaultEnableThinking(true));
+}
+
+test "defaultEnableThinking: the checkpoint's own generation_config default outranks the arch allowlist" {
+    // A thinking model whose arch is not on the allowlist still thinks when
+    // its own generation_config declares it — this is the case a silent
+    // request used to lose (3 tokens and no reasoning where the same weights
+    // reason for ~1000 tokens under a runner that obeys the template).
+    var on = ModelConfig{ .model_type = "qwen3" };
+    on.gen_enable_thinking = true;
+    try testing.expect(on.defaultEnableThinking(false));
+    try testing.expect(on.defaultEnableThinking(true));
+    // And a checkpoint that declares thinking OFF turns an opted-in arch off.
+    var off = ModelConfig{ .model_type = "bailing_hybrid" };
+    off.gen_enable_thinking = false;
+    try testing.expect(!off.defaultEnableThinking(false));
+    try testing.expect(!off.defaultEnableThinking(true));
+}
+
+test "parseGenerationDefaultsFromJson: reads default_chat_template_kwargs.enable_thinking" {
+    const on = parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": {\"enable_thinking\": true}}",
+    );
+    try testing.expectEqual(@as(?bool, true), on.enable_thinking);
+    const off = parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": {\"enable_thinking\": false}}",
+    );
+    try testing.expectEqual(@as(?bool, false), off.enable_thinking);
+    // Absent, wrong shape, or a non-bool value: null, arch default stays.
+    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson("{\"top_k\": 20}").enable_thinking);
+    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": \"on\"}",
+    ).enable_thinking);
+    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": {\"enable_thinking\": \"yes\"}}",
+    ).enable_thinking);
 }
 
 test "ModelConfig addEosToken" {
