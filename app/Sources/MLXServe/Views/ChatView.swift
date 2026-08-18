@@ -4132,9 +4132,11 @@ struct MarkdownText: View {
 
     var body: some View {
         // Fenced code renders as its own view (colors, copy button);
-        // everything between fences stays in ONE text view per run so
-        // drag-selection still crosses paragraphs, lists and tables. See
-        // `MarkdownSegmenter` for why the split is at fences, not at blocks.
+        // everything between fences — including tables, rendered as an
+        // `NSTextTable` inside the shared attributed string — stays in ONE
+        // text view per run so drag-selection still crosses paragraphs,
+        // lists, and tables. See `MarkdownSegmenter` for why the split is at
+        // fences, not at blocks.
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
                 switch segment {
@@ -4151,8 +4153,6 @@ struct MarkdownText: View {
                     }
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
-                case .table(let headers, let rows, let alignments):
-                    MarkdownTableView(headers: headers, rows: rows, alignments: alignments)
                 }
             }
         }
@@ -4205,6 +4205,7 @@ struct MarkdownText: View {
         case code(String, String)              // language, content
         case listItem(String)
         case xmlBlock(String)                  // raw XML/tag content
+        case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
     }
 
     fileprivate static func parseBlocks(source: String) -> [Block] {
@@ -4292,6 +4293,16 @@ struct MarkdownText: View {
                         continue
                     }
                 }
+            }
+
+            // Table (GFM pipe table, or the whitespace-aligned pseudo-table
+            // smaller models emit without GFM syntax) — checked before
+            // list-item/paragraph so a `- ` inside a cell or numbered header
+            // doesn't get misread as a list marker.
+            if let table = MarkdownTable.parse(lines: lines, start: i) {
+                blocks.append(.table(table.headers, table.rows, table.alignments))
+                i = table.end
+                continue
             }
 
             // List item
@@ -4422,6 +4433,9 @@ struct MarkdownText: View {
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
 
+            case .table(let headers, let rows, let alignments):
+                result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
+
             case .xmlBlock(let content):
                 let p = NSMutableParagraphStyle()
                 p.firstLineHeadIndent = 8
@@ -4435,6 +4449,73 @@ struct MarkdownText: View {
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
             }
+        }
+        return result
+    }
+
+    /// Render a table as an `NSTextTable` run appended directly into the
+    /// message's continuous attributed string, so drag-selection and copy
+    /// span prose and table cells together like every other block instead of
+    /// stopping at the table's edge. `NSTextTable` has no "tight to content"
+    /// sizing mode — every column is a percentage of the available width —
+    /// so columns are weighted by content length
+    /// (`MarkdownTable.columnFractions`) and the table always fills the
+    /// reading column.
+    private static func renderTable(
+        headers: [String],
+        rows: [[String]],
+        alignments: [TableAlignment],
+        theme: LaTeXTheme
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let cols = headers.count
+        guard cols > 0 else { return result }
+
+        let table = NSTextTable()
+        table.numberOfColumns = cols
+        let fractions = MarkdownTable.columnFractions(headers: headers, rows: rows)
+        let dividerColor = NSColor.separatorColor
+
+        func textAlignment(_ column: Int) -> NSTextAlignment {
+            guard column < alignments.count else { return .left }
+            switch alignments[column] {
+            case .left: return .left
+            case .right: return .right
+            case .center: return .center
+            }
+        }
+
+        func appendRow(_ cells: [String], rowIndex: Int, bold: Bool) {
+            for column in 0..<cols {
+                let text = column < cells.count ? cells[column] : ""
+                let block = NSTextTableBlock(
+                    table: table, startingRow: rowIndex, rowSpan: 1,
+                    startingColumn: column, columnSpan: 1
+                )
+                block.setContentWidth(Double(fractions[column]) * 100, type: .percentageValueType)
+                block.setWidth(6, type: .absoluteValueType, for: .padding)
+                // Divider under the header row only — no vertical borders,
+                // no rules between data rows, matching the "minimal GFM"
+                // look chat UIs use.
+                if rowIndex == 0 {
+                    block.setBorderColor(dividerColor, for: .maxY)
+                    block.setWidth(1, type: .absoluteValueType, for: .border, edge: .maxY)
+                }
+                let pStyle = NSMutableParagraphStyle()
+                pStyle.textBlocks = [block]
+                pStyle.alignment = textAlignment(column)
+                let cell = NSMutableAttributedString(
+                    attributedString: renderInline(text, theme: theme, weight: bold ? .semibold : .regular)
+                )
+                cell.append(NSAttributedString(string: "\n"))
+                cell.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: cell.length))
+                result.append(cell)
+            }
+        }
+
+        appendRow(headers, rowIndex: 0, bold: true)
+        for (index, row) in rows.enumerated() {
+            appendRow(row, rowIndex: index + 1, bold: false)
         }
         return result
     }

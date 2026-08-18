@@ -10,9 +10,9 @@ enum TableAlignment: Equatable {
 /// Detects and parses markdown tables: GFM pipe tables, and the
 /// whitespace-aligned "pseudo-tables" smaller models emit when asked for
 /// tabular data without GFM syntax. Shared by `MarkdownSegmenter` (which
-/// splits a table into its own segment) and `MarkdownText` (whose
-/// `parseBlocks` still calls this for anything the segmenter didn't already
-/// split out) so the two passes can never disagree about what is a table.
+/// leaves table lines in the prose it hands to `MarkdownText`) and
+/// `MarkdownText.parseBlocks` (which calls this to detect and render them),
+/// so the two passes can never disagree about what is a table.
 enum MarkdownTable {
 
     struct ParsedTable {
@@ -140,18 +140,25 @@ enum MarkdownTable {
         }
     }
 
-    /// Given each column's natural (unconstrained) content width and the
-    /// width available for the whole row, returns the actual per-column
-    /// widths: natural widths untouched when their sum already fits, or all
-    /// scaled down by the same factor — preserving their relative shares —
-    /// when the sum would overflow. Pure and view-independent so
-    /// `MarkdownTableView` can pin its layout to it without spinning up a
-    /// view, and so this rule has direct unit coverage.
-    static func layout(natural: [CGFloat], available: CGFloat) -> [CGFloat] {
-        guard available > 0, !natural.isEmpty else { return natural }
-        let total = natural.reduce(0, +)
-        guard total > available, total > 0 else { return natural }
-        let scale = available / total
-        return natural.map { $0 * scale }
+    /// Column weight for `NSTextTable`'s percentage-of-container width: each
+    /// column's share is proportional to its longest cell's character
+    /// count, floored so an empty or all-short column still gets a visible
+    /// sliver instead of collapsing to nothing. `NSTextTable` has no native
+    /// "tight to content" sizing mode — a table always fills the available
+    /// width — so these are relative weights, not point widths.
+    static func columnFractions(headers: [String], rows: [[String]]) -> [CGFloat] {
+        let cols = headers.count
+        guard cols > 0 else { return [] }
+        var longest = headers.map { CGFloat($0.count) }
+        for row in rows {
+            for (j, cell) in row.prefix(cols).enumerated() {
+                longest[j] = max(longest[j], CGFloat(cell.count))
+            }
+        }
+        let floor: CGFloat = 3
+        let weighted = longest.map { max($0, floor) }
+        let total = weighted.reduce(0, +)
+        guard total > 0 else { return Array(repeating: 1.0 / CGFloat(cols), count: cols) }
+        return weighted.map { $0 / total }
     }
 }

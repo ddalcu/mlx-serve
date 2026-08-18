@@ -3,11 +3,12 @@ import XCTest
 
 /// Splits an assistant reply into prose runs and fenced code blocks.
 ///
-/// Why a separate pass from `MarkdownText`'s block parser: prose is rendered by
-/// ONE NSTextView per run so drag-selection still crosses paragraphs, lists and
-/// tables, while each code block becomes its own view with a gutter and a copy
-/// button. Consecutive prose blocks must therefore stay in a SINGLE segment —
-/// splitting per block is what used to break selection at every boundary.
+/// Why a separate pass from `MarkdownText`'s block parser: prose (including
+/// tables) is rendered by ONE NSTextView per run so drag-selection crosses
+/// paragraphs, lists, and tables, while each code block becomes its own view
+/// with a gutter and a copy button. Consecutive prose blocks must therefore
+/// stay in a SINGLE segment — splitting per block is what used to break
+/// selection at every boundary.
 final class MarkdownSegmenterTests: XCTestCase {
 
     private func segs(_ s: String) -> [MarkdownSegmenter.Segment] {
@@ -96,8 +97,6 @@ final class MarkdownSegmenterTests: XCTestCase {
                 switch seg {
                 case .prose(let t): return t
                 case .code(_, let c): return c
-                case .table(let headers, let rows, _):
-                    return ([headers] + rows).map { $0.joined(separator: " | ") }.joined(separator: "\n")
                 }
             }.joined(separator: "\n")
             for line in src.components(separatedBy: "\n")
@@ -108,41 +107,25 @@ final class MarkdownSegmenterTests: XCTestCase {
         }
     }
 
-    func testGfmTableBecomesItsOwnSegment() {
-        let s = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter"
-        XCTAssertEqual(segs(s), [
-            .prose("before"),
-            .table(headers: ["a", "b"], rows: [["1", "2"]], alignments: [.left, .left]),
-            .prose("after"),
-        ])
-    }
-
-    func testTableAtTheVeryStartHasNoLeadingEmptyProse() {
-        let s = "| a | b |\n|---|---|\n| 1 | 2 |"
-        XCTAssertEqual(segs(s), [.table(headers: ["a", "b"], rows: [["1", "2"]], alignments: [.left, .left])])
-    }
-
     func testPipeWithoutSeparatorStaysOneProseSegment() {
         XCTAssertEqual(segs("a | b\nplain"), [.prose("a | b\nplain")])
     }
 
-    func testUnterminatedTableMidStreamStillRendersAsTable() {
-        let s = "| a | b |\n|---|---|\n| 1"
-        XCTAssertEqual(segs(s), [.table(headers: ["a", "b"], rows: [["1"]], alignments: [.left, .left])])
+    func testTableStaysInsideItsSurroundingProseSegment() {
+        // Unlike a fence, a table is NOT a segment boundary — it renders as
+        // an NSTextTable inside the same NSTextView as the surrounding
+        // prose, via MarkdownText.parseBlocks, so drag-selection can span
+        // prose and table together.
+        let s = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter"
+        XCTAssertEqual(segs(s), [.prose(s)])
     }
 
-    func testAsciiPseudoTableBecomesItsOwnSegment() {
-        let s = "Tip        Explanation\n─────────  ──────────────────\n`$@`       preserve args"
-        XCTAssertEqual(segs(s), [
-            .table(headers: ["Tip", "Explanation"], rows: [["`$@`", "preserve args"]], alignments: [.left, .left]),
-        ])
-    }
-
-    func testTableThenCodeFenceBothSplitOut() {
+    func testTableThenCodeFenceSplitsOnlyAtTheFence() {
         let s = "| a | b |\n|---|---|\n| 1 | 2 |\n```\nx\n```"
         XCTAssertEqual(segs(s), [
-            .table(headers: ["a", "b"], rows: [["1", "2"]], alignments: [.left, .left]),
+            .prose("| a | b |\n|---|---|\n| 1 | 2 |"),
             .code(language: "", code: "x"),
         ])
     }
+
 }

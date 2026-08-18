@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import MLXCore
 
 final class MarkdownTableTests: XCTestCase {
@@ -60,34 +61,45 @@ final class MarkdownTableTests: XCTestCase {
         XCTAssertEqual(t?.rows, [["`$@`", "preserve args with spaces in them"]])
     }
 
-    func testLayoutReturnsNaturalWidthsUnchangedWhenTheyFit() {
-        let w = MarkdownTable.layout(natural: [50, 100], available: 200)
-        XCTAssertEqual(w, [50, 100])
+    func testColumnFractionsWeightByLongestCellInEachColumn() {
+        let f = MarkdownTable.columnFractions(headers: ["a", "bbbb"], rows: [["x", "y"]])
+        XCTAssertEqual(f.count, 2)
+        XCTAssertGreaterThan(f[1], f[0])
+        XCTAssertEqual(f.reduce(0, +), 1.0, accuracy: 0.0001)
     }
 
-    func testLayoutScalesDownProportionallyOnOverflow() {
-        let w = MarkdownTable.layout(natural: [100, 300], available: 200)
-        XCTAssertEqual(w, [50, 150])
-        // Relative shares are preserved: the wider column stays 3x the narrower one.
-        XCTAssertEqual(w[1] / w[0], 3, accuracy: 0.0001)
-        XCTAssertEqual(w.reduce(0, +), 200, accuracy: 0.0001)
+    func testColumnFractionsGiveEmptyColumnAVisibleFloor() {
+        let f = MarkdownTable.columnFractions(headers: ["a", ""], rows: [["x", ""], ["y", ""]])
+        // Both columns bottom out at the same floor, so they split evenly.
+        XCTAssertEqual(f[0], f[1], accuracy: 0.0001)
     }
 
-    func testLayoutEmptyColumnsReturnsEmpty() {
-        XCTAssertEqual(MarkdownTable.layout(natural: [], available: 200), [])
+    func testColumnFractionsRaggedRowsDoNotCrashAndReturnOneFractionPerHeader() {
+        let f = MarkdownTable.columnFractions(headers: ["a", "b", "c"], rows: [["x"], ["y", "z", "w", "extra"]])
+        XCTAssertEqual(f.count, 3)
     }
 
-    func testLayoutSingleColumnFitsWithinAvailableStaysNatural() {
-        XCTAssertEqual(MarkdownTable.layout(natural: [50], available: 200), [50])
+    func testColumnFractionsNoHeadersReturnsEmpty() {
+        XCTAssertEqual(MarkdownTable.columnFractions(headers: [], rows: []), [])
     }
 
-    func testLayoutSingleColumnOverflowClampsToAvailable() {
-        XCTAssertEqual(MarkdownTable.layout(natural: [300], available: 200), [200])
-    }
-
-    func testLayoutZeroAvailableReturnsNaturalRatherThanCollapsing() {
-        // Guards the pre-first-measurement frame, where the caller hasn't
-        // measured a real width yet — this function must not divide by zero.
-        XCTAssertEqual(MarkdownTable.layout(natural: [50, 100], available: 0), [50, 100])
+    func testTableRendersAsNSTextTableInsideTheSharedAttributedString() {
+        // Regression guard for the drag-selection fix: a table must be part
+        // of the SAME NSAttributedString as its surrounding prose (an
+        // NSTextTable paragraph attribute), not a separate SwiftUI view, so
+        // selection and copy span prose and table together.
+        let source = "before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nafter"
+        let attributed = MarkdownText.attributedString(for: source)
+        var foundTable = false
+        attributed.enumerateAttribute(
+            .paragraphStyle, in: NSRange(location: 0, length: attributed.length)
+        ) { value, _, _ in
+            if let style = value as? NSParagraphStyle, style.textBlocks.contains(where: { $0 is NSTextTableBlock }) {
+                foundTable = true
+            }
+        }
+        XCTAssertTrue(foundTable)
+        XCTAssertTrue(attributed.string.contains("before"))
+        XCTAssertTrue(attributed.string.contains("after"))
     }
 }
