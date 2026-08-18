@@ -237,6 +237,26 @@ pub const MtpHeadRef = union(enum) {
         _ = allocator;
     }
 
+    /// Draft-rerank scheme (see mtp.zig): greedy drafts pick via a coarse
+    /// 2-bit readout + trunk-head top-32 re-score instead of a full
+    /// draft-head projection + argmax.
+    pub fn canRerankDrafts(self: MtpHeadRef) bool {
+        return switch (self) {
+            .qwen => |h| h.canRerankDrafts(),
+        };
+    }
+
+    pub fn draftSelect(
+        self: MtpHeadRef,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        return switch (self) {
+            .qwen => |h| h.draftSelect(target, x, suppress_mask),
+        };
+    }
+
     /// The G17/NAX cost surfaces are calibrated against the dense Qwen3.6-27B
     /// sidecar geometry specifically, so every other head plans under
     /// `generic` — an off-profile head served by a calibrated surface would
@@ -4139,11 +4159,19 @@ pub const Generator = struct {
         const mc = &self.mtp_cache.?;
         const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
         const mtp_mrope_ctx = self.mtpMropeContext();
+        const rerank_drafts = head.canRerankDrafts();
         std.debug.assert(chain.n_drafted == from);
         var i: u32 = from;
         while (i < to) : (i += 1) {
             const h_prev_arg: mlx.mlx_array = if (chain.h_chain) |h| h else self.last_hidden;
             const prev_tok_arr: mlx.mlx_array = if (i == 0) chain.t1_arr else chain.draft_arrs[i - 1];
+            // Rerank drafts skip the head's own logits projection entirely:
+            // the token comes from `draftSelect` on the chained hidden. The
+            // sharp-proposal (q_probs) and confidence paths still need the
+            // full distribution, so they keep want_logits.
+            const need_logits = chain.q_probs != null or
+                (chain.conf_arrs != null and i < chain.plan.m_lo);
+            const use_rerank = rerank_drafts and !need_logits;
             const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
@@ -4175,9 +4203,11 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true, mtp_mrope_ctx);
-            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), true, mtp_mrope_ctx);
-            if (chain.q_probs) |slots| {
+                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), !use_rerank, mtp_mrope_ctx);
+            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), !use_rerank, mtp_mrope_ctx);
+            if (use_rerank) {
+                chain.draft_arrs[i] = try head.draftSelect(xfm, step_out.hidden_next, draft_sampling.suppress_mask);
+            } else if (chain.q_probs) |slots| {
                 // Sharp proposal: q = filtered softmax of the draft-head
                 // logits at the FIXED sharpened constants; the draft is
                 // sampled from exactly this distribution (log+categorical
@@ -4197,7 +4227,7 @@ pub const Generator = struct {
                 chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
                 chain.n_conf = i + 1;
             }
-            _ = mlx.mlx_array_free(step_out.logits);
+            if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
             if (chain.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
             chain.h_chain = step_out.hidden_next;
         }

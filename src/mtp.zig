@@ -289,6 +289,15 @@ pub const MtpModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
+    /// Draft-rerank scheme (MLX_SERVE_MTP_DRAFT_RERANK): a coarse 2-bit/gs64
+    /// requant of the trunk lm_head; greedy drafts shortlist its top-32 and
+    /// re-score them through the trunk head's own rows (`draftSelect`). When
+    /// built, the 3-bit draft head is dropped — non-greedy draft paths fall
+    /// back to the trunk head.
+    rerank_coarse: ?QLinear = null,
+    rerank_rows: c_int = 0,
+    rerank_logged: bool = false,
+
     /// Cross-request EV controller seed (inference thread only, like every
     /// mutable field here): the last HEALTHY request's per-index acceptance
     /// EMAs + base depth, written by `Generator.deinit`, consumed by the
@@ -301,6 +310,7 @@ pub const MtpModel = struct {
     ev_seed_m_lo: u32 = 1,
 
     pub fn deinit(self: *MtpModel) void {
+        if (self.rerank_coarse) |*rc| rc.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         if (self.eh_proj) |*ep| ep.deinit();
         _ = mlx.mlx_array_free(self.fc_w_t);
@@ -451,6 +461,7 @@ pub const MtpModel = struct {
             self.buildDraftHead(target) catch |err| {
                 log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
             };
+            self.maybeBuildDraftRerank(target);
             return;
         }
         if (!cfg.attn_output_gate) return error.UnsupportedMtpArch;
@@ -463,6 +474,7 @@ pub const MtpModel = struct {
         self.buildDraftHead(target) catch |err| {
             log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
+        self.maybeBuildDraftRerank(target);
         // NOTE (2026-07-13): mlx_compile'ing the offset-free front/back
         // halves of the seq-1 draft step (the compileMoeRouting pattern,
         // weights captured via payload) was built, verified equivalent at
@@ -525,6 +537,201 @@ pub const MtpModel = struct {
         self.draft_head_bits = bits;
         self.draft_head_group = group;
         log.info("[mtp] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
+    }
+
+    /// MLX_SERVE_MTP_DRAFT_RERANK: "0" off, "1" force-on, absent/other →
+    /// auto (on where the cost surface is generic; the calibrated G17 NAX
+    /// surfaces keep the 3-bit draft head they were measured with).
+    fn draftRerankMode() enum { auto, on, off } {
+        const p = std.c.getenv("MLX_SERVE_MTP_DRAFT_RERANK") orelse return .auto;
+        const raw = std.mem.span(p);
+        if (std.mem.eql(u8, raw, "0")) return .off;
+        if (std.mem.eql(u8, raw, "1")) return .on;
+        return .auto;
+    }
+
+    /// Build the coarse 2-bit rerank head (see the draft-rerank section
+    /// below). Infallible by design: any refusal keeps the draft-head path.
+    fn maybeBuildDraftRerank(self: *MtpModel, target: *Transformer) void {
+        const mode = draftRerankMode();
+        if (mode == .off) return;
+        if (target.lm_head_s.ctx == null) return; // dense bf16 head — row-gather rerank unbuilt/unmeasured
+        if (mode == .auto and self.m5NaxCostProfile(target) != .generic) return;
+        const w_shape = mlx.getShape(target.lm_head_w);
+        if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return;
+        const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+        if (head_qp.bits <= 2) return; // nothing coarser to gain
+
+        var rc = requantizeRows(
+            self.s,
+            target.lm_head_w,
+            target.lm_head_s,
+            target.lm_head_b,
+            head_qp.group_size,
+            head_qp.bits,
+            head_qp.mode.cstr(),
+            64,
+            2,
+            32768,
+        ) catch |err| {
+            log.warn("[mtp] draft rerank coarse build failed ({s}) — keeping the draft-head path\n", .{@errorName(err)});
+            return;
+        };
+
+        // Materialize now so the first draft doesn't pay for it.
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, rc.w);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, rc.s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
+            mlx.check(mlx.mlx_eval(eval_vec)) catch {
+                rc.deinit();
+                log.warn("[mtp] draft rerank coarse eval failed — keeping the draft-head path\n", .{});
+                return;
+            };
+        }
+
+        if (self.draft_head) |*dh| {
+            dh.deinit();
+            self.draft_head = null;
+            self.draft_head_bits = 0;
+            self.draft_head_group = 0;
+        }
+        self.rerank_coarse = rc;
+        self.rerank_rows = w_shape[0];
+        log.info("[mtp] draft rerank: coarse 2-bit/gs64 head built ({d} rows); greedy drafts re-rank through the trunk head\n", .{w_shape[0]});
+    }
+
+    pub fn canRerankDrafts(self: *const MtpModel) bool {
+        return self.rerank_coarse != null;
+    }
+
+    /// One greedy draft proposal via the rerank scheme: coarse 2-bit
+    /// full-vocab readout → exact top-32 shortlist (two dispatches) → the
+    /// trunk head's own 32 rows re-score → argmax. Returns a lazy [1,1]
+    /// int32 token id. PROPOSAL SIDE ONLY — verification still reads the
+    /// trunk forward's logits, so a coarse miss costs acceptance, never
+    /// output. A shortlist-kernel failure permanently drops back to the
+    /// trunk-head readout (this call included).
+    pub fn draftSelect(
+        self: *MtpModel,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const s = self.s;
+        // A mid-chain kernel failure nulls rerank_coarse; later steps of the
+        // same chain land here and must still answer.
+        const rc = if (self.rerank_coarse) |*p| p else return self.draftFallbackArgmax(target, x, suppress_mask);
+
+        var coarse = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(coarse);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &coarse,
+            x,
+            rc.w,
+            rc.s,
+            rc.b,
+            true,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(2),
+            "affine",
+            s,
+        ));
+        if (suppress_mask) |m| {
+            const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+            defer _ = mlx.mlx_array_free(neg_inf);
+            var masked = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_where(&masked, m, neg_inf, coarse, s));
+            _ = mlx.mlx_array_free(coarse);
+            coarse = masked;
+        }
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const flat_shape = [_]c_int{self.rerank_rows};
+        try mlx.check(mlx.mlx_reshape(&flat, coarse, &flat_shape, 1, s));
+
+        const cands = draftTop32(s, flat, self.rerank_rows) catch |err| {
+            log.warn("[mtp] draft rerank shortlist failed ({s}) — dropping to the trunk-head readout\n", .{@errorName(err)});
+            var dead = self.rerank_coarse.?;
+            dead.deinit();
+            self.rerank_coarse = null;
+            return self.draftFallbackArgmax(target, x, suppress_mask);
+        };
+        defer _ = mlx.mlx_array_free(cands);
+
+        if (!self.rerank_logged) {
+            log.info("[mtp] draft rerank engaged (2-bit coarse → top-32 → trunk re-score)\n", .{});
+            self.rerank_logged = true;
+        }
+
+        // Re-score the shortlist through the trunk head's own rows: gathered
+        // packed rows are self-contained (w [V, K·bits/32], scales/biases
+        // [V, K/gs]), so a 32-row quantized matmul is exact.
+        const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+        var w32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w32);
+        var s32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(s32);
+        var b32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(b32);
+        try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&s32, target.lm_head_s, cands, 0, s));
+        if (target.lm_head_b.ctx != null)
+            try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
+
+        var exact = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(exact);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &exact,
+            x,
+            w32,
+            s32,
+            b32,
+            true,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            s,
+        ));
+
+        var amax = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(amax);
+        try mlx.check(mlx.mlx_argmax_axis(&amax, exact, -1, false, s));
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, cands, amax, 0, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
+        return out;
+    }
+
+    /// Rerank's failure fallback: full trunk-head readout + argmax, same
+    /// [1,1] int32 shape as `draftSelect`.
+    fn draftFallbackArgmax(
+        self: *const MtpModel,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const s = self.s;
+        var logits = try targetLmHead(self, target, x, s);
+        defer _ = mlx.mlx_array_free(logits);
+        if (suppress_mask) |m| {
+            const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+            defer _ = mlx.mlx_array_free(neg_inf);
+            var masked = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+            _ = mlx.mlx_array_free(logits);
+            logits = masked;
+        }
+        var amax = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(amax);
+        try mlx.check(mlx.mlx_argmax_axis(&amax, logits, -1, false, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&out, amax, .int32, s));
+        return out;
     }
 };
 
@@ -1633,7 +1840,7 @@ const FrontOut = struct {
     q_t: mlx.mlx_array, // [1, H, L, D] normed, pre-rope
     k_t: mlx.mlx_array, // [1, Hkv, L, D] normed, pre-rope
     v_t: mlx.mlx_array, // [1, Hkv, L, D]
-    gate: mlx.mlx_array, // [1, L, H*D] raw output gate (pre-sigmoid)
+    gate: mlx.mlx_array, // [1, L, H, D] raw output gate (pre-sigmoid, strided split view)
     x: mlx.mlx_array, // [1, L, H] fc output — the residual input
 
     fn deinit(self: *FrontOut) void {
@@ -1689,8 +1896,6 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
     const eps = cfg.rms_norm_eps;
     const h_shape = mlx.getShape(hidden);
     const seq_len: c_int = h_shape[1];
-    const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
-
     const x = try fcConcat(self, target, id_arr, hidden, seq_len);
     errdefer _ = mlx.mlx_array_free(x);
 
@@ -1723,10 +1928,9 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
         if (mlx.mlx_vector_array_size(split_vec) != 2) return error.UnexpectedSplitCount;
         try mlx.check(mlx.mlx_vector_array_get(&queries, split_vec, 0));
 
-        var gate_4d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(gate_4d);
-        try mlx.check(mlx.mlx_vector_array_get(&gate_4d, split_vec, 1));
-        try mlx.check(mlx.mlx_reshape(&gate, gate_4d, &flat_shape, 3, s));
+        // The gate STAYS 4-D — flattening the split view is a REAL Copy
+        // kernel per draft step (backChain multiplies it strided for free).
+        try mlx.check(mlx.mlx_vector_array_get(&gate, split_vec, 1));
     }
 
     const k_proj = try qLinearFwd(self, normed, &self.k);
@@ -1777,21 +1981,27 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
     var attn_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_t);
     try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, s));
-    var attn_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(attn_flat);
-    try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
 
     // Output gate: o_proj(attn * sigmoid(gate)); ungated archs (Hy3) pass a
-    // null-ctx gate → straight o_proj(attn).
-    const o_out = if (gate.ctx == null)
-        try qLinearFwd(self, attn_flat, &self.o)
-    else blk: {
+    // null-ctx gate → straight o_proj(attn). The gated arm multiplies 4-D
+    // (strided views are copy-free in the elementwise kernel) and flattens
+    // the CONTIGUOUS product — flattening attn_t/gate first paid two REAL
+    // Copy kernels per draft step.
+    const o_out = if (gate.ctx == null) blk: {
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
+        break :blk try qLinearFwd(self, attn_flat, &self.o);
+    } else blk: {
         var gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_sig);
         try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate, s));
+        var gated_4d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated_4d);
+        try mlx.check(mlx.mlx_multiply(&gated_4d, attn_t, gate_sig, s));
         var gated = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gated);
-        try mlx.check(mlx.mlx_multiply(&gated, attn_flat, gate_sig, s));
+        try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, s));
         break :blk try qLinearFwd(self, gated, &self.o);
     };
     defer _ = mlx.mlx_array_free(o_out);
@@ -2071,14 +2281,14 @@ pub fn forwardWithMrope(
 
     const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);
 
-    if (!want_logits) {
-        return .{ .logits = .{ .ctx = null }, .hidden_next = post };
-    }
     // Logits (and the chained hidden) are only ever consumed for the LAST
     // row — the draft chain's next token / confidence. Multi-row calls (the
     // merged history+draft forward) slice to the last row BEFORE the vocab
     // head projection: projecting the history rows through a 248k-vocab head
     // is pure waste, and a [1,L,H] hidden_next would break the L=1 chain.
+    // The slice applies on the want_logits=false arm too: the rerank draft
+    // path chains hidden_next without ever asking for logits, and
+    // appendHistory (the other no-logits caller) frees hidden_next unused.
     var post_last = post;
     if (seq_len > 1) {
         var sliced = mlx.mlx_array_new();
@@ -2092,6 +2302,9 @@ pub fn forwardWithMrope(
         };
         _ = mlx.mlx_array_free(post);
         post_last = sliced;
+    }
+    if (!want_logits) {
+        return .{ .logits = .{ .ctx = null }, .hidden_next = post_last };
     }
     const logits = targetLmHead(self, target, post_last, s) catch |err| {
         _ = mlx.mlx_array_free(post_last);
@@ -2164,6 +2377,298 @@ pub fn stepArrWithMrope(
 ) !StepOut {
     // KVCache.update advances `cache.step` (layer 0) by 1.
     return forwardWithMrope(self, target, cache, prev_token_arr, hidden, rope_offset, true, mrope_ctx);
+}
+
+// ── Draft-rerank shortlist (port of the mlx.fast challenge draft-rerank
+// scheme, submission 942e5ab2 in mlx.fast-qwen-3.8-mtp-challenge) ──
+//
+// PROPOSAL SIDE ONLY: a coarse 2-bit requant of the trunk lm_head scores the
+// full vocab, an exact top-32 shortlist is taken in TWO dispatches (MLX's
+// GPU argpartition is a full multi-block argsort — 14 dependent dispatches
+// for 32 read values), and the trunk head's own 32 rows re-score the
+// shortlist. The draft is the trunk's argmax over those rows, so whenever
+// the coarse top-32 contains the trunk argmax the draft IS the trunk's
+// choice — acceptance rides the trunk's order at ~2-bit readout cost.
+// Verification is untouched: a coarse miss costs acceptance, never output.
+//
+// Ordinal: a monotone map from float into uint32 inducing (value asc, NaN
+// above every number, -0.0 == +0.0). Real values never map to 0, so the
+// zero-initialized empty slots below can never be selected while a
+// simdgroup still has real candidates (guaranteed by rows >= TILES*TG).
+const TOP32_ORDINAL_HEADER =
+    \\inline uint msv_top32_ordinal(float v) {
+    \\    if (isnan(v))  { return 0xFFFFFFFFu; }
+    \\    if (v == 0.0f) { return 0x80000000u; }
+    \\    uint u = as_type<uint>(v);
+    \\    return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+    \\}
+;
+
+// Stage 1: TILES threadgroups partition [0, RC); each emits its local top 32
+// as (ordinal, index) pairs — TILES * 32 candidates. Selection is 32 rounds
+// of simd_max over per-thread slots with a `taken` bitmask (hence the
+// PER_THREAD <= 32 static_assert), then one simdgroup reduces the
+// threadgroup's per-simd lists the same way.
+const TOP32_PARTIAL_SRC =
+    \\constexpr uint REAL_COUNT = (uint)RC;
+    \\constexpr uint TG_SIZE    = 256;
+    \\constexpr uint STRIDE     = 64u * 256u;
+    \\constexpr uint PER_THREAD = (REAL_COUNT + STRIDE - 1u) / STRIDE;
+    \\constexpr uint TOPK       = 32;
+    \\constexpr uint SIMD_SIZE  = 32;
+    \\constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+    \\constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+    \\static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+    \\static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+    \\
+    \\uint tile = threadgroup_position_in_grid.x;
+    \\uint tid  = thread_position_in_threadgroup.x;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg   = simdgroup_index_in_threadgroup;
+    \\
+    \\uint ord[PER_THREAD];
+    \\uint idx[PER_THREAD];
+    \\for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
+    \\uint n = 0;
+    \\for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
+    \\    ord[n] = msv_top32_ordinal(float(logits[i]));
+    \\    idx[n] = i;
+    \\    n++;
+    \\}
+    \\
+    \\threadgroup uint sc_ord[NSIMD * TOPK];
+    \\threadgroup uint sc_idx[NSIMD * TOPK];
+    \\
+    \\uint taken = 0u;
+    \\for (uint r = 0; r < TOPK; ++r) {
+    \\    uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\    for (uint t = 0; t < PER_THREAD; ++t) {
+    \\        if ((taken & (1u << t)) != 0u) { continue; }
+    \\        if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+    \\            bo = ord[t]; bi = idx[t]; bs = t;
+    \\        }
+    \\    }
+    \\    uint mo = simd_max(bo);
+    \\    uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\    if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\        taken |= (1u << bs);
+    \\    }
+    \\    if (lane == 0) {
+    \\        sc_ord[sg * TOPK + r] = mo;
+    \\        sc_idx[sg * TOPK + r] = mi;
+    \\    }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\if (sg == 0) {
+    \\    uint o2[PB];
+    \\    uint i2[PB];
+    \\    for (uint t = 0; t < PB; ++t) {
+    \\        uint p = t * SIMD_SIZE + lane;
+    \\        o2[t] = sc_ord[p];
+    \\        i2[t] = sc_idx[p];
+    \\    }
+    \\    uint tk2 = 0u;
+    \\    for (uint r = 0; r < TOPK; ++r) {
+    \\        uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\        for (uint t = 0; t < PB; ++t) {
+    \\            if ((tk2 & (1u << t)) != 0u) { continue; }
+    \\            if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+    \\                bo = o2[t]; bi = i2[t]; bs = t;
+    \\            }
+    \\        }
+    \\        uint mo = simd_max(bo);
+    \\        uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\        if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\            tk2 |= (1u << bs);
+    \\        }
+    \\        if (lane == 0) {
+    \\            cand_ord[tile * TOPK + r] = mo;
+    \\            cand_idx[tile * TOPK + r] = mi;
+    \\        }
+    \\    }
+    \\}
+;
+
+// Stage 2: one threadgroup reduces the TILES*32 candidates to the final 32
+// ids (written ascending by (value, index) — consumers are order-blind).
+const TOP32_FINAL_SRC =
+    \\constexpr uint TG_SIZE    = 256;
+    \\constexpr uint PER_THREAD = 8;
+    \\constexpr uint TOPK       = 32;
+    \\constexpr uint SIMD_SIZE  = 32;
+    \\constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+    \\constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+    \\
+    \\uint tid  = thread_position_in_threadgroup.x;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg   = simdgroup_index_in_threadgroup;
+    \\
+    \\uint ord[PER_THREAD];
+    \\uint idx[PER_THREAD];
+    \\for (uint t = 0; t < PER_THREAD; ++t) {
+    \\    uint p = t * TG_SIZE + tid;
+    \\    ord[t] = cand_ord[p];
+    \\    idx[t] = cand_idx[p];
+    \\}
+    \\
+    \\threadgroup uint sc_ord[NSIMD * TOPK];
+    \\threadgroup uint sc_idx[NSIMD * TOPK];
+    \\
+    \\uint taken = 0u;
+    \\for (uint r = 0; r < TOPK; ++r) {
+    \\    uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\    for (uint t = 0; t < PER_THREAD; ++t) {
+    \\        if ((taken & (1u << t)) != 0u) { continue; }
+    \\        if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+    \\            bo = ord[t]; bi = idx[t]; bs = t;
+    \\        }
+    \\    }
+    \\    uint mo = simd_max(bo);
+    \\    uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\    if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\        taken |= (1u << bs);
+    \\    }
+    \\    if (lane == 0) {
+    \\        sc_ord[sg * TOPK + r] = mo;
+    \\        sc_idx[sg * TOPK + r] = mi;
+    \\    }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\if (sg == 0) {
+    \\    uint o2[PB];
+    \\    uint i2[PB];
+    \\    for (uint t = 0; t < PB; ++t) {
+    \\        uint p = t * SIMD_SIZE + lane;
+    \\        o2[t] = sc_ord[p];
+    \\        i2[t] = sc_idx[p];
+    \\    }
+    \\    uint tk2 = 0u;
+    \\    for (uint r = 0; r < TOPK; ++r) {
+    \\        uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\        for (uint t = 0; t < PB; ++t) {
+    \\            if ((tk2 & (1u << t)) != 0u) { continue; }
+    \\            if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+    \\                bo = o2[t]; bi = i2[t]; bs = t;
+    \\            }
+    \\        }
+    \\        uint mo = simd_max(bo);
+    \\        uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\        if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\            tk2 |= (1u << bs);
+    \\        }
+    \\        if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
+    \\    }
+    \\}
+;
+
+const TOP32_K: c_int = 32;
+const TOP32_TG: c_int = 256;
+const TOP32_TILES: c_int = 64;
+const TOP32_CANDS: c_int = TOP32_TILES * TOP32_K;
+/// Minimum row count: below TILES*TG some simdgroups hold fewer than 32 real
+/// candidates and the zero-initialized empty slots become reachable.
+pub const TOP32_MIN_ROWS: c_int = TOP32_TILES * TOP32_TG;
+
+var top32_partial_cached: ?mlx.mlx_fast_metal_kernel = null;
+var top32_final_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getTop32Partial() !mlx.mlx_fast_metal_kernel {
+    if (top32_partial_cached) |k| return k;
+    const input_names = [_][*:0]const u8{"logits"};
+    const output_names = [_][*:0]const u8{ "cand_ord", "cand_idx" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_mtp_top32_partial",
+        in_vec,
+        out_vec,
+        TOP32_PARTIAL_SRC,
+        TOP32_ORDINAL_HEADER,
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    top32_partial_cached = kernel;
+    return kernel;
+}
+
+fn getTop32Final() !mlx.mlx_fast_metal_kernel {
+    if (top32_final_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "cand_ord", "cand_idx" };
+    const output_names = [_][*:0]const u8{"token_ids"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_mtp_top32_finalize",
+        in_vec,
+        out_vec,
+        TOP32_FINAL_SRC,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    top32_final_cached = kernel;
+    return kernel;
+}
+
+/// Exact top-32 ids of `row` ([rows], any float dtype) as a lazy [32] uint32
+/// array, ascending by (value, index) — ties break toward the higher index,
+/// NaN above every number. `rows` rides as a template int (stable per model,
+/// so MLX caches one specialization per vocab width).
+pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (rows < TOP32_MIN_ROWS) return error.UnsupportedTop32Shape;
+    const per_thread = @divTrunc(rows + TOP32_TILES * TOP32_TG - 1, TOP32_TILES * TOP32_TG);
+    if (per_thread > 32) return error.UnsupportedTop32Shape;
+
+    const pk = try getTop32Partial();
+    var cand_ord = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ord);
+    var cand_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_idx);
+    {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        const cand_shape = [_]c_int{TOP32_CANDS};
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &cand_shape, 1, .uint32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &cand_shape, 1, .uint32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, TOP32_TILES * TOP32_TG, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TOP32_TG, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RC", rows));
+        const inputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(inputs);
+        _ = mlx.mlx_vector_array_append_value(inputs, row);
+        var outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, pk, inputs, cfg, s));
+        try mlx.check(mlx.mlx_vector_array_get(&cand_ord, outputs, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&cand_idx, outputs, 1));
+    }
+
+    const fk = try getTop32Final();
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const out_shape = [_]c_int{TOP32_K};
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, TOP32_TG, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TOP32_TG, 1, 1));
+    const inputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    _ = mlx.mlx_vector_array_append_value(inputs, cand_ord);
+    _ = mlx.mlx_vector_array_append_value(inputs, cand_idx);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, fk, inputs, cfg, s));
+    var token_ids = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&token_ids, outputs, 0));
+    return token_ids;
 }
 
 // ── Tests ──
@@ -3423,5 +3928,65 @@ test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible wi
         defer m.deinit();
         try testing.expect(m.q.s.ctx == null);
         try testing.expect(m.mlp.dense.gate.s.ctx == null);
+    }
+}
+
+test "mtp: draftTop32 matches a host top-32 reference (bf16, ties, -inf)" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    // Two widths: the guard edge (just past TILES*TG with a ragged tail) and
+    // the live Qwen3.5-family vocab.
+    const counts = [_]c_int{ TOP32_MIN_ROWS + 7, 248320 };
+    var prng = std.Random.DefaultPrng.init(0x7031);
+    const rand = prng.random();
+
+    for (counts) |n| {
+        const un: usize = @intCast(n);
+        // bf16-exact values with deliberate duplicates (ties) and a few -inf
+        // (the suppress-mask spelling).
+        const vals = try allocator.alloc(f32, un);
+        defer allocator.free(vals);
+        for (vals) |*v| {
+            const level: f32 = @floatFromInt(rand.intRangeAtMost(i32, -512, 511));
+            v.* = level * 0.125; // exact in bf16
+        }
+        vals[0] = -std.math.inf(f32);
+        vals[un / 2] = -std.math.inf(f32);
+
+        const shape = [_]c_int{n};
+        const row_f32 = mlx.mlx_array_new_data(vals.ptr, &shape, 1, .float32);
+        defer _ = mlx.mlx_array_free(row_f32);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_astype(&row, row_f32, .bfloat16, s));
+
+        const ids = try draftTop32(s, row, n);
+        defer _ = mlx.mlx_array_free(ids);
+        try mlx.check(mlx.mlx_array_eval(ids));
+        const ids_ptr = mlx.mlx_array_data_uint32(ids) orelse return error.NoData;
+
+        // Host reference: (value asc, index asc), take the tail 32.
+        const Entry = struct { v: f32, i: u32 };
+        const entries = try allocator.alloc(Entry, un);
+        defer allocator.free(entries);
+        for (vals, 0..) |v, i| entries[i] = .{ .v = v, .i = @intCast(i) };
+        std.mem.sort(Entry, entries, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                if (a.v != b.v) return a.v < b.v;
+                return a.i < b.i;
+            }
+        }.lt);
+
+        var expect_set = std.AutoHashMap(u32, void).init(allocator);
+        defer expect_set.deinit();
+        for (entries[un - 32 ..]) |e| try expect_set.put(e.i, {});
+
+        for (0..32) |k| {
+            const id = ids_ptr[k];
+            try testing.expect(expect_set.contains(id));
+            _ = expect_set.remove(id); // no duplicates either
+        }
+        try testing.expectEqual(@as(u32, 0), expect_set.count());
     }
 }

@@ -11635,11 +11635,12 @@ pub const Transformer = struct {
             queries = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&queries, split_vec, 0));
 
-            var gate_4d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(gate_4d);
-            try mlx.check(mlx.mlx_vector_array_get(&gate_4d, split_vec, 1));
-
-            try mlx.check(mlx.mlx_reshape(&gate, gate_4d, &flat_shape, 3, self.s));
+            // The gate STAYS 4-D: flattening the split view here merges the
+            // head axis across the packed q/gate interleave — a REAL Copy
+            // kernel per call. Elementwise sigmoid/multiply below take the
+            // strided view copy-free; the element pairing (h, d) <-> flat
+            // h*D+d is identical either way.
+            try mlx.check(mlx.mlx_vector_array_get(&gate, split_vec, 1));
         } else {
             const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
             queries = mlx.mlx_array_new();
@@ -11791,26 +11792,32 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
         }
 
-        // Transpose back [B,H,S,D] -> [B,S,H*D]
+        // Transpose back [B,H,S,D] -> [B,S,H,D] (view)
         const perm_back = [_]c_int{ 0, 2, 1, 3 };
         var attn_t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_t);
         try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
-        var attn_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn_flat);
-        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
 
-        // Optional output gating
+        // Optional output gating: multiply 4-D (strided inputs are copy-free
+        // in the elementwise kernel), then flatten the CONTIGUOUS product —
+        // a free view. Flattening attn_t/gate first paid two REAL Copy
+        // kernels per call (reshape of a transpose/split view).
         if (cfg.attn_output_gate) {
             var gate_sig = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_sig);
             try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate, self.s));
+            var gated_4d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gated_4d);
+            try mlx.check(mlx.mlx_multiply(&gated_4d, attn_t, gate_sig, self.s));
             var gated = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gated);
-            try mlx.check(mlx.mlx_multiply(&gated, attn_flat, gate_sig, self.s));
+            try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, self.s));
             return self.attnProj(gated, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
         }
 
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
         return self.attnProj(attn_flat, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
     }
 
