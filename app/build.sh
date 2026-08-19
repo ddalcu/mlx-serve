@@ -75,21 +75,43 @@ fi
 # against a CHANGELOG that said 26.7.12). Guarded by
 # tests/test_release_workflow_gates.sh.
 YM="$(TZ=America/New_York date +%y.%-m)"
-if [ "$FAST_DEV" = "1" ]; then
-    # A fast build cuts no release, so the `gh` round-trip buys nothing — and
-    # stamping the TRACKED plist would leave the tree dirty on every iteration
-    # (release.yml's Homebrew step rebases and cannot take a dirty tree). Reuse
-    # whatever version the plist already carries; it is only ever read back by
+# Only a build that could BECOME a release asks GitHub what has been published.
+# A fast build cuts nothing, and neither does an ad-hoc one: `gh` is release
+# tooling, not a build dependency, and someone who clones the repo to compile
+# the app must not need a GitHub login to do it. The signing identity is the
+# discriminator because it is already the flag deciding hardened runtime,
+# notarization and productbuild below — no identity, no release, no `gh`.
+# Nothing in CI reaches this: release.yml mirrors this script step by step and
+# runs its own `gh release list`.
+if [ "$FAST_DEV" = "1" ] || [ "$IDENTITY" = "-" ]; then
+    # Reuse whatever version the plist already carries. It is only read back by
     # UpdateChecker, which has nothing to compare against on a dev build.
     CALVER="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST_SRC" 2>/dev/null || echo "${YM}.0")"
 else
-    LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null || echo "0")
+    # `gh` is the only thing that knows what has already been published, so its
+    # failure is not defaultable. It used to end in `|| echo "0"`, which turns a
+    # missing login or an offline laptop into v<YY.M>.1 — BEHIND every release
+    # already cut that month, which is the same UpdateChecker dead end as an
+    # unstamped bundle from the other direction. An empty month still yields 0
+    # through the jq's own `// 0`; only the COMMAND failing stops the build.
+    if ! LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null); then
+        echo "ERROR: \`gh release list\` failed, so the next CalVer number is unknown."
+        echo "       Defaulting it would stamp v${YM}.1, behind what is already published."
+        echo "       Fix it (\`gh auth login\`), or build for yourself: FAST_DEV=1 bash app/build.sh"
+        exit 1
+    fi
     NEXT_N=$((LAST_N + 1))
     CALVER="${YM}.${NEXT_N}"
-    # Stamp the version into whichever Info.plist this build mode ships.
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" "$INFO_PLIST_SRC"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" "$INFO_PLIST_SRC"
 fi
+# The version is stamped into the BUNDLE below, never here. This block used to
+# PlistBuddy the TRACKED app/Info.plist, which dirties the working tree on every
+# build: release.yml's Homebrew step rebases and cannot take a dirty tree, and a
+# contributor who merely builds the app ends up with a modified file they never
+# touched. Not stamping at all is the other half of the same line and has
+# already shipped — v26.8.1's DMG contained an app reporting 26.7.12, so
+# UpdateChecker offered an update that installing could never satisfy, forever.
+# Stamping the bundle copy is what release.yml does; both sides are pinned by
+# tests/test_release_workflow_gates.sh.
 export MLX_SERVE_VERSION="$CALVER"
 
 if [ "$FAST_DEV" = "1" ]; then
@@ -239,8 +261,13 @@ cp "$PROJECT_ROOT/LICENSE" "$PROJECT_ROOT/LICENSE-APACHE-2.0" "$PROJECT_ROOT/NOT
 # mlx-serve Zig binary
 cp "$PROJECT_ROOT/$MLX_BIN" "$CONTENTS/MacOS/mlx-serve"
 
-# Info.plist (the build-mode variant, already version-stamped)
+# Info.plist (the build-mode variant), stamped HERE rather than at the source:
+# the tracked file stays clean, and the bundle can never ship the last release's
+# version. Must land after this cp (which would overwrite it) and before the
+# codesign below (a write after the seal invalidates it).
 cp "$INFO_PLIST_SRC" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" "$CONTENTS/Info.plist"
 
 # The vz-agent guest binary ships in EVERY build variant (issue #89: it was
 # MAS-only, so Developer ID / ad-hoc builds always booted the legacy console

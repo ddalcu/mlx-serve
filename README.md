@@ -50,6 +50,18 @@ Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Direct `--mode
 
 And because mlx-serve **speaks the Ollama API** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/pull`, …) alongside OpenAI and Anthropic, your existing Ollama-connected tools — Raycast, Obsidian, Enchanted, Open WebUI, `ollama-python`/`js` — work unchanged: point them at `http://localhost:11234` and keep your workflow, on a faster engine.
 
+### Build from source
+
+Needs Xcode 26.2+ with the Metal Toolchain component (if `xcrun -sdk macosx metal --version` fails, run `xcodebuild -downloadComponent MetalToolchain`):
+
+```bash
+git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
+brew bundle install --file=Brewfile   # cmake + webp
+./app/build.sh                        # app + server, ad-hoc signed
+```
+
+That's the whole list. Zig, mlx and llama.cpp are pinned and fetched or built by the script, and there's no Python anywhere in the build. Server-only builds are in [docs/building.md](docs/building.md).
+
 ## Why mlx-serve
 ![MLX Core](website/screenshots/ds4.jpg)
 

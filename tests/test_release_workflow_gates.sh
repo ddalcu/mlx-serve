@@ -247,6 +247,63 @@ for pat, what in ((r'install_name_tool -add_rpath @loader_path "\$CONTENTS/Frame
             guarded = any('STAGE_FRAMEWORKS' in x for x in b_lines[max(0, i - 12):i])
             check(guarded, f"{what} runs only when the frameworks were restaged")
 
+# ── The version is stamped into the BUNDLE, never into the tracked plist.
+# Two failures meet here, one on each side of the same line. Stamping the repo
+# file dirties the working tree — release.yml's Homebrew step cannot `git
+# rebase` on a dirty tree, and a contributor who merely BUILDS ends up with a
+# modified app/Info.plist they never touched. Not stamping at all is worse and
+# has already shipped: v26.8.1's DMG contained an app reporting 26.7.12, so
+# UpdateChecker offered an update that installing could never satisfy, forever.
+# The one answer that is neither: stamp $CONTENTS/Info.plist after the cp that
+# creates it and before the app is signed, which is what release.yml does.
+# The number being stamped has to be RIGHT, and `gh release list` is the only
+# thing that knows it. Swallowing its failure into a default (`|| echo "0"`)
+# yields v<YY.M>.1 — behind every release already published that month — and
+# that is the same UpdateChecker dead end as an unstamped bundle, reached
+# through a different door. Observed live: a working copy carrying 26.8.1 with
+# 26.8.9 committed and v26.8.8 published, written by a build whose `gh` was not
+# authed. A legitimately empty month must still yield 0, so the jq keeps
+# `// 0`; what must not be defaulted is the COMMAND failing.
+gh_line = b_first(r"gh release list")
+check(gh_line is not None, "app/build.sh computes CalVer from the published releases")
+if gh_line is not None:
+    check("|| echo" not in b_code[gh_line],
+          "a `gh` failure is not swallowed into a default CalVer number")
+    check(any("exit 1" in l for l in b_code[gh_line:gh_line + 12]),
+          "a `gh` failure stops the build instead of stamping a version behind the published ones")
+
+    # ...but only a build that could BECOME a release may require `gh` at all.
+    # The GitHub CLI is release tooling, not a build dependency: a contributor
+    # who clones and runs app/build.sh signs ad-hoc, cuts nothing, and must not
+    # be stopped by a missing login. Nothing in CI reaches this code (release.yml
+    # mirrors the script and runs its own `gh release list`), so the identity is
+    # the whole discriminator — and it is already the flag deciding hardened
+    # runtime, notarization and productbuild further down.
+    guard = "\n".join(b_code[max(0, gh_line - 14):gh_line])
+    check('"$IDENTITY" = "-"' in guard,
+          "the `gh` round-trip is skipped for an ad-hoc build — no signing identity, no release")
+    check("$FAST_DEV" in guard,
+          "the `gh` round-trip is skipped under FAST_DEV too")
+    # The skip has to LAND somewhere: an ad-hoc build still needs a CALVER.
+    adhoc_ver = b_first(r'CALVER="\$\(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString"')
+    check(adhoc_ver is not None and adhoc_ver < gh_line,
+          "the no-`gh` arm reuses the version already in the plist")
+
+stamp_targets = [l for l in b_code if "PlistBuddy" in l and "Set :CFBundle" in l]
+check(stamp_targets and all("$CONTENTS/Info.plist" in l for l in stamp_targets),
+      "app/build.sh stamps the BUNDLE's Info.plist, never the tracked source")
+check(not any("$INFO_PLIST_SRC" in l for l in stamp_targets),
+      "no build mode writes the tracked app/Info.plist — a build leaves the tree clean")
+for key in ("CFBundleVersion", "CFBundleShortVersionString"):
+    check(any(f"Set :{key} " in l for l in stamp_targets),
+          f"the bundle's {key} is stamped from the version being built")
+first_stamp = b_first(r'PlistBuddy -c "Set :CFBundle')
+cp_plist = b_first(r'^\s*cp "\$INFO_PLIST_SRC" "\$CONTENTS/Info\.plist"')
+check(cp_plist is not None and first_stamp is not None and cp_plist < first_stamp,
+      "the stamp runs AFTER the plist is copied into the bundle (or the cp overwrites it)")
+check(first_stamp is not None and sign_app is not None and first_stamp < sign_app,
+      "the stamp runs BEFORE the bundle is sealed (a later write breaks the signature)")
+
 # ── Homebrew push timing: the release is created as a DRAFT, so its assets
 # are not downloadable until it is published. The formula push must fire on
 # the publish transition ONLY — any other trigger reintroduces the window

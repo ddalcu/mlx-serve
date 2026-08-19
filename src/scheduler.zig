@@ -2793,6 +2793,27 @@ test "a refusal quotes the number it actually compared" {
     try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB)));
 }
 
+test "BOTH preflight refusals quote the number they compared, not the weights" {
+    // The media arm was fixed for #144's class (2026-08-08) and the TEXT arm was
+    // not: it printed "weights ~8.4 GB but only 10.1 GB free", which reads as
+    // "this should have worked" — the load was refused for the 2.05 GB of
+    // headroom the sentence never named (live 2026-08-17, a gemma-4-12B QAT pack
+    // on a 16 GB M4, where the bar is 10.45 GB). `insufficient_free_memory_message`
+    // sends the client to this very line for the figures, so a line that omits
+    // the bar makes the client message a dead end too. Needles are ++-split so
+    // this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    // Each refusal formats the REQUIREMENT as its first figure, from the one
+    // helper the comparison itself uses — never a second formula that can drift.
+    const media_arg = "loadRequirement" ++ "Bytes(peak))) / gb";
+    try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
+    const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
+    try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);
+    // The weights-first shape that could not state its own bar must be GONE.
+    const old = "Insufficient memory to load model: weights ~" ++ "{d:.1} GB but only";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
 test "the eviction gate bills a media entry its BACKEND peak, never the dir's safetensors sum" {
     // #126. MiniMax-H3's four safetensors sum to 37.55 GiB, but the text
     // encoder RUNS AND IS FREED before the DiT loads, so the real staged peak
@@ -2962,7 +2983,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
         if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
-            log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
             });
