@@ -4,8 +4,16 @@ Two things I want measured on hardware I don't have. Everything below was valida
 
 ## Setup (both tests)
 
-- macOS 26.2 or newer (hard floor, the self-built mlx needs it).
-- Build: `./scripts/fetch-zig.sh`, then `./scripts/build-mlx.sh`, then `zig build -Doptimize=ReleaseFast`. Never bench a bare `zig build`, Debug is 2-4x slower and every number is fiction.
+- macOS 26.2 or newer (hard floor, the self-built mlx needs it), Xcode 26.2+ with the Metal Toolchain component (`xcodebuild -downloadComponent MetalToolchain` if `xcrun -sdk macosx metal --version` fails).
+- Build, the easy way (full details in `docs/building.md`):
+
+  ```bash
+  git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
+  brew bundle install --file=Brewfile
+  ./app/build.sh
+  ```
+
+  That one script stages everything (zig nightly, llama.cpp, mlx with NAX kernels asserted), builds the app + server, and signs ad-hoc with no Apple account. The server binary you bench is `zig-out/bin/mlx-serve`. Server-only alternative: `./scripts/fetch-zig.sh`, `./scripts/fetch-llama.sh && ./scripts/build-mlx.sh`, then `zig build -Doptimize=ReleaseFast`. Never bench a bare `zig build`, Debug is 2-4x slower and every number is fiction.
 - Models (HF, all ungated):
   - Qwen trunk: https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit (or any Qwen3.8-27B MLX-Serve pack you have; it ships the MTP head)
   - Qwen DFlash2 drafter: https://huggingface.co/incoai/Qwen3.8-27B-DFlash2 (3.85 GB)
