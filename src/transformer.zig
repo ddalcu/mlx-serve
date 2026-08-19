@@ -3723,6 +3723,12 @@ const FullAttnWeights = struct {
     // latent instead of q/k/v — those three fields stay null-ctx and
     // `mlaAttnWith` runs in place of gatedFullAttnWith. `o_w` holds the
     // checkpoint's `dense` (the output projection) as usual.
+    /// The direct Q projection, used INSTEAD of the q_a/q_b pair when the
+    /// config carries `q_lora_rank: null` (`ModelConfig.mlaHasQLora`). Exactly
+    /// one of `mla_q_direct_w` and `mla_q_a_w` is non-null on an MLA layer.
+    mla_q_direct_w: mlx.mlx_array = .{ .ctx = null },
+    mla_q_direct_s: mlx.mlx_array = .{ .ctx = null },
+    mla_q_direct_b: mlx.mlx_array = .{ .ctx = null },
     mla_q_a_w: mlx.mlx_array = .{ .ctx = null },
     mla_q_a_s: mlx.mlx_array = .{ .ctx = null },
     mla_q_a_b: mlx.mlx_array = .{ .ctx = null },
@@ -11278,12 +11284,21 @@ pub const Transformer = struct {
         const strides3 = [_]c_int{ 1, 1, 1 };
         const strides4 = [_]c_int{ 1, 1, 1, 1 };
 
-        // ── Q: low rank, then split into the non-positional and rope halves.
-        const q_a = try self.qmatmul(x, fa.mla_q_a_w, fa.mla_q_a_s, fa.mla_q_a_b);
-        defer _ = mlx.mlx_array_free(q_a);
-        const q_a_n = try self.rmsNorm(q_a, fa.mla_q_a_norm);
-        defer _ = mlx.mlx_array_free(q_a_n);
-        const q_flat = try self.qmatmul(q_a_n, fa.mla_q_b_w, fa.mla_q_b_s, fa.mla_q_b_b);
+        // ── Q, then split into the non-positional and rope halves.
+        //
+        // Two arms. The low-rank pair (q_a → norm → q_b) is tiny's; a direct
+        // q_proj is flash's, where `q_lora_rank` is null. Both produce the same
+        // [batch, seq, heads * qk_head_dim] flat query, so everything below is
+        // shared — only the projection differs.
+        const q_flat = if (fa.mla_q_direct_w.ctx != null)
+            try self.qmatmul(x, fa.mla_q_direct_w, fa.mla_q_direct_s, fa.mla_q_direct_b)
+        else blk: {
+            const q_a = try self.qmatmul(x, fa.mla_q_a_w, fa.mla_q_a_s, fa.mla_q_a_b);
+            defer _ = mlx.mlx_array_free(q_a);
+            const q_a_n = try self.rmsNorm(q_a, fa.mla_q_a_norm);
+            defer _ = mlx.mlx_array_free(q_a_n);
+            break :blk try self.qmatmul(q_a_n, fa.mla_q_b_w, fa.mla_q_b_s, fa.mla_q_b_b);
+        };
         defer _ = mlx.mlx_array_free(q_flat);
 
         var q_heads = mlx.mlx_array_new();
@@ -13919,13 +13934,19 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     .g_w = getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
                     .g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new(),
                     .g_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new(),
-                    .mla_q_a_w = getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight"),
-                    .mla_q_a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.scales") orelse mlx.mlx_array_new(),
-                    .mla_q_a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.biases") orelse mlx.mlx_array_new(),
-                    .mla_q_a_norm = getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight"),
-                    .mla_q_b_w = getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight"),
-                    .mla_q_b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.scales") orelse mlx.mlx_array_new(),
-                    .mla_q_b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.biases") orelse mlx.mlx_array_new(),
+                    // Exactly ONE Q arm per checkpoint: the low-rank pair
+                    // (tiny) or a direct q_proj (flash, `q_lora_rank: null`).
+                    // Asking for the absent one would abort the load.
+                    .mla_q_direct_w = if (config.mlaHasQLora()) mlx.mlx_array_new() else getLayerWeight(weights, name_buf, prefix, li, "attention.q_proj.weight"),
+                    .mla_q_direct_s = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.scales") orelse mlx.mlx_array_new()),
+                    .mla_q_direct_b = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.biases") orelse mlx.mlx_array_new()),
+                    .mla_q_a_w = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight") else mlx.mlx_array_new(),
+                    .mla_q_a_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
+                    .mla_q_a_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
+                    .mla_q_a_norm = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight") else mlx.mlx_array_new(),
+                    .mla_q_b_w = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight") else mlx.mlx_array_new(),
+                    .mla_q_b_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
+                    .mla_q_b_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
                     .mla_kv_a_w = getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.weight"),
                     .mla_kv_a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.scales") orelse mlx.mlx_array_new(),
                     .mla_kv_a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.biases") orelse mlx.mlx_array_new(),
@@ -13939,6 +13960,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 const fa = &lw.attn.full;
                 try maybeTransposeForBf16(&fa.o_w, fa.o_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.g_w, fa.g_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&fa.mla_q_direct_w, fa.mla_q_direct_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.mla_q_a_w, fa.mla_q_a_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.mla_q_b_w, fa.mla_q_b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.mla_kv_a_w, fa.mla_kv_a_s, &owned_bf16, allocator, s);
