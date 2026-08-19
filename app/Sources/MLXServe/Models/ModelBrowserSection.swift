@@ -185,6 +185,21 @@ enum ModelBrowserUse {
         return models.first { normalize($0.path) == wanted && $0.isChatPickable }
     }
 
+    /// The media model at `path` and the pane it belongs to, if any.
+    ///
+    /// The sibling of `pickableModel` for the other half of the catalogue. Both
+    /// return nil for the other's kind, so a row asks both and gets at most one
+    /// answer — a media checkpoint is never chat-pickable and a chat model has
+    /// no modality. Every on-disk row can then offer a Use, instead of Discover
+    /// and the Media pane quietly ending at Delete the way My Models did (#228).
+    static func mediaModel(atPath path: String?, in models: [LocalModel]) -> (model: LocalModel, modality: MediaModality)? {
+        guard let path, !path.isEmpty else { return nil }
+        let wanted = normalize(path)
+        guard let m = models.first(where: { normalize($0.path) == wanted }),
+              let modality = MediaModality(modelType: m.modelType) else { return nil }
+        return (m, modality)
+    }
+
     private static func normalize(_ path: String) -> String {
         var p = (path as NSString).standardizingPath
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }

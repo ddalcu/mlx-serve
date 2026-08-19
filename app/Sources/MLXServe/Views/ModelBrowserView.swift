@@ -386,6 +386,12 @@ private struct RecommendedModelTableRow: View {
         return ModelBrowserUse.pickableModel(atPath: path, in: appState.localModels)
     }
 
+    /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
+    private var usableMedia: (model: LocalModel, modality: MediaModality)? {
+        let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
+        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels)
+    }
+
     var body: some View {
         HStack(spacing: RecTableMetrics.spacing) {
             // Model — name + tagline; the full blurb is on hover.
@@ -480,6 +486,8 @@ private struct RecommendedModelTableRow: View {
                     } else {
                         ModelUseBadge(state: use)
                     }
+                } else if let media = usableMedia {
+                    UseMediaModelButton(modality: media.modality, name: media.model.name)
                 } else {
                     Text("✓ On disk")
                         .font(.caption.weight(.medium))
@@ -1360,6 +1368,14 @@ private struct ModelBrowserRow: View {
         )
     }
 
+    /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
+    private var usableMedia: (model: LocalModel, modality: MediaModality)? {
+        ModelBrowserUse.mediaModel(
+            atPath: downloads.existingModelDir(for: model.id),
+            in: appState.localModels
+        )
+    }
+
     /// A verified community media pack downloads as its FAMILY bundle — the
     /// same allowlists + ready markers the catalog packs use — never the flat
     /// chat-default pull, which would miss subdirs and grab repo junk. nil for
@@ -1428,6 +1444,8 @@ private struct ModelBrowserRow: View {
                         } else {
                             ModelUseBadge(state: use)
                         }
+                    } else if let media = usableMedia {
+                        UseMediaModelButton(modality: media.modality, name: media.model.name)
                     } else {
                         Text("✓ On disk")
                             .font(.caption.weight(.medium))

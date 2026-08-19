@@ -153,3 +153,62 @@ final class MediaUseButtonSourceTests: XCTestCase {
                       "the media Use button should route through AppState.showCreate")
     }
 }
+
+/// `pickableModel` and `mediaModel` are the two halves of the catalogue, and
+/// every on-disk row asks both. Before this, only My Models was fixed and
+/// Discover / Recommended still ended at Delete.
+final class MediaModelResolutionTests: XCTestCase {
+
+    private func local(_ type: String, path: String) -> LocalModel {
+        LocalModel(id: "test:\(type)", name: type, path: path, sizeFormatted: "1 GB",
+                   modelType: type, source: .mlxServe, kind: .base)
+    }
+
+    func testTheTwoHalvesNeverBothAnswer() {
+        // A media checkpoint is never chat-pickable and a chat model has no
+        // modality, so a row asking both gets at most one answer — no ordering
+        // rule needed between them.
+        let models = [local("minimax_music3", path: "/m/music"), local("qwen3", path: "/m/chat")]
+        XCTAssertNil(ModelBrowserUse.pickableModel(atPath: "/m/music", in: models))
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/music", in: models)?.modality, .music)
+
+        XCTAssertNotNil(ModelBrowserUse.pickableModel(atPath: "/m/chat", in: models))
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: "/m/chat", in: models))
+    }
+
+    func testEachMediaKindResolvesToItsOwnPane() {
+        let models = [local("flux2-klein-4b", path: "/m/img"), local("AudioVideo", path: "/m/vid"),
+                      local("qwen3_tts", path: "/m/voice"), local("acestep", path: "/m/music"),
+                      local("hunyuan3d_2_1", path: "/m/mesh")]
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/img", in: models)?.modality, .image)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/vid", in: models)?.modality, .video)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/voice", in: models)?.modality, .voice)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/music", in: models)?.modality, .music)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/mesh", in: models)?.modality, .mesh)
+    }
+
+    func testPathMatchingIsAsForgivingAsTheChatHalf() {
+        // Same normalization, or the two halves would disagree about which row
+        // a path belongs to.
+        let models = [local("acestep", path: "/m/music")]
+        XCTAssertNotNil(ModelBrowserUse.mediaModel(atPath: "/m/music/", in: models))
+        XCTAssertNotNil(ModelBrowserUse.mediaModel(atPath: "/m/./music", in: models))
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: "", in: models))
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: nil, in: models))
+    }
+
+    func testEveryOnDiskRowOffersAUse() throws {
+        // Source audit: all three on-disk arms (Recommended, Discover, My
+        // Models) must consult the media half, not just the chat one. The Media
+        // pane passes its modality directly, so it is exempt.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(
+            contentsOf: root.appendingPathComponent("app/Sources/MLXServe/Views/ModelBrowserView.swift"),
+            encoding: .utf8)
+        let uses = text.components(separatedBy: "UseMediaModelButton(").count - 1
+        XCTAssertGreaterThanOrEqual(uses, 4,
+            "expected the media Use button in Recommended, Discover, My Models and the Media pane")
+    }
+}
