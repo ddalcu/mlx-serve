@@ -69,6 +69,11 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
     // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
+    // SeedVR2: the VAE is the small half of the pack and lands long before the
+    // 6.8 GB DiT, so keying on the DiT is what actually detects a half-finished
+    // download. A marker-less restore dir would fall through to the TEXT loader
+    // and die on the first missing weight.
+    if (std.mem.startsWith(u8, model_type, "seedvr2")) return "dit.safetensors";
     return null;
 }
 
@@ -83,6 +88,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.startsWith(u8, model_type, "seedvr2") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -369,6 +375,7 @@ pub const ModelKind = enum {
     audio,
     video,
     mesh,
+    restore,
     embed,
     drafter,
     unsupported,
@@ -381,6 +388,7 @@ pub const ModelKind = enum {
             .audio => "audio",
             .video => "video",
             .mesh => "3d",
+            .restore => "restore",
             .embed => "embed",
             .drafter => "drafter",
             .unsupported => "unsupported",
@@ -395,6 +403,7 @@ pub const ModelKind = enum {
             .audio => "an audio generation model",
             .video => "a video generation model",
             .mesh => "a 3D generation model",
+            .restore => "a restoration/upscaling model",
             .embed => "an embedding encoder (use /v1/embeddings)",
             .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
             .unsupported => "an architecture mlx-serve does not support",
@@ -408,6 +417,7 @@ pub const ModelKind = enum {
             .audio => "/v1/audio/speech (TTS) or /v1/audio/music-generations (music)",
             .video => "/v1/video/generations",
             .mesh => "/v1/3d/generations",
+            .restore => "/v1/images/upscales (images) or /v1/video/upscales (video)",
             else => null,
         };
     }
@@ -427,6 +437,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.startsWith(u8, model_type, "seedvr2")) return .restore;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;

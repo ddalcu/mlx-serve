@@ -56,6 +56,12 @@ test {
     _ = @import("ltx_diffvae_kernel.zig");
     _ = @import("ltx_diffvae_forward.zig");
     _ = @import("ltx_audio.zig");
+    _ = @import("seedvr2_window.zig");
+    _ = @import("seedvr2_vae_shape.zig");
+    _ = @import("seedvr2_manifest.zig");
+    _ = @import("seedvr2_vae.zig");
+    _ = @import("seedvr2_dit.zig");
+    _ = @import("seedvr2_pipeline.zig");
     _ = @import("minimax_h3.zig");
     _ = @import("minimax_h3_vision.zig");
     _ = @import("minimax_h3_vae.zig");

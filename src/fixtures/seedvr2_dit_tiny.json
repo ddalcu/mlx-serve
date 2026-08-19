@@ -1,0 +1,202 @@
+{
+ "_substitutions": {
+  "flash_attn": "torch-sdpa-varlen (exact)",
+  "apex.normalization": "torch-equivalent"
+ },
+ "_note": "tiny random-weight NaDiT; CPU fp32",
+ "_config": {
+  "vid_dim": 64,
+  "heads": 2,
+  "head_dim": 32,
+  "num_layers": 4,
+  "mm_layers": 2,
+  "txt_in_dim": 80,
+  "patch": [
+   1,
+   2,
+   2
+  ],
+  "vid_shape": [
+   2,
+   48,
+   48
+  ],
+  "txt_len": 7,
+  "timestep": 734.0
+ },
+ "in_vid": {
+  "shape": [
+   4608,
+   33
+  ],
+  "dtype": "f32"
+ },
+ "in_txt": {
+  "shape": [
+   7,
+   80
+  ],
+  "dtype": "f32"
+ },
+ "act_block0_attn_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block0_attn_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block0_mlp_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block0_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block0_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block1_attn_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block1_attn_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block1_mlp_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block1_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block1_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block2_attn_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block2_attn_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block2_mlp_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block2_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block2_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block3_attn_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block3_attn_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block3_mlp_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block3_txt": {
+  "shape": [
+   7,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_block3_vid": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "act_emb": {
+  "shape": [
+   1,
+   384
+  ],
+  "dtype": "f32"
+ },
+ "act_vid_in": {
+  "shape": [
+   1152,
+   64
+  ],
+  "dtype": "f32"
+ },
+ "out_vid": {
+  "shape": [
+   4608,
+   16
+  ],
+  "dtype": "f32"
+ }
+}
