@@ -5385,7 +5385,13 @@ fn handleChatCompletions(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -5647,7 +5653,13 @@ fn handleCompletions(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -10813,7 +10825,13 @@ fn handleAnthropicMessages(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -12556,7 +12574,8 @@ fn handleResponses(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld_resp = false;
             }
-            if (enable_drafter_resp and !drafter_explicit_in_json) {
+            // DFlash exemption — same rule as the other three surfaces.
+            if (enable_drafter_resp and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter_resp = false;
             }

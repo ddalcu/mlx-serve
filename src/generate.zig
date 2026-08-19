@@ -3658,7 +3658,12 @@ pub const Generator = struct {
         const bs: u32 = @max(self.dflash_block_size, 2);
         const m: u32 = bs - 1;
         const t1: u32 = self.next_token_id;
-        const anchor_pos: usize = self.ctx.cache.step;
+        // On the moe/GDN path positions come from moe_seq_offset (cache.step
+        // is a bookkeeping counter the model never reads there — same rule as
+        // nextMtp); the standard path keeps cache.step as the anchor.
+        const moe_path = self.xfm.moe_layers != null;
+        const anchor_pos: usize = if (moe_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
+        const kv_step_snap = self.ctx.cache.step;
         std.debug.assert(dctx.absLen() == anchor_pos);
 
         const tracing = dflashTraceEnabled();
@@ -3709,14 +3714,45 @@ pub const Generator = struct {
         // requests keep the argmax path untouched, so the byte-equality
         // guard is unaffected.
         const stochastic = self.sampling.temperature > 0.01;
-        const sample_drafts = stochastic and dflashSampledDraftsEnabled();
+        // DFlash2 path selector: when the sidecar ships one, drafts come from
+        // the pairwise-scored path trace instead of per-position argmax /
+        // block sampling. Greedy requests keep the byte-equality bar (a
+        // selector draft only survives verify if it IS the trunk argmax);
+        // stochastic requests sample the selector's own candidate softmax and
+        // accept through min(1, p/q) with q read off the traced path —
+        // exact by construction. `MLX_SERVE_DFLASH_SELECTOR=0` forces the v1
+        // arms for A/Bs.
+        const use_selector = model.selector != null and dflashSelectorEnabled();
+        const sample_drafts = stochastic and !use_selector and dflashSampledDraftsEnabled();
+        var sel_path: ?dflash_mod.SelectedPath = null;
+        defer if (sel_path) |*sp| sp.deinit(allocator);
         var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
         defer if (draft_q.ctx != null) {
             _ = mlx.mlx_array_free(draft_q);
         };
         var draft_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_ids);
-        if (sample_drafts) {
+        if (use_selector) {
+            const sel_temp: f32 = if (stochastic) self.sampling.temperature else 0.0;
+            sel_path = try dflash_mod.selectPath(
+                allocator,
+                &model.selector.?,
+                model.config.selector_top_k,
+                blk_hidden,
+                draft_logits,
+                t1,
+                sel_temp,
+                self.prng.random(),
+                s,
+            );
+            const ids_i32 = try allocator.alloc(i32, m);
+            defer allocator.free(ids_i32);
+            for (sel_path.?.ids, ids_i32) |v, *d| d.* = @intCast(v);
+            const row_shape = [_]c_int{ 1, @intCast(m) };
+            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(host_arr);
+            try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
+        } else if (sample_drafts) {
             draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
             var logq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(logq);
@@ -3769,7 +3805,14 @@ pub const Generator = struct {
         var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
+        // Per-position SSM capture on a GDN trunk so partial accept can roll
+        // back the recurrent state without re-forwarding (mirrors nextMtp).
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        self.ctx.capture_ssm_seq = false;
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
         self.dflash_attempted += 1;
         if (tracing) {
             // Captures ride the same forward — eval them here or their cost
@@ -3820,7 +3863,9 @@ pub const Generator = struct {
         }
         var drafts = try allocator.alloc(u32, m);
         errdefer allocator.free(drafts);
-        {
+        if (sel_path) |*sp| {
+            @memcpy(drafts, sp.ids);
+        } else {
             try mlx.check(mlx.mlx_array_eval(draft_ids));
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
             for (drafts, 0..) |*d, idx| d.* = @intCast(draft_data[idx]);
@@ -3838,6 +3883,11 @@ pub const Generator = struct {
                     const q_row = try sliceProbRow(draft_q, k, s);
                     defer _ = mlx.mlx_array_free(q_row);
                     break :blk specAcceptProb(p_draft, try probAt(q_row, drafts[k], s));
+                } else if (sel_path) |*sp| blk: {
+                    // Selector-sampled draft: q is the traced step's own
+                    // candidate softmax — exact, no GPU read.
+                    const kk = sp.cand_ids.len / @as(usize, m);
+                    break :blk specAcceptProb(p_draft, sp.q.?[@as(usize, k) * kk + sp.chosen_idx[k]]);
                 } else @min(1.0, p_draft);
                 const u: f32 = self.prng.random().float(f32);
                 if (u >= accept_prob) break;
@@ -3874,6 +3924,8 @@ pub const Generator = struct {
                     // sampled draft, and wrong silently.
                     const q_row = if (draft_q.ctx != null)
                         try sliceProbRow(draft_q, accepted, s)
+                    else if (sel_path) |*sp|
+                        try selectorQRow(sp, accepted, m, vl_shape[2], s)
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
@@ -3897,6 +3949,22 @@ pub const Generator = struct {
         const n_commit: usize = 1 + @as(usize, accepted);
         if (accepted < m) {
             try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+            if (moe_path) {
+                // Same bookkeeping as nextMtp's GDN arm: preserve the
+                // pre-verify cache.step (prefix-cache kv_step contract),
+                // roll every linear layer's recurrent state back to the
+                // accepted position from the verify pass's capture, and
+                // re-point moe_seq_offset at the committed length.
+                self.ctx.cache.step = kv_step_snap;
+                if (self.ctx.ssm_entries) |entries| {
+                    const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
+                    if (!gdn_captured) return error.SpecRollbackUnavailable;
+                    for (entries) |*entry| {
+                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                    }
+                }
+                self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
+            }
         }
         if (accepted == m) {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
@@ -5741,6 +5809,21 @@ pub const Generator = struct {
         return on;
     }
 
+    /// `MLX_SERVE_DFLASH_SELECTOR`: default ON when the sidecar ships a
+    /// selector (DFlash2). "0" forces the v1 draft arms (argmax / block
+    /// sampling) for A/Bs — the conv layers stay, they are the checkpoint.
+    var dflash_selector_cache: ?bool = null;
+    fn dflashSelectorEnabled() bool {
+        if (dflash_selector_cache) |v| return v;
+        var on = true;
+        if (std.c.getenv("MLX_SERVE_DFLASH_SELECTOR")) |p| {
+            const val = std.mem.span(p);
+            if (val.len > 0 and val[0] == '0') on = false;
+        }
+        dflash_selector_cache = on;
+        return on;
+    }
+
     var dflash_trace_cache: ?bool = null;
     fn dflashTraceEnabled() bool {
         if (dflash_trace_cache) |v| return v;
@@ -6757,6 +6840,27 @@ fn sliceProbRow(rows_2d: mlx.mlx_array, row: u32, s: mlx.mlx_stream) !mlx.mlx_ar
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, rows_2d, &start, 2, &stop, 2, &strides, 2, s));
+    return out;
+}
+
+/// The DFlash2 selector's proposal density for one step as a `[1, V]` row:
+/// its per-candidate softmax scattered into zeros — q is zero off the
+/// candidate set by construction, so this is the exact density the draft was
+/// drawn from (the residual-correction contract).
+fn selectorQRow(sp: *const dflash_mod.SelectedPath, step: usize, m: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const kk = sp.cand_ids.len / @as(usize, m);
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    const z_shape = [_]c_int{ 1, vocab };
+    try mlx.check(mlx.mlx_zeros(&zeros, &z_shape, 2, .float32, s));
+    const row_shape = [_]c_int{ 1, @intCast(kk) };
+    const ids_arr = mlx.mlx_array_new_data(sp.cand_ids.ptr + step * kk, &row_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+    const vals_arr = mlx.mlx_array_new_data(sp.q.?.ptr + step * kk, &row_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(vals_arr);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_put_along_axis(&out, zeros, ids_arr, vals_arr, 1, s));
     return out;
 }
 
@@ -11071,6 +11175,47 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, got.items.len);
         try testing.expectEqual(@as(u32, @intCast(want)), gen.completion_tokens);
         try testing.expectEqual(want, gen.generated_ids.items.len);
+        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
+    }
+
+    // DFlash2 arm: selector-traced greedy drafts + dyn-conv forward. The bar
+    // is unchanged — a selector draft only survives verify when it IS the
+    // trunk argmax, so the emitted stream must still be byte-identical to
+    // serial at every accepted count.
+    {
+        var tmp_a2 = std.testing.tmpDir(.{});
+        defer tmp_a2.cleanup();
+        var a2_buf: [512]u8 = undefined;
+        const a2_path = a2_buf[0..try tmp_a2.dir.realPath(io, &a2_buf)];
+        try dflash_mod.TinyFix.writeAssistant2(io, tmp_a2.dir, a2_path, s);
+
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var dm = try dflash_mod.loadDflash(io, allocator, s, a2_path);
+        defer dm.deinit();
+        try testing.expect(dm.selector != null);
+        try dm.bind(&xfm);
+
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+            .dflash_enabled = true,
+            .dflash = &dm,
+            .dflash_min_accepted_per_round = 0,
+        });
+        defer gen.deinit(allocator);
+
+        var got = std.ArrayList(u32).empty;
+        defer got.deinit(allocator);
+        while (true) {
+            const attempts_before = gen.dflash_attempted;
+            const res = (try gen.nextDflash(allocator)) orelse break;
+            defer allocator.free(res.tokens);
+            try got.appendSlice(allocator, res.tokens);
+            try testing.expect(gen.dflash_attempted != attempts_before);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+        }
+        try testing.expect(gen.dflash_attempted > 0);
+        try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
 }

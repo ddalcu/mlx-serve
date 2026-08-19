@@ -32,7 +32,10 @@ BASE="http://127.0.0.1:$PORT"
 BIN="$(dirname "$0")/../zig-out/bin/mlx-serve"
 LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
 
-"$BIN" --model "$MODEL" --drafter "$DRAFTER" --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
+# --no-mtp: spec priority is MTP > dflash, and a trunk shipping an
+# in-checkpoint MTP head (Qwen3.8 packs) would silently win every round —
+# the whole script would then measure MTP with green dflash boot lines.
+"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -53,6 +56,17 @@ bad()  { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; fail=
 # [1] The probe classified the sidecar as DFlash at boot.
 if grep -q "DFlash drafter ready" "$LOG"; then ok "boot: DFlash sidecar detected"; else bad "boot: DFlash sidecar detected" "$(grep -i drafter "$LOG" | head -3)"; fi
 
+# [1b] DFlash2 sidecars (config declares `dflash_config`) must load their
+# selector + dyn convs — the drafter still runs v1-style without them, so
+# only the load line can prove the trained modules are in the forward.
+if grep -q '"dflash_config"' "$DRAFTER/config.json" 2>/dev/null; then
+    if grep -q "\[dflash\] dflash2: selector" "$LOG"; then
+        ok "dflash2: selector + dyn convs loaded ($(grep -o 'dflash2: selector[^\"]*' "$LOG" | head -1))"
+    else
+        bad "dflash2: selector + dyn convs loaded" "$(grep '\[dflash\]' "$LOG" | head -3)"
+    fi
+fi
+
 # Greedy request helper: returns reasoning_content + content concatenated.
 gen() { # prompt, max_tokens, extra_json_fragment
     curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
@@ -67,7 +81,7 @@ gen() { # prompt, max_tokens, extra_json_fragment
 # [2] Echo-ish greedy round WITH dflash (the default when the sidecar loads) —
 # long enough to accumulate spec-stats rounds.
 DFLASH_ON_REQS=0
-LONG=$(gen "List the numbers from 1 to 15, one per line, then repeat the same list once more." 200 "")
+LONG=$(gen "List the numbers from 1 to 15, one per line, then repeat the same list once more." 200 ", \"enable_drafter\": true")
 DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on generation non-empty"; fi
 
@@ -77,9 +91,17 @@ if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on
 # Fresh prompt (different leading text) so neither arm rides the other's
 # prefix-cache entry; the OFF arm turns off PLD too — fully serial.
 EQ_PROMPT="Explain in one short paragraph why the sky is blue."
-ON=$(gen "$EQ_PROMPT" 30 "")
+ON=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": true")
 DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 OFF=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
+
+# [3b] The ngram spec-gate must not silently strand a DFlash drafter: an
+# IMPLICIT novel request (no enable_drafter in the body, prompt scores ~0)
+# still engages — dflash's runtime yield gate is its only economics gate.
+# Counted into [6]: if the ngram gate disabled it, no stats line appears and
+# the per-request count mismatches.
+gen "Describe how a refrigerator keeps food cold, in one short paragraph." 40 "" > /dev/null
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 
 # [4] Engagement COUNTS: at least one dflash round ran, with accepts.
 STATS=$(grep "mode=dflash" "$LOG" | tail -1)
@@ -156,7 +178,7 @@ case "$EQ_VERDICT" in
         ok "greedy dflash-on == dflash-off (byte-equal exact window, ${QUANT_BITS}-bit)" ;;
     narrow:*)
         SHARED="${EQ_VERDICT##*:}"
-        ON2=$(gen "$EQ_PROMPT" 30 "")
+        ON2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": true")
         DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
         OFF2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
         if [ "$ON" != "$ON2" ]; then
@@ -190,7 +212,8 @@ CAP=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/j
     "model": "mlx-serve",
     "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
     "temperature": 0.0,
-    "max_tokens": 17
+    "max_tokens": 17,
+    "enable_drafter": true
 }')
 if echo "$CAP" | python3 -c '
 import json, sys
@@ -208,6 +231,7 @@ CAP_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: app
     "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
     "temperature": 0.0,
     "max_tokens": 17,
+    "enable_drafter": true,
     "stream": true,
     "stream_options": {"include_usage": true}
 }')
@@ -247,7 +271,8 @@ TOOLS=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application
     "messages": [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}],
     "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
     "temperature": 0.0,
-    "max_tokens": 400
+    "max_tokens": 400,
+    "enable_drafter": true
 }')
 if echo "$TOOLS" | python3 -c '
 import json, sys
@@ -297,9 +322,9 @@ fi
 # collapsed 92.6% -> 66.5% live. Same prompt twice: the second is a hit, and
 # BOTH turns must report the same per-draft rate.
 CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea state and the ships that had passed by the point before dawn."
-gen "$CTX_PROMPT" 120 "" > /dev/null
+gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
-gen "$CTX_PROMPT" 120 "" > /dev/null
+gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
 if grep -q "dflash context restored" "$LOG" && [ "$RATE_COLD" = "$RATE_HIT" ]; then
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"

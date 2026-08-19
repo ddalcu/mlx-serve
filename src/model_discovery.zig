@@ -14,6 +14,9 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+// Only the pure JSON contract predicate is referenced — lazy analysis keeps
+// dflash.zig's mlx FFI out of this filesystem-only module.
+const dflash = @import("dflash.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -113,6 +116,10 @@ const ConfigPeek = union(enum) {
     supported: []const u8, // owned dupe of model_type
     unsupported_arch: []const u8, // owned dupe of model_type
     unsupported_quant: []const u8, // owned dupe of quantization.mode
+    /// Declares the DFlash config contract — a spec-decode sidecar whatever
+    /// its `model_type` says (DFlash2 ships a bare "qwen3" with no embed
+    /// weights; registering it as chat dies at cold load).
+    drafter,
     missing_or_unparseable,
 };
 
@@ -149,6 +156,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .missing_or_unparseable;
     defer parsed.deinit();
     const root = parsed.value.object;
+    // The DFlash contract outranks model_type: v1 assistants at least carry a
+    // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
+    // from its trunk family without this probe (one predicate, shared with
+    // the loader's own detection).
+    if (dflash.isDflashConfigJson(root)) return .drafter;
     const mt_val = root.get("model_type") orelse return .missing_or_unparseable;
     if (mt_val != .string) return .missing_or_unparseable;
     if (!isSupportedModelType(mt_val.string)) {
@@ -456,6 +468,7 @@ pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []c
             allocator.free(mode);
             break :blk .unsupported;
         },
+        .drafter => .drafter,
         .supported => |mt| blk: {
             defer allocator.free(mt);
             break :blk modelKindFromType(mt);
@@ -801,6 +814,10 @@ fn tryAddModel(
                 log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
                 return true;
             },
+            .drafter => {
+                log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model", .{name});
+                return true;
+            },
             .supported => |mt| mt, // ownership moves to the DiscoveredModel
         };
     };
@@ -936,6 +953,7 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
             allocator.free(mode);
             return error.UnsupportedQuantMode;
         },
+        .drafter => return error.UnsupportedArch,
         .supported => |mt| mt,
     };
     errdefer allocator.free(model_type);
@@ -1547,6 +1565,41 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
     try testing.expect(classifyModelPath(io, allocator, junk) == null);
     try testing.expect(classifyModelPath(io, allocator, "") == null);
     try testing.expect(classifyModelPath(io, allocator, "rel/path") == null);
+}
+
+test "a DFlash2 sidecar (bare chat model_type + dflash_config) classifies as drafter, never listed" {
+    // incoai/Qwen3.8-27B-DFlash2 ships `model_type: "qwen3"` — the
+    // `*_assistant` suffix rule alone would register it as a standalone chat
+    // model and die at cold load (no embed weights). Classification consults
+    // the DFlash config contract too (dflash.isDflashConfigJson — the ONE
+    // predicate the loader itself keys on).
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const d2_config =
+        \\{"model_type":"qwen3",
+        \\ "dflash_config":{"block_size":8,"mask_token_id":248070,"target_layer_ids":[5,19],
+        \\   "conv_kernel_size":2,"conv_group_size":16,"selector_rank":256,"selector_top_k":16},
+        \\ "hidden_size":5120,"num_hidden_layers":5,"num_attention_heads":32,"head_dim":128,
+        \\ "intermediate_size":17408,"rms_norm_eps":1e-6,"sliding_window":2048,
+        \\ "layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention"]}
+    ;
+    try tmp.dir.createDirPath(io, "d2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "d2/config.json", .data = d2_config });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+    const p = try std.fmt.allocPrint(allocator, "{s}/d2", .{root});
+    defer allocator.free(p);
+    try testing.expectEqual(ModelKind.drafter, classifyModelPath(io, allocator, p).?);
+
+    // The discovery scan skips it entirely.
+    var result = try discoverModels(io, allocator, root);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.models.len);
 }
 
 test "trimTrailingSlash" {

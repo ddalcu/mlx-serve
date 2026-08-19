@@ -2960,3 +2960,102 @@ and coverage ships partial — the 2026-08-18 class); under a fully-cold
 build's budget it logs the convergence expectation instead. Still open
 from A8: building in the background after serving starts (the dequant
 stage is inference-thread-bound; queue it between requests).
+
+## DFlash 2 port (incoai/Qwen3.8-27B-DFlash2, 2026-08-18)
+
+inco.ai's DFlash 2 extends the v1 block drafter with two trained modules
+(blog: 4.80 mean acceptance vs MTP 4.28 on this trunk): a **path selector**
+(top-16 candidates per position by draft logit; adjacent pairs scored
+`S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t), succ(b)>` through two 256-dim
+per-token codebooks + a hidden→rank projection; path traced from the anchor)
+and **grouped dynamic causal convs** (two-tap depthwise, `base + dynamic`
+kernels, the dynamic part projected per position from each sublayer's normed
+input, 16 channels per coefficient) wrapped around every attention and MLP
+sublayer. Everything else is v1 machinery unchanged. The oracle is
+z-lab/dflash's `dflash/model_mlx.py` — read the code, not the blog.
+
+What bit, in order:
+
+- **The checkpoint's names are z-lab's, not transformers'**: root `fc` +
+  `hidden_norm` where the muse assistant says `encoder.fc` +
+  `encoder.output_norm_enc`, and the codebooks ship with NO `.weight`
+  suffix (`candidate_selector.predecessor_codebook`) — the reference loader
+  renames them before `load_weights`. The loader probes both spellings.
+- **`model_type` is a bare "qwen3"**, so a scanned copy registered as a
+  standalone chat model and would die at cold load (no embed weights).
+  `peekConfig` now consults `dflash.isDflashConfigJson` (the loader's own
+  contract predicate) and returns a `.drafter` classification before ever
+  reading `model_type` — the `*_assistant` suffix rule alone was a list of
+  the exports that happened to be polite.
+- **The trunk-side capture seam had been REVERTED with the DSpark port**
+  (2026-08-16, preserved at ~/claude-tmp/dspark-qwen38/). Plan said "the
+  seam already works on Qwen3.8" — it had been PROVEN, then reverted with
+  the rest of that experiment. Re-landed from the patch: capture site in
+  `forwardMoeWith`, bind gate `supportsLayerCapture` (standard + moe/GDN),
+  and nextDflash's GDN arms (anchor = `moe_seq_offset`, `capture_ssm_seq`
+  verify, `ssmRollbackFromCapture` + kv_step preservation on partial
+  accept — mirrors nextMtp).
+- **The ngram spec-gate scores the PROMPT and every novel prompt scored
+  0.000** (< threshold 0.010), so the drafter silently never engaged — the
+  muse arm of test_dflash.sh had been passing on template luck (harmony
+  markers recur; qwen's template doesn't). All dflash-on test arms now
+  pass `enable_drafter:true`, the documented explicit override. Gate
+  retune for DFlash2's novel-content acceptance stays a measured question.
+- **Selector implementation shape**: all pairwise edges precomputed on GPU
+  in ONE batched eval (anchor row [k] + [m-1, k, k] via
+  `(pred_rows ⊙ H) @ succᵀ`), then a trivial 16-wide host trace — same
+  math as the reference's sequential loop, chosen path identical, no
+  per-step sync. Sampled arm: q = softmax(scores/temp) over the 16 (no
+  top-p/top-k inside the selector, reference behavior), exact for the
+  Leviathan ratio; residual correction scatters the 16 q values into a
+  [1, V] row (`selectorQRow`, put_along_axis).
+- **Conv transcription traps**: `base_kernel` axes are `[prepare|finish,
+  tap, channel]` — BOTH leading dims are 2 at ksize 2, so a transposed
+  reshape is silent; the finish kernels come from the sublayer's INPUT
+  (prepare time), not its output; block position 0's predecessor tap is
+  the reference's ZERO pad (block-local, never the previous block). The
+  hermetic prepare/finish orientation test uses distinct base halves +
+  zero projection; the real-checkpoint fixture
+  (`tests/dump_dflash2_fixtures.py`) pins block hidden at cos 0.9998 /
+  rms 1.0018 and the greedy path ids EXACTLY (sparse synthetic logits +
+  the reference's own bf16 hidden on both sides, so the trace is pure
+  math).
+
+Live (M4 Max, oQ4e trunk, block capped 5): novel prose 58.3% per-draft /
+2.33 accepted per round, echo 83-96%, hybrid DflashSnap prefix-cache
+restore works (cold==hit). test_dflash.sh 14/14 on qwen, 13/13 muse v1.
+
+Bench (same session, oQ4e trunk, greedy, prefix cache off, 2 counterbalanced
+boots per arm, per-cell medians of 3 reps; one prompt per cell — thin, treat
+deltas under ~5% as suggestive): novel — MTP 65.7 tok/s (2.49/round) >
+dflash2 v1-arms 64.6 (2.75) > dflash2 selector 62.5 (2.66); echo — MTP 79.5
+(4.89) > 78.5 ≈ 78.2; serial 28. At the M4-capped block 5 the SELECTOR
+slightly loses to plain argmax drafts; at its trained block 8 it wins
+(+16% acceptance, 3.69 vs 3.17, 44.7 vs 39.6 tok/s novel) — but block 8 is
+the split-K dead zone on M4, so block 5 stays optimal and **MTP stays the
+default on this machine**. The selector's value is real and width-gated:
+re-measure on an M5/NAX box where block 8 is servable. No default flipped.
+
+Follow-ups (same day): inco also released Muse-Glimmer-30B-DFlash2
+(finetuned from the official muse assistant). Its config adds
+`final_logit_softcapping: 20` + `output_multiplier: 0.196` under
+`dflash_config` — the borrowed trunk head is the BARE Linear and argmax
+drafts don't care (monotone), but the selector SUMS unary logits with
+codebook edges and the sampled arm softmaxes them, so both fields are
+parsed and applied in `draftLogits` (`applyLogitTransforms`, scalars cast
+to the logits dtype). 14/14 live on muse, byte-equal greedy at 8-bit.
+Muse bench (single boot, block 5): DFlash2 ≈ v1 assistant — echo both at
+the block-5 ceiling (3.97 vs 3.87 per round; their README's "acceptance
+length" counts accepted+1, so our 3.97 is 4.97 on their scale, the max at
+block 5), novel both runtime-gate-disabled at 0.50/round. Two findings:
+(1) drafter acceptance is a THINKING-MODE property — same prompt, muse
+DFlash2 thinking-off 12.5% per-draft (gate-disabled in 4 rounds) vs
+thinking-on 47.8% (engaged throughout); the sidecars are trained on
+reasoning-mode outputs and inco's own eval runs high reasoning strength.
+(2) The ngram spec-gate is now DFLASH-EXEMPT (all four surfaces,
+`lm.dflash == null` conjunct): the runtime yield gate already cuts losses
+within ~4 rounds on realized acceptance, and llmprobe/bench request
+bodies cannot carry `enable_drafter:true`, so the ngram gate made every
+external tool silently bench serial decode. The gemma cross-attention
+drafter keeps the gate. Guard: test_dflash.sh [3b] (an implicit novel
+request must still produce a mode=dflash stats line, counted by [6]).

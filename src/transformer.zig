@@ -8458,15 +8458,24 @@ pub const Transformer = struct {
     }
 
     /// Does `forwardWith` route this model through `forwardStandardWith`?
-    /// Mirrors the dispatch chain above IN ORDER. DFlash's capture seam
-    /// (`ForwardCtx.capture_layers`) lives in the standard path only (v1),
-    /// so `DflashModel.bind` gates on this predicate.
+    /// Mirrors the dispatch chain above IN ORDER.
     pub fn usesStandardForward(self: *const Transformer) bool {
         return self.dsv4 == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention and
             self.hybrid_layers == null and
             self.moe_layers == null;
+    }
+
+    /// Does `forwardWith` route through a path that honors
+    /// `ForwardCtx.capture_layers`? Standard path (v1) + the moe/GDN path
+    /// (qwen3_5-family DFlash2/DSpark sidecars). `DflashModel.bind` gates on
+    /// this predicate. Mirrors the dispatch chain above IN ORDER.
+    pub fn supportsLayerCapture(self: *const Transformer) bool {
+        return self.dsv4 == null and
+            self.bert_layers == null and
+            !self.config.use_bidirectional_attention and
+            self.hybrid_layers == null;
     }
 
     /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -10232,6 +10241,14 @@ pub const Transformer = struct {
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(h));
                 decode_prof.mlp_ns += pclk.lap();
+            }
+
+            // DFlash capture: this h IS `hidden_states[li+1]` — the layer's
+            // final output (mirrors forwardStandardWith's capture site).
+            if (ctx.capture_layers) |cl| {
+                for (cl.ids, cl.out) |cid, *slot| {
+                    if (cid == li) _ = mlx.mlx_array_set(slot, h);
+                }
             }
 
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % moe_eval_cadence == 0) {
