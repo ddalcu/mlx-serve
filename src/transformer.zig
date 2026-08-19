@@ -13727,12 +13727,28 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 qkv_s[n] = getLayerWeightOpt(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch unreachable) orelse mlx.mlx_array_new();
                 qkv_b[n] = getLayerWeightOpt(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch unreachable) orelse mlx.mlx_array_new();
                 if (qkv_s[n].ctx != null) any_scales = true;
-                const conv_base = switch (n) {
+                // The depthwise conv is `<x>_conv1d.conv.weight` in the reference
+                // HF checkpoint, where it sits inside a ShortConvolution module.
+                // mlx-lm's converter flattens that module away and emits
+                // `<x>_conv1d.weight` instead — same [C, 1, K] tensor, one name
+                // segment shorter. Both public MLX Ling-3.0 quants ship the flat
+                // form (djrsystemservices/Ling-3.0-tiny-oQ8e,
+                // d1sl1ke/Ling-3.0-flash-oQ4e-mtp), so a nested-only lookup
+                // aborts the load on every one of them. Prefer the nested name
+                // so reference checkpoints bind exactly as before, then fall
+                // back to the flat one.
+                const conv_nested = switch (n) {
                     0 => "attention.q_conv1d.conv.weight",
                     1 => "attention.k_conv1d.conv.weight",
                     else => "attention.v_conv1d.conv.weight",
                 };
-                conv_w[n] = getLayerWeight(weights, name_buf, prefix, li, conv_base);
+                const conv_flat = switch (n) {
+                    0 => "attention.q_conv1d.weight",
+                    1 => "attention.k_conv1d.weight",
+                    else => "attention.v_conv1d.weight",
+                };
+                conv_w[n] = getLayerWeightOpt(weights, name_buf, prefix, li, conv_nested) orelse
+                    getLayerWeight(weights, name_buf, prefix, li, conv_flat);
             }
             // The three projections must be quantized IDENTICALLY to join. A
             // dense q beside a quantized k gives a triple whose scales cover
@@ -14048,20 +14064,31 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // Routing itself (sigmoid → +bias → group limit → top-k → renorm →
             // routed_scaling_factor) is hy3's chain with the group limit
             // inserted; `moe_n_group`/`moe_topk_group` pick it in moeMLP2.
+            //
+            // mlx-lm's converter renames both banks: it quantizes the router
+            // and keeps its module level, so the router lands at
+            // `mlp.gate.gate_proj.*`, and it stacks the experts under
+            // `mlp.switch_mlp.*`. Resolve each by probing, exactly as laguna
+            // and hy_v3 already do, so reference and converted checkpoints
+            // both bind.
+            const rt = bailingRouterBase(weights, name_buf, prefix, li);
+            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
+            var rtbuf: [64]u8 = undefined;
+            var exbuf: [64]u8 = undefined;
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
-                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
-                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
-                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
-                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
-                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .router_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
+                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
                     .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
                     .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
@@ -18782,6 +18809,22 @@ fn lagunaRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
     return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.weight") == null and
         getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.proj.weight") != null)
         "mlp.gate.proj"
+    else
+        "mlp.gate";
+}
+
+/// Resolve the bailing_hybrid MoE router's weight base. The reference Ling-3.0
+/// checkpoint carries a dense `mlp.gate.weight`; mlx-lm's converter quantizes
+/// the router and keeps its module layout, so the same [E, hidden] tensor lands
+/// at `mlp.gate.gate_proj.*` with its own scales and biases
+/// (djrsystemservices/Ling-3.0-tiny-oQ8e, d1sl1ke/Ling-3.0-flash-oQ4e-mtp).
+/// Same shape as lagunaRouterBase: prefer the flat name so reference
+/// checkpoints bind byte-identically, and fall back to it when neither exists
+/// so the MISSING WEIGHT error names the canonical key.
+fn bailingRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32) []const u8 {
+    return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.weight") == null and
+        getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.gate_proj.weight") != null)
+        "mlp.gate.gate_proj"
     else
         "mlp.gate";
 }
