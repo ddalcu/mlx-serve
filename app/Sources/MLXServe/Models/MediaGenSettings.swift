@@ -191,6 +191,19 @@ struct MusicGenSettings: Codable, Equatable {
     var durationSeconds: Int = 60
     var vocalLanguage: String = "en"
     var keepResident: Bool = false
+    // Everything below used to live in plain `@State`. The pane is UNMOUNTED
+    // when you navigate away from the Audio page, so these reset on every
+    // visit, not just across launches — the image and video panes persist
+    // their seeds and this one did not.
+    var bpm: Int? = nil
+    var keyscale: String = ""
+    var timesignature: String = ""
+    var seed: Int = -1
+    var steps: Int? = nil
+    var instrumental: Bool = false
+    /// Advanced starts OPEN. Collapsed-by-default is why tempo, key, seed and
+    /// steps read as missing features — they were one unlabeled chevron away.
+    var showAdvanced: Bool = true
 
     private static let storageKey = "musicGenSettings"
 
@@ -217,6 +230,11 @@ extension MusicGenSettings {
             ?? .acestepXLTurbo8bit
     }
 
+    /// Every key optional so a blob written by an older build still decodes —
+    /// a throwing decode would silently reset the pane to defaults for every
+    /// existing install. Absent keys keep the property defaults, which is also
+    /// how `showAdvanced` ends up OPEN for people upgrading from a build that
+    /// never wrote it.
     init(from decoder: Decoder) throws {
         self.init()
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -224,6 +242,13 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .durationSeconds) { durationSeconds = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .vocalLanguage) { vocalLanguage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        bpm = try c.decodeIfPresent(Int.self, forKey: .bpm)
+        if let v = try c.decodeIfPresent(String.self, forKey: .keyscale) { keyscale = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .timesignature) { timesignature = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
+        steps = try c.decodeIfPresent(Int.self, forKey: .steps)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .instrumental) { instrumental = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }
 }
 

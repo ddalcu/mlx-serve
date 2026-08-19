@@ -71,10 +71,29 @@ struct MediaBundle: Identifiable, Equatable {
     /// TTS model rounding to "~0 GB" would be a lie). Shared by
     /// `BundleDownloadBar` and the Model Browser's Media pane so the two
     /// surfaces can't drift onto different rounding rules.
-    var approxSizeLabel: String {
-        sizeEstimateGB >= 1
-            ? String(format: "~%.0f GB", sizeEstimateGB)
-            : String(format: "~%.1f GB", sizeEstimateGB)
+    ///
+    /// A .5 keeps its decimal, and ties round UP.
+    ///
+    /// `%.0f`/`%.1f` are round-half-to-EVEN, which made the 2.0 GB and 2.5 GB
+    /// Qwen3-TTS presets both print "~2 GB" — two different downloads wearing
+    /// one label — and rendered Kokoro's 0.35 GB as "~0.3 GB". Both errors run
+    /// the same way: a size shown SMALLER than the bytes about to be fetched.
+    /// For a download prompt that is the misleading direction, so ties go up.
+    var approxSizeLabel: String { Self.sizeLabel(forGB: sizeEstimateGB) }
+
+    /// Static so the rounding rule is testable without building a bundle.
+    static func sizeLabel(forGB gb: Double) -> String {
+        if gb < 1 { return String(format: "~%.1f GB", roundUpHalf(gb * 10) / 10) }
+        let rounded = roundUpHalf(gb * 2) / 2
+        return rounded == rounded.rounded()
+            ? String(format: "~%.0f GB", rounded)
+            : String(format: "~%.1f GB", rounded)
+    }
+
+    /// `.rounded(.toNearestOrAwayFromZero)`, spelled out because the whole
+    /// point of this helper is that the DEFAULT tie rule was the bug.
+    private static func roundUpHalf(_ v: Double) -> Double {
+        v.rounded(.toNearestOrAwayFromZero)
     }
 
     static func == (l: MediaBundle, r: MediaBundle) -> Bool { l.id == r.id }

@@ -1093,9 +1093,17 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// button while its weights are absent.
     var isLocalOnly: Bool { repo.hasPrefix("local/") }
 
-    /// bpm/keyscale/timesignature/vocal_language — ACE-Step conditioning
-    /// fields with NO Music 3 equivalent (the server names each a 400).
+    /// timesignature/vocal_language — ACE-Step conditioning fields MiniMax's
+    /// card documents no equivalent for, so the server still names each a 400
+    /// on Music 3 and the pane hides them there.
     var supportsMusicalMeta: Bool { family == .acestep }
+
+    /// Tempo and key, which BOTH engines support — they are conditioning
+    /// fields on ACE-Step and caption text on Music 3 (Global Metadata on
+    /// MiniMax's card; its example caption reads "BPM: 96. Key: C major."").
+    /// The pane used to hide them on Music 3 along with the two genuinely
+    /// unsupported knobs, which read as "this model can't do tempo".
+    var supportsTempoAndKey: Bool { true }
     /// Music 3 is lyric-conditioned; the server 400s empty lyrics. ACE-Step
     /// defaults empty lyrics to "[Instrumental]".
     var requiresLyrics: Bool { family == .minimaxMusic3 }
@@ -1104,6 +1112,13 @@ struct MusicModelPreset: Identifiable, Hashable {
     var durationRange: ClosedRange<Double> {
         family == .acestep ? 10...600 : 5...360
     }
+
+    /// Music 3 takes `steps` in [4,100] — the flow-match refinement passes.
+    /// ACE-Step Turbo is distillation-fixed at 8 and the server IGNORES the
+    /// field there, so exposing it would be a control that visibly does
+    /// nothing. `fixedSteps` stays the per-checkpoint default either way.
+    var supportsSteps: Bool { family == .minimaxMusic3 }
+    var stepsRange: ClosedRange<Int> { 4...100 }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -1137,6 +1152,19 @@ struct MusicModelPreset: Identifiable, Hashable {
     static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit]
 }
 
+extension MusicGenRequest {
+    /// Is the lyrics requirement met? Music 3 is lyric-conditioned and the
+    /// server 400s an empty block — but ticking instrumental LIFTS that, or the
+    /// checkbox would be unreachable on the one model that most needs it.
+    /// The pane's Generate gate and the service's pre-flight read this ONE
+    /// answer so they cannot disagree about what is sendable.
+    static func lyricsSatisfied(model: MusicModelPreset, lyrics: String,
+                                instrumental: Bool) -> Bool {
+        if !model.requiresLyrics || instrumental { return true }
+        return !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 /// Dropdown catalogs for the Music tab's advanced options. Users shouldn't
 /// have to know the server's value grammar — every entry here is a value the
 /// engine accepts verbatim (languages ⊆ the reference VALID_LANGUAGES, bpm in
@@ -1154,6 +1182,20 @@ enum MusicOptions {
         ("Arabic", "ar"), ("Dutch", "nl"), ("Polish", "pl"),
         ("Turkish", "tr"), ("Vietnamese", "vi"), ("Swedish", "sv"),
     ]
+
+    /// The section tags the checkpoints were trained on, verbatim from
+    /// MiniMaxAI/MiniMax-Music3's model card. Nothing in the app listed them,
+    /// so the vocabulary was guesswork — the helper text said "like [verse] or
+    /// [chorus]" and left the other seven undiscoverable.
+    static let sectionTags: [String] = [
+        "[intro]", "[verse]", "[pre-chorus]", "[chorus]", "[post-chorus]",
+        "[bridge]", "[instrumental]", "[solo]", "[outro]",
+    ]
+    static let sectionTagHint: String = sectionTags.joined(separator: " ")
+
+    /// What the server accepts for `bpm`. The pane used to offer only the ten
+    /// anchors below, so 92 was unaskable while the chat tool could send it.
+    static let bpmRange: ClosedRange<Int> = 30...300
 
     /// (label, bpm). Labels carry the genre anchor so non-musicians can pick.
     static let bpms: [(label: String, bpm: Int)] = [
@@ -1174,6 +1216,42 @@ enum MusicOptions {
         let notes = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
         return notes.map { "\($0) major" } + notes.map { "\($0) minor" }
     }()
+
+    /// The character a key is conventionally associated with, so the dropdown
+    /// reads like the BPM one (whose labels carry a genre anchor) instead of
+    /// asking a non-musician to pick between 24 bare note names.
+    ///
+    /// These are the common Western associations, not physics — equal
+    /// temperament makes every major key acoustically identical to every other,
+    /// and the associations survive from unequal historical tunings plus
+    /// instrument register and repertoire. Useful as a nudge, not a rule; only
+    /// the twelve most-used keys get one, the rest show bare.
+    /// One word each. Two-word moods made the longest row
+    /// ("A minor — natural, plain sad") wider than any sane menu, and a
+    /// truncated label is worse than no label.
+    static let keyMoods: [String: String] = [
+        "C major": "open",
+        "G major": "pastoral",
+        "D major": "triumphant",
+        "A major": "sunny",
+        "E major": "brilliant",
+        "F major": "gentle",
+        "Bb major": "brassy",
+        "Eb major": "heroic",
+        "A minor": "plain sad",
+        "E minor": "wistful",
+        "D minor": "solemn",
+        "C minor": "stormy",
+        "B minor": "yearning",
+        "F# minor": "moody",
+        "G minor": "restless",
+    ]
+
+    /// "C major — plain, open", or just "C major" where we have no association.
+    static func keyLabel(_ key: String) -> String {
+        guard let mood = keyMoods[key] else { return key }
+        return "\(key) — \(mood)"
+    }
 
     /// (label, wire value). The engine takes the beats-per-bar number.
     static let timeSignatures: [(label: String, value: String)] = [
@@ -1733,6 +1811,10 @@ struct MusicGenRequest {
     var prompt: String
     /// Optional lyrics; empty → the server's "[Instrumental]" convention.
     var lyrics: String = ""
+    /// Wordless track. Sent as `instrumental: true` with the lyrics field
+    /// OMITTED — the server names the pair a 400 on both backends, and on
+    /// Music 3 an omitted lyrics field is the only spelling it accepts.
+    var instrumental: Bool = false
     /// Vocal language code ("en", "zh", …) — only meaningful with lyrics.
     var vocalLanguage: String = "en"
     /// Optional musical metadata; nil/empty → the model decides ("N/A").
@@ -1743,6 +1825,9 @@ struct MusicGenRequest {
     var durationSeconds: Int = 60
     /// -1 = fresh random seed per generation.
     var seed: Int = -1
+    /// Flow-match refinement passes; nil = the server's own default. Only sent
+    /// on backends whose `supportsSteps` is true.
+    var steps: Int? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every
