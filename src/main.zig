@@ -133,10 +133,10 @@ fn printUsage(io: std.Io) void {
         \\                        a DFlash block-drafter (auto-detected from
         \\                        its config: block_size + mask_token_id +
         \\                        target_layer_ids, either at root or under
-        \\                        dflash_config for DFlash 2). Loaded at startup, bound
-        \\                        to the target model, default draft source
-        \\                        for new requests (priority: MTP > dflash >
-        \\                        drafter > PLD > regular).
+        \\                        dflash_config for DFlash 2). Loaded at
+        \\                        startup, bound to the target model, default
+        \\                        draft source for new requests (priority:
+        \\                        dflash > MTP > drafter > PLD > regular).
         \\  --draft-block-size <n>  Tokens per drafter round. Gemma default is
         \\                        auto-detected per target (E2B=2, E4B=4,
         \\                        26B-A4B=4, 31B=8); DFlash uses its config's
