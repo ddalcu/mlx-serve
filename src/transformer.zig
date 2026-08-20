@@ -4657,7 +4657,8 @@ const BitsCache = QuantParamsCache;
 // owning their own caches.
 /// DFlash capture request: intermediate layer OUTPUTS, `hidden_states[i+1]`
 /// semantics (the residual stream AFTER layer `ids[k]` completes, before the
-/// next layer's input norm). Honored by the standard and hybrid forward paths.
+/// next layer's input norm). Honored by the standard, MoE, and hybrid forwards;
+/// DFlash's target-mode gate decides which of those paths can roll back safely.
 pub const CaptureLayers = struct {
     /// Trunk layer indices to capture, ascending.
     ids: []const u32,
@@ -4666,6 +4667,35 @@ pub const CaptureLayers = struct {
     /// handles (init with `mlx_array_new`, free after use).
     out: []mlx.mlx_array,
 };
+
+/// Target-side state contract available to DFlash verification. The assistant
+/// format is model-family agnostic; this mode describes how the target forward
+/// advances position and how a partially accepted verify block is committed.
+pub const DflashTargetMode = enum {
+    unsupported,
+    standard_kv,
+    moe_kv,
+    gated_delta_net,
+};
+
+const DflashForwardRoute = enum { standard, moe, other };
+
+fn classifyDflashTargetMode(
+    route: DflashForwardRoute,
+    moe_has_gdn: bool,
+    moe_has_other_recurrent_state: bool,
+) DflashTargetMode {
+    return switch (route) {
+        .standard => .standard_kv,
+        .moe => if (moe_has_other_recurrent_state)
+            .unsupported
+        else if (moe_has_gdn)
+            .gated_delta_net
+        else
+            .moe_kv,
+        .other => .unsupported,
+    };
+}
 
 pub const ForwardCtx = struct {
     cache: *KVCache,
@@ -4697,11 +4727,11 @@ pub const ForwardCtx = struct {
     /// their normal path. One-shot forwards only: a chunked prefill would
     /// need a per-chunk slice of it.
     prefill_mask_add: ?mlx.mlx_array = null,
-    /// PLD spec-decode: when true, the GatedDeltaNet trunk records per-position
+    /// Spec-decode: when true, the GatedDeltaNet trunk records per-position
     /// SSM/conv state during the verify forward (see `SSMCacheEntry.spec_*`),
-    /// so partial-accept rollback needs no re-forward. Set only by `nextPld`
-    /// for the verify pass on a GDN model; the flag reaches the layers via
-    /// `Transformer.spec_capture_ssm`.
+    /// so partial-accept rollback needs no re-forward. The flag reaches the
+    /// layers via `Transformer.spec_capture_ssm` and is used only for PLD, MTP,
+    /// and DFlash verify passes on a GDN model.
     capture_ssm_seq: bool = false,
     vision_embeddings: ?mlx.mlx_array,
     /// Chunked vision prefill (issue #197): number of image/audio placeholder
@@ -8402,33 +8432,103 @@ pub const Transformer = struct {
             self.moe_layers == null;
     }
 
-    /// DFlash captures are implemented for pure-attention standard trunks and
-    /// GatedDeltaNet/full-attention hybrids. The latter use
-    /// `full_attention_interval` and per-position SSM capture for rollback.
-    pub fn supportsDflashCapture(self: *const Transformer) bool {
-        return self.usesStandardForward() or
-            (self.dsv4 == null and self.usesDflashRecurrentForward());
+    /// Classify the target by the state contract its actual forward path
+    /// exposes. DFlash is a method rather than a model-family feature: standard
+    /// dense and pure-attention MoE targets need KV rollback, while every
+    /// `MoeLayerWeights.attn.linear` layer uses the shared GatedDeltaNet capture
+    /// contract. Module-owned and general hybrid state stays unsupported until
+    /// that mixer has an exact per-position rollback implementation.
+    pub fn dflashTargetMode(self: *const Transformer) DflashTargetMode {
+        if (self.usesStandardForward()) {
+            return classifyDflashTargetMode(.standard, false, false);
+        }
+        if (self.dsv4 != null or
+            self.bert_layers != null or
+            self.config.use_bidirectional_attention or
+            self.hybrid_layers != null)
+        {
+            return classifyDflashTargetMode(.other, false, false);
+        }
+
+        const layers = self.moe_layers orelse
+            return classifyDflashTargetMode(.other, false, false);
+        if (layers.len == 0) return classifyDflashTargetMode(.other, false, false);
+
+        var has_gdn = false;
+        var has_other_recurrent_state = false;
+        for (layers) |*layer| {
+            // Inkling's full-attention layers still advance four short-conv
+            // states. Those do not implement the GDN per-position contract.
+            if (layer.attn_sconv_w != null or layer.mlp_sconv_w != null) {
+                has_other_recurrent_state = true;
+            }
+            switch (layer.attn) {
+                .linear => has_gdn = true,
+                .full => {},
+            }
+        }
+        return classifyDflashTargetMode(.moe, has_gdn, has_other_recurrent_state);
     }
 
-    /// Logical number of committed target tokens. A hybrid's layer-zero path
-    /// is recurrent and does not advance `KVCache.step`, so its sequence offset
-    /// is authoritative; standard attention uses the cache counter.
-    pub fn dflashPosition(self: *const Transformer, ctx: *const ForwardCtx) usize {
-        return if (self.usesDflashRecurrentForward()) ctx.moe_seq_offset.* else ctx.cache.step;
+    fn dflashGdnCaptureReady(entry: *const SSMCacheEntry, accepted: u32) bool {
+        if (entry.spec_state_seq.ctx == null or
+            entry.spec_conv_input.ctx == null or
+            entry.ssm_state.ctx == null or
+            entry.conv_state.ctx == null)
+        {
+            return false;
+        }
+
+        const state_seq = mlx.getShape(entry.spec_state_seq);
+        const conv_input = mlx.getShape(entry.spec_conv_input);
+        const state = mlx.getShape(entry.ssm_state);
+        const conv = mlx.getShape(entry.conv_state);
+        if (state_seq.len != 5 or conv_input.len != 3 or state.len != 4 or conv.len != 3) return false;
+        if (state_seq[0] <= @as(c_int, @intCast(accepted))) return false;
+        if (conv_input[1] < state_seq[0]) return false;
+        if (state_seq[1] != state[0] or
+            state_seq[2] != state[1] or
+            state_seq[3] != state[2] or
+            state_seq[4] != state[3])
+        {
+            return false;
+        }
+        return conv_input[0] == conv[0] and
+            conv_input[2] == conv[2] and
+            conv_input[1] - state_seq[0] == conv[1];
     }
 
-    pub fn dflashUsesHybridState(self: *const Transformer) bool {
-        return self.usesDflashRecurrentForward();
+    /// Validate every GatedDeltaNet layer before the commit path mutates either
+    /// KV or recurrent state.
+    pub fn dflashValidateGdnCapture(self: *const Transformer, ctx: *const ForwardCtx, accepted: u32) !void {
+        const layers = self.moe_layers orelse return error.DflashRollbackUnavailable;
+        const entries = ctx.ssm_entries orelse return error.DflashRollbackUnavailable;
+        if (entries.len != layers.len) return error.DflashRollbackUnavailable;
+
+        var linear_count: usize = 0;
+        for (layers, entries) |*layer, *entry| {
+            switch (layer.attn) {
+                .linear => {
+                    linear_count += 1;
+                    if (!dflashGdnCaptureReady(entry, accepted)) return error.DflashRollbackUnavailable;
+                },
+                .full => {},
+            }
+        }
+        if (linear_count == 0) return error.DflashRollbackUnavailable;
     }
 
-    /// Recurrent forwards need per-position SSM capture and rollback during
-    /// DFlash verification. Qwen3.5/3.6 uses the shared MoE/GDN dispatcher
-    /// even for dense checkpoints, rather than `forwardHybridWith`.
-    fn usesDflashRecurrentForward(self: *const Transformer) bool {
-        return self.hybrid_layers != null or
-            (self.moe_layers != null and
-                self.config.full_attention_interval != 0 and
-                std.mem.eql(u8, self.config.model_type, "qwen3_5_moe"));
+    /// Restore every and only GatedDeltaNet layer after the commit path has
+    /// successfully called `dflashValidateGdnCapture` for the same capture.
+    pub fn dflashRollbackValidatedGdnFromCapture(self: *Transformer, ctx: *ForwardCtx, accepted: u32) !void {
+        const layers = self.moe_layers.?;
+        const entries = ctx.ssm_entries.?;
+        for (layers, entries) |*layer, *entry| {
+            switch (layer.attn) {
+                .linear => try ssmRollbackFromCapture(entry, accepted, self.s),
+                .full => {},
+            }
+        }
     }
 
     /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -21540,6 +21640,66 @@ test "SSMCacheEntry snapshot/restore round-trip preserves arrays" {
     try testing.expectEqual(@as(c_int, 2), restored_shape[1]);
     try testing.expectEqual(@as(c_int, 8), restored_shape[2]);
     try testing.expectEqual(@as(c_int, 4), restored_shape[3]);
+}
+
+test "DFlash target modes separate route, position, and rollback capabilities" {
+    try testing.expectEqual(
+        DflashTargetMode.standard_kv,
+        classifyDflashTargetMode(.standard, false, false),
+    );
+    try testing.expectEqual(
+        DflashTargetMode.moe_kv,
+        classifyDflashTargetMode(.moe, false, false),
+    );
+    try testing.expectEqual(
+        DflashTargetMode.gated_delta_net,
+        classifyDflashTargetMode(.moe, true, false),
+    );
+    try testing.expectEqual(
+        DflashTargetMode.unsupported,
+        classifyDflashTargetMode(.moe, false, true),
+    );
+    try testing.expectEqual(
+        DflashTargetMode.unsupported,
+        classifyDflashTargetMode(.moe, true, true),
+    );
+    try testing.expectEqual(
+        DflashTargetMode.unsupported,
+        classifyDflashTargetMode(.other, false, false),
+    );
+}
+
+test "DFlash GDN capture validation requires complete compatible state" {
+    const state_seq_data = [_]f32{ 1.0, 2.0, 3.0 };
+    const state_seq_shape = [_]c_int{ 3, 1, 1, 1, 1 };
+    const conv_input_data = [_]f32{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    const conv_input_shape = [_]c_int{ 1, 5, 2 };
+    const state_data = [_]f32{3.0};
+    const state_shape = [_]c_int{ 1, 1, 1, 1 };
+    const conv_data = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    const conv_shape = [_]c_int{ 1, 2, 2 };
+
+    var entry: SSMCacheEntry = .{
+        .conv_state = mlx.mlx_array_new_data(&conv_data, &conv_shape, conv_shape.len, .float32),
+        .ssm_state = mlx.mlx_array_new_data(&state_data, &state_shape, state_shape.len, .float32),
+        .initialized = true,
+        .spec_state_seq = mlx.mlx_array_new_data(&state_seq_data, &state_seq_shape, state_seq_shape.len, .float32),
+        .spec_conv_input = mlx.mlx_array_new_data(&conv_input_data, &conv_input_shape, conv_input_shape.len, .float32),
+    };
+    defer {
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        _ = mlx.mlx_array_free(entry.spec_state_seq);
+        _ = mlx.mlx_array_free(entry.spec_conv_input);
+    }
+
+    try testing.expect(Transformer.dflashGdnCaptureReady(&entry, 0));
+    try testing.expect(Transformer.dflashGdnCaptureReady(&entry, 2));
+    try testing.expect(!Transformer.dflashGdnCaptureReady(&entry, 3));
+
+    _ = mlx.mlx_array_free(entry.spec_conv_input);
+    entry.spec_conv_input = mlx.mlx_array_new();
+    try testing.expect(!Transformer.dflashGdnCaptureReady(&entry, 0));
 }
 
 test "SSMCacheEntry snapshot/restore handles null ssm_state (LFM2 gated_conv)" {

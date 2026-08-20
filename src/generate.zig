@@ -716,12 +716,68 @@ pub fn capAcceptedForTokenBudget(accepted: u32, completion: u32, max_tokens: u32
     return @min(accepted, remaining - 1);
 }
 
+const DflashPartialCommitPlan = struct {
+    cache_len: usize,
+    moe_seq_offset: ?usize,
+    preserve_kv_step: bool,
+    rollback_gdn: bool,
+};
+
+fn dflashPartialCommitPlan(
+    mode: transformer_mod.DflashTargetMode,
+    anchor_pos: usize,
+    moe_seq_offset_snap: usize,
+    n_commit: usize,
+) DflashPartialCommitPlan {
+    return switch (mode) {
+        .standard_kv => .{
+            .cache_len = anchor_pos + n_commit,
+            .moe_seq_offset = null,
+            .preserve_kv_step = false,
+            .rollback_gdn = false,
+        },
+        .moe_kv => .{
+            .cache_len = moe_seq_offset_snap + n_commit,
+            .moe_seq_offset = moe_seq_offset_snap + n_commit,
+            .preserve_kv_step = false,
+            .rollback_gdn = false,
+        },
+        .gated_delta_net => .{
+            .cache_len = moe_seq_offset_snap + n_commit,
+            .moe_seq_offset = moe_seq_offset_snap + n_commit,
+            .preserve_kv_step = true,
+            .rollback_gdn = true,
+        },
+        .unsupported => unreachable,
+    };
+}
+
 test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
     try std.testing.expectEqual(@as(u32, 15), capAcceptedForTokenBudget(15, 0, 400));
     try std.testing.expectEqual(@as(u32, 2), capAcceptedForTokenBudget(15, 397, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 399, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 400, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
+}
+
+test "DFlash partial commit plans preserve each target's position authority" {
+    const standard = dflashPartialCommitPlan(.standard_kv, 100, 900, 3);
+    try std.testing.expectEqual(@as(usize, 103), standard.cache_len);
+    try std.testing.expectEqual(@as(?usize, null), standard.moe_seq_offset);
+    try std.testing.expect(!standard.preserve_kv_step);
+    try std.testing.expect(!standard.rollback_gdn);
+
+    const moe = dflashPartialCommitPlan(.moe_kv, 100, 200, 3);
+    try std.testing.expectEqual(@as(usize, 203), moe.cache_len);
+    try std.testing.expectEqual(@as(?usize, 203), moe.moe_seq_offset);
+    try std.testing.expect(!moe.preserve_kv_step);
+    try std.testing.expect(!moe.rollback_gdn);
+
+    const gdn = dflashPartialCommitPlan(.gated_delta_net, 100, 200, 3);
+    try std.testing.expectEqual(@as(usize, 203), gdn.cache_len);
+    try std.testing.expectEqual(@as(?usize, 203), gdn.moe_seq_offset);
+    try std.testing.expect(gdn.preserve_kv_step);
+    try std.testing.expect(gdn.rollback_gdn);
 }
 
 test "every speculative decoder caps accepted drafts before commit" {
@@ -3635,11 +3691,17 @@ pub const Generator = struct {
         const bs: u32 = @max(self.dflash_block_size, 2);
         const m: u32 = bs - 1;
         const t1: u32 = self.next_token_id;
-        const anchor_pos: usize = xfm.dflashPosition(&self.ctx);
+        const target_mode = model.target_mode;
+        std.debug.assert(target_mode != .unsupported);
+        const anchor_pos: usize = switch (target_mode) {
+            .standard_kv => self.ctx.cache.step,
+            .moe_kv, .gated_delta_net => self.ctx.moe_seq_offset.*,
+            .unsupported => unreachable,
+        };
         std.debug.assert(dctx.absLen() == anchor_pos);
         const kv_step_snap = self.ctx.cache.step;
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
-        const hybrid_target = xfm.dflashUsesHybridState();
+        const gdn_target = target_mode == .gated_delta_net;
 
         const tracing = dflashTraceEnabled();
         var ph: io_util.Stopwatch = undefined;
@@ -3791,7 +3853,7 @@ pub const Generator = struct {
         var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
-        self.ctx.capture_ssm_seq = hybrid_target and self.ctx.ssm_entries != null;
+        self.ctx.capture_ssm_seq = gdn_target and self.ctx.ssm_entries != null;
         const verify_logits = xfm.forwardWith(&self.ctx, verify_input) catch |err| {
             self.ctx.capture_ssm_seq = false;
             return err;
@@ -3926,23 +3988,16 @@ pub const Generator = struct {
         // assistant context by exactly the committed positions ──
         const n_commit: usize = 1 + @as(usize, accepted);
         if (accepted < m) {
-            if (hybrid_target) {
-                const gdn_captured = if (self.ctx.ssm_entries) |entries|
-                    entries.len > 0 and entries[0].spec_state_seq.ctx != null
-                else
-                    false;
-                if (!gdn_captured) return error.DflashRollbackUnavailable;
-                try self.ctx.cache.truncate(moe_seq_offset_snap + n_commit, s);
-                // Layer zero is recurrent, so KVCache.step is not the hybrid's
-                // position counter. Preserve its pre-verify bookkeeping value.
-                self.ctx.cache.step = kv_step_snap;
-                for (self.ctx.ssm_entries.?) |*entry| {
-                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
-                }
-                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + n_commit;
-            } else {
-                try self.ctx.cache.truncate(anchor_pos + n_commit, s);
-            }
+            const commit = dflashPartialCommitPlan(target_mode, anchor_pos, moe_seq_offset_snap, n_commit);
+            // Validate every recurrent layer before changing either state
+            // store; layer zero alone does not prove the target's contract.
+            if (commit.rollback_gdn) try xfm.dflashValidateGdnCapture(&self.ctx, accepted);
+            try self.ctx.cache.truncate(commit.cache_len, s);
+            // A recurrent layer precedes the first attention layer, so
+            // cache.step is not this forward's position authority.
+            if (commit.preserve_kv_step) self.ctx.cache.step = kv_step_snap;
+            if (commit.rollback_gdn) try xfm.dflashRollbackValidatedGdnFromCapture(&self.ctx, accepted);
+            if (commit.moe_seq_offset) |pos| self.ctx.moe_seq_offset.* = pos;
         }
         if (accepted == m) {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);

@@ -745,6 +745,9 @@ pub const DflashModel = struct {
     final_norm: mlx.mlx_array, // norm [hidden]
     layers: []DflashLayer,
     candidate_selector: ?DflashCandidateSelector = null,
+    /// Bound once from the target's actual forward/state capabilities. Decode
+    /// reads this cached mode instead of rescanning every target layer per round.
+    target_mode: transformer_mod.DflashTargetMode = .unsupported,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
     /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 0/off).
@@ -769,10 +772,10 @@ pub const DflashModel = struct {
 
     /// Validate compatibility with the target trunk. The assistant borrows
     /// the trunk's embedding table and lm_head, so hidden size and token-id
-    /// space must line up. Captures are supported by pure-attention standard
-    /// trunks and supported GatedDeltaNet/full-attention recurrent targets;
-    /// other module-owned and general MoE paths are refused rather than
-    /// silently drafting from empty captures.
+    /// space must line up. Captures are supported by standard dense trunks,
+    /// pure-attention MoE trunks, and targets whose recurrent layers implement
+    /// the shared GatedDeltaNet rollback contract. Other module-owned state is
+    /// refused rather than silently drafting from incomplete captures.
     pub fn bind(self: *DflashModel, target: *Transformer) !void {
         if (self.config.hidden_size != target.config.hidden_size) {
             log.err("[dflash] hidden_size mismatch: assistant={d}, target={d}\n", .{
@@ -792,7 +795,8 @@ pub const DflashModel = struct {
             });
             return err;
         };
-        if (!target.supportsDflashCapture()) {
+        const target_mode = target.dflashTargetMode();
+        if (target_mode == .unsupported) {
             log.err("[dflash] target arch '{s}' does not expose a DFlash capture/rollback seam\n", .{
                 target.config.model_type,
             });
@@ -811,6 +815,7 @@ pub const DflashModel = struct {
                 return error.DflashTargetMismatch;
             }
         }
+        self.target_mode = target_mode;
         self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
