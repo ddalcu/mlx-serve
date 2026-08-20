@@ -84,6 +84,15 @@
 - Warm requests kept the fast prefill but lost the draft head: reusing a cached prefix left the head's history empty, so follow-up turns decoded at almost half speed (38 vs 72 tok/s measured). The history is now saved and restored with the prefix, so warm turns decode as fast as cold ones.
 - Qwen 3.8 27B can now auto-speculate 8 tokens deep instead of capping at 6, once its checkpoint matches a calibrated quantization profile — the 4-, 6- and 8-bit MLX-Serve builds all qualify. Measured up to 31% faster decode at depth 8 vs. 6 on the 4-bit build. Thanks @CerebralCoding (#194).
 - Images stopped failing in long conversations (#197). A prompt with an image ran as one whole-prompt forward, so the memory check billed the full width and past roughly 40k tokens on Qwen 3.8 27B every screenshot got a 400 no flag could fix. Vision prompts now prefill in the same memory-bounded chunks text uses, with the image splice resuming exactly across chunk boundaries: a 51k-token conversation with a screenshot that used to be refused (82 GB billed against 67 available) now runs, output is unchanged on LFM2.5-VL, Gemma 4 and Muse, and time to first token stays within 3% either way. Cancelling mid-prefill now also stops a vision prompt within one chunk instead of running it to the end.
+- Concurrent chat streams no longer stall for an entire cold prefill: a 9k-token prefill used to freeze every other active stream for 0.8s, a 53k-token one for 7.6s. Prefill now yields at chunk boundaries, capping the stall at about one chunk-forward (~150ms), with byte-identical greedy output. Thanks @sf-jin-ku (#205).
+
+### Fixes
+
+- Claude Code's newer `output_config.effort` and `output_config.format: json_schema` fields are now honored on `/v1/messages`. Previously ignored, so every Claude Code request ran with an unbounded thinking budget, and JSON-schema replies came back as plain markdown the client rejected.
+- `POST /v1/unload-model` now rejects a body that names the wrong key (`model_id`, `id`) with a 400, instead of quietly unloading the default model and reporting success. Thanks @Fe2-O3 (#211).
+- Fixed a memory/CPU leak in the app: a slow or failing MCP server connection kept running in the background forever instead of being torn down, measured at ~160% sustained CPU over a 23-hour session. Thanks @slava-kudzinau (#201).
+- Fixed a memory leak from long-running servers accumulating one thread stack per HTTP connection instead of reaping it. Thanks @sf-jin-ku (#203).
+- The command-line binary only started when launched from the repo root; it now resolves its library path relative to itself, so it runs from anywhere it's installed. Thanks @Fe2-O3 (#193).
 
 ## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
 
