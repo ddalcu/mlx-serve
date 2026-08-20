@@ -1267,6 +1267,7 @@ pub fn main(init: std.process.Init) !void {
             .mtp_depth = mtp_depth,
             .ane_prefill = ane_prefill,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
+            .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
@@ -1689,6 +1690,7 @@ fn runGenServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
+            .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1817,6 +1819,7 @@ fn runHeadlessServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
+            .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 

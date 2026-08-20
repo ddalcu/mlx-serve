@@ -128,6 +128,7 @@ pub const LoadParams = struct {
     /// The ANE build compiles fixed-shape tiles against THIS width — resolving
     /// it any other way would let the tile and the forward's chunk drift.
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -949,6 +950,7 @@ pub const LoadRequest = struct {
     /// `--ane-prefill` survives cold loads (the flag-eater class).
     ane_prefill: bool = false,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
 
     load_vision: bool = false,
     warmup_eager: bool = true,
@@ -1104,6 +1106,7 @@ pub const Scheduler = struct {
     /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
     ane_prefill: bool,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
     /// became load-bearing on this path the moment `dflash.resolveInDirDrafter`
     /// started probing `<model_dir>/drafter` at load: without it here, a server
@@ -1276,6 +1279,7 @@ pub const Scheduler = struct {
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
             .ane_prefill = params.ane_prefill,
             .ane_chunk_resolver = params.ane_chunk_resolver,
+            .ane_headroom_resolver = params.ane_headroom_resolver,
             .no_drafter = params.no_drafter,
             .drafter_dir = params.drafter_dir,
             .primary_model_dir = params.model_dir,
@@ -1761,6 +1765,7 @@ pub const Scheduler = struct {
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
             .ane_prefill = self.ane_prefill,
             .ane_chunk_resolver = self.ane_chunk_resolver,
+            .ane_headroom_resolver = self.ane_headroom_resolver,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -2695,6 +2700,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
         "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
         "ane_chunk_resolver",
+        "ane_headroom_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3393,7 +3399,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 cfg.isMoe(),
                 pinned,
             ));
-            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare());
+            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), params.ane_headroom_resolver);
         } else {
             log.warn("[ane] --ane-prefill: no prefill-chunk resolver on this load path — disabled\n", .{});
         }

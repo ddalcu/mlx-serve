@@ -2645,13 +2645,20 @@ pub fn applyMlxCacheLimit() void {
 /// (total − wired − compressed − internal-anon) — tightens it. See
 /// `physicalMemoryCeiling`.
 fn currentGpuMemoryCeiling(active_mem: u64) u64 {
+    // The ANE's int8 copies are wired host buffers: invisible to MLX's own
+    // accounting, but genuinely gone from free RAM. Left to leak in through
+    // the noisy free-RAM term they made auto-context swing across boots of the
+    // SAME build (measured 5,120 / 10,240 / 55,296 tokens, 27B iQ on a 32 GB
+    // M1 Pro). Add them back and subtract the known figure once. Zero — and so
+    // exactly the old expression — whenever no offload is resident.
+    const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
     return physicalMemoryCeiling(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        metrics.getAvailableMemBytes(),
-    );
+        metrics.getAvailableMemBytes() +| ane_bytes,
+    ) -| ane_bytes;
 }
 
 /// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
@@ -2752,6 +2759,32 @@ pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u6
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
     );
+}
+
+/// The ANE admission gate's headroom for THIS model at THIS chunk: the KV
+/// cache for a context worth serving, the hot prefix cache, the prefill
+/// chunk's transient envelope, and the non-model baseline. Every term is one
+/// the auto-context sizer also reserves — the gate must not admit an offload
+/// into memory the sizer has already spoken for.
+///
+/// Both model terms already exist as estimators — this is the "a gate that
+/// runs BEFORE the estimator that knows better is the estimator" rule applied
+/// to `ane.gateAllows`, which carried a flat 12 GB instead. That constant was
+/// calibrated for the 27B at chunk 8192 and was wrong in BOTH directions once
+/// `resolvePrefillChunk` sized the chunk down: measured on that geometry, the
+/// envelope is 12.66 GB at chunk 8192 but 2.13 GB at chunk 1024.
+///
+/// The KV term is a RESERVE, not a prediction: see `ane.MIN_CONTEXT_TOKENS`.
+pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
+    const kv_bits: u64 = defaultKvBits();
+    const ctx: u64 = if (config.max_position_embeddings > 0)
+        @min(ane_mod.MIN_CONTEXT_TOKENS, config.max_position_embeddings)
+    else
+        ane_mod.MIN_CONTEXT_TOKENS;
+    return ane_mod.GATE_BASELINE_BYTES +|
+        (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
+        prefix_cache_mem_bytes +|
+        prefillTransientReserve(config, kv_bits, chunk);
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -14667,6 +14700,43 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
     // back rather than being invisible.
     const narrow = safeContextForBudget(ceiling, weights, prefillTransientReserve(&cfg, 4, 256), per_tok, 262144);
     try t.expect(narrow > got);
+}
+
+test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    cfg.num_hidden_layers = 64;
+    cfg.full_attention_interval = 4;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 48;
+    cfg.max_position_embeddings = 262144;
+
+    const wide = aneGateHeadroom(&cfg, 8192);
+    const narrow = aneGateHeadroom(&cfg, 1024);
+    const gib = 1024 * 1024 * 1024;
+
+    // Dominated by the chunk envelope, which is the whole point: the flat
+    // 12 GB it replaces refused a measured +38% prefill at chunk 1024 while
+    // under-reserving at chunk 8192.
+    try t.expect(wide > 12 * gib);
+    try t.expect(narrow < wide / 2);
+
+    // The KV reserve is exactly MIN_CONTEXT_TOKENS worth — the guarantee that
+    // an admitted offload leaves a usable context behind.
+    try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
+        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
+        prefix_cache_mem_bytes +
+        prefillTransientReserve(&cfg, defaultKvBits(), 1024));
+
+    // A model that cannot reach the reserve context only reserves its own max.
+    cfg.max_position_embeddings = 8192;
+    try t.expect(aneGateHeadroom(&cfg, 1024) < narrow);
 }
 
 test "auto-context never sizes past the ceiling as weights grow" {

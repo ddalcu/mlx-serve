@@ -13728,7 +13728,13 @@ pub const Transformer = struct {
     /// the load: every refusal is a NAMED `[ane]` line and the model serves
     /// GPU-only. v1 scope: qwen3_5-family DENSE MLP (data-dependent MoE
     /// routing is not expressible as a fixed-shape ANE graph).
-    pub fn buildAnePrefill(self: *Transformer, io: std.Io, chunk_rows: u32, share: f32) void {
+    pub fn buildAnePrefill(
+        self: *Transformer,
+        io: std.Io,
+        chunk_rows: u32,
+        share: f32,
+        headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
+    ) void {
         if (self.ane_prefill != null) return;
         if (!ane_offload.available()) {
             log.warn("[ane] unavailable: AppleNeuralEngine framework not present — --ane-prefill disabled\n", .{});
@@ -13840,14 +13846,20 @@ pub const Transformer = struct {
             const total_mem = totalMemBytes();
             var resident: usize = 0;
             _ = mlx.mlx_get_active_memory(&resident);
-            if (!ane_offload.gateAllows(total_mem, resident, bill)) {
+            // Model-derived: KV for a context worth serving + this chunk's
+            // prefill envelope + baseline (`server.aneGateHeadroom`). Without
+            // a resolver (tests, other load paths) only the baseline stands.
+            const headroom: u64 = if (headroom_resolver) |hr| hr(cfg, chunk_rows) else ane_offload.GATE_BASELINE_BYTES;
+            if (!ane_offload.gateAllows(total_mem, resident, bill, headroom)) {
                 const gib = 1024 * 1024 * 1024;
-                log.warn("[ane] --ane-prefill: the {s}-mode offload bills ~{d:.1} GB (int8 copies + I/O planes{s}) on top of {d:.1} GB resident + {d} GB headroom, exceeding {d} GB total RAM — disabled\n", .{
+                log.warn("[ane] --ane-prefill: the {s}-mode offload bills ~{d:.1} GB (int8 copies + I/O planes{s}) on top of {d:.1} GB resident + {d:.1} GB headroom (KV for {d} tokens + the chunk-{d} prefill envelope + baseline), exceeding {d} GB total RAM — disabled\n", .{
                     @tagName(mode),
                     @as(f64, @floatFromInt(bill)) / gib,
                     if (mode == .channel) " + GPU rest slices" else "",
                     @as(f64, @floatFromInt(resident)) / gib,
-                    ane_offload.GATE_HEADROOM_BYTES / gib,
+                    @as(f64, @floatFromInt(headroom)) / gib,
+                    ane_offload.MIN_CONTEXT_TOKENS,
+                    chunk_rows,
                     total_mem / gib,
                 });
                 return;

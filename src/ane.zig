@@ -290,20 +290,30 @@ pub fn engineBillBytes(dense_layers: u64, gdn_layers: u64, hidden: u64, ffn: u64
     return (dense_int8 + gdn_int8 + planes) * units;
 }
 
-/// Headroom the gate reserves beyond resident weights + the ANE bill: KV
-/// cache, the prefill chunk's transient envelope, and OS baseline. 12 GB
-/// covers the 27B at the default chunk with margin; a refused load names
-/// every number it compared.
-pub const GATE_HEADROOM_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// The non-model part of the gate's headroom: OS, other apps, MLX's own
+/// reclaimable pool. Everything that scales with the checkpoint is computed
+/// per model by `server.aneGateHeadroom`.
+pub const GATE_BASELINE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Context the gate RESERVES KV for before admitting an offload.
+///
+/// This is what keeps the offload from eating the advertised context. The ANE
+/// int8 copies come out of the same memory the KV cache is sized from, and
+/// auto-context is pinned AFTER the build — so with no reserve, admitting the
+/// offload silently shrank the number clients read once per session (measured
+/// 2026-08-20, Qwen3.8-27B iQ on a 32 GB M1 Pro: 97,280 tokens off, 5,120 on).
+/// Reserving the KV up front means an offload is admitted only if a usable
+/// context still fits beside it, and the sizer then finds that memory free.
+pub const MIN_CONTEXT_TOKENS: u32 = 32768;
 
 /// The per-model admission gate (replaces the v1 flat 96 GB total-RAM
 /// check, which refused a 1 GB bill on a 64 GB Mac and said nothing about
 /// WHY): the bill is admitted when resident + bill + headroom fits total
 /// RAM. An unknown total (sysctl failure) is no information — allow, the
 /// server's other memory guards still stand.
-pub fn gateAllows(total_mem: u64, resident: u64, bill: u64) bool {
+pub fn gateAllows(total_mem: u64, resident: u64, bill: u64, headroom: u64) bool {
     if (total_mem == 0) return true;
-    return resident + bill + GATE_HEADROOM_BYTES <= total_mem;
+    return resident +| bill +| headroom <= total_mem;
 }
 
 /// The hard floor for starting an ANE build at all: below this much free
@@ -1037,17 +1047,30 @@ test "engineBillBytes: int8 weights + per-unit fp16 planes (A9 sharing within a 
 
 test "gateAllows: per-model bill vs total RAM, unknown total allows" {
     const gib = 1024 * 1024 * 1024;
+    const hr = 12 * gib;
     // Unknown total (sysctl failure) is no information — allow, the old
     // `total_mem > 0` behavior.
-    try testing.expect(gateAllows(0, 16 * gib, 32 * gib));
+    try testing.expect(gateAllows(0, 16 * gib, 32 * gib, hr));
     // 64 GB Mac, 16 GB resident, ~32 GB bill: 16+32+12 headroom = 60 <= 64.
-    try testing.expect(gateAllows(64 * gib, 16 * gib, 32 * gib));
+    try testing.expect(gateAllows(64 * gib, 16 * gib, 32 * gib, hr));
     // 36 GB Mac, same model: refused.
-    try testing.expect(!gateAllows(36 * gib, 16 * gib, 32 * gib));
+    try testing.expect(!gateAllows(36 * gib, 16 * gib, 32 * gib, hr));
     // A small model on a small Mac passes (the flat 96 GB gate refused it).
-    try testing.expect(gateAllows(16 * gib, 1 * gib, 1 * gib));
+    try testing.expect(gateAllows(16 * gib, 1 * gib, 1 * gib, hr));
     // Exact fit allows.
-    try testing.expect(gateAllows(60 * gib, 16 * gib, 32 * gib));
+    try testing.expect(gateAllows(60 * gib, 16 * gib, 32 * gib, hr));
+
+    // The headroom is a PARAMETER, which is the fix: the measured M1 Pro case
+    // (32 GB, 12.5 GB resident, 10.3 GB bill) is refused under the flat 12 GB
+    // the constant used to be, and admitted under the ~7 GB this model needs
+    // at its chunk-1024 envelope — an arm measured at +38% prefill.
+    const resident = 12_500 * 1024 * 1024;
+    const bill = 10_300 * 1024 * 1024;
+    try testing.expect(!gateAllows(32 * gib, resident, bill, 12 * gib));
+    try testing.expect(gateAllows(32 * gib, resident, bill, 7 * gib));
+
+    // Saturating: an absurd headroom refuses rather than wrapping to allow.
+    try testing.expect(!gateAllows(32 * gib, resident, bill, std.math.maxInt(u64)));
 }
 
 test "aneShareRows: 32-row floor, GPU remainder, engagement minimum" {
