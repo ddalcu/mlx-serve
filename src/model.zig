@@ -3137,7 +3137,10 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         std.mem.startsWith(u8, key, "model.vision_adapter.") or
         std.mem.startsWith(u8, key, "model.vision_projection.") or
         std.mem.startsWith(u8, key, "vision_adapter.") or
-        std.mem.startsWith(u8, key, "vision_projection."))) return false;
+        std.mem.startsWith(u8, key, "vision_projection.") or
+        // avlp12's Qwen3.8 "Alis" packs spell the Qwen3-VL tower
+        // `model.visual.` (pure rename of `vision_tower.`).
+        std.mem.startsWith(u8, key, "model.visual."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -3768,6 +3771,10 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
+    // avlp12 Alis spells the Qwen3-VL tower `model.visual.` — same gate, or
+    // --no-vision cannot drop it and we hold ~0.9 GB we never read.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));

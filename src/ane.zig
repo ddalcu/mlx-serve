@@ -99,19 +99,55 @@ pub fn aneShareRows(chunk_rows: u32, share: f32) u32 {
     return rows;
 }
 
+/// Chip name via sysctl ("Apple M3 Ultra"); empty on failure — callers fall
+/// to their default row. Canonical copy (dflash.zig delegates here); the GPU
+/// arch string cannot tell Ultra from Max, hence the CPU brand.
+pub fn chipBrandString(buf: []u8) []const u8 {
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname("machdep.cpu.brand_string", buf.ptr, &len, null, 0) != 0) return "";
+    if (len > 0 and buf[len - 1] == 0) len -= 1;
+    return buf[0..len];
+}
+
+/// Per-(mode, silicon) default share. Every row is a MEASURED optimum of its
+/// own sweep — never interpolated (a share change needs its own A/B):
+///   channel / M4 Max: 0.45 (2026-08-18, Qwen3.8-27B oQ4e: 0.40/0.45/0.50
+///     ranked 305/311/297 at 16k — rollover at 0.50).
+///   channel / M3 Ultra: 0.35 (PR #223 tester, 2026-08-19, same pack 4-bit:
+///     0.45 ≈ +1% at 32k — nothing; sweep 0.45/0.40/0.35/0.30 ranked
+///     398/421/440/438 at 32k; clean post-reboot 0.35 A/B +0.2%/+8.5%/+13.7%
+///     at 8k/16k/32k, reproduced 3x incl. across a reboot — and the smaller
+///     share also drops the int8 copy 9.47 → 7.30 GB).
+///   row / M4 Max: 0.40 (2026-08-17: 0.30 +10/+14%, 0.40 +12/+18%, 0.50
+///     regresses). Row is unmeasured elsewhere and keeps the M4 row.
+pub fn defaultShare(mode: Mode, chip: []const u8) f32 {
+    if (mode == .row) return 0.40;
+    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return 0.35;
+    return 0.45;
+}
+
 /// The ANE's share of each covered projection (channel mode: fraction of
 /// output channels; row mode: fraction of chunk token rows).
-/// MLX_SERVE_ANE_SPLIT overrides; the default is PER MODE, each the
-/// measured optimum of its own sweep on Qwen3.8-27B/M4 Max: channel 0.45
-/// (2026-08-18: 0.40/0.45/0.50 ranked 305/311/297 at 16k — same
-/// ANE-becomes-critical-path rollover as row, one notch later), row 0.40
-/// (2026-08-17: 0.30 +10/+14%, 0.40 +12/+18%, 0.50 regresses).
+/// MLX_SERVE_ANE_SPLIT overrides; the default is per (mode, silicon) —
+/// see `defaultShare`.
 pub fn splitShare() f32 {
-    const def: f32 = if (splitMode() == .channel) 0.45 else 0.40;
+    var chip_buf: [128]u8 = undefined;
+    const def = defaultShare(splitMode(), chipBrandString(&chip_buf));
     const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return def;
     const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return def;
     if (!(v > 0) or v > 1) return def;
     return v;
+}
+
+/// ANE prefill is for M4-and-below: on NAX-class GPUs (M5+) the GPU prefill
+/// already outruns the seam — measured a LOSS on M5 Max (channel 0.45 median
+/// -11%/-7.5% at 16k/32k, PR #223, two testers). MLX_SERVE_ANE_FORCE=1 keeps
+/// the build for future silicon measurement (M6 etc.). Pure so it is
+/// hermetically testable; the scheduler passes the live NAX probe + env.
+pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
+    if (!nax_available) return true;
+    if (force_env) |v| return v.len > 0 and v[0] == '1';
+    return false;
 }
 
 /// GDN input-projection offload beside the MLP one (v2). MLX_SERVE_ANE_GDN=0
@@ -313,6 +349,12 @@ pub const AnePrefill = struct {
     eval_err: [512]u8 = @splat(0),
     engaged_logged: bool = false,
     gdn_engaged_logged: bool = false,
+    /// Lifetime eval counts, read by /props from the server thread (the M3
+    /// Ultra tester could not verify DISPATCH from /props — the one-shot
+    /// engagement lines live in the log, but a props probe is what a bench
+    /// harness reads). Written on the ANE thread, hence atomics.
+    evals_ok: std.atomic.Value(u64) = .init(0),
+    evals_failed: std.atomic.Value(u64) = .init(0),
 
     /// `gdn_qkv_out`/`gdn_z_out` of 0 skips the GDN output plane (MLP-only
     /// engine); non-zero sizes it for the fused qkv+z programs. In channel
@@ -460,7 +502,10 @@ pub const AnePrefill = struct {
             self.mu.unlock(self.io);
 
             const ok = msv_ane_mlp_eval(handle, &self.eval_err, self.eval_err.len) != 0;
-            if (!ok) {
+            if (ok) {
+                _ = self.evals_ok.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.evals_failed.fetchAdd(1, .monotonic);
                 log.warn("[ane] eval failed: {s}\n", .{std.mem.sliceTo(&self.eval_err, 0)});
             }
 
@@ -559,6 +604,31 @@ pub const AnePrefill = struct {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "defaultShare: per-silicon channel rows, row mode keeps its M4 optimum" {
+    // M3 Ultra channel row (PR #223 tester): 0.45 measured ≈ nothing, 0.35
+    // measured +8.5%/+13.7% at 16k/32k — the default must be the measured
+    // optimum for the machine, never one machine's number everywhere.
+    try std.testing.expectEqual(@as(f32, 0.35), defaultShare(.channel, "Apple M3 Ultra"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M4 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M3 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, ""));
+    // Row mode is only measured on M4; every chip keeps that row.
+    try std.testing.expectEqual(@as(f32, 0.40), defaultShare(.row, "Apple M3 Ultra"));
+    try std.testing.expectEqual(@as(f32, 0.40), defaultShare(.row, "Apple M4 Max"));
+}
+
+test "anePrefillAllowed: NAX-class GPUs refuse the seam unless forced" {
+    // No NAX (M1-M4): allowed regardless of the force env.
+    try std.testing.expect(anePrefillAllowed(false, null));
+    try std.testing.expect(anePrefillAllowed(false, "0"));
+    // NAX present (M5+): refused — the GPU prefill measured faster (PR #223).
+    try std.testing.expect(!anePrefillAllowed(true, null));
+    try std.testing.expect(!anePrefillAllowed(true, "0"));
+    try std.testing.expect(!anePrefillAllowed(true, ""));
+    // MLX_SERVE_ANE_FORCE=1 keeps the build for future-silicon measurement.
+    try std.testing.expect(anePrefillAllowed(true, "1"));
+}
 
 test "engineBillBytes: int8 weights + SHARED fp16 planes (A9)" {
     // Evals are strictly serial, so the planes are per SHAPE CLASS, not per

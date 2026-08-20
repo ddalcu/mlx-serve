@@ -3233,20 +3233,28 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            var chip_buf: [128]u8 = undefined;
+            const block_cap = dflash_mod.blockCapForMachine(dflash_mod.chipBrandString(&chip_buf));
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
                 params.draft_block_size_explicit,
                 wide_lane,
+                block_cap.cap,
             );
+            var cap_note_buf: [96]u8 = undefined;
+            const cap_note: []const u8 = if (params.draft_block_size_explicit)
+                ", user-clamped"
+            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
+                    block_cap.label,
+                    block_cap.cap,
+                }) catch ", capped"
+            else
+                "";
             log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
                 sch.drafter_block_size,
-                if (params.draft_block_size_explicit)
-                    ", user-clamped"
-                else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
-                    ", capped (no wide verify lane)"
-                else
-                    "",
+                cap_note,
                 wide_lane,
                 d.config.target_layer_ids,
             });
@@ -3334,6 +3342,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.allocator.destroy(h);
             }
         } else |_| {}
+    } else if (params.mtp_enabled) {
+        // A quiet fallback to mode=pld cost a tester a day: nothing logged
+        // when the probe finds no head. Debug-level — most checkpoints have
+        // no MTP head and an info line per load would be noise.
+        log.debug(
+            "[mtp] no head found: no mtp/ sidecar and no [language_model.]mtp.* " ++
+                "keys resolvable from the index at {s} — MTP off\n",
+            .{params.model_dir},
+        );
     }
     errdefer if (mtp_ptr) |h| {
         h.deinit();
@@ -3346,7 +3363,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // pin (idempotent — the later pinAutoContext keeps this value), so the
     // compiled fixed-shape tile matches the width the forward will run.
     if (params.ane_prefill) {
-        if (params.ane_chunk_resolver) |resolve| {
+        const ane_force: ?[]const u8 = if (std.c.getenv("MLX_SERVE_ANE_FORCE")) |p| std.mem.span(p) else null;
+        if (!ane_mod.anePrefillAllowed(transformer_mod.verifyQmmNaxAvailable(), ane_force)) {
+            // ANE prefill is M4-and-below: on NAX machines it measured a
+            // loss (M5 Max, PR #223). `/props` ane stays absent, as off.
+            log.info(
+                "[ane] --ane-prefill disabled: NAX-class GPU prefill already outruns the ANE seam " ++
+                    "(measured a loss on M5 Max, PR #223); MLX_SERVE_ANE_FORCE=1 overrides\n",
+                .{},
+            );
+        } else if (params.ane_chunk_resolver) |resolve| {
             const pinned = resolve(@constCast(params.config));
             // The forward's chunk is the pinned width run through the SAME
             // per-request policy every prefill applies (effectivePrefillChunk:

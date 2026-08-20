@@ -1,6 +1,16 @@
-# Note to testers: DFlash2 (M5 Max) + ANE prefill (M3 Ultra / M5 Max)
+# Note to testers: DFlash2 (M3 Ultra) + ANE prefill (M3 Ultra)
+
+**M3 Ultra ANE verdict (extensive test received 2026-08-19 — thank you)**: ANE prefill WORKS on the M3 Ultra, but the M4 default share was worth ~nothing there (channel 0.45: +1% at 32k). The tester's sweep found the optimum at **0.35** (+8.5%/+13.7% at 16k/32k over OFF, post-reboot A/B, reproduced 3x), so this build's default share is now per-silicon: M3 Ultra boots at 0.35 automatically. Also from that round: the second ANE instance is idle (all energy on ANE0_0 — see the dual-ANE section), `powermetrics ane_power` returns empty samples on that build (use `macpow --dump | grep ANE0_`), and `/props` ane now carries `evals`/`eval_failures` so dispatch is verifiable without log-grepping. Test 2 below is ANSWERED for the M3 Ultra; what remains there is the optional dual-ANE exploration.
 
 Two things I want measured on hardware I don't have. Everything below was validated on an M4 Max, the open questions are exactly the ones your chips answer. Background stories live in `docs/gotchas/engine-mlx.md` (sections "DFlash 2 port" and the ANE rules in root `CLAUDE.md`).
+
+**M5 Max verdict (thanks to both testers, 2026-08-19)**: DFlash2 ties MTP at block 8 (35.2 vs 35.3 tok/s novel) — the block-8/NAX lane engages correctly and the selector holds (+17% acceptance, 1.6x accepted/verify vs MTP), there's just no tok/s win on that chip. Not a bug; the fight is settled per machine. ANE prefill LOSES on M5 Max (channel 0.45 median -11%/-7.5% at 16k/32k) — NAX prefill already covers it, so this build gates `--ane-prefill` OFF on NAX-class GPUs (`MLX_SERVE_ANE_FORCE=1` overrides for future silicon). M5 testers: nothing left to bench here, but please confirm the two test fixes at the bottom on your next run. **The open question moves to the M3 Ultra.**
+
+## Power/thermal (laptops especially)
+
+Measure on AC power at high charge. One tester's decode roughly DOUBLED mid-run when the machine went from battery to AC — a battery arm and an AC arm are not the same machine. On laptops, Latin-square or A-B-A the arms so a power/thermal drift reads as drift, not as an effect.
+
+One more machine-state trap from the M3 Ultra round: mid-session, speculative decode collapsed (5.45 → 2.0 tok/step) and STAYED collapsed across mlx-serve restarts and an ANE-OFF control — a macOS reboot fully restored it. Root cause unknown (the OFF control degrading too acquits the build; the state lived in the OS). If a spec cell collapses and a fresh server boot doesn't recover it, reboot the machine and re-baseline before reporting a regression.
 
 ## Setup (both tests)
 
@@ -23,9 +33,9 @@ Two things I want measured on hardware I don't have. Everything below was valida
 - llmprobe is on npm, `npx -y llmprobe@latest`. `tests/bench.sh` drives it for you.
 - Keep everything else off the GPU while measuring. Background GPU traffic poisoned cells 2x for us.
 
-## Test 1: DFlash2 vs MTP (M5 Max only)
+## Test 1: DFlash2 vs MTP (M3 Ultra)
 
-On M4 Max, MTP wins (novel 65.7 vs 64.6/62.5 tok/s). The reason is hardware: the DFlash block is the trunk verify width, and without the NAX m16 tile the verify falls off a cliff past M=7, so the block caps at 5. Your M5 keeps the checkpoint's block automatically (8 for the Qwen drafter, 16 for the muse one), and at block 8 the DFlash2 selector already measured +16% acceptance over plain argmax drafts on the M4 (3.69 vs 3.17 accepted/round). Whether that beats MTP on M5 is the question.
+On M4 Max, MTP wins (novel 65.7 vs 64.6/62.5 tok/s); on M5 Max they tie (see the verdict above). The M3 Ultra is the machine DFlash2 should actually WIN on: oMLX PRs #2850/#2840 shipped DFlash2 with M3 Ultra numbers of 1.33-1.43x over serial at T=0.7 on our exact model pairing (Qwen3.8-27B + the incoai drafter, block 8). This build's default block cap is now per-silicon — the M3 Ultra defaults to block 8 (matching oMLX's evidence); on older builds pass `--draft-block-size 8` explicitly. Whether our engine reproduces their 1.33-1.43x there is the question.
 
 For calibration, inco's own H200 numbers for the muse drafter (block 16, SGLang): acceptance length 4.4 to 6.6 depending on task, 2.6x to 4.6x over autoregressive. Two metric notes: their "acceptance length" counts accepted+1, so our `avg_per_round` is theirs minus 1, and at block 5 our echo cells already sit at the ceiling (4.97 on their scale), which is why the M4 can't see the difference.
 
@@ -67,18 +77,20 @@ Reproduce the acceptance cell alongside the tok/s arms (one boot each, same thin
 mlx-serve --model <qwen-pack> --drafter <dflash2-dir> --no-mtp --draft-block-size 8 \
   --serve --port 8123 --prefix-cache-entries 0 --skip-mem-preflight
 
-# MTP acceptance at matched depth (forced, acceptance metric ONLY -- the
-# adaptive default is the fair tok/s arm, forced depth is deliberately
-# uneconomic and exists to compare drafters at equal width)
+# MTP acceptance at matched depth. **ACCEPTANCE METRIC ONLY — never use this
+# boot as the MTP tok/s arm.** The adaptive default boot is the fair tok/s
+# arm; forced depth is deliberately uneconomic and exists to compare
+# drafters at equal width. (One tester benched MTP tok/s at forced depth 7 —
+# that number undersells MTP and is not comparable to anything.)
 MLX_SERVE_MTP_ADAPTIVE=0 mlx-serve --model <qwen-pack> --mtp --mtp-depth 7 \
   --serve --port 8123 --prefix-cache-entries 0 --skip-mem-preflight
 ```
 
 Read `avg_per_round`, `per_draft_pct`, and (mtp) `drafted=` off the `[spec-stats]` line after a request with `"enable_thinking": true`, temperature 0, max_tokens 600. Note whether MTP's drafted/attempts ratio still self-limits below 7 on your box; that number is part of the result.
 
-## Test 2: ANE prefill offload (M3 Ultra and M5 Max)
+## Test 2: ANE prefill offload — ANSWERED (M3 Ultra measured 2026-08-19)
 
-`--ane-prefill` (opt-in, lossy int8/fp16 by design) offloads dense MLP + GDN input projections to the Neural Engine during prefill. Measured M4 Max on the 27B: +19%/+26% prefill at 16k/32k, decode untouched. M3 Ultra (older ANE gen, two of them) and M5 Max are unmeasured.
+`--ane-prefill` (opt-in, lossy int8/fp16 by design) offloads dense MLP + GDN input projections to the Neural Engine during prefill. Measured M4 Max on the 27B: +19%/+26% prefill at 16k/32k. M5 Max measured a LOSS — ANE prefill is for M4-and-below, refused by name on NAX-class GPUs. **M3 Ultra measured (27B 4-bit): +8.5%/+13.7% at 16k/32k at channel share 0.35** (the 0.45 default was ~+1% — the older ANE hits its critical-path rollover earlier), decode untouched. This build defaults the M3 Ultra to 0.35 automatically; verify with `/props` (`"share":0.35`, `evals` > 0 after a long prompt). The procedure below stays for reference on any new machine.
 
 Procedure:
 
@@ -86,18 +98,22 @@ Procedure:
 - First boot compiles ANE programs. Watch for `[ane] ... ready: N/M` in the log. If N < M the compile ran out of internal disk budget, just reboot the server, the cache converges across boots. Measure only after full coverage. Needs a few GB free on the INTERNAL disk (aned stages there regardless of TMPDIR).
 - Measure with llmprobe, prefill is the number that moves:
   - `npx -y llmprobe@latest --bench-only -u http://127.0.0.1:8123 -m <model-id>` gives the decode/prefill ladder, or use `./tests/bench.sh --url 127.0.0.1:8123 -m <model-id>` for paste-ready rows.
+  - **Do NOT pass `--full`.** The default ladder stops at 16k with one run per rung, which is all this test needs and is minutes instead of a quarter hour per arm. `--full` adds a 32k and a 64k rung at 3 reps each; the 64k rung tells us nothing here and the extra time is what made the first M3 Ultra round an all-day job.
   - A/B by BOOT: on, off, on, off (same session, alternate arms per boot, never block-of-N). The off arm is the same command without `--ane-prefill`.
-  - The 8k/16k/32k prefill rungs are the signal. Ignore decode, it must not move (if it does, that's a bug, report it).
+  - The 8k and 16k prefill rungs are the signal, and 16k is the one that decides it. Ignore decode, it must not move (if it does, that's a bug, report it).
+  - Optional, only if 16k looks interesting and you want the long-context point: the win grows with context (M3 Ultra measured +8.5% at 16k and +13.7% at 32k), and one 32k reading per arm is a single request rather than a ladder. `tests/prefill_ab.sh` is the shape to crib: send one long prompt with `max_tokens: 4`, read `timings.prompt_ms` off the response, and check `usage.prompt_tokens_details.cached_tokens` is under ~64 so the prefix cache did not serve the body.
 - Verify engagement before believing any number: the log carries per-seam one-shot engagement lines, and `GET /props` has an `"ane"` object with eval counts. Zero engagements with a green boot means the tile width didn't match, report the log.
-- Knobs worth one sweep each on new silicon (M4's defaults were measured on M4 and may not transfer):
+- Knobs worth one sweep each on NEW silicon only (M3 Ultra and M4 are already swept, and this build picks their measured shares automatically, so skip this on those):
   - `MLX_SERVE_ANE_SPLIT=0.30 / 0.40 / 0.45 / 0.50` (share of channels on the ANE; M4 optimum was 0.45 channel mode, rollover at 0.50 where the ANE becomes the critical path)
   - `MLX_SERVE_ANE_MODE=row` (the older token-row split, M4 optimum 0.40)
   - `MLX_SERVE_ANE_GDN=0` (MLP-only, isolates the GDN seam)
 - RAM: the ANE holds an int8 copy of what it serves, ~11 GB on the 27B at channel 0.45. The admission gate bills it, plenty of headroom on your boxes.
 
-Report: prefill tok/s per rung per arm (medians of the alternating boots), the winning share, and the `/props` ane object from one on-boot.
+Report: prefill tok/s per rung per arm (medians of the alternating boots), the winning share, and the `/props` ane object from one on-boot. Two boots per arm is enough to call it; four if the two disagree.
 
 ## Dual ANE on the M3 Ultra
+
+**Partially answered (2026-08-19)**: the IOReport counters (`macpow --dump | grep ANE0_` — note `powermetrics --samplers ane_power` returns EMPTY samples on this build despite confirmed activity) show every ANE-on run accumulating essentially all energy on `ANE0_0` with `ANE0_1` idle, so aned schedules our serial evals onto ONE instance and there is no hidden load balancing. The exploration below — lighting the second instance deliberately — is still open and still interesting.
 
 Short answer: our code does NOT use the second ANE today, and I'd like to know if it can.
 
@@ -105,13 +121,13 @@ Current state: `lib/ane/ane_bridge.m` loads `_ANEInMemoryModel` programs and eva
 
 Cheap probe first (no code, do this before implementing anything):
 
-1. Count instances: `ioreg -l | grep -ci h11ane` (or look for the ANE service class of your gen), and check `sudo powermetrics --samplers ane_power -i 1000` during a 32k `--ane-prefill` run. If total ANE power on the Ultra roughly matches a single Max die's, the second ANE is idle.
+1. Count instances: `ioreg -l | grep -ci h11ane` (or the ANE service class of your gen), and read `macpow --dump | grep ANE0_` before and after an `--ane-prefill` run. Already done on one M3 Ultra: two services (H11ANE/H11ANE1), two counters, and essentially all energy landing on `ANE0_0` while `ANE0_1` stays flat. Do not reach for `powermetrics --samplers ane_power` here, it returns empty samples on that build even with the ANE confirmed busy.
 
 If it's idle and you want to try lighting it (this is a good task for your coding agent, it's exploratory):
 
 1. Find the affinity handle. Class-dump `/System/Library/PrivateFrameworks/AppleNeuralEngine.framework` and look at `_ANEDeviceController` / `_ANEClient` and the accepted keys of the `options:` dicts we currently pass as `@{}` in `msv_ane_model_create` and `msv_ane_model_eval`. You're looking for anything naming a device index, instance, or affinity. If nothing exists at the model/request level, check whether separate client connections get balanced across instances.
 2. If you can pin a program to an instance, the right split is the CHANNEL split we already have: give each ANE half of the current ANE channel share and kick both evals concurrently, then add both partials at the existing seam. That halves the ANE critical path, which is exactly what caps the share at 0.45/0.50 today, so expect the optimal `MLX_SERVE_ANE_SPLIT` to move up. Engine changes needed in `src/ane.zig`: two engine instances per layer, per-instance OUTPUT planes (the shared-plane trick assumes serial evals, the shared INPUT plane is fine since both only read it), kick-both/wait-both on the eval thread, and both halves billed in `engineBillBytes`. Respect the existing constraints per half: fp16 plane rows must be multiples of 32, channel boundaries align to 128.
-3. Verify with powermetrics that both instances draw power, and A/B against single-ANE with the same boot-alternation discipline as above. Also note the M3-gen ANE is slower per instance than M4's, so even a working dual split may land near M4 single-ANE numbers. That's still a result worth having.
+3. Verify both instances draw energy (`macpow --dump | grep ANE0_` deltas on BOTH counters, not just ANE0_0) and A/B against single-ANE with the same boot-alternation discipline as above. Also note the M3-gen ANE is slower per instance than M4's, so even a working dual split may land near M4 single-ANE numbers. That's still a result worth having.
 
 If the framework simply refuses to address the second ANE, that's also a result, write down what you tried.
 
@@ -122,3 +138,12 @@ If the framework simply refuses to address the second ANE, that's also a result,
 - Server logs from one boot per arm (`~/.mlx-serve/logs/` or wherever you redirected them).
 - `GET /props` ane object from an ANE-on boot.
 - Machine, macOS version, pack used, and which llmprobe version.
+
+## M5 testers: two blind test fixes to confirm
+
+Both M5-only GPU unit-test failures you reported are fixed on principled grounds without an M5 to verify on — please run `zig build test` once on your next pull and confirm:
+
+- `deepseek_v4.zig` dec-chain parity: the composed-vs-kernel compare now acquits a mismatch only when the pre-quant value sits at an fp4 rounding midpoint between the two returned grid points (reduction-order near-tie, machine-dependent). Any other mismatch still fails.
+- `minimax_h3.zig` sparseAttend closed form: tolerance widened to 2e-3 — the closed form is exact only in exact arithmetic, and your 1.9995117-vs-2 reading is fp16-accumulation scale on a different sdpa arm, not a wrong mask.
+
+Also fixed from your reports: the live scripts now wait for the model to actually LOAD instead of proceeding at `/health` (no more local patches), `test_dflash.sh` [10] asserts the drafter's own declared block instead of a literal 16, and a missing MTP head now logs `[mtp] no head found: ...` at debug instead of silently falling back to mode=pld.

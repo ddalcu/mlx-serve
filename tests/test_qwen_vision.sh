@@ -53,7 +53,7 @@ echo "$ANT_TEXT" | grep -qiE "house|home|building" || { echo "  FAIL: expected '
 
 echo "== M-RoPE engagement (chat path) =="
 grep -qE "M-RoPE: 1 images" "$LOG" && echo "  OK: M-RoPE engaged" || { echo "  FAIL: M-RoPE did not engage"; FAIL=1; }
-grep -qE "Qwen grid" "$LOG" && echo "  OK: Qwen ViT ran" || { echo "  FAIL: Qwen encoder did not run"; FAIL=1; }
+grep -qiE "qwen grid" "$LOG" && echo "  OK: Qwen ViT ran" || { echo "  FAIL: Qwen encoder did not run"; FAIL=1; }
 
 if [ "$FAIL" = "0" ]; then echo "PASS: qwen vision e2e"; else echo "FAIL: qwen vision e2e"; cat "$LOG" | tail -20; fi
 exit $FAIL

@@ -2857,7 +2857,7 @@ pub const DenseKVView = struct {
     }
 };
 
-fn newEmptyKVEntry() KVCacheEntry {
+pub fn newEmptyKVEntry() KVCacheEntry {
     return .{
         .keys = mlx.mlx_array_new(),
         .values = mlx.mlx_array_new(),

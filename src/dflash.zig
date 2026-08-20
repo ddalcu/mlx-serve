@@ -35,6 +35,7 @@ const transformer_mod = @import("transformer.zig");
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -298,17 +299,42 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
 /// (M5-class) have a real M 8..16 lane and keep the checkpoint's block.
 pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
 
+/// A no-wide-lane block cap with the machine row it came from, for the
+/// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
+pub const BlockCap = struct { cap: u32, label: []const u8 };
+
+/// Per-silicon cap table for machines WITHOUT the NAX m16 verify lane. The
+/// cap is a MACHINE measurement, so each row is one: the M4 row is
+/// NO_WIDE_LANE_BLOCK_CAP (see above); the M3 Ultra row is 8 on oMLX PR
+/// #2850's evidence — block-8 DFlash2 measured 1.33-1.43x over serial at
+/// T=0.7 on the same Qwen3.8-27B + incoai drafter pairing there. New
+/// silicon rows are one-liners (an M1 row lands when the user measures it).
+/// `chip` is sysctl machdep.cpu.brand_string ("Apple M3 Ultra"); the GPU
+/// arch string cannot tell Ultra from Max, hence the CPU brand.
+pub fn blockCapForMachine(chip: []const u8) BlockCap {
+    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return .{ .cap = 8, .label = "m3-ultra" };
+    return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
+}
+
+/// Chip name via sysctl ("Apple M3 Ultra"); empty on failure, which lands
+/// on the default cap row. Canonical copy lives in ane.zig (the ANE share
+/// table keys on the same string).
+pub fn chipBrandString(buf: []u8) []const u8 {
+    return ane_mod.chipBrandString(buf);
+}
+
 /// Resolve the effective block size: the config's value, capped by what the
-/// machine's verify lanes serve, then clamped DOWNWARD by an explicit
+/// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
+/// when there is no wide lane), then clamped DOWNWARD by an explicit
 /// `--draft-block-size` (never raised past the config — the assistant was
 /// trained at its config block). Floor 2 (1 draft + t1).
-pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool) u32 {
+pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32) u32 {
     const base = if (cli_explicit)
         @min(config_block, cli_block)
     else if (wide_verify_lane)
         config_block
     else
-        @min(config_block, NO_WIDE_LANE_BLOCK_CAP);
+        @min(config_block, no_lane_cap);
     return @max(base, 2);
 }
 
@@ -2040,13 +2066,13 @@ test "dflash: out-of-range target_layer_ids rejected by name" {
 
 test "dflash: block size resolves from config, clamped downward by explicit CLI" {
     // A machine WITH a wide verify lane keeps the checkpoint's own block.
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP));
     // Explicit smaller CLI clamps down.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP));
     // Explicit LARGER CLI never raises past the config (training contract).
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP));
     // Floor 2.
-    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true));
+    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
@@ -2094,14 +2120,33 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
 test "dflash: no wide verify lane caps the block at the split-K width" {
     // Without an M 8..16 verify lane the trunk forward falls off a cliff at
     // width 8, so the block is capped even though the checkpoint asks for 16.
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false));
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP));
     // The cap is a CEILING, never a floor: an explicit smaller CLI still wins,
     // and a checkpoint whose own block is already narrow is left alone.
-    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false));
-    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false));
+    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
     // Explicit CLI is the escape hatch for a wider block on capped hardware:
     // it clamps against the CONFIG block, not the cap.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    // An explicit CLI also bypasses a per-silicon cap entirely.
+    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8));
+}
+
+test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
+    // The cap is a MACHINE measurement, keyed on the CPU brand string (the
+    // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX PR #2850:
+    // 1.33-1.43x at block 8 on the same pairing); everything else without a
+    // wide lane keeps the M4-measured default.
+    const ultra = blockCapForMachine("Apple M3 Ultra");
+    try testing.expectEqual(@as(u32, 8), ultra.cap);
+    try testing.expectEqualStrings("m3-ultra", ultra.label);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M4 Max").cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M3 Max").cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("").cap);
+    // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
+    // block-8 one is left alone.
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap));
 }
 
 // ── Hermetic fixtures: tiny llama trunk + tiny DFlash assistant ──

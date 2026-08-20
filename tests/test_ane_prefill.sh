@@ -68,6 +68,23 @@ run_arm() {
         kill $SRV 2>/dev/null || true
         return 1
     fi
+    # /health answers as soon as the socket binds — the model (and the ANE
+    # build, minutes cold) is still loading behind it. Wait for the load's
+    # own ready line, timeout scaled to the checkpoint size.
+    local model_mb ready_secs ready=0
+    model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+    ready_secs=$(( 600 + ${model_mb:-0} / 100 ))
+    for i in $(seq 1 $((ready_secs / 3)) ); do
+        if grep -q "Model ready (loaded on inference thread)" "$LOGFILE"; then ready=1; break; fi
+        if ! kill -0 $SRV 2>/dev/null; then break; fi
+        sleep 3
+    done
+    if [ "$ready" != "1" ]; then
+        echo -e "  ${RED}FAIL${NC} model did not finish loading in ${ready_secs}s" >&2
+        tail -20 "$LOGFILE" >&2
+        kill $SRV 2>/dev/null || true
+        return 1
+    fi
     # ~8.6k-token prompt: one FULL default-width (8192) prefill chunk, which
     # is the only shape the fixed-size ANE tiles serve.
     local body

@@ -141,6 +141,21 @@ pub const QLinear = struct {
     }
 };
 
+/// Does the Qwen head's concat projection map `[2H] -> [H]` for this trunk?
+/// Dense arm: the pre-transposed weight is literally `[2H, H]`. Quantized arm:
+/// the packed weight is `[H, in_packed]`, so the logical input width is solved
+/// from geometry (`affineParamsFromGeometry` succeeds only when the packed
+/// columns and the scales groups both agree with `2H`).
+fn fcMatchesHidden(fc: *const QLinear, hidden_size: u32) bool {
+    if (fc.w.ctx == null or hidden_size == 0 or hidden_size > std.math.maxInt(c_int) / 2) return false;
+    const shape = mlx.getShape(fc.w);
+    if (shape.len != 2) return false;
+    const h: c_int = @intCast(hidden_size);
+    if (fc.s.ctx == null) return shape[0] == h * 2 and shape[1] == h;
+    if (shape[0] != h) return false;
+    return transformer_mod.affineParamsFromGeometry(fc.w, fc.s, hidden_size * 2) != null;
+}
+
 fn m5NaxQLinearMatches(q: *const QLinear, in_dim: u32, out_dim: u32, bits: u32, group_size: u32) bool {
     if (q.w.ctx == null or q.s.ctx == null or q.b.ctx == null) return false;
     if (mlx.mlx_array_dtype(q.w) != .uint32 or
@@ -260,7 +275,11 @@ pub const MtpModel = struct {
     quant_bits: u32,
     quant_group_size: u32,
 
-    fc_w_t: mlx.mlx_array, // [2H, H] bf16, pre-transposed (Qwen heads; empty for Hy3)
+    /// Qwen heads' concat projection (empty for Hy3). Dense bf16 ships
+    /// pre-transposed `[2H, H]` for plain matmul; a checkpoint that ships it
+    /// QUANTIZED (avlp12 Alis) keeps `(w, scales, biases)` verbatim — packed
+    /// `[out=H, in=2H]` is already what quantized_matmul(transpose) wants.
+    fc: QLinear,
     /// Hy3 (hy_v3) heads: the concat projection ships QUANTIZED as
     /// `mtp.eh_proj` instead of Qwen's bf16 `mtp.fc`. Non-null selects the
     /// Hy3 layer shape everywhere it differs: eh_proj replaces the fc matmul
@@ -313,7 +332,7 @@ pub const MtpModel = struct {
         if (self.rerank_coarse) |*rc| rc.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         if (self.eh_proj) |*ep| ep.deinit();
-        _ = mlx.mlx_array_free(self.fc_w_t);
+        self.fc.deinit();
         _ = mlx.mlx_array_free(self.pre_fc_norm_emb);
         _ = mlx.mlx_array_free(self.pre_fc_norm_hidden);
         _ = mlx.mlx_array_free(self.final_norm);
@@ -384,8 +403,8 @@ pub const MtpModel = struct {
         const q_out: u32 = @intCast(q_out_wide);
         const kv_out: u32 = @intCast(kv_out_wide);
 
-        const fc_shape = mlx.getShape(self.fc_w_t);
-        if (mlx.mlx_array_dtype(self.fc_w_t) != .bfloat16 or
+        const fc_shape = mlx.getShape(self.fc.w);
+        if (mlx.mlx_array_dtype(self.fc.w) != .bfloat16 or
             fc_shape.len != 2 or
             fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
             fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size))) return .generic;
@@ -465,11 +484,7 @@ pub const MtpModel = struct {
             return;
         }
         if (!cfg.attn_output_gate) return error.UnsupportedMtpArch;
-        const fc_shape = mlx.getShape(self.fc_w_t);
-        if (fc_shape.len != 2 or
-            fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
-            fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size)))
-            return error.MtpTargetMismatch;
+        if (!fcMatchesHidden(&self.fc, cfg.hidden_size)) return error.MtpTargetMismatch;
 
         self.buildDraftHead(target) catch |err| {
             log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
@@ -973,8 +988,12 @@ fn mtpNormsAreDeltaEncoded(w: *const Weights, p: []const u8, s: mlx.mlx_stream) 
         const nf = negFraction(arr, s) catch continue;
         if (nf > max_neg) max_neg = nf;
     }
-    return max_neg > 0.05;
+    return max_neg > NORM_DELTA_NEG_FRACTION;
 }
+
+/// Negative-fraction bar that separates a delta-encoded gamma (~30-50%
+/// negative) from a folded one (positive by construction).
+pub const NORM_DELTA_NEG_FRACTION: f32 = 0.05;
 
 /// Own an RMSNorm weight, folding `+1` when the head stores delta-encoded norms.
 fn ownNorm(w: *const Weights, key: []const u8, s: mlx.mlx_stream, fold: bool) !mlx.mlx_array {
@@ -1008,7 +1027,16 @@ fn arrayMeanF32(arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 /// sits more than the margin below its backbone anchor. A correctly-stored head
 /// norm sits at/above its anchor (gap ≤ 0 → false); idempotent — after the `+1`
 /// the mean lands above the anchor, so a second pass is a no-op.
-fn mtpNormNeedsRepair(head_mean: f32, anchor: f32) bool {
+/// `neg_frac` is the norm's OWN negative fraction. A FOLDED gamma is strictly
+/// positive by construction (the same evidence `mtpNormsAreDeltaEncoded`
+/// reads, one tensor at a time); a delta one always carries some negatives —
+/// only ~0.2-0.8% on the vulnerable norms (q/k_norm, post_attn, final), which
+/// is why the whole-head detector needs its 5% bar and this one must not use
+/// it. The anchor gap alone cannot tell the two apart: a backbone
+/// mean-of-means spans layers from 0.02 to 2.24, so a correctly folded head
+/// norm can sit a long way under it.
+fn mtpNormNeedsRepair(head_mean: f32, anchor: f32, neg_frac: f32) bool {
+    if (neg_frac <= 0) return false;
     return anchor - head_mean > MTP_NORM_REPAIR_MARGIN;
 }
 
@@ -1052,7 +1080,8 @@ fn ownHeadNormWithRepair(
     if (fold) return owned;
     const anchor = mtpBackboneAnchorMean(w, backbone_suffix, s) orelse return owned;
     const head_mean = arrayMeanF32(owned, s) catch return owned;
-    if (!mtpNormNeedsRepair(head_mean, anchor)) return owned;
+    const neg_frac = negFraction(owned, s) catch return owned;
+    if (!mtpNormNeedsRepair(head_mean, anchor, neg_frac)) return owned;
     defer _ = mlx.mlx_array_free(owned);
     log.info("[mtp] repairing head norm {s}: mean {d:.3} < backbone anchor {d:.3} (+1)\n", .{ head_key, head_mean, anchor });
     return foldNormPlusOne(owned, s);
@@ -1422,7 +1451,10 @@ pub fn loadMtp(
         .s = s,
         .quant_bits = 0, // inferred from tensor geometry below
         .quant_group_size = 0,
-        .fc_w_t = try ownAndTranspose2D(&weights, K.k(&kb, p, "fc.weight"), s),
+        // fc via loadLinear (never loadTrunkLinear — the m5Nax profile
+        // contract wants a bf16 fc): dense gets the pre-transpose, a
+        // quantized one (Alis) loads verbatim.
+        .fc = try loadLinear(&weights, allocator, K.k(&kb, p, "fc"), s),
         .pre_fc_norm_emb = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms),
         .pre_fc_norm_hidden = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms),
         // The 4 norms an oQ `mean<0.5 → +1` conversion can leave a full +1 too
@@ -1505,8 +1537,16 @@ pub fn loadMtp(
     // affineParamsFromGeometry, since sidecars mix bits AND group sizes
     // (the 35B-A3B head: q/k 5-bit gs-128, v 6-bit gs-128, o 4-bit gs-64).
     {
-        const fc_shape = mlx.getShape(m.fc_w_t); // [2H, H] (pre-transposed)
-        const hidden: u32 = if (fc_shape.len == 2) @intCast(fc_shape[1]) else 0;
+        // Dense fc is pre-transposed [2H, H]; a quantized one keeps its
+        // [out=H, in_packed] orientation — read hidden off the axis that is
+        // H in both spellings, never the packed column count.
+        const fc_shape = mlx.getShape(m.fc.w);
+        const hidden: u32 = if (fc_shape.len != 2)
+            0
+        else if (m.fc.s.ctx == null)
+            @intCast(fc_shape[1])
+        else
+            @intCast(fc_shape[0]);
         m.quant_bits = inferBits(&m.q, hidden) orelse 4;
         m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
     }
@@ -1516,11 +1556,14 @@ pub fn loadMtp(
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         const base = [_]mlx.mlx_array{
-            m.fc_w_t,     m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
-            m.input_norm, m.post_attn_norm,  m.q_norm,             m.k_norm,
+            m.fc.w,       m.fc.s,            m.fc.b,               m.pre_fc_norm_emb,
+            m.pre_fc_norm_hidden,            m.final_norm,         m.input_norm,
+            m.post_attn_norm,                m.q_norm,             m.k_norm,
             m.q.w,        m.k.w,             m.v.w,                m.o.w,
         };
-        for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        for (base) |a| if (a.ctx != null) {
+            _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        };
         switch (m.mlp) {
             .dense => |*d| {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, d.gate.w);
@@ -1584,7 +1627,7 @@ fn loadHy3Mtp(
         .s = s,
         .quant_bits = 0,
         .quant_group_size = 0,
-        .fc_w_t = .{ .ctx = null },
+        .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
         .eh_proj = try loadLinear(weights, allocator, K.k(&kb, p, "eh_proj"), s),
         .pre_fc_norm_emb = try ownWeight(weights, K.k(&kb, p, "enorm.weight")),
         .pre_fc_norm_hidden = try ownWeight(weights, K.k(&kb, p, "hnorm.weight")),
@@ -1881,10 +1924,9 @@ fn fcConcat(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, 
         // Hy3: the concat projection is quantized (mtp.eh_proj, 8-bit).
         return qLinearFwd(self, cat, ep);
     }
-    var x = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
-    return x;
+    // Dense fc keeps the plain matmul (qLinearFwd's own dense arm); a
+    // quantized fc (Alis packs) takes the quantized path unchanged.
+    return qLinearFwd(self, cat, &self.fc);
 }
 
 fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array) !FrontOut {
@@ -2755,7 +2797,7 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
     // Hy3 shape: quantizable eh_proj bound, no bf16 fc, MoE mlp with the
     // sigmoid-router extras, UNGATED shared expert.
     try testing.expect(m.eh_proj != null);
-    try testing.expect(m.fc_w_t.ctx == null);
+    try testing.expect(m.fc.w.ctx == null);
     try testing.expect(m.mlp == .moe);
     try testing.expect(m.mlp.moe.expert_bias != null);
     try testing.expect(m.mlp.moe.shared_ungated);
@@ -3015,10 +3057,19 @@ fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 test "mtp: reference-based head-norm repair rule (oMLX norm_repair)" {
     // Gap beyond the margin (an oQ-broken head, ~1 below its backbone anchor)
     // → repair; a head at/above its anchor → no-op; idempotent after the +1.
-    try testing.expect(mtpNormNeedsRepair(0.75, 1.45)); // gap 0.70 → repair
-    try testing.expect(!mtpNormNeedsRepair(1.30, 1.45)); // gap 0.15 → no-op
-    try testing.expect(!mtpNormNeedsRepair(1.50, 1.45)); // above anchor → no-op
-    try testing.expect(!mtpNormNeedsRepair(0.75 + 1.0, 1.45)); // post-shift → no-op
+    // Delta-encoded (some negatives) + gap beyond the margin → repair.
+    try testing.expect(mtpNormNeedsRepair(0.75, 1.45, 0.008)); // gap 0.70 → repair
+    try testing.expect(!mtpNormNeedsRepair(1.30, 1.45, 0.008)); // gap 0.15 → no-op
+    try testing.expect(!mtpNormNeedsRepair(1.50, 1.45, 0.008)); // above anchor → no-op
+    try testing.expect(!mtpNormNeedsRepair(0.75 + 1.0, 1.45, 0.0)); // post-shift → no-op
+
+    // A STRICTLY POSITIVE norm is folded by construction, whatever the anchor
+    // says: avlp12's Alis head ships post_attention_layernorm at 1.206 — the
+    // exact value the delta fold produces — against a 1.93 mean-of-means
+    // anchor whose own layers span 0.02..2.24. The gap rule alone convicted
+    // it, double-shifted it to 2.21 and dropped per-draft acceptance from
+    // ~86% to 33% (live 2026-08-19).
+    try testing.expect(!mtpNormNeedsRepair(1.206, 1.930, 0.0));
 }
 
 test "mtp: inferGroupSize geometry" {
@@ -3343,7 +3394,7 @@ test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" 
         },
     }
     // fc transposed to [H, 2H].
-    const fcs = mlx.getShape(m.fc_w_t);
+    const fcs = mlx.getShape(m.fc.w);
     try testing.expectEqual(@as(c_int, 8), fcs[0]);
     try testing.expectEqual(@as(c_int, 16), fcs[1]);
 }
@@ -3777,6 +3828,22 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
                 try mlx.check(mlx.mlx_array_eval(bf));
                 _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
             }
+            // A delta-encoded gamma: mostly `value`, with the single negative
+            // entry that is all a real one carries on these norms (~0.2-0.8%).
+            fn putDelta(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, len: usize, value: f32, neg: f32, st: mlx.mlx_stream) !void {
+                const data = try std.testing.allocator.alloc(f32, len);
+                defer std.testing.allocator.free(data);
+                for (data) |*x| x.* = value;
+                data[len - 1] = neg;
+                const shape = [_]c_int{@intCast(len)};
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, &shape, 1, .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
         };
         try H.put(map, "language_model.mtp.fc.weight", &.{ 8, 16 }, s);
         try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{8}, s);
@@ -3784,9 +3851,11 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
         try H.put(map, "language_model.mtp.norm.weight", &.{8}, s);
         try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{8}, s);
         try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
-        // Head q_norm sits a full +1 below its backbone anchor (0.7 vs 1.4) —
-        // the oQ conversion bug; k_norm sits at/above (1.5 vs 1.4) — correct.
-        try H.putConst(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, 0.7, s);
+        // Head q_norm sits a full +1 below its backbone anchor (mean 0.7 vs
+        // 1.4) and is DELTA-encoded (one negative entry, like every real
+        // unfolded gamma) — the oQ conversion bug; k_norm sits at/above
+        // (1.5 vs 1.4) — correct.
+        try H.putDelta(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", 32, 0.745, -0.7, s);
         try H.putConst(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, 1.5, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 8, 8 }, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 4, 8 }, s);
@@ -3831,8 +3900,8 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
 
     // Dense flavor, bf16 fc bound and pre-transposed to [2H, H].
     try testing.expect(m.mlp == .dense);
-    try testing.expect(m.fc_w_t.ctx != null);
-    const fc_shape = mlx.getShape(m.fc_w_t);
+    try testing.expect(m.fc.w.ctx != null);
+    const fc_shape = mlx.getShape(m.fc.w);
     try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
     try testing.expectEqual(@as(c_int, 8), fc_shape[1]);
 
@@ -3842,6 +3911,133 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
     try testing.expect(q_mean > 1.6 and q_mean < 1.8);
     const k_mean = try arrayMeanF32(m.k_norm, s);
     try testing.expect(k_mean > 1.45 and k_mean < 1.55);
+    // post_attention_layernorm is strictly positive (already folded) and sits
+    // far below the 1.4 anchor — the gap alone must NOT convict it (the Alis
+    // false repair: a correct 1.206 double-shifted to 2.206).
+    const pa_mean = try arrayMeanF32(m.post_attn_norm, s);
+    try testing.expect(pa_mean > 0.2 and pa_mean < 0.4);
+
+    // …and binds against a hidden-8 trunk.
+    try testing.expect(fcMatchesHidden(&m.fc, 8));
+    try testing.expect(!fcMatchesHidden(&m.fc, 16));
+}
+
+test "mtp: a QUANTIZED fc loads verbatim and binds (avlp12 Alis layout)" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // Toy dense head at hidden 16 (2 heads x hd 8, 1 kv head, inter 6) whose
+    // `fc` ships QUANTIZED 4-bit/gs-32: w u32 [16, 4] + scales/biases [16, 1]
+    // (4 packed cols x 8 values = 32 logical = 2H). Everything else is the
+    // ordinary dense in-checkpoint layout.
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model-00002-of-00002.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn bf16(shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.1 + 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                return bf;
+            }
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                const bf = try bf16(shape, st);
+                defer _ = mlx.mlx_array_free(bf);
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+        };
+        {
+            const dense_fc = try H.bf16(&.{ 16, 32 }, s);
+            defer _ = mlx.mlx_array_free(dense_fc);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, dense_fc, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+            const names = [_][*:0]const u8{
+                "language_model.mtp.fc.weight",
+                "language_model.mtp.fc.scales",
+                "language_model.mtp.fc.biases",
+            };
+            for (names, 0..) |name, i| {
+                var a = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(a);
+                try mlx.check(mlx.mlx_vector_array_get(&a, triple, i));
+                try mlx.check(mlx.mlx_array_eval(a));
+                _ = mlx.mlx_map_string_to_array_insert(map, name, a);
+            }
+        }
+        try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.pre_fc_norm_hidden.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.norm.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 16, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 8, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.v_proj.weight", &.{ 8, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.o_proj.weight", &.{ 16, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.gate_proj.weight", &.{ 6, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.up_proj.weight", &.{ 6, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.down_proj.weight", &.{ 16, 6 }, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{
+        \\ "language_model.model.embed_tokens.weight":"model-00001-of-00002.safetensors",
+        \\ "language_model.mtp.fc.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.fc.scales":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.fc.biases":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_embedding.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_hidden.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.input_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.post_attention_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.o_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.gate_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.up_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.down_proj.weight":"model-00002-of-00002.safetensors"}}
+    });
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // fc kept verbatim: packed [out=H, in_packed], NOT transposed, NOT dequantized.
+    try testing.expect(m.fc.s.ctx != null);
+    try testing.expect(m.fc.b.ctx != null);
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(m.fc.w));
+    const fc_shape = mlx.getShape(m.fc.w);
+    try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
+    try testing.expectEqual(@as(c_int, 4), fc_shape[1]);
+
+    // …and binds against a hidden-16 trunk (this is what used to 400 the head
+    // with MtpTargetMismatch: a packed shape compared against hidden_size * 2).
+    try testing.expect(fcMatchesHidden(&m.fc, 16));
+    try testing.expect(!fcMatchesHidden(&m.fc, 8));
 }
 
 test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible widths stay dense" {
@@ -3917,7 +4113,7 @@ test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible wi
         const down_shape = mlx.getShape(m.mlp.dense.down.w);
         try testing.expectEqual(@as(c_int, 96), down_shape[0]);
         // fc bf16 by contract.
-        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(m.fc_w_t));
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(m.fc.w));
     }
 
     // Lever off (0): everything stays dense.

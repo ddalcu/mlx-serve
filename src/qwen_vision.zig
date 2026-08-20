@@ -459,6 +459,13 @@ pub const QwenVision = struct {
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
+        var kbuf: [256]u8 = undefined;
+
+        const prefix = resolveVisionPrefix(weights) orelse {
+            log.warn("MISSING QWEN VISION WEIGHT: {s}patch_embed.proj.weight\n", .{VISION_PREFIXES[0]});
+            return error.MissingVisionWeights;
+        };
+        log.info("[vision] qwen tower prefix: {s}\n", .{prefix});
 
         const must = struct {
             fn f(w: *const Weights, b: *[256]u8, name: []const u8) !mlx.mlx_array {
@@ -469,44 +476,55 @@ pub const QwenVision = struct {
             }
         }.f;
 
-        // patch_embed.proj.weight is stored MLX-conv layout [out, kT, ps, ps, Cin].
-        // Transpose to [out, Cin, kT, ps, ps] then flatten to [out, Cin*kT*ps*ps]
-        // so it matches the processor's [C, tps, py, px] pixel_values feature order,
-        // turning the full-window Conv3d into a plain Linear.
-        const conv_w = try must(weights, &buf, "vision_tower.patch_embed.proj.weight");
+        // patch_embed.proj.weight is a Conv3d whose STORED axis order is the
+        // converter's choice. Either way it ends flattened to
+        // [out, Cin*kT*ps*ps], matching the processor's [C, tps, py, px]
+        // pixel_values feature order — a full-window Conv3d as a plain Linear.
+        const conv_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.weight"));
         const cw_shape = mlx.getShape(conv_w);
         std.debug.assert(cw_shape.len == 5);
         const out_c = cw_shape[0];
         const flat_in = cw_shape[1] * cw_shape[2] * cw_shape[3] * cw_shape[4];
+        const layout = patchProjLayout(cw_shape, config.qv_temporal_patch, config.qv_patch) orelse {
+            log.warn("QWEN VISION: unreadable patch_embed.proj.weight shape (tps={d}, ps={d})\n", .{ config.qv_temporal_patch, config.qv_patch });
+            return error.MissingVisionWeights;
+        };
+        log.info("[vision] qwen patch_embed layout: {s}\n", .{@tagName(layout)});
         var patch_w = mlx.mlx_array_new();
         {
-            const perm = [_]c_int{ 0, 4, 1, 2, 3 }; // [out,kT,ps,ps,C] → [out,C,kT,ps,ps]
-            var transposed = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(transposed);
-            try mlx.check(mlx.mlx_transpose_axes(&transposed, conv_w, &perm, 5, s));
             const flat_shape = [_]c_int{ out_c, flat_in };
-            try mlx.check(mlx.mlx_reshape(&patch_w, transposed, &flat_shape, 2, s));
+            switch (layout) {
+                .channels_last => {
+                    const perm = [_]c_int{ 0, 4, 1, 2, 3 }; // [out,kT,ps,ps,C] → [out,C,kT,ps,ps]
+                    var transposed = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(transposed);
+                    try mlx.check(mlx.mlx_transpose_axes(&transposed, conv_w, &perm, 5, s));
+                    try mlx.check(mlx.mlx_reshape(&patch_w, transposed, &flat_shape, 2, s));
+                },
+                // Already [out, C, kT, ps, ps] — flatten as-is.
+                .channels_first => try mlx.check(mlx.mlx_reshape(&patch_w, conv_w, &flat_shape, 2, s)),
+            }
         }
-        const patch_b = try must(weights, &buf, "vision_tower.patch_embed.proj.bias");
-        const pos_embed = try must(weights, &buf, "vision_tower.pos_embed.weight");
+        const patch_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.bias"));
+        const pos_embed = try must(weights, &buf, fmtKey(&kbuf, prefix, "pos_embed.weight"));
 
         const depth = config.qv_depth;
         var blocks = try allocator.alloc(QBlock, depth);
         errdefer allocator.free(blocks);
         for (0..depth) |i| {
             blocks[i] = .{
-                .norm1_w = try must(weights, &buf, fmtLayer(&buf, i, "norm1.weight")),
-                .norm1_b = try must(weights, &buf, fmtLayer(&buf, i, "norm1.bias")),
-                .norm2_w = try must(weights, &buf, fmtLayer(&buf, i, "norm2.weight")),
-                .norm2_b = try must(weights, &buf, fmtLayer(&buf, i, "norm2.bias")),
-                .qkv_w = try must(weights, &buf, fmtLayer(&buf, i, "attn.qkv.weight")),
-                .qkv_b = try must(weights, &buf, fmtLayer(&buf, i, "attn.qkv.bias")),
-                .proj_w = try must(weights, &buf, fmtLayer(&buf, i, "attn.proj.weight")),
-                .proj_b = try must(weights, &buf, fmtLayer(&buf, i, "attn.proj.bias")),
-                .fc1_w = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc1.weight")),
-                .fc1_b = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc1.bias")),
-                .fc2_w = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc2.weight")),
-                .fc2_b = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc2.bias")),
+                .norm1_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm1.weight")),
+                .norm1_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm1.bias")),
+                .norm2_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm2.weight")),
+                .norm2_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm2.bias")),
+                .qkv_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.weight")),
+                .qkv_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.bias")),
+                .proj_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.weight")),
+                .proj_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.bias")),
+                .fc1_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.weight")),
+                .fc1_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.bias")),
+                .fc2_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.weight")),
+                .fc2_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.bias")),
             };
         }
 
@@ -524,12 +542,12 @@ pub const QwenVision = struct {
             .patch_b = patch_b,
             .pos_embed = pos_embed,
             .blocks = blocks,
-            .merger_norm_w = try must(weights, &buf, "vision_tower.merger.norm.weight"),
-            .merger_norm_b = try must(weights, &buf, "vision_tower.merger.norm.bias"),
-            .merger_fc1_w = try must(weights, &buf, "vision_tower.merger.linear_fc1.weight"),
-            .merger_fc1_b = try must(weights, &buf, "vision_tower.merger.linear_fc1.bias"),
-            .merger_fc2_w = try must(weights, &buf, "vision_tower.merger.linear_fc2.weight"),
-            .merger_fc2_b = try must(weights, &buf, "vision_tower.merger.linear_fc2.bias"),
+            .merger_norm_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.weight")),
+            .merger_norm_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.bias")),
+            .merger_fc1_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight")),
+            .merger_fc1_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.bias")),
+            .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
+            .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
         };
     }
 
@@ -1033,8 +1051,92 @@ fn getWeightLocal(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx
     return weights.get(name);
 }
 
-fn fmtLayer(buf: *[256]u8, layer: usize, suffix: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "vision_tower.blocks.{d}.{s}", .{ layer, suffix }) catch unreachable;
+fn fmtLayer(buf: *[256]u8, prefix: []const u8, layer: usize, suffix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}blocks.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
+}
+
+fn fmtKey(buf: *[256]u8, prefix: []const u8, suffix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch unreachable;
+}
+
+/// Tower spellings we serve, most common first. Qwen3-VL checkpoints say
+/// `vision_tower.`; avlp12's Qwen3.8 "Alis" packs ship the same 333 tensors
+/// under `model.visual.` (pure rename, substructure identical).
+pub const VISION_PREFIXES = [_][]const u8{ "vision_tower.", "model.visual." };
+
+/// Stored axis order of `patch_embed.proj.weight`. mlx_lm's Conv3d writes
+/// channels LAST (`[out, kT, ps, ps, Cin]`); a straight torch export keeps
+/// channels FIRST (`[out, Cin, kT, ps, ps]` — avlp12's Alis packs). Reading
+/// one as the other produces a running tower that describes every image as
+/// black-and-white stripes, so the layout is DERIVED from the shape.
+pub const PatchProjLayout = enum { channels_last, channels_first };
+
+pub fn patchProjLayout(shape: []const c_int, temporal_patch: u32, patch: u32) ?PatchProjLayout {
+    if (shape.len != 5 or temporal_patch == 0 or patch == 0) return null;
+    const tps: c_int = @intCast(temporal_patch);
+    const ps: c_int = @intCast(patch);
+    if (shape[1] == tps and shape[2] == ps and shape[3] == ps) return .channels_last;
+    if (shape[2] == tps and shape[3] == ps and shape[4] == ps) return .channels_first;
+    return null;
+}
+
+/// Resolve the tower prefix by PROBING the loaded weights (model.resolveWeightPrefix
+/// pattern) — null when no spelling is present, which is what disables vision.
+pub fn resolveVisionPrefix(weights: *const Weights) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    for (VISION_PREFIXES) |p| {
+        if (weights.get(fmtKey(&buf, p, "patch_embed.proj.weight")) != null) return p;
+    }
+    return null;
+}
+
+test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
+    const allocator = std.testing.allocator;
+    const put = struct {
+        fn add(w: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try w.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+
+    // Qwen3-VL spelling.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
+        try std.testing.expectEqualStrings("vision_tower.", resolveVisionPrefix(&w).?);
+    }
+    // avlp12 Alis spelling (live: vision silently disabled, 0.92 GB dead weight).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.visual.patch_embed.proj.weight");
+        try std.testing.expectEqualStrings("model.visual.", resolveVisionPrefix(&w).?);
+    }
+    // No tower (text-only pack, or --no-vision dropped it) → vision disabled.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.layers.0.self_attn.q_proj.weight");
+        try std.testing.expect(resolveVisionPrefix(&w) == null);
+    }
+    // patch_embed.proj axis order is derived from the shape, not assumed.
+    {
+        // mlx-community/Qwen3.5-0.8B-MLX-4bit
+        try std.testing.expectEqual(PatchProjLayout.channels_last, patchProjLayout(&.{ 768, 2, 16, 16, 3 }, 2, 16).?);
+        // avlp12/Qwen3.8-27B-Alis-MLX-4bit
+        try std.testing.expectEqual(PatchProjLayout.channels_first, patchProjLayout(&.{ 1152, 3, 2, 16, 16 }, 2, 16).?);
+        try std.testing.expect(patchProjLayout(&.{ 1152, 3, 2, 16 }, 2, 16) == null);
+        try std.testing.expect(patchProjLayout(&.{ 1152, 5, 5, 5, 5 }, 2, 16) == null);
+    }
+    // Layer keys are built from the RESOLVED prefix.
+    {
+        var buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "model.visual.blocks.7.attn.qkv.weight",
+            fmtLayer(&buf, "model.visual.", 7, "attn.qkv.weight"),
+        );
+    }
 }
 
 test "qwen smart_resize matches reference table" {

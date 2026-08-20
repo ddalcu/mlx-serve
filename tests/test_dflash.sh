@@ -48,6 +48,22 @@ for _ in $(seq 1 120); do
     fi
     sleep 3
 done
+# /health answers as soon as the socket binds — the model is still loading
+# behind it (a 17 GB checkpoint takes minutes). Wait for the load itself via
+# the server's own ready line, timeout scaled to the checkpoint size.
+MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
+echo "waiting for model load (up to ${READY_SECS}s)..."
+for _ in $(seq 1 $((READY_SECS / 3))); do
+    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
+    fi
+    sleep 3
+done
+if ! grep -q "Model ready (loaded on inference thread)" "$LOG"; then
+    echo "FAIL: model did not finish loading in ${READY_SECS}s"; tail -20 "$LOG"; exit 1
+fi
 
 pass=0; fail=0
 ok()   { echo "PASS $1"; pass=$((pass+1)); }
@@ -306,15 +322,23 @@ else
     bad "drafts route through the trunk lm_head by default" "$(grep -i 'draft.*lm_head' "$LOG" | head -2)"
 fi
 
-# [10] The block is capped to what this machine's verify lanes serve. Without
-# the NAX m16 tile the checkpoint's own block (16) is a 4x-cost verify.
+# [10] The block is capped to what this machine's verify lanes serve. The
+# uncapped expectation is the DRAFTER'S OWN declared block (root or nested
+# dflash_config, the loader's probe order) — a literal here was a checkpoint
+# expectation: muse declares 16, the qwen assistants declare 8.
+DECLARED_BLOCK=$(python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+dc = cfg.get("dflash_config") or cfg
+print(dc.get("block_size", ""))
+' "$DRAFTER/config.json")
 BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
-if echo "$BLINE" | grep -q "capped (no wide verify lane"; then
-    ok "block capped on a machine with no wide verify lane ($BLINE)"
-elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=16"; then
-    ok "wide verify lane present, checkpoint block kept ($BLINE)"
+if echo "$BLINE" | grep -q ", capped ("; then
+    ok "block capped for this machine's verify lanes ($BLINE)"
+elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
+    ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
 else
-    bad "block resolves against the machine's verify lanes" "$BLINE"
+    bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
 fi
 
 # [11] The assistant context rides the prefix cache. A restore forwards no
@@ -330,6 +354,70 @@ if grep -q "dflash context restored" "$LOG" && [ "$RATE_COLD" = "$RATE_HIT" ]; t
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
 else
     bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$(grep -c 'dflash context restored' "$LOG")"
+fi
+
+# [12] The assistant context also survives the SSD tier (v4 spec sidecar):
+# same prompt across a SERVER RESTART with --prefix-cache-disk must restore
+# the trunk from disk AND the dflash context beside it — a disk hit used to
+# draft blind (the same 92.6% -> 66.5% class [11] pins for the RAM tier).
+# Isolated HOME so the real kv-cache is never touched. Opt out with
+# DFLASH_SKIP_DISK=1 (two extra boots of the target).
+if [ "${DFLASH_SKIP_DISK:-0}" != "1" ]; then
+    cleanup
+    trap - EXIT
+    DISK_HOME=$(mktemp -d /tmp/dflash_disk_home.XXXXXX)
+    DISK_PROMPT="Repeat this sentence exactly, word for word: the harbor master counted the lanterns twice and noted the tide tables in the margin before the ferry cast off for the northern islands at first light. $(python3 -c 'print(" ".join(f"filler{i}" for i in range(400)))')"
+    disk_boot() { # $1 = logfile
+        HOME="$DISK_HOME" "$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-disk 2GB \
+            --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$1" 2>&1 &
+        SERVER_PID=$!
+        trap cleanup EXIT
+        for _ in $(seq 1 $((READY_SECS / 3)) ); do
+            grep -q "Model ready (loaded on inference thread)" "$1" && return 0
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 3
+        done
+        return 1
+    }
+    LOG_D1=$(mktemp /tmp/dflash_disk1.XXXXXX)
+    LOG_D2=$(mktemp /tmp/dflash_disk2.XXXXXX)
+    if disk_boot "$LOG_D1"; then
+        gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+        DISK_RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D1" | tail -1)
+        sleep 2 # let the post-response disk flush land
+        cleanup
+        trap - EXIT
+        if disk_boot "$LOG_D2"; then
+            gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+            DISK_RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D2" | tail -1)
+            # Rate equality is tolerant (5pp): a HYBRID trunk's prefix restore
+            # is legitimately not bit-identical (re-run recurrence block size),
+            # so near-tie flips can nudge the generation. The blind-draft
+            # collapse this pins is ~26pp.
+            RATES_CLOSE=$(python3 -c "
+import sys
+try:
+    c = float('${DISK_RATE_COLD#per_draft_pct=}' or 'nan')
+    h = float('${DISK_RATE_HIT#per_draft_pct=}' or 'nan')
+    print('yes' if abs(c - h) <= 5.0 else 'no')
+except ValueError:
+    print('no')
+")
+            if grep -q "\[disk-cache\] restored" "$LOG_D2" && grep -q "dflash context restored" "$LOG_D2" \
+                && [ -n "$DISK_RATE_HIT" ] && [ "$RATES_CLOSE" = "yes" ]; then
+                ok "assistant context restored from the SSD tier across a restart (cold==hit $DISK_RATE_HIT)"
+            else
+                bad "assistant context restored from the SSD tier across a restart" \
+                    "cold=$DISK_RATE_COLD hit=$DISK_RATE_HIT" \
+                    "disk-restores=$(grep -c '\[disk-cache\] restored' "$LOG_D2") dflash-restores=$(grep -c 'dflash context restored' "$LOG_D2")"
+            fi
+        else
+            bad "disk-tier arm: second boot did not become ready" "$(tail -5 "$LOG_D2")"
+        fi
+    else
+        bad "disk-tier arm: first boot did not become ready" "$(tail -5 "$LOG_D1")"
+    fi
+    rm -rf "$DISK_HOME"
 fi
 
 echo

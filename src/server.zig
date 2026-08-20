@@ -4059,8 +4059,8 @@ fn renderPropsBody(
 /// holding" is answerable without log-grepping. Pure — the handler feeds
 /// it the engine's fields; returns a leading-comma fragment spliced before
 /// the props root close (empty when there is no engine).
-fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64) ![]u8 {
-    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d}}}", .{ mode_name, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes });
+fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, evals: u64, eval_failures: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d}}}", .{ mode_name, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures });
 }
 
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
@@ -4116,7 +4116,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const ane_json = blk: {
         if (lm.transformer) |x| {
             if (x.ane_prefill) |eng| {
-                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes);
+                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, eng.evals_ok.load(.monotonic), eng.evals_failed.load(.monotonic));
             }
         }
         break :blk try allocator.dupe(u8, "");
@@ -15175,10 +15175,10 @@ test "renderPropsBody omits chat_template" {
     parsed.deinit();
 }
 
-test "anePropsJson: the /props ane object carries mode, coverage and the int8 bill" {
-    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104);
+test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {
+    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, 112, 0);
     defer testing.allocator.free(frag);
-    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104}", frag);
+    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104,\"evals\":112,\"eval_failures\":0}", frag);
     // Spliced into a props body it stays valid JSON with the object present.
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5_moe";
@@ -15189,6 +15189,11 @@ test "anePropsJson: the /props ane object carries mode, coverage and the int8 bi
     const ane = parsed.value.object.get("ane") orelse return error.MissingAne;
     try testing.expectEqualStrings("channel", ane.object.get("mode").?.string);
     try testing.expectEqual(@as(i64, 48), ane.object.get("gdn_layers").?.integer);
+    // The M3 Ultra tester could not verify DISPATCH from /props (the
+    // engagement lines live only in the log) — evals is the probe a bench
+    // harness reads: zero with a green boot = built-but-never-dispatched.
+    try testing.expectEqual(@as(i64, 112), ane.object.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 0), ane.object.get("eval_failures").?.integer);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
