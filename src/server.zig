@@ -28,6 +28,7 @@ const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -1276,7 +1277,14 @@ pub fn serve(
     // `runSingleDecodeTick` — sequential through the inference thread,
     // safe).
     if (max_concurrent > 1) {
-        if (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()) {
+        // A dense GatedDeltaNet trunk (qwen3_5 family) has its OWN batched
+        // kernel since `forwardMoeBatchedDecode`, so it is no longer part of
+        // the hybrid clamp — ask the shared predicate rather than re-deriving
+        // the arch list here, or this site silently disables batching that
+        // the scheduler is willing to do.
+        if (!config.supportsBatchedGdnDecode() and
+            (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()))
+        {
             log.info("Concurrency: requested {d} but model is hybrid/MoE/encoder; falling back to 1\n", .{max_concurrent});
             max_concurrent = 1;
         } else {
@@ -2644,13 +2652,20 @@ pub fn applyMlxCacheLimit() void {
 /// (total − wired − compressed − internal-anon) — tightens it. See
 /// `physicalMemoryCeiling`.
 fn currentGpuMemoryCeiling(active_mem: u64) u64 {
+    // The ANE's int8 copies are wired host buffers: invisible to MLX's own
+    // accounting, but genuinely gone from free RAM. Left to leak in through
+    // the noisy free-RAM term they made auto-context swing across boots of the
+    // SAME build (measured 5,120 / 10,240 / 55,296 tokens, 27B iQ on a 32 GB
+    // M1 Pro). Add them back and subtract the known figure once. Zero — and so
+    // exactly the old expression — whenever no offload is resident.
+    const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
     return physicalMemoryCeiling(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        metrics.getAvailableMemBytes(),
-    );
+        metrics.getAvailableMemBytes() +| ane_bytes,
+    ) -| ane_bytes;
 }
 
 /// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
@@ -2753,6 +2768,32 @@ pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u6
     );
 }
 
+/// The ANE admission gate's headroom for THIS model at THIS chunk: the KV
+/// cache for a context worth serving, the hot prefix cache, the prefill
+/// chunk's transient envelope, and the non-model baseline. Every term is one
+/// the auto-context sizer also reserves — the gate must not admit an offload
+/// into memory the sizer has already spoken for.
+///
+/// Both model terms already exist as estimators — this is the "a gate that
+/// runs BEFORE the estimator that knows better is the estimator" rule applied
+/// to `ane.gateAllows`, which carried a flat 12 GB instead. That constant was
+/// calibrated for the 27B at chunk 8192 and was wrong in BOTH directions once
+/// `resolvePrefillChunk` sized the chunk down: measured on that geometry, the
+/// envelope is 12.66 GB at chunk 8192 but 2.13 GB at chunk 1024.
+///
+/// The KV term is a RESERVE, not a prediction: see `ane.MIN_CONTEXT_TOKENS`.
+pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
+    const kv_bits: u64 = defaultKvBits();
+    const ctx: u64 = if (config.max_position_embeddings > 0)
+        @min(ane_mod.MIN_CONTEXT_TOKENS, config.max_position_embeddings)
+    else
+        ane_mod.MIN_CONTEXT_TOKENS;
+    return ane_mod.GATE_BASELINE_BYTES +|
+        (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
+        prefix_cache_mem_bytes +|
+        prefillTransientReserve(config, kv_bits, chunk);
+}
+
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
@@ -2802,7 +2843,7 @@ pub fn resolvePrefillChunk(
 /// transient reserve, and `checkAttentionMemory` and
 /// `generate.effectivePrefillChunk` then read the same frozen value, so the
 /// bill and the forward cannot drift.
-fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
+pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
@@ -3900,6 +3941,43 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     // The job body wrote the full HTTP/SSE response on the inference thread.
 }
 
+/// Does an unload body carry keys but no usable `"model"`? `{"model_id": id}`
+/// and `{"id": id}` parse fine, leave the id empty, and so resolve to the
+/// DEFAULT model — which, when that default is already unloaded, answers 200
+/// with `{"id":"mlx-serve","state":"unloaded"}`. That is a success-shaped
+/// payload for an unload that never happened, and no client can tell it apart
+/// from a real one (and on a server whose default IS resident, it unloads the
+/// wrong model). Same class as the context-overflow 400: an unload that did
+/// not do what was asked has to say so.
+///
+/// An EMPTY object (or no body at all) is left alone — "the default model" is
+/// the documented shorthand this endpoint has always taken.
+fn unloadBodyNamesNoModel(obj: std.json.ObjectMap) bool {
+    if (obj.count() == 0) return false;
+    if (obj.get("model")) |m| return m != .string;
+    return true;
+}
+
+test "an unload body naming an unrecognised key is a 400, not the default model" {
+    const Case = struct { body: []const u8, rejected: bool };
+    for ([_]Case{
+        .{ .body = "{\"model\":\"org/repo\"}", .rejected = false },
+        .{ .body = "{\"model\":\"/abs/path/org-repo\"}", .rejected = false },
+        // The shorthand every other endpoint honours must keep working.
+        .{ .body = "{}", .rejected = false },
+        // The live bug: 200 + "mlx-serve" with the named model still resident.
+        .{ .body = "{\"model_id\":\"org/repo\"}", .rejected = true },
+        .{ .body = "{\"id\":\"org/repo\"}", .rejected = true },
+        // A present-but-unusable `model` took the same silent path.
+        .{ .body = "{\"model\":123}", .rejected = true },
+        .{ .body = "{\"model\":null}", .rejected = true },
+    }) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(c.rejected, unloadBodyNamesNoModel(parsed.value.object));
+    }
+}
+
 /// `POST /v1/unload-model` `{"model": id}`. Frees the model's resident GPU
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
@@ -3917,6 +3995,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
     if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
         parsed_body = parsed;
         if (parsed.value == .object) {
+            if (unloadBodyNamesNoModel(parsed.value.object)) {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Unload requires the model id as a string under the \"model\" key", 400);
+                return;
+            }
             if (parsed.value.object.get("model")) |m| {
                 if (m == .string) requested_id = m.string;
             }
@@ -3986,6 +4068,7 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
+    ane_json: []const u8,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
@@ -3997,7 +4080,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -4007,7 +4090,35 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
+        ane_json,
     });
+}
+
+/// The /props "ane" object (A8): mode, coverage, geometry and the int8
+/// bill of the resident ANE prefill engine, so "what is the Neural Engine
+/// holding" is answerable without log-grepping. Pure — the handler feeds
+/// it the engine's fields; returns a leading-comma fragment spliced before
+/// the props root close (empty when there is no engine).
+/// One ANE unit's dispatch evidence. Under dual this is the ONLY in-process
+/// proof that both dies were addressed — a silently ignored affinity hint
+/// looks identical from here, so the counters pair with the out-of-process
+/// `macpow --dump | grep ANE0_` check, never replace it.
+const AneUnitStat = struct { instance: i64, evals: u64, eval_failures: u64 };
+
+fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, units: []const AneUnitStat) ![]u8 {
+    var evals: u64 = 0;
+    var eval_failures: u64 = 0;
+    for (units) |u| {
+        evals += u.evals;
+        eval_failures += u.eval_failures;
+    }
+    var rows_buf: [512]u8 = undefined;
+    var used: usize = 0;
+    for (units, 0..) |u, i| {
+        const row = try std.fmt.bufPrint(rows_buf[used..], "{s}{{\"instance\":{d},\"evals\":{d},\"eval_failures\":{d}}}", .{ if (i == 0) "" else ",", u.instance, u.evals, u.eval_failures });
+        used += row.len;
+    }
+    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"units\":{d},\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d},\"unit_evals\":[{s}]}}", .{ mode_name, units.len, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures, rows_buf[0..used] });
 }
 
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
@@ -4059,7 +4170,24 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem);
+    // ANE prefill engine state (A8) — absent when the offload is off.
+    const ane_json = blk: {
+        if (lm.transformer) |x| {
+            if (x.ane_prefill) |eng| {
+                var stats: [ane_mod.MAX_UNITS]AneUnitStat = undefined;
+                for (eng.units, 0..) |*u, i| stats[i] = .{
+                    .instance = u.instance,
+                    .evals = u.evals_ok.load(.monotonic),
+                    .eval_failures = u.evals_failed.load(.monotonic),
+                };
+                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
+            }
+        }
+        break :blk try allocator.dupe(u8, "");
+    };
+    defer allocator.free(ane_json);
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -5321,7 +5449,13 @@ fn handleChatCompletions(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -5583,7 +5717,13 @@ fn handleCompletions(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -7876,6 +8016,10 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     _ = mlx.mlx_get_cache_memory(&mlx_cache);
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
+    // ANE prefill offload totals — published by the engines themselves
+    // (ane.publishLive / deinit), so this is a lock-free read.
+    ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
+    ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -10745,7 +10889,13 @@ fn handleAnthropicMessages(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -12488,7 +12638,8 @@ fn handleResponses(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld_resp = false;
             }
-            if (enable_drafter_resp and !drafter_explicit_in_json) {
+            // DFlash exemption — same rule as the other three surfaces.
+            if (enable_drafter_resp and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter_resp = false;
             }
@@ -14558,6 +14709,43 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
     try t.expect(narrow > got);
 }
 
+test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    cfg.num_hidden_layers = 64;
+    cfg.full_attention_interval = 4;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 48;
+    cfg.max_position_embeddings = 262144;
+
+    const wide = aneGateHeadroom(&cfg, 8192);
+    const narrow = aneGateHeadroom(&cfg, 1024);
+    const gib = 1024 * 1024 * 1024;
+
+    // Dominated by the chunk envelope, which is the whole point: the flat
+    // 12 GB it replaces refused a measured +38% prefill at chunk 1024 while
+    // under-reserving at chunk 8192.
+    try t.expect(wide > 12 * gib);
+    try t.expect(narrow < wide / 2);
+
+    // The KV reserve is exactly MIN_CONTEXT_TOKENS worth — the guarantee that
+    // an admitted offload leaves a usable context behind.
+    try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
+        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
+        prefix_cache_mem_bytes +
+        prefillTransientReserve(&cfg, defaultKvBits(), 1024));
+
+    // A model that cannot reach the reserve context only reserves its own max.
+    cfg.max_position_embeddings = 8192;
+    try t.expect(aneGateHeadroom(&cfg, 1024) < narrow);
+}
+
 test "auto-context never sizes past the ceiling as weights grow" {
     const t = std.testing;
     const ceiling: u64 = 10_600 * 1000 * 1000;
@@ -15078,10 +15266,61 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
+    // No ANE engine => no ane object, and the body is still valid JSON.
+    try testing.expect(std.mem.indexOf(u8, body, "\"ane\"") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    parsed.deinit();
+}
+
+test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 112, .eval_failures = 0 }};
+    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &one);
+    defer testing.allocator.free(frag);
+    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"units\":1,\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104,\"evals\":112,\"eval_failures\":0,\"unit_evals\":[{\"instance\":0,\"evals\":112,\"eval_failures\":0}]}", frag);
+    // Spliced into a props body it stays valid JSON with the object present.
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const ane = parsed.value.object.get("ane") orelse return error.MissingAne;
+    try testing.expectEqualStrings("channel", ane.object.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 48), ane.object.get("gdn_layers").?.integer);
+    // The M3 Ultra tester could not verify DISPATCH from /props (the
+    // engagement lines live only in the log) — evals is the probe a bench
+    // harness reads: zero with a green boot = built-but-never-dispatched.
+    try testing.expectEqual(@as(i64, 112), ane.object.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 0), ane.object.get("eval_failures").?.integer);
+
+    // Dual: `evals` is the TOTAL, and `unit_evals` names each die. A
+    // silently ignored affinity hint is invisible in-process — both units
+    // report evals and both land on one ANE — so this row is what a tester
+    // cross-checks against `macpow --dump | grep ANE0_`, which must show
+    // BOTH counters moving.
+    const two = [_]AneUnitStat{
+        .{ .instance = 1, .evals = 112, .eval_failures = 0 },
+        .{ .instance = 2, .evals = 112, .eval_failures = 3 },
+    };
+    const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
+    defer testing.allocator.free(dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, dual);
+    defer testing.allocator.free(dual_body);
+    var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
+    defer dual_parsed.deinit();
+    const dane = dual_parsed.value.object.get("ane").?.object;
+    try testing.expectEqual(@as(i64, 2), dane.get("units").?.integer);
+    try testing.expectEqual(@as(i64, 224), dane.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 3), dane.get("eval_failures").?.integer);
+    const rows_json = dane.get("unit_evals").?.array;
+    try testing.expectEqual(@as(usize, 2), rows_json.items.len);
+    try testing.expectEqual(@as(i64, 1), rows_json.items[0].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 2), rows_json.items[1].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 112), rows_json.items[1].object.get("evals").?.integer);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
@@ -15097,7 +15336,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.

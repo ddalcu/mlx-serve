@@ -150,10 +150,21 @@ pub fn formatPrompt(a: std.mem.Allocator, caption: []const u8, metas: []const u8
     );
 }
 
+/// The reference marker for a wordless track. ACE-Step has had this since day
+/// one as the empty-lyrics default; `resolveLyrics` is the explicit spelling.
+pub const INSTRUMENTAL_LYRICS = "[Instrumental]";
+
+/// The lyrics the engine should condition on. `instrumental: true` is the
+/// EXPLICIT form of what an empty lyric block already meant here, so it
+/// resolves to the same marker rather than opening a second code path.
+pub fn resolveLyrics(instrumental: bool, lyrics: []const u8) []const u8 {
+    return if (instrumental) INSTRUMENTAL_LYRICS else lyrics;
+}
+
 /// Lyric block. Empty lyrics default to the reference "[Instrumental]" marker.
 pub fn formatLyrics(a: std.mem.Allocator, language: []const u8, lyrics: []const u8) ![]u8 {
     const lang = if (language.len == 0) "en" else language;
-    const body = if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) "[Instrumental]" else lyrics;
+    const body = if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) INSTRUMENTAL_LYRICS else lyrics;
     return std.fmt.allocPrint(a, "# Languages\n{s}\n\n# Lyric\n{s}<|endoftext|>", .{ lang, body });
 }
 
@@ -1959,4 +1970,18 @@ test "acestep oracle: VAE encode mean matches reference" {
     const corr = try arrayCosine(mean_cf, ref, s);
     std.debug.print("[acestep-vaeenc] corr={d:.6}\n", .{corr});
     try testing.expect(corr > 0.999);
+}
+
+test "acestep instrumental flag reaches the same reference marker as empty lyrics" {
+    const a = std.testing.allocator;
+    // `instrumental: true` is the EXPLICIT spelling of what an empty lyric
+    // block already meant here, so the two must assemble byte-identically —
+    // otherwise the flag would be a second, silently different code path.
+    const flagged = try formatLyrics(a, "en", resolveLyrics(true, ""));
+    defer a.free(flagged);
+    const empty = try formatLyrics(a, "en", "");
+    defer a.free(empty);
+    try std.testing.expectEqualStrings(empty, flagged);
+    try std.testing.expectEqualStrings("# Languages\nen\n\n# Lyric\n[Instrumental]<|endoftext|>", flagged);
+    try std.testing.expectEqualStrings("[verse]\nhi", resolveLyrics(false, "[verse]\nhi"));
 }

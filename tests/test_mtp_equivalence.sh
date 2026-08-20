@@ -119,10 +119,21 @@ start_server() { # $1 = extra flags
     "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --prefix-cache-entries 0 --log-level info $1 >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
-        curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+        curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
         sleep 1
     done
-    echo "FAIL: server did not become healthy"; cat "$LOG" | tail -20; exit 1
+    # /health answers as soon as the socket binds — the model is still
+    # loading behind it. Wait for the load's own ready line, timeout scaled
+    # to the checkpoint size.
+    local model_mb ready_secs
+    model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+    ready_secs=$(( 300 + ${model_mb:-0} / 100 ))
+    for _ in $(seq 1 $((ready_secs / 3)) ); do
+        grep -q "Model ready (loaded on inference thread)" "$LOG" && return 0
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        sleep 3
+    done
+    echo "FAIL: server did not become ready"; cat "$LOG" | tail -20; exit 1
 }
 
 stop_server() {
@@ -339,6 +350,14 @@ SERVER_PID=$!
 for _ in $(seq 1 120); do
     curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     sleep 1
+done
+# Same readiness rule as start_server: /health is up before the load ends.
+MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
+for _ in $(seq 1 $((READY_SECS / 3)) ); do
+    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 3
 done
 curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
     $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,

@@ -62,6 +62,16 @@ b400 "missing lyrics" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"duration_s
 b400 "duration 0" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"lyrics\":\"la\",\"duration_seconds\":0}"
 b400 "duration 999" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"lyrics\":\"la\",\"duration_seconds\":999}"
 b400 "steps 2" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"lyrics\":\"la\",\"steps\":2}"
+# `instrumental` and real lyrics are contradictory — a NAMED 400, never a
+# silent winner.
+b400 "instrumental beside lyrics" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"instrumental\":true,\"lyrics\":\"[verse]\\nla la\"}"
+grep -q "instrumental" /tmp/test_music3_err.txt \
+  || { echo "FAIL: conflict 400 does not NAME 'instrumental'"; cat /tmp/test_music3_err.txt; exit 1; }
+# The missing-lyrics 400 must point at the way out, or the flag is undiscoverable.
+grep -q 'instrumental' <(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\"}") \
+  || { echo "FAIL: missing-lyrics 400 does not mention the instrumental escape hatch"; exit 1; }
+echo "PASS: missing-lyrics 400 names the instrumental escape hatch"
 # ACE-Step-only fields have NO music3 equivalent — refused by name, never ignored.
 for f in '"bpm":120' '"keyscale":"F# minor"' '"timesignature":"4/4"' '"vocal_language":"en"'; do
   b400 "ACE-Step field ${f%%:*}" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"lyrics\":\"la\",$f}"
@@ -101,6 +111,31 @@ PY
 [ $? -eq 0 ] || exit 1
 grep -q '\[music3\] AR stage' /tmp/test_music3_server.log || { echo "FAIL: no AR-stage engagement in log"; exit 1; }
 echo "PASS: AR-stage engagement logged"
+
+# 3b. Instrumental: NO lyrics field at all, just the flag. `is_instrumental` is
+# a hosted-api convenience the open weights never had, so the flag becomes the
+# `[Instrumental]` section tag MiniMax's model card lists. The bar is ACCEPTED +
+# produces real audio, AND that the engine logs instrumental=true — a silently
+# ignored flag would otherwise pass by generating a normal sung track.
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"slow lo-fi piano, rain, no vocals\",\"instrumental\":true,\"duration_seconds\":8,\"steps\":8,\"seed\":7}" \
+  -o /tmp/test_music3_inst.wav -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: instrumental gen http $code"; head -c 300 /tmp/test_music3_inst.wav; tail -20 /tmp/test_music3_server.log; exit 1; }
+python3 - /tmp/test_music3_inst.wav <<'INSTPY'
+import sys, struct
+b = open(sys.argv[1], "rb").read()
+assert b[:4] == b"RIFF" and b[8:12] == b"WAVE", f"not a WAV: {b[:12]!r}"
+channels, rate = struct.unpack("<HI", b[22:28])
+n = (len(b) - 44) // (2 * channels)
+assert channels == 2 and rate == 44100, (channels, rate)
+assert n / rate >= 0.5, f"instrumental too short: {n / rate:.2f} s"
+assert any(b[44:44 + 4 * 44100]), "instrumental output is all-zero audio"
+print(f"PASS: instrumental (no lyrics field) -> {n / rate:.2f} s WAV")
+INSTPY
+[ $? -eq 0 ] || exit 1
+grep -q 'instrumental=true' /tmp/test_music3_server.log \
+  || { echo "FAIL: instrumental flag never reached the engine (no instrumental=true in log)"; exit 1; }
+echo "PASS: instrumental=true logged — the flag is not a silent no-op"
 
 # 4. Server survives the gen.
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server died after music gen"; exit 1; }

@@ -44,6 +44,84 @@ struct ResolutionOption: Hashable, Identifiable {
     static let matchSource = ResolutionOption(width: 0, height: 0, label: "Match source (keep the original size)")
 
     var isMatchSource: Bool { width == 0 && height == 0 }
+
+    /// Sentinel: the menu row that reveals the width/height fields. Carries no
+    /// size of its own — the pane holds the typed values, because they must
+    /// survive a preset switch the way the reference lists do.
+    static let custom = ResolutionOption(width: -1, height: -1, label: "Custom…")
+
+    var isCustom: Bool { width == -1 && height == -1 }
+}
+
+// MARK: - Custom resolution
+
+/// The resolution grid a backend actually samples on.
+///
+/// This MIRRORS `clampFluxDim` / `clampKreaDim` in `src/gen.zig` — the server
+/// stays the authority and rewrites anything off-grid regardless of what the
+/// app sends. The mirror exists so the pane can say what will happen BEFORE
+/// the request, instead of the user reading a size back off a finished image.
+/// Documented duplication in the `isMediaModelType` / `modalityFromType`
+/// mould; `CustomResolutionTests` is what keeps the two from drifting.
+struct ResolutionGrid: Hashable {
+    /// Every dimension must be a multiple of this.
+    let alignment: Int
+    let minDim: Int
+    let maxDim: Int
+
+    /// Round onto the grid the way the server does — UP, never to nearest
+    /// (`((v + 31) / 32) * 32`). Rounding the friendly way would print a hint
+    /// naming a size the server does not generate.
+    func snap(_ v: Int) -> Int {
+        guard v > 0 else { return minDim }
+        return ((v + alignment - 1) / alignment) * alignment
+    }
+
+    /// Classify a typed size. In-range-but-off-grid is a CORRECTION (the model
+    /// can nearly do it, so do it and say so); out-of-range is a REFUSAL, since
+    /// silently clamping 4000 to 1536 hands back a picture a third of the
+    /// requested size with nothing explaining why.
+    func resolve(width: Int, height: Int) -> CustomResolution {
+        for v in [width, height] where v <= 0 {
+            return .invalid(message: "Width and height must be whole numbers above zero.")
+        }
+        for v in [width, height] where v < minDim || v > maxDim {
+            return .invalid(message: "This model samples between \(minDim) and \(maxDim) px per side. \(v) is outside that.")
+        }
+        let w = snap(width), h = snap(height)
+        guard w != width || h != height else { return .ok(width: width, height: height) }
+        return .corrected(width: w, height: h,
+                          note: "Rounded to \(w) × \(h) — this model samples in steps of \(alignment) px.")
+    }
+}
+
+/// What the pane does with a typed size.
+enum CustomResolution: Equatable {
+    /// Already on the grid — send it as typed.
+    case ok(width: Int, height: Int)
+    /// Nudged onto the grid. `note` is the small hint shown under the fields.
+    case corrected(width: Int, height: Int, note: String)
+    /// Cannot be honored at all; Generate stays disabled and `message` says why.
+    case invalid(message: String)
+
+    /// The size to actually send, or nil when there is nothing to send.
+    var size: (width: Int, height: Int)? {
+        switch self {
+        case let .ok(w, h), let .corrected(w, h, _): return (w, h)
+        case .invalid: return nil
+        }
+    }
+
+    var isValid: Bool { size != nil }
+
+    /// The line shown under the fields — nil when there is nothing to say.
+    var hint: String? {
+        switch self {
+        case .ok: return nil
+        case let .corrected(_, _, note): return note
+        case let .invalid(message): return message
+        }
+    }
 }
 
 // MARK: - Image presets
@@ -95,6 +173,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     // The architecture is shared across versions, so the bucket is too.
     private static let fluxResolutions: [ResolutionOption] = [
         .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        // The server has always taken this (`clampFluxDim` accepts any multiple
+        // of 32 from 256 up) — it was a missing menu row, not a missing
+        // capability. Below the ~1MP trained scale, so quality falls off; it is
+        // here for speed and for Macs that cannot hold a 1024² working set.
+        .init(width: 512,  height: 512,  label: "512 × 512 (fast, low RAM)"),
         .init(width: 1152, height: 896,  label: "1152 × 896 (landscape 4:3)"),
         .init(width: 896,  height: 1152, label: "896 × 1152 (portrait 3:4)"),
         .init(width: 1216, height: 832,  label: "1216 × 832 (landscape 3:2)"),
@@ -459,6 +542,37 @@ struct VideoModelPreset: Identifiable, Hashable {
     func settings(_ q: QualityPreset) -> VideoQualitySettings {
         qualityProfiles[q] ?? qualityProfiles[defaultQuality]!
     }
+
+    /// The grid this backend samples on. Unlike the image side this is a
+    /// FUNCTION, not a property, because LTX's alignment depends on the
+    /// PIPELINE: `handleVideo` refuses a non-/32 canvas outright ("width and
+    /// height must be multiples of 32"), and a two-stage pipeline denoises at
+    /// half the canvas so it demands /64 as its own named 400. Same model, two
+    /// grids — a constant could only ever be right for one of them.
+    ///
+    /// Video is also where this matters most: the image backends silently
+    /// rewrite an off-grid size, so a bad guess costs a slightly different
+    /// picture. Here it costs the whole generation.
+    ///
+    /// The ceiling is the largest canvas the preset itself ships; the real
+    /// bound past that is memory and time, which `H3Plan`/`H3TimeEstimate` and
+    /// the frame ladder already model and surface.
+    func resolutionGrid(twoStage: Bool) -> ResolutionGrid {
+        let maxDim = resolutions.map { max($0.width, $0.height) }.max() ?? 1024
+        switch backend {
+        // H3 has no two-stage pipeline at all, and its own fastest canvases
+        // (544, 672, 960) are /32 and not /64 — applying LTX's two-stage grid
+        // here would refuse the model's own shipped rows.
+        case .minimaxH3:
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: maxDim)
+        case .ltx:
+            return ResolutionGrid(alignment: twoStage ? 64 : 32, minDim: 256, maxDim: maxDim)
+        }
+    }
+
+    /// The picker's rows plus the Custom… sentinel, which goes last so the
+    /// tuned canvases stay the obvious pick.
+    func resolutionOptions() -> [ResolutionOption] { resolutions + [.custom] }
 
     /// Which prompt FORMAT this model expects — the one chokepoint the pane's
     /// examples, placeholder, hint and tips link all read. Derived from the
@@ -1093,9 +1207,17 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// button while its weights are absent.
     var isLocalOnly: Bool { repo.hasPrefix("local/") }
 
-    /// bpm/keyscale/timesignature/vocal_language — ACE-Step conditioning
-    /// fields with NO Music 3 equivalent (the server names each a 400).
+    /// timesignature/vocal_language — ACE-Step conditioning fields MiniMax's
+    /// card documents no equivalent for, so the server still names each a 400
+    /// on Music 3 and the pane hides them there.
     var supportsMusicalMeta: Bool { family == .acestep }
+
+    /// Tempo and key, which BOTH engines support — they are conditioning
+    /// fields on ACE-Step and caption text on Music 3 (Global Metadata on
+    /// MiniMax's card; its example caption reads "BPM: 96. Key: C major."").
+    /// The pane used to hide them on Music 3 along with the two genuinely
+    /// unsupported knobs, which read as "this model can't do tempo".
+    var supportsTempoAndKey: Bool { true }
     /// Music 3 is lyric-conditioned; the server 400s empty lyrics. ACE-Step
     /// defaults empty lyrics to "[Instrumental]".
     var requiresLyrics: Bool { family == .minimaxMusic3 }
@@ -1104,6 +1226,13 @@ struct MusicModelPreset: Identifiable, Hashable {
     var durationRange: ClosedRange<Double> {
         family == .acestep ? 10...600 : 5...360
     }
+
+    /// Music 3 takes `steps` in [4,100] — the flow-match refinement passes.
+    /// ACE-Step Turbo is distillation-fixed at 8 and the server IGNORES the
+    /// field there, so exposing it would be a control that visibly does
+    /// nothing. `fixedSteps` stays the per-checkpoint default either way.
+    var supportsSteps: Bool { family == .minimaxMusic3 }
+    var stepsRange: ClosedRange<Int> { 4...100 }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -1137,6 +1266,19 @@ struct MusicModelPreset: Identifiable, Hashable {
     static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit]
 }
 
+extension MusicGenRequest {
+    /// Is the lyrics requirement met? Music 3 is lyric-conditioned and the
+    /// server 400s an empty block — but ticking instrumental LIFTS that, or the
+    /// checkbox would be unreachable on the one model that most needs it.
+    /// The pane's Generate gate and the service's pre-flight read this ONE
+    /// answer so they cannot disagree about what is sendable.
+    static func lyricsSatisfied(model: MusicModelPreset, lyrics: String,
+                                instrumental: Bool) -> Bool {
+        if !model.requiresLyrics || instrumental { return true }
+        return !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 /// Dropdown catalogs for the Music tab's advanced options. Users shouldn't
 /// have to know the server's value grammar — every entry here is a value the
 /// engine accepts verbatim (languages ⊆ the reference VALID_LANGUAGES, bpm in
@@ -1154,6 +1296,20 @@ enum MusicOptions {
         ("Arabic", "ar"), ("Dutch", "nl"), ("Polish", "pl"),
         ("Turkish", "tr"), ("Vietnamese", "vi"), ("Swedish", "sv"),
     ]
+
+    /// The section tags the checkpoints were trained on, verbatim from
+    /// MiniMaxAI/MiniMax-Music3's model card. Nothing in the app listed them,
+    /// so the vocabulary was guesswork — the helper text said "like [verse] or
+    /// [chorus]" and left the other seven undiscoverable.
+    static let sectionTags: [String] = [
+        "[intro]", "[verse]", "[pre-chorus]", "[chorus]", "[post-chorus]",
+        "[bridge]", "[instrumental]", "[solo]", "[outro]",
+    ]
+    static let sectionTagHint: String = sectionTags.joined(separator: " ")
+
+    /// What the server accepts for `bpm`. The pane used to offer only the ten
+    /// anchors below, so 92 was unaskable while the chat tool could send it.
+    static let bpmRange: ClosedRange<Int> = 30...300
 
     /// (label, bpm). Labels carry the genre anchor so non-musicians can pick.
     static let bpms: [(label: String, bpm: Int)] = [
@@ -1174,6 +1330,42 @@ enum MusicOptions {
         let notes = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
         return notes.map { "\($0) major" } + notes.map { "\($0) minor" }
     }()
+
+    /// The character a key is conventionally associated with, so the dropdown
+    /// reads like the BPM one (whose labels carry a genre anchor) instead of
+    /// asking a non-musician to pick between 24 bare note names.
+    ///
+    /// These are the common Western associations, not physics — equal
+    /// temperament makes every major key acoustically identical to every other,
+    /// and the associations survive from unequal historical tunings plus
+    /// instrument register and repertoire. Useful as a nudge, not a rule; only
+    /// the twelve most-used keys get one, the rest show bare.
+    /// One word each. Two-word moods made the longest row
+    /// ("A minor — natural, plain sad") wider than any sane menu, and a
+    /// truncated label is worse than no label.
+    static let keyMoods: [String: String] = [
+        "C major": "open",
+        "G major": "pastoral",
+        "D major": "triumphant",
+        "A major": "sunny",
+        "E major": "brilliant",
+        "F major": "gentle",
+        "Bb major": "brassy",
+        "Eb major": "heroic",
+        "A minor": "plain sad",
+        "E minor": "wistful",
+        "D minor": "solemn",
+        "C minor": "stormy",
+        "B minor": "yearning",
+        "F# minor": "moody",
+        "G minor": "restless",
+    ]
+
+    /// "C major — plain, open", or just "C major" where we have no association.
+    static func keyLabel(_ key: String) -> String {
+        guard let mood = keyMoods[key] else { return key }
+        return "\(key) — \(mood)"
+    }
 
     /// (label, wire value). The engine takes the beats-per-bar number.
     static let timeSignatures: [(label: String, value: String)] = [
@@ -1524,6 +1716,22 @@ extension ImageModelPreset {
         }
     }
 
+    /// The grid this backend samples on, mirroring `gen.zig`'s per-backend
+    /// clamps. Derived from the variant, never from the id: a new preset of an
+    /// existing variant inherits the right grid instead of defaulting to one.
+    var resolutionGrid: ResolutionGrid {
+        switch variant {
+        // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
+        // with a ×16 VAE downsample and shares the same clamp server-side.
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
+        // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
+        // widest preset edge.
+        case .flux2Klein4B, .flux2Klein9B:
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+        }
+    }
+
     /// Instruction editing (in-context reference conditioning) is a trained
     /// capability: FLUX.2-klein, and the Mage-Flow-Edit checkpoint. Krea and
     /// Mage-Flow Turbo (txt2img) can only do renoise variations.
@@ -1584,7 +1792,10 @@ extension ImageModelPreset {
     /// model offers "Match source" first — the reference pipeline's default and
     /// the only choice that can't distort the picture the user handed over.
     func resolutionOptions(editMode: Bool) -> [ResolutionOption] {
-        (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
+        let base = (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
+        // Last, so the fixed buckets stay the obvious pick and the fields only
+        // appear for someone who went looking for them.
+        return base + [.custom]
     }
 
     /// Keep a persisted selection valid when the mode changes (leaving edit mode
@@ -1733,6 +1944,10 @@ struct MusicGenRequest {
     var prompt: String
     /// Optional lyrics; empty → the server's "[Instrumental]" convention.
     var lyrics: String = ""
+    /// Wordless track. Sent as `instrumental: true` with the lyrics field
+    /// OMITTED — the server names the pair a 400 on both backends, and on
+    /// Music 3 an omitted lyrics field is the only spelling it accepts.
+    var instrumental: Bool = false
     /// Vocal language code ("en", "zh", …) — only meaningful with lyrics.
     var vocalLanguage: String = "en"
     /// Optional musical metadata; nil/empty → the model decides ("N/A").
@@ -1743,6 +1958,9 @@ struct MusicGenRequest {
     var durationSeconds: Int = 60
     /// -1 = fresh random seed per generation.
     var seed: Int = -1
+    /// Flow-match refinement passes; nil = the server's own default. Only sent
+    /// on backends whose `supportsSteps` is true.
+    var steps: Int? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every

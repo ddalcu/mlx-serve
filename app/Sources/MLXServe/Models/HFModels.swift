@@ -66,14 +66,96 @@ let supportedModelTypes: Set<String> = [
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
 private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "hunyuan3d"]
 // Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
-// a media model missing from this list is treated as a chat model by the
-// browser and the picker. `kokoro` is deliberately absent — it is voice-mode
-// only and never appears in the media-gen catalog (see AudioModelPreset).
-private let mediaModelTypeExactValues: Set<String> = ["qwen3_tts", "AudioVideo", "acestep", "minimax_h3"]
+// a media model missing from this list fails the ARCHITECTURE gate outright,
+// so the browser draws it a red "Unsupported" — which is what happened to
+// `minimax_music3` on the same screen that offers to download it, and to bare
+// `mageflow` (MageFlow ships no root config.json, so it is classified from
+// model_index.json under that spelling). `kokoro` was excluded on purpose
+// because it is voice-mode-only and absent from every media picker — but
+// "hidden from pickers" and "shown to the user as an unsupported
+// architecture" are different decisions, and it was getting both. Exclusion
+// from pickers is `isChatPickable`'s job, which reads this same list. #228.
+//
+// `MediaModalityParityTests` reads `media_model_types` out of src/gen.zig and
+// asserts this agrees. Zig already pinned its own two copies against each
+// other; nothing pinned Swift, which is why this drifted unnoticed.
+private let mediaModelTypeExactValues: Set<String> = [
+    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow",
+]
 
 func isMediaModelType(_ modelType: String) -> Bool {
     if mediaModelTypeExactValues.contains(modelType) { return true }
     return mediaModelTypePrefixes.contains { modelType.hasPrefix($0) }
+}
+
+/// Media architectures a **Discover search row** may offer as a download.
+///
+/// A narrower question than `isMediaModelType`, and the two were conflated.
+/// "Is this a media architecture?" decides the Unsupported badge and the
+/// chat-picker exclusion — Kokoro is one, and pretending otherwise is what put
+/// a red flag on it. "Should a search result offer this repo?" is a CATALOG
+/// decision, and Kokoro is answered by the built-in voice-mode entry rather
+/// than by arbitrary repos found on the hub. Kokoro still appears in the Media
+/// pane's Audio section via `AudioModelPreset.allIncludingVoiceOnly`, so this
+/// hides nothing the user needs; it only keeps the Discover door shut.
+func discoverableMediaModelType(_ modelType: String) -> Bool {
+    modelType != "kokoro" && isMediaModelType(modelType)
+}
+
+/// Which create pane a media checkpoint belongs to.
+///
+/// Mirrors Zig's `gen.modalityFromType` with ONE deliberate difference: Zig
+/// collapses speech and music into `.audio` because they share an engine slot,
+/// but the app has to tell them apart — they are two tabs of one pane, so a
+/// Use button that only knew "audio" would drop a music model on the Voice
+/// tab. `CustomMediaModels.musicFamily` is the existing discriminator; this is
+/// the same split, minus the running-server requirement (a browser row is a
+/// filesystem `LocalModel` with no capabilities).
+enum MediaModality: CaseIterable {
+    case image, voice, music, video, mesh
+
+    init?(modelType: String) {
+        if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
+            || modelType.hasPrefix("mage_flow") || modelType == "mageflow" { self = .image; return }
+        if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
+        switch modelType {
+        case "qwen3_tts", "kokoro": self = .voice
+        case "acestep", "minimax_music3": self = .music
+        case "AudioVideo", "minimax_h3": self = .video
+        default: return nil
+        }
+    }
+
+    /// The top-level create page. Music has no `GenExperiment` case of its own
+    /// — it is a tab inside Audio — so it shares `.audio` with voice.
+    var experiment: GenExperiment {
+        switch self {
+        case .image: return .image
+        case .voice, .music: return .audio
+        case .video: return .video
+        case .mesh: return .model3d
+        }
+    }
+
+    /// Which tab of the Audio pane, or nil where the question does not apply.
+    var audioTab: AudioGenView.Tab? {
+        switch self {
+        case .voice: return .voice
+        case .music: return .music
+        default: return nil
+        }
+    }
+
+    /// What the Use button says it will open.
+    var paneName: String {
+        switch self {
+        case .image: return "Image Generation"
+        case .voice: return "Voice"
+        case .music: return "Music"
+        case .video: return "Video Generation"
+        case .mesh: return "3D"
+        }
+    }
 }
 
 /// The `config` block the HF API returns when asked (`expand[]=config`).
@@ -153,11 +235,11 @@ struct HFModel: Identifiable, Codable {
     /// diffusers repos carry no model_type), else a tag spelling a media
     /// model_type verbatim (mlx-serve packs tag it, e.g. "minimax_h3").
     /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
-    /// (voice-mode-only catalog rule).
+    /// (voice-mode-only catalog rule — see `discoverableMediaModelType`).
     var mediaFamilyModelType: String? {
-        if let t = config?.modelType, isMediaModelType(t) { return t }
+        if let t = config?.modelType, discoverableMediaModelType(t) { return t }
         if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
-        return (tags ?? []).first(where: isMediaModelType)
+        return (tags ?? []).first(where: discoverableMediaModelType)
     }
 
     var isServedMediaRepo: Bool { mediaFamilyModelType != nil }

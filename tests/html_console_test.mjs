@@ -630,6 +630,18 @@ test('musicBody requires a prompt and passes lyrics + duration through', () => {
   assert.deepEqual(bare, { model: 'm', prompt: 'lofi' });
 });
 
+test('musicBody: the instrumental flag replaces lyrics rather than riding beside them', () => {
+  // Sending both is a named 400 on BOTH backends, so the console must never
+  // emit the pair — and an omitted lyrics field is the only spelling of "no
+  // words" that MiniMax Music 3 accepts at all.
+  const inst = C.musicBody({ model: 'm', prompt: 'lofi', instrumental: true, lyrics: 'la la' });
+  assert.equal(inst.instrumental, true);
+  assert.equal(inst.lyrics, undefined);
+  const sung = C.musicBody({ model: 'm', prompt: 'lofi', instrumental: false, lyrics: 'la la' });
+  assert.equal(sung.instrumental, undefined);
+  assert.equal(sung.lyrics, 'la la');
+});
+
 test('speechBody uses the OpenAI `input` field', () => {
   assert.deepEqual(C.speechBody({ model: 'm', text: 'hello' }), { model: 'm', input: 'hello' });
   assert.deepEqual(

@@ -409,6 +409,15 @@ struct ModelInfo {
     /// modality, so empty counts as chat and nothing else.
     func lanAdvertises(_ capability: String) -> Bool {
         guard lanPeer != nil else { return false }
+        // "audio" is the MODALITY, and the server advertises a music backend
+        // ADDITIVELY as ["audio","music"] on both the ready and stub paths
+        // (src/server.zig) — so a peer running ACE-Step or MiniMax Music 3
+        // matched the Voice pane's "audio" ask and offered itself as a TTS
+        // voice. Speech is audio-and-not-music; the Music pane's own "music"
+        // ask was already exact, because no TTS backend advertises it.
+        if capability == "speech" {
+            return capabilities.contains("audio") && !capabilities.contains("music")
+        }
         if capabilities.contains(capability) { return true }
         return capability == "chat" && capabilities.isEmpty
     }

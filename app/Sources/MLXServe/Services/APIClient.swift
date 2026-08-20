@@ -347,6 +347,16 @@ class APIClient {
         return MemoryInfo.parse(mem)
     }
 
+    /// Live throughput feed. 503s when the server was launched without
+    /// `--metrics`, which reads as nil (the tray hides the rows).
+    func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
+        let url = URL(string: "http://127.0.0.1:\(port)/metrics.json")!
+        let (data, response) = try await session.data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)
+    }
+
     // MARK: - Agent Tool Calling
 
     struct ToolCall {

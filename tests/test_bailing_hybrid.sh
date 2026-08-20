@@ -60,6 +60,20 @@ for _ in $(seq 1 120); do
     fi
     sleep 3
 done
+# /health answers as soon as the socket binds — the model is still loading
+# behind it. Wait for the load's own ready line, timeout scaled to size.
+MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
+for _ in $(seq 1 $((READY_SECS / 3)) ); do
+    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
+    fi
+    sleep 3
+done
+if ! grep -q "Model ready (loaded on inference thread)" "$LOG"; then
+    echo "FAIL: model did not finish loading in ${READY_SECS}s"; tail -20 "$LOG"; exit 1
+fi
 
 pass=0; fail=0
 check() { # name, got, expected-substring

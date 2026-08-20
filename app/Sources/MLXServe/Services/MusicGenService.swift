@@ -44,17 +44,39 @@ final class MusicGenService: ObservableObject {
             "duration_seconds": duration,
             "stream": true,
         ]
-        let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lyrics.isEmpty { body["lyrics"] = lyrics }
+        // `instrumental` and lyrics are a named 400 on BOTH backends, so the
+        // flag WINS here rather than letting the pair reach the server. On
+        // Music 3 an omitted lyrics field is the only spelling of "no words"
+        // that is accepted at all.
+        if request.instrumental {
+            body["instrumental"] = true
+        } else {
+            let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lyrics.isEmpty { body["lyrics"] = lyrics }
+        }
+        // Only the backend that reads `steps` gets it — ACE-Step Turbo ignores
+        // the field. Clamping mirrors the duration clamp above: sticky settings
+        // outlive a model switch and must not earn a 400.
+        if request.model.supportsSteps, let steps = request.steps {
+            let r = request.model.stepsRange
+            body["steps"] = min(max(steps, r.lowerBound), r.upperBound)
+        }
         // The musical-metadata knob set is ACE-Step's; Music 3 names each
         // field a 400 — gate the FIELDS here, not just the pane's controls
         // (values may linger from an ACE session).
-        if request.model.supportsMusicalMeta {
-            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !lang.isEmpty { body["vocal_language"] = lang }
+        // Tempo and key go to BOTH engines; the server decides whether they
+        // are conditioning fields (ACE-Step) or caption text (Music 3).
+        if request.model.supportsTempoAndKey {
             if let bpm = request.bpm { body["bpm"] = bpm }
             let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
             if !ks.isEmpty { body["keyscale"] = ks }
+        }
+        // These two remain ACE-Step-only and are a named 400 elsewhere, so the
+        // FIELDS are gated here and not just the pane's controls — values
+        // linger in @State across a model switch.
+        if request.model.supportsMusicalMeta {
+            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lang.isEmpty { body["vocal_language"] = lang }
             let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
             if !ts.isEmpty { body["timesignature"] = ts }
         }
@@ -72,19 +94,28 @@ final class MusicGenService: ObservableObject {
             "duration_seconds: \(request.durationSeconds)",
             "seed: \(resolvedSeed)",
         ]
-        if request.model.supportsMusicalMeta {
-            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !lang.isEmpty, lang != "unknown" { lines.append("vocal_language: \(lang)") }
+        // A setting that changed the output but not the sidecar is a silent
+        // setting — the .txt is what makes a track reproducible.
+        if request.instrumental { lines.append("instrumental: true") }
+        if request.model.supportsSteps, let steps = request.steps {
+            let r = request.model.stepsRange
+            lines.append("steps: \(min(max(steps, r.lowerBound), r.upperBound))")
+        }
+        if request.model.supportsTempoAndKey {
             if let bpm = request.bpm { lines.append("bpm: \(bpm)") }
             let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
             if !ks.isEmpty { lines.append("keyscale: \(ks)") }
+        }
+        if request.model.supportsMusicalMeta {
+            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lang.isEmpty, lang != "unknown" { lines.append("vocal_language: \(lang)") }
             let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
             if !ts.isEmpty { lines.append("timesignature: \(ts)") }
         }
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let lyr = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-        out += "\n\n# Lyrics\n" + (lyr.isEmpty ? "[Instrumental]" : lyr)
+        out += "\n\n# Lyrics\n" + (request.instrumental || lyr.isEmpty ? "[Instrumental]" : lyr)
         return out + "\n"
     }
 
@@ -101,9 +132,9 @@ final class MusicGenService: ObservableObject {
             phase = .failed("Prompt is empty.")
             return
         }
-        if request.model.requiresLyrics,
-           request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            phase = .failed("\(request.model.name) needs lyrics — put structure tags like [verse] on their own lines.")
+        if !MusicGenRequest.lyricsSatisfied(model: request.model, lyrics: request.lyrics,
+                                            instrumental: request.instrumental) {
+            phase = .failed("\(request.model.name) needs lyrics — put structure tags like [verse] on their own lines, or tick Instrumental.")
             return
         }
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
@@ -193,9 +224,9 @@ final class MusicGenService: ObservableObject {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MediaGenError.emptyInput("Prompt")
         }
-        if request.model.requiresLyrics,
-           request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw MediaGenError.emptyInput("Lyrics (this model is lyric-conditioned)")
+        if !MusicGenRequest.lyricsSatisfied(model: request.model, lyrics: request.lyrics,
+                                            instrumental: request.instrumental) {
+            throw MediaGenError.emptyInput("Lyrics (this model is lyric-conditioned; or set instrumental)")
         }
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             throw MediaGenError.notDownloaded(request.model.name)

@@ -130,6 +130,15 @@ run_request() {
     fi
     local body
     body=$(echo "$payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions")
+    # Engagement is only observable AFTER a decode has run.
+    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
+        echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel —" >&2
+        echo "    this comparison would be serial-vs-serial and pass for free." >&2
+        tail -20 "$logfile" >&2
+        kill $pid 2>/dev/null || true
+        rm -f "$logfile"
+        return 1
+    fi
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
     rm -f "$logfile"
@@ -168,6 +177,13 @@ run_and_tokenize() {
     completion=$(echo "$body" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
     local tok_payload
     tok_payload=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$completion")
+    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
+        echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel (long arm)" >&2
+        tail -20 "$logfile" >&2
+        kill $pid 2>/dev/null || true
+        rm -f "$logfile"
+        return 1
+    fi
     local tokens
     tokens=$(echo "$tok_payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" | python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
     kill $pid 2>/dev/null || true
@@ -176,6 +192,22 @@ run_and_tokenize() {
     printf -v "$out_completion_var" '%s' "$completion"
     printf -v "$out_tokens_var" '%s' "$tokens"
 }
+
+# A GatedDeltaNet trunk (qwen3_5 family) routes the batched tick through
+# `forwardMoeBatchedDecode`, a DIFFERENT kernel from the standard batched one.
+# Without this probe the whole test passes vacuously on such a checkpoint: if
+# the batching gate ever stops admitting it, both arms silently become the
+# same serial path and every byte matches.
+IS_GDN=$(python3 - "$MODEL" <<'PYEOF'
+import json, sys, pathlib
+try:
+    c = json.loads((pathlib.Path(sys.argv[1]) / "config.json").read_text())
+except Exception:
+    print("0"); raise SystemExit
+t = c.get("text_config") or c
+print("1" if t.get("full_attention_interval", 0) else "0")
+PYEOF
+)
 
 echo "== batched-kernel byte-equivalence test =="
 echo "  model: $MODEL"
@@ -250,6 +282,84 @@ else
     echo "  batched first ${FIRST_N_TOKENS}: $(echo "$LONG_BATCHED_TOKS" | cut -d',' -f1-${FIRST_N_TOKENS})"
     exit 1
 fi
+
+echo
+echo "== real N=2 concurrency (batch != 1) =="
+# Everything above forces the batched kernel at N=1, which is the ONE width
+# where `batch == 1` still holds inside the forward — and several decisions key
+# on exactly that. `attnProj` passes `batch == 1 and !is_prefill` as its
+# decode_shape, so `--decode-attn-quant` (default ON) engages at forced-N=1 and
+# does NOT at real N>1; the fused QK-norm+RoPE gates are `batch == 1` too. A
+# guard that only ever runs at N=1 therefore pins a shape that never ships.
+# This arm runs two genuinely concurrent streams and holds each to the same
+# first-N-tokens bar against the serial answer.
+sleep 2
+CONC_LOG=$(mktemp)
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$CONC_LOG" 2>&1 &
+CONC_PID=$!
+up=0
+for i in $(seq 1 60); do
+    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
+    sleep 1
+done
+if [ "$up" != "1" ]; then
+    echo -e "${RED}FAIL${NC} concurrent server did not become healthy in 60s"
+    tail -20 "$CONC_LOG"; kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG"; exit 1
+fi
+
+CONC_A=$(mktemp); CONC_B=$(mktemp)
+echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > "$CONC_A" &
+CA=$!
+echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > "$CONC_B" &
+CB=$!
+wait $CA; wait $CB
+
+# Engagement: output equality alone cannot tell a batched run from two serial
+# ones, and two concurrent requests are not guaranteed to overlap. The log line
+# is the only proof the batched path ran at N>1.
+if ! grep -qE "\[batched\] (gdn batched decode|batched decode) engaged \(slots=[2-9]" "$CONC_LOG"; then
+    echo -e "  ${YELLOW}NOT RUN${NC} the two requests never overlapped into a batch of >= 2"
+    grep "\[batched\]" "$CONC_LOG" | head -3 | sed 's/^/    /'
+    CONC_SKIPPED=1
+fi
+
+if [ -z "${CONC_SKIPPED:-}" ]; then
+    CONC_FAIL=0
+    for f in "$CONC_A" "$CONC_B"; do
+        txt=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$f" 2>/dev/null || true)
+        if [ -z "$txt" ]; then
+            echo -e "${RED}FAIL${NC} concurrent request returned no completion"; cat "$f"; CONC_FAIL=1; break
+        fi
+        toks=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$txt" |
+            curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" |
+            python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
+        verdict=$(python3 - "$LONG_SINGLE_TOKS" "$toks" "$FIRST_N_TOKENS" <<'PYEOF'
+import sys
+a = sys.argv[1].split(",") if sys.argv[1] else []
+b = sys.argv[2].split(",") if sys.argv[2] else []
+n = min(int(sys.argv[3]), len(a), len(b))
+for i in range(n):
+    if a[i] != b[i]:
+        print(f"DIFF at index {i}: single={a[i]} concurrent={b[i]}")
+        break
+else:
+    print("OK" if n > 0 else "EMPTY")
+PYEOF
+)
+        if [ "$verdict" != "OK" ]; then
+            echo -e "${RED}FAIL${NC} N=2 concurrent stream diverged from serial: $verdict"
+            CONC_FAIL=1; break
+        fi
+    done
+    if [ "$CONC_FAIL" != "0" ]; then
+        tail -20 "$CONC_LOG"
+        kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"; exit 1
+    fi
+    echo -e "${GREEN}PASS${NC} both concurrent streams byte-identical to serial for ${FIRST_N_TOKENS} tokens (batch >= 2)"
+fi
+kill $CONC_PID 2>/dev/null || true
+wait $CONC_PID 2>/dev/null || true
+rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"
 
 echo
 echo "== batched-kernel x kv-quant crash guard =="

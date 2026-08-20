@@ -12,7 +12,12 @@ struct AudioGenView: View {
         case music = "Music"
     }
 
-    @State private var tab: Tab = .voice
+    /// The left menu's "Audio & Music" row must reopen on the tab you left it
+    /// on. `ChatView.createPane` UNMOUNTS this view on navigation, so plain
+    /// `@State` reset to Voice on every visit, not only across launches.
+    /// The stored raw values are a persistence contract — renaming the display
+    /// text would silently send everyone back to Voice.
+    @AppStorage("audioGenTab") private var tab: Tab = .voice
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,6 +40,25 @@ struct AudioGenView: View {
     }
 }
 
+/// The style prompt a track was made from, read back out of the `<track>.txt`
+/// sidecar the gen services write beside every WAV.
+///
+/// A history row carries a path and nothing else, so without this a track sent
+/// to chat arrives captioned "Generated audio" — true, and useless in a
+/// transcript you keep. Best-effort by design: an older track, a hand-copied
+/// file or a missing sidecar just falls back to that.
+enum AudioSidecar {
+    static func prompt(forTrack path: String) -> String {
+        let txt = (path as NSString).deletingPathExtension + ".txt"
+        guard let body = try? String(contentsOfFile: txt, encoding: .utf8) else { return "" }
+        guard let range = body.range(of: "# Style prompt\n") else { return "" }
+        let rest = body[range.upperBound...]
+        // The sidecar's sections are separated by a blank line.
+        let end = rest.range(of: "\n\n")?.lowerBound ?? rest.endIndex
+        return String(rest[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// Vertical list of past generations, shared by the Voice and Music tabs.
 /// Every file the service ever wrote stays listed (newest first, uncapped);
 /// clicking a row plays it through the owning tab's player, replacing
@@ -45,6 +69,9 @@ struct AudioHistoryShelf: View {
     let playingPath: String?
     let onPlay: (String) -> Void
     let onStop: () -> Void
+    /// Send this track to a new conversation. Optional so a shelf without a
+    /// chat to send to still compiles; both audio tabs pass it.
+    var onSendToChat: ((String) -> Void)? = nil
 
     var body: some View {
         Group {
@@ -88,6 +115,17 @@ struct AudioHistoryShelf: View {
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
             .help("Reveal in Finder")
+            // Reaching a conversation should not depend on a track being the
+            // one this session happened to make last: the completed panel is
+            // transient, the shelf is every track you have.
+            if let send = onSendToChat {
+                Button { send(path) } label: {
+                    Image(systemName: "bubble.left.and.text.bubble.right")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Send to Chat — opens a new conversation with this attached")
+            }
         }
         .padding(.vertical, 3)
         .padding(.horizontal, 6)
@@ -202,7 +240,11 @@ struct VoiceGenView: View {
                     paths: service.recent,
                     playingPath: clipPlayer.playingPath,
                     onPlay: { play($0) },
-                    onStop: { stopPlayback() }
+                    onStop: { stopPlayback() },
+                    onSendToChat: { path in
+                        appState.sendGeneratedMediaToNewChat(
+                            path: path, prompt: AudioSidecar.prompt(forTrack: path), kind: .audio)
+                    }
                 )
                 outputFolderLink
             }
@@ -300,7 +342,9 @@ struct VoiceGenView: View {
         MediaModelChooser.pane(
             all: AudioModelPreset.all,
             onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
-            capability: "audio",
+            // "speech", not "audio": see ModelInfo.lanAdvertises — a peer's
+            // music model advertises "audio" too.
+            capability: "speech",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
             resolveCustom: { [models = server.allModels] in

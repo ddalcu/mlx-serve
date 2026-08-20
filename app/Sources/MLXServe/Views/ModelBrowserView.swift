@@ -386,6 +386,12 @@ private struct RecommendedModelTableRow: View {
         return ModelBrowserUse.pickableModel(atPath: path, in: appState.localModels)
     }
 
+    /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
+    private var usableMedia: (model: LocalModel, modality: MediaModality)? {
+        let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
+        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels)
+    }
+
     var body: some View {
         HStack(spacing: RecTableMetrics.spacing) {
             // Model — name + tagline; the full blurb is on hover.
@@ -480,6 +486,8 @@ private struct RecommendedModelTableRow: View {
                     } else {
                         ModelUseBadge(state: use)
                     }
+                } else if let media = usableMedia {
+                    UseMediaModelButton(modality: media.modality, name: media.model.name)
                 } else {
                     Text("✓ On disk")
                         .font(.caption.weight(.medium))
@@ -832,7 +840,7 @@ private struct MediaPane: View {
                     systemImage: "photo",
                     tint: .pink
                 ) {
-                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, modality: .image, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Audio",
@@ -843,7 +851,7 @@ private struct MediaPane: View {
                     // The browser lists the FULL catalog — Kokoro is voice-mode
                     // only (out of `.all`, which the media panes offer) but is
                     // still a model the user can fetch from here.
-                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, modality: .voice, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Video",
@@ -851,7 +859,7 @@ private struct MediaPane: View {
                     systemImage: "film",
                     tint: .indigo
                 ) {
-                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, modality: .video, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Music",
@@ -859,7 +867,7 @@ private struct MediaPane: View {
                     systemImage: "music.note",
                     tint: .orange
                 ) {
-                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
                 }
             }
             .padding(16)
@@ -901,11 +909,18 @@ private struct ModelGroupSection<Content: View>: View {
 
 /// One row for any media preset (image/audio/video/music) — generic over
 /// `MediaModelPreset` so the four modalities share this instead of four
-/// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`;
-/// unlike a chat model there's no "Use" (each gen pane keeps its own sticky
-/// model selection), so the terminal state is just on-disk + Delete.
+/// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`.
+///
+/// The terminal state used to be on-disk + Delete and nothing else, on the
+/// reasoning that each gen pane keeps its own sticky model selection. But that
+/// left "throw it away" as the only verb the browser offered for a model it
+/// had just finished downloading (#228). `Use` opens the owning pane; the pane
+/// still keeps its own selection, so this is navigation, not a second loader.
+/// The modality is passed in rather than derived — the Media pane already
+/// groups by it, so the call site knows it exactly.
 private struct MediaModelRow<Preset: MediaModelPreset>: View {
     let preset: Preset
+    let modality: MediaModality
     let physicalMemoryBytes: UInt64
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
@@ -973,9 +988,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
     private var actionControl: some View {
         if isReady {
             HStack(spacing: 6) {
-                Text("✓ On disk")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.green)
+                UseMediaModelButton(modality: modality, name: preset.name)
                 Button {
                     confirmDelete = true
                 } label: {
@@ -1065,6 +1078,30 @@ private struct UseModelButton: View {
         .controlSize(.small)
         .disabled(isLoading)
         .help("Load \(name) as the server's model, then open chat")
+    }
+}
+
+/// "Use" for a media checkpoint: open the pane that owns it.
+///
+/// `AppState.showCreate` is documented as the one way into a create page.
+/// Music needs a second step because it has no `GenExperiment` case of its own
+/// — it is a tab inside the Audio pane — and that tab is `@AppStorage`, so
+/// writing it here is what makes the pane come up on Music instead of Voice.
+private struct UseMediaModelButton: View {
+    let modality: MediaModality
+    let name: String
+    @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage("audioGenTab") private var audioTab: AudioGenView.Tab = .voice
+
+    var body: some View {
+        Button("Use") {
+            if let tab = modality.audioTab { audioTab = tab }
+            appState.showCreate(modality.experiment)
+            AppActivation.openWindow(id: "chat", using: openWindow)
+        }
+        .controlSize(.small)
+        .help("Open \(name) in \(modality.paneName)")
     }
 }
 
@@ -1333,6 +1370,14 @@ private struct ModelBrowserRow: View {
         )
     }
 
+    /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
+    private var usableMedia: (model: LocalModel, modality: MediaModality)? {
+        ModelBrowserUse.mediaModel(
+            atPath: downloads.existingModelDir(for: model.id),
+            in: appState.localModels
+        )
+    }
+
     /// A verified community media pack downloads as its FAMILY bundle — the
     /// same allowlists + ready markers the catalog packs use — never the flat
     /// chat-default pull, which would miss subdirs and grab repo junk. nil for
@@ -1401,6 +1446,8 @@ private struct ModelBrowserRow: View {
                         } else {
                             ModelUseBadge(state: use)
                         }
+                    } else if let media = usableMedia {
+                        UseMediaModelButton(modality: media.modality, name: media.model.name)
                     } else {
                         Text("✓ On disk")
                             .font(.caption.weight(.medium))
@@ -1779,6 +1826,16 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
+                } else if let modality = MediaModality(modelType: model.modelType) {
+                    // A media checkpoint is a real, loadable, servable model —
+                    // it just is not a CHAT model, and until now that meant the
+                    // only verb the browser offered for it was Delete. This
+                    // does NOT go through `useModelAndAwaitReady`: that starts
+                    // the server on the path as its primary chat model, which
+                    // for a diffusion checkpoint means the text loader. It
+                    // opens the pane that owns the model instead, and lets the
+                    // pane load it the way it always has.
+                    UseMediaModelButton(modality: modality, name: model.name)
                 }
                 if let reason = model.externalReadOnlyReason {
                     // Read-only: this model lives outside ~/.mlx-serve (LM Studio,

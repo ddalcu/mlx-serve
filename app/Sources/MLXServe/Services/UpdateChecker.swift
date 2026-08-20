@@ -91,10 +91,24 @@ final class UpdateChecker: ObservableObject {
         return out
     }
 
+    /// A LOCAL version may carry a pre-release suffix (`26.8.10-pre-release`,
+    /// cut so the plain number stays free for the real release). It parses to
+    /// the same numbers with a `-1` tail, which sorts BELOW the bare version
+    /// after zero-padding — so someone running the pre-release IS offered
+    /// v26.8.10 when it ships. Deliberately local-only: `parseCalVer` stays
+    /// strict for remote tags, where a surprising suffix must never announce
+    /// an update.
+    nonisolated static func parseLocalCalVer(_ s: String) -> [Int]? {
+        guard let dash = s.firstIndex(of: "-") else { return parseCalVer(s) }
+        guard var v = parseCalVer(String(s[s.startIndex..<dash])) else { return nil }
+        v.append(-1)
+        return v
+    }
+
     /// Numeric component-wise compare (lexicographic would sort v26.10 below
     /// v26.9); shorter versions zero-pad. Malformed input is never newer.
     nonisolated static func isNewer(_ remote: String, than local: String) -> Bool {
-        guard var r = parseCalVer(remote), var l = parseCalVer(local) else { return false }
+        guard var r = parseCalVer(remote), var l = parseLocalCalVer(local) else { return false }
         let n = max(r.count, l.count)
         r.append(contentsOf: repeatElement(0, count: n - r.count))
         l.append(contentsOf: repeatElement(0, count: n - l.count))

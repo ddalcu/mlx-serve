@@ -986,7 +986,7 @@ pub fn templateConsumesEffort(tpl: []const u8) bool {
 pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     const e = effort orelse return "low";
     if (std.mem.eql(u8, e, "high")) return "high";
-    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max")) return "max";
+    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
     return "low";
 }
 
@@ -8671,6 +8671,8 @@ test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max"
     try testing.expectEqualStrings("high", dsv4EffortFor("high"));
     try testing.expectEqualStrings("max", dsv4EffortFor("xhigh"));
     try testing.expectEqualStrings("max", dsv4EffortFor("max"));
+    // `ultra` is an EXPLICIT ask for the top tier — the unknown-string fallback would invert it into low.
+    try testing.expectEqualStrings("max", dsv4EffortFor("ultra"));
 }
 
 test "serializeExtraContext: dsv4 gets the reference's default reasoning effort" {

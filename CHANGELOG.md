@@ -1,16 +1,89 @@
 # Changelog
 
-## Unreleased
+## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
+
+### Highlights
+
+- **The Neural Engine now helps with long prompts.** Opt-in `--ane-prefill`, +19% at 16k and +26% at 32k on Qwen 3.8 27B.
+- **Concurrent chats on Qwen 3.5/3.6/3.8 decode together instead of one after another** — 2.76x aggregate throughput at 4 streams.
+- **DFlash 2 draft heads are supported**, and warm turns keep their draft history across the SSD prefix cache instead of drafting blind.
+- **Per-machine tuning**: the Neural Engine share, the draft block size and the speculative depth cap are now measured per chip rather than one number for every Mac in auto mode.
+- **Markdown tables**: chat now render as a real grid instead of monospaced ASCII-art text: bold header row, one divider, no vertical borders, with inline markdown (bold, code, links) rendered inside cells instead of shown as literal characters.
+
+### Neural Engine prefill
+
+- **The Neural Engine now helps with long prompts.** New opt-in `--ane-prefill` (Settings ▸ "Neural Engine prefill boost") runs a slice of each Qwen-family projection on the Apple Neural Engine in parallel with the GPU: the ANE owns part of the MLP and GatedDeltaNet output channels through its own int8 copy of that slice, the GPU computes the rest, and long-prompt processing gets +19% at 16k and +26% at 32k tokens on Qwen 3.8 27B (306/301 tok/s on an M4 Max). Reply speed is unchanged. The extra copy is ~11 GB on a 27B, ~1 GB on a small model, and the server checks the exact fit per model at load, declining by name when it doesn't fit.
+- Covers Qwen 3.5/3.6/3.8 dense checkpoints (MLP + GatedDeltaNet) and MoE ones like the 35B-A3B (GatedDeltaNet only, +4% at 16k for ~0.5 GB). First load of a model compiles the ANE programs once (~1-2 minutes, cached after); a build that would run the disk out is refused by name instead of shipping partial coverage; `/props` and `/metrics` report what the Neural Engine is holding. Levers: `MLX_SERVE_ANE_MODE=row` (row split instead of channel slices), `MLX_SERVE_ANE_SPLIT` (share), `MLX_SERVE_ANE_GDN=0` (MLP-only).
+- The share of each projection the Neural Engine takes is now per chip: 0.45 on M4, 0.35 on M3 Ultra (+8.5%/+13.7% at 16k/32k, dual ANE more but I need hardware to test).
+- `--ane-prefill` is refused by name on M5-class GPUs, where the GPU prefill already outruns the offload and two testers measured a loss. `MLX_SERVE_ANE_FORCE=1` keeps it for future measurement.
+- `/props` reports Neural Engine dispatch counts and failures, so you can tell a built-but-never-used offload from a working one without reading the log.
+- Experimental `MLX_SERVE_ANE_DUAL=1` (off by default, M3 Ultra only) pins two Neural Engine units to the two dies and splits the share between them. Untested on hardware so far.
+
+### Concurrency
+
+- **Concurrent requests on a Qwen 3.5/3.6/3.8 trunk now decode as one batch.** They used to run strictly serially, each stream re-reading the whole model. Measured 2.76x aggregate at 4 streams. Two separate gates were cancelling it: the server clamped concurrency to 1 on these architectures, and a prompt that merely armed predictive decoding lost batching permanently even after that speculation turned itself back off (9.6 → 12.4 tok/s per stream on 4 concurrent 5.5k-token prompts on a Mac Mini).
+- A batch mixing one very long conversation with short ones no longer builds a padded attention tensor sized by the longest stream — the long ones fall out to serial for that step and everything still advances. Left unchecked this was several GB per step that nothing accounted for, ending in an unrecoverable GPU out-of-memory.
+
+### Speculative decoding
+
+- **DFlash 2 draft heads load and run** (the nested `dflash_config` sidecars), including the trained path selector and its convolutions. On an M4 the built-in MTP head is still the faster option; the selector's win needs the wider draft blocks only larger machines serve.
+- Draft-head history now survives the on-disk prefix cache, not just the in-memory one. Resuming a conversation after a restart used to draft blind.
+- The draft block size is capped per chip (8 on M3 Ultra), and so is the automatic speculation depth (4 on M1 Pro, where forcing depth 4 is +27% while the shipping cap of 6 was worth +0.7%). The log names which machine row it applied, so a depth of 4 is distinguishable from the planner having chosen it.
+- +3% decode from removing a redundant copy in the draft gate, plus a re-scored draft shortlist: 62 → 64 tok/s on an M4 Max, and +5% on novel content.
+- A model that ships a draft head but fails to load it now says so instead of quietly falling back to the slower predictive path.
+
+### Models
+
+- **Ling 3.0 flash-line checkpoints** that ship a direct query projection (`"q_lora_rank": null`) are no longer refused at load, and Ling 3.0 tiny loads under both converter layouts. Thanks @Fe2-O3 (#232). The published flash quants need a further layout change and still do not load.
+- **Alis (avlp12) Qwen packs are served**: their quantized draft-head projection binds, the vision tower's prefix and convolution layout are probed instead of assumed, and a false "broken norm" repair that was halving draft acceptance is fixed (33% → 70%).
+- Embedded DeepSeek and llama.cpp engines updated to their latest upstream versions.
+
+### Releases
+
+- The release workflow gained a **Pre-release** checkbox: it tags `v<version>-pre-release.1`, `.2`, `.3` instead of `v<version>`, so a build can go out for testing without spending the version number that the real release will use. Still created as a draft, still kept out of Homebrew.
 
 ### App
 
+- **Music mode gained an instrumental switch** plus tempo and key controls, and remembers your settings between generations. Instrumental is marked experimental on MiniMax Music 3, where the open weights have no real switch and the tag alone still leaves vocal texture in; ACE-Step's is documented and works. Closes #225.
+- **Media checkpoints in My Models stopped reading as "Unsupported"** and gained a Use button. MiniMax Music 3, MageFlow and Kokoro were missing from the app's copy of the architecture list, so a model the app itself offers to download came back with a red badge. Thanks @justinluque (#229).
+- **The tray shows live prefill and decode tokens/s** Metrics are on by default now so those rows always have something to read — the cost is a few counters per request, never per token.
+- **The memory meter is one bar** — model, everything else in use, free — instead of two bars measured against the same total, which invited reading them as if they added up.
+
+
+## v26.8.9 — Launch your coding agent, richer chat, faster decode
+
+### Highlights
+
+- **`mlx-serve launch <agent>`.** One command (or one click in the app) configures and starts Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, or aider against the local server — each agent gets its own config folder and the model's real context window, and the app starts itself first if the server isn't running.
+- **Chat picked up the moves of a real editor.** Continue a cut-off reply instead of restarting it, edit or regenerate any message with a version history you can page through, branch a conversation from any point (right click your own chat bubble), and bulk-select or ⌘+digit-jump between chats.
+- **Decode got faster on several fronts**: quantized draft heads, a deeper speculative-depth planner, faster verify passes, and — specifically on Qwen 3.8 27B — automatic depth-8 speculation on the calibrated hardware profile, up to 31% faster than the previous depth-6 cap.
+- **Long chats with images stopped erroring out** (#197). Vision prompts now prefill in the same memory-bounded chunks text does, so a screenshot 51k tokens into a conversation runs instead of getting refused.
+- **Concurrent chats no longer stall behind a big prefill.** A cold prefill used to block every other stream until it finished (7.6s on a 53k-token prompt); it now yields at chunk boundaries, capping the stall at about one chunk (~150ms), byte-identical output either way. Thanks @sf-jin-ku (#205).
+
+### Coding agents
+
+- `mlx-serve launch` supports `claude`, `pi`, `omp` (oh-my-pi), `opencode`, `codex`, `hermes`, and `aider`. `--model` picks a model, `--print` shows the launch script instead of running it, and anything after `--` passes through to the agent (`mlx-serve launch codex -- resume`).
+- oh-my-pi and other OpenAI-style clients that read a model's context length from the top level of `/v1/models` instead of `meta.*` now see the real advertised context instead of a hardcoded 128k.
+- The context size and max-tokens sliders in Settings gained finer steps between 32K/64K/128K, so a memory-limited Mac isn't stuck jumping straight from too small to too large.
+
+### Chat
+
+- A reply that hit the token limit gets a **Continue** action that extends it instead of starting over.
+- Double-click your own message to edit it, ⌘R to regenerate a reply — both keep every prior version behind a pager.
+- Right-click any message to branch the conversation from that point into a new chat.
+- ⌘-click / ⇧-click select chats in the sidebar and ⌘⌫ deletes the selection; hold ⌘ to badge the visible chats 1-9 and jump with ⌘+digit; ⌘L opens a model switcher without leaving the transcript; ↑ in an empty composer recalls your last message, ⎋ stops a reply mid-stream. Thanks @justinluque (#180).
+- Pick any resolution you like for images and video. The Image and Video panes gained a **Custom…** option with width and height fields, alongside a new 512 × 512 preset for FLUX — the server always accepted it, it was just missing from the menu. A size the model can nearly do is nudged onto its grid with a note saying what it used and in what steps, so the next guess lands; a size it cannot do at all is refused with the range it enforces, instead of silently coming back a third of the size you asked for. Video is where this matters most: an off-grid canvas there is refused outright by the server, and a two-stage LTX tier tightens the rule further, so the fields follow the tier you picked. Thanks @justinluque (#218).
 - Assistant responses render inline and display LaTeX natively with SwaTex, including `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation environments. Incomplete or invalid streamed TeX stays readable as source, fenced code and user prompts remain literal, and copying inline math restores its original delimiters. SwaTex is MIT-licensed; its bundled KaTeX fonts retain the SIL Open Font License 1.1.
+- Video generations now write a `.txt` settings sidecar next to the clip — model, preset, seed, resolution, frames, fps, steps — matching what audio and music generations already do. Thanks @Morac2 (#199).
+
+### Performance
+
 - Speculative decoding got faster without KV quantization: verify steps 6-9 tokens wide at head-dim 256 ran MLX's slow attention fallback on every machine. They now split into two fast passes, +4-9% decode with PLD or a deep draft head on Qwen-class models.
 - Draft heads that ship in bf16 (MTPLX packs, the stock Qwen MTP release) are now quantized to 4-bit at load. The head only proposes tokens and verification corrects them, so output quality is decided by the main model either way: measured +10% decode at equal acceptance on Qwen3.8-27B.
 - The speculative depth planner was re-measured against the faster verify steps: it now drafts one position deeper on predictable content, +3% decode on Qwen-class models with the draft head.
 - Warm requests kept the fast prefill but lost the draft head: reusing a cached prefix left the head's history empty, so follow-up turns decoded at almost half speed (38 vs 72 tok/s measured). The history is now saved and restored with the prefix, so warm turns decode as fast as cold ones.
+- Qwen 3.8 27B can now auto-speculate 8 tokens deep instead of capping at 6, once its checkpoint matches a calibrated quantization profile — the 4-, 6- and 8-bit MLX-Serve builds all qualify. Measured up to 31% faster decode at depth 8 vs. 6 on the 4-bit build. Thanks @CerebralCoding (#194).
 - Images stopped failing in long conversations (#197). A prompt with an image ran as one whole-prompt forward, so the memory check billed the full width and past roughly 40k tokens on Qwen 3.8 27B every screenshot got a 400 no flag could fix. Vision prompts now prefill in the same memory-bounded chunks text uses, with the image splice resuming exactly across chunk boundaries: a 51k-token conversation with a screenshot that used to be refused (82 GB billed against 67 available) now runs, output is unchanged on LFM2.5-VL, Gemma 4 and Muse, and time to first token stays within 3% either way. Cancelling mid-prefill now also stops a vision prompt within one chunk instead of running it to the end.
-- Markdown tables in chat now render as a real grid instead of monospaced ASCII-art text: bold header row, one divider, no vertical borders, with inline markdown (bold, code, links) rendered inside cells instead of shown as literal characters. Columns take their natural content width and only scale down (wrapping instead of overflowing) when a row's combined content exceeds the reading column. The chat's reading column also grows with the window instead of stopping at a fixed 740pt cap, so wide panels no longer waste 40-50% of their width.
 
 ## v26.8.8 — Faster 6-bit models, Better memory checks, UI Bug fixes
 

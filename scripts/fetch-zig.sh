@@ -14,7 +14,7 @@
 # ZIG_VERSION to upgrade; CI and local builds re-fetch automatically.
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.17.0-dev.1422+e863bf3be}"
+ZIG_VERSION="${ZIG_VERSION:-0.17.0-dev.1818+7051f8e73}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

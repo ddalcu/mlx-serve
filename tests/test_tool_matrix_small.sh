@@ -146,7 +146,12 @@ try:
     a=json.loads(args_s)
     if isinstance(a,dict):
         json_ok=1
-        if a.get("path")==want_path: path_ok=1
+        # The check exists to catch OUR parse chain mangling the value
+        # (eaten escapes/quotes), so the BASENAME must match byte-exactly;
+        # a model-prepended directory is checkpoint behavior, not mangling
+        # (Qwen3.5-0.8B greedily emits "/snippet.html" — verified raw).
+        p=a.get("path") or ""
+        if p==want_path or p.split("/")[-1]==want_path: path_ok=1
         ct=a.get("content") or ""
         if (must=="-" or must in ct) and len(ct)>=minlen: content_ok=1
 except Exception: pass

@@ -58,7 +58,9 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
-        XCTAssertEqual(d.enableMetrics, false)        // main.zig metrics_enabled
+        // Deliberate divergence from main.zig's metrics_enabled=false: the tray
+        // reads /metrics.json for its throughput rows.
+        XCTAssertEqual(d.enableMetrics, true)
         XCTAssertEqual(d.apiKey, "")                  // server.zig g_api_key (null = open)
         XCTAssertEqual(d.enablePrefixCacheDisk, false) // server.zig prefix_cache_disk_bytes (0 = off)
 
@@ -77,8 +79,9 @@ final class ServerOptionsTests: XCTestCase {
         // The SSD tier is always emitted so it can't be silently on via a
         // server default; a fresh (toggle-off) launch emits `off`.
         XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "off"))
-        // --metrics + --api-key are emit-only-when-set and absent by default.
-        XCTAssertFalse(args.contains("--metrics"))
+        // --metrics is ON by default here (the tray reads /metrics.json);
+        // --api-key is emit-only-when-set.
+        XCTAssertTrue(args.contains("--metrics"))
         XCTAssertFalse(args.contains("--api-key"))
     }
 
@@ -184,15 +187,14 @@ final class ServerOptionsTests: XCTestCase {
 
     // MARK: - Observability (--metrics)
 
-    func testMetricsFlagOmittedByDefault() {
-        let opts = ServerOptions()
-        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
+    func testMetricsFlagEmittedByDefault() {
+        XCTAssertTrue(ServerOptions().toCLIArgs().contains("--metrics"))
     }
 
-    func testMetricsFlagEmittedWhenEnabled() {
+    func testMetricsFlagOmittedWhenDisabled() {
         var opts = ServerOptions()
-        opts.enableMetrics = true
-        XCTAssertTrue(opts.toCLIArgs().contains("--metrics"))
+        opts.enableMetrics = false
+        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
     }
 
     func testMetricsHasNoAdminKeyFlag() {
@@ -232,7 +234,7 @@ final class ServerOptionsTests: XCTestCase {
     func testEnableMetricsChangeTriggersRestart() {
         let a = ServerOptions()
         var b = ServerOptions()
-        b.enableMetrics = true
+        b.enableMetrics = false
         XCTAssertFalse(a.serverLaunchEquals(b),
                       "Toggling --metrics must trigger a server restart")
     }

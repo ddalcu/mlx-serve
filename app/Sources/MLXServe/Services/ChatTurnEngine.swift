@@ -1436,7 +1436,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                             approxGB: "\(model.approxDownloadGB)",
                                             window: "Image", lanId: lanId) { return notice }
         let req = try MediaToolArgs.image(args, model: model,
-                                          saved: s.resolvedResolution(for: model),
+                                          saved: s.concreteResolution(for: model),
                                           seed: s.seed, safeMode: s.safeMode,
                                           keepResident: s.keepResident, lanId: lanId)
         let path = try await appState.imageGen.generateForAgent(req, server: appState.server,
@@ -1501,7 +1501,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                             approxGB: "\(model.approxFirstRunDownloadGB)",
                                             window: "Video", lanId: lanId) { return notice }
         let req = try MediaToolArgs.video(args, model: model,
-                                          saved: s.resolvedResolution(for: model),
+                                          saved: s.concreteResolution(for: model),
                                           keepResident: s.keepResident, lanId: lanId)
         let path = try await appState.videoGen.generateForAgent(req, server: appState.server,
                                                                 onProgress: onProgress)

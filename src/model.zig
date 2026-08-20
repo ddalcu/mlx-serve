@@ -717,6 +717,17 @@ pub const ModelConfig = struct {
         return self.mla_kv_lora_rank > 0;
     }
 
+    /// Does Q go through a low-rank pair, or straight from the hidden state?
+    ///
+    /// `q_lora_rank: null` is DeepSeek-V3's documented option and what the
+    /// whole Ling 3.0 FLASH line ships (tiny ships 256). Those checkpoints
+    /// carry a plain `attention.q_proj` instead of
+    /// q_a_proj/q_a_layernorm/q_b_proj. 0 is the signal, since a real rank is
+    /// always positive.
+    pub fn mlaHasQLora(self: *const ModelConfig) bool {
+        return self.mla_q_lora_rank > 0;
+    }
+
     /// MLA query/key head dim = the non-positional part plus the rope part.
     /// This — not head_dim — is what the attention scale and the cached K's
     /// last dim are measured in.
@@ -773,6 +784,34 @@ pub const ModelConfig = struct {
     /// denoising loop, not autoregressive decode.
     pub fn isDiffusion(self: *const ModelConfig) bool {
         return self.canvas_length > 0;
+    }
+
+    /// Pure-config half of "can this arch ride the batched GatedDeltaNet
+    /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
+    /// GDN trunk with periodic full attention, i.e. the qwen3_5 family.
+    ///
+    /// This exists because the answer is needed in TWO places that see
+    /// different things: `server.zig` decides whether `--max-concurrent`
+    /// clamps to 1 with only a ModelConfig in hand, while
+    /// `Transformer.supportsBatchedGdnDecode` also checks the built layer
+    /// set. Both MUST read this predicate — when they were hand-rolled
+    /// separately, the server kept clamping qwen3_5 to serial decode while
+    /// the scheduler was happily batching it, so `--max-concurrent 4` (the
+    /// obvious serving config) silently DISABLED the batched path.
+    ///
+    /// Says nothing about MoE/hybrid archs that merely share the same
+    /// forward — those stay serial, by name, in both callers.
+    pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        if (self.full_attention_interval == 0) return false; // not a GDN trunk
+        if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
+        if (self.is_encoder_only) return false;
+        if (self.isMoe()) return false; // routed experts: not modelled yet
+        if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
+        if (self.isDiffusion()) return false;
+        if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
+        if (std.mem.eql(u8, self.model_type, "laguna")) return false;
+        if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
+        return true;
     }
 
     /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
@@ -2105,9 +2144,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (v == .integer) config.mla_v_head_dim = @intCast(v.integer);
         }
         if (config.mla_v_head_dim == 0) config.mla_v_head_dim = config.head_dim;
-        // q_lora_rank null (a plain q_proj) is a different weight layout.
-        if (config.mla_q_lora_rank == 0 or config.mla_kv_lora_rank == 0) {
-            log.err("bailing_hybrid: q_lora_rank and kv_lora_rank are required\n", .{});
+        // `q_lora_rank: null` is a plain q_proj — a different weight layout,
+        // now served (see `mlaHasQLora`). The KV latent has no such fallback.
+        if (config.mla_kv_lora_rank == 0) {
+            log.err("bailing_hybrid: kv_lora_rank is required\n", .{});
             return error.UnsupportedBailingConfig;
         }
         // The declared qk_head_dim must agree with nope+rope: everything
@@ -3137,7 +3177,10 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         std.mem.startsWith(u8, key, "model.vision_adapter.") or
         std.mem.startsWith(u8, key, "model.vision_projection.") or
         std.mem.startsWith(u8, key, "vision_adapter.") or
-        std.mem.startsWith(u8, key, "vision_projection."))) return false;
+        std.mem.startsWith(u8, key, "vision_projection.") or
+        // avlp12's Qwen3.8 "Alis" packs spell the Qwen3-VL tower
+        // `model.visual.` (pure rename of `vision_tower.`).
+        std.mem.startsWith(u8, key, "model.visual."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -3768,6 +3811,10 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
+    // avlp12 Alis spells the Qwen3-VL tower `model.visual.` — same gate, or
+    // --no-vision cannot drop it and we hold ~0.9 GB we never read.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
@@ -5717,4 +5764,64 @@ test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION 
     bare.head_dim = 128;
     bare.has_hybrid_layers = true;
     try testing.expectEqual(@as(u32, 16), bare.attnCacheLayerCount());
+}
+
+test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {
+    // Ling 3.0 FLASH ships `"q_lora_rank": null` where tiny ships 256, and its
+    // MLA layers carry a plain `attention.q_proj` instead of the
+    // q_a_proj/q_a_layernorm/q_b_proj triple. That is DeepSeek-V3's documented
+    // option, not a broken export — refusing it meant the whole flash line was
+    // unloadable while tiny worked.
+    const json =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 2560, "num_hidden_layers": 42,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 32, "head_dim": 128,
+        \\  "layer_group_size": 6,
+        \\  "q_lora_rank": null, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 512, "num_experts_per_tok": 8, "moe_intermediate_size": 768,
+        \\  "vocab_size": 157184, "kda_lower_bound": -5.0
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(cfg.isMla());
+    // 0 IS the signal: no low-rank Q, project straight from the hidden state.
+    try testing.expectEqual(@as(u32, 0), cfg.mla_q_lora_rank);
+    try testing.expect(!cfg.mlaHasQLora());
+    try testing.expectEqual(@as(u32, 512), cfg.mla_kv_lora_rank);
+    // The attention scale still comes from the FULL query width, unchanged.
+    try testing.expectEqual(@as(u32, 192), cfg.mlaQkHeadDim());
+    try testing.expectEqual(@as(u32, 192), cfg.query_pre_attn_scalar);
+
+    // kv_lora_rank is still genuinely required — the latent has no fallback.
+    const no_kv =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 2560, "num_hidden_layers": 42,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 32, "head_dim": 128,
+        \\  "layer_group_size": 6, "q_lora_rank": null,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 512, "num_experts_per_tok": 8, "moe_intermediate_size": 768,
+        \\  "vocab_size": 157184
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedBailingConfig, parseConfigFromJson(testing.allocator, no_kv));
+
+    // And tiny's low-rank arm is untouched.
+    const tiny =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 1536, "num_hidden_layers": 24,
+        \\  "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 128,
+        \\  "layer_group_size": 4,
+        \\  "q_lora_rank": 256, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+        \\  "vocab_size": 157184
+        \\}
+    ;
+    const t = try parseConfigFromJson(testing.allocator, tiny);
+    try testing.expect(t.mlaHasQLora());
+    try testing.expectEqual(@as(u32, 256), t.mla_q_lora_rank);
 }

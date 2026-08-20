@@ -1337,3 +1337,106 @@ The fix is a dtype-conditional cast at the ONE place the scores enter the expert
 2. **Byte-equality between the chunked and unchunked arms is an unsound bar.** Chunk width changes GEMM shapes; a 4-bit checkpoint flips near-tie argmaxes across widths (measured text-only: chunk 512 vs 16384 diverge mid-answer on LFM2.5-VL-1.6B-4bit) — same class as MTP verify-width divergence. The A/B bar is the perceived-content invariant: both arms must name the SAME color set for a quadrant image (checkpoint-agnostic — gemma-4-qat calls dark yellow "brown" in BOTH arms), the off arm must read the top row at all, and the class bug shows as the chunked arm's set collapsing.
 
 **Validated live** on LFM2-VL (hybrid arm, image split across chunks 1–3 at chunk 32: identical answers), gemma-4-12B-qat (standard arm + PLE), and Muse-Glimmer-30B-4bit (muse arm, window-attention ViT). Qwen3.5-VL (M-RoPE) rides the same shared splice but had no local checkpoint in the loop — M-RoPE indexes its position table by absolute offset and rebuilds cos/sin per forward, so a chunk boundary inside an image is positionally safe there by construction. Guards: `tests/test_vision_chunked_prefill.sh` (two-arm engagement + color-set invariant), `spliceVisionRows` chunk-equivalence + audio-ordering tests (transformer.zig), `countSpliceRows` + wiring scan (generate.zig), guard-billing scan (server.zig).
+
+---
+
+## A renamed vision tower, and a Conv3d read in the wrong axis order (Alis, 2026-08-19)
+
+`avlp12/Qwen3.8-27B-Alis-MLX-*` stores the Qwen3-VL tower under `model.visual.*` where
+every pack before it said `vision_tower.*` — 333 tensors, substructure identical, a
+pure rename. `src/qwen_vision.zig` hardcoded `vision_tower.` in ~10 `must(...)` keys
+plus `fmtLayer`, so the tower loaded nothing and the boot printed
+`MISSING QWEN VISION WEIGHT: vision_tower.patch_embed.proj.weight` → "vision disabled".
+It degrades gracefully, which is why it is easy to miss: the pack serves text
+perfectly. `shouldKeepWeightKey` did not list the prefix either, so `--no-vision` could
+not drop it and the load carried 0.92 GB it could never read. The prefix is now probed
+once in `QwenVision.init` (`resolveVisionPrefix`, the `model.resolveWeightPrefix`
+pattern) and threaded through every key including `fmtLayer`, and `model.visual.` joins
+the `--no-vision` list. Muse / LFM2 / Gemma already probe; Qwen was the last hardcoded
+one.
+
+**The second half is the one that fails silently.** With the prefix fixed the tower
+ran, the token accounting was right, and the model answered a red square with "black"
+and a 256px red square with "a black and white vertical striped pattern" — the
+signature of scrambled patch features, not of a bad checkpoint. `patch_embed.proj` is a
+Conv3d whose STORED axis order is the converter's choice: mlx_lm writes channels LAST,
+`[out, kT, ps, ps, Cin]` (mlx-community's Qwen3.5-0.8B: `(768, 2, 16, 16, 3)`), while a
+straight torch export keeps channels FIRST, `[out, Cin, kT, ps, ps]` (Alis:
+`(1152, 3, 2, 16, 16)`). Our loader permuted `(0,4,1,2,3)` unconditionally, which is
+correct for the first spelling and a scramble for the second. `patchProjLayout` now
+derives it from the shape against `qv_temporal_patch`/`qv_patch` (the two dims we
+already parse), logs which spelling won, and refuses by name if neither matches; the
+channels-first arm flattens with no transpose at all.
+
+**Probe with three colours.** Red → "black", green → "black", blue → "blue" was the
+broken state: one colour alone cannot tell "saw it" from "guessed", and blue was a
+coin-flip pass. After the fix: red/green/blue all correct, and `--no-vision` drops the
+capability from `/v1/models` entirely. Guards: the `patchProjLayout` + prefix unit
+tests (both spellings, plus the `--no-vision` key gate in `shouldKeepWeightKey`) and
+the live three-colour probe.
+
+**The layout trap is a CLASS, found by fact-checking a table (2026-08-19).** Three
+divergence rows in the Qwen3.8 shootout — `mlx-community/Qwen3.8-27B-8bit`,
+`avlp12/…-Alis-MLX-8bit` and `Youssofal/…-MTPLX-Optimized-Quality` — agreed to 15
+decimal places, which looks like a harness bug. It is not: a byte-level scan (dtype,
+shape, size, head+tail SHA over every tensor, plus full SHA-256 over 20 whole tensors)
+shows all 1847 shared language-model tensors are identical — same deterministic
+`mlx_lm` 8-bit/gs-64 affine quantization of the same bf16 source. The scan surfaced
+exactly ONE differing tensor between mlx-community and MTPLX:
+`vision_tower.patch_embed.proj.weight`, `[1152, 3, 2, 16, 16]` in MTPLX against
+`[1152, 2, 16, 16, 3]` in mlx-community's — and byte-identical to the Alis conv. So
+MTPLX-Optimized-Quality shipped the same scrambled vision under the prefix we DID
+support, where nothing pointed at it: the tower loaded, the token accounting was right,
+and only the answers were wrong. Both packs name colours correctly on the fixed build.
+Same scan explains the `ddalcu-8bit` row sitting 0.8 points apart: exactly one shared
+tensor differs (`embed_tokens`, dense bf16 vs 8-bit) plus its MTP head.
+
+---
+
+## Standardizing our own Qwen3.8 packs: embeddings, head norms, DWQ (2026-08-19)
+
+Three changes, each driven by a measurement rather than by "what everyone else does",
+applied by `tests/restandardize_qwen38_pack.py` (source pack in, new pack out; every
+transform is a no-op when the pack is already in the target state).
+
+**1. The embedding is now quantized.** Our 4-bit and 8-bit packs kept `embed_tokens`
+dense bf16 while every other vendor packs it; our own 6-bit and iQ packs already packed
+it, so we were not even self-consistent. The comparison is unusually clean because
+`ddalcu-4bit` and `mlx-community/Qwen3.8-27B-4bit` differ in **exactly one shared
+tensor** (verified by a full-key scan: 2178 common keys, 1 mismatch), as do the two
+8-bit packs. Dense vs quantized: 83.6% / KL 0.322 vs 84.0% / 0.342 at 4-bit, 95.5% /
+0.0136 vs 96.3% / 0.0158 at 8-bit — top-1 nominally favours quantized, KL nominally
+favours dense, all inside ±2se. Cost of dense: 1.8 GB at 4-bit, 1.2 GB at 8-bit. A
+trap worth naming: `mx.quantize` on the raw stored bf16 bytes reproduces mlx_lm's
+output **byte-for-byte**, but routing the same values through an f32 round trip does
+not — and byte-identical codes are what makes a DWQ graft legal, so the repack
+quantizes from the raw bytes.
+
+**2. Head norms are published FOLDED.** Qwen's own release stores them delta-encoded
+(zero-centered, the layer computes `1 + w`) and ddalcu packs were byte-faithful to it.
+The fold is not a numerical improvement: our loader's `+1` (upcast f32, add, cast back
+to bf16) reproduces the folded packs' stored values bit-for-bit on all 7 tensors, so
+both conventions are the same bytes at serve time. It is an interop choice — a loader
+that does not detect the convention multiplies by gamma ≈ 0.03 and drafts at ~0%
+acceptance while looking healthy.
+
+**Do not assume the convention fixes a downstream loader.** Simulating oMLX's actual
+two stages against the real tensors — `sanitize`'s per-key `mean < 0.5 → +1`, then
+`norm_repair`'s backbone-anchor pass — both delta (ddalcu) and folded (jundot) land
+7/7 correct on Qwen3.8-27B. The pack that breaks there is `alis-4bit`, and not because
+of its head: its BACKBONE `post_attention_layernorm` norms sit 0.8 higher than
+mlx-community's, which moves the anchor and makes oMLX double-shift the head's copy —
+the same false-repair class we fixed on our own side the same day.
+
+**3. DWQ is graftable at 4-bit, and only at 4-bit.** `WaveCut/Qwen3.8-27B-MLX-4bit-DWQ`
+is `mlx-community/Qwen3.8-27B-4bit` with learned dequantization: identical packed codes
+(0 of 40 sampled differ), every `.scales` different, some `.biases`, and all the
+un-quantized GDN `conv1d` weights. Our 4-bit codes are byte-identical to that same
+base, so the learned tensors transfer as a file copy — 1044 tensors grafted, the tool
+verifying the underlying codes match PER TENSOR and refusing where they do not.
+Measured on our repacked pack: 83.6% → **84.2%** top-1, KL 0.322 → **0.289** (the best
+4-bit KL in the shootout bar `jundot-oQ4e`), resident 17.67 → **15.85 GB**, decode and
+MTP acceptance unchanged (36 engagement lines, 74–95% per-draft). At 6 or 8 bits the
+scales are meaningless — the codes are a different alphabet — and the shapes still
+MATCH (group size decides scale geometry, not width), so a wrong graft would load and
+produce garbage rather than erroring.

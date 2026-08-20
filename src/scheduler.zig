@@ -39,6 +39,7 @@ const generate_mod = @import("generate.zig");
 const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
@@ -118,6 +119,16 @@ pub const LoadParams = struct {
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
+    /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
+    /// perf-plan-aug-17 P5). Opt-in, lossy by design; every refusal is a
+    /// named `[ane]` line and the model serves GPU-only.
+    ane_prefill: bool = false,
+    /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
+    /// pointer because the scheduler deliberately has no server.zig import.
+    /// The ANE build compiles fixed-shape tiles against THIS width — resolving
+    /// it any other way would let the tile and the forward's chunk drift.
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -936,6 +947,10 @@ pub const LoadRequest = struct {
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
+    /// `--ane-prefill` survives cold loads (the flag-eater class).
+    ane_prefill: bool = false,
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
 
     load_vision: bool = false,
     warmup_eager: bool = true,
@@ -1088,6 +1103,10 @@ pub const Scheduler = struct {
     ds4_mtp: bool,
     ds4_dspark: bool,
     ds4_ssd_streaming: bool,
+    /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
+    ane_prefill: bool,
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
     /// became load-bearing on this path the moment `dflash.resolveInDirDrafter`
     /// started probing `<model_dir>/drafter` at load: without it here, a server
@@ -1258,6 +1277,9 @@ pub const Scheduler = struct {
             .ds4_mtp = params.ds4_mtp,
             .ds4_dspark = params.ds4_dspark,
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
+            .ane_prefill = params.ane_prefill,
+            .ane_chunk_resolver = params.ane_chunk_resolver,
+            .ane_headroom_resolver = params.ane_headroom_resolver,
             .no_drafter = params.no_drafter,
             .drafter_dir = params.drafter_dir,
             .primary_model_dir = params.model_dir,
@@ -1741,6 +1763,9 @@ pub const Scheduler = struct {
             .ds4_mtp = self.ds4_mtp,
             .ds4_dspark = self.ds4_dspark,
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
+            .ane_prefill = self.ane_prefill,
+            .ane_chunk_resolver = self.ane_chunk_resolver,
+            .ane_headroom_resolver = self.ane_headroom_resolver,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -1916,6 +1941,43 @@ pub const Scheduler = struct {
         return req.result orelse error.VisionEncodeFailed;
     }
 
+    /// Does this slot's next decode tick actually run the regular (non-speculative)
+    /// path? The slot's `enable_*` flags carry the REQUEST's wish; `specTickMode` is
+    /// the authoritative dispatch answer, and a generator can also have turned spec
+    /// off at runtime. Reading the armed flags here vetoed batched decode for any
+    /// slot whose prompt merely n-gram-scored high enough to ARM PLD, even after
+    /// PLD's own yield gate had disabled itself — neither speculation nor batching
+    /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
+    /// INIT options does not bind DISPATCH".
+    fn slotTicksRegular(slot: *const Slot) bool {
+        const gen = if (slot.legacy_gen) |*g| g else
+            return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        // A runtime-disabled generator is already ticking regular, so batching it
+        // dispatches what it was going to dispatch anyway.
+        //
+        // The POLICY this encodes, which is deliberate and not free: `nextPld`'s
+        // periodic re-enable check (`SPEC_REENABLE_INTERVAL`) lives on the serial
+        // path, and the batched tick never calls it. So a slot whose PLD yield
+        // gate disabled itself stays disabled for as long as it keeps company —
+        // even if its tail later turns into the file/tool echo PLD is best at.
+        // That is the right trade at N>1 (the batched kernel reads the weight set
+        // once for the whole group, which beats one slot's lookup wins) and it
+        // self-corrects: a SOLO slot never reaches the batched path, so the
+        // re-enable check resumes the moment concurrency drops back to one.
+        // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
+        // documented trade` below — flip either half deliberately, not by accident.
+        return gen.spec_disabled_runtime or specTickMode(
+            slot.enable_mtp,
+            gen.mtp != null,
+            slot.enable_drafter,
+            gen.drafter != null,
+            gen.dflash != null,
+            slot.enable_pld,
+            gen.pld_enabled,
+            gen.dspark_enabled,
+        ) == .regular;
+    }
+
     /// Active-tick gate. Decides whether a slot is eligible for the batched
     /// decode kernel. Hybrid SSM / MoE / encoder / DSV4 models can't ride
     /// the batched kernel (it doesn't model their state), so any slot
@@ -1924,7 +1986,7 @@ pub const Scheduler = struct {
     /// means the scheduler's startup config is no longer authoritative.
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
         _ = self;
-        if (slot.enable_pld or slot.enable_drafter or slot.enable_mtp) return false;
+        if (!slotTicksRegular(slot)) return false;
         if (slot.sampling.constraint != null) return false;
         if (slot.logprobs_n > 0) return false;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
@@ -1932,9 +1994,56 @@ pub const Scheduler = struct {
         // into the engine).
         if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
         const cfg = slot.model.config orelse return false;
-        return modelBatchable(cfg);
+        if (modelBatchable(cfg)) return true;
+        // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
+        // a hybrid), but has its own batched kernel. Ask the transformer, never
+        // name the arch here — same rule as `modelExclusiveDecode`.
+        const t = slot.model.transformer orelse return false;
+        return t.supportsBatchedGdnDecode();
     }
 };
+
+/// Batched decode pads every slot's KV to the group's LONGEST (`padAndStackBatchedKV`),
+/// so the tensor it builds is `N x kv_max`, not `sum(kv_len)`. A group mixing one
+/// 100k-token stream with three 1k ones therefore materializes ~100x the bytes the
+/// short slots need — on a qwen3_5 trunk (hd 256, `--ctx-size` up to 262144) that is
+/// ~410 MB per full-attention layer, ~6.5 GB across the 16 of them, and NOTHING bills
+/// it: it is a per-tick transient, invisible to `prefillTransientReserve` and to the
+/// load-time gate. An uncatchable Metal OOM is the failure mode.
+///
+/// So the group is capped by PADDING WASTE, which is the quantity that actually hurts,
+/// rather than by a length ratio: keep the largest prefix of the ascending-sorted
+/// lengths whose padded tensor stays within `MAX_PAD_WASTE` of its useful bytes. The
+/// slots that fall out are the LONGEST ones — the ones dominating kv_max — and they
+/// decode serially this tick, so every slot still advances.
+///
+/// Returns how many of `kv_lens_asc` may batch together (0 or 1 = nobody batches).
+/// The lengths handed in are the caller's `cache.step` — the PRE-tick counts,
+/// while the forward pads to the post-update view, and a sliding layer's view
+/// is trimmed shorter still. So this is deliberately an approximation of the
+/// padding the forward will actually build (one token low, and an upper bound
+/// on sliding layers); it is a heuristic bar, not an accounting identity, and
+/// re-deriving it from the exact per-layer view widths buys nothing.
+/// The padded tensor may be at most this multiple of the bytes the group
+/// actually needs. It must stay BELOW 2.0 or a two-slot group can never be
+/// vetoed: one 1-token slot beside one 200k slot pads to exactly 2x, which is
+/// the worst case for N=2 and the pathological pair this cap exists for.
+pub const MAX_PAD_WASTE: f64 = 1.5;
+
+var kv_skew_split_logged: bool = false; // one-shot log guard
+
+pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
+    if (kv_lens_asc.len < 2) return 0;
+    var k: usize = kv_lens_asc.len;
+    while (k >= 2) : (k -= 1) {
+        var sum: u64 = 0;
+        for (kv_lens_asc[0..k]) |l| sum += l;
+        if (sum == 0) return k; // nothing prefilled yet: no padding to waste
+        const padded: f64 = @floatFromInt(@as(u64, k) * kv_lens_asc[k - 1]);
+        if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
+    }
+    return 0;
+}
 
 /// Pure-config predicate: is this model's architecture compatible with the
 /// batched-decode kernel? Used by `Scheduler.batchable` after slot-level
@@ -2673,7 +2782,9 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "mtp_enabled",             "mtp_depth",                 "llama_cache_entries",
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
-        "draft_block_size",        "draft_block_size_explicit",
+        "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
+        "ane_chunk_resolver",
+        "ane_headroom_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -2770,6 +2881,27 @@ test "a refusal quotes the number it actually compared" {
     try std.testing.expect(!memInsufficientForLoad(peak, loadRequirementBytes(peak)));
     try std.testing.expect(memInsufficientForLoad(peak, loadRequirementBytes(peak) - 1));
     try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB)));
+}
+
+test "BOTH preflight refusals quote the number they compared, not the weights" {
+    // The media arm was fixed for #144's class (2026-08-08) and the TEXT arm was
+    // not: it printed "weights ~8.4 GB but only 10.1 GB free", which reads as
+    // "this should have worked" — the load was refused for the 2.05 GB of
+    // headroom the sentence never named (live 2026-08-17, a gemma-4-12B QAT pack
+    // on a 16 GB M4, where the bar is 10.45 GB). `insufficient_free_memory_message`
+    // sends the client to this very line for the figures, so a line that omits
+    // the bar makes the client message a dead end too. Needles are ++-split so
+    // this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    // Each refusal formats the REQUIREMENT as its first figure, from the one
+    // helper the comparison itself uses — never a second formula that can drift.
+    const media_arg = "loadRequirement" ++ "Bytes(peak))) / gb";
+    try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
+    const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
+    try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);
+    // The weights-first shape that could not state its own bar must be GONE.
+    const old = "Insufficient memory to load model: weights ~" ++ "{d:.1} GB but only";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
 test "the eviction gate bills a media entry its BACKEND peak, never the dir's safetensors sum" {
@@ -2941,7 +3073,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
         if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
-            log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
             });
@@ -3190,20 +3323,27 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
                 params.draft_block_size_explicit,
                 wide_lane,
+                block_cap.cap,
             );
+            var cap_note_buf: [96]u8 = undefined;
+            const cap_note: []const u8 = if (params.draft_block_size_explicit)
+                ", user-clamped"
+            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
+                    block_cap.label,
+                    block_cap.cap,
+                }) catch ", capped"
+            else
+                "";
             log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
                 sch.drafter_block_size,
-                if (params.draft_block_size_explicit)
-                    ", user-clamped"
-                else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
-                    ", capped (no wide verify lane)"
-                else
-                    "",
+                cap_note,
                 wide_lane,
                 d.config.target_layer_ids,
             });
@@ -3291,11 +3431,62 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.allocator.destroy(h);
             }
         } else |_| {}
+    } else if (params.mtp_enabled) {
+        // A quiet fallback to mode=pld cost a tester a day: nothing logged
+        // when the probe finds no head. Debug-level — most checkpoints have
+        // no MTP head and an info line per load would be noise.
+        log.debug(
+            "[mtp] no head found: no mtp/ sidecar and no [language_model.]mtp.* " ++
+                "keys resolvable from the index at {s} — MTP off\n",
+            .{params.model_dir},
+        );
     }
     errdefer if (mtp_ptr) |h| {
         h.deinit();
         sch.allocator.destroy(h);
     };
+
+    // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
+    // HERE because the mlx dequant must run on the inference thread (sole
+    // MLX caller), with the chunk width resolved through the server's own
+    // pin (idempotent — the later pinAutoContext keeps this value), so the
+    // compiled fixed-shape tile matches the width the forward will run.
+    if (params.ane_prefill) {
+        const ane_force: ?[]const u8 = if (std.c.getenv("MLX_SERVE_ANE_FORCE")) |p| std.mem.span(p) else null;
+        if (!ane_mod.anePrefillAllowed(transformer_mod.verifyQmmNaxAvailable(), ane_force)) {
+            // ANE prefill is M4-and-below: on NAX machines it measured a
+            // loss (M5 Max, PR #223). `/props` ane stays absent, as off.
+            log.info(
+                "[ane] --ane-prefill disabled: NAX-class GPU prefill already outruns the ANE seam " ++
+                    "(measured a loss on M5 Max, PR #223); MLX_SERVE_ANE_FORCE=1 overrides\n",
+                .{},
+            );
+        } else if (params.ane_chunk_resolver) |resolve| {
+            const pinned = resolve(@constCast(params.config));
+            // The forward's chunk is the pinned width run through the SAME
+            // per-request policy every prefill applies (effectivePrefillChunk:
+            // the MoE 4096 / dense-hd-256 8192 caps + the --prefill-chunk and
+            // env overrides) — compiling the tile at the pinned width alone
+            // left every MoE program built at 8192 while the forward chunked
+            // at 4096: built, never dispatched (A7, 2026-08-18). total_ctx is
+            // representative-large: under the default fused-causal mode the
+            // policy arm is ctx-independent, and under the composed fallback
+            // the chunk is ctx-dependent anyway (fixed shapes cannot follow
+            // it, and the seam's width equality just never engages).
+            const cfg = params.config;
+            const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+                cfg.prefillScoreHeadDim(),
+                cfg.num_attention_heads,
+                1 << 20,
+                cfg.has_sliding_window,
+                cfg.isMoe(),
+                pinned,
+            ));
+            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), params.ane_headroom_resolver);
+        } else {
+            log.warn("[ane] --ane-prefill: no prefill-chunk resolver on this load path — disabled\n", .{});
+        }
+    }
 
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
@@ -4941,7 +5132,32 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     while (start < batchable_n) {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
-        const group = batchable_buf[start..end];
+        var group = batchable_buf[start..end];
+        // Cap the group by padding waste: the batched kernel pads every slot's
+        // KV to the longest in the group, so one long-context stream would make
+        // its short neighbours build a tensor orders of magnitude bigger than
+        // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
+        // how many still fit; the tail decodes serially this tick.
+        if (group.len >= 2) {
+            std.sort.pdq(*Slot, group, {}, struct {
+                fn lt(_: void, a: *Slot, b: *Slot) bool {
+                    return a.cache.step < b.cache.step;
+                }
+            }.lt);
+            var kv_lens: [32]u32 = undefined;
+            for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            if (keep < group.len) {
+                if (!kv_skew_split_logged) {
+                    kv_skew_split_logged = true;
+                    log.info("[batched] kv-length skew: batching {d} of {d} slots (kv_len {d}..{d}), rest serial\n", .{
+                        keep, group.len, kv_lens[0], kv_lens[group.len - 1],
+                    });
+                }
+                for (group[keep..]) |s| try runSingleDecodeTick(sch, s);
+                group = group[0..keep];
+            }
+        }
         // Honor force_batched even when only one slot is batchable so the
         // test hook actually exercises forwardBatchedDecode at N=1.
         if (group.len >= 2 or (sch.force_batched and group.len == 1)) {
@@ -5393,7 +5609,22 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         rope_offsets[i] = @intCast(slot.cache.step);
     }
 
-    const logits_arr = try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
+    // Two batched kernels: the standard one, and the GatedDeltaNet twin for
+    // hybrid trunks (qwen3_5 family). `batchedGdnReady` is the runtime half of
+    // the gate — a slot that has not prefilled yet carries no recurrent state
+    // to merge, so that tick stays serial rather than merging a wrong width.
+    const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
+    if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
+        // A slot with no recurrent state yet cannot join the merge. Decode the
+        // group serially this tick instead of skipping it — skipping advances
+        // nothing, so a group that never becomes ready would spin forever.
+        for (batch) |s| try runSingleDecodeTick(sch, s);
+        return;
+    }
+    const logits_arr = if (use_gdn)
+        try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets)
+    else
+        try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
     defer {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
@@ -5527,10 +5758,166 @@ test "modelBatchable: a PARSED deepseek_v4 config can never route to batched dec
     try testing.expect(!prefix_cache_mod.HotPrefixCache.shouldUse(&cfg, true));
 }
 
+test "batchedKvKeepCount: padding waste caps the group, and the long slots are the ones dropped" {
+    // Even lengths: no padding waste, everybody batches.
+    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 1000 }));
+    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 900, 1000, 1100, 1200 }));
+
+    // The case this exists for: three short streams and one long one. Batching
+    // all four pads to 4 x 100000 = 400k against 103k useful (3.9x); dropping
+    // the long one leaves 3 x 1000 vs 3000 (1.0x).
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 100_000 }));
+
+    // Two long ones: the pair still batches together, since 2 x 100000 against
+    // 200000 useful wastes nothing — the veto is about the padding, not length.
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&[_]u32{ 100_000, 100_000 }));
+    // One short slot among two long ones still batches: 3 x 100000 padded
+    // against 200010 useful is 1.5x, inside the bar. The veto is about the
+    // WASTE the padding creates, not about any slot being an outlier.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 10, 100_000, 100_000 }));
+
+    // One slot never "batches", and neither does an empty group.
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{1000}));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{}));
+
+    // Nothing prefilled yet: no padding to waste, so nothing is vetoed (the
+    // ready gate, not this one, is what keeps unprefilled slots out).
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+
+    // A pathological pair degrades to no batch at all rather than making the
+    // 1-token slot build a 200k-wide tensor nobody billed. This is why the bar
+    // has to sit below 2.0 — at 2.0 a pair is unvetoable by construction.
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, 200_000 }));
+}
+
+test "the batched group is capped by padding waste before it is dispatched" {
+    // Source-scan class guard: the grouping loop must consult the cap. Without
+    // it a single long-context stream makes every short neighbour materialize
+    // a padded KV tensor sized by ITS length — a per-tick transient no gate
+    // bills, whose failure mode is an uncatchable Metal OOM.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
+    // ...and the dropped slots must still be ticked, or they never advance.
+    try testing.expect(std.mem.indexOf(u8, body, "for (group[keep..]) |s| try runSingleDecodeTick") != null);
+}
+
 test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     try testing.expect(modelBatchable(&cfg));
+}
+
+test "a GDN trunk is batchable AND is not clamped by the server's concurrency gate" {
+    // The two sites that decide "does this model batch?" must agree. They
+    // disagreed once: the scheduler batched qwen3_5 while server.zig still
+    // clamped --max-concurrent to 1 for anything with
+    // full_attention_interval > 0, so asking for concurrency turned the
+    // batched path OFF. Both now read ModelConfig.supportsBatchedGdnDecode.
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "qwen3_5";
+    cfg.full_attention_interval = 4;
+    try testing.expect(cfg.supportsBatchedGdnDecode());
+
+    // The pure-config gate rejects it (it IS a hybrid), which is exactly why
+    // the GDN predicate has to be consulted beside it.
+    try testing.expect(!modelBatchable(&cfg));
+
+    // The server's clamp condition, transcribed: it must NOT fire here.
+    const server_would_clamp = !cfg.supportsBatchedGdnDecode() and
+        (cfg.has_hybrid_layers or cfg.full_attention_interval > 0 or
+            cfg.is_encoder_only or cfg.isMoe());
+    try testing.expect(!server_would_clamp);
+}
+
+test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
+    // `slotTicksRegular` admits a generator whose speculation turned itself off
+    // at runtime. That is what recovered the throughput (9.6 -> 12.4 tok/s per
+    // stream on 4 concurrent 5.5k prompts), and it costs something real: the
+    // batched tick does not call `nextPld`, so its periodic re-enable check
+    // cannot run while the slot is batched. Both halves are load-bearing, so
+    // both are stated here — if the re-enable check ever moves onto the batched
+    // path, or the clause is dropped, this is the note to revisit.
+    const src = @embedFile("scheduler.zig");
+    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
+    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
+    const hbody = src[hs..he];
+    // The clause that admits it...
+    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime or") != null);
+    // ...and the trade it makes, written down where it is made.
+    try testing.expect(std.mem.indexOf(u8, hbody, "re-enable check") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "SOLO slot never reaches the batched path") != null);
+}
+
+test "the batched gate reads DISPATCH, not the armed spec flags" {
+    // A prompt that merely n-gram-scores high enough to ARM PLD used to veto
+    // batched decode forever, even after PLD's own yield gate disabled itself
+    // at runtime: neither speculation nor batching (9.7 vs 14.3 tok/s per
+    // stream, 4 concurrent 4232-token prompts on Qwen3.5-4B). The armed flags
+    // are the REQUEST's wish; specTickMode is what the tick actually
+    // dispatches, and spec_disabled_runtime is what recovered the throughput.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "fn batchable(self: *const Scheduler") orelse return error.MissingBatchable;
+    const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
+    // No armed-flag read may come back into the gate.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_pld") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
+
+    // ...and the helper answers from BOTH: the generator's runtime kill and
+    // the authoritative dispatch decision.
+    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
+    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
+    const hbody = src[hs..he];
+    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
+
+    // The dispatch answer itself: a live MTP slot never ticks regular, an
+    // unarmed one always does.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, false, true, false, false));
+}
+
+test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not model" {
+    // A new arch on the shared moe forward must default to SERIAL, not ride
+    // a kernel that never modelled its state.
+    {
+        var moe = std.mem.zeroes(model_mod.ModelConfig);
+        moe.model_type = "qwen3_5_moe";
+        moe.full_attention_interval = 4;
+        moe.num_experts = 128;
+        moe.num_experts_per_tok = 8;
+        try testing.expect(!moe.supportsBatchedGdnDecode());
+    }
+    {
+        var lfm2 = std.mem.zeroes(model_mod.ModelConfig);
+        lfm2.model_type = "lfm2";
+        lfm2.has_hybrid_layers = true;
+        try testing.expect(!lfm2.supportsBatchedGdnDecode());
+    }
+    {
+        var kda = std.mem.zeroes(model_mod.ModelConfig);
+        kda.model_type = "bailing_hybrid";
+        kda.full_attention_interval = 4;
+        kda.kda_vector_gate = true;
+        try testing.expect(!kda.supportsBatchedGdnDecode());
+    }
+    {
+        var ink = std.mem.zeroes(model_mod.ModelConfig);
+        ink.model_type = "inkling_mm_model";
+        ink.full_attention_interval = 4;
+        try testing.expect(!ink.supportsBatchedGdnDecode());
+    }
+    {
+        // Pure attention: not a GDN trunk at all, rides the standard kernel.
+        var dense = std.mem.zeroes(model_mod.ModelConfig);
+        dense.model_type = "qwen3";
+        try testing.expect(!dense.supportsBatchedGdnDecode());
+    }
 }
 
 test "admitPendingTick: exclusive single-flight FIFO contract" {
@@ -5985,4 +6372,25 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
+}
+
+test "the ANE build resolves its chunk through effectivePrefillChunk, never the pin alone" {
+    // The compiled ANE tile only serves chunks of EXACTLY its width, and the
+    // forward's chunk is the pin run through effectivePrefillChunk's
+    // per-arch policy (MoE caps at 4096 where the pin says 8192) — building
+    // at the bare pin left every MoE program built-but-never-dispatched
+    // (A7, 2026-08-18). The needle is split so this test's own text cannot
+    // satisfy it.
+    const src = @embedFile("scheduler.zig");
+    const needle = "effectivePrefillChunk" ++ "(";
+    var it = std.mem.splitSequence(u8, src, "xfm_ptr.buildAnePrefill");
+    _ = it.first();
+    const before_call = it.rest();
+    _ = before_call;
+    // The call site's chunk value must be produced by effectivePrefillChunk
+    // in the same block: find the buildAnePrefill call and scan the 1200
+    // bytes before it for the resolver.
+    const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
+    const window_start = call_at -| 1200;
+    try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
 }

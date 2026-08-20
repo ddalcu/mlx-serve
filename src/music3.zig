@@ -84,6 +84,147 @@ const OVERLAP_LATENT: u32 = 172;
 const CROP_LEFT_LATENT: u32 = 86;
 const CROP_RIGHT_LATENT: u32 = 344 - 86;
 const VOC_HOP: u32 = 512; // samples per latent frame (8*8*4*2)
+/// The lyric block an instrumental request sends.
+///
+/// `is_instrumental` is a convenience on MiniMax's HOSTED api — the open
+/// weights have no such parameter (their own end-to-end script,
+/// `scripts/end_to_end/minimax_ttm_test.py`, posts nothing but lyrics text),
+/// and the checkpoint's lyric vocabulary is plain BPE with no special token
+/// for it. So the flag can only become a lyric TAG, and the tag has to be one
+/// the model was trained on. MiniMaxAI/MiniMax-Music3's model card lists the
+/// section tags verbatim: `[Intro]`, `[Verse]`, `[Pre-Chorus]`, `[Chorus]`,
+/// `[Post-Chorus]`, `[Bridge]`, `[Instrumental]`, `[Solo]`, `[Outro]`.
+///
+/// The two MiniMax sources DISAGREE on the spelling, and neither documents a
+/// "whole track has no vocals" tag at all — both list theirs among SECTION
+/// markers, beside `[Bridge]` and `[Solo]`:
+///   - the open-weights model card (our exact weights): `[Instrumental]`
+///   - the hosted api reference: `[Inst]`, with `is_instrumental` a SEPARATE
+///     boolean, which means their product does preprocessing we cannot see.
+/// So this is a best-effort mapping, not a verified contract. `[Instrumental]`
+/// wins the default because it is the card for the checkpoint we actually run
+/// — and it is ALSO ACE-Step's existing marker, so one spelling serves both
+/// backends. `MLX_SERVE_MUSIC3_INST_TAG` overrides it so the alternative can be
+/// A/B'd by ear without a rebuild; the honest test is listening, not a fixture.
+pub const INSTRUMENTAL_LYRICS = "[Instrumental]";
+
+/// The marker actually sent, honoring the env override.
+pub fn instrumentalMarker() []const u8 {
+    const raw = std.c.getenv("MLX_SERVE_MUSIC3_INST_TAG") orelse return markerFromEnvValue(null);
+    return markerFromEnvValue(std.mem.span(raw));
+}
+
+/// Split out so the override's three arms are testable without an environment.
+/// `none` sends an EMPTY lyric body — the hosted api makes `lyrics` optional
+/// under `is_instrumental`, and `[start]` alone is the closest this prompt
+/// template gets to sending nothing. Unset or blank keeps the default: an
+/// override that emptied the block by accident would read as a broken flag.
+pub fn markerFromEnvValue(raw: ?[]const u8) []const u8 {
+    const v = std.mem.trim(u8, raw orelse return INSTRUMENTAL_LYRICS, " \t\r\n");
+    if (v.len == 0) return INSTRUMENTAL_LYRICS;
+    if (std.ascii.eqlIgnoreCase(v, "none")) return "";
+    return v;
+}
+
+/// The clause appended to an instrumental request's caption.
+///
+/// MiniMax's api marks `prompt` REQUIRED for an instrumental track while making
+/// `lyrics` optional, which says the CAPTION carries the no-vocals intent and
+/// the lyric tag was never meant to carry it alone. Measured 2026-08-18:
+/// `[Instrumental]` by itself sang no words but still produced vocal texture —
+/// exactly what a SECTION tag would do.
+pub const INSTRUMENTAL_CAPTION_CLAUSE = "Instrumental only: no vocals, no singing, no lyrics.";
+
+/// Only guards against stacking OUR OWN clause twice.
+///
+/// This used to fuzzy-match "instrumental" / "no vocal" / "without vocal" /
+/// "no singing" anywhere in the caption, on the theory that appending on top
+/// repeats the user back at the model. That was wrong, and it silently
+/// disabled the feature for exactly the people using it: a real caption opens
+/// "Instrumental ambient field-recording piece, freely paced, no vocals" —
+/// where "Instrumental" is the GENRE, not an instruction — so the guard
+/// matched, the clause never fired, and every take was secretly a tag-only
+/// take. Measured on a live session 2026-08-19: `caption_facts=false` on nine
+/// consecutive runs the user believed were testing the clause.
+///
+/// A short clause repeated near a user's own wording is harmless, and emphasis
+/// may even help. Duplicating our exact sentence is the only real waste.
+pub fn captionMentionsNoVocals(caption: []const u8) bool {
+    return captionContainsAny(caption, &.{INSTRUMENTAL_CAPTION_CLAUSE});
+}
+
+/// Default ON. `MLX_SERVE_MUSIC3_INST_CAPTION=0` sends the tag alone, which is
+/// the arm that was measured to leave vocal texture in.
+pub fn instrumentalCaptionEnabled() bool {
+    const raw = std.c.getenv("MLX_SERVE_MUSIC3_INST_CAPTION") orelse return true;
+    return raw[0] != '0';
+}
+
+fn captionContainsAny(caption: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (caption.len < needle.len) continue;
+        var i: usize = 0;
+        while (i + needle.len <= caption.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(caption[i .. i + needle.len], needle)) return true;
+        }
+    }
+    return false;
+}
+
+/// The caption, plus the facts this request carries that the caption does not
+/// already state.
+///
+/// Music 3 has no `bpm` or `keyscale` request field — but it is NOT missing
+/// tempo and key. MiniMaxAI/MiniMax-Music3's card lists both under Global
+/// Metadata and its own example caption reads
+/// `Genre: acoustic pop. BPM: 96. Key: C major.`, so these are caption TEXT
+/// here where they are conditioning fields on ACE-Step. Same knobs, different
+/// channel — which is why the pane can offer them on both engines.
+///
+/// Every clause is skipped when the user already said it: appending on top
+/// repeats them back to the model and spends caption budget. Order is fixed so
+/// a seed stays reproducible across runs. Returns an OWNED copy always, so the
+/// caller frees exactly one thing whether or not anything was added.
+pub fn captionWithFacts(
+    a: std.mem.Allocator,
+    caption: []const u8,
+    bpm: ?u32,
+    keyscale: []const u8,
+    instrumental: bool,
+) ![]u8 {
+    var facts: std.ArrayList(u8) = .empty;
+    defer facts.deinit(a);
+
+    if (instrumental and !captionMentionsNoVocals(caption))
+        try facts.appendSlice(a, INSTRUMENTAL_CAPTION_CLAUSE);
+    if (bpm) |b| {
+        if (!captionContainsAny(caption, &.{ "bpm", "beats per minute" })) {
+            if (facts.items.len != 0) try facts.append(a, ' ');
+            var nb: [32]u8 = undefined;
+            try facts.appendSlice(a, std.fmt.bufPrint(&nb, "BPM: {d}.", .{b}) catch unreachable);
+        }
+    }
+    const key = std.mem.trim(u8, keyscale, " \t\r\n");
+    if (key.len != 0 and !captionContainsAny(caption, &.{ "key:", " major", " minor" })) {
+        if (facts.items.len != 0) try facts.append(a, ' ');
+        try facts.appendSlice(a, "Key: ");
+        try facts.appendSlice(a, key);
+        try facts.append(a, '.');
+    }
+
+    if (facts.items.len == 0) return a.dupe(u8, caption);
+    return std.fmt.allocPrint(a, "{s}\n{s}", .{ caption, facts.items });
+}
+
+/// The lyrics the engine should condition on. An instrumental request replaces
+/// whatever the client sent with the canonical marker; everything else passes
+/// through untouched. Empty lyrics WITHOUT the flag stay empty — the handler
+/// 400s on those, so a client that simply forgot the field never gets a
+/// wordless track it did not ask for.
+pub fn resolveLyrics(instrumental: bool, lyrics: []const u8) []const u8 {
+    return if (instrumental) instrumentalMarker() else lyrics;
+}
+
 pub const DEFAULT_STEPS: u32 = 30;
 pub const MIN_DURATION_S: u32 = 1;
 pub const MAX_DURATION_S: u32 = 360; // 9000 frames / 25 Hz
@@ -3002,4 +3143,117 @@ test "music3 frame cost probe (env-gated, informational)" {
     const ar = try e.runArStage(a, toks.ids, toks.uncond, .{ .max_frames = frames }, &smp, null);
     defer _ = mlx.mlx_array_free(ar.frame_buf);
     try testing.expect(ar.emitted > 0);
+}
+
+test "music3 instrumental marker survives lyric normalization as the bare [inst] tag" {
+    const a = std.testing.allocator;
+    const norm = try normalizeLyrics(a, INSTRUMENTAL_LYRICS);
+    defer a.free(norm);
+    // `[start]` is unconditional; the marker must arrive as the single
+    // lowercased tag the checkpoint was trained on, with no stray words.
+    try std.testing.expectEqualStrings("[start]\n[instrumental]", norm);
+}
+
+test "music3 instrumental lyrics resolve from the flag, never from an empty string" {
+    // The flag is the ONLY way in: an empty `lyrics` stays empty (the handler
+    // 400s on it) so a client that forgot the field cannot silently get an
+    // instrumental it did not ask for.
+    try std.testing.expectEqualStrings(instrumentalMarker(), resolveLyrics(true, ""));
+    try std.testing.expectEqualStrings(instrumentalMarker(), resolveLyrics(true, "   \n\t "));
+    // Unset in the test environment, so the override resolves to the default.
+    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, instrumentalMarker());
+    try std.testing.expectEqualStrings("", resolveLyrics(false, ""));
+    try std.testing.expectEqualStrings("[verse]\nhello", resolveLyrics(false, "[verse]\nhello"));
+}
+
+test "music3 instrumental caption: the clause is appended only when the user did not already say it" {
+    // MiniMax's own api marks `prompt` REQUIRED for an instrumental track while
+    // making `lyrics` optional — which says the CAPTION is where the no-vocals
+    // intent lives, and the lyric tag alone was never meant to carry it. Live
+    // 2026-08-18: `[Instrumental]` alone sang no words but still produced vocal
+    // texture, exactly what a SECTION tag would do.
+    try std.testing.expect(!captionMentionsNoVocals("upbeat synthwave with driving bass"));
+    // A caption whose GENRE is instrumental music must still get the clause —
+    // the old fuzzy guard matched these and silently disabled the feature.
+    try std.testing.expect(!captionMentionsNoVocals("Instrumental ambient field-recording piece, no vocals"));
+    try std.testing.expect(!captionMentionsNoVocals("an instrumental piece"));
+    try std.testing.expect(!captionMentionsNoVocals("lo-fi piano, no vocals"));
+    // Only our own sentence, so a re-render cannot stack it twice.
+    try std.testing.expect(captionMentionsNoVocals("lo-fi. " ++ INSTRUMENTAL_CAPTION_CLAUSE));
+}
+
+test "music3 instrumental tag override: a spelling, or 'none' for a bare lyric block" {
+    // The two MiniMax sources disagree on the tag and neither documents a
+    // track-level one, so the spelling is a lever, not a contract. `none` is
+    // the third arm: the hosted api says lyrics are NOT REQUIRED under
+    // `is_instrumental`, and the closest local equivalent to sending nothing is
+    // an EMPTY lyric body — `[start]` on its own.
+    try std.testing.expectEqualStrings("", markerFromEnvValue("none"));
+    try std.testing.expectEqualStrings("", markerFromEnvValue("NONE"));
+    try std.testing.expectEqualStrings("[Inst]", markerFromEnvValue("[Inst]"));
+    // Unset or blank keeps the default rather than silently emptying the block.
+    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, markerFromEnvValue(null));
+    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, markerFromEnvValue("   "));
+}
+
+test "music3 instrumental with an empty marker still assembles a legal lyric block" {
+    const a = std.testing.allocator;
+    // The `none` arm must not produce a malformed prompt: `[start]` is
+    // unconditional in normalizeLyrics, so an empty body is just that alone.
+    const norm = try normalizeLyrics(a, "");
+    defer a.free(norm);
+    try std.testing.expectEqualStrings("[start]\n", norm);
+}
+
+test "music3 caption facts: bpm and key are appended in MiniMax's own spelling" {
+    const a = std.testing.allocator;
+    // Music 3 has no `bpm` field, but it DOES support tempo and key — the model
+    // card lists them under Global Metadata and its own example caption reads
+    // "Genre: acoustic pop. BPM: 96. Key: C major." So the fields are not
+    // inapplicable here, they are carried as caption TEXT.
+    const c1 = try captionWithFacts(a, "acoustic pop", 96, "C major", false);
+    defer a.free(c1);
+    try std.testing.expectEqualStrings("acoustic pop\nBPM: 96. Key: C major.", c1);
+
+    // Each fact is independent.
+    const c2 = try captionWithFacts(a, "lo-fi", 84, "", false);
+    defer a.free(c2);
+    try std.testing.expectEqualStrings("lo-fi\nBPM: 84.", c2);
+    const c3 = try captionWithFacts(a, "lo-fi", null, "F minor", false);
+    defer a.free(c3);
+    try std.testing.expectEqualStrings("lo-fi\nKey: F minor.", c3);
+
+    // Nothing to add leaves the caption byte-identical, so a plain request is
+    // unchanged from before this existed.
+    const c4 = try captionWithFacts(a, "lo-fi", null, "", false);
+    defer a.free(c4);
+    try std.testing.expectEqualStrings("lo-fi", c4);
+}
+
+test "music3 caption facts: the user's own words always win" {
+    const a = std.testing.allocator;
+    // Appending on top of what they already wrote repeats them back at the
+    // model and spends caption budget doing it.
+    const c1 = try captionWithFacts(a, "acoustic pop at 96 bpm", 120, "", false);
+    defer a.free(c1);
+    try std.testing.expectEqualStrings("acoustic pop at 96 bpm", c1);
+    const c2 = try captionWithFacts(a, "something in C major", null, "F minor", false);
+    defer a.free(c2);
+    try std.testing.expectEqualStrings("something in C major", c2);
+    // ...but "instrumental" in the GENRE is not the user asking us to skip the
+    // clause, so it still fires alongside the tempo fact.
+    const c3 = try captionWithFacts(a, "an instrumental piece", 96, "", true);
+    defer a.free(c3);
+    try std.testing.expectEqualStrings(
+        "an instrumental piece\nInstrumental only: no vocals, no singing, no lyrics. BPM: 96.", c3);
+}
+
+test "music3 caption facts: instrumental clause leads, then bpm, then key" {
+    const a = std.testing.allocator;
+    // Order is a contract only in that it is STABLE — a caption that reshuffles
+    // between runs makes seeds non-reproducible for no reason.
+    const c = try captionWithFacts(a, "ambient", 70, "A minor", true);
+    defer a.free(c);
+    try std.testing.expectEqualStrings(
+        "ambient\nInstrumental only: no vocals, no singing, no lyrics. BPM: 70. Key: A minor.", c);
 }

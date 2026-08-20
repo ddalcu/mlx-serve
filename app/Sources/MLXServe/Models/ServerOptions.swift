@@ -47,8 +47,11 @@ struct ServerOptions: Codable, Equatable {
 
     // Observability (server-launch flag). When true, launches with `--metrics`,
     // exposing the Prometheus `/metrics` scrape endpoint AND a live throughput/
-    // latency/GPU/memory panel on the server's index page (GET /).
-    var enableMetrics: Bool = false
+    // latency/GPU/memory panel on the server's index page (GET /). ON by
+    // default here — deliberately NOT mirroring the server's own default:
+    // the tray's throughput rows read `/metrics.json`, and the cost is a few
+    // relaxed atomics per request, never per token.
+    var enableMetrics: Bool = true
     /// Optional API key (`--api-key`). When non-empty, remote (non-loopback)
     /// requests to the OpenAI/Anthropic/Ollama APIs AND the index page + metrics
     /// panel require it (Authorization: Bearer / x-api-key / HTTP Basic / query
@@ -131,6 +134,17 @@ struct ServerOptions: Codable, Equatable {
     /// fit-gate still applies and disables with a log when the box can't hold
     /// trunk + stages + headroom). Off, matching the server default.
     var enableDSpark: Bool = false
+    /// `--ane-prefill`. Neural Engine prefill offload: part of every long
+    /// prompt's prefill (dense MLP rows + GatedDeltaNet input projections on
+    /// Qwen 3.5-family models) runs on the ANE in parallel with the GPU.
+    /// Measured +16-20% prefill at 16-32k on an M4 Max; decode untouched.
+    /// The server refuses by name on unsupported models and on Macs under
+    /// 96 GB RAM (the int8 ANE weight copy is ~20 GB wired on a 27B), so the
+    /// flag is always safe to pass — but it stays opt-in and OFF, matching
+    /// the server default, because the copy is real memory and the win is
+    /// per-machine (M5-family GPUs carry NAX cores that raise the GPU's own
+    /// prefill baseline, shrinking the ANE's edge — see AnePrefillAdvice).
+    var anePrefill: Bool = false
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -479,6 +493,7 @@ struct ServerOptions: Codable, Equatable {
         mtpDepth == other.mtpDepth &&
         forceMTPOnMoE == other.forceMTPOnMoE &&
         enableDSpark == other.enableDSpark &&
+        anePrefill == other.anePrefill &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -630,6 +645,11 @@ struct ServerOptions: Codable, Equatable {
         // the stages cost ~11 GB resident), so only ON emits.
         if enableDSpark {
             args += ["--dspark"]
+        }
+        // ANE prefill offload: server default is OFF (opt-in — the int8 ANE
+        // copy is ~11 GB on a 27B under the channel split), so only ON emits.
+        if anePrefill {
+            args += ["--ane-prefill"]
         }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
@@ -813,6 +833,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .anePrefill) { anePrefill = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -991,6 +1012,10 @@ extension ServerOptions {
         "enableDSpark": .init(
             title: "DSpark draft stages (DeepSeek‑V4)",
             explainer: "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. For DeepSeek‑V4 GGUF files this arms the embedded ds4 engine's DSpark runtime instead, using the DSpark support GGUF downloaded beside the model (nothing happens without that file). Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only.",
+            needsRestart: true),
+        "anePrefill": .init(
+            title: "Neural Engine prefill boost",
+            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The Neural Engine keeps its own copy of part of the model's math — roughly 11 GB extra for a 27B, around 1 GB for a small model — and the server checks that exact fit at load, declining by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
             needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
