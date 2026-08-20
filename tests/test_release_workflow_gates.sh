@@ -73,6 +73,20 @@ check(len(nax_steps) == 1, "NAX metallib static guard step present")
 check(nax_steps and "if" not in nax_steps[0],
       "NAX guard unconditional (runs on every event incl. PRs)")
 
+# DwarfStar's identity is source provenance. The release must derive it with
+# the fail-closed helper and pass that exact value to Zig rather than trusting a
+# plain-build Git lookup whose state is outside the workflow's declared inputs.
+ds4_step = steps.get("Compute DwarfStar source identity", {})
+ds4_run = str(ds4_step.get("run", ""))
+check(ds4_step.get("id") == "ds4", "DwarfStar identity step has stable output id")
+check("scripts/ds4-git-identity.sh lib/ds4" in ds4_run,
+      "release derives DwarfStar identity through helper")
+check('echo "commit=$DS4_COMMIT" >> "$GITHUB_OUTPUT"' in ds4_run,
+      "release exports the exact DwarfStar identity")
+zig_build_run = str(steps.get("Build mlx-serve (Zig)", {}).get("run", ""))
+check("-Dds4-commit=${{ steps.ds4.outputs.commit }}" in zig_build_run,
+      "release passes explicit DwarfStar identity to Zig")
+
 # The PR build's output must be uploaded as an artifact.
 upload = [s for s in job["steps"]
           if s.get("uses", "").startswith("actions/upload-artifact")]

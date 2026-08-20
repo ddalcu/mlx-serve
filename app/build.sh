@@ -178,7 +178,7 @@ ZIG_DEVELOPER_DIR=/Library/Developer/CommandLineTools
 # Settings can show engine versions without booting the server — src/version.zig).
 # MLX + ggml self-report at runtime; these three have no runtime API:
 MLXC_VERSION="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
-DS4_COMMIT="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
+DS4_COMMIT="$(bash "$PROJECT_ROOT/scripts/ds4-git-identity.sh" "$PROJECT_ROOT/lib/ds4" 2>/dev/null || true)"
 LLAMA_TAG="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
 # ReleaseFast unless ZIG_DEBUG asked otherwise (see the lever's comment at the
 # top). Even under FAST_DEV the default stays ReleaseFast: Zig's cache already

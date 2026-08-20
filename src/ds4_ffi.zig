@@ -4,8 +4,6 @@
 // wrapper that owns lifetimes, errors, and Metal-kernel extraction lives in
 // `src/arch/ds4.zig`. Keeping this layer mechanical means an upstream `ds4.h`
 // drift shows up as a Zig compile error here rather than in the bridge.
-//
-// Submodule pin: lib/ds4 @ efdadd4.
 
 const std = @import("std");
 
@@ -72,7 +70,7 @@ pub const DistributedOptions = extern struct {
     debug: bool = false,
 };
 
-// Two-machine tensor parallelism (pin efdadd4). Never enabled by mlx-serve —
+// Two-machine tensor parallelism. Never enabled by mlx-serve —
 // mirrored only because ds4_engine_options embeds it by value.
 pub const TpRole = enum(c_int) {
     none = 0,
@@ -137,6 +135,7 @@ pub const EngineOptions = extern struct {
     ssd_streaming_full_layers_set: bool = false,
     inspect_only: bool = false,
     placement_ctx_hint: c_int = 0,
+    placement_session_count_hint: c_int = 0,
     share_session_prefill_workspace: bool = false,
     first_token_test: bool = false,
     metal_graph_test: bool = false,
@@ -269,6 +268,7 @@ pub extern fn ds4_session_snapshot_free(snap: *SessionSnapshot) void;
 extern fn mlxserve_ds4_sizeof_engine_options() usize;
 extern fn mlxserve_ds4_offsetof_mtp_draft_tokens() usize;
 extern fn mlxserve_ds4_offsetof_ssd_streaming() usize;
+extern fn mlxserve_ds4_offsetof_placement_session_count_hint() usize;
 extern fn mlxserve_ds4_offsetof_distributed() usize;
 extern fn mlxserve_ds4_sizeof_distributed_options() usize;
 extern fn mlxserve_ds4_sizeof_tokens() usize;
@@ -283,6 +283,7 @@ test "ds4 FFI mirror layout matches ds4.h (mid-struct-insert guard)" {
     try std.testing.expectEqual(mlxserve_ds4_sizeof_engine_options(), @sizeOf(EngineOptions));
     try std.testing.expectEqual(mlxserve_ds4_offsetof_mtp_draft_tokens(), @offsetOf(EngineOptions, "mtp_draft_tokens"));
     try std.testing.expectEqual(mlxserve_ds4_offsetof_ssd_streaming(), @offsetOf(EngineOptions, "ssd_streaming"));
+    try std.testing.expectEqual(mlxserve_ds4_offsetof_placement_session_count_hint(), @offsetOf(EngineOptions, "placement_session_count_hint"));
     try std.testing.expectEqual(mlxserve_ds4_offsetof_distributed(), @offsetOf(EngineOptions, "distributed"));
     try std.testing.expectEqual(mlxserve_ds4_sizeof_distributed_options(), @sizeOf(DistributedOptions));
     try std.testing.expectEqual(mlxserve_ds4_sizeof_tokens(), @sizeOf(Tokens));

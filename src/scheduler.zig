@@ -184,9 +184,9 @@ pub const LoadParams = struct {
     /// SSD weight-streaming for the ds4 engine (issue #39): stream experts from
     /// disk instead of requiring the full model resident in RAM.
     ds4_ssd_streaming: bool = false,
-    /// Auto-load the ds4 MTP draft head (found beside the model) for speculative
-    /// decode. Default on; forced off when `ds4_ssd_streaming` (ds4 refuses the
-    /// combination). `--no-ds4-mtp` disables it.
+    /// Auto-load the ds4 support sidecar (found beside the model) for
+    /// speculative decode. `--no-ds4-mtp` disables both legacy MTP and
+    /// DSpark; plain SSD remains target-only unless --dspark is explicit.
     ds4_mtp: bool = true,
     /// Select ds4's DSpark runtime when the auto-found support GGUF carries
     /// DSpark stages (`--dspark`, the same flag that opts the NATIVE dsv4
@@ -922,9 +922,9 @@ pub const LoadRequest = struct {
     /// SSD weight-streaming for cold-loaded ds4 models (issue #39). The CLI
     /// startup path supplies this via LoadParams; cold-load defaults it off.
     ds4_ssd_streaming: bool = false,
-    /// Auto-load the ds4 MTP draft head beside a cold-loaded ds4 model. Default
-    /// on (a switched-to ds4 model gets speculative decode); forced off under
-    /// `ds4_ssd_streaming`.
+    /// Auto-load the ds4 MTP draft head beside a cold-loaded ds4 model. Plain
+    /// SSD ignores sidecars; explicit DSpark receives only its deterministic
+    /// filename-lineage-matched sidecar.
     ds4_mtp: bool = true,
     /// DSpark runtime for a cold-loaded ds4 model whose sidecar carries
     /// DSpark stages. Cold loads inherit the launch flag via the Scheduler's
@@ -2260,11 +2260,20 @@ fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32) bool {
 
 fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     log.info("[ds4] opening engine: {s}\n", .{params.ds4_path});
-    // Auto-load the MTP draft head sitting beside the model for speculative
-    // decode. ds4 refuses `--mtp` together with `--ssd-streaming`, so the sidecar
-    // is only sought when streaming is off; `ds4_mtp` (default on) gates opt-out.
-    const mtp_path: ?[]u8 = if (params.ds4_mtp and !params.ds4_ssd_streaming)
-        model_discovery.findDs4MtpSidecar(sch.io, sch.allocator, params.ds4_path)
+    // Keep this byte-for-byte policy-equivalent to main.zig's offline path:
+    // plain SSD stays target-only; explicit DSpark receives only a DSpark
+    // bundle, while --no-ds4-mtp is the deliberate opt-out. A missing explicit
+    // support file reaches open() and is rejected instead of target-only.
+    const support_policy = arch_ds4.supportSidecarPolicy(
+        params.ds4_mtp,
+        params.ds4_ssd_streaming,
+        params.ds4_dspark,
+    );
+    const mtp_path: ?[]u8 = if (support_policy.lookup)
+        if (support_policy.require_dspark)
+            model_discovery.findDs4DsparkSidecar(sch.io, sch.allocator, params.ds4_path)
+        else
+            model_discovery.findDs4MtpSidecar(sch.io, sch.allocator, params.ds4_path)
     else
         null;
     defer if (mtp_path) |p| sch.allocator.free(p);
@@ -2272,12 +2281,13 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
         .backend = .metal,
+        .context_size = @intCast(params.config.max_position_embeddings),
         .warm_weights = true,
         .ssd_streaming = params.ds4_ssd_streaming,
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
-        .dspark = params.ds4_dspark,
+        .dspark = support_policy.dspark,
     });
     errdefer engine.close();
     // draft_tokens is the spec-readiness signal for BOTH support kinds
@@ -4349,9 +4359,9 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
     slot.state = .decoding;
 }
 
-/// ds4 decode tick: argmax (temp ≤ 0) or sample, check EOS, push token,
-/// `eval(token)` to extend the session, and stop on max_tokens. Each call
-/// emits exactly one token (unlike PLD/drafter which can emit several).
+/// ds4 decode tick: eligible greedy sessions use the engine-owned speculative
+/// lane and may emit several accepted tokens; other sessions sample or argmax
+/// one token and evaluate it. Both paths enforce EOS and max_tokens here.
 fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session) !void {
     const engine = slot.model.ds4_engine.?;
     const next_id: i32 = if (slot.sampling.temperature <= 0.0)
@@ -5131,9 +5141,9 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
 }
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
-    // ds4-backed slot: drive the engine's session forward by one token. No
-    // PLD / drafter / batched paths apply — ds4 has its own internal MTP
-    // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
+    // ds4-backed slot: drive the engine's session through its internal
+    // speculative lane when eligible, with ordinary single-token decode as
+    // the engine-owned fallback. mlx-serve PLD/drafter batching does not apply.
     if (slot.ds4_session) |session| {
         return runDs4DecodeTick(sch, slot, session);
     }

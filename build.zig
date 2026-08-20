@@ -66,11 +66,19 @@ pub fn build(b: *std.Build) void {
     // that have NO runtime query API (MLX + ggml report themselves at runtime):
     //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
     //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
-    //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
+    //   --ds4-commit     explicit release pin. Plain builds deliberately
+    //                    report "unknown" rather than reusing a cached Git
+    //                    identity; CI/app builds derive and pass the pin.
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
     //                    (written by scripts/fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
+    // Git state is not a declared Zig build input. Re-querying it here let a
+    // cached clean identity survive a later `git status` failure, so a plain
+    // build could make a false source-provenance claim. Release.yml and
+    // app/build.sh compute scripts/ds4-git-identity.sh first and pass the
+    // result explicitly. Developers get an honest unknown unless they choose
+    // the same explicit -Dds4-commit contract.
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
@@ -127,7 +135,7 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("lib/xatlas"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
-    // `lib/ds4/` submodule pinned at 613e9b2 and `src/arch/ds4.zig`. Kernel
+    // `lib/ds4/` submodule pinned at 34e30e7 and `src/arch/ds4.zig`. Kernel
     // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
@@ -452,9 +460,9 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
     // ds4.c #includes ds4_distributed.h; the engine/session path links its impl.
-    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c and
-    // ds4_gpu_args.c are CLI/server-only and not part of the library path
-    // mlx-serve embeds (upstream Makefile CORE_OBJS is the authority).
+    // ds4_gpu.h is implemented in ds4_metal.m. The separate CLI/server/eval/
+    // agent support translation units are not part of the library path
+    // mlx-serve embeds; upstream Makefile CORE_OBJS is the authority.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
     // SSD weight-streaming (issue #39): ds4_ssd.c is a standalone TU (#includes
     // only ds4_ssd.h) implementing the streaming expert cache the engine_options

@@ -149,8 +149,18 @@ jobs:
       - name: Fetch libllama (llama.cpp GGUF engine)
         run: bash scripts/fetch-llama.sh
 
+      # Build metadata is a source-fidelity claim, not a cosmetic version
+      # string. Derive it once through the fail-closed helper and pass it to
+      # Zig explicitly so the release never relies on ambient Git/cache state.
+      - name: Compute DwarfStar source identity
+        id: ds4
+        run: |
+          DS4_COMMIT="$(bash scripts/ds4-git-identity.sh lib/ds4)"
+          test -n "$DS4_COMMIT"
+          echo "commit=$DS4_COMMIT" >> "$GITHUB_OUTPUT"
+
       - name: Build mlx-serve (Zig)
-        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
+        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dds4-commit=${{ steps.ds4.outputs.commit }}
 
       # The Agent Sandbox's guest-side binary (static aarch64-linux ELF). It
       # rides inside the .app at Resources/guest/vz-agent — without it the

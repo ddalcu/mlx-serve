@@ -1,0 +1,51 @@
+[mem] MLX buffer-pool cap 8192 MB (was 124518 MB)
+Logging to /Users/pjb/.mlx-serve/logs/mlx-serve-18075.log (rotates at 32 MB)
+[gguf] engine: ds4 (arch=deepseek4, ds4-lora=true)
+mlx-serve 26.8.6 (ds4 engine, GGUF backend)
+[args] model: /Users/pjb/git/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf
+[args] serve: 127.0.0.1:18075, ctx-size=8192
+[registry] max_resident_models=3, max_resident_mem=unlimited
+[ds4] opening engine: /Users/pjb/git/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf
+[ds4] staged 19 Metal kernel sources at /Users/pjb/.mlx-serve/ds4-metal/71c79523a70fe7764dd175fe286c965a
+[ds4] SSD streaming cache budget: 8.00 GiB (mlx-serve safe default)
+ds4: Metal device Apple M5 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: metal SSD streaming total expert budget 8.00 GiB = 3.38 GiB prefill headroom + 4.62 GiB dynamic cache (701 experts, 6.75 MiB each)
+ds4: SSD streaming mixed-precision model: 6/43 routed layers off the slab size class will bypass the expert cache and read experts via mapped model views
+ds4: SSD streaming initial metal model map restricted to token embedding (1 spans, 0.99 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.42 GiB (raw 0.36 + compressed 0.06) + buffers 0.06 GiB + resident model 0.99 GiB + expert cache 4.62 GiB + prefill expert reserve 3.38 GiB = 9.47 GiB planned
+ds4: memory detail: ctx=8192 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=2050 backend=metal
+[ds4] engine ready (EOS=1, has_mtp=false, draft_tokens=0)
+Model ready (loaded on inference thread).
+Hot prefix cache: requested capacity=32 but disabled by scheduler
+Context size: 8192 tokens (manual)
+Request timeout: 300s
+Model context length: 8192 tokens
+Reasoning budget: unlimited
+
+Server listening on http://127.0.0.1:18075
+  GET  /
+  GET  /health
+  GET  /props
+  GET  /v1/models
+  POST /v1/chat/completions
+  POST /v1/completions
+  POST /v1/embeddings
+  POST /v1/messages (Anthropic)
+  POST /v1/responses (OpenAI Responses)
+  POST /v1/responses/compact
+  GET  /v1/responses/{id}
+  DEL  /v1/responses/{id}
+  POST /tokenize
+  POST /detokenize
+
+RSS: 63M  Mem: 14%  CPU: 9%  GPU: 37%
+POST /v1/chat/completions (1 msgs, max_tokens=1, temp=0.00, top_p=1.00, top_k=0, stream=false, thinking=false, sys=0b, user=72b, tools=0b, tool_msgs=0) 
+  > "Reply with exactly the integer that is one more than 10. No punctuation."
+  prompt=20 tokens, max_gen=1, ctx=8192
+  <- 20+1 tokens (1420ms) [prefill: 16.6 tok/s, decode: 0.0 tok/s] [length]
+
+Shutting down gracefully...

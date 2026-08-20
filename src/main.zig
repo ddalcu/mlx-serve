@@ -42,9 +42,11 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 // parsing, read by the ds4 serve + offline open paths. Module-level to avoid
 // threading it through runDs4Serve's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
-// Auto-load the ds4 MTP draft head (beside the model) for speculative decode.
-// Default on; `--no-ds4-mtp` disables it, and it's forced off under
-// `--ssd-streaming` (ds4 refuses the combination). Read by the same ds4 paths.
+// Auto-load the ds4 support sidecar (beside the model) for speculative decode.
+// Default on; `--no-ds4-mtp` disables both legacy MTP and optional DSpark.
+// Plain SSD stays target-only; an explicit --dspark accepts only the
+// deterministic lineage-matched DSpark sidecar, while legacy MTP remains
+// rejected there.
 var ds4_mtp: bool = true;
 // `--dspark` for the EMBEDDED ds4 engine: select the DSpark runtime when the
 // auto-found support GGUF carries DSpark stages (the same flag opts the
@@ -153,13 +155,14 @@ fn printUsage(io: std.Io) void {
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
         \\  --dspark            Enable DeepSeek-V4 DSpark draft stages (OFF by
-        \\                        default: the stages cost ~11 GB resident; the
-        \\                        memory fit-gate still applies at load). For a
+        \\                        default; persistent support has an explicit
+        \\                        startup admission check). For a
         \\                        served .gguf this arms the embedded ds4
         \\                        engine's DSpark runtime instead, using the
         \\                        DSpark support GGUF found beside the model
-        \\                        (greedy requests only; needs the sidecar,
-        \\                        so --no-ds4-mtp disables it too).
+        \\                        (greedy requests only; requires a lineage-matched
+        \\                        DSpark sidecar and fails closed if missing;
+        \\                        --no-ds4-mtp deliberately disables it).
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -266,10 +269,11 @@ fn printUsage(io: std.Io) void {
         \\                        model in RAM (skips full residency + warmup).
         \\                        Use when the model is larger than available
         \\                        memory. Ignored by the MLX + llama.cpp engines.
-        \\  --no-ds4-mtp        ds4 only: don't auto-load the MTP draft head
+        \\  --no-ds4-mtp        ds4 only: don't auto-load a speculative support
+        \\                        sidecar (legacy MTP or DSpark).
         \\                        (speculative decode). On by default when the
-        \\                        model dir ships one; auto-off under
-        \\                        --ssd-streaming (ds4 refuses the combination).
+        \\                        model dir ships one; under SSD streaming it
+        \\                        is an explicit DSpark opt-out.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -604,9 +608,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
-            // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
-            // ~11 GB resident, so the default leaves them lazy and serves
-            // serial. deepseek_v4.initModel reads the env at model load.
+            // DSpark (DeepSeek-V4 draft stages) is opt-in. The MLX runtime
+            // reads this at model load; the embedded ds4 route separately
+            // requires a lineage-matched sidecar and admits its persistent
+            // support.
             _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
             // Same flag, embedded engine: arm ds4's DSpark runtime when a
             // DSpark support GGUF sits beside a served .gguf model.
@@ -1239,6 +1244,11 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
+        const ds4_options = ds4LoadOptions(
+            ds4_ssd_streaming,
+            ds4_mtp,
+            ds4_dspark,
+        );
         const params = scheduler_mod.LoadParams{
             .registry = registry,
             .entry = entry,
@@ -1263,8 +1273,9 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama_cache_entries = server_mod.llama_cache_entries,
-            .ds4_mtp = ds4_mtp,
-            .ds4_dspark = ds4_dspark,
+            .ds4_ssd_streaming = ds4_options.ssd_streaming,
+            .ds4_mtp = ds4_options.mtp,
+            .ds4_dspark = ds4_options.dspark,
             .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
             .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
             .metrics = server_mod.g_metrics,
@@ -1500,10 +1511,19 @@ fn runDs4Offline(
 
     log.info("[ds4] backend: Metal, model: {s}\n", .{gguf_path});
 
-    // Auto-load the MTP draft head beside the model for speculative decode
-    // (mirrors the serve path); skipped under ssd-streaming (ds4 refuses both).
-    const mtp_path: ?[]u8 = if (ds4_mtp and !ds4_ssd_streaming)
-        model_discovery.findDs4MtpSidecar(io, allocator, gguf_path)
+    // Offline and scheduler use the same support-sidecar policy. Plain SSD
+    // stays target-only; an explicit DSpark request selects only DSpark
+    // support and a null result reaches Ds4Engine.open as a fail-closed error.
+    const support_policy = ds4_arch.supportSidecarPolicy(
+        ds4_mtp,
+        ds4_ssd_streaming,
+        ds4_dspark,
+    );
+    const mtp_path: ?[]u8 = if (support_policy.lookup)
+        if (support_policy.require_dspark)
+            model_discovery.findDs4DsparkSidecar(io, allocator, gguf_path)
+        else
+            model_discovery.findDs4MtpSidecar(io, allocator, gguf_path)
     else
         null;
     defer if (mtp_path) |p| allocator.free(p);
@@ -1511,12 +1531,13 @@ fn runDs4Offline(
 
     var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
         .backend = .metal,
+        .context_size = @intCast(ds4_arch.clampSessionCtx(ctx_size)),
         .warm_weights = true,
         .ssd_streaming = ds4_ssd_streaming,
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,
-        .dspark = ds4_dspark,
+        .dspark = support_policy.dspark,
     }) catch |err| {
         log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
         return err;
@@ -1653,6 +1674,11 @@ fn runGenServe(
         config_owned_by_registry = true;
     };
 
+    const ds4_options = ds4LoadOptions(
+        ds4_ssd_streaming,
+        ds4_mtp,
+        ds4_dspark,
+    );
     const params = scheduler_mod.LoadParams{
         .registry = registry,
         .entry = entry,
@@ -1669,8 +1695,9 @@ fn runGenServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
+        .ds4_ssd_streaming = ds4_options.ssd_streaming,
+        .ds4_mtp = ds4_options.mtp,
+        .ds4_dspark = ds4_options.dspark,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1689,6 +1716,28 @@ fn runGenServe(
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .kv_attn_mode = .auto,
     });
+}
+
+const Ds4LoadOptions = struct {
+    ssd_streaming: bool,
+    mtp: bool,
+    dspark: bool,
+};
+
+/// Keep all ds4 CLI state together at every scheduler load boundary. Any
+/// constructor can later cold-switch to a discovered DS4 GGUF, so dropping a
+/// field from even an MLX, native-generator, or llama startup path changes the
+/// eventual DS4 launch policy.
+fn ds4LoadOptions(
+    ssd_streaming: bool,
+    mtp: bool,
+    dspark: bool,
+) Ds4LoadOptions {
+    return .{
+        .ssd_streaming = ssd_streaming,
+        .mtp = mtp,
+        .dspark = dspark,
+    };
 }
 
 /// Headless serve mode: start with NO primary model. The registry holds all
@@ -1765,6 +1814,11 @@ fn runHeadlessServe(
         break :blk &placeholder;
     };
 
+    const ds4_options = ds4LoadOptions(
+        ds4_ssd_streaming,
+        ds4_mtp,
+        ds4_dspark,
+    );
     const params = scheduler_mod.LoadParams{
         .registry = registry,
         .entry = carrier,
@@ -1795,8 +1849,9 @@ fn runHeadlessServe(
         // runHeadlessServe flag-eater class): the app always boots headless
         // and cold-loads GGUFs, so a LoadParams default here silently eats
         // --no-ds4-mtp / --dspark for every embedded-engine load.
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
+        .ds4_ssd_streaming = ds4_options.ssd_streaming,
+        .ds4_mtp = ds4_options.mtp,
+        .ds4_dspark = ds4_options.dspark,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1822,6 +1877,33 @@ fn runHeadlessServe(
         // defaults true), so the MoE force flag has to reach this path too.
         .default_force_mtp = force_mtp,
     });
+}
+
+test "ds4: every scheduler load forwards SSD, MTP, and DSpark flags together" {
+    const options = ds4LoadOptions(true, false, true);
+    try std.testing.expect(options.ssd_streaming);
+    try std.testing.expect(!options.mtp);
+    try std.testing.expect(options.dspark);
+
+    const source = @embedFile("main.zig");
+    const constructor = "scheduler_mod.LoadParams{";
+    var cursor: usize = 0;
+    var constructor_count: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, constructor)) |start| {
+        const end = std.mem.indexOfPos(
+            u8,
+            source,
+            start,
+            ".metrics = server_mod.g_metrics,",
+        ) orelse return error.TestExpectedEqual;
+        const block = source[start..end];
+        try std.testing.expect(std.mem.indexOf(u8, block, ".ds4_ssd_streaming = ds4_options.ssd_streaming,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, block, ".ds4_mtp = ds4_options.mtp,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, block, ".ds4_dspark = ds4_options.dspark,") != null);
+        constructor_count += 1;
+        cursor = end + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), constructor_count);
 }
 
 /// ds4 serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig
@@ -1989,6 +2071,11 @@ fn runDs4Serve(
     // untested; clamp serial.
     server_mod.max_concurrent = 1;
 
+    const ds4_options = ds4LoadOptions(
+        ds4_ssd_streaming,
+        ds4_mtp,
+        ds4_dspark,
+    );
     const params = scheduler_mod.LoadParams{
         .registry = registry,
         .entry = entry,
@@ -2008,9 +2095,9 @@ fn runDs4Serve(
         // Iteration 2: tokenize cache for ds4 too.
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
-        .ds4_ssd_streaming = ds4_ssd_streaming,
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
+        .ds4_ssd_streaming = ds4_options.ssd_streaming,
+        .ds4_mtp = ds4_options.mtp,
+        .ds4_dspark = ds4_options.dspark,
         .metrics = server_mod.g_metrics,
     };
 
@@ -2256,6 +2343,11 @@ fn runLlamaServe(
     // multiplies with concurrency); keep one in flight like the ds4 path.
     server_mod.max_concurrent = 1;
 
+    const ds4_options = ds4LoadOptions(
+        ds4_ssd_streaming,
+        ds4_mtp,
+        ds4_dspark,
+    );
     const params = scheduler_mod.LoadParams{
         .registry = registry,
         .entry = entry,
@@ -2283,8 +2375,9 @@ fn runLlamaServe(
         .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
         .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         .llama_path = gguf_path_owned,
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
+        .ds4_ssd_streaming = ds4_options.ssd_streaming,
+        .ds4_mtp = ds4_options.mtp,
+        .ds4_dspark = ds4_options.dspark,
         .metrics = server_mod.g_metrics,
     };
 

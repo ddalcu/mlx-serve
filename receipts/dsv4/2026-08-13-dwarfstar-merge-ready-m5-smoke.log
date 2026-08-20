@@ -1,0 +1,40 @@
+Logging to /private/tmp/dsv4-merge-smoke.thc4Vh/server.log (rotates at 32 MB)
+[gguf] engine: ds4 (arch=deepseek4, ds4-lora=true)
+mlx-serve 26.8.6 (ds4 engine, GGUF backend)
+[args] model: /Users/pjb/git/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf
+[args] serve: 127.0.0.1:18074, ctx-size=8192
+[registry] max_resident_models=3, max_resident_mem=unlimited
+[ds4] opening engine: /Users/pjb/git/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf
+[ds4] staged 19 Metal kernel sources at /Users/pjb/.mlx-serve/ds4-metal/71c79523a70fe7764dd175fe286c965a
+[ds4] SSD streaming cache budget: 8.00 GiB (mlx-serve safe default)
+[ds4] engine ready (EOS=1, has_mtp=false, draft_tokens=0)
+Model ready (loaded on inference thread).
+Hot prefix cache: requested capacity=32 but disabled by scheduler
+Context size: 8192 tokens (manual)
+Request timeout: 300s
+Model context length: 8192 tokens
+Reasoning budget: unlimited
+
+Server listening on http://127.0.0.1:18074
+  GET  /
+  GET  /health
+  GET  /props
+  GET  /v1/models
+  POST /v1/chat/completions
+  POST /v1/completions
+  POST /v1/embeddings
+  POST /v1/messages (Anthropic)
+  POST /v1/responses (OpenAI Responses)
+  POST /v1/responses/compact
+  GET  /v1/responses/{id}
+  DEL  /v1/responses/{id}
+  POST /tokenize
+  POST /detokenize
+
+RSS: 68M  Mem: 24%  CPU: 9%  GPU: 35%
+POST /v1/chat/completions (1 msgs, max_tokens=1, temp=0.00, top_p=1.00, top_k=0, stream=false, thinking=false, sys=0b, user=72b, tools=0b, tool_msgs=0) 
+  > "Reply with exactly the integer that is one more than 10. No punctuation."
+  prompt=20 tokens, max_gen=1, ctx=8192
+  <- 20+1 tokens (4426ms) [prefill: 5.2 tok/s, decode: 1.8 tok/s] [length]
+
+Shutting down gracefully...
