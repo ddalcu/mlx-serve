@@ -21,6 +21,20 @@
 #      the row split, with the request completing either way.
 #   5. OFF ARM — without the flag there are ZERO `[ane]` lines (the offload
 #      is strictly opt-in).
+#   5b. NO FAILED EVALS — every arm must log ZERO `[ane] ... eval failed`.
+#      A failed eval falls back to a GPU recompute for that chunk, so the
+#      request still answers correctly and only the RATE moves: the
+#      42-procedure bank whose symbol indices were wrong lost 200 of 210
+#      evals and read as "banks are 23% slower" (2026-08-20).
+#   6. BANKS — programs are PROCEDURE BANKS, so the ready line reports
+#      strictly FEWER banks than covered layers (the ~121-handle runtime
+#      limit is why; one handle per layer is what banks replace), and this
+#      machine reports `units=1`.
+#   7. SPLIT LADDER — a tiny MLX_SERVE_ANE_BANK_MAX_BYTES forces more banks
+#      and coverage must still be FULL: partitioning is a packaging
+#      decision, never a coverage one.
+#   8. DUAL SELF-DISABLE — MLX_SERVE_ANE_DUAL=1 on single-ANE silicon must
+#      say so by name and build units=1, never fail the boot.
 #
 # Rates are NOT compared here (one-run rates are variance; the adoption
 # numbers live in perf-plan-aug-17.md P5). Model default is the small
@@ -131,6 +145,19 @@ if ! grep -q "\[ane\] prefill offload engaged" "$ON_LOG"; then
     rm -f "$ON_LOG"
     exit 1
 fi
+# A failed eval never fails the REQUEST — the seam recomputes that chunk on
+# the GPU — so the only evidence is this line. Silence here is the contract.
+assert_no_eval_failures() { # $1 label, $2 log
+    local n
+    n=$(grep -c "eval failed" "$2")
+    if [ "$n" != "0" ]; then
+        echo -e "${RED}FAIL${NC} $1: $n failed ANE evals — every one silently fell back to a GPU recompute:"
+        grep -m 2 "eval failed" "$2"
+        rm -f "$2"
+        exit 1
+    fi
+}
+assert_no_eval_failures "on arm" "$ON_LOG"
 CONTENT=$(echo "$ON_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
 RATE=$(echo "$ON_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('timings',{}).get('prompt_per_second',0))" 2>/dev/null)
 if [ -z "$CONTENT" ]; then
@@ -171,7 +198,32 @@ if ! grep "prefill offload ready" "$ON_LOG" | grep -q "mode=channel"; then
     rm -f "$ON_LOG"
     exit 1
 fi
-echo "  on arm: ready + engaged (mode=channel, gdn=$GDN_LAYERS), prefill=$RATE tok/s, reply: $(echo "$CONTENT" | head -c 40)"
+# Banks: the ready line names how many programs the layers were packed
+# into, and it must be FEWER than the layers themselves — one handle per
+# layer is exactly what the ~121-handle runtime limit refuses.
+READY_LINE=$(grep "prefill offload ready" "$ON_LOG" | head -1)
+MLP_LAYERS=$(echo "$READY_LINE" | sed -n 's|.* \([0-9][0-9]*\)/[0-9][0-9]* mlp .*|\1|p')
+BANKS=$(echo "$READY_LINE" | sed -n 's/.* in \([0-9][0-9]*\) banks.*/\1/p')
+UNITS=$(echo "$READY_LINE" | sed -n 's/.*units=\([0-9][0-9]*\).*/\1/p')
+if [ -z "$BANKS" ] || [ -z "$UNITS" ] || [ -z "$MLP_LAYERS" ]; then
+    echo -e "${RED}FAIL${NC} ready line does not report units/banks/mlp counts:"
+    echo "$READY_LINE"
+    rm -f "$ON_LOG"
+    exit 1
+fi
+TOTAL_PROGRAMS=$(( MLP_LAYERS + GDN_LAYERS ))
+if [ "$BANKS" -lt 1 ] || [ "$BANKS" -ge "$TOTAL_PROGRAMS" ]; then
+    echo -e "${RED}FAIL${NC} $TOTAL_PROGRAMS programs landed in $BANKS banks — that is per-layer programs, not banks:"
+    echo "$READY_LINE"
+    rm -f "$ON_LOG"
+    exit 1
+fi
+if [ "$UNITS" != "1" ]; then
+    echo -e "${RED}FAIL${NC} default build reports units=$UNITS — dual is opt-in."
+    rm -f "$ON_LOG"
+    exit 1
+fi
+echo "  on arm: ready + engaged (mode=channel, units=1, gdn=$GDN_LAYERS, $TOTAL_PROGRAMS programs in $BANKS banks), prefill=$RATE tok/s, reply: $(echo "$CONTENT" | head -c 40)"
 if [ -d "$ORPHAN" ]; then
     echo -e "${RED}FAIL${NC} orphaned staging dir with a dead-pid marker survived the boot (reap missing)."
     rm -rf "$ORPHAN" "$ON_LOG"
@@ -205,8 +257,78 @@ if [ "$GDN_LAYERS" -gt 0 ]; then
         rm -f "$NOGDN_LOG"
         exit 1
     fi
-    echo "  gdn-off arm: 0 gdn layers, mlp still engaged"
+    assert_no_eval_failures "gdn-off arm" "$NOGDN_LOG"
+echo "  gdn-off arm: 0 gdn layers, mlp still engaged"
     rm -f "$NOGDN_LOG"
+fi
+
+# Split ladder: a tiny bank cap forces the partitioner to make MORE banks,
+# and coverage must stay FULL — how programs are packaged is never allowed
+# to become a coverage decision.
+sleep 2
+LADDER_BODY=""
+export MLX_SERVE_ANE_BANK_MAX_BYTES=4096
+run_arm "ane on, tiny bank cap" "--ane-prefill" LADDER_BODY || { unset MLX_SERVE_ANE_BANK_MAX_BYTES; exit 1; }
+unset MLX_SERVE_ANE_BANK_MAX_BYTES
+LADDER_LOG="$LOGFILE"
+LADDER_READY=$(grep "prefill offload ready" "$LADDER_LOG" | head -1)
+LADDER_BANKS=$(echo "$LADDER_READY" | sed -n 's/.* in \([0-9][0-9]*\) banks.*/\1/p')
+LADDER_MLP=$(echo "$LADDER_READY" | sed -n 's|.* \([0-9][0-9]*\)/[0-9][0-9]* mlp .*|\1|p')
+LADDER_GDN=$(echo "$LADDER_READY" | sed -n 's/.*+ \([0-9][0-9]*\) gdn layers.*/\1/p')
+if [ "${LADDER_MLP:-0}" != "$MLP_LAYERS" ] || [ "${LADDER_GDN:-0}" != "$GDN_LAYERS" ]; then
+    echo -e "${RED}FAIL${NC} a small bank cap changed COVERAGE ($LADDER_MLP/$LADDER_GDN vs $MLP_LAYERS/$GDN_LAYERS):"
+    echo "$LADDER_READY"
+    rm -f "$LADDER_LOG"
+    exit 1
+fi
+if [ "${LADDER_BANKS:-0}" -le "$BANKS" ]; then
+    echo -e "${RED}FAIL${NC} MLX_SERVE_ANE_BANK_MAX_BYTES=4096 did not split further ($LADDER_BANKS vs $BANKS banks):"
+    echo "$LADDER_READY"
+    rm -f "$LADDER_LOG"
+    exit 1
+fi
+if ! grep -q "\[ane\] prefill offload engaged" "$LADDER_LOG"; then
+    echo -e "${RED}FAIL${NC} split banks built but the MLP seam never engaged:"
+    grep "\[ane\]" "$LADDER_LOG" | head -5
+    rm -f "$LADDER_LOG"
+    exit 1
+fi
+assert_no_eval_failures "ladder arm" "$LADDER_LOG"
+echo "  ladder arm: same coverage in $LADDER_BANKS banks (vs $BANKS), still engaged"
+rm -f "$LADDER_LOG"
+
+# Dual on single-ANE silicon: refused BY NAME, still a working single-ANE
+# build. (A real two-instance machine is the tester's arm — see
+# NOTE_TO_TESTER_ANE_DFLASH2.md.)
+if [ "$(sysctl -n machdep.cpu.brand_string 2>/dev/null)" != "${DUAL_CHIP:-}" ] && \
+   ! sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q Ultra; then
+    sleep 2
+    DUAL_BODY=""
+    export MLX_SERVE_ANE_DUAL=1
+    run_arm "ane on, dual asked" "--ane-prefill" DUAL_BODY || { unset MLX_SERVE_ANE_DUAL; exit 1; }
+    unset MLX_SERVE_ANE_DUAL
+    DUAL_LOG="$LOGFILE"
+    if ! grep -q "MLX_SERVE_ANE_DUAL=1 ignored" "$DUAL_LOG"; then
+        echo -e "${RED}FAIL${NC} dual on single-ANE silicon did not self-disable by name:"
+        grep "\[ane\]" "$DUAL_LOG" | head -5
+        rm -f "$DUAL_LOG"
+        exit 1
+    fi
+    if ! grep "prefill offload ready" "$DUAL_LOG" | grep -q "units=1"; then
+        echo -e "${RED}FAIL${NC} dual self-disabled but did not build units=1:"
+        grep "prefill offload ready" "$DUAL_LOG"
+        rm -f "$DUAL_LOG"
+        exit 1
+    fi
+    if ! grep -q "\[ane\] prefill offload engaged" "$DUAL_LOG"; then
+        echo -e "${RED}FAIL${NC} a refused dual request killed the single-ANE seam:"
+        grep "\[ane\]" "$DUAL_LOG" | head -5
+        rm -f "$DUAL_LOG"
+        exit 1
+    fi
+    assert_no_eval_failures "dual arm" "$DUAL_LOG"
+    echo "  dual arm: refused by name on single-ANE silicon, units=1 still engaged"
+    rm -f "$DUAL_LOG"
 fi
 
 # Row-mode lever arm (A1): the non-default split builds + engages; both
@@ -243,6 +365,7 @@ if [ -z "$CHAN_CONTENT" ]; then
     rm -f "$CHAN_LOG"
     exit 1
 fi
+assert_no_eval_failures "row arm" "$CHAN_LOG"
 echo "  row arm: ready + engaged (mode=row, gdn=${CHAN_GDN:-0}), reply: $(echo "$CHAN_CONTENT" | head -c 40)"
 rm -f "$CHAN_LOG"
 

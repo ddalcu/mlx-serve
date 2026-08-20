@@ -14,11 +14,23 @@
 
 struct msv_ane_model {
     void *model;
-    void *request;
+    void *requests; /* NSArray<_ANERequest *>, one per procedure */
+    void *options;  /* NSDictionary passed at compile/load/eval */
     char *staging_directory;
     double compile_seconds;
     bool cache_hit;
 };
+
+/* Instance affinity (oMLX, qwen35_prefill/csrc/qwen35_ane.mm:381). BOTH
+ * keys are required together: the scheduler only honours an instance hint
+ * for its single-ANE procedure variant, so naming a die without the variant
+ * hint is silently ignored. Instance 0 = no hint at all, byte-identical to
+ * the empty dict every single-ANE build has always passed. */
+static NSDictionary *bridge_options(int ane_instance) {
+    if (ane_instance <= 0) return @{};
+    return @{ @"kANEFProcedureVariantHint" : @1,
+              @"kANEFAneInstanceHint" : @(ane_instance) };
+}
 
 static void bridge_fail(char *error, size_t error_size, const char *format,
                         ...) {
@@ -196,11 +208,59 @@ static void bridge_cache_evict(const char *identifier) {
         removeItemAtPath:bridge_cache_entry(@(identifier)) error:nil];
 }
 
+/* Symbol indices for one procedure: oMLX query the model rather than
+ * assuming 0..count-1 (qwen35_ane.mm:724-731), because a bank's procedures
+ * do NOT share one symbol numbering — the identity mapping serves procedure
+ * 0 and fails EVERY other one with a bare "Program Inference error"
+ * (measured 2026-08-20: 200 of 252 evals dead on a 42-procedure bank).
+ *
+ * The selectors live on `_ANEModel`, and `_ANEInMemoryModel` is NOT a
+ * subclass of it (checked: `instancesRespondToSelector:` is NO) — it OWNS
+ * one, reachable through its `-model` accessor once the net is loaded. So
+ * the lookup unwraps first and only then falls back to identity. */
+static id bridge_inner_model(id in_memory_model) {
+    if (![in_memory_model respondsToSelector:@selector(model)]) return nil;
+    return ((id(*)(id, SEL))objc_msgSend)(in_memory_model, @selector(model));
+}
+
+static NSArray *bridge_symbol_indices(id in_memory_model, bool want_input,
+                                      uint32_t proc, uint32_t count) {
+    id model = bridge_inner_model(in_memory_model) ?: in_memory_model;
+    NSString *key = want_input ? @"ANEFModelInputSymbolIndexArray"
+                               : @"ANEFModelOutputSymbolIndexArray";
+    if ([model respondsToSelector:@selector(procedureInfoForProcedureIndex:)]) {
+        id info = ((id(*)(id, SEL, unsigned int))objc_msgSend)(
+            model, @selector(procedureInfoForProcedureIndex:), proc);
+        if ([info isKindOfClass:[NSDictionary class]]) {
+            id indices = ((NSDictionary *)info)[key];
+            if ([indices isKindOfClass:[NSArray class]] &&
+                [(NSArray *)indices count] == count)
+                return indices;
+        }
+    }
+    NSMutableArray *identity = [NSMutableArray array];
+    for (uint32_t i = 0; i < count; i++) [identity addObject:@(i)];
+    return identity;
+}
+
+/* Whether the loaded model can answer the symbol query at all. A bank of
+ * more than one procedure CANNOT be served without it — identity indices
+ * make every procedure past the first fail at eval, which reads as a slow
+ * offload rather than a broken one — so the create is refused by name and
+ * the caller's split ladder walks down to banks of one. */
+static bool bridge_has_symbol_api(id in_memory_model) {
+    id model = bridge_inner_model(in_memory_model) ?: in_memory_model;
+    return model &&
+        [model respondsToSelector:@selector(procedureInfoForProcedureIndex:)];
+}
+
 msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                                   void *weight_bytes_owned, size_t weight_bytes,
                                   IOSurfaceRef *input_surfaces,
                                   uint32_t input_count, IOSurfaceRef output,
+                                  uint32_t procedure_count, int ane_instance,
                                   char *error, size_t error_size) {
+    if (!procedure_count) procedure_count = 1;
     if (!msv_ane_bridge_available()) {
         free(weight_bytes_owned);
         bridge_fail(error, error_size, "the Neural Engine bridge is "
@@ -295,10 +355,11 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                encoding:NSUTF8StringEncoding
                   error:nil];
         handle->staging_directory = strdup(directory.UTF8String);
+        NSDictionary *options = bridge_options(ane_instance);
         double started = bridge_seconds();
         bool loaded = cached &&
             ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(loadWithQoS:options:error:), 21, @{},
+                model, @selector(loadWithQoS:options:error:), 21, options,
                 &failure);
         if (cached && !loaded) {
             failure = nil;
@@ -306,8 +367,8 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
         }
         if (!loaded) {
             if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(compileWithQoS:options:error:), 21, @{},
-                    &failure)) {
+                    model, @selector(compileWithQoS:options:error:), 21,
+                    options, &failure)) {
                 bridge_fail(error, error_size, "ANE %s compile failed: %s",
                             name, failure ?
                             failure.localizedDescription.UTF8String : "?");
@@ -317,7 +378,7 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                 return NULL;
             }
             if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(loadWithQoS:options:error:), 21, @{},
+                    model, @selector(loadWithQoS:options:error:), 21, options,
                     &failure)) {
                 bridge_fail(error, error_size, "ANE %s load failed: %s", name,
                             failure ?
@@ -352,44 +413,73 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
         handle->cache_hit = loaded;
         handle->compile_seconds = bridge_seconds() - started;
         NSMutableArray *inputs = [NSMutableArray array];
-        NSMutableArray *indices = [NSMutableArray array];
-        for (uint32_t index = 0; index < input_count; index++) {
+        for (uint32_t index = 0; index < input_count; index++)
             [inputs addObject:((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
                 surfaceClass, @selector(objectWithIOSurface:),
                 input_surfaces[index])];
-            [indices addObject:@(index)];
-        }
         id wrapped = ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
             surfaceClass, @selector(objectWithIOSurface:), output);
-        id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))
-                      objc_msgSend)(
-            requestClass,
-            @selector(requestWithInputs:inputIndices:outputs:outputIndices:
-                      weightsBuffer:perfStats:procedureIndex:),
-            inputs, indices, @[wrapped], @[@0], nil, nil, @0);
-        if (!request) {
-            bridge_fail(error, error_size, "ANE %s request rejected", name);
+        /* One request per procedure: a bank's procedures share the surfaces
+         * but each carries its own procedureIndex. */
+        if (procedure_count > 1 && !bridge_has_symbol_api(model)) {
+            bridge_fail(error, error_size, "ANE %s: this framework build "
+                        "exposes no per-procedure symbol indices, so a bank "
+                        "of %u cannot be dispatched", name, procedure_count);
+            handle->model = (__bridge_retained void *)model;
             msv_ane_model_free(handle);
             return NULL;
         }
+        NSMutableArray *requests = [NSMutableArray array];
+        for (uint32_t proc = 0; proc < procedure_count; proc++) {
+            NSArray *in_indices =
+                bridge_symbol_indices(model, true, proc, input_count);
+            NSArray *out_indices =
+                bridge_symbol_indices(model, false, proc, 1);
+            id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))
+                          objc_msgSend)(
+                requestClass,
+                @selector(requestWithInputs:inputIndices:outputs:outputIndices:
+                          weightsBuffer:perfStats:procedureIndex:),
+                inputs, in_indices, @[wrapped], out_indices, nil, nil,
+                @(proc));
+            if (!request) {
+                bridge_fail(error, error_size,
+                            "ANE %s request rejected for procedure %u", name,
+                            proc);
+                handle->model = (__bridge_retained void *)model;
+                msv_ane_model_free(handle);
+                return NULL;
+            }
+            [requests addObject:request];
+        }
         handle->model = (__bridge_retained void *)model;
-        handle->request = (__bridge_retained void *)request;
+        handle->requests = (__bridge_retained void *)requests;
+        handle->options = (__bridge_retained void *)options;
     }
     return handle;
 }
 
-int msv_ane_model_eval(msv_ane_model *handle, char *error, size_t error_size) {
-    if (!handle || !handle->model || !handle->request) {
+int msv_ane_model_eval(msv_ane_model *handle, uint32_t procedure, char *error,
+                       size_t error_size) {
+    if (!handle || !handle->model || !handle->requests) {
         bridge_fail(error, error_size, "the ANE model is not loaded");
         return 0;
     }
     int ok = 0;
     @autoreleasepool {
+        NSArray *requests = (__bridge NSArray *)handle->requests;
+        if (procedure >= requests.count) {
+            bridge_fail(error, error_size, "ANE procedure %u is outside the "
+                        "bank's %lu procedures", procedure,
+                        (unsigned long)requests.count);
+            return 0;
+        }
         NSError *failure = nil;
         ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
             (__bridge id)handle->model,
-            @selector(evaluateWithQoS:options:request:error:), 21, @{},
-            (__bridge id)handle->request, &failure) ? 1 : 0;
+            @selector(evaluateWithQoS:options:request:error:), 21,
+            (__bridge id)handle->options, requests[procedure],
+            &failure) ? 1 : 0;
         if (!ok)
             bridge_fail(error, error_size, "ANE evaluation failed: %s",
                         failure ?
@@ -428,7 +518,9 @@ int msv_ane_model_reload(msv_ane_model *handle, char *error, size_t error_size) 
         NSError *failure = nil;
         if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
                 (__bridge id)handle->model,
-                @selector(loadWithQoS:options:error:), 21, @{}, &failure)) {
+                @selector(loadWithQoS:options:error:), 21,
+                handle->options ? (__bridge id)handle->options : @{},
+                &failure)) {
             bridge_fail(error, error_size, "ANE reload failed: %s",
                         failure ?
                         failure.localizedDescription.UTF8String : "?");
@@ -447,9 +539,13 @@ void msv_ane_model_free(msv_ane_model *handle) {
             ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
                 model, @selector(unloadWithQoS:error:), 21, &failure);
         }
-        if (handle->request) {
-            id request = (__bridge_transfer id)handle->request;
-            (void)request;
+        if (handle->requests) {
+            id requests = (__bridge_transfer id)handle->requests;
+            (void)requests;
+        }
+        if (handle->options) {
+            id options = (__bridge_transfer id)handle->options;
+            (void)options;
         }
         if (handle->staging_directory) {
             [[NSFileManager defaultManager]

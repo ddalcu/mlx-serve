@@ -4059,8 +4059,26 @@ fn renderPropsBody(
 /// holding" is answerable without log-grepping. Pure — the handler feeds
 /// it the engine's fields; returns a leading-comma fragment spliced before
 /// the props root close (empty when there is no engine).
-fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, evals: u64, eval_failures: u64) ![]u8 {
-    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d}}}", .{ mode_name, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures });
+/// One ANE unit's dispatch evidence. Under dual this is the ONLY in-process
+/// proof that both dies were addressed — a silently ignored affinity hint
+/// looks identical from here, so the counters pair with the out-of-process
+/// `macpow --dump | grep ANE0_` check, never replace it.
+const AneUnitStat = struct { instance: i64, evals: u64, eval_failures: u64 };
+
+fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, units: []const AneUnitStat) ![]u8 {
+    var evals: u64 = 0;
+    var eval_failures: u64 = 0;
+    for (units) |u| {
+        evals += u.evals;
+        eval_failures += u.eval_failures;
+    }
+    var rows_buf: [512]u8 = undefined;
+    var used: usize = 0;
+    for (units, 0..) |u, i| {
+        const row = try std.fmt.bufPrint(rows_buf[used..], "{s}{{\"instance\":{d},\"evals\":{d},\"eval_failures\":{d}}}", .{ if (i == 0) "" else ",", u.instance, u.evals, u.eval_failures });
+        used += row.len;
+    }
+    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"units\":{d},\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d},\"unit_evals\":[{s}]}}", .{ mode_name, units.len, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures, rows_buf[0..used] });
 }
 
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
@@ -4116,7 +4134,13 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const ane_json = blk: {
         if (lm.transformer) |x| {
             if (x.ane_prefill) |eng| {
-                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, eng.evals_ok.load(.monotonic), eng.evals_failed.load(.monotonic));
+                var stats: [ane_mod.MAX_UNITS]AneUnitStat = undefined;
+                for (eng.units, 0..) |*u, i| stats[i] = .{
+                    .instance = u.instance,
+                    .evals = u.evals_ok.load(.monotonic),
+                    .eval_failures = u.evals_failed.load(.monotonic),
+                };
+                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
             }
         }
         break :blk try allocator.dupe(u8, "");
@@ -15176,9 +15200,10 @@ test "renderPropsBody omits chat_template" {
 }
 
 test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {
-    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, 112, 0);
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 112, .eval_failures = 0 }};
+    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &one);
     defer testing.allocator.free(frag);
-    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104,\"evals\":112,\"eval_failures\":0}", frag);
+    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"units\":1,\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104,\"evals\":112,\"eval_failures\":0,\"unit_evals\":[{\"instance\":0,\"evals\":112,\"eval_failures\":0}]}", frag);
     // Spliced into a props body it stays valid JSON with the object present.
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5_moe";
@@ -15194,6 +15219,31 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     // harness reads: zero with a green boot = built-but-never-dispatched.
     try testing.expectEqual(@as(i64, 112), ane.object.get("evals").?.integer);
     try testing.expectEqual(@as(i64, 0), ane.object.get("eval_failures").?.integer);
+
+    // Dual: `evals` is the TOTAL, and `unit_evals` names each die. A
+    // silently ignored affinity hint is invisible in-process — both units
+    // report evals and both land on one ANE — so this row is what a tester
+    // cross-checks against `macpow --dump | grep ANE0_`, which must show
+    // BOTH counters moving.
+    const two = [_]AneUnitStat{
+        .{ .instance = 1, .evals = 112, .eval_failures = 0 },
+        .{ .instance = 2, .evals = 112, .eval_failures = 3 },
+    };
+    const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
+    defer testing.allocator.free(dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, dual);
+    defer testing.allocator.free(dual_body);
+    var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
+    defer dual_parsed.deinit();
+    const dane = dual_parsed.value.object.get("ane").?.object;
+    try testing.expectEqual(@as(i64, 2), dane.get("units").?.integer);
+    try testing.expectEqual(@as(i64, 224), dane.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 3), dane.get("eval_failures").?.integer);
+    const rows_json = dane.get("unit_evals").?.array;
+    try testing.expectEqual(@as(usize, 2), rows_json.items.len);
+    try testing.expectEqual(@as(i64, 1), rows_json.items[0].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 2), rows_json.items[1].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 112), rows_json.items[1].object.get("evals").?.integer);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {

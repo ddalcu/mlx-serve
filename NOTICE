@@ -81,9 +81,22 @@ Used in mlx-serve (`src/transformer.zig`):
   * The per-dispatch key-chunk budget in the head-dim-256 fused causal
     attention path, whose design comes from `qwen35_fa256_attention.py`.
 
+Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
+
+  * The Neural Engine instance-affinity option keys and the requirement that
+    they be passed together, from `custom_kernels/qwen35_prefill/csrc/
+    qwen35_ane.mm`; the per-procedure request construction and the practice
+    of reading a procedure's symbol indices from the model rather than
+    assuming them come from the same file.
+  * The procedure-bank program layout (many linears as procedures inside one
+    compiled program) as a response to the runtime's resident-handle limit.
+
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the fa256
 chunking carries exact online-softmax state between dispatches so a chunked run
-is bit-identical to a single dispatch.
+is bit-identical to a single dispatch. The ANE MIL emitter is our own
+(`constexpr_affine_dequantize` with an int8 zero point, our K-chunked down
+conv and power-of-two accumulator wrap); only the bank structure and the
+affinity handle are theirs.
 
 --------------------------------------------------------------------------------
 jinja.cpp

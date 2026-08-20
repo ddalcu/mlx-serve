@@ -24,15 +24,27 @@ IOSurfaceRef msv_ane_bridge_surface(size_t bytes);
 
 /* Compile (or restore from the compile cache) and load one MIL program.
  * Takes ownership of the malloc'd weights blob. The input surfaces bind to
- * indices 0..input_count-1 and `output` to output index 0. */
+ * indices 0..input_count-1 and `output` to output index 0.
+ *
+ * `procedure_count` is how many `procedureNNN` functions the MIL declares
+ * (1 for a plain `main` program): one _ANERequest is built per procedure
+ * and dispatched by index, all sharing the same surfaces.
+ *
+ * `ane_instance` pins the program to one Neural Engine die: 0 keeps the
+ * empty options dict (no affinity — the driver schedules it), 1..4 pass
+ * kANEFAneInstanceHint together with the single-ANE procedure-variant hint.
+ * BOTH keys are required — the scheduler only honours an instance hint for
+ * the single-ANE variant. */
 msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                                   void *weights, size_t weight_bytes,
                                   IOSurfaceRef *inputs, uint32_t input_count,
                                   IOSurfaceRef output,
+                                  uint32_t procedure_count, int ane_instance,
                                   char *error, size_t error_size);
 void msv_ane_model_free(msv_ane_model *model);
 
-int msv_ane_model_eval(msv_ane_model *model, char *error, size_t error_size);
+int msv_ane_model_eval(msv_ane_model *model, uint32_t procedure, char *error,
+                       size_t error_size);
 
 /* Residency rotation: unload releases the wired compiled net but keeps the
  * handle and request; reload re-wires it from the compile cache. */

@@ -3233,3 +3233,137 @@ fully restored 133-135 / 5.45, persisting in both post-reboot arms. Root cause u
 process — the state lived in the OS: aned, Metal, or memory pressure). The rule for
 benching: when a spec cell collapses and a fresh server boot doesn't recover it, stop
 attributing to the build — reboot the machine and re-baseline before concluding anything.
+
+## Dual ANE: procedure banks, instance pinning, and why the proof is out-of-process (2026-08-20)
+
+Everything before this round used exactly ONE Neural Engine. `ane_bridge.m`
+passed an empty `@{}` options dict at every `compileWithQoS:` /
+`loadWithQoS:` / `evaluateWithQoS:` site, so no device was ever named and
+aned scheduled wherever it liked. The M3 Ultra tester round (2026-08-19)
+measured what that means: two physical services (`H11ANE`/`H11ANE1`), two
+IOReport counters, and essentially all energy on `ANE0_0` across all 11 runs
+while `ANE0_1` stayed flat. `src/ane.zig` was structurally single-ANE too —
+strictly serial evals, which is the only reason the A9 shared I/O planes
+were legal.
+
+### The affinity handle needs BOTH keys
+
+oMLX found it (`omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm:381`):
+
+```objc
+@{ @"kANEFProcedureVariantHint" : @1,
+   @"kANEFAneInstanceHint" : @(ane_instance) }
+```
+
+passed to compile, load AND eval — the same dict at all three, plus our
+reload site. The variant hint is not decoration: the scheduler only honours
+an instance hint for its single-ANE procedure variant, so naming a die
+without it is silently ignored. Their measurement: two pinned evals 41.51 ms
+against one unpinned eval 57.90 ms for the same work (28.3% faster), and a
+full dual path at 1.356x over GPU-only on the M3 Ultra. They also state the
+driver does NOT stripe one procedure across dies, which independently
+matches our tester's idle `ANE0_1`.
+
+Instance 0 keeps the literal `@{}` dict, so every single-ANE build — the M4
+row, and an Ultra with dual off — is byte-identical to before.
+
+### ~121 resident handles is why programs are BANKS
+
+The private runtime accepted only ~121 resident model handles in oMLX's
+probe. We created one handle per layer (64 MLP + 48 GDN = 112 on the 27B),
+so a naive dual build would want 224 and would hit the wall. Every covered
+layer's slice is now one `func procedureNNN` inside ONE program, with one
+`_ANERequest` per procedure carrying its own `procedureIndex`. ### A procedure's symbol indices come from `procedureInfoForProcedureIndex:`, and nothing else answers
+
+Procedure N's request must bind surfaces to symbol index N, not to 0. Three
+layers of this were wrong before it worked, and none of them errored:
+
+1. **The selectors live on `_ANEModel`; `_ANEInMemoryModel` is not a
+   subclass of it.** It OWNS one, behind a `-model` accessor
+   (`instancesRespondToSelector:` on the in-memory class returns NO; its
+   ivar list carries `_model : @"_ANEModel"`).
+2. **`inputSymbolIndicesForProcedureIndex:` /
+   `outputSymbolIndicesForProcedureIndex:` return `0` for EVERY procedure**
+   even asked on the right object — measured, all 24 procedures of an MLP
+   bank.
+3. **`procedureInfoForProcedureIndex:` is the one that answers**, as a
+   dictionary: `{ANEFModelInputSymbolIndexArray = (N);
+   ANEFModelOutputSymbolIndexArray = (N); ANEFModelProcedureID = N;}`. That
+   is what we read.
+
+The failure mode is why this is written down. Identity indices are CORRECT
+for procedure 0 and wrong for every other one, so on a 5-chunk prefill
+exactly 10 of 210 evals succeeded — one per bank per chunk — and the other
+200 came back `ANEProgramProcessRequestDirect() ... Program Inference
+error`. The seam's per-chunk GPU recompute swallowed every one, the answer
+stayed correct, and the whole thing read as **banks costing 23% of prefill**
+(5.37k vs 7.01k tok/s, three counterbalanced reps). It is not a cost: with
+the indices right, banks measure 5658 against per-layer's 5715 tok/s on the
+same boot discipline — a wash, as expected for a packaging change. The tell
+was `eval_failures`, never the rate, which is why every arm of
+`tests/test_ane_prefill.sh` now asserts zero of them. A bank of more than
+one procedure is also REFUSED by name when the procedure-info API cannot be
+reached, so the split ladder walks down to banks of one rather than shipping
+a bank that evaluates into the fallback.
+
+MIL function scopes ought to be per-function, but a bank is not worth
+betting a silent compile failure on: every emitted tensor and const name
+carries its procedure index. The op set stays OURS —
+`constexpr_affine_dequantize` with `zero_point=int8(0)`;
+`constexpr_blockwise_shift_scale` is on the known-bad list above (it crashes
+the compile helper) and oMLX's emitter is not adopted wholesale.
+
+The content-hash cache key covers MIL text plus weights, so a bank is
+naturally ONE large cache entry instead of N small ones.
+
+### The bank cap is TWO constraints wearing one number
+
+oMLX hit an `0x20004` load failure once a bank exceeded roughly a 4 GiB
+per-instance device address window. Independently, our builder holds a
+group's quantized payloads AND the assembled blob at once, so the cap is
+also the build's transient host peak (2x). `MLX_SERVE_ANE_BANK_MAX_BYTES`
+(default 2 GiB) governs both, and `bankGroupLen` partitions by it. Under the
+cap a model banks monolithically — which is what oMLX measured bit-stable
+across five greedy runs, against split banks that were ~1% faster but
+occasionally diverged at a tie.
+
+A refused bank walks a LADDER: halve the program count, retry, halve again,
+and only a bank of ONE that still fails drops its layer to the GPU. The
+ladder is load-bearing, not defensive: the 27B at share 0.35 is ~7.3 GB of
+int8, ~3.65 GB per unit under dual, right against the observed window.
+
+### Per-instance OUTPUT planes are mandatory; the input copy is deliberate
+
+A9's shared planes assume serial evals. Concurrent units break that
+assumption for outputs outright. For the INPUT it is subtler: two live evals
+reading one surface is an unproven read-concurrency assumption on private
+API whose failure mode is silently wrong numbers, not an error. So the pack
+happens once and is memcpy'd into each unit's plane (~1.7 ms on the 27B
+against a ~20 ms eval), and `MLX_SERVE_ANE_DUAL_SHARE_INPUT=1` is the lever
+to try the optimisation once dual itself is proven.
+
+The pack wait stays BLOCKING and on the inference thread. oMLX measured that
+moving it to a worker, or launching the ANE from the Metal completion
+callback, destroyed device overlap — a fused layer went 47.5 ms → 71.0 ms —
+and that persistent high-priority eval workers regressed against
+short-lived paired launches.
+
+### MLX_SERVE_ANE_SPLIT stays the TOTAL share
+
+The share is the fraction of channels taken off the GPU, halved across the
+units, so every measurement in the sections above and every row of
+`ane.defaultShare` carries over unchanged. Unit u takes channels
+`[u*k, (u+1)*k)`, the GPU takes `[units*k, width)`, every boundary
+`CHANNEL_ALIGN`-aligned. The prediction is that the optimum RISES from the
+M3 Ultra's 0.35 — halving the ANE critical path is the whole point, and
+oMLX landed at 0.53 MLP / 0.50 GDN — but that is a re-sweep, never an
+interpolation.
+
+### A silently ignored hint cannot be detected in-process
+
+This is why `/props` `"ane"` grew `units` and a `unit_evals` row per
+instance, and why the deliverable includes the `macpow --dump | grep ANE0_`
+cross-check rather than treating it as a nicety. A REJECTED load fails by
+name and falls back. An IGNORED hint looks exactly like success: both units'
+evals succeed, both land on one die, and the only evidence is that one
+IOReport counter never moves. Either failure is itself the result.
