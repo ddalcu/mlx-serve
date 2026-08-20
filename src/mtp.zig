@@ -62,9 +62,14 @@ pub const MAX_DEPTH: u32 = 8;
 ///     cliff; auto at cap 6 measured 10.64, barely over --no-mtp's 10.57).
 /// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrandString`
 /// (the GPU arch string cannot tell Ultra from Max); "" lands on default.
-pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) u32 {
-    if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return 4;
-    return default_cap;
+/// The row carries its own LABEL so the resolve site can say which one it
+/// applied: a bare depth=4 in the spec-stats line is indistinguishable from
+/// the EV controller having picked 4 on its own, or from `--mtp-depth 4`.
+pub const DepthCap = struct { cap: u32, label: []const u8 };
+
+pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
+    if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro" };
+    return .{ .cap = default_cap, .label = "default" };
 }
 
 pub fn chipBrandString(buf: []u8) []const u8 {
@@ -4205,9 +4210,18 @@ test "mtp: draftTop32 matches a host top-32 reference (bf16, ties, -inf)" {
     }
 }
 
+test "adaptiveDepthCapForMachine names the row it applied" {
+    // The cap must be nameable at runtime or an M1 Pro's depth=4 is
+    // indistinguishable from the EV controller having chosen 4 by itself —
+    // same reason `dflash.blockCapForMachine` carries a label.
+    try testing.expectEqualStrings("m1-pro", adaptiveDepthCapForMachine("Apple M1 Pro", 6).label);
+    try testing.expectEqualStrings("default", adaptiveDepthCapForMachine("Apple M4 Max", 6).label);
+    try testing.expectEqualStrings("default", adaptiveDepthCapForMachine("", 6).label);
+}
+
 test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the default" {
-    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M1 Pro", 6));
-    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6));
-    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6));
-    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6));
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M1 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6).cap);
 }

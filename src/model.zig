@@ -775,6 +775,34 @@ pub const ModelConfig = struct {
         return self.canvas_length > 0;
     }
 
+    /// Pure-config half of "can this arch ride the batched GatedDeltaNet
+    /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
+    /// GDN trunk with periodic full attention, i.e. the qwen3_5 family.
+    ///
+    /// This exists because the answer is needed in TWO places that see
+    /// different things: `server.zig` decides whether `--max-concurrent`
+    /// clamps to 1 with only a ModelConfig in hand, while
+    /// `Transformer.supportsBatchedGdnDecode` also checks the built layer
+    /// set. Both MUST read this predicate — when they were hand-rolled
+    /// separately, the server kept clamping qwen3_5 to serial decode while
+    /// the scheduler was happily batching it, so `--max-concurrent 4` (the
+    /// obvious serving config) silently DISABLED the batched path.
+    ///
+    /// Says nothing about MoE/hybrid archs that merely share the same
+    /// forward — those stay serial, by name, in both callers.
+    pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        if (self.full_attention_interval == 0) return false; // not a GDN trunk
+        if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
+        if (self.is_encoder_only) return false;
+        if (self.isMoe()) return false; // routed experts: not modelled yet
+        if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
+        if (self.isDiffusion()) return false;
+        if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
+        if (std.mem.eql(u8, self.model_type, "laguna")) return false;
+        if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
+        return true;
+    }
+
     /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
     /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
     /// proportional RoPE on full layers). DiffusionGemma reuses the Gemma 4

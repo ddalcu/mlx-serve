@@ -1277,7 +1277,14 @@ pub fn serve(
     // `runSingleDecodeTick` — sequential through the inference thread,
     // safe).
     if (max_concurrent > 1) {
-        if (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()) {
+        // A dense GatedDeltaNet trunk (qwen3_5 family) has its OWN batched
+        // kernel since `forwardMoeBatchedDecode`, so it is no longer part of
+        // the hybrid clamp — ask the shared predicate rather than re-deriving
+        // the arch list here, or this site silently disables batching that
+        // the scheduler is willing to do.
+        if (!config.supportsBatchedGdnDecode() and
+            (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()))
+        {
             log.info("Concurrency: requested {d} but model is hybrid/MoE/encoder; falling back to 1\n", .{max_concurrent});
             max_concurrent = 1;
         } else {

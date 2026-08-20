@@ -2959,6 +2959,7 @@ pub const SlidingView = struct {
 };
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
+var gdn_batched_logged: bool = false; // one-shot log guard
 pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) SlidingView {
     // Keyed on the kernel's OWN floor: it declines everything below
     // FUSED256_MIN_Q_LEN, so a spec-verify block (4-8 wide) is never
@@ -4800,6 +4801,20 @@ pub const ForwardCtx = struct {
     /// certified-below-the-winner elsewhere — exactly enough for an argmax,
     /// not for a tail distribution. Default false = dense path everywhere.
     argmax_only: bool = false,
+    /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
+    /// Non-null means: this forward runs at `batch == batch_slots.len`,
+    /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
+    /// here — NOT on `ctx.cache`, which is only a shape donor in this mode.
+    /// The GDN layers need no branch (their state is merged into this ctx's
+    /// `ssm_entries` at B=N and split back out by the driver); only the
+    /// full-attention layers do, because K/V lengths differ per slot and
+    /// each slot ropes at its own offset.
+    ///
+    /// `batch_rope_offsets` is the matching int32 `[N]` offset array for
+    /// `mlx_fast_rope_dynamic` — already carrying each slot's M-RoPE delta,
+    /// so the attention layer never re-derives a per-slot offset.
+    batch_slots: ?[]const *ForwardCtx = null,
+    batch_rope_offsets: ?mlx.mlx_array = null,
 };
 
 // ── Decode quantized-KV attention kernel (docs/kv-quant-perf.md) ──
@@ -9887,6 +9902,241 @@ pub const Transformer = struct {
         return out;
     }
 
+    /// Batched decode for a GatedDeltaNet trunk (qwen3_5 family), the hybrid
+    /// twin of `forwardBatchedDecode`.
+    ///
+    /// Why this exists: without it, concurrent requests on a GDN model decode
+    /// strictly serially, so N streams read the whole weight set N times.
+    /// Batching reads it ONCE — measured against oMLX/mlx-lm, which batch
+    /// these models and were ~2x our aggregate throughput at 4 streams.
+    ///
+    /// The trick is that `forwardMoeWith` is already batch-generic: every
+    /// projection, norm, MLP and the GDN recurrence kernel (whose grid is
+    /// `B*Hv` on the z axis) take B=N unchanged. Only two things are per-slot:
+    ///
+    ///   - the GDN recurrent state — merged here into ONE [N, …] entry per
+    ///     layer and split back after, so the layers never learn about slots;
+    ///   - the KV cache of the full-attention layers — left in place and
+    ///     handled by the `ctx.batch_slots` branch in `gatedFullAttnWith`,
+    ///     because kv_len differs per slot and cannot be a single tensor.
+    ///
+    /// Returns N logits arrays `[1,1,V]`, caller owns each and the slice.
+    pub fn forwardMoeBatchedDecode(
+        self: *Transformer,
+        next_tokens: []const u32,
+        ctxs: []const *ForwardCtx,
+        rope_offsets: []const u32,
+    ) ![]mlx.mlx_array {
+        const N: c_int = @intCast(next_tokens.len);
+        std.debug.assert(next_tokens.len == ctxs.len);
+        std.debug.assert(next_tokens.len == rope_offsets.len);
+        std.debug.assert(N >= 1);
+        const ml = self.moe_layers orelse return error.BatchedGdnRequiresMoeLayers;
+        if (!gdn_batched_logged) {
+            gdn_batched_logged = true;
+            log.info("[batched] gdn batched decode engaged (slots={d})\n", .{next_tokens.len});
+        }
+
+        // [N,1] tokens.
+        var token_buf = try self.allocator.alloc(i32, next_tokens.len);
+        defer self.allocator.free(token_buf);
+        for (next_tokens, 0..) |t, i| token_buf[i] = @intCast(t);
+        const tok_shape = [_]c_int{ N, 1 };
+        const token_arr = mlx.mlx_array_new_data(token_buf.ptr, &tok_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(token_arr);
+
+        // Per-slot RoPE offsets, each already carrying its own M-RoPE delta.
+        var off_buf = try self.allocator.alloc(i32, rope_offsets.len);
+        defer self.allocator.free(off_buf);
+        for (rope_offsets, 0..) |o, i| {
+            const d: i32 = if (ctxs[i].mrope_pos != null) ctxs[i].mrope_delta else 0;
+            off_buf[i] = @as(i32, @intCast(o)) + d;
+        }
+        const off_shape = [_]c_int{N};
+        const rope_offset_arr = mlx.mlx_array_new_data(off_buf.ptr, &off_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(rope_offset_arr);
+
+        // Merge each linear layer's per-slot GDN state into one B=N entry.
+        // A layer whose state is not initialized on EVERY slot cannot be
+        // merged (widths would disagree) — the caller gates on
+        // `batchedGdnReady`. Reusing the previous tick's merged buffer instead
+        // of rebuilding it was tried and measured flat (90.7 vs 91.0 tok/s
+        // aggregate at 4 streams), so the simple version is what ships.
+        const merged = try self.allocator.alloc(SSMCacheEntry, ml.len);
+        defer self.allocator.free(merged);
+        for (merged) |*m| m.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
+        defer for (merged) |*m| {
+            if (m.conv_state.ctx != null) _ = mlx.mlx_array_free(m.conv_state);
+            if (m.ssm_state.ctx != null) _ = mlx.mlx_array_free(m.ssm_state);
+        };
+        for (ml, 0..) |*lw, l| {
+            if (!lw.is_linear) continue;
+            merged[l] = try self.mergeSsmAcrossSlots(ctxs, l);
+        }
+
+        // Scratch ctx. `cache` is never read on this path — the batched branch
+        // in `gatedFullAttnWith` goes to the slot caches — but the field is
+        // non-optional, so slot 0's stands in. `moe_seq_offset` likewise only
+        // feeds the scalar-RoPE path the batched branch replaces.
+        var scratch_offset: usize = rope_offsets[0];
+        var bctx: ForwardCtx = .{
+            .cache = ctxs[0].cache,
+            .moe_seq_offset = &scratch_offset,
+            .ssm_entries = merged,
+            .capture_hidden = null,
+            .vision_embeddings = null,
+            .batch_slots = ctxs,
+            .batch_rope_offsets = rope_offset_arr,
+        };
+
+        const logits = try self.forwardMoeWith(&bctx, token_arr);
+        defer _ = mlx.mlx_array_free(logits);
+
+        // Hand the advanced state back to the slots it came from, as views,
+        // and record the handles so next tick can prove nothing moved.
+        for (merged, 0..) |*m, li| {
+            if (!ml[li].is_linear) continue;
+            try self.splitSsmToSlots(m, ctxs, li);
+        }
+
+        const lshape = mlx.getShape(logits);
+        const vocab: c_int = lshape[2];
+        const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
+        errdefer self.allocator.free(out);
+        for (out, 0..) |*slot, i| {
+            const i_c: c_int = @intCast(i);
+            const start = [_]c_int{ i_c, 0, 0 };
+            const stop = [_]c_int{ i_c + 1, 1, vocab };
+            const strides = [_]c_int{ 1, 1, 1 };
+            slot.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(slot, logits, &start, 3, &stop, 3, &strides, 3, self.s));
+        }
+        return out;
+    }
+
+    /// Concatenate every slot's `[1, …]` GDN state for one layer into a single
+    /// `[N, …]` entry. Both halves are concatenated on axis 0 — the batch axis
+    /// the recurrence kernel already indexes with `b_idx`.
+    fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
+        var out: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+        errdefer {
+            _ = mlx.mlx_array_free(out.conv_state);
+            _ = mlx.mlx_array_free(out.ssm_state);
+        }
+        const conv = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        defer self.allocator.free(conv);
+        const ssm = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        defer self.allocator.free(ssm);
+        for (ctxs, 0..) |c, i| {
+            const e = &c.ssm_entries.?[layer];
+            conv[i] = e.conv_state;
+            ssm[i] = e.ssm_state;
+        }
+        const cvec = mlx.mlx_vector_array_new_data(conv.ptr, conv.len);
+        defer _ = mlx.mlx_vector_array_free(cvec);
+        try mlx.check(mlx.mlx_concatenate_axis(&out.conv_state, cvec, 0, self.s));
+        const svec = mlx.mlx_vector_array_new_data(ssm.ptr, ssm.len);
+        defer _ = mlx.mlx_vector_array_free(svec);
+        try mlx.check(mlx.mlx_concatenate_axis(&out.ssm_state, svec, 0, self.s));
+        return out;
+    }
+
+    /// Inverse of `mergeSsmAcrossSlots`: hand row i of the advanced state back
+    /// to slot i, replacing what it held.
+    ///
+    /// The rows are handed over as SLICE VIEWS, not copies. mlx arrays are
+    /// refcounted, so each view keeps the merged parent alive and the slot
+    /// owns a perfectly valid state array — while the copy this used to make
+    /// was the single most expensive thing on the batched path: the GDN state
+    /// is ~2 MB per layer per slot, so materializing it here cost a full extra
+    /// read+write of the whole trunk state (hundreds of MB) every step, for
+    /// nothing. Next tick's merge concatenates the views straight back.
+    ///
+    /// Safe because the one consumer that must outlive the parent — the
+    /// prefix-cache checkpoint (`captureSsmCheckpoint`) — already takes
+    /// `materializedOwnedCopy` + a batched eval of whatever it is handed, so
+    /// no view escapes into storage. Do NOT read that guarantee off the
+    /// similarly-named `ssmSnapshot`: the PLD-rollback snapshot deliberately
+    /// shares the handle (transient, per-decode-step), so a snapshot taken
+    /// while these views are live pins the whole merged [N, …] parent until
+    /// the rollback window closes. Bounded, but it is the same retention
+    /// shape as the 3.4x hot-cache under-count.
+    fn splitSsmToSlots(self: *Transformer, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
+        const cshape = mlx.getShape(m.conv_state);
+        const sshape = mlx.getShape(m.ssm_state);
+        for (ctxs, 0..) |c, i| {
+            const i_c: c_int = @intCast(i);
+            var e = &c.ssm_entries.?[layer];
+
+            var conv_slice = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(conv_slice);
+            const c_start = [_]c_int{ i_c, 0, 0 };
+            const c_stop = [_]c_int{ i_c + 1, cshape[1], cshape[2] };
+            const c_str = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&conv_slice, m.conv_state, &c_start, 3, &c_stop, 3, &c_str, 3, self.s));
+            var conv_own = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&conv_own, conv_slice);
+            if (e.conv_state.ctx != null) _ = mlx.mlx_array_free(e.conv_state);
+            e.conv_state = conv_own;
+
+            var ssm_slice = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ssm_slice);
+            const s_start = [_]c_int{ i_c, 0, 0, 0 };
+            const s_stop = [_]c_int{ i_c + 1, sshape[1], sshape[2], sshape[3] };
+            const s_str = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&ssm_slice, m.ssm_state, &s_start, 4, &s_stop, 4, &s_str, 4, self.s));
+            var ssm_own = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&ssm_own, ssm_slice);
+            if (e.ssm_state.ctx != null) _ = mlx.mlx_array_free(e.ssm_state);
+            e.ssm_state = ssm_own;
+
+            e.initialized = true;
+        }
+    }
+
+    /// Can these slots take ONE batched GDN decode tick? Every slot must
+    /// already carry initialized state for every linear layer — that is true
+    /// after any prefill, and false for a slot that has not run one, whose
+    /// zero-state would otherwise be merged at the wrong width.
+    pub fn batchedGdnReady(self: *const Transformer, ctxs: []const *ForwardCtx) bool {
+        const ml = self.moe_layers orelse return false;
+        for (ctxs) |c| {
+            const entries = c.ssm_entries orelse return false;
+            if (entries.len != ml.len) return false;
+            for (ml, 0..) |*lw, i| {
+                if (!lw.is_linear) continue;
+                if (!entries[i].initialized) return false;
+                if (entries[i].conv_state.ctx == null or entries[i].ssm_state.ctx == null) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Does this transformer support `forwardMoeBatchedDecode`? The GDN trunk
+    /// shape only — the archs that share `forwardMoeWith` but add per-layer
+    /// state or routing of their own (inkling short-convs, laguna, MLA,
+    /// gemma4 MoE) are NOT covered and must keep the serial path. Asked by
+    /// the scheduler's batching gate, so a new arch on this forward defaults
+    /// to serial instead of silently riding a path that never modelled it.
+    pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
+        // Arch question: ONE predicate, shared with server.zig's
+        // --max-concurrent clamp so the two cannot disagree about whether
+        // this model batches.
+        if (!self.config.supportsBatchedGdnDecode()) return false;
+        // Built-state question: this path reads `moe_layers` and the GDN
+        // ssm entries, so the trunk must actually be that shape.
+        if (self.moe_layers == null) return false;
+        if (self.hybrid_layers != null or self.dsv4 != null) return false;
+        // Every layer must be one of the two shapes this path handles.
+        for (self.moe_layers.?) |*lw| {
+            switch (lw.mlp) {
+                .dense => {},
+                .moe => return false,
+            }
+        }
+        return true;
+    }
+
     // Pads each slot's dense KV view (shape [1, kv_h, kv_len_i, head_dim]) to a
     // common kv_max along axis 2 with bf16 zeros and concatenates axis 0 →
     // [N, kv_h, kv_max, head_dim]. Views come from KVCache.denseView so quant
@@ -11757,11 +12007,72 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(k_rope);
                 q_rope = try self.applyMrope(q_t, cos, sin, rope_dims);
                 k_rope = try self.applyMrope(k_t, cos, sin, rope_dims);
+            } else if (ctx.batch_rope_offsets) |off_arr| {
+                // Batched decode: every slot sits at its own position, so the
+                // offset is an [N] array, not a scalar. The driver already
+                // folded each slot's M-RoPE delta into it.
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, off_arr, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, off_arr, .{ .ctx = null }, self.s));
             } else {
                 const eff_offset: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
                 try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, eff_offset, .{ .ctx = null }, self.s));
                 try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, eff_offset, .{ .ctx = null }, self.s));
             }
+        }
+
+        // Batched decode: each slot owns its own KV cache and its own kv_len,
+        // so the update happens per slot at B=1 (a slice of the stacked k/v)
+        // and the reads are padded to a common width and stacked — the same
+        // shape the standard batched path builds. Everything downstream (gate,
+        // o_proj, MLP) is batch-invariant and stays shared.
+        if (ctx.batch_slots) |slots| {
+            var attn_out_b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_out_b);
+            {
+                const k_shape_full = mlx.getShape(k_rope);
+                const k_h_dim = k_shape_full[1];
+                const k_hd_dim = k_shape_full[3];
+                for (slots, 0..) |slot_ctx, i| {
+                    const i_c: c_int = @intCast(i);
+                    const slc_start = [_]c_int{ i_c, 0, 0, 0 };
+                    const slc_stop = [_]c_int{ i_c + 1, k_h_dim, 1, k_hd_dim };
+                    const slc_strides = [_]c_int{ 1, 1, 1, 1 };
+                    var k_slot = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(k_slot);
+                    var v_slot = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(v_slot);
+                    try mlx.check(mlx.mlx_slice(&k_slot, k_rope, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
+                    try mlx.check(mlx.mlx_slice(&v_slot, v_t, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
+                    var slot_view = try slot_ctx.cache.update(layer, k_slot, v_slot, self.s, 0);
+                    slot_view.deinit();
+                }
+
+                const dense_views = try self.allocator.alloc(DenseKVView, slots.len);
+                defer {
+                    for (dense_views) |*dv| dv.deinit();
+                    self.allocator.free(dense_views);
+                }
+                for (dense_views) |*dv| dv.* = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false };
+                const kv_len_buf = try self.allocator.alloc(i32, slots.len);
+                defer self.allocator.free(kv_len_buf);
+                var kv_max: c_int = 0;
+                for (slots, 0..) |slot_ctx, i| {
+                    dense_views[i] = try slot_ctx.cache.denseView(layer, self.s);
+                    const klen: c_int = mlx.getShape(dense_views[i].k)[2];
+                    kv_len_buf[i] = klen;
+                    if (klen > kv_max) kv_max = klen;
+                }
+
+                const stacked_k = try self.padAndStackBatchedKV(dense_views, true, kv_max);
+                defer _ = mlx.mlx_array_free(stacked_k);
+                const stacked_v = try self.padAndStackBatchedKV(dense_views, false, kv_max);
+                defer _ = mlx.mlx_array_free(stacked_v);
+                const stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max);
+                defer _ = mlx.mlx_array_free(stacked_mask);
+
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, self.s));
+            }
+            return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer);
         }
 
         var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
@@ -11813,6 +12124,22 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
         }
 
+        return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer);
+    }
+
+    /// Shared tail of `gatedFullAttnWith`: transpose the attention output back
+    /// to [B,S,H,D], apply the optional sigmoid output gate, flatten, project.
+    /// One copy so the batched-decode branch cannot drift from the serial one.
+    fn gatedAttnTail(
+        self: *Transformer,
+        attn_out: mlx.mlx_array,
+        gate: mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        flat_shape: [3]c_int,
+        batch: c_int,
+        is_prefill: bool,
+        layer: u32,
+    ) !mlx.mlx_array {
         // Transpose back [B,H,S,D] -> [B,S,H,D] (view)
         const perm_back = [_]c_int{ 0, 2, 1, 3 };
         var attn_t = mlx.mlx_array_new();
@@ -11823,7 +12150,7 @@ pub const Transformer = struct {
         // in the elementwise kernel), then flatten the CONTIGUOUS product —
         // a free view. Flattening attn_t/gate first paid two REAL Copy
         // kernels per call (reshape of a transpose/split view).
-        if (cfg.attn_output_gate) {
+        if (self.config.attn_output_gate) {
             var gate_sig = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_sig);
             try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate, self.s));

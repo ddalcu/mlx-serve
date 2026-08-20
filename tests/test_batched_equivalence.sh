@@ -130,6 +130,15 @@ run_request() {
     fi
     local body
     body=$(echo "$payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions")
+    # Engagement is only observable AFTER a decode has run.
+    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
+        echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel —" >&2
+        echo "    this comparison would be serial-vs-serial and pass for free." >&2
+        tail -20 "$logfile" >&2
+        kill $pid 2>/dev/null || true
+        rm -f "$logfile"
+        return 1
+    fi
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
     rm -f "$logfile"
@@ -168,6 +177,13 @@ run_and_tokenize() {
     completion=$(echo "$body" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
     local tok_payload
     tok_payload=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$completion")
+    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
+        echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel (long arm)" >&2
+        tail -20 "$logfile" >&2
+        kill $pid 2>/dev/null || true
+        rm -f "$logfile"
+        return 1
+    fi
     local tokens
     tokens=$(echo "$tok_payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" | python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
     kill $pid 2>/dev/null || true
@@ -176,6 +192,22 @@ run_and_tokenize() {
     printf -v "$out_completion_var" '%s' "$completion"
     printf -v "$out_tokens_var" '%s' "$tokens"
 }
+
+# A GatedDeltaNet trunk (qwen3_5 family) routes the batched tick through
+# `forwardMoeBatchedDecode`, a DIFFERENT kernel from the standard batched one.
+# Without this probe the whole test passes vacuously on such a checkpoint: if
+# the batching gate ever stops admitting it, both arms silently become the
+# same serial path and every byte matches.
+IS_GDN=$(python3 - "$MODEL" <<'PYEOF'
+import json, sys, pathlib
+try:
+    c = json.loads((pathlib.Path(sys.argv[1]) / "config.json").read_text())
+except Exception:
+    print("0"); raise SystemExit
+t = c.get("text_config") or c
+print("1" if t.get("full_attention_interval", 0) else "0")
+PYEOF
+)
 
 echo "== batched-kernel byte-equivalence test =="
 echo "  model: $MODEL"

@@ -1941,6 +1941,32 @@ pub const Scheduler = struct {
         return req.result orelse error.VisionEncodeFailed;
     }
 
+    /// Does this slot's next decode tick actually run the regular (non-speculative)
+    /// path? The slot's `enable_*` flags carry the REQUEST's wish; `specTickMode` is
+    /// the authoritative dispatch answer, and a generator can also have turned spec
+    /// off at runtime. Reading the armed flags here vetoed batched decode for any
+    /// slot whose prompt merely n-gram-scored high enough to ARM PLD, even after
+    /// PLD's own yield gate had disabled itself — neither speculation nor batching
+    /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
+    /// INIT options does not bind DISPATCH".
+    fn slotTicksRegular(slot: *const Slot) bool {
+        const gen = if (slot.legacy_gen) |*g| g else
+            return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        // A runtime-disabled generator is already ticking regular. Batching it is
+        // safe because a SOLO slot never reaches the batched path, so nextPld's
+        // re-enable check still runs whenever concurrency drops back to one.
+        return gen.spec_disabled_runtime or specTickMode(
+            slot.enable_mtp,
+            gen.mtp != null,
+            slot.enable_drafter,
+            gen.drafter != null,
+            gen.dflash != null,
+            slot.enable_pld,
+            gen.pld_enabled,
+            gen.dspark_enabled,
+        ) == .regular;
+    }
+
     /// Active-tick gate. Decides whether a slot is eligible for the batched
     /// decode kernel. Hybrid SSM / MoE / encoder / DSV4 models can't ride
     /// the batched kernel (it doesn't model their state), so any slot
@@ -1949,7 +1975,7 @@ pub const Scheduler = struct {
     /// means the scheduler's startup config is no longer authoritative.
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
         _ = self;
-        if (slot.enable_pld or slot.enable_drafter or slot.enable_mtp) return false;
+        if (!slotTicksRegular(slot)) return false;
         if (slot.sampling.constraint != null) return false;
         if (slot.logprobs_n > 0) return false;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
@@ -1957,7 +1983,12 @@ pub const Scheduler = struct {
         // into the engine).
         if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
         const cfg = slot.model.config orelse return false;
-        return modelBatchable(cfg);
+        if (modelBatchable(cfg)) return true;
+        // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
+        // a hybrid), but has its own batched kernel. Ask the transformer, never
+        // name the arch here — same rule as `modelExclusiveDecode`.
+        const t = slot.model.transformer orelse return false;
+        return t.supportsBatchedGdnDecode();
     }
 };
 
@@ -5501,7 +5532,22 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         rope_offsets[i] = @intCast(slot.cache.step);
     }
 
-    const logits_arr = try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
+    // Two batched kernels: the standard one, and the GatedDeltaNet twin for
+    // hybrid trunks (qwen3_5 family). `batchedGdnReady` is the runtime half of
+    // the gate — a slot that has not prefilled yet carries no recurrent state
+    // to merge, so that tick stays serial rather than merging a wrong width.
+    const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
+    if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
+        // A slot with no recurrent state yet cannot join the merge. Decode the
+        // group serially this tick instead of skipping it — skipping advances
+        // nothing, so a group that never becomes ready would spin forever.
+        for (batch) |s| try runSingleDecodeTick(sch, s);
+        return;
+    }
+    const logits_arr = if (use_gdn)
+        try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets)
+    else
+        try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
     defer {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
@@ -5639,6 +5685,97 @@ test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     try testing.expect(modelBatchable(&cfg));
+}
+
+test "a GDN trunk is batchable AND is not clamped by the server's concurrency gate" {
+    // The two sites that decide "does this model batch?" must agree. They
+    // disagreed once: the scheduler batched qwen3_5 while server.zig still
+    // clamped --max-concurrent to 1 for anything with
+    // full_attention_interval > 0, so asking for concurrency turned the
+    // batched path OFF. Both now read ModelConfig.supportsBatchedGdnDecode.
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "qwen3_5";
+    cfg.full_attention_interval = 4;
+    try testing.expect(cfg.supportsBatchedGdnDecode());
+
+    // The pure-config gate rejects it (it IS a hybrid), which is exactly why
+    // the GDN predicate has to be consulted beside it.
+    try testing.expect(!modelBatchable(&cfg));
+
+    // The server's clamp condition, transcribed: it must NOT fire here.
+    const server_would_clamp = !cfg.supportsBatchedGdnDecode() and
+        (cfg.has_hybrid_layers or cfg.full_attention_interval > 0 or
+            cfg.is_encoder_only or cfg.isMoe());
+    try testing.expect(!server_would_clamp);
+}
+
+test "the batched gate reads DISPATCH, not the armed spec flags" {
+    // A prompt that merely n-gram-scores high enough to ARM PLD used to veto
+    // batched decode forever, even after PLD's own yield gate disabled itself
+    // at runtime: neither speculation nor batching (9.7 vs 14.3 tok/s per
+    // stream, 4 concurrent 4232-token prompts on Qwen3.5-4B). The armed flags
+    // are the REQUEST's wish; specTickMode is what the tick actually
+    // dispatches, and spec_disabled_runtime is what recovered the throughput.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "fn batchable(self: *const Scheduler") orelse return error.MissingBatchable;
+    const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
+    // No armed-flag read may come back into the gate.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_pld") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
+
+    // ...and the helper answers from BOTH: the generator's runtime kill and
+    // the authoritative dispatch decision.
+    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
+    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
+    const hbody = src[hs..he];
+    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
+
+    // The dispatch answer itself: a live MTP slot never ticks regular, an
+    // unarmed one always does.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, false, true, false, false));
+}
+
+test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not model" {
+    // A new arch on the shared moe forward must default to SERIAL, not ride
+    // a kernel that never modelled its state.
+    {
+        var moe = std.mem.zeroes(model_mod.ModelConfig);
+        moe.model_type = "qwen3_5_moe";
+        moe.full_attention_interval = 4;
+        moe.num_experts = 128;
+        moe.num_experts_per_tok = 8;
+        try testing.expect(!moe.supportsBatchedGdnDecode());
+    }
+    {
+        var lfm2 = std.mem.zeroes(model_mod.ModelConfig);
+        lfm2.model_type = "lfm2";
+        lfm2.has_hybrid_layers = true;
+        try testing.expect(!lfm2.supportsBatchedGdnDecode());
+    }
+    {
+        var kda = std.mem.zeroes(model_mod.ModelConfig);
+        kda.model_type = "bailing_hybrid";
+        kda.full_attention_interval = 4;
+        kda.kda_vector_gate = true;
+        try testing.expect(!kda.supportsBatchedGdnDecode());
+    }
+    {
+        var ink = std.mem.zeroes(model_mod.ModelConfig);
+        ink.model_type = "inkling_mm_model";
+        ink.full_attention_interval = 4;
+        try testing.expect(!ink.supportsBatchedGdnDecode());
+    }
+    {
+        // Pure attention: not a GDN trunk at all, rides the standard kernel.
+        var dense = std.mem.zeroes(model_mod.ModelConfig);
+        dense.model_type = "qwen3";
+        try testing.expect(!dense.supportsBatchedGdnDecode());
+    }
 }
 
 test "admitPendingTick: exclusive single-flight FIFO contract" {

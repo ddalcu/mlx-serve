@@ -340,27 +340,39 @@ export MLX_SERVE_ANE_MODE=row
 run_arm "ane on, row mode" "--ane-prefill" CHAN_BODY || { unset MLX_SERVE_ANE_MODE; exit 1; }
 unset MLX_SERVE_ANE_MODE
 CHAN_LOG="$LOGFILE"
-if ! grep "prefill offload ready" "$CHAN_LOG" | grep -q "mode=row"; then
+# Row mode bills roughly TWICE channel mode's int8 bytes (~2.8 GB vs ~1.3 GB
+# on a 4B), so on a small-RAM Mac it legitimately does not fit once the box
+# carries any pressure from earlier arms — the admission gate then refuses it
+# BY NAME. That is the gate working, not a row-mode regression, so this arm
+# reports NOT-RUN instead of failing. Keyed on the gate's own refusal string
+# so a genuine "built nothing, said nothing" still FAILs below.
+if grep -q "row-mode offload bills" "$CHAN_LOG"; then
+    echo -e "  ${YELLOW}NOT RUN${NC} row-mode arm: refused by the memory gate on this machine"
+    grep "row-mode offload bills" "$CHAN_LOG" | sed 's/^/    /' | head -2
+    echo "    (channel mode is the shipping default and was exercised above)"
+    ROW_ARM_SKIPPED=1
+fi
+if [ -z "${ROW_ARM_SKIPPED:-}" ] && ! grep "prefill offload ready" "$CHAN_LOG" | grep -q "mode=row"; then
     echo -e "${RED}FAIL${NC} MLX_SERVE_ANE_MODE=row did not build row-mode programs:"
     grep "\[ane\]" "$CHAN_LOG" | head -5
     rm -f "$CHAN_LOG"
     exit 1
 fi
-if ! grep "prefill offload engaged" "$CHAN_LOG" | grep -q "mode=row"; then
+if [ -z "${ROW_ARM_SKIPPED:-}" ] && ! grep "prefill offload engaged" "$CHAN_LOG" | grep -q "mode=row"; then
     echo -e "${RED}FAIL${NC} row mode built but the MLP seam never engaged (or engaged as channel):"
     grep "\[ane\]" "$CHAN_LOG" | head -5
     rm -f "$CHAN_LOG"
     exit 1
 fi
 CHAN_GDN=$(grep "prefill offload ready" "$CHAN_LOG" | sed -n 's/.*+ \([0-9][0-9]*\) gdn layers.*/\1/p')
-if [ "${CHAN_GDN:-0}" -gt 0 ] && ! grep "gdn offload engaged" "$CHAN_LOG" | grep -q "mode=row"; then
+if [ -z "${ROW_ARM_SKIPPED:-}" ] && [ "${CHAN_GDN:-0}" -gt 0 ] && ! grep "gdn offload engaged" "$CHAN_LOG" | grep -q "mode=row"; then
     echo -e "${RED}FAIL${NC} row mode built $CHAN_GDN gdn layers but the gdn seam never engaged:"
     grep "\[ane\]" "$CHAN_LOG" | head -5
     rm -f "$CHAN_LOG"
     exit 1
 fi
 CHAN_CONTENT=$(echo "$CHAN_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
-if [ -z "$CHAN_CONTENT" ]; then
+if [ -z "${ROW_ARM_SKIPPED:-}" ] && [ -z "$CHAN_CONTENT" ]; then
     echo -e "${RED}FAIL${NC} empty completion under row mode."
     rm -f "$CHAN_LOG"
     exit 1

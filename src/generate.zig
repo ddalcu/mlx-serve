@@ -5356,6 +5356,9 @@ pub const Generator = struct {
     /// it on chips whose verify-width cliff was measured (M1 Pro: 4).
     pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
     pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
+    /// One-shot guard for the per-silicon cap log (the row is a property of
+    /// the machine, so it is worth saying once per process, not per request).
+    var mtp_depth_cap_logged: bool = false;
     /// Rounds of legacy (fixed-depth windowed) behavior while the EMAs fill.
     /// Warmup, but converges in ROUNDS, not 43 s of offline calibration.
     pub const MTP_EV_WARMUP_ROUNDS: u32 = 10;
@@ -5563,7 +5566,24 @@ pub const Generator = struct {
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
     pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
         var chip_buf: [128]u8 = undefined;
-        return mtpDepthCapForProfileChip(configured, adaptive, profile, mtp_mod.chipBrandString(&chip_buf));
+        const chip = mtp_mod.chipBrandString(&chip_buf);
+        const cap = mtpDepthCapForProfileChip(configured, adaptive, profile, chip);
+        // Name the row ONCE when a per-silicon measurement is what fenced the
+        // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
+        // as the EV controller having chosen 4, or as `--mtp-depth 4` — and
+        // the fence is exactly what someone debugging MTP there needs to see.
+        if (configured == 0 and adaptive and !mtp_depth_cap_logged) {
+            const row = mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP);
+            if (cap == row.cap and row.cap < MTP_ADAPTIVE_DEFAULT_CAP) {
+                mtp_depth_cap_logged = true;
+                log.info("[mtp] adaptive depth cap {d} ({s} row, default {d})\n", .{
+                    row.cap,
+                    row.label,
+                    MTP_ADAPTIVE_DEFAULT_CAP,
+                });
+            }
+        }
+        return cap;
     }
 
     /// Same, with the chip string injected (tests, and the one live caller).
@@ -5571,7 +5591,7 @@ pub const Generator = struct {
         if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
         if (!adaptive) return mtp_mod.DEFAULT_DEPTH;
         return switch (profile) {
-            .generic => mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP),
+            .generic => mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP).cap,
             .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
         };
     }
@@ -9806,8 +9826,20 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
 
     // The original boolean helpers remain source-compatible and map true to
     // the pre-existing q8 profile.
+    // The live resolver must NAME the row it applied, once. A silicon fence
+    // nobody can see in the log is indistinguishable from the EV controller's
+    // own choice at the same depth (dflash's ready line does the same).
+    {
+        const src = @embedFile("generate.zig");
+        const start = std.mem.indexOf(u8, src, "pub fn mtpDepthCapForProfile(configured") orelse return error.MissingResolver;
+        const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingResolverEnd;
+        const body = src[start..end];
+        try testing.expect(std.mem.indexOf(u8, body, "row.label") != null);
+        try testing.expect(std.mem.indexOf(u8, body, "mtp_depth_cap_logged") != null);
+    }
+
     var chip_buf: [128]u8 = undefined;
-    const live_generic = mtp_mod.adaptiveDepthCapForMachine(mtp_mod.chipBrandString(&chip_buf), Generator.MTP_ADAPTIVE_DEFAULT_CAP);
+    const live_generic = mtp_mod.adaptiveDepthCapForMachine(mtp_mod.chipBrandString(&chip_buf), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
     try testing.expectEqual(live_generic, Generator.mtpDepthCapFor(0, true, false));
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }

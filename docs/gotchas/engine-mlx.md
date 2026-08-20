@@ -3425,3 +3425,75 @@ gates by NAX and shape, never chip — and `mixedNaxShapeEnabled` precedent says
 adoption is per machine AND shape). That needs a paired same-boot A/B on an M1;
 if the answer is no, gate adoption by chip and the threshold question dissolves
 for the un-adopted lanes.
+A cap that fires silently is half a fix. `adaptiveDepthCapForMachine`
+returns `{cap, label}` (the `dflash.blockCapForMachine` shape) and the live
+resolver logs it once when a row actually lowers the default:
+
+```
+[mtp] adaptive depth cap 4 (m1-pro row, default 6)
+```
+
+Verified both ways with the chip string injected: the M1 Pro row logs and runs
+`depth=4`, an M4 stays silent at `depth=6`. Without the line, `[spec-stats]
+… depth=4` on that machine is indistinguishable from the EV controller having
+promoted no further on its own, or from someone having passed `--mtp-depth 4`
+— three very different situations with one symptom. The resolve site is
+source-scan-pinned to keep naming the row.
+
+## The armed spec flags vetoed batched decode, and PLD then turned itself off (2026-08-20)
+
+`Scheduler.batchable` opened with `if (slot.enable_pld or slot.enable_drafter
+or slot.enable_mtp) return false;`. Those three are the REQUEST's wish, set
+before the generator exists. `specTickMode` is what the decode tick actually
+dispatches on, and it takes the generator's state as well — that split is the
+same one CLAUDE.md already names as "a guard that shapes INIT options does not
+bind DISPATCH".
+
+The chain, measured on a Mac mini M4 with 4 concurrent 5467-token repetitive
+prompts on Qwen3.5-4B:
+
+1. The prompt is repetitive, so the ngram spec-gate scores it 0.386 against a
+   0.010 threshold and arms PLD.
+2. `batchable` sees `enable_pld` and refuses the slot. Four slots decode
+   serial.
+3. PLD drafts nothing (the model is answering, not echoing), so its own yield
+   gate logs `pld=disabled (yield gate: 0 drafted tokens over 8 steps <
+   0.25/step)` and stops speculating.
+
+From step 3 on the server is running neither speculation nor batching. Same
+binary, same prompt, same flags, counterbalanced against a `--no-pld` control:
+
+| arm | `[batched] gdn batched decode engaged` | decode tok/s per stream |
+|---|---|---|
+| pre-fix, default (PLD armed) | no | 9.5 / 9.5 / 9.6 / 9.7 |
+| fixed, default | yes | 12.3 / 12.3 / 12.4 / 12.5 |
+| fixed, `--no-pld` | yes | 12.2 / 12.4 / 12.7 / 12.8 |
+
+The bug was free while qwen3_5 had no batched kernel, which is why it sat
+there unnoticed; `forwardMoeBatchedDecode` is what turned it into 1.28x.
+
+The fix is `slotTicksRegular`, read by `batchable` in place of the flag line.
+Both of its clauses carry weight and only one of them recovers the throughput:
+
+- `specTickMode(...) == .regular` covers a slot whose generator never armed
+  spec at all (`!gen.pld_enabled`, permanent — `generate.zig`'s dsv4
+  chokepoint says no re-enable check can resurrect it).
+- `gen.spec_disabled_runtime` covers the measured case. `pld_enabled` stays
+  TRUE through the yield-gate kill, so `specTickMode` still answers `.pld`
+  there and the first clause alone changes nothing.
+
+Why pausing PLD's re-enable is the right trade: `runDecodeTick` only reaches
+the batched kernel at `group.len >= 2`. A solo slot always goes through
+`runSingleDecodeTick` -> `nextPld` -> the periodic re-enable check, so
+re-enable is only deferred while 2+ slots are decoding, which is exactly the
+regime where batching (2.76x aggregate, measured) beats one stream's
+speculative recovery. A slot that is genuinely speculating still returns false
+and decodes serial: verified live on the MTPLX 9B pack, where 4 concurrent
+streams all logged `mode=mtp avg_per_round≈5.0 per_draft_pct=100%` with zero
+batched-engagement lines.
+
+Guard: the class test `the batched gate reads DISPATCH, not the armed spec
+flags` scans `batchable`'s body for any `slot.enable_*` read (red on revert)
+and pins that the helper consults both `spec_disabled_runtime` and
+`specTickMode`. Byte-equivalence across the batched path is unchanged and was
+re-run on all three checkpoints (qwen35-4b, qwen35-9b, gemma-4-e2b).
