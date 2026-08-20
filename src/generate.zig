@@ -12,6 +12,7 @@ const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -5565,8 +5566,7 @@ pub const Generator = struct {
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
     pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
-        var chip_buf: [128]u8 = undefined;
-        const chip = mtp_mod.chipBrandString(&chip_buf);
+        const chip = ane_mod.chipBrand();
         const cap = mtpDepthCapForProfileChip(configured, adaptive, profile, chip);
         // Name the row ONCE when a per-silicon measurement is what fenced the
         // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
@@ -9838,8 +9838,7 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
         try testing.expect(std.mem.indexOf(u8, body, "mtp_depth_cap_logged") != null);
     }
 
-    var chip_buf: [128]u8 = undefined;
-    const live_generic = mtp_mod.adaptiveDepthCapForMachine(mtp_mod.chipBrandString(&chip_buf), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
+    const live_generic = mtp_mod.adaptiveDepthCapForMachine(ane_mod.chipBrand(), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
     try testing.expectEqual(live_generic, Generator.mtpDepthCapFor(0, true, false));
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }

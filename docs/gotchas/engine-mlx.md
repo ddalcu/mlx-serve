@@ -3497,3 +3497,93 @@ flags` scans `batchable`'s body for any `slot.enable_*` read (red on revert)
 and pins that the helper consults both `spec_disabled_runtime` and
 `specTickMode`. Byte-equivalence across the batched path is unchanged and was
 re-run on all three checkpoints (qwen35-4b, qwen35-9b, gemma-4-e2b).
+
+## The verify-lane parity bar had to stop referencing stock's worst element (2026-08-20)
+
+`expectVerifyQmmNoWorseThanStock` is the machine-independent guard on every
+verify qmm lane: run the lane, run stock, run an fp32 dequant ground truth, and
+require the lane be no less accurate than stock. It compared WORST ELEMENTS,
+clamped-relative, with 0.01 of slack.
+
+On an M1 Pro it went red. Measured there: `kern_max` 0.0313 / 0.0290 / 0.0224
+for the plain-SIMD, split-K and crossrow lanes against a stock 0.0039, all at
+cosine 0.999998 vs 0.999999. The first fix widened the slack to 0.04 on a
+chip-string row (`verifyQmmParitySlack`), on the reasoning that each GPU's
+reduction order is its own measurement.
+
+That was wrong twice.
+
+**Cosine cannot cover for a widened max.** Cosine is a global measure over the
+whole tensor. The defects this function exists to catch — a partial-sum race, a
+register spill, a bad index — corrupt ONE element while leaving every other one
+intact, which moves cosine by nothing at all. Widening the max is precisely a
+blindfold for the failure mode the doc comment names.
+
+**`stock_max` is not a stable reference.** Instrumenting the same shapes on M4
+Max (`MLX_SERVE_VQMM_PARITY_DEBUG=1`) measured stock_max 0.017-0.036 across all
+111 lane checks — the same order as the M1 Pro *kernel* reading. So the M1 Pro
+row was never a lane landing 8x worse than normal; it was STOCK landing
+unusually well on that data, and the lane sitting exactly at the bf16 output's
+own rounding floor. Any bar keyed to stock's worst element inherits that
+instability and gets re-fit per machine forever.
+
+The bars are now three, none fit per GPU (`VerifyQmmParity`):
+
+- `GROSS_CEILING` 0.5 — an ABSOLUTE ceiling on the worst element. The
+  clamped-relative metric's noise floor is 0.02-0.035 on every machine measured,
+  so this is ~14x headroom, and a corrupted accumulator lands orders of
+  magnitude past it. This is the single-element bar cosine cannot provide.
+- `RMS_FACTOR` 3.0 — the lane's RMS error over stock's. Scale-free, so an
+  unusually accurate stock does not tighten it into a false red. This is the
+  systematic bar. M4 Max measures ratio 1.000 on all 111 checks.
+- The cosine pair, unchanged: no worse than stock's by 1e-5, and a 0.999 floor
+  that catches a broken reference.
+
+`verifyQmmParityVerdict` is pure, so each failure shape is unit-tested without a
+GPU, and the failure print carries every number needed to judge a new machine.
+
+## A batched decode group is bounded by padding waste, not slot count (2026-08-20)
+
+`padAndStackBatchedKV` pads every slot's KV to the group's longest and
+concatenates, so the tensor the batched kernel reads is `N x kv_max` — not
+`sum(kv_len)`. Nothing bounded the spread of the group.
+
+The arithmetic on a qwen3_5 trunk (hd 256, and the app launches with
+`--ctx-size 262144`): four slots where one sits at 100k and three at 1k build
+`[4, kv_h, 100000, 256]` bf16 per full-attention layer, ~410 MB each, ~6.5 GB
+across the 16 of them — for three slots that needed 1k of context between them.
+It is a per-tick transient, so `prefillTransientReserve` never sees it and the
+load-time gate never bills it. The failure mode is an uncatchable Metal OOM,
+which is exactly the class that reads as "the model crashed the server".
+
+`batchedKvKeepCount` caps the group by the quantity that actually hurts — the
+padding waste — rather than a length ratio: sort ascending by kv_len and keep
+the largest prefix whose padded tensor stays within `MAX_PAD_WASTE` of the bytes
+the group needs. The slots that fall out are the LONGEST ones (the ones setting
+kv_max), and they decode serially the same tick, so every slot still advances.
+
+`MAX_PAD_WASTE` is 1.5 and has to stay **below 2.0**: for N=2 the worst possible
+waste is exactly 2x (a 1-token slot beside a 200k one), so at a bar of 2.0 a
+pair can never be vetoed — which is the pathological case the cap was written
+for.
+
+## A batched-decode guard that only runs at N=1 pins a shape that never ships (2026-08-20)
+
+`MLX_SERVE_FORCE_BATCHED=1` routes a single slot through the batched kernel, and
+`test_batched_equivalence.sh` used it for every arm. But at one slot the forward
+still has `batch == 1`, and that value is not inert:
+
+- `attnProj` takes `batch == 1 and !is_prefill` as its `decode_shape`, which is
+  what arms `--decode-attn-quant` (default ON) — so the lossy side copies engage
+  at forced-N=1 and do NOT at real N>1.
+- Both fused QK-norm+RoPE gates (`hd 128` and the `hd 256` sibling) require
+  `batch == 1`, so the batched path takes the composed chain instead.
+
+None of that is a correctness bug — the batched path is the more accurate one —
+but the guard's "byte-equivalence" claim covered a width that never serves a
+real concurrent request. The script now runs a real two-stream arm against the
+serial answer, and both batched kernels emit a one-shot
+`[batched] ... engaged (slots=N)` line: output equality alone cannot distinguish
+a batched run from N serial ones, and two concurrent curls are not guaranteed to
+overlap, so the arm reports NOT-RUN rather than passing for free when they
+don't.

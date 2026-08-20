@@ -1952,9 +1952,20 @@ pub const Scheduler = struct {
     fn slotTicksRegular(slot: *const Slot) bool {
         const gen = if (slot.legacy_gen) |*g| g else
             return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
-        // A runtime-disabled generator is already ticking regular. Batching it is
-        // safe because a SOLO slot never reaches the batched path, so nextPld's
-        // re-enable check still runs whenever concurrency drops back to one.
+        // A runtime-disabled generator is already ticking regular, so batching it
+        // dispatches what it was going to dispatch anyway.
+        //
+        // The POLICY this encodes, which is deliberate and not free: `nextPld`'s
+        // periodic re-enable check (`SPEC_REENABLE_INTERVAL`) lives on the serial
+        // path, and the batched tick never calls it. So a slot whose PLD yield
+        // gate disabled itself stays disabled for as long as it keeps company —
+        // even if its tail later turns into the file/tool echo PLD is best at.
+        // That is the right trade at N>1 (the batched kernel reads the weight set
+        // once for the whole group, which beats one slot's lookup wins) and it
+        // self-corrects: a SOLO slot never reaches the batched path, so the
+        // re-enable check resumes the moment concurrency drops back to one.
+        // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
+        // documented trade` below — flip either half deliberately, not by accident.
         return gen.spec_disabled_runtime or specTickMode(
             slot.enable_mtp,
             gen.mtp != null,
@@ -1991,6 +2002,48 @@ pub const Scheduler = struct {
         return t.supportsBatchedGdnDecode();
     }
 };
+
+/// Batched decode pads every slot's KV to the group's LONGEST (`padAndStackBatchedKV`),
+/// so the tensor it builds is `N x kv_max`, not `sum(kv_len)`. A group mixing one
+/// 100k-token stream with three 1k ones therefore materializes ~100x the bytes the
+/// short slots need — on a qwen3_5 trunk (hd 256, `--ctx-size` up to 262144) that is
+/// ~410 MB per full-attention layer, ~6.5 GB across the 16 of them, and NOTHING bills
+/// it: it is a per-tick transient, invisible to `prefillTransientReserve` and to the
+/// load-time gate. An uncatchable Metal OOM is the failure mode.
+///
+/// So the group is capped by PADDING WASTE, which is the quantity that actually hurts,
+/// rather than by a length ratio: keep the largest prefix of the ascending-sorted
+/// lengths whose padded tensor stays within `MAX_PAD_WASTE` of its useful bytes. The
+/// slots that fall out are the LONGEST ones — the ones dominating kv_max — and they
+/// decode serially this tick, so every slot still advances.
+///
+/// Returns how many of `kv_lens_asc` may batch together (0 or 1 = nobody batches).
+/// The lengths handed in are the caller's `cache.step` — the PRE-tick counts,
+/// while the forward pads to the post-update view, and a sliding layer's view
+/// is trimmed shorter still. So this is deliberately an approximation of the
+/// padding the forward will actually build (one token low, and an upper bound
+/// on sliding layers); it is a heuristic bar, not an accounting identity, and
+/// re-deriving it from the exact per-layer view widths buys nothing.
+/// The padded tensor may be at most this multiple of the bytes the group
+/// actually needs. It must stay BELOW 2.0 or a two-slot group can never be
+/// vetoed: one 1-token slot beside one 200k slot pads to exactly 2x, which is
+/// the worst case for N=2 and the pathological pair this cap exists for.
+pub const MAX_PAD_WASTE: f64 = 1.5;
+
+var kv_skew_split_logged: bool = false; // one-shot log guard
+
+pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
+    if (kv_lens_asc.len < 2) return 0;
+    var k: usize = kv_lens_asc.len;
+    while (k >= 2) : (k -= 1) {
+        var sum: u64 = 0;
+        for (kv_lens_asc[0..k]) |l| sum += l;
+        if (sum == 0) return k; // nothing prefilled yet: no padding to waste
+        const padded: f64 = @floatFromInt(@as(u64, k) * kv_lens_asc[k - 1]);
+        if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
+    }
+    return 0;
+}
 
 /// Pure-config predicate: is this model's architecture compatible with the
 /// batched-decode kernel? Used by `Scheduler.batchable` after slot-level
@@ -3270,8 +3323,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            var chip_buf: [128]u8 = undefined;
-            const block_cap = dflash_mod.blockCapForMachine(dflash_mod.chipBrandString(&chip_buf));
+            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
@@ -5080,7 +5132,32 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     while (start < batchable_n) {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
-        const group = batchable_buf[start..end];
+        var group = batchable_buf[start..end];
+        // Cap the group by padding waste: the batched kernel pads every slot's
+        // KV to the longest in the group, so one long-context stream would make
+        // its short neighbours build a tensor orders of magnitude bigger than
+        // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
+        // how many still fit; the tail decodes serially this tick.
+        if (group.len >= 2) {
+            std.sort.pdq(*Slot, group, {}, struct {
+                fn lt(_: void, a: *Slot, b: *Slot) bool {
+                    return a.cache.step < b.cache.step;
+                }
+            }.lt);
+            var kv_lens: [32]u32 = undefined;
+            for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            if (keep < group.len) {
+                if (!kv_skew_split_logged) {
+                    kv_skew_split_logged = true;
+                    log.info("[batched] kv-length skew: batching {d} of {d} slots (kv_len {d}..{d}), rest serial\n", .{
+                        keep, group.len, kv_lens[0], kv_lens[group.len - 1],
+                    });
+                }
+                for (group[keep..]) |s| try runSingleDecodeTick(sch, s);
+                group = group[0..keep];
+            }
+        }
         // Honor force_batched even when only one slot is batchable so the
         // test hook actually exercises forwardBatchedDecode at N=1.
         if (group.len >= 2 or (sch.force_batched and group.len == 1)) {
@@ -5681,6 +5758,52 @@ test "modelBatchable: a PARSED deepseek_v4 config can never route to batched dec
     try testing.expect(!prefix_cache_mod.HotPrefixCache.shouldUse(&cfg, true));
 }
 
+test "batchedKvKeepCount: padding waste caps the group, and the long slots are the ones dropped" {
+    // Even lengths: no padding waste, everybody batches.
+    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 1000 }));
+    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 900, 1000, 1100, 1200 }));
+
+    // The case this exists for: three short streams and one long one. Batching
+    // all four pads to 4 x 100000 = 400k against 103k useful (3.9x); dropping
+    // the long one leaves 3 x 1000 vs 3000 (1.0x).
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 100_000 }));
+
+    // Two long ones: the pair still batches together, since 2 x 100000 against
+    // 200000 useful wastes nothing — the veto is about the padding, not length.
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&[_]u32{ 100_000, 100_000 }));
+    // One short slot among two long ones still batches: 3 x 100000 padded
+    // against 200010 useful is 1.5x, inside the bar. The veto is about the
+    // WASTE the padding creates, not about any slot being an outlier.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 10, 100_000, 100_000 }));
+
+    // One slot never "batches", and neither does an empty group.
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{1000}));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{}));
+
+    // Nothing prefilled yet: no padding to waste, so nothing is vetoed (the
+    // ready gate, not this one, is what keeps unprefilled slots out).
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+
+    // A pathological pair degrades to no batch at all rather than making the
+    // 1-token slot build a 200k-wide tensor nobody billed. This is why the bar
+    // has to sit below 2.0 — at 2.0 a pair is unvetoable by construction.
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, 200_000 }));
+}
+
+test "the batched group is capped by padding waste before it is dispatched" {
+    // Source-scan class guard: the grouping loop must consult the cap. Without
+    // it a single long-context stream makes every short neighbour materialize
+    // a padded KV tensor sized by ITS length — a per-tick transient no gate
+    // bills, whose failure mode is an uncatchable Metal OOM.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
+    // ...and the dropped slots must still be ticked, or they never advance.
+    try testing.expect(std.mem.indexOf(u8, body, "for (group[keep..]) |s| try runSingleDecodeTick") != null);
+}
+
 test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
@@ -5707,6 +5830,25 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
         (cfg.has_hybrid_layers or cfg.full_attention_interval > 0 or
             cfg.is_encoder_only or cfg.isMoe());
     try testing.expect(!server_would_clamp);
+}
+
+test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
+    // `slotTicksRegular` admits a generator whose speculation turned itself off
+    // at runtime. That is what recovered the throughput (9.6 -> 12.4 tok/s per
+    // stream on 4 concurrent 5.5k prompts), and it costs something real: the
+    // batched tick does not call `nextPld`, so its periodic re-enable check
+    // cannot run while the slot is batched. Both halves are load-bearing, so
+    // both are stated here — if the re-enable check ever moves onto the batched
+    // path, or the clause is dropped, this is the note to revisit.
+    const src = @embedFile("scheduler.zig");
+    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
+    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
+    const hbody = src[hs..he];
+    // The clause that admits it...
+    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime or") != null);
+    // ...and the trade it makes, written down where it is made.
+    try testing.expect(std.mem.indexOf(u8, hbody, "re-enable check") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "SOLO slot never reaches the batched path") != null);
 }
 
 test "the batched gate reads DISPATCH, not the armed spec flags" {

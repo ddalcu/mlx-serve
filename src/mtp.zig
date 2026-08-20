@@ -60,7 +60,7 @@ pub const MAX_DEPTH: u32 = 8;
 ///   M1 Pro: 4 (2026-08-20, Qwen3.8-27B iQ-3.8bpw, forced-depth sweep:
 ///     13.01 tok/s at depth 4 vs 10.78/9.63 at 5/6 — the verify width 6
 ///     cliff; auto at cap 6 measured 10.64, barely over --no-mtp's 10.57).
-/// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrandString`
+/// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrand`
 /// (the GPU arch string cannot tell Ultra from Max); "" lands on default.
 /// The row carries its own LABEL so the resolve site can say which one it
 /// applied: a bare depth=4 in the spec-stats line is indistinguishable from
@@ -70,10 +70,6 @@ pub const DepthCap = struct { cap: u32, label: []const u8 };
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro" };
     return .{ .cap = default_cap, .label = "default" };
-}
-
-pub fn chipBrandString(buf: []u8) []const u8 {
-    return ane_mod.chipBrandString(buf);
 }
 
 /// Exact full-round cost surfaces known to the adaptive MTP controller.

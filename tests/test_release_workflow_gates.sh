@@ -59,6 +59,31 @@ check("Formula/mlx-serve.rb" not in open(".github/workflows/release.yml").read()
 check("workflow_dispatch" in step_if("Create tag (manual dispatch)"),
       "tag creation restricted to workflow_dispatch")
 
+# ── The pre_release checkbox exists so a build can be cut WITHOUT consuming the
+# version number: it tags v<YY.M.N>-pre-release.<n>, which the `^vYY.M.[0-9]+$`
+# match that picks N never sees, so the plain vYY.M.N is still there to cut
+# later. Two halves, both load-bearing:
+#   - the suffix must be applied where the tag is MINTED (the version step), not
+#     at the release step, or the tag consumes the number anyway;
+#   - the release must still be created as a DRAFT and must NOT set `prerelease`
+#     itself — flipping that flag is a deliberate manual step, and setting it
+#     here would also be what keeps the formula push away (homebrew.yml skips
+#     pre-releases), turning a checkbox into a silent brew decision.
+inputs = triggers.get("workflow_dispatch", {}).get("inputs", {})
+check("pre_release" in inputs, "workflow_dispatch offers a pre_release checkbox")
+check(inputs.get("pre_release", {}).get("default") in (False, "false"),
+      "pre_release defaults to OFF")
+version_step = next((s for s in job["steps"] if s.get("id") == "version"), {})
+check("inputs.pre_release" in str(version_step.get("run", "")),
+      "the pre-release suffix is applied where the tag is minted")
+check("-pre-release" in str(version_step.get("run", "")),
+      "the pre-release tag suffix is spelled in the version step")
+rel_with = steps.get("Create Release", {}).get("with", {})
+check(rel_with.get("draft") in (True, "true"),
+      "the release is still created as a draft")
+check("prerelease" not in rel_with,
+      "the workflow never sets the prerelease flag itself (manual, by design)")
+
 # Notarization must RUN on PRs — its gate may exclude dry_run but never PRs.
 for n in ("Notarize CLI", "Notarize app bundle"):
     check("pull_request" not in step_if(n),

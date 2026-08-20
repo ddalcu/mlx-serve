@@ -120,7 +120,29 @@ pub fn aneShareRows(chunk_rows: u32, share: f32) u32 {
 /// Chip name via sysctl ("Apple M3 Ultra"); empty on failure — callers fall
 /// to their default row. Canonical copy (dflash.zig delegates here); the GPU
 /// arch string cannot tell Ultra from Max, hence the CPU brand.
-pub fn chipBrandString(buf: []u8) []const u8 {
+var chip_brand_buf: [128]u8 = undefined;
+var chip_brand_len: usize = 0;
+/// 0 = unread, 1 = one thread is reading it, 2 = published.
+var chip_brand_state = std.atomic.Value(u8).init(0);
+
+/// Cached `machdep.cpu.brand_string` — THE accessor for every per-silicon
+/// table (ANE share, MTP depth cap, DFlash block cap). The chip cannot change
+/// under a running process and these are read on request-shaped paths
+/// (Generator init), so the sysctl runs exactly once. Callers that need to
+/// inject a chip string take it as a parameter; nobody re-wraps this.
+pub fn chipBrand() []const u8 {
+    if (chip_brand_state.load(.acquire) != 2) {
+        if (chip_brand_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            chip_brand_len = chipBrandString(&chip_brand_buf).len;
+            chip_brand_state.store(2, .release);
+        } else {
+            while (chip_brand_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+        }
+    }
+    return chip_brand_buf[0..chip_brand_len];
+}
+
+fn chipBrandString(buf: []u8) []const u8 {
     var len: usize = buf.len;
     if (std.c.sysctlbyname("machdep.cpu.brand_string", buf.ptr, &len, null, 0) != 0) return "";
     if (len > 0 and buf[len - 1] == 0) len -= 1;
@@ -154,8 +176,7 @@ pub fn defaultShare(mode: Mode, chip: []const u8) f32 {
 /// chunk token rows). MLX_SERVE_ANE_SPLIT overrides; the default is per
 /// (mode, silicon) — see `defaultShare`.
 pub fn splitShare() f32 {
-    var chip_buf: [128]u8 = undefined;
-    const def = defaultShare(splitMode(), chipBrandString(&chip_buf));
+    const def = defaultShare(splitMode(), chipBrand());
     const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return def;
     const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return def;
     if (!(v > 0) or v > 1) return def;

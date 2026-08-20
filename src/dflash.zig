@@ -319,10 +319,6 @@ pub fn blockCapForMachine(chip: []const u8) BlockCap {
 /// Chip name via sysctl ("Apple M3 Ultra"); empty on failure, which lands
 /// on the default cap row. Canonical copy lives in ane.zig (the ANE share
 /// table keys on the same string).
-pub fn chipBrandString(buf: []u8) []const u8 {
-    return ane_mod.chipBrandString(buf);
-}
-
 /// Resolve the effective block size: the config's value, capped by what the
 /// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
 /// when there is no wide lane), then clamped DOWNWARD by an explicit

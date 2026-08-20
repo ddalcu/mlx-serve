@@ -47,8 +47,11 @@ struct ServerOptions: Codable, Equatable {
 
     // Observability (server-launch flag). When true, launches with `--metrics`,
     // exposing the Prometheus `/metrics` scrape endpoint AND a live throughput/
-    // latency/GPU/memory panel on the server's index page (GET /).
-    var enableMetrics: Bool = false
+    // latency/GPU/memory panel on the server's index page (GET /). ON by
+    // default here — deliberately NOT mirroring the server's own default:
+    // the tray's throughput rows read `/metrics.json`, and the cost is a few
+    // relaxed atomics per request, never per token.
+    var enableMetrics: Bool = true
     /// Optional API key (`--api-key`). When non-empty, remote (non-loopback)
     /// requests to the OpenAI/Anthropic/Ollama APIs AND the index page + metrics
     /// panel require it (Authorization: Bearer / x-api-key / HTTP Basic / query

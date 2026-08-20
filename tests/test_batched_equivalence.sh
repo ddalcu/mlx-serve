@@ -284,6 +284,84 @@ else
 fi
 
 echo
+echo "== real N=2 concurrency (batch != 1) =="
+# Everything above forces the batched kernel at N=1, which is the ONE width
+# where `batch == 1` still holds inside the forward — and several decisions key
+# on exactly that. `attnProj` passes `batch == 1 and !is_prefill` as its
+# decode_shape, so `--decode-attn-quant` (default ON) engages at forced-N=1 and
+# does NOT at real N>1; the fused QK-norm+RoPE gates are `batch == 1` too. A
+# guard that only ever runs at N=1 therefore pins a shape that never ships.
+# This arm runs two genuinely concurrent streams and holds each to the same
+# first-N-tokens bar against the serial answer.
+sleep 2
+CONC_LOG=$(mktemp)
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$CONC_LOG" 2>&1 &
+CONC_PID=$!
+up=0
+for i in $(seq 1 60); do
+    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
+    sleep 1
+done
+if [ "$up" != "1" ]; then
+    echo -e "${RED}FAIL${NC} concurrent server did not become healthy in 60s"
+    tail -20 "$CONC_LOG"; kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG"; exit 1
+fi
+
+CONC_A=$(mktemp); CONC_B=$(mktemp)
+echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > "$CONC_A" &
+CA=$!
+echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > "$CONC_B" &
+CB=$!
+wait $CA; wait $CB
+
+# Engagement: output equality alone cannot tell a batched run from two serial
+# ones, and two concurrent requests are not guaranteed to overlap. The log line
+# is the only proof the batched path ran at N>1.
+if ! grep -qE "\[batched\] (gdn batched decode|batched decode) engaged \(slots=[2-9]" "$CONC_LOG"; then
+    echo -e "  ${YELLOW}NOT RUN${NC} the two requests never overlapped into a batch of >= 2"
+    grep "\[batched\]" "$CONC_LOG" | head -3 | sed 's/^/    /'
+    CONC_SKIPPED=1
+fi
+
+if [ -z "${CONC_SKIPPED:-}" ]; then
+    CONC_FAIL=0
+    for f in "$CONC_A" "$CONC_B"; do
+        txt=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$f" 2>/dev/null || true)
+        if [ -z "$txt" ]; then
+            echo -e "${RED}FAIL${NC} concurrent request returned no completion"; cat "$f"; CONC_FAIL=1; break
+        fi
+        toks=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$txt" |
+            curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" |
+            python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
+        verdict=$(python3 - "$LONG_SINGLE_TOKS" "$toks" "$FIRST_N_TOKENS" <<'PYEOF'
+import sys
+a = sys.argv[1].split(",") if sys.argv[1] else []
+b = sys.argv[2].split(",") if sys.argv[2] else []
+n = min(int(sys.argv[3]), len(a), len(b))
+for i in range(n):
+    if a[i] != b[i]:
+        print(f"DIFF at index {i}: single={a[i]} concurrent={b[i]}")
+        break
+else:
+    print("OK" if n > 0 else "EMPTY")
+PYEOF
+)
+        if [ "$verdict" != "OK" ]; then
+            echo -e "${RED}FAIL${NC} N=2 concurrent stream diverged from serial: $verdict"
+            CONC_FAIL=1; break
+        fi
+    done
+    if [ "$CONC_FAIL" != "0" ]; then
+        tail -20 "$CONC_LOG"
+        kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"; exit 1
+    fi
+    echo -e "${GREEN}PASS${NC} both concurrent streams byte-identical to serial for ${FIRST_N_TOKENS} tokens (batch >= 2)"
+fi
+kill $CONC_PID 2>/dev/null || true
+wait $CONC_PID 2>/dev/null || true
+rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"
+
+echo
 echo "== batched-kernel x kv-quant crash guard =="
 # Regression: forwardBatchedDecode read cache.entries[].key_view/value_view
 # RAW. Under --kv-quant those hold the packed quantized words (hd 256 at
