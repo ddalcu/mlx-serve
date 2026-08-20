@@ -447,6 +447,52 @@ struct Model3DGenSettings: Codable, Equatable {
     }
 }
 
+// MARK: - Restore / Upscale
+
+struct RestoreGenSettings: Codable, Equatable {
+    var modelId: String = RestoreModelPreset.seedvr2_3b.id
+    /// 1 = restore only (same resolution). 2/4 = bicubic-resize to that
+    /// factor before restoring, so SeedVR2 fills in real detail at the
+    /// larger canvas rather than the resize just looking soft.
+    var scale: Int = 2
+    var seed: Int = -1
+    var keepResident: Bool = false
+
+    private static let storageKey = "restoreGenSettings"
+
+    static func load() -> RestoreGenSettings {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let v = try? JSONDecoder().decode(RestoreGenSettings.self, from: data) else {
+            return RestoreGenSettings()
+        }
+        return v
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+}
+
+extension RestoreGenSettings {
+    var resolvedModel: RestoreModelPreset { resolvedModel(models: []) }
+
+    func resolvedModel(models: [ModelInfo]) -> RestoreModelPreset {
+        RestoreModelPreset.all.first { $0.id == modelId }
+            ?? CustomMediaModels.restorePreset(for: modelId, from: models)
+            ?? .seedvr2_3b
+    }
+
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .scale) { scale = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+    }
+}
+
 extension Model3DGenSettings {
     var resolvedModel: Model3DModelPreset { resolvedModel(models: []) }
 

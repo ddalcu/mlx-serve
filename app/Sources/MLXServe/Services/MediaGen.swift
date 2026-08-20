@@ -124,6 +124,23 @@ enum CustomResolution: Equatable {
     }
 }
 
+// MARK: - Image window mode
+
+/// The Image Generation window's top-level switch: Create (text-to-image)
+/// vs Upscale (restore/upscale an existing photo). Two different pipelines
+/// — generation vs restoration — sharing one window because both start from
+/// "I want a better picture." Internal identifiers stay "restore"
+/// (`RestoreModelPreset`, `RestoreService`) to match the server's own
+/// capability name; "Upscale" is what the user reads, since that's what
+/// they're actually asking for — a bigger, cleaner image.
+enum ImagePaneMode: String, CaseIterable, Identifiable {
+    case create = "Create"
+    case upscale = "Upscale"
+
+    var id: String { rawValue }
+    var label: String { rawValue }
+}
+
 // MARK: - Image presets
 
 /// mflux variant — picks the model class and `ModelConfig` factory the
@@ -1164,6 +1181,50 @@ struct Model3DModelPreset: Identifiable, Hashable {
 
     /// Catalog. One entry today; grows as more 3D checkpoints convert.
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
+}
+
+/// Restoration/upscaling checkpoints (`.restore` capability — SeedVR2 today).
+/// One-step diffusion image/video restoration, served through
+/// `POST /v1/images/upscales` and `POST /v1/video/upscales` rather than the
+/// generation endpoints, so it carries no prompt/quality/resolution knobs —
+/// the model runs at the source's own geometry. Same `local/`-prefix
+/// convention as `Model3DModelPreset` for a not-yet-published conversion.
+struct RestoreModelPreset: Identifiable, Hashable {
+    var id: String
+    var name: String
+    /// Model directory under `~/.mlx-serve/models`.
+    var repo: String
+    /// Peak unified-memory footprint, GB — the DiT's compute dtype can widen
+    /// past its on-disk fp16 size (`seedvr2_dit.dtypeWidthRatio`), so this is
+    /// not just the download size.
+    let approxRAMGB: Int
+    /// Full bundle download size, GB (DiT + VAE + text-conditioning tensor).
+    let approxDownloadGB: Double
+    /// Plain-English explanation shown under the model in the Media pane.
+    let description: String
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    var isLocalOnly: Bool { repo.hasPrefix("local/") }
+
+    /// SeedVR2-3B, fp16 — a straight repack of ByteDance-Seed/SeedVR2-3B, no
+    /// requantization.
+    static let seedvr2_3b = RestoreModelPreset(
+        id: "seedvr2-3b",
+        name: "SeedVR2 3B (fp16)",
+        repo: "justintime47/SeedVR2-3B-MLX-Serve",
+        // 7.3 GB weights (bf16 compute, the server default) + a fixed 6 GB
+        // activation headroom the server bills for windowed attention + the
+        // VAE decoder's first upsampled feature map (`SEEDVR2_ACTIVATION_BYTES`
+        // in src/gen.zig) + the eviction gate's own 10% margin.
+        approxRAMGB: 18,
+        approxDownloadGB: 7.3,
+        description: "One-step diffusion restoration for photos and video clips — sharpens detail and removes compression artifacts, and can enlarge the image up to 4× while filling in real detail rather than just resizing."
+    )
+
+    /// Catalog. One entry today; grows as more restoration checkpoints convert.
+    static let all: [RestoreModelPreset] = [.seedvr2_3b]
 }
 
 /// Which music ENGINE a checkpoint drives. The two families share the
