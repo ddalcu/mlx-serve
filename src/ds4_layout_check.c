@@ -15,6 +15,9 @@ size_t mlxserve_ds4_offsetof_mtp_draft_tokens(void) {
 size_t mlxserve_ds4_offsetof_ssd_streaming(void) {
     return offsetof(ds4_engine_options, ssd_streaming);
 }
+size_t mlxserve_ds4_offsetof_placement_session_count_hint(void) {
+    return offsetof(ds4_engine_options, placement_session_count_hint);
+}
 size_t mlxserve_ds4_offsetof_distributed(void) {
     return offsetof(ds4_engine_options, distributed);
 }

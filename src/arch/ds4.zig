@@ -22,6 +22,7 @@ const log = @import("../log.zig");
 
 pub const Error = error{
     EngineOpenFailed,
+    MissingDsparkSupport,
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,
@@ -202,6 +203,9 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
 pub const OpenOptions = struct {
     backend: ffi.Backend = .metal,
     n_threads: c_int = 0,
+    /// Startup admission is sized to this context, before any persistent
+    /// DSpark support view is registered.
+    context_size: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
     /// Optional support GGUF (ds4 speculative decode): the legacy MTP draft
@@ -218,7 +222,10 @@ pub const OpenOptions = struct {
     dspark: bool = false,
     /// SSD weight-streaming (issue #39): skip full model residency + warmup and
     /// stream expert weights from disk, with an in-RAM cache. Lets DeepSeek-V4-Flash
-    /// run on machines whose RAM can't hold the full model. 0 cache fields = ds4 auto.
+    /// run on machines whose RAM can't hold the full model. When neither cache
+    /// field is set, mlx-serve supplies its measured-safe 8 GiB budget instead
+    /// of DwarfStar's device-limit-based auto budget, which cannot see other
+    /// resident processes.
     ssd_streaming: bool = false,
     ssd_streaming_cold: bool = false,
     ssd_streaming_cache_experts: u32 = 0,
@@ -226,12 +233,61 @@ pub const OpenOptions = struct {
     ssd_streaming_preload_experts: u32 = 0,
 };
 
-/// Whether to actually pass `--dspark` to the engine: only when a support
-/// GGUF is going in too — ds4 hard-errors open() on `--dspark` with no
-/// `--mtp FILE`, and a missing OPTIONAL accelerator must degrade to a serial
-/// boot, never a boot failure. Pure; unit-tested.
-pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
-    return requested and has_support_gguf;
+/// Shared offline/server policy for ds4 support sidecars. `--no-ds4-mtp` is a
+/// deliberate opt-out and therefore disables DSpark too. An explicit DSpark
+/// request requires the deterministic lineage-matched DSpark sidecar; it must
+/// never silently degrade to target-only or substitute the legacy MTP
+/// checkpoint. Plain SSD remains target-only even when a sidecar is present.
+pub const SupportSidecarPolicy = struct {
+    lookup: bool,
+    require_dspark: bool,
+    dspark: bool,
+};
+
+pub fn supportSidecarPolicy(
+    mtp_enabled: bool,
+    ssd_streaming: bool,
+    dspark_requested: bool,
+) SupportSidecarPolicy {
+    if (!mtp_enabled) return .{
+        .lookup = false,
+        .require_dspark = false,
+        .dspark = false,
+    };
+    if (dspark_requested) return .{
+        .lookup = true,
+        .require_dspark = true,
+        .dspark = true,
+    };
+    if (ssd_streaming) return .{
+        .lookup = false,
+        .require_dspark = false,
+        .dspark = false,
+    };
+    return .{
+        .lookup = true,
+        .require_dspark = false,
+        .dspark = false,
+    };
+}
+
+/// SSD streaming is explicitly the bounded-memory route. Faulting every GGUF
+/// page before the engine configures its streaming map defeats that contract
+/// and can evict unrelated resident models, so the wrapper enforces the safe
+/// combination even when a caller leaves its general warmup default enabled.
+pub fn warmWeightsEffective(requested: bool, ssd_streaming: bool) bool {
+    return requested and !ssd_streaming;
+}
+
+pub fn ssdStreamingCacheBytesEffective(
+    ssd_streaming: bool,
+    requested_experts: u32,
+    requested_bytes: u64,
+) u64 {
+    if (!ssd_streaming or requested_experts != 0 or requested_bytes != 0) {
+        return requested_bytes;
+    }
+    return 8 * 1024 * 1024 * 1024;
 }
 
 pub const Ds4Engine = struct {
@@ -241,22 +297,22 @@ pub const Ds4Engine = struct {
     mtp_path_owned: ?[:0]u8,
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
-        try ensureMetalKernels(allocator);
-
         const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
         errdefer allocator.free(path_z);
 
         const mtp_z: ?[:0]u8 = if (opts.mtp_path) |p| (allocator.dupeSentinel(u8, p, 0) catch return Error.OutOfMemory) else null;
         errdefer if (mtp_z) |s| allocator.free(s);
 
-        const dspark_on = dsparkEffective(opts.dspark, mtp_z != null);
-        if (opts.dspark and !dspark_on) {
-            log.warn("[ds4] DSpark requested but no support GGUF found beside the model — serving without it\n", .{});
-        } else if (dspark_on) {
-            // Engagement line (the silent-fallback class): the engine still
-            // decides support-kind from the GGUF's tensors and logs its own
-            // detection; this pins that WE armed the runtime.
-            log.info("[ds4] DSpark runtime armed (support GGUF: {s})\n", .{opts.mtp_path.?});
+        if (opts.dspark and mtp_z == null) {
+            log.err("[ds4] DSpark requested but its lineage-matched support GGUF is missing; refusing target-only fallback\n", .{});
+            return Error.MissingDsparkSupport;
+        }
+        try ensureMetalKernels(allocator);
+        const dspark_on = opts.dspark;
+        if (dspark_on) {
+            // The nested engine still validates the candidate's actual tensor
+            // content before it can arm DSpark or register support memory.
+            log.info("[ds4] DSpark runtime requested (support GGUF candidate: {s})\n", .{opts.mtp_path.?});
         }
 
         var options = ffi.EngineOptions{
@@ -264,22 +320,39 @@ pub const Ds4Engine = struct {
             .mtp_path = if (mtp_z) |s| s.ptr else null,
             .backend = opts.backend,
             .n_threads = opts.n_threads,
+            .context_size = opts.context_size,
             .mtp_draft_tokens = opts.mtp_draft_tokens,
             .mtp_margin = opts.mtp_margin,
             .dspark = dspark_on,
             .directional_steering_file = null,
             .directional_steering_attn = 0,
             .directional_steering_ffn = 0,
-            .warm_weights = opts.warm_weights,
+            .warm_weights = warmWeightsEffective(opts.warm_weights, opts.ssd_streaming),
             .quality = opts.quality,
             .ssd_streaming = opts.ssd_streaming,
             .ssd_streaming_cold = opts.ssd_streaming_cold,
             .ssd_streaming_cache_experts = opts.ssd_streaming_cache_experts,
-            .ssd_streaming_cache_bytes = opts.ssd_streaming_cache_bytes,
+            .ssd_streaming_cache_bytes = ssdStreamingCacheBytesEffective(
+                opts.ssd_streaming,
+                opts.ssd_streaming_cache_experts,
+                opts.ssd_streaming_cache_bytes,
+            ),
             .ssd_streaming_preload_experts = opts.ssd_streaming_preload_experts,
         };
 
         var raw: ?*ffi.Engine = null;
+        if (opts.ssd_streaming) {
+            log.info(
+                "[ds4] SSD streaming cache budget: {d:.2} GiB ({s})\n",
+                .{
+                    @as(f64, @floatFromInt(options.ssd_streaming_cache_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                    if (opts.ssd_streaming_cache_experts == 0 and opts.ssd_streaming_cache_bytes == 0)
+                        "mlx-serve safe default"
+                    else
+                        "explicit",
+                },
+            );
+        }
         const rc = ffi.ds4_engine_open(&raw, &options);
         if (rc != 0 or raw == null) {
             log.err("[ds4] ds4_engine_open rc={d} model={s}\n", .{ rc, model_path });
@@ -596,15 +669,51 @@ const TokenHolder = struct {
     }
 };
 
-test "dsparkEffective: DSpark arms only with a support GGUF present" {
-    // The engine hard-errors open() on `--dspark` without `--mtp FILE`, so a
-    // dspark request with no sidecar on disk must degrade to a logged serial
-    // boot, never a failed boot (a launcher that refuses to start over a
-    // missing OPTIONAL accelerator is worse than one that serves without it).
-    try std.testing.expect(dsparkEffective(true, true));
-    try std.testing.expect(!dsparkEffective(true, false));
-    try std.testing.expect(!dsparkEffective(false, true));
-    try std.testing.expect(!dsparkEffective(false, false));
+test "ds4: supportSidecarPolicy gives offline and scheduler the same fail-closed DSpark contract" {
+    const normal = supportSidecarPolicy(true, false, false);
+    try std.testing.expect(normal.lookup);
+    try std.testing.expect(!normal.require_dspark);
+    try std.testing.expect(!normal.dspark);
+
+    const requested_dspark = supportSidecarPolicy(true, false, true);
+    try std.testing.expect(requested_dspark.lookup);
+    try std.testing.expect(requested_dspark.require_dspark);
+    try std.testing.expect(requested_dspark.dspark);
+
+    const ssd_default = supportSidecarPolicy(true, true, false);
+    try std.testing.expect(!ssd_default.lookup);
+    try std.testing.expect(!ssd_default.require_dspark);
+    try std.testing.expect(!ssd_default.dspark);
+
+    const disabled = supportSidecarPolicy(false, true, true);
+    try std.testing.expect(!disabled.lookup);
+    try std.testing.expect(!disabled.require_dspark);
+    try std.testing.expect(!disabled.dspark);
+}
+
+test "ds4: open rejects missing explicit DSpark support before Metal staging" {
+    try std.testing.expectError(
+        Error.MissingDsparkSupport,
+        Ds4Engine.open(std.testing.allocator, "unused-target.gguf", .{
+            .dspark = true,
+            .mtp_path = null,
+        }),
+    );
+}
+
+test "warmWeightsEffective: SSD streaming never faults the complete GGUF" {
+    try std.testing.expect(warmWeightsEffective(true, false));
+    try std.testing.expect(!warmWeightsEffective(true, true));
+    try std.testing.expect(!warmWeightsEffective(false, false));
+    try std.testing.expect(!warmWeightsEffective(false, true));
+}
+
+test "ssdStreamingCacheBytesEffective: wrapper default is bounded and explicit budgets win" {
+    const safe_default: u64 = 8 * 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u64, 0), ssdStreamingCacheBytesEffective(false, 0, 0));
+    try std.testing.expectEqual(safe_default, ssdStreamingCacheBytesEffective(true, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), ssdStreamingCacheBytesEffective(true, 701, 0));
+    try std.testing.expectEqual(@as(u64, 12 * 1024 * 1024 * 1024), ssdStreamingCacheBytesEffective(true, 0, 12 * 1024 * 1024 * 1024));
 }
 
 test "clampSessionCtx: unset (0) → ds4 default" {
@@ -634,4 +743,19 @@ test "kernel hash is stable across calls" {
     const a = computeKernelHash();
     const b = computeKernelHash();
     try std.testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "embedded Metal source inventory matches upstream loader" {
+    // The Objective-C loader table is the upstream authority. If DwarfStar
+    // adds an entry, this fails before mlx-serve can silently ship an older
+    // embedded-kernel closure.
+    try std.testing.expectEqual(
+        kernel_entries.len,
+        std.mem.count(u8, metal_sources.upstream_loader, "@[@\"DS4_METAL_"),
+    );
+
+    for (kernel_entries) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, metal_sources.upstream_loader, entry.env_var) != null);
+        try std.testing.expect(std.mem.indexOf(u8, metal_sources.upstream_loader, entry.file_name) != null);
+    }
 }

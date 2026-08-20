@@ -11,6 +11,7 @@ const unavailable = "ds4 engine is unavailable on the iOS build (MLX safetensors
 
 pub const Error = error{
     EngineOpenFailed,
+    MissingDsparkSupport,
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,
@@ -31,9 +32,45 @@ pub fn clampSessionCtx(requested: u32) u32 {
     return @max(requested, ds4_prefill_chunk);
 }
 
+/// Signature and policy mirror `arch/ds4.zig`; iOS never reaches the ds4
+/// loader, but shared scheduler code must type-check the same contract.
+pub const SupportSidecarPolicy = struct {
+    lookup: bool,
+    require_dspark: bool,
+    dspark: bool,
+};
+
+pub fn supportSidecarPolicy(
+    mtp_enabled: bool,
+    ssd_streaming: bool,
+    dspark_requested: bool,
+) SupportSidecarPolicy {
+    if (!mtp_enabled) return .{
+        .lookup = false,
+        .require_dspark = false,
+        .dspark = false,
+    };
+    if (dspark_requested) return .{
+        .lookup = true,
+        .require_dspark = true,
+        .dspark = true,
+    };
+    if (ssd_streaming) return .{
+        .lookup = false,
+        .require_dspark = false,
+        .dspark = false,
+    };
+    return .{
+        .lookup = true,
+        .require_dspark = false,
+        .dspark = false,
+    };
+}
+
 pub const OpenOptions = struct {
     backend: ffi.Backend = .metal,
     n_threads: c_int = 0,
+    context_size: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
     // Match arch/ds4.zig's OpenOptions.mtp_path (?[]const u8): the shared

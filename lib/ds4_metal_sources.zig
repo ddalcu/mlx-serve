@@ -10,6 +10,10 @@
 // `.metal` file in lib/ds4/metal/, add a `pub const` here, and add an entry in
 // `src/arch/ds4.zig` `kernel_entries`.
 
+/// Upstream loader source, exposed only so integration tests can prove this
+/// module mirrors every Metal source override DwarfStar actually loads.
+pub const upstream_loader: []const u8 = @embedFile("ds4/ds4_metal.m");
+
 pub const argsort: []const u8 = @embedFile("ds4/metal/argsort.metal");
 pub const bin: []const u8 = @embedFile("ds4/metal/bin.metal");
 pub const concat: []const u8 = @embedFile("ds4/metal/concat.metal");

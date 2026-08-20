@@ -1,6 +1,6 @@
 [submodule "lib/ds4"]
 	path = lib/ds4
-	url = https://github.com/antirez/ds4
+	url = https://github.com/PhilipJohnBasile/ds4
 [submodule "lib/mlx-src"]
 	path = lib/mlx-src
 	url = https://github.com/ml-explore/mlx

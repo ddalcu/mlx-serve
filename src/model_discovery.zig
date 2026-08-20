@@ -565,6 +565,16 @@ pub fn isMtpGgufBasename(basename: []const u8) bool {
         asciiContainsIgnoreCase(basename, "-dspark-") or asciiContainsIgnoreCase(basename, "-dspark.");
 }
 
+/// True only for an actual DSpark support checkpoint. `isMtpGgufBasename`
+/// intentionally includes both support formats because a normal speculative
+/// decode may use the legacy MTP head. An explicit DSpark request must not
+/// silently substitute that legacy head, however.
+pub fn isDsparkSupportGgufBasename(basename: []const u8) bool {
+    if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
+    return asciiContainsIgnoreCase(basename, "-dspark-") or
+        asciiContainsIgnoreCase(basename, "-dspark.");
+}
+
 pub fn isGgufSidecarBasename(basename: []const u8) bool {
     if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
     if (isMmprojGgufBasename(basename)) return true;
@@ -572,25 +582,88 @@ pub fn isGgufSidecarBasename(basename: []const u8) bool {
     return isMtpGgufBasename(basename);
 }
 
-/// Full path to the ds4 MTP draft-head GGUF sitting beside `model_file_path`
-/// (the primary quant), or null when there is none. The primary's parent
-/// directory is scanned for a `-MTP-` GGUF. Caller owns the returned slice.
-/// Used to auto-enable ds4 speculative decode: the app downloads the MTP file
-/// into the same folder as the chosen quant, and the engine finds it here.
-pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+fn ds4SidecarRank(model_basename: []const u8, candidate: []const u8, prefer_dspark: bool) u8 {
+    const model_is_0731 = asciiContainsIgnoreCase(model_basename, "-0731");
+    const candidate_is_0731 = asciiContainsIgnoreCase(candidate, "-0731");
+    const candidate_is_dspark = isDsparkSupportGgufBasename(candidate);
+
+    var rank: u8 = 0;
+    if (model_is_0731 != candidate_is_0731) rank += 2;
+    if (prefer_dspark != candidate_is_dspark) rank += 1;
+    return rank;
+}
+
+/// Explicit DSpark is a checkpoint-paired runtime, not a best-effort draft
+/// lookup. Its 0731 lineage must match the target. Ordinary MTP keeps
+/// the ranking fallback above for backward compatibility with legacy pairs.
+fn ds4SidecarLineageMatches(model_basename: []const u8, candidate: []const u8) bool {
+    return asciiContainsIgnoreCase(model_basename, "-0731") ==
+        asciiContainsIgnoreCase(candidate, "-0731");
+}
+
+const Ds4SidecarKind = enum {
+    any_support,
+    dspark_only,
+};
+
+/// Full path to a ds4 support GGUF sitting beside `model_file_path`, or null
+/// when there is none. The choice is deterministic and checkpoint-aware: a
+/// 0731 target prefers its 0731 sidecar, followed by a lexical tie-break. An
+/// explicit DSpark request uses `.dspark_only`, so a legacy MTP head or a
+/// mismatched target/support lineage can never be mistaken for the requested
+/// runtime.
+fn findDs4Sidecar(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_file_path: []const u8,
+    kind: Ds4SidecarKind,
+) ?[]u8 {
     const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    const model_basename = std.fs.path.basename(model_file_path);
     // openDirAbsolute asserts (→ ReleaseFast UB) on a non-absolute path.
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
     defer dir.close(io);
+    var best_path: ?[]u8 = null;
+    var best_rank: u8 = std.math.maxInt(u8);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (!isMtpGgufBasename(entry.name)) continue;
+        if (kind == .dspark_only and !isDsparkSupportGgufBasename(entry.name)) continue;
+        if (kind == .dspark_only and !ds4SidecarLineageMatches(model_basename, entry.name)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind != .file) continue;
-        return std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return null;
+        const rank = ds4SidecarRank(model_basename, entry.name, kind == .dspark_only);
+        const replace = rank < best_rank or (rank == best_rank and (best_path == null or
+            std.mem.order(u8, entry.name, std.fs.path.basename(best_path.?)) == .lt));
+        if (!replace) continue;
+        const candidate_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
+        if (best_path) |old| allocator.free(old);
+        best_path = candidate_path;
+        best_rank = rank;
     }
-    return null;
+    return best_path;
+}
+
+/// Find either support format for ordinary ds4 speculative decoding. Caller
+/// owns the result. This preserves the legacy-MTP path.
+pub fn findDs4MtpSidecar(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_file_path: []const u8,
+) ?[]u8 {
+    return findDs4Sidecar(io, allocator, model_file_path, .any_support);
+}
+
+/// Find the deterministic filename-lineage-matched DSpark support GGUF. A
+/// legacy MTP head is deliberately not a fallback: the caller must fail closed
+/// if this returns null for an explicit `--dspark` request.
+pub fn findDs4DsparkSidecar(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_file_path: []const u8,
+) ?[]u8 {
+    return findDs4Sidecar(io, allocator, model_file_path, .dspark_only);
 }
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1630,6 +1703,8 @@ test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
     // classifies as a servable chat quant and becomes a pickable tray entry
     // that can only fail.
     try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(isDsparkSupportGgufBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(!isDsparkSupportGgufBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
     try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
     try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-dsparkle-chat.gguf"));
 
@@ -1640,6 +1715,176 @@ test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
     // (no delimited `-MTP-` token) is NOT a sidecar.
     try testing.expect(!isGgufSidecarBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
     try testing.expect(!isGgufSidecarBasename("tokenizer.json"));
+}
+
+test "ds4 sidecar ranking is checkpoint-aware and DSpark-aware" {
+    const target_0731 = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix-0731.gguf";
+    const target_old = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix.gguf";
+    const dspark_0731 = "DeepSeek-V4-Flash-DSpark-support-0731.gguf";
+    const dspark_old = "DeepSeek-V4-Flash-DSpark-support.gguf";
+    const mtp_0731 = "DeepSeek-V4-Flash-MTP-Q4K-0731.gguf";
+
+    try testing.expect(ds4SidecarRank(target_0731, dspark_0731, true) <
+        ds4SidecarRank(target_0731, dspark_old, true));
+    try testing.expect(ds4SidecarRank(target_old, dspark_old, true) <
+        ds4SidecarRank(target_old, dspark_0731, true));
+    try testing.expect(ds4SidecarRank(target_0731, dspark_0731, true) <
+        ds4SidecarRank(target_0731, mtp_0731, true));
+    try testing.expect(ds4SidecarRank(target_0731, mtp_0731, false) <
+        ds4SidecarRank(target_0731, dspark_0731, false));
+}
+
+test "findDs4MtpSidecar deterministically selects the matching 0731 support" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const model_name = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix-0731.gguf";
+    const dspark_0731 = "DeepSeek-V4-Flash-DSpark-support-0731.gguf";
+    const dspark_old = "DeepSeek-V4-Flash-DSpark-support.gguf";
+    const mtp_0731 = "DeepSeek-V4-Flash-MTP-Q4K-0731.gguf";
+    try tmp.dir.writeFile(io, .{ .sub_path = model_name, .data = "target" });
+    try tmp.dir.writeFile(io, .{ .sub_path = dspark_old, .data = "old" });
+    try tmp.dir.writeFile(io, .{ .sub_path = dspark_0731, .data = "new" });
+    try tmp.dir.writeFile(io, .{ .sub_path = mtp_0731, .data = "mtp" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const model_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/{s}",
+        .{ cwd, tmp.sub_path, model_name },
+    );
+    defer allocator.free(model_path);
+
+    const dspark_path = findDs4DsparkSidecar(io, allocator, model_path) orelse
+        return error.TestExpectedEqual;
+    defer allocator.free(dspark_path);
+    try testing.expectEqualStrings(dspark_0731, std.fs.path.basename(dspark_path));
+
+    const mtp_path = findDs4MtpSidecar(io, allocator, model_path) orelse
+        return error.TestExpectedEqual;
+    defer allocator.free(mtp_path);
+    try testing.expectEqualStrings(mtp_0731, std.fs.path.basename(mtp_path));
+}
+
+test "findDs4DsparkSidecar rejects a legacy MTP fallback" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const model_name = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix-0731.gguf";
+    const mtp_0731 = "DeepSeek-V4-Flash-MTP-Q4K-0731.gguf";
+    try tmp.dir.writeFile(io, .{ .sub_path = model_name, .data = "target" });
+    try tmp.dir.writeFile(io, .{ .sub_path = mtp_0731, .data = "legacy" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const model_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/{s}",
+        .{ cwd, tmp.sub_path, model_name },
+    );
+    defer allocator.free(model_path);
+
+    try testing.expect(findDs4DsparkSidecar(io, allocator, model_path) == null);
+
+    const legacy_path = findDs4MtpSidecar(io, allocator, model_path) orelse
+        return error.TestExpectedEqual;
+    defer allocator.free(legacy_path);
+    try testing.expectEqualStrings(mtp_0731, std.fs.path.basename(legacy_path));
+}
+
+test "ds4: explicit DSpark rejects older support for a 0731 target" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const model_name = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix-0731.gguf";
+    const older_dspark = "DeepSeek-V4-Flash-DSpark-support.gguf";
+    try tmp.dir.writeFile(io, .{ .sub_path = model_name, .data = "target" });
+    try tmp.dir.writeFile(io, .{ .sub_path = older_dspark, .data = "old support" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const model_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/{s}",
+        .{ cwd, tmp.sub_path, model_name },
+    );
+    defer allocator.free(model_path);
+
+    try testing.expect(findDs4DsparkSidecar(io, allocator, model_path) == null);
+}
+
+test "ds4: explicit DSpark rejects 0731 support for an older target" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const model_name = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix.gguf";
+    const dspark_0731 = "DeepSeek-V4-Flash-DSpark-support-0731.gguf";
+    try tmp.dir.writeFile(io, .{ .sub_path = model_name, .data = "target" });
+    try tmp.dir.writeFile(io, .{ .sub_path = dspark_0731, .data = "new support" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const model_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/{s}",
+        .{ cwd, tmp.sub_path, model_name },
+    );
+    defer allocator.free(model_path);
+
+    try testing.expect(findDs4DsparkSidecar(io, allocator, model_path) == null);
+}
+
+test "ds4: SSD default leaves legacy and DSpark sidecars unselected" {
+    const ds4_arch = @import("arch/ds4.zig");
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const model_name = "DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix-0731.gguf";
+    try tmp.dir.writeFile(io, .{ .sub_path = model_name, .data = "target" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "DeepSeek-V4-Flash-MTP-Q4K-0731.gguf", .data = "legacy" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "DeepSeek-V4-Flash-DSpark-support-0731.gguf", .data = "dspark" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const model_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/{s}",
+        .{ cwd, tmp.sub_path, model_name },
+    );
+    defer allocator.free(model_path);
+
+    const policy = ds4_arch.supportSidecarPolicy(true, true, false);
+    try testing.expect(!policy.lookup);
+    const selected: ?[]u8 = if (policy.lookup)
+        findDs4MtpSidecar(io, allocator, model_path)
+    else
+        null;
+    defer if (selected) |p| allocator.free(p);
+    try testing.expect(selected == null);
+
+    const ordinary = findDs4MtpSidecar(io, allocator, model_path) orelse
+        return error.TestExpectedEqual;
+    defer allocator.free(ordinary);
+    try testing.expectEqualStrings(
+        "DeepSeek-V4-Flash-MTP-Q4K-0731.gguf",
+        std.fs.path.basename(ordinary),
+    );
 }
 
 test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {

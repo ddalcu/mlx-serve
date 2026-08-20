@@ -66,12 +66,13 @@ pub fn build(b: *std.Build) void {
     // that have NO runtime query API (MLX + ggml report themselves at runtime):
     //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
     //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
-    //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
+    //   --ds4-commit     explicit release pin; plain builds inspect the local
+    //                    DwarfStar checkout, including a dirty marker
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
     //                    (written by scripts/fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
-    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
+    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse readDs4GitIdentity(b) orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
     const build_options = b.addOptions();
@@ -127,7 +128,7 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("lib/xatlas"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
-    // `lib/ds4/` submodule pinned at 613e9b2 and `src/arch/ds4.zig`. Kernel
+    // `lib/ds4/` submodule pinned at 69b3762 and `src/arch/ds4.zig`. Kernel
     // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
@@ -452,9 +453,9 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
     // ds4.c #includes ds4_distributed.h; the engine/session path links its impl.
-    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c and
-    // ds4_gpu_args.c are CLI/server-only and not part of the library path
-    // mlx-serve embeds (upstream Makefile CORE_OBJS is the authority).
+    // ds4_gpu.h is implemented in ds4_metal.m. The separate CLI/server/eval/
+    // agent support translation units are not part of the library path
+    // mlx-serve embeds; upstream Makefile CORE_OBJS is the authority.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
     // SSD weight-streaming (issue #39): ds4_ssd.c is a standalone TU (#includes
     // only ds4_ssd.h) implementing the streaming expert cache the engine_options
@@ -499,6 +500,28 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
     ) catch return null;
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     return if (trimmed.len == 0) null else b.dupe(trimmed);
+}
+
+/// Plain developer builds should disclose the DwarfStar revision they really
+/// compiled. The release path can still pass an explicit --ds4-commit pin.
+/// Return null only when git metadata is genuinely unavailable.
+fn readDs4GitIdentity(b: *std.Build) ?[]const u8 {
+    var ignored_exit_code: u8 = undefined;
+    const revision = b.runAllowFail(
+        &.{ "git", "-C", "lib/ds4", "rev-parse", "--short=12", "HEAD" },
+        &ignored_exit_code,
+        .inherit,
+    ) catch return null;
+    const trimmed_revision = std.mem.trim(u8, revision, " \t\r\n");
+    if (trimmed_revision.len == 0) return null;
+
+    const status = b.runAllowFail(
+        &.{ "git", "-C", "lib/ds4", "status", "--porcelain", "--untracked-files=normal" },
+        &ignored_exit_code,
+        .inherit,
+    ) catch return null;
+    const dirty = std.mem.trim(u8, status, " \t\r\n").len != 0;
+    return b.fmt("{s}{s}", .{ trimmed_revision, if (dirty) "-dirty" else "" });
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
