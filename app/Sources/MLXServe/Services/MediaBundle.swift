@@ -438,11 +438,13 @@ extension MediaBundle {
     }
 
     /// SeedVR2 (restore/upscale): a flat converted dir — `config.json` +
-    /// `dit.safetensors` (the completeness marker, mirrors
-    /// `model_discovery.requiredMediaMarker`) + `vae.safetensors` +
-    /// `pos_emb.safetensors`. Non-recursive, no allowlist needed — the
+    /// `vae.safetensors` + `pos_emb.safetensors` + the DiT/transformer weight
+    /// file (the completeness marker, mirrors
+    /// `model_discovery.requiredMediaMarkers`) — `dit.safetensors` for this
+    /// project's own converter, `transformer.safetensors` for the
+    /// mlx-community 8-bit mirror. Non-recursive, no allowlist needed — each
     /// converter writes exactly these four files and nothing else.
-    static func restore(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+    static func restore(repo: String, displayName: String, sizeGB: Double, ditFilename: String = "dit.safetensors") -> MediaBundle {
         MediaBundle(
             id: "restore:\(repo)",
             displayName: displayName,
@@ -450,7 +452,7 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(),
-                    readyMarkers: ["config.json", "vae.safetensors", "pos_emb.safetensors", "dit.safetensors"]
+                    readyMarkers: ["config.json", "vae.safetensors", "pos_emb.safetensors", ditFilename]
                 ),
             ],
             sizeEstimateGB: sizeGB
@@ -524,7 +526,7 @@ extension Model3DModelPreset {
 
 extension RestoreModelPreset {
     var bundle: MediaBundle {
-        .restore(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        .restore(repo: repo, displayName: name, sizeGB: approxDownloadGB, ditFilename: ditFilename)
     }
 }
 

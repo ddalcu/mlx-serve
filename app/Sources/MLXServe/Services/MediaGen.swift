@@ -1202,6 +1202,13 @@ struct RestoreModelPreset: Identifiable, Hashable {
     let approxDownloadGB: Double
     /// Plain-English explanation shown under the model in the Media pane.
     let description: String
+    /// The DiT/transformer weight file this pack ships — `dit.safetensors`
+    /// for this project's own converter, `transformer.safetensors` for the
+    /// mlx-community 8-bit mirror (same NaDiT, quantized; the server's
+    /// `seedvr2_dit.KeyScheme` reads the naming difference off the
+    /// checkpoint itself). Feeds the bundle's ready-marker so the app's own
+    /// completeness check agrees with the server's `requiredMediaMarkers`.
+    var ditFilename: String = "dit.safetensors"
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -1223,8 +1230,27 @@ struct RestoreModelPreset: Identifiable, Hashable {
         description: "One-step diffusion restoration for photos and video clips — sharpens detail and removes compression artifacts, and can enlarge the image up to 4× while filling in real detail rather than just resizing."
     )
 
-    /// Catalog. One entry today; grows as more restoration checkpoints convert.
-    static let all: [RestoreModelPreset] = [.seedvr2_3b]
+    /// SeedVR2-3B, 8-bit affine — the mlx-community mirror. The DiT stays
+    /// QUANTIZED at rest (`mlx_quantized_matmul`, never dequantized to bf16
+    /// at load), so unlike the fp16 sibling its resident weight bytes track
+    /// the download almost 1:1 rather than doubling under `--seedvr2-f32`.
+    /// Sizes are the repo's own reported bytes (`transformer.safetensors`
+    /// 4217529094 + `vae.safetensors`/`pos_emb.safetensors` ~502 MB): dir sum
+    /// ~4.72 GB + the same fixed 6 GiB activation headroom + the eviction
+    /// gate's 10% margin ≈ 12.3 GB, rounded up.
+    static let seedvr2_3b_int8 = RestoreModelPreset(
+        id: "seedvr2-3b-8bit",
+        name: "SeedVR2 3B (8-bit)",
+        repo: "mlx-community/SeedVR2-3B-mlx-int8",
+        approxRAMGB: 13,
+        approxDownloadGB: 4.7,
+        description: "One-step diffusion restoration for photos and video clips — sharpens detail and removes compression artifacts, and can enlarge the image up to 4× while filling in real detail rather than just resizing. This 8-bit build halves the download and memory footprint of the fp16 original.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    /// Catalog, newest/smallest first — the 8-bit build is the one most Macs
+    /// should reach for.
+    static let all: [RestoreModelPreset] = [.seedvr2_3b_int8, .seedvr2_3b]
 }
 
 /// Which music ENGINE a checkpoint drives. The two families share the

@@ -267,17 +267,30 @@ pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
     return discovery.requiredMediaMarker(model_type);
 }
 
+/// True when ANY of `model_type`'s required marker filenames exists under
+/// `model_dir` (`discovery.requiredMediaMarkers` — plural only for SeedVR2,
+/// which ships as either `dit.safetensors` or the mlx-community mirror's
+/// `transformer.safetensors`). No markers declared for the type ⇒ vacuously
+/// present, matching the old single-marker call sites' `orelse` fallthrough.
+fn mediaMarkerPresent(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, model_type: []const u8) bool {
+    var marker_buf: [2][]const u8 = undefined;
+    const markers = discovery.requiredMediaMarkers(model_type, &marker_buf);
+    if (markers.len == 0) return true;
+    for (markers) |marker| {
+        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch continue;
+        defer allocator.free(p);
+        if (fileExists(io, p)) return true;
+    }
+    return false;
+}
+
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (requiredMarkerFor(mt)) |marker| {
-        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
-        defer allocator.free(p);
-        if (!fileExists(io, p)) {
-            log.warn("[gen] {s} at {s} is missing {s}; not treating it as a media model\n", .{ mt, model_dir, marker });
-            return null;
-        }
+    if (!mediaMarkerPresent(io, allocator, model_dir, mt)) {
+        log.warn("[gen] {s} at {s} is missing its required marker; not treating it as a media model\n", .{ mt, model_dir });
+        return null;
     }
     return modality;
 }
@@ -292,10 +305,18 @@ pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     const mt = peekModelType(io, allocator, model_dir) orelse return false;
     defer allocator.free(mt);
     if (modalityFromType(mt) == null) return false;
-    const marker = requiredMarkerFor(mt) orelse return false;
-    const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return false;
-    defer allocator.free(p);
-    return !fileExists(io, p);
+    return !mediaMarkerPresent(io, allocator, model_dir, mt);
+}
+
+/// The DiT/transformer filename actually present in `model_dir` — this
+/// project's own `dit.safetensors`, or (falling back) the mlx-community
+/// 8-bit mirror's `transformer.safetensors`. `RestoreEngine.load` is the one
+/// reader; `discovery.requiredMediaMarkers` is the one table both filenames
+/// live in.
+fn seedvr2DitFilename(io: std.Io, model_dir: []const u8) []const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&buf, "{s}/dit.safetensors", .{model_dir}, 0) catch return "dit.safetensors";
+    return if (fileExists(io, p)) "dit.safetensors" else "transformer.safetensors";
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -869,7 +890,6 @@ pub const RestoreEngine = struct {
     pos_emb: mlx.mlx_array,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*RestoreEngine {
-        _ = io;
         const self = try allocator.create(RestoreEngine);
         errdefer allocator.destroy(self);
         const s = mlx.gpuStream();
@@ -879,7 +899,12 @@ pub const RestoreEngine = struct {
         var vw = try model_mod.loadWeightsSingleFile(allocator, vae_path);
         defer vw.deinit();
 
-        const dit_path = try std.fmt.allocPrint(allocator, "{s}/dit.safetensors", .{model_dir});
+        // Our own converter ships `dit.safetensors`; the mlx-community 8-bit
+        // mirror ships `transformer.safetensors` (same NaDiT, quantized) —
+        // `discovery.requiredMediaMarkers` is the one place BOTH spellings
+        // are enumerated, so a third convention only has to be taught there.
+        const dit_name = seedvr2DitFilename(io, model_dir);
+        const dit_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, dit_name });
         defer allocator.free(dit_path);
         var dw = try model_mod.loadWeightsSingleFile(allocator, dit_path);
         defer dw.deinit();
@@ -888,7 +913,10 @@ pub const RestoreEngine = struct {
         defer allocator.free(emb_path);
         var ew = try model_mod.loadWeightsSingleFile(allocator, emb_path);
         defer ew.deinit();
-        const pe = ew.get("pos_emb") orelse return error.MissingSeedVr2PosEmb;
+        // Ours stores the tensor as "pos_emb" (F32); the mlx-community mirror
+        // stores the SAME [58, 5120] table as "embedding" (F16) — `forward`
+        // casts it to the compute dtype regardless, so only the key differs.
+        const pe = ew.get("pos_emb") orelse ew.get("embedding") orelse return error.MissingSeedVr2PosEmb;
         var pos = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&pos, pe));
 

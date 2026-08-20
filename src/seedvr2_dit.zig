@@ -167,6 +167,16 @@ fn loadVec(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, ar
     defer _ = mlx.mlx_array_free(raw);
     return astype(raw, dt, s);
 }
+/// A `"<prefix>.<suffix>"` vector — the PREFIX-taking twin of `loadVec`, for
+/// call sites that already built the prefix once (a `DitLinear`'s bias, a
+/// scheme-dependent attn/norm key).
+fn loadVecAt(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, comptime suffix: []const u8, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+    const name = try std.fmt.allocPrint(a, "{s}." ++ suffix, .{prefix});
+    defer a.free(name);
+    const raw = try ownWeight(w, name);
+    defer _ = mlx.mlx_array_free(raw);
+    return astype(raw, dt, s);
+}
 /// Linear stored `[out, in]` -> `[in, out]` so the hot path is a plain matmul.
 fn loadLinT(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     const name = try std.fmt.allocPrint(a, fmt, args);
@@ -179,9 +189,82 @@ fn loadLinT(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, a
     defer _ = mlx.mlx_array_free(t);
     return contig(t, s);
 }
-fn linT(x: mlx.mlx_array, wt: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !mlx.mlx_array {
+
+/// A NaDiT Linear, dense (this project's own bf16/fp16 converter) or
+/// affine-quantized (the mlx-community 8-bit mirror). The checkpoint carries
+/// no format flag, so it is decided PER TENSOR by the presence of a
+/// `.scales` sibling — same primitive as `krea.zig`'s / `mage_flow.zig`'s
+/// `MixedLinear`, minus the LoRA arm SeedVR2 has no adapter path for.
+/// `(bits, group_size)` are solved from the packed geometry, never assumed,
+/// so a mirror at a different width works by construction.
+///
+/// Kept QUANTIZED at rest and run through `mlx_quantized_matmul` rather than
+/// dequantized to the compute dtype at load: the 8-bit pack halves both the
+/// download and the resident weight bytes this way, and — unlike a decode
+/// loop — the one-step recipe runs the DiT forward once per restore, so
+/// there is no per-token bandwidth case for pre-widening to bf16.
+const DitLinear = struct {
+    quantized: bool,
+    /// Dense: pre-transposed `[in, out]` in the compute dtype.
+    /// Quantized: packed `[out, in*bits/32]` U32 — `mlx_quantized_matmul`
+    /// takes `transpose_w: true` instead, so this stays as shipped.
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array = .{ .ctx = null },
+    biases: mlx.mlx_array = .{ .ctx = null },
+    bits: u32 = 0,
+    group_size: u32 = 0,
+
+    fn deinit(self: *DitLinear) void {
+        _ = mlx.mlx_array_free(self.w);
+        if (self.quantized) {
+            _ = mlx.mlx_array_free(self.scales);
+            _ = mlx.mlx_array_free(self.biases);
+        }
+    }
+};
+
+/// Load a Linear at `<prefix>.weight` (+ `.scales`/`.biases` when quantized),
+/// dense or quantized, decided by whether the `.scales` sibling is present.
+/// `in_features` is read only on the quantized path, to solve `(bits,
+/// group_size)` from the packed shape — the checkpoint states neither.
+fn loadMixedLinT(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dt: mlx.mlx_dtype, s: S) !DitLinear {
+    const wk = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
+    defer a.free(wk);
+    const sk = try std.fmt.allocPrint(a, "{s}.scales", .{prefix});
+    defer a.free(sk);
+
+    if (w.get(sk) != null) {
+        const bk = try std.fmt.allocPrint(a, "{s}.biases", .{prefix});
+        defer a.free(bk);
+        const weight = try ownWeight(w, wk);
+        errdefer _ = mlx.mlx_array_free(weight);
+        const scales = try ownWeight(w, sk);
+        errdefer _ = mlx.mlx_array_free(scales);
+        const biases = try ownWeight(w, bk);
+        errdefer _ = mlx.mlx_array_free(biases);
+        const w_cols: u32 = @intCast(mlx.getShape(weight)[1]); // in*bits/32
+        const s_cols: u32 = @intCast(mlx.getShape(scales)[1]); // in/group_size
+        const bits: u32 = @intCast(@divExact(32 * w_cols, in_features));
+        const gs: u32 = @intCast(@divExact(in_features, s_cols));
+        return .{ .quantized = true, .w = weight, .scales = scales, .biases = biases, .bits = bits, .group_size = gs };
+    }
+
+    const raw = try ownWeight(w, wk);
+    defer _ = mlx.mlx_array_free(raw);
+    const f = try astype(raw, dt, s);
+    defer _ = mlx.mlx_array_free(f);
+    const t = try transpose(f, &[_]c_int{ 1, 0 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    return .{ .quantized = false, .w = try contig(t, s) };
+}
+
+fn linT(x: mlx.mlx_array, wt: *const DitLinear, bias: ?mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_matmul(&o, x, wt, s));
+    if (wt.quantized) {
+        try mlx.check(mlx.mlx_quantized_matmul(&o, x, wt.w, wt.scales, wt.biases, true, mlx.mlx_optional_int.some(@intCast(wt.group_size)), mlx.mlx_optional_int.some(@intCast(wt.bits)), "affine", s));
+    } else {
+        try mlx.check(mlx.mlx_matmul(&o, x, wt.w, s));
+    }
     if (bias) |b| {
         defer _ = mlx.mlx_array_free(o);
         return addA(o, b, s);
@@ -469,45 +552,109 @@ fn applyRope(x: mlx.mlx_array, r: *const Rope, s: S) !mlx.mlx_array {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// Key scheme — two converters, one set of tensors
+// ════════════════════════════════════════════════════════════════════════
+
+/// Two on-disk key layouts carry the same NaDiT weights. This project's own
+/// converter (`dit.safetensors`, `justintime47/SeedVR2-3B-MLX-Serve`) nests
+/// the txt/vid split as its own path segment (`attn.proj_qkv.txt.weight`,
+/// `ada.txt.attn_gate`, `rope.rope.freqs`, `vid_out_ada.out_shift`); the
+/// mlx-community 8-bit mirror (`transformer.safetensors`) flattens the split
+/// into the tensor name instead (`attn.proj_qkv_txt.weight`,
+/// `ada.params_txt.attn_gate`, `rope.freqs`, root-level `out_shift`). Same
+/// tensors, same shapes — the MLP names are already identical either way.
+/// Detected once from which spelling is actually IN the checkpoint, never
+/// assumed from the file it loaded from: a future pack could ship either
+/// name under either filename.
+const KeyScheme = enum {
+    ours,
+    mlx_community,
+
+    fn detect(w: *const Weights) KeyScheme {
+        return if (w.get("blocks.0.attn.proj_qkv_txt.weight") != null) .mlx_community else .ours;
+    }
+};
+
+/// `blocks.{layer}.attn.<field>.<stream>` (ours) or
+/// `blocks.{layer}.attn.<field>_<stream>` (mlx-community) — the tensor-name
+/// PREFIX; the caller appends `.weight`/`.bias`/`.scales`/`.biases`.
+fn attnPrefix(a: std.mem.Allocator, layer: u32, comptime field: []const u8, stream: []const u8, scheme: KeyScheme) ![]u8 {
+    return switch (scheme) {
+        .ours => std.fmt.allocPrint(a, "blocks.{d}.attn." ++ field ++ ".{s}", .{ layer, stream }),
+        .mlx_community => std.fmt.allocPrint(a, "blocks.{d}.attn." ++ field ++ "_{s}", .{ layer, stream }),
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Blocks
 // ════════════════════════════════════════════════════════════════════════
 
 /// One stream's weights (vid or txt, or the shared `.all` set).
 const Stream = struct {
-    qkv_wt: mlx.mlx_array,
-    out_wt: mlx.mlx_array,
+    qkv_wt: DitLinear,
+    out_wt: DitLinear,
     out_b: mlx.mlx_array,
     nq_w: mlx.mlx_array,
     nk_w: mlx.mlx_array,
-    gate_wt: mlx.mlx_array,
-    up_wt: mlx.mlx_array,
-    down_wt: mlx.mlx_array,
+    gate_wt: DitLinear,
+    up_wt: DitLinear,
+    down_wt: DitLinear,
     ada: [6]mlx.mlx_array, // [layer][kind] flattened: l*3 + kind
 
-    fn load(a: std.mem.Allocator, w: *const Weights, layer: u32, key: []const u8, dt: mlx.mlx_dtype, s: S) !Stream {
+    fn load(a: std.mem.Allocator, w: *const Weights, layer: u32, key: []const u8, cfg: Config, scheme: KeyScheme, dt: mlx.mlx_dtype, s: S) !Stream {
         var st: Stream = undefined;
-        st.qkv_wt = try loadLinT(w, a, "blocks.{d}.attn.proj_qkv.{s}.weight", .{ layer, key }, dt, s);
-        st.out_wt = try loadLinT(w, a, "blocks.{d}.attn.proj_out.{s}.weight", .{ layer, key }, dt, s);
-        st.out_b = try loadVec(w, a, "blocks.{d}.attn.proj_out.{s}.bias", .{ layer, key }, dt, s);
-        st.nq_w = try loadVec(w, a, "blocks.{d}.attn.norm_q.{s}.weight", .{ layer, key }, dt, s);
-        st.nk_w = try loadVec(w, a, "blocks.{d}.attn.norm_k.{s}.weight", .{ layer, key }, dt, s);
+
+        const qkv_prefix = try attnPrefix(a, layer, "proj_qkv", key, scheme);
+        defer a.free(qkv_prefix);
+        st.qkv_wt = try loadMixedLinT(w, a, qkv_prefix, cfg.vid_dim, dt, s);
+
+        const out_prefix = try attnPrefix(a, layer, "proj_out", key, scheme);
+        defer a.free(out_prefix);
+        st.out_wt = try loadMixedLinT(w, a, out_prefix, cfg.innerDim(), dt, s);
+        st.out_b = try loadVecAt(w, a, out_prefix, "bias", dt, s);
+
+        const nq_prefix = try attnPrefix(a, layer, "norm_q", key, scheme);
+        defer a.free(nq_prefix);
+        st.nq_w = try loadVecAt(w, a, nq_prefix, "weight", dt, s);
+        const nk_prefix = try attnPrefix(a, layer, "norm_k", key, scheme);
+        defer a.free(nk_prefix);
+        st.nk_w = try loadVecAt(w, a, nk_prefix, "weight", dt, s);
+
+        // MLP naming is identical across schemes.
         // proj_in_gate is the SiLU'd branch; proj_in is the linear one. The
         // names invite the opposite reading and both shapes match.
-        st.gate_wt = try loadLinT(w, a, "blocks.{d}.mlp.{s}.proj_in_gate.weight", .{ layer, key }, dt, s);
-        st.up_wt = try loadLinT(w, a, "blocks.{d}.mlp.{s}.proj_in.weight", .{ layer, key }, dt, s);
-        st.down_wt = try loadLinT(w, a, "blocks.{d}.mlp.{s}.proj_out.weight", .{ layer, key }, dt, s);
+        const gate_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in_gate", .{ layer, key });
+        defer a.free(gate_prefix);
+        st.gate_wt = try loadMixedLinT(w, a, gate_prefix, cfg.vid_dim, dt, s);
+        const up_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in", .{ layer, key });
+        defer a.free(up_prefix);
+        st.up_wt = try loadMixedLinT(w, a, up_prefix, cfg.vid_dim, dt, s);
+        const down_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_out", .{ layer, key });
+        defer a.free(down_prefix);
+        st.down_wt = try loadMixedLinT(w, a, down_prefix, cfg.mlpHidden(), dt, s);
+
         const lnames = [_][]const u8{ "attn", "mlp" };
         const knames = [_][]const u8{ "shift", "scale", "gate" };
+        // The ada block's stream token: `txt`/`vid`/`all` unchanged (ours) or
+        // `params_txt`/`params_vid`/`params_all` (mlx-community) — the only
+        // group where the community mirror renames the token itself rather
+        // than changing the joiner.
+        const ada_stream = switch (scheme) {
+            .ours => try a.dupe(u8, key),
+            .mlx_community => try std.fmt.allocPrint(a, "params_{s}", .{key}),
+        };
+        defer a.free(ada_stream);
         for (lnames, 0..) |ln, li| {
             for (knames, 0..) |kn, ki| {
-                st.ada[li * 3 + ki] = try loadVec(w, a, "blocks.{d}.ada.{s}.{s}_{s}", .{ layer, key, ln, kn }, dt, s);
+                st.ada[li * 3 + ki] = try loadVec(w, a, "blocks.{d}.ada.{s}.{s}_{s}", .{ layer, ada_stream, ln, kn }, dt, s);
             }
         }
         return st;
     }
 
     fn deinit(st: *Stream) void {
-        for ([_]*mlx.mlx_array{ &st.qkv_wt, &st.out_wt, &st.out_b, &st.nq_w, &st.nk_w, &st.gate_wt, &st.up_wt, &st.down_wt }) |p|
+        for ([_]*DitLinear{ &st.qkv_wt, &st.out_wt, &st.gate_wt, &st.up_wt, &st.down_wt }) |p| p.deinit();
+        for ([_]*mlx.mlx_array{ &st.out_b, &st.nq_w, &st.nk_w }) |p|
             _ = mlx.mlx_array_free(p.*);
         for (&st.ada) |*p| _ = mlx.mlx_array_free(p.*);
     }
@@ -517,15 +664,15 @@ const Stream = struct {
     }
 
     fn mlp(st: *const Stream, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const g = try linT(x, st.gate_wt, null, s);
+        const g = try linT(x, &st.gate_wt, null, s);
         defer _ = mlx.mlx_array_free(g);
         const act = try siluA(g, s);
         defer _ = mlx.mlx_array_free(act);
-        const u = try linT(x, st.up_wt, null, s);
+        const u = try linT(x, &st.up_wt, null, s);
         defer _ = mlx.mlx_array_free(u);
         const p = try mulA(act, u, s);
         defer _ = mlx.mlx_array_free(p);
-        return linT(p, st.down_wt, null, s);
+        return linT(p, &st.down_wt, null, s);
     }
 };
 
@@ -551,17 +698,17 @@ const Block = struct {
 
 pub const Model = struct {
     cfg: Config,
-    vid_in_wt: mlx.mlx_array,
+    vid_in_wt: DitLinear,
     vid_in_b: mlx.mlx_array,
-    txt_in_wt: mlx.mlx_array,
+    txt_in_wt: DitLinear,
     txt_in_b: mlx.mlx_array,
-    emb_in_wt: [3]mlx.mlx_array,
+    emb_in_wt: [3]DitLinear,
     emb_in_b: [3]mlx.mlx_array,
     blocks: []Block,
     out_norm_w: mlx.mlx_array,
     out_shift: mlx.mlx_array,
     out_scale: mlx.mlx_array,
-    vid_out_wt: mlx.mlx_array,
+    vid_out_wt: DitLinear,
     vid_out_b: mlx.mlx_array,
     /// The dtype every weight was widened to. `forward` casts its f32 inputs
     /// into it and casts the result back, so callers never see it.
@@ -569,9 +716,12 @@ pub const Model = struct {
     alloc: std.mem.Allocator,
 
     pub fn deinit(m: *Model) void {
-        for ([_]*mlx.mlx_array{ &m.vid_in_wt, &m.vid_in_b, &m.txt_in_wt, &m.txt_in_b, &m.out_norm_w, &m.out_shift, &m.out_scale, &m.vid_out_wt, &m.vid_out_b }) |p|
+        m.vid_in_wt.deinit();
+        m.txt_in_wt.deinit();
+        m.vid_out_wt.deinit();
+        for ([_]*mlx.mlx_array{ &m.vid_in_b, &m.txt_in_b, &m.out_norm_w, &m.out_shift, &m.out_scale, &m.vid_out_b }) |p|
             _ = mlx.mlx_array_free(p.*);
-        for (&m.emb_in_wt) |*p| _ = mlx.mlx_array_free(p.*);
+        for (&m.emb_in_wt) |*p| p.deinit();
         for (&m.emb_in_b) |*p| _ = mlx.mlx_array_free(p.*);
         for (m.blocks) |*b| b.deinit();
         m.alloc.free(m.blocks);
@@ -591,14 +741,19 @@ pub fn loadAs(a: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_
     m.cfg = cfg;
     m.alloc = a;
     m.dtype = dt;
-    m.vid_in_wt = try loadLinT(w, a, "vid_in.proj.weight", .{}, dt, s);
-    m.vid_in_b = try loadVec(w, a, "vid_in.proj.bias", .{}, dt, s);
-    m.txt_in_wt = try loadLinT(w, a, "txt_in.weight", .{}, dt, s);
-    m.txt_in_b = try loadVec(w, a, "txt_in.bias", .{}, dt, s);
+    const scheme = KeyScheme.detect(w);
+
+    m.vid_in_wt = try loadMixedLinT(w, a, "vid_in.proj", cfg.patchInDim(), dt, s);
+    m.vid_in_b = try loadVecAt(w, a, "vid_in.proj", "bias", dt, s);
+    m.txt_in_wt = try loadMixedLinT(w, a, "txt_in", cfg.txt_in_dim, dt, s);
+    m.txt_in_b = try loadVecAt(w, a, "txt_in", "bias", dt, s);
     const embn = [_][]const u8{ "proj_in", "proj_hid", "proj_out" };
+    const emb_in_features = [_]u32{ cfg.sinusoidal_dim, cfg.vid_dim, cfg.vid_dim };
     for (embn, 0..) |n, i| {
-        m.emb_in_wt[i] = try loadLinT(w, a, "emb_in.{s}.weight", .{n}, dt, s);
-        m.emb_in_b[i] = try loadVec(w, a, "emb_in.{s}.bias", .{n}, dt, s);
+        const prefix = try std.fmt.allocPrint(a, "emb_in.{s}", .{n});
+        defer a.free(prefix);
+        m.emb_in_wt[i] = try loadMixedLinT(w, a, prefix, emb_in_features[i], dt, s);
+        m.emb_in_b[i] = try loadVecAt(w, a, prefix, "bias", dt, s);
     }
 
     m.blocks = try a.alloc(Block, cfg.num_layers);
@@ -608,28 +763,37 @@ pub fn loadAs(a: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_
         var b: Block = undefined;
         switch (branch) {
             .split => {
-                b.vid = try Stream.load(a, w, i, "vid", dt, s);
-                b.txt = try Stream.load(a, w, i, "txt", dt, s);
+                b.vid = try Stream.load(a, w, i, "vid", cfg, scheme, dt, s);
+                b.txt = try Stream.load(a, w, i, "txt", cfg, scheme, dt, s);
             },
             .shared => {
-                b.vid = try Stream.load(a, w, i, "all", dt, s);
+                b.vid = try Stream.load(a, w, i, "all", cfg, scheme, dt, s);
                 b.txt = null;
             },
         }
         // The inverse-frequency table stays f32 whatever the compute dtype:
         // it is multiplied by positions and fed to cos/sin, and bf16 there is
         // ~3 significant digits of ANGLE.
-        b.rope_freqs = try loadVec(w, a, "blocks.{d}.attn.rope.rope.freqs", .{i}, mlx.mlx_dtype.float32, s);
+        b.rope_freqs = switch (scheme) {
+            .ours => try loadVec(w, a, "blocks.{d}.attn.rope.rope.freqs", .{i}, mlx.mlx_dtype.float32, s),
+            .mlx_community => try loadVec(w, a, "blocks.{d}.attn.rope.freqs", .{i}, mlx.mlx_dtype.float32, s),
+        };
         b.method = win_mod.methodForLayer(i);
         b.is_last = manifest.txtSkipsMlp(cfg, i);
         m.blocks[i] = b;
     }
 
     m.out_norm_w = try loadVec(w, a, "vid_out_norm.weight", .{}, dt, s);
-    m.out_shift = try loadVec(w, a, "vid_out_ada.out_shift", .{}, dt, s);
-    m.out_scale = try loadVec(w, a, "vid_out_ada.out_scale", .{}, dt, s);
-    m.vid_out_wt = try loadLinT(w, a, "vid_out.proj.weight", .{}, dt, s);
-    m.vid_out_b = try loadVec(w, a, "vid_out.proj.bias", .{}, dt, s);
+    m.out_shift = switch (scheme) {
+        .ours => try loadVec(w, a, "vid_out_ada.out_shift", .{}, dt, s),
+        .mlx_community => try loadVec(w, a, "out_shift", .{}, dt, s),
+    };
+    m.out_scale = switch (scheme) {
+        .ours => try loadVec(w, a, "vid_out_ada.out_scale", .{}, dt, s),
+        .mlx_community => try loadVec(w, a, "out_scale", .{}, dt, s),
+    };
+    m.vid_out_wt = try loadMixedLinT(w, a, "vid_out.proj", cfg.vid_dim, dt, s);
+    m.vid_out_b = try loadVecAt(w, a, "vid_out.proj", "bias", dt, s);
     return m;
 }
 
@@ -672,15 +836,15 @@ fn embedTimestep(m: *const Model, t: f32, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(sin32);
     const sin = try astype(sin32, m.dtype, s);
     defer _ = mlx.mlx_array_free(sin);
-    const a = try linT(sin, m.emb_in_wt[0], m.emb_in_b[0], s);
+    const a = try linT(sin, &m.emb_in_wt[0], m.emb_in_b[0], s);
     defer _ = mlx.mlx_array_free(a);
     const a2 = try siluA(a, s);
     defer _ = mlx.mlx_array_free(a2);
-    const b = try linT(a2, m.emb_in_wt[1], m.emb_in_b[1], s);
+    const b = try linT(a2, &m.emb_in_wt[1], m.emb_in_b[1], s);
     defer _ = mlx.mlx_array_free(b);
     const b2 = try siluA(b, s);
     defer _ = mlx.mlx_array_free(b2);
-    return linT(b2, m.emb_in_wt[2], m.emb_in_b[2], s);
+    return linT(b2, &m.emb_in_wt[2], m.emb_in_b[2], s);
 }
 
 fn idxArray(idx: []const i32, s: S) !mlx.mlx_array {
@@ -931,9 +1095,9 @@ fn attention(
     const vs = b.vid;
     const ts = b.txtStream();
 
-    const vqkv = try linT(vid, vs.qkv_wt, null, s);
+    const vqkv = try linT(vid, &vs.qkv_wt, null, s);
     defer _ = mlx.mlx_array_free(vqkv);
-    const tqkv = try linT(txt, ts.qkv_wt, null, s);
+    const tqkv = try linT(txt, &ts.qkv_wt, null, s);
     defer _ = mlx.mlx_array_free(tqkv);
 
     var vsplit: [3]mlx.mlx_array = undefined;
@@ -1059,8 +1223,8 @@ fn attention(
     const tflat = try reshape(txt_mean, &[_]c_int{ txt_len, heads * hd }, s);
     defer _ = mlx.mlx_array_free(tflat);
     return .{
-        .vid = try linT(vflat, vs.out_wt, vs.out_b, s),
-        .txt = try linT(tflat, ts.out_wt, ts.out_b, s),
+        .vid = try linT(vflat, &vs.out_wt, vs.out_b, s),
+        .txt = try linT(tflat, &ts.out_wt, ts.out_b, s),
     };
 }
 
@@ -1200,8 +1364,8 @@ pub fn forward(
     defer _ = mlx.mlx_array_free(patched);
     const txt_dt = try astype(txt, m.dtype, s);
     defer _ = mlx.mlx_array_free(txt_dt);
-    var cur_v = try linT(patched, m.vid_in_wt, m.vid_in_b, s);
-    var cur_t = try linT(txt_dt, m.txt_in_wt, m.txt_in_b, s);
+    var cur_v = try linT(patched, &m.vid_in_wt, m.vid_in_b, s);
+    var cur_t = try linT(txt_dt, &m.txt_in_wt, m.txt_in_b, s);
 
     const tok_grid: [3]u32 = .{ grid[0], grid[1] / 2, grid[2] / 2 };
 
@@ -1234,7 +1398,7 @@ pub fn forward(
     // own 1-layer view is malformed and never evaluated.
     const modded = try adaIn(n, &mod, LAYER_ATTN, m.out_shift, m.out_scale, s);
     defer _ = mlx.mlx_array_free(modded);
-    const proj_dt = try linT(modded, m.vid_out_wt, m.vid_out_b, s);
+    const proj_dt = try linT(modded, &m.vid_out_wt, m.vid_out_b, s);
     defer _ = mlx.mlx_array_free(proj_dt);
     // Back to f32 at the boundary: the sampler's `x_0 = noise - pred` and the
     // VAE downstream are f32, and a bf16 prediction subtracted from f32 noise
@@ -1410,7 +1574,7 @@ test "seedvr2 dit: tiny NaDiT matches the reference stage by stage" {
     // Stage 1: patchify + vid_in.
     const patched = try patchify(vid0, grid, s);
     defer _ = mlx.mlx_array_free(patched);
-    var cur_v = try linT(patched, m.vid_in_wt, m.vid_in_b, s);
+    var cur_v = try linT(patched, &m.vid_in_wt, m.vid_in_b, s);
     defer _ = mlx.mlx_array_free(cur_v);
     try expectStage("vid_in", cur_v, &fx, "act_vid_in", s);
 
@@ -1423,7 +1587,7 @@ test "seedvr2 dit: tiny NaDiT matches the reference stage by stage" {
     var mod = try Modulation.init(emb, @intCast(cfg.vid_dim), s);
     defer mod.deinit();
 
-    var cur_t = try linT(txt0, m.txt_in_wt, m.txt_in_b, s);
+    var cur_t = try linT(txt0, &m.txt_in_wt, m.txt_in_b, s);
     defer _ = mlx.mlx_array_free(cur_t);
 
     var plans = try WindowPlans.build(a, tok_grid);
@@ -1473,9 +1637,9 @@ test "seedvr2 dit probe: block 0 attention output" {
     defer _ = mlx.mlx_array_free(txt0);
     const patched = try patchify(vid0, grid, s);
     defer _ = mlx.mlx_array_free(patched);
-    const v = try linT(patched, m.vid_in_wt, m.vid_in_b, s);
+    const v = try linT(patched, &m.vid_in_wt, m.vid_in_b, s);
     defer _ = mlx.mlx_array_free(v);
-    const t = try linT(txt0, m.txt_in_wt, m.txt_in_b, s);
+    const t = try linT(txt0, &m.txt_in_wt, m.txt_in_b, s);
     defer _ = mlx.mlx_array_free(t);
     const emb = try embedTimestep(&m, 734.0, s);
     defer _ = mlx.mlx_array_free(emb);
@@ -1548,6 +1712,100 @@ test "seedvr2 dit: the bf16 default reaches the same answer as f32" {
         std.debug.print("bf16 forward max relative error {e:.3} exceeds ~20 bf16 ulp (cos {d:.6})\n", .{ rel, c });
         return err;
     };
+}
+
+test "seedvr2 dit: KeyScheme reads the checkpoint's OWN spelling, never the filename" {
+    const a = testing.allocator;
+    var ours = model_mod.Weights.init(a);
+    defer ours.deinit();
+    try ours.map.put(try a.dupe(u8, "blocks.0.attn.proj_qkv.txt.weight"), mlx.mlx_array_new_float(0));
+    try testing.expectEqual(KeyScheme.ours, KeyScheme.detect(&ours));
+
+    var community = model_mod.Weights.init(a);
+    defer community.deinit();
+    try community.map.put(try a.dupe(u8, "blocks.0.attn.proj_qkv_txt.weight"), mlx.mlx_array_new_float(0));
+    try testing.expectEqual(KeyScheme.mlx_community, KeyScheme.detect(&community));
+
+    // A dir with neither spelling (e.g. only VAE/pos_emb weights probed
+    // before the DiT file is even opened) must not silently claim a scheme —
+    // `.ours` is the DEFAULT it falls back to, same as every load before
+    // this scheme existed.
+    var neither = model_mod.Weights.init(a);
+    defer neither.deinit();
+    try testing.expectEqual(KeyScheme.ours, KeyScheme.detect(&neither));
+}
+
+test "seedvr2 dit: a quantized DitLinear reaches the same product as the dense weight" {
+    // Same template as hunyuan3d.zig's MixedLinear test: quantize a random
+    // dense matrix, load it back through `loadMixedLinT`, and check the
+    // quantized matmul reproduces the dense product within 8-bit tolerance.
+    // This is the primitive the mlx-community 8-bit mirror's DiT linears
+    // (qkv/proj_out/mlp/emb_in/txt_in/vid_out) all route through.
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+
+    const in: c_int = 128;
+    const out: c_int = 64;
+    const wv = try a.alloc(f32, @intCast(in * out));
+    defer a.free(wv);
+    var prng = std.Random.DefaultPrng.init(11);
+    for (wv) |*x| x.* = prng.random().float(f32) - 0.5;
+    const wsh = [_]c_int{ out, in };
+    const wf = mlx.mlx_array_new_data(wv.ptr, &wsh, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(wf);
+
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    const null_gscale = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", null_gscale, s));
+    var qw = mlx.mlx_array_new();
+    var qs = mlx.mlx_array_new();
+    var qb = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&qw, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qs, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&qb, triple, 2));
+
+    var ww = model_mod.Weights.init(a);
+    defer ww.deinit();
+    try ww.map.put(try a.dupe(u8, "l.weight"), qw);
+    try ww.map.put(try a.dupe(u8, "l.scales"), qs);
+    try ww.map.put(try a.dupe(u8, "l.biases"), qb);
+    var dl = try loadMixedLinT(&ww, a, "l", @intCast(in), mlx.mlx_dtype.float32, s);
+    defer dl.deinit();
+    try testing.expect(dl.quantized);
+    try testing.expectEqual(@as(u32, 8), dl.bits);
+    try testing.expectEqual(@as(u32, 64), dl.group_size);
+
+    const xv = try a.alloc(f32, @intCast(in));
+    defer a.free(xv);
+    for (xv, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1;
+    const xsh = [_]c_int{ 1, in };
+    const xa = mlx.mlx_array_new_data(xv.ptr, &xsh, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(xa);
+    const o = try linT(xa, &dl, null, s);
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_array_eval(o));
+    try testing.expectEqual(@as(usize, @intCast(out)), @as(usize, @intCast(mlx.mlx_array_size(o))));
+    const od = mlx.mlx_array_data_float32(o) orelse return error.NoData;
+    // 8-bit quant of a [-0.5, 0.5] matrix reproduces the dense product closely.
+    var manual: f32 = 0;
+    for (0..@intCast(in)) |i| manual += xv[i] * wv[i]; // row 0
+    try testing.expectApproxEqAbs(manual, od[0], 0.05);
+
+    // Dense weights (no `.scales` sibling) still load through the same
+    // chokepoint and reach the plain-matmul branch.
+    var dense_w = model_mod.Weights.init(a);
+    defer dense_w.deinit();
+    const wf2 = mlx.mlx_array_new_data(wv.ptr, &wsh, 2, mlx.mlx_dtype.float32);
+    try dense_w.map.put(try a.dupe(u8, "d.weight"), wf2);
+    var dd = try loadMixedLinT(&dense_w, a, "d", @intCast(in), mlx.mlx_dtype.float32, s);
+    defer dd.deinit();
+    try testing.expect(!dd.quantized);
+    const od2 = try linT(xa, &dd, null, s);
+    defer _ = mlx.mlx_array_free(od2);
+    try mlx.check(mlx.mlx_array_eval(od2));
+    const od2d = mlx.mlx_array_data_float32(od2) orelse return error.NoData;
+    try testing.expectApproxEqAbs(manual, od2d[0], 1e-4);
 }
 
 test "the compute dtype is bf16 unless the kill switch is set, and the bill follows it" {

@@ -906,4 +906,29 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(q4.bundle.id, "minimax-h3:ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit")
     }
 
+    func testSeedVr2EightBitPresetReadsTheMlxCommunityMirrorsOwnFilename() {
+        let all = RestoreModelPreset.all
+        XCTAssertTrue(all.contains(where: { $0.id == RestoreModelPreset.seedvr2_3b.id }))
+        guard let int8 = all.first(where: { $0.id == RestoreModelPreset.seedvr2_3b_int8.id }) else {
+            return XCTFail("no 8-bit SeedVR2 preset in RestoreModelPreset.all")
+        }
+        XCTAssertEqual(int8.repo, "mlx-community/SeedVR2-3B-mlx-int8")
+        XCTAssertNotEqual(int8.id, RestoreModelPreset.seedvr2_3b.id)
+        // The point of the pack: it's the smaller download. The DiT stays
+        // quantized at rest (never dequantized to bf16), so its resident RAM
+        // is well under the fp16 sibling's too, not just its download size.
+        XCTAssertLessThan(int8.approxDownloadGB, RestoreModelPreset.seedvr2_3b.approxDownloadGB)
+        XCTAssertLessThan(int8.approxRAMGB, RestoreModelPreset.seedvr2_3b.approxRAMGB)
+        // The completeness marker follows the mlx-community mirror's OWN
+        // filename (`transformer.safetensors`), never this project's own
+        // `dit.safetensors` — the two converters ship different names for
+        // the same NaDiT weights (`model_discovery.requiredMediaMarkers`).
+        let markers = int8.bundle.components[0].readyMarkers
+        XCTAssertTrue(markers.contains("transformer.safetensors"))
+        XCTAssertFalse(markers.contains("dit.safetensors"))
+        let fp16Markers = RestoreModelPreset.seedvr2_3b.bundle.components[0].readyMarkers
+        XCTAssertTrue(fp16Markers.contains("dit.safetensors"))
+        XCTAssertFalse(fp16Markers.contains("transformer.safetensors"))
+    }
+
 }

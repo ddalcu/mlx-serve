@@ -77,6 +77,23 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Every marker filename that PROVES a media model_type's big weight file
+/// landed — plural because SeedVR2 alone has two converters in the wild:
+/// this project's own `dit.safetensors`, and the mlx-community 8-bit
+/// mirror's `transformer.safetensors` (a quantized re-export of the same
+/// NaDiT, `seedvr2_dit.zig`'s `KeyScheme` reads the difference). Every other
+/// media arch still has exactly one marker, so this is `requiredMediaMarker`
+/// plus one alternate spelling rather than a second table to keep in sync.
+pub fn requiredMediaMarkers(model_type: []const u8, buf: *[2][]const u8) []const []const u8 {
+    const primary = requiredMediaMarker(model_type) orelse return buf[0..0];
+    buf[0] = primary;
+    if (std.mem.startsWith(u8, model_type, "seedvr2")) {
+        buf[1] = "transformer.safetensors";
+        return buf[0..2];
+    }
+    return buf[0..1];
+}
+
 pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
@@ -818,13 +835,25 @@ fn tryAddModel(
     errdefer if (model_type.len > 0) allocator.free(model_type);
 
     // An incomplete media pack stays invisible, like any half-pulled
-    // download (see `requiredMediaMarker`).
-    if (requiredMediaMarker(model_type)) |marker| {
-        const present = if (sub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
-        if (!present) {
-            log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)", .{ name, model_type, marker });
-            allocator.free(model_type);
-            return true;
+    // download (see `requiredMediaMarkers`).
+    {
+        var marker_buf: [2][]const u8 = undefined;
+        const markers = requiredMediaMarkers(model_type, &marker_buf);
+        if (markers.len > 0) {
+            var present = false;
+            for (markers) |marker| {
+                if (sub.statFile(io, marker, .{})) |st| {
+                    if (st.kind == .file) {
+                        present = true;
+                        break;
+                    }
+                } else |_| {}
+            }
+            if (!present) {
+                log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)", .{ name, model_type, markers[0] });
+                allocator.free(model_type);
+                return true;
+            }
         }
     }
 
@@ -953,11 +982,23 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 
     // Same completeness rule as tryAddModel: registering an incomplete media
     // pack by path would hand it straight to the text loader.
-    if (requiredMediaMarker(model_type)) |marker| {
-        var msub = dir.openDir(io, base, .{}) catch return error.ModelDirNotFound;
-        defer msub.close(io);
-        const present = if (msub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
-        if (!present) return error.IncompleteMediaPack;
+    {
+        var marker_buf: [2][]const u8 = undefined;
+        const markers = requiredMediaMarkers(model_type, &marker_buf);
+        if (markers.len > 0) {
+            var msub = dir.openDir(io, base, .{}) catch return error.ModelDirNotFound;
+            defer msub.close(io);
+            var present = false;
+            for (markers) |marker| {
+                if (msub.statFile(io, marker, .{})) |st| {
+                    if (st.kind == .file) {
+                        present = true;
+                        break;
+                    }
+                } else |_| {}
+            }
+            if (!present) return error.IncompleteMediaPack;
+        }
     }
 
     var bytes: u64 = 0;
@@ -1862,6 +1903,44 @@ test "discovery skips an incomplete media pack (media model_type without its mar
 
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("ddalcu/h3-complete", result.models[0].id);
+}
+
+test "SeedVR2 discovers as complete under EITHER its own or the mlx-community mirror's DiT filename" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Our own converter's marker.
+    try tmp.dir.createDirPath(io, "justintime47/seedvr2-3b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "justintime47/seedvr2-3b/config.json", .data = "{\"model_type\":\"seedvr2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "justintime47/seedvr2-3b/dit.safetensors", .data = "0123" });
+    // The mlx-community 8-bit mirror ships `transformer.safetensors`
+    // instead — same NaDiT, no `dit.safetensors` at all.
+    try tmp.dir.createDirPath(io, "mlx-community/seedvr2-3b-int8");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/seedvr2-3b-int8/config.json", .data = "{\"model_type\":\"seedvr2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/seedvr2-3b-int8/transformer.safetensors", .data = "0123" });
+    // Neither marker present (an in-flight download of either shape) stays
+    // invisible, exactly like every other media arch's fragment.
+    try tmp.dir.createDirPath(io, "x/seedvr2-fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/seedvr2-fragment/config.json", .data = "{\"model_type\":\"seedvr2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/seedvr2-fragment/vae.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(allocator);
+    for (result.models) |m| try ids.append(allocator, m.id);
+    std.mem.sort([]const u8, ids.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    try testing.expectEqual(@as(usize, 2), ids.items.len);
+    try testing.expectEqualStrings("justintime47/seedvr2-3b", ids.items[0]);
+    try testing.expectEqualStrings("mlx-community/seedvr2-3b-int8", ids.items[1]);
 }
 
 test "probeModelDir refuses an incomplete media pack by name" {
