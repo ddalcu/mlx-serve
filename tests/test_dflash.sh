@@ -282,14 +282,18 @@ else
 fi
 
 # [10] The block is capped to what this machine's verify lanes serve. Without
-# the NAX m16 tile the checkpoint's own block (16) is a 4x-cost verify.
+# a wide verify lane the checkpoint block may be reduced; with one, preserve
+# the checkpoint's own block size (currently 8 for Qwen3.8 DFlash2, 16 for the
+# original Muse assistant).
 BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
+CHECKPOINT_BLOCK=$(grep -o '\[dflash[^]]*\] loaded.*block_size=[0-9]*' "$LOG" | head -1 | sed -n 's/.*block_size=\([0-9]*\).*/\1/p')
+READY_BLOCK=$(echo "$BLINE" | sed -n 's/.*block_size=\([0-9]*\).*/\1/p')
 if echo "$BLINE" | grep -q "capped (no wide verify lane"; then
     ok "block capped on a machine with no wide verify lane ($BLINE)"
-elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=16"; then
+elif echo "$BLINE" | grep -q "wide_verify_lane=true" && [ -n "$CHECKPOINT_BLOCK" ] && [ "$READY_BLOCK" = "$CHECKPOINT_BLOCK" ]; then
     ok "wide verify lane present, checkpoint block kept ($BLINE)"
 else
-    bad "block resolves against the machine's verify lanes" "$BLINE"
+    bad "block resolves against the machine's verify lanes" "$BLINE" "checkpoint_block=$CHECKPOINT_BLOCK ready_block=$READY_BLOCK"
 fi
 
 # [11] The assistant context rides the prefix cache. A restore forwards no

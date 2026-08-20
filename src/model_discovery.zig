@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const dflash = @import("dflash.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -439,6 +440,10 @@ pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []c
     if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
     if (isGgufModelPath(io, abs_path)) return .chat;
     const trimmed = trimTrailingSlash(abs_path);
+    // DFlash 2 deliberately keeps `model_type: qwen3`; its drafter identity
+    // lives in the nested method contract, so model_type-only classification
+    // would advertise it as a standalone chat model.
+    if (dflash.probeIsDflash(io, allocator, trimmed)) return .drafter;
     const base = std.fs.path.basename(trimmed);
     const parent = std.fs.path.dirname(trimmed) orelse return null;
     if (base.len == 0 or parent.len == 0) return null;
@@ -1522,6 +1527,11 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
     try tmp.dir.writeFile(io, .{ .sub_path = "img/config.json", .data = "{\"model_type\":\"flux2-klein-4b\"}" });
     try tmp.dir.createDirPath(io, "drafter");
     try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"gemma4_assistant\"}" });
+    try tmp.dir.createDirPath(io, "dflash2");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "dflash2/config.json",
+        .data = "{\"model_type\":\"qwen3\",\"dflash_config\":{\"block_size\":8,\"mask_token_id\":7,\"target_layer_ids\":[1]}}",
+    });
     // MageFlow diffusers repo: NO root config.json, only model_index.json.
     try tmp.dir.createDirPath(io, "mage");
     try tmp.dir.writeFile(io, .{ .sub_path = "mage/model_index.json", .data = "{\"_class_name\":\"MageFlowPipeline\"}" });
@@ -1535,6 +1545,7 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
         .{ "g", ModelKind.chat },
         .{ "img", ModelKind.image },
         .{ "drafter", ModelKind.drafter },
+        .{ "dflash2", ModelKind.drafter },
         .{ "mage", ModelKind.image },
     };
     inline for (cases) |c| {

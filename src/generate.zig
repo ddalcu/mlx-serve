@@ -3599,14 +3599,11 @@ pub const Generator = struct {
     /// (`cache.step = prompt_len + emitted`, t1 NOT in cache on entry,
     /// correction from ORIGINAL `verify_logits[accepted]`).
     ///
-    /// Rollback is an offset-only `cache.truncate` — legal because
-    /// `DflashModel.bind` restricts targets to the pure-KVCache standard
-    /// path (no SSM, no module-owned state), where a position's K/V depend
-    /// only on earlier positions (causal) and are identical whether computed
-    /// in a width-16 verify or any re-forward. No re-forward runs at all:
-    /// the next round's context comes from slicing THIS round's verify
-    /// captures to the committed prefix — exactly the reference's
-    /// `hidden_states[i+1][:, :n_accepted]`.
+    /// Pure-attention rollback is an offset-only `cache.truncate`. On Qwen's
+    /// hybrid GatedDeltaNet target, the verify pass captures per-position
+    /// recurrent state and rollback slices the accepted state exactly—the same
+    /// no-re-forward scheme used by MTP/PLD. The next round's assistant context
+    /// comes from slicing THIS round's verify captures to the committed prefix.
     ///
     /// Drafts are greedy (argmax over the trunk lm_head on assistant
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
@@ -3638,8 +3635,11 @@ pub const Generator = struct {
         const bs: u32 = @max(self.dflash_block_size, 2);
         const m: u32 = bs - 1;
         const t1: u32 = self.next_token_id;
-        const anchor_pos: usize = self.ctx.cache.step;
+        const anchor_pos: usize = xfm.dflashPosition(&self.ctx);
         std.debug.assert(dctx.absLen() == anchor_pos);
+        const kv_step_snap = self.ctx.cache.step;
+        const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
+        const hybrid_target = xfm.dflashUsesHybridState();
 
         const tracing = dflashTraceEnabled();
         var ph: io_util.Stopwatch = undefined;
@@ -3657,9 +3657,23 @@ pub const Generator = struct {
         const noise_shape = [_]c_int{ 1, @intCast(bs) };
         const noise_input = mlx.mlx_array_new_data(noise_ids.ptr, &noise_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(noise_input);
-        // RAW table rows — no embed norm, no scale (the DFlash contract).
-        const noise_embeds = try xfm.rawEmbedding(noise_input);
-        defer _ = mlx.mlx_array_free(noise_embeds);
+        // RAW table rows — no embed norm. DFlash 2 optionally calibrates the
+        // borrowed table with its method-level input embedding scale.
+        const noise_embeds_raw = try xfm.rawEmbedding(noise_input);
+        defer _ = mlx.mlx_array_free(noise_embeds_raw);
+        var noise_embeds_scaled: ?mlx.mlx_array = null;
+        defer if (noise_embeds_scaled) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const noise_embeds = if (model.config.input_embedding_scale != 1.0) blk: {
+            const scale = mlx.mlx_array_new_float(model.config.input_embedding_scale);
+            defer _ = mlx.mlx_array_free(scale);
+            var scaled = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(scaled);
+            try mlx.check(mlx.mlx_multiply(&scaled, noise_embeds_raw, scale, s));
+            noise_embeds_scaled = scaled;
+            break :blk scaled;
+        } else noise_embeds_raw;
 
         const blk_hidden = try dflash_mod.forwardBlock(model, dctx, noise_embeds, anchor_pos);
         defer _ = mlx.mlx_array_free(blk_hidden);
@@ -3696,7 +3710,35 @@ pub const Generator = struct {
         };
         var draft_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_ids);
-        if (sample_drafts) {
+        if (model.candidate_selector) |*selector| {
+            var draft_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(draft_hidden);
+            const bh_shape = mlx.getShape(blk_hidden);
+            try mlx.check(mlx.mlx_slice(
+                &draft_hidden,
+                blk_hidden,
+                &[_]c_int{ 0, 1, 0 },
+                3,
+                &[_]c_int{ 1, @intCast(bs), bh_shape[2] },
+                3,
+                &[_]c_int{ 1, 1, 1 },
+                3,
+                s,
+            ));
+            const scored = try selector.score(draft_hidden, draft_logits, t1, s);
+            defer scored.deinit();
+            const walk = try dflash2Walk(
+                allocator,
+                &scored,
+                @intCast(xfm.config.vocab_size),
+                self.sampling,
+                sample_drafts,
+                s,
+            );
+            _ = mlx.mlx_array_free(draft_ids);
+            draft_ids = walk.ids;
+            if (walk.q.ctx != null) draft_q = walk.q;
+        } else if (sample_drafts) {
             draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
             var logq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(logq);
@@ -3749,7 +3791,15 @@ pub const Generator = struct {
         var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
-        const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        self.ctx.capture_ssm_seq = hybrid_target and self.ctx.ssm_entries != null;
+        const verify_logits = xfm.forwardWith(&self.ctx, verify_input) catch |err| {
+            self.ctx.capture_ssm_seq = false;
+            return err;
+        };
+        self.ctx.capture_ssm_seq = false;
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
         self.dflash_attempted += 1;
         if (tracing) {
             // Captures ride the same forward — eval them here or their cost
@@ -3876,7 +3926,23 @@ pub const Generator = struct {
         // assistant context by exactly the committed positions ──
         const n_commit: usize = 1 + @as(usize, accepted);
         if (accepted < m) {
-            try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+            if (hybrid_target) {
+                const gdn_captured = if (self.ctx.ssm_entries) |entries|
+                    entries.len > 0 and entries[0].spec_state_seq.ctx != null
+                else
+                    false;
+                if (!gdn_captured) return error.DflashRollbackUnavailable;
+                try self.ctx.cache.truncate(moe_seq_offset_snap + n_commit, s);
+                // Layer zero is recurrent, so KVCache.step is not the hybrid's
+                // position counter. Preserve its pre-verify bookkeeping value.
+                self.ctx.cache.step = kv_step_snap;
+                for (self.ctx.ssm_entries.?) |*entry| {
+                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                }
+                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + n_commit;
+            } else {
+                try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+            }
         }
         if (accepted == m) {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
@@ -6646,6 +6712,170 @@ fn filteredProbsBlock(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx
         rows = masked;
     }
     return filteredProbsRows(rows, sampling, s);
+}
+
+const Dflash2Walk = struct {
+    ids: mlx.mlx_array, // [1, m] int32
+    q: mlx.mlx_array, // sampled: [m, V] f32; greedy: null
+
+    fn deinit(self: *const Dflash2Walk) void {
+        _ = mlx.mlx_array_free(self.ids);
+        if (self.q.ctx != null) _ = mlx.mlx_array_free(self.q);
+    }
+};
+
+/// Walk DFlash 2's K-way transition lattice without synchronizing between
+/// positions. `previous` remains a lazy candidate-local index, so the whole
+/// dependent walk is one MLX graph. For sampled requests each K-way proposal
+/// is scattered back into a dense vocab row; that exact q is later consumed by
+/// Leviathan acceptance and residual correction.
+fn dflash2Walk(
+    allocator: std.mem.Allocator,
+    scored: *const dflash_mod.DflashCandidateSelector.Scores,
+    vocab: c_int,
+    sampling: SamplingParams,
+    sample_drafts: bool,
+    s: mlx.mlx_stream,
+) !Dflash2Walk {
+    const csh = mlx.getShape(scored.candidate_ids);
+    const esh = mlx.getShape(scored.edges);
+    std.debug.assert(csh.len == 3 and esh.len == 4);
+    const m: usize = @intCast(csh[1]);
+    const k = csh[2];
+    const token_rows = try allocator.alloc(mlx.mlx_array, m);
+    defer allocator.free(token_rows);
+    var built_tokens: usize = 0;
+    errdefer {
+        for (token_rows[0..built_tokens]) |a| _ = mlx.mlx_array_free(a);
+    }
+    const q_rows: []mlx.mlx_array = if (sample_drafts) try allocator.alloc(mlx.mlx_array, m) else &.{};
+    defer if (sample_drafts) allocator.free(q_rows);
+    var built_q: usize = 0;
+    errdefer if (sample_drafts) {
+        for (q_rows[0..built_q]) |a| _ = mlx.mlx_array_free(a);
+    };
+
+    const zero_idx: i32 = 0;
+    const idx_shape = [_]c_int{1};
+    var previous = mlx.mlx_array_new_data(&zero_idx, &idx_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(previous);
+
+    const strides3 = [_]c_int{ 1, 1, 1 };
+    const strides4 = [_]c_int{ 1, 1, 1, 1 };
+    for (0..m) |step| {
+        var candidate_3d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(candidate_3d);
+        try mlx.check(mlx.mlx_slice(
+            &candidate_3d,
+            scored.candidate_ids,
+            &[_]c_int{ 0, @intCast(step), 0 },
+            3,
+            &[_]c_int{ 1, @as(c_int, @intCast(step)) + 1, k },
+            3,
+            &strides3,
+            3,
+            s,
+        ));
+        var candidate_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(candidate_row);
+        try mlx.check(mlx.mlx_reshape(&candidate_row, candidate_3d, &[_]c_int{ 1, k }, 2, s));
+
+        var edge_4d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(edge_4d);
+        try mlx.check(mlx.mlx_slice(
+            &edge_4d,
+            scored.edges,
+            &[_]c_int{ 0, @intCast(step), 0, 0 },
+            4,
+            &[_]c_int{ 1, @as(c_int, @intCast(step)) + 1, k, k },
+            4,
+            &strides4,
+            4,
+            s,
+        ));
+        var edge_matrix = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(edge_matrix);
+        try mlx.check(mlx.mlx_reshape(&edge_matrix, edge_4d, &[_]c_int{ k, k }, 2, s));
+        var selected_scores = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(selected_scores);
+        try mlx.check(mlx.mlx_take_axis(&selected_scores, edge_matrix, previous, 0, s));
+
+        var masked_scores: mlx.mlx_array = .{ .ctx = null };
+        defer if (masked_scores.ctx != null) {
+            _ = mlx.mlx_array_free(masked_scores);
+        };
+        const walk_scores = if (sampling.suppress_mask) |mask| blk: {
+            var candidate_mask = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(candidate_mask);
+            try mlx.check(mlx.mlx_take_axis(&candidate_mask, mask, candidate_row, 0, s));
+            const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+            defer _ = mlx.mlx_array_free(neg_inf);
+            try mlx.check(mlx.mlx_where(&masked_scores, candidate_mask, neg_inf, selected_scores, s));
+            break :blk masked_scores;
+        } else selected_scores;
+
+        var local_index = mlx.mlx_array_new();
+        var local_index_transferred = false;
+        defer if (!local_index_transferred) {
+            _ = mlx.mlx_array_free(local_index);
+        };
+        if (sample_drafts) {
+            var owned_scores = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&owned_scores, walk_scores));
+            var candidate_sampling = sampling;
+            if (candidate_sampling.top_k > @as(u32, @intCast(k))) candidate_sampling.top_k = @intCast(k);
+            const candidate_q = try filteredProbsRows(owned_scores, candidate_sampling, s);
+            defer _ = mlx.mlx_array_free(candidate_q);
+            var logq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(logq);
+            try mlx.check(mlx.mlx_log(&logq, candidate_q, s));
+            const null_key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(null_key);
+            try mlx.check(mlx.mlx_random_categorical(&local_index, logq, -1, null_key, s));
+
+            const zero = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var dense_q = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dense_q);
+            try mlx.check(mlx.mlx_full(&dense_q, &[_]c_int{ 1, vocab }, 2, zero, .float32, s));
+            q_rows[step] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_put_along_axis(&q_rows[step], dense_q, candidate_row, candidate_q, -1, s));
+            built_q += 1;
+        } else {
+            try mlx.check(mlx.mlx_argmax_axis(&local_index, walk_scores, -1, false, s));
+        }
+
+        var local_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(local_2d);
+        try mlx.check(mlx.mlx_reshape(&local_2d, local_index, &[_]c_int{ 1, 1 }, 2, s));
+        token_rows[step] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_along_axis(&token_rows[step], candidate_row, local_2d, -1, s));
+        built_tokens += 1;
+
+        _ = mlx.mlx_array_free(previous);
+        previous = local_index;
+        local_index_transferred = true;
+    }
+
+    const token_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(token_vec);
+    for (token_rows) |a| _ = mlx.mlx_vector_array_append_value(token_vec, a);
+    var ids = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_concatenate_axis(&ids, token_vec, 1, s));
+    for (token_rows) |a| _ = mlx.mlx_array_free(a);
+    built_tokens = 0;
+
+    var q: mlx.mlx_array = .{ .ctx = null };
+    if (sample_drafts) {
+        const q_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(q_vec);
+        for (q_rows) |a| _ = mlx.mlx_vector_array_append_value(q_vec, a);
+        try mlx.check(mlx.mlx_concatenate_axis(&q, q_vec, 0, s));
+        for (q_rows) |a| _ = mlx.mlx_array_free(a);
+        built_q = 0;
+    }
+    return .{ .ids = ids, .q = q };
 }
 
 /// Read `probs[0, token_id]` as f32. Forces realization with a single eval.

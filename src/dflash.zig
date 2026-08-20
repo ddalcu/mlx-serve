@@ -1,4 +1,4 @@
-//! DFlash block-drafter — generic block-parallel speculative decoding.
+//! DFlash 1/2 block-drafter — generic block-parallel speculative decoding.
 //!
 //! A small assistant transformer drafts `block_size - 1` tokens in ONE
 //! forward, conditioned on the trunk's intermediate hidden states. Mirrors
@@ -6,7 +6,8 @@
 //! `muse_glimmer_assistant` reference model. DFlash is a METHOD, not a
 //! model-family feature: detection keys on the CONFIG CONTRACT
 //! (`block_size` + `mask_token_id` + `target_layer_ids`), never on the
-//! `model_type` string.
+//! `model_type` string. DFlash 2 nests that contract in `dflash_config` and
+//! adds paired dynamic convolutions plus a sparse candidate selector.
 //!
 //! Protocol per round (assistant borrows the trunk's embed table + lm_head):
 //!   1. Context delta = trunk hiddens at the OUTPUT of layers
@@ -67,6 +68,20 @@ pub const DflashConfig = struct {
     block_size: u32,
     mask_token_id: u32,
     target_layer_ids: []u32, // owned, ascending
+    /// DFlash 2 augments the v1 block transformer with paired dynamic
+    /// depthwise convolutions and a low-rank candidate selector. Zero values
+    /// mean the legacy DFlash contract.
+    conv_kernel_size: u32 = 0,
+    conv_group_size: u32 = 0,
+    selector_rank: u32 = 0,
+    selector_top_k: u32 = 0,
+    input_embedding_scale: f32 = 1.0,
+    output_multiplier: f32 = 1.0,
+    final_logit_softcapping: f32 = 0.0,
+
+    pub fn isDflash2(self: *const DflashConfig) bool {
+        return self.conv_kernel_size != 0;
+    }
 
     pub fn deinit(self: *DflashConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.layer_types);
@@ -78,9 +93,29 @@ pub const DflashConfig = struct {
 /// be present — `model_type` (`*_assistant`) is only the discovery-level
 /// "this is a drafter" signal, never the DFlash detection.
 pub fn isDflashConfigJson(root: std.json.ObjectMap) bool {
-    return root.get("block_size") != null and
-        root.get("mask_token_id") != null and
-        root.get("target_layer_ids") != null;
+    const contract = dflashContract(root) orelse return false;
+    return contract.get("block_size") != null and
+        contract.get("mask_token_id") != null and
+        contract.get("target_layer_ids") != null;
+}
+
+/// DFlash 1 stores its method fields at the config root. DFlash 2 follows the
+/// Hugging Face model convention and nests them under `dflash_config`.
+fn dflashContract(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (root.get("dflash_config")) |v| {
+        if (v == .object) return v.object;
+        return null;
+    }
+    return root;
+}
+
+fn hasArchitecture(root: std.json.ObjectMap, name: []const u8) bool {
+    const value = root.get("architectures") orelse return false;
+    if (value != .array) return false;
+    for (value.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, name)) return true;
+    }
+    return false;
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -141,11 +176,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
 
     if (!isDflashConfigJson(root)) return error.NotDflashConfig;
 
-    const block_size: u32 = try jsonU32(root.get("block_size").?);
+    const contract = dflashContract(root) orelse return error.NotDflashConfig;
+    const block_size: u32 = try jsonU32(contract.get("block_size").?);
     if (block_size < 2) return error.InvalidDflashBlockSize;
-    const mask_token_id: u32 = try jsonU32(root.get("mask_token_id").?);
+    const mask_token_id: u32 = try jsonU32(contract.get("mask_token_id").?);
 
-    const tl_val = root.get("target_layer_ids").?;
+    const tl_val = contract.get("target_layer_ids").?;
     if (tl_val != .array or tl_val.array.items.len == 0) return error.InvalidDflashTargetLayers;
     const target_layer_ids = try allocator.alloc(u32, tl_val.array.items.len);
     errdefer allocator.free(target_layer_ids);
@@ -180,6 +216,44 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         if (layer_types[i] == .sliding_attention and sliding == 0) return error.IncompleteDflashConfig;
     }
 
+    const has_v2_field = hasArchitecture(root, "DFlash2DraftModel") or
+        contract.get("conv_kernel_size") != null or
+        contract.get("conv_group_size") != null or
+        contract.get("selector_rank") != null or
+        contract.get("selector_top_k") != null;
+    var conv_kernel_size: u32 = 0;
+    var conv_group_size: u32 = 0;
+    var selector_rank: u32 = 0;
+    var selector_top_k: u32 = 0;
+    var input_embedding_scale: f32 = 1.0;
+    var output_multiplier: f32 = 1.0;
+    var final_logit_softcapping: f32 = 0.0;
+    if (has_v2_field) {
+        conv_kernel_size = try jsonU32(contract.get("conv_kernel_size") orelse return error.IncompleteDflash2Config);
+        conv_group_size = try jsonU32(contract.get("conv_group_size") orelse return error.IncompleteDflash2Config);
+        selector_rank = try jsonU32(contract.get("selector_rank") orelse return error.IncompleteDflash2Config);
+        selector_top_k = try jsonU32(contract.get("selector_top_k") orelse return error.IncompleteDflash2Config);
+        // The published implementation is a two-tap convolution. Naming the
+        // unsupported geometry at load is safer than silently running a
+        // different recurrence.
+        if (conv_kernel_size != 2 or conv_group_size == 0 or hidden_size % conv_group_size != 0 or
+            selector_rank == 0 or selector_top_k == 0)
+        {
+            return error.UnsupportedDflash2Config;
+        }
+        if (contract.get("input_embedding_scale")) |v| input_embedding_scale = jsonFloat(v);
+        if (contract.get("output_multiplier")) |v| output_multiplier = jsonFloat(v);
+        if (contract.get("final_logit_softcapping")) |v| {
+            const cap = jsonFloat(v);
+            if (cap > 0) final_logit_softcapping = cap;
+        }
+        if (!std.math.isFinite(input_embedding_scale) or !std.math.isFinite(output_multiplier) or
+            !std.math.isFinite(final_logit_softcapping))
+        {
+            return error.UnsupportedDflash2Config;
+        }
+    }
+
     return DflashConfig{
         .hidden_size = hidden_size,
         .num_hidden_layers = num_layers,
@@ -194,6 +268,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .block_size = block_size,
         .mask_token_id = mask_token_id,
         .target_layer_ids = target_layer_ids,
+        .conv_kernel_size = conv_kernel_size,
+        .conv_group_size = conv_group_size,
+        .selector_rank = selector_rank,
+        .selector_top_k = selector_top_k,
+        .input_embedding_scale = input_embedding_scale,
+        .output_multiplier = output_multiplier,
+        .final_logit_softcapping = final_logit_softcapping,
     };
 }
 
@@ -351,6 +432,260 @@ pub const DflashLinear = struct {
 
 // ── Model ──
 
+const PreparedConv = struct {
+    input: mlx.mlx_array,
+    output_delta: mlx.mlx_array,
+
+    fn deinit(self: *const PreparedConv) void {
+        _ = mlx.mlx_array_free(self.input);
+        _ = mlx.mlx_array_free(self.output_delta);
+    }
+};
+
+/// DFlash 2's paired input/output dynamic depthwise convolution. The one
+/// projection produces both sides' per-position grouped corrections; the
+/// base kernels remain channel-specific.
+pub const DflashGroupedConv = struct {
+    base_kernel: mlx.mlx_array, // [2, taps, hidden]
+    kernel_projection: DflashLinear, // hidden -> 2*taps*num_groups
+    group_size: u32,
+    taps: u32,
+
+    fn deinit(self: *DflashGroupedConv) void {
+        _ = mlx.mlx_array_free(self.base_kernel);
+        self.kernel_projection.deinit();
+    }
+
+    fn appendEval(self: *const DflashGroupedConv, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.base_kernel);
+        self.kernel_projection.appendEval(vec);
+    }
+
+    fn prepare(self: *const DflashGroupedConv, x: mlx.mlx_array, s: mlx.mlx_stream) !PreparedConv {
+        const projected = try self.kernel_projection.apply(x, s);
+        defer _ = mlx.mlx_array_free(projected);
+        const xsh = mlx.getShape(x);
+        const num_groups: c_int = @divExact(xsh[2], @as(c_int, @intCast(self.group_size)));
+        const shape = [_]c_int{ xsh[0], xsh[1], 2, @intCast(self.taps), num_groups };
+        var all_delta = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all_delta);
+        try mlx.check(mlx.mlx_reshape(&all_delta, projected, &shape, 5, s));
+
+        var input_delta_5d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(input_delta_5d);
+        const strides5 = [_]c_int{ 1, 1, 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(
+            &input_delta_5d,
+            all_delta,
+            &[_]c_int{ 0, 0, 0, 0, 0 },
+            5,
+            &[_]c_int{ xsh[0], xsh[1], 1, @intCast(self.taps), num_groups },
+            5,
+            &strides5,
+            5,
+            s,
+        ));
+        var output_delta_5d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(output_delta_5d);
+        try mlx.check(mlx.mlx_slice(
+            &output_delta_5d,
+            all_delta,
+            &[_]c_int{ 0, 0, 1, 0, 0 },
+            5,
+            &[_]c_int{ xsh[0], xsh[1], 2, @intCast(self.taps), num_groups },
+            5,
+            &strides5,
+            5,
+            s,
+        ));
+        const delta_shape = [_]c_int{ xsh[0], xsh[1], @intCast(self.taps), num_groups };
+        var input_delta = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(input_delta);
+        try mlx.check(mlx.mlx_reshape(&input_delta, input_delta_5d, &delta_shape, 4, s));
+        var output_delta = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(output_delta);
+        try mlx.check(mlx.mlx_reshape(&output_delta, output_delta_5d, &delta_shape, 4, s));
+
+        return .{
+            .input = try groupedConv2(x, input_delta, self.base_kernel, 0, self.group_size, s),
+            .output_delta = output_delta,
+        };
+    }
+
+    fn finish(self: *const DflashGroupedConv, x: mlx.mlx_array, delta: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        return groupedConv2(x, delta, self.base_kernel, 1, self.group_size, s);
+    }
+};
+
+pub const DflashCandidateSelector = struct {
+    predecessor_codebook: mlx.mlx_array, // [vocab, rank]
+    successor_codebook: mlx.mlx_array, // [vocab, rank]
+    hidden_projection: DflashLinear, // hidden -> rank
+    top_k: u32,
+    rank: u32,
+    output_multiplier: f32 = 1.0,
+    final_logit_softcapping: f32 = 0.0,
+
+    fn deinit(self: *DflashCandidateSelector) void {
+        _ = mlx.mlx_array_free(self.predecessor_codebook);
+        _ = mlx.mlx_array_free(self.successor_codebook);
+        self.hidden_projection.deinit();
+    }
+
+    fn appendEval(self: *const DflashCandidateSelector, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.predecessor_codebook);
+        _ = mlx.mlx_vector_array_append_value(vec, self.successor_codebook);
+        self.hidden_projection.appendEval(vec);
+    }
+
+    pub const Scores = struct {
+        candidate_ids: mlx.mlx_array, // [1, draft_len, top_k] int32
+        edges: mlx.mlx_array, // [1, draft_len, top_k, top_k] float32
+
+        pub fn deinit(self: *const Scores) void {
+            _ = mlx.mlx_array_free(self.candidate_ids);
+            _ = mlx.mlx_array_free(self.edges);
+        }
+    };
+
+    /// Score DFlash 2's sparse transition lattice. The first predecessor row
+    /// is the verified anchor repeated K times; every later row uses the prior
+    /// position's K candidates. Candidate ordering is intentionally left as
+    /// argpartition returns it—the lattice is invariant to that permutation.
+    pub fn score(
+        self: *const DflashCandidateSelector,
+        hidden: mlx.mlx_array,
+        logits: mlx.mlx_array,
+        anchor_id: u32,
+        s: mlx.mlx_stream,
+    ) !Scores {
+        const lsh = mlx.getShape(logits);
+        std.debug.assert(lsh.len == 3 and lsh[0] == 1);
+        const draft_len = lsh[1];
+        const vocab = lsh[2];
+        const top_k: c_int = @intCast(@min(self.top_k, @as(u32, @intCast(vocab))));
+
+        var neg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(neg);
+        try mlx.check(mlx.mlx_negative(&neg, logits, s));
+        var partition = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(partition);
+        try mlx.check(mlx.mlx_argpartition_axis(&partition, neg, top_k - 1, -1, s));
+        var ids_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_raw);
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(
+            &ids_raw,
+            partition,
+            &[_]c_int{ 0, 0, 0 },
+            3,
+            &[_]c_int{ 1, draft_len, top_k },
+            3,
+            &strides3,
+            3,
+            s,
+        ));
+        var candidate_ids = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(candidate_ids);
+        try mlx.check(mlx.mlx_astype(&candidate_ids, ids_raw, .int32, s));
+
+        var unary_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(unary_raw);
+        try mlx.check(mlx.mlx_take_along_axis(&unary_raw, logits, candidate_ids, -1, s));
+        var unary_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(unary_f32);
+        try mlx.check(mlx.mlx_astype(&unary_f32, unary_raw, .float32, s));
+        const multiplier = mlx.mlx_array_new_float(self.output_multiplier);
+        defer _ = mlx.mlx_array_free(multiplier);
+        var unary_scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(unary_scaled);
+        try mlx.check(mlx.mlx_multiply(&unary_scaled, unary_f32, multiplier, s));
+
+        var unary_softcapped: ?mlx.mlx_array = null;
+        defer if (unary_softcapped) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const unary = if (self.final_logit_softcapping > 0) blk: {
+            const cap = mlx.mlx_array_new_float(self.final_logit_softcapping);
+            defer _ = mlx.mlx_array_free(cap);
+            var normalized = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(normalized);
+            try mlx.check(mlx.mlx_divide(&normalized, unary_scaled, cap, s));
+            var squashed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(squashed);
+            try mlx.check(mlx.mlx_tanh(&squashed, normalized, s));
+            var capped = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(capped);
+            try mlx.check(mlx.mlx_multiply(&capped, squashed, cap, s));
+            unary_softcapped = capped;
+            break :blk capped;
+        } else unary_scaled;
+
+        var successors = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(successors);
+        try mlx.check(mlx.mlx_take_axis(&successors, self.successor_codebook, candidate_ids, 0, s));
+
+        const anchor_i32: i32 = @intCast(anchor_id);
+        const one_shape = [_]c_int{ 1, 1, 1 };
+        const anchor_one = mlx.mlx_array_new_data(&anchor_i32, &one_shape, 3, .int32);
+        defer _ = mlx.mlx_array_free(anchor_one);
+        var anchor_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(anchor_row);
+        try mlx.check(mlx.mlx_repeat_axis(&anchor_row, anchor_one, top_k, 2, s));
+        var predecessor_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(predecessor_ids);
+        if (draft_len == 1) {
+            try mlx.check(mlx.mlx_array_set(&predecessor_ids, anchor_row));
+        } else {
+            var prior_rows = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(prior_rows);
+            try mlx.check(mlx.mlx_slice(
+                &prior_rows,
+                candidate_ids,
+                &[_]c_int{ 0, 0, 0 },
+                3,
+                &[_]c_int{ 1, draft_len - 1, top_k },
+                3,
+                &strides3,
+                3,
+                s,
+            ));
+            const parts = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ anchor_row, prior_rows }, 2);
+            defer _ = mlx.mlx_vector_array_free(parts);
+            try mlx.check(mlx.mlx_concatenate_axis(&predecessor_ids, parts, 1, s));
+        }
+
+        var predecessors = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(predecessors);
+        try mlx.check(mlx.mlx_take_axis(&predecessors, self.predecessor_codebook, predecessor_ids, 0, s));
+        const hidden_rank = try self.hidden_projection.apply(hidden, s);
+        defer _ = mlx.mlx_array_free(hidden_rank);
+        var hidden_expanded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hidden_expanded);
+        try mlx.check(mlx.mlx_expand_dims(&hidden_expanded, hidden_rank, 2, s));
+        var gated_predecessors = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated_predecessors);
+        try mlx.check(mlx.mlx_multiply(&gated_predecessors, predecessors, hidden_expanded, s));
+        var successors_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(successors_t);
+        try mlx.check(mlx.mlx_transpose_axes(&successors_t, successors, &[_]c_int{ 0, 1, 3, 2 }, 4, s));
+        var bilinear_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bilinear_raw);
+        try mlx.check(mlx.mlx_matmul(&bilinear_raw, gated_predecessors, successors_t, s));
+        var bilinear = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bilinear);
+        try mlx.check(mlx.mlx_astype(&bilinear, bilinear_raw, .float32, s));
+        var unary_expanded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(unary_expanded);
+        try mlx.check(mlx.mlx_expand_dims(&unary_expanded, unary, 2, s));
+        var edges = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(edges);
+        try mlx.check(mlx.mlx_add(&edges, bilinear, unary_expanded, s));
+
+        return .{ .candidate_ids = candidate_ids, .edges = edges };
+    }
+};
+
 /// Per-layer assistant weights.
 pub const DflashLayer = struct {
     layer_type: LayerType,
@@ -368,6 +703,8 @@ pub const DflashLayer = struct {
     gate: DflashLinear, // [hidden → intermediate]
     up: DflashLinear, // [hidden → intermediate]
     down: DflashLinear, // [intermediate → hidden]
+    attention_conv: ?DflashGroupedConv = null,
+    mlp_conv: ?DflashGroupedConv = null,
 
     fn deinit(self: *DflashLayer) void {
         _ = mlx.mlx_array_free(self.input_norm);
@@ -381,6 +718,8 @@ pub const DflashLayer = struct {
         self.gate.deinit();
         self.up.deinit();
         self.down.deinit();
+        if (self.attention_conv) |*conv| conv.deinit();
+        if (self.mlp_conv) |*conv| conv.deinit();
     }
 
     fn appendEval(self: *const DflashLayer, vec: mlx.mlx_vector_array) void {
@@ -391,6 +730,8 @@ pub const DflashLayer = struct {
         for ([_]*const DflashLinear{ &self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down }) |lin| {
             lin.appendEval(vec);
         }
+        if (self.attention_conv) |*conv| conv.appendEval(vec);
+        if (self.mlp_conv) |*conv| conv.appendEval(vec);
     }
 };
 
@@ -403,9 +744,10 @@ pub const DflashModel = struct {
     enc_norm: mlx.mlx_array, // encoder.output_norm_enc [hidden]
     final_norm: mlx.mlx_array, // norm [hidden]
     layers: []DflashLayer,
+    candidate_selector: ?DflashCandidateSelector = null,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 3, 0 disables).
+    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 0/off).
     /// Only the block's draft argmax projects through it — VERIFICATION is a
     /// trunk forward and never touches it, so the emitted distribution is
     /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.
@@ -419,6 +761,7 @@ pub const DflashModel = struct {
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
         _ = mlx.mlx_array_free(self.final_norm);
+        if (self.candidate_selector) |*selector| selector.deinit();
         for (self.layers) |*lw| lw.deinit();
         allocator.free(self.layers);
         self.config.deinit(allocator);
@@ -426,9 +769,10 @@ pub const DflashModel = struct {
 
     /// Validate compatibility with the target trunk. The assistant borrows
     /// the trunk's embedding table and lm_head, so hidden size and token-id
-    /// space must line up; the capture seam lives in the STANDARD forward
-    /// path only (v1), so module-owned / MoE / hybrid trunks are refused by
-    /// name at load rather than silently drafting from empty captures.
+    /// space must line up. Captures are supported by pure-attention standard
+    /// trunks and supported GatedDeltaNet/full-attention recurrent targets;
+    /// other module-owned and general MoE paths are refused rather than
+    /// silently drafting from empty captures.
     pub fn bind(self: *DflashModel, target: *Transformer) !void {
         if (self.config.hidden_size != target.config.hidden_size) {
             log.err("[dflash] hidden_size mismatch: assistant={d}, target={d}\n", .{
@@ -448,11 +792,24 @@ pub const DflashModel = struct {
             });
             return err;
         };
-        if (!target.usesStandardForward()) {
-            log.err("[dflash] target arch '{s}' does not run the standard forward path (capture seam v1)\n", .{
+        if (!target.supportsDflashCapture()) {
+            log.err("[dflash] target arch '{s}' does not expose a DFlash capture/rollback seam\n", .{
                 target.config.model_type,
             });
             return error.DflashTargetMismatch;
+        }
+        if (self.candidate_selector) |*selector| {
+            const pred_shape = mlx.getShape(selector.predecessor_codebook);
+            const succ_shape = mlx.getShape(selector.successor_codebook);
+            if (pred_shape.len != 2 or succ_shape.len != 2 or
+                pred_shape[0] != @as(c_int, @intCast(target.config.vocab_size)) or
+                succ_shape[0] != @as(c_int, @intCast(target.config.vocab_size)) or
+                pred_shape[1] != @as(c_int, @intCast(selector.rank)) or
+                succ_shape[1] != @as(c_int, @intCast(selector.rank)))
+            {
+                log.err("[dflash2] selector codebook geometry does not match target vocab/rank\n", .{});
+                return error.DflashTargetMismatch;
+            }
         }
         self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
@@ -537,8 +894,9 @@ pub const DflashModel = struct {
     }
 
     /// Draft logits for the block hidden: the low-bit draft head when one was
-    /// built, else the trunk's own head. Both are the bare Linear — softcap /
-    /// output_multiplier are monotone, so draft argmax is unaffected.
+    /// built, else the trunk's own head. Both are the bare Linear. DFlash 2
+    /// applies its optional multiplier/softcap to the top-K unary values inside
+    /// the selector, where they interact with the learned transition score.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         if (self.draft_head) |*dh| {
             var out = mlx.mlx_array_new();
@@ -570,6 +928,11 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     var owned = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&owned, arr));
     return owned;
+}
+
+fn ownWeightEither(w: *const Weights, primary: []const u8, fallback: []const u8) !mlx.mlx_array {
+    if (w.get(primary) != null) return ownWeight(w, primary);
+    return ownWeight(w, fallback);
 }
 
 /// Load `<prefix>.weight` as an assistant linear. A checkpoint that already
@@ -615,6 +978,40 @@ fn loadLinear(
     const perm = [_]c_int{ 1, 0 };
     try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
     return .{ .w = transposed, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+}
+
+fn loadLinearEither(
+    w: *const Weights,
+    primary: []const u8,
+    fallback: []const u8,
+    in_features: u32,
+    bits: u32,
+    s: mlx.mlx_stream,
+) !DflashLinear {
+    var key_buf: [256]u8 = undefined;
+    const primary_weight = try std.fmt.bufPrint(&key_buf, "{s}.weight", .{primary});
+    if (w.get(primary_weight) != null) return loadLinear(w, primary, in_features, bits, s);
+    return loadLinear(w, fallback, in_features, bits, s);
+}
+
+fn loadGroupedConv(
+    w: *const Weights,
+    prefix: []const u8,
+    hidden: u32,
+    cfg: *const DflashConfig,
+    s: mlx.mlx_stream,
+) !DflashGroupedConv {
+    var key_buf: [256]u8 = undefined;
+    const base = try ownWeight(w, try std.fmt.bufPrint(&key_buf, "{s}.base_kernel", .{prefix}));
+    errdefer _ = mlx.mlx_array_free(base);
+    return .{
+        .base_kernel = base,
+        // Reference checkpoints deliberately leave this small correction
+        // projection dense even when the drafter backbone is quantized.
+        .kernel_projection = try loadLinear(w, try std.fmt.bufPrint(&key_buf, "{s}.kernel_projection", .{prefix}), hidden, 0, s),
+        .group_size = cfg.conv_group_size,
+        .taps = cfg.conv_kernel_size,
+    };
 }
 
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
@@ -677,9 +1074,9 @@ pub fn loadDflashQuant(
     const q_out = cfg.num_attention_heads * cfg.head_dim;
     const fc_in: u32 = @intCast(cfg.target_layer_ids.len * hidden);
 
-    var fc = try loadLinear(&weights, "encoder.fc", fc_in, bits, s);
+    var fc = try loadLinearEither(&weights, "fc", "encoder.fc", fc_in, bits, s);
     errdefer fc.deinit();
-    const enc_norm = try ownWeight(&weights, "encoder.output_norm_enc.weight");
+    const enc_norm = try ownWeightEither(&weights, "hidden_norm.weight", "encoder.output_norm_enc.weight");
     errdefer _ = mlx.mlx_array_free(enc_norm);
     const final_norm = try ownWeight(&weights, "norm.weight");
     errdefer _ = mlx.mlx_array_free(final_norm);
@@ -710,6 +1107,44 @@ pub fn loadDflashQuant(
             .down = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj", .{li}), cfg.intermediate_size, bits, s),
         };
         layers_inited += 1;
+        if (cfg.isDflash2()) {
+            layers[li].attention_conv = try loadGroupedConv(
+                &weights,
+                try std.fmt.bufPrint(&key_buf, "layers.{d}.attention_conv", .{li}),
+                hidden,
+                &cfg,
+                s,
+            );
+            layers[li].mlp_conv = try loadGroupedConv(
+                &weights,
+                try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp_conv", .{li}),
+                hidden,
+                &cfg,
+                s,
+            );
+        }
+    }
+
+    var candidate_selector: ?DflashCandidateSelector = null;
+    errdefer if (candidate_selector) |*selector| selector.deinit();
+    if (cfg.isDflash2()) {
+        candidate_selector = blk: {
+            const predecessor_codebook = try ownWeight(&weights, "candidate_selector.predecessor_codebook");
+            errdefer _ = mlx.mlx_array_free(predecessor_codebook);
+            const successor_codebook = try ownWeight(&weights, "candidate_selector.successor_codebook");
+            errdefer _ = mlx.mlx_array_free(successor_codebook);
+            var hidden_projection = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, 0, s);
+            errdefer hidden_projection.deinit();
+            break :blk .{
+                .predecessor_codebook = predecessor_codebook,
+                .successor_codebook = successor_codebook,
+                .hidden_projection = hidden_projection,
+                .top_k = cfg.selector_top_k,
+                .rank = cfg.selector_rank,
+                .output_multiplier = cfg.output_multiplier,
+                .final_logit_softcapping = cfg.final_logit_softcapping,
+            };
+        };
     }
 
     // Force-eval all weights so serve time never faults a lazy transpose or
@@ -721,16 +1156,17 @@ pub fn loadDflashQuant(
         _ = mlx.mlx_vector_array_append_value(eval_vec, enc_norm);
         _ = mlx.mlx_vector_array_append_value(eval_vec, final_norm);
         for (layers) |*lw| lw.appendEval(eval_vec);
+        if (candidate_selector) |*selector| selector.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
 
     if (fc.isQuantized()) {
-        log.info("[dflash] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights={d}-bit/gs{d}\n", .{
-            cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids, fc.bits, fc.group_size,
+        log.info("[dflash{s}] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights={d}-bit/gs{d}\n", .{
+            if (cfg.isDflash2()) "2" else "", cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids, fc.bits, fc.group_size,
         });
     } else {
-        log.info("[dflash] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights=dense bf16\n", .{
-            cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids,
+        log.info("[dflash{s}] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights=dense bf16\n", .{
+            if (cfg.isDflash2()) "2" else "", cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids,
         });
     }
 
@@ -742,6 +1178,7 @@ pub fn loadDflashQuant(
         .enc_norm = enc_norm,
         .final_norm = final_norm,
         .layers = layers,
+        .candidate_selector = candidate_selector,
     };
 }
 
@@ -804,6 +1241,125 @@ fn swiglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_ar
     try mlx.check(mlx.mlx_multiply(&silu_out, gate, sig, s));
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_multiply(&out, silu_out, up, s));
+    return out;
+}
+
+/// Two-tap dynamic depthwise grouped convolution:
+///   y[t,c] = (base[side,0,c] + delta[t,0,g(c)]) * x[t,c]
+///          + (base[side,1,c] + delta[t,1,g(c)]) * x[t-1,c]
+/// The leading row is zero-padded, which is the DFlash 2 block-boundary rule;
+/// because the anchor is row zero, every draft row still sees its predecessor.
+fn groupedConv2(
+    x: mlx.mlx_array,
+    delta: mlx.mlx_array,
+    base_kernel: mlx.mlx_array,
+    side: c_int,
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    std.debug.assert(xsh.len == 3);
+
+    var delta_channels = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(delta_channels);
+    try mlx.check(mlx.mlx_repeat_axis(&delta_channels, delta, @intCast(group_size), 3, s));
+
+    var base_side = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(base_side);
+    const strides3 = [_]c_int{ 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(
+        &base_side,
+        base_kernel,
+        &[_]c_int{ side, 0, 0 },
+        3,
+        &[_]c_int{ side + 1, 2, xsh[2] },
+        3,
+        &strides3,
+        3,
+        s,
+    ));
+    var base4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(base4);
+    const base_shape = [_]c_int{ 1, 1, 2, xsh[2] };
+    try mlx.check(mlx.mlx_reshape(&base4, base_side, &base_shape, 4, s));
+    var coeff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coeff);
+    try mlx.check(mlx.mlx_add(&coeff, delta_channels, base4, s));
+
+    var coeff0_4d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coeff0_4d);
+    const strides4 = [_]c_int{ 1, 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(
+        &coeff0_4d,
+        coeff,
+        &[_]c_int{ 0, 0, 0, 0 },
+        4,
+        &[_]c_int{ xsh[0], xsh[1], 1, xsh[2] },
+        4,
+        &strides4,
+        4,
+        s,
+    ));
+    var coeff0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coeff0);
+    try mlx.check(mlx.mlx_reshape(&coeff0, coeff0_4d, xsh.ptr, 3, s));
+    var current = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(current);
+    try mlx.check(mlx.mlx_multiply(&current, x, coeff0, s));
+
+    const zero = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    var padded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(padded);
+    try mlx.check(mlx.mlx_pad(
+        &padded,
+        x,
+        &[_]c_int{ 0, 1, 2 },
+        3,
+        &[_]c_int{ 0, 1, 0 },
+        3,
+        &[_]c_int{ 0, 0, 0 },
+        3,
+        zero,
+        "constant",
+        s,
+    ));
+    var previous = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(previous);
+    try mlx.check(mlx.mlx_slice(
+        &previous,
+        padded,
+        &[_]c_int{ 0, 0, 0 },
+        3,
+        &[_]c_int{ xsh[0], xsh[1], xsh[2] },
+        3,
+        &strides3,
+        3,
+        s,
+    ));
+
+    var coeff1_4d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coeff1_4d);
+    try mlx.check(mlx.mlx_slice(
+        &coeff1_4d,
+        coeff,
+        &[_]c_int{ 0, 0, 1, 0 },
+        4,
+        &[_]c_int{ xsh[0], xsh[1], 2, xsh[2] },
+        4,
+        &strides4,
+        4,
+        s,
+    ));
+    var coeff1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coeff1);
+    try mlx.check(mlx.mlx_reshape(&coeff1, coeff1_4d, xsh.ptr, 3, s));
+    var prior = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prior);
+    try mlx.check(mlx.mlx_multiply(&prior, previous, coeff1, s));
+
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, current, prior, s));
     return out;
 }
 
@@ -1032,11 +1588,18 @@ pub fn forwardBlock(
         const normed = try rmsNormFn(x, lw.input_norm, cfg.rms_norm_eps, s);
         defer _ = mlx.mlx_array_free(normed);
 
-        const q = try projectHeads(normed, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
+        var attn_prepared: ?PreparedConv = null;
+        defer if (attn_prepared) |*prepared| prepared.deinit();
+        const attn_input = if (lw.attention_conv) |*conv| blk: {
+            attn_prepared = try conv.prepare(normed, s);
+            break :blk attn_prepared.?.input;
+        } else normed;
+
+        const q = try projectHeads(attn_input, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
         defer _ = mlx.mlx_array_free(q);
-        const bk = try projectHeads(normed, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
+        const bk = try projectHeads(attn_input, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
         defer _ = mlx.mlx_array_free(bk);
-        const bv = try projectHeadsNoNorm(normed, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
+        const bv = try projectHeadsNoNorm(attn_input, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(bv);
 
         // Append block K/V into spare capacity; the view spans ctx + block.
@@ -1062,8 +1625,16 @@ pub fn forwardBlock(
         defer _ = mlx.mlx_array_free(attn_flat);
         const flat_shape = [_]c_int{ 1, q_len_c, @intCast(cfg.num_attention_heads * cfg.head_dim) };
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
-        const o_out = try lw.o.apply(attn_flat, s);
-        defer _ = mlx.mlx_array_free(o_out);
+        const o_projected = try lw.o.apply(attn_flat, s);
+        defer _ = mlx.mlx_array_free(o_projected);
+        var o_convolved: ?mlx.mlx_array = null;
+        defer if (o_convolved) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const o_out = if (lw.attention_conv) |*conv| blk: {
+            o_convolved = try conv.finish(o_projected, attn_prepared.?.output_delta, s);
+            break :blk o_convolved.?;
+        } else o_projected;
 
         var h_new = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&h_new, x, o_out, s));
@@ -1072,14 +1643,28 @@ pub fn forwardBlock(
 
         const ff_normed = try rmsNormFn(x, lw.post_attn_norm, cfg.rms_norm_eps, s);
         defer _ = mlx.mlx_array_free(ff_normed);
-        const gate = try lw.gate.apply(ff_normed, s);
+        var mlp_prepared: ?PreparedConv = null;
+        defer if (mlp_prepared) |*prepared| prepared.deinit();
+        const mlp_input = if (lw.mlp_conv) |*conv| blk: {
+            mlp_prepared = try conv.prepare(ff_normed, s);
+            break :blk mlp_prepared.?.input;
+        } else ff_normed;
+        const gate = try lw.gate.apply(mlp_input, s);
         defer _ = mlx.mlx_array_free(gate);
-        const up = try lw.up.apply(ff_normed, s);
+        const up = try lw.up.apply(mlp_input, s);
         defer _ = mlx.mlx_array_free(up);
         const act = try swiglu(gate, up, s);
         defer _ = mlx.mlx_array_free(act);
-        const down = try lw.down.apply(act, s);
-        defer _ = mlx.mlx_array_free(down);
+        const down_projected = try lw.down.apply(act, s);
+        defer _ = mlx.mlx_array_free(down_projected);
+        var down_convolved: ?mlx.mlx_array = null;
+        defer if (down_convolved) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const down = if (lw.mlp_conv) |*conv| blk: {
+            down_convolved = try conv.finish(down_projected, mlp_prepared.?.output_delta, s);
+            break :blk down_convolved.?;
+        } else down_projected;
 
         var h_next = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&h_next, x, down, s));
@@ -1144,6 +1729,31 @@ const GEMMA_ASSISTANT_CONFIG_JSON =
     \\}
 ;
 
+const DFLASH2_CONFIG_JSON =
+    \\{
+    \\  "architectures": ["DFlash2DraftModel"],
+    \\  "dflash_config": {
+    \\    "block_size": 8,
+    \\    "conv_group_size": 16,
+    \\    "conv_kernel_size": 2,
+    \\    "mask_token_id": 248070,
+    \\    "selector_rank": 256,
+    \\    "selector_top_k": 16,
+    \\    "target_layer_ids": [5, 19, 33, 47, 61]
+    \\  },
+    \\  "head_dim": 128,
+    \\  "hidden_size": 5120,
+    \\  "intermediate_size": 17408,
+    \\  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+    \\  "num_attention_heads": 32,
+    \\  "num_hidden_layers": 5,
+    \\  "num_key_value_heads": 8,
+    \\  "rms_norm_eps": 1e-06,
+    \\  "rope_parameters": {"rope_theta": 10000000.0},
+    \\  "sliding_window": 2048
+    \\}
+;
+
 test "dflash: muse assistant config parses with the full DFlash contract" {
     const allocator = testing.allocator;
     var cfg = try parseConfigFromJson(allocator, MUSE_ASSISTANT_CONFIG_JSON);
@@ -1163,6 +1773,110 @@ test "dflash: muse assistant config parses with the full DFlash contract" {
     try testing.expectApproxEqAbs(@as(f32, 500000.0), cfg.rope_theta, 1.0);
     try testing.expectEqual(@as(usize, 5), cfg.layer_types.len);
     for (cfg.layer_types) |lt| try testing.expectEqual(LayerType.sliding_attention, lt);
+}
+
+test "dflash2: nested contract parses selector and convolution geometry" {
+    const allocator = testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, DFLASH2_CONFIG_JSON, .{});
+    defer parsed.deinit();
+    try testing.expect(isDflashConfigJson(parsed.value.object));
+
+    var cfg = try parseConfigFromJson(allocator, DFLASH2_CONFIG_JSON);
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.isDflash2());
+    try testing.expectEqual(@as(u32, 8), cfg.block_size);
+    try testing.expectEqual(@as(u32, 2), cfg.conv_kernel_size);
+    try testing.expectEqual(@as(u32, 16), cfg.conv_group_size);
+    try testing.expectEqual(@as(u32, 256), cfg.selector_rank);
+    try testing.expectEqual(@as(u32, 16), cfg.selector_top_k);
+    try testing.expectEqual(@as(f32, 1.0), cfg.input_embedding_scale);
+    try testing.expectEqual(@as(f32, 1.0), cfg.output_multiplier);
+    try testing.expectEqual(@as(f32, 0.0), cfg.final_logit_softcapping);
+    try testing.expectEqualSlices(u32, &[_]u32{ 5, 19, 33, 47, 61 }, cfg.target_layer_ids);
+}
+
+test "dflash2: grouped convolution uses the prior block row and grouped corrections" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const x_data = [_]f32{
+        1, 2,  3,  4,
+        5, 6,  7,  8,
+        9, 10, 11, 12,
+    };
+    const x = mlx.mlx_array_new_data(&x_data, &[_]c_int{ 1, 3, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    // side 0: current coefficient 1, prior coefficient 2. Side 1 unused.
+    const base_data = [_]f32{
+        1, 1, 1, 1, 2, 2, 2, 2,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    const base = mlx.mlx_array_new_data(&base_data, &[_]c_int{ 2, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    // [B,L,tap,group]. Only the prior-tap corrections are nonzero.
+    const delta_data = [_]f32{
+        0, 0, 0,   0,
+        0, 0, 0.5, -0.5,
+        0, 0, 1,   2,
+    };
+    const delta = mlx.mlx_array_new_data(&delta_data, &[_]c_int{ 1, 3, 2, 2 }, 4, .float32);
+    defer _ = mlx.mlx_array_free(delta);
+    const out = try groupedConv2(x, delta, base, 0, 2, s);
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    const got = mlx.mlx_array_data_float32(out) orelse return error.MlxArrayDataNull;
+    const want = [_]f32{
+        1,   2,  3,    4,
+        7.5, 11, 11.5, 14,
+        24,  28, 39,   44,
+    };
+    for (want, 0..) |v, i| try testing.expectApproxEqAbs(v, got[i], 1e-6);
+}
+
+test "dflash2: selector scores the anchor and prior-candidate transitions" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const pred_data = [_]f32{ 1, 0, 0, 1, 1, 1, 2, -1 };
+    const succ_data = [_]f32{ 1, 2, 3, 1, -1, 2, 2, 3 };
+    var selector = DflashCandidateSelector{
+        .predecessor_codebook = mlx.mlx_array_new_data(&pred_data, &[_]c_int{ 4, 2 }, 2, .float32),
+        .successor_codebook = mlx.mlx_array_new_data(&succ_data, &[_]c_int{ 4, 2 }, 2, .float32),
+        .hidden_projection = .{
+            .w = mlx.mlx_array_new_data(&[_]f32{ 1, 0, 0, 1 }, &[_]c_int{ 2, 2 }, 2, .float32),
+            .scales = mlx.mlx_array_new(),
+            .biases = mlx.mlx_array_new(),
+        },
+        .top_k = 2,
+        .rank = 2,
+        .output_multiplier = 0.5,
+        .final_logit_softcapping = 2.0,
+    };
+    defer selector.deinit();
+    const hidden_data = [_]f32{ 2, 3, 4, 5 };
+    const hidden = mlx.mlx_array_new_data(&hidden_data, &[_]c_int{ 1, 2, 2 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(hidden);
+    const logits_data = [_]f32{ 0, 10, 5, 1, 7, 2, 9, 3 };
+    const logits = mlx.mlx_array_new_data(&logits_data, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const scored = try selector.score(hidden, logits, 1, s);
+    defer scored.deinit();
+    const eval_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ scored.candidate_ids, scored.edges }, 2);
+    defer _ = mlx.mlx_vector_array_free(eval_vec);
+    try mlx.check(mlx.mlx_eval(eval_vec));
+    const ids = mlx.mlx_array_data_int32(scored.candidate_ids) orelse return error.MlxArrayDataNull;
+    const edges = mlx.mlx_array_data_float32(scored.edges) orelse return error.MlxArrayDataNull;
+    for (0..2) |step| {
+        for (0..2) |pi| {
+            const pred_id: usize = if (step == 0) 1 else @intCast(ids[pi]);
+            for (0..2) |ci| {
+                const succ_id: usize = @intCast(ids[step * 2 + ci]);
+                const unary = 2.0 * std.math.tanh(logits_data[step * 4 + succ_id] * 0.25);
+                const dot = pred_data[pred_id * 2] * hidden_data[step * 2] * succ_data[succ_id * 2] +
+                    pred_data[pred_id * 2 + 1] * hidden_data[step * 2 + 1] * succ_data[succ_id * 2 + 1];
+                try testing.expectApproxEqAbs(unary + dot, edges[step * 4 + pi * 2 + ci], 1e-5);
+            }
+        }
+    }
 }
 
 test "dflash: gemma assistant config is NOT detected as DFlash" {

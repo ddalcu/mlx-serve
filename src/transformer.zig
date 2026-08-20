@@ -4657,7 +4657,7 @@ const BitsCache = QuantParamsCache;
 // owning their own caches.
 /// DFlash capture request: intermediate layer OUTPUTS, `hidden_states[i+1]`
 /// semantics (the residual stream AFTER layer `ids[k]` completes, before the
-/// next layer's input norm). Standard forward path only (v1).
+/// next layer's input norm). Honored by the standard and hybrid forward paths.
 pub const CaptureLayers = struct {
     /// Trunk layer indices to capture, ascending.
     ids: []const u32,
@@ -4678,9 +4678,7 @@ pub const ForwardCtx = struct {
     /// cache needs the trunk hidden at every verify/prefill position.
     capture_hidden_all: ?*mlx.mlx_array = null,
     /// DFlash: capture the residual stream at these layer OUTPUTS (all
-    /// positions). Honored by `forwardStandardWith` only — DflashModel.bind
-    /// refuses non-standard-path targets so this can never be silently
-    /// ignored on an engaged path.
+    /// positions). Honored by the standard and hybrid forward paths.
     capture_layers: ?*CaptureLayers = null,
     /// An additive attention term composed into the standard PREFILL path's
     /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
@@ -5770,7 +5768,8 @@ pub const Transformer = struct {
     gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
     /// PLD spec-decode: mirrors `ForwardCtx.capture_ssm_seq` for the current
     /// forward so `gatedDeltaNet`/`conv1dWithCache` (which don't take the ctx)
-    /// can capture per-position state. Set+reset only inside `forwardMoeWith`.
+    /// can capture per-position state. Set+reset inside the MoE and hybrid
+    /// forward paths.
     spec_capture_ssm: bool = false,
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
@@ -8394,15 +8393,42 @@ pub const Transformer = struct {
     }
 
     /// Does `forwardWith` route this model through `forwardStandardWith`?
-    /// Mirrors the dispatch chain above IN ORDER. DFlash's capture seam
-    /// (`ForwardCtx.capture_layers`) lives in the standard path only (v1),
-    /// so `DflashModel.bind` gates on this predicate.
+    /// Mirrors the dispatch chain above IN ORDER.
     pub fn usesStandardForward(self: *const Transformer) bool {
         return self.dsv4 == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention and
             self.hybrid_layers == null and
             self.moe_layers == null;
+    }
+
+    /// DFlash captures are implemented for pure-attention standard trunks and
+    /// GatedDeltaNet/full-attention hybrids. The latter use
+    /// `full_attention_interval` and per-position SSM capture for rollback.
+    pub fn supportsDflashCapture(self: *const Transformer) bool {
+        return self.usesStandardForward() or
+            (self.dsv4 == null and self.usesDflashRecurrentForward());
+    }
+
+    /// Logical number of committed target tokens. A hybrid's layer-zero path
+    /// is recurrent and does not advance `KVCache.step`, so its sequence offset
+    /// is authoritative; standard attention uses the cache counter.
+    pub fn dflashPosition(self: *const Transformer, ctx: *const ForwardCtx) usize {
+        return if (self.usesDflashRecurrentForward()) ctx.moe_seq_offset.* else ctx.cache.step;
+    }
+
+    pub fn dflashUsesHybridState(self: *const Transformer) bool {
+        return self.usesDflashRecurrentForward();
+    }
+
+    /// Recurrent forwards need per-position SSM capture and rollback during
+    /// DFlash verification. Qwen3.5/3.6 uses the shared MoE/GDN dispatcher
+    /// even for dense checkpoints, rather than `forwardHybridWith`.
+    fn usesDflashRecurrentForward(self: *const Transformer) bool {
+        return self.hybrid_layers != null or
+            (self.moe_layers != null and
+                self.config.full_attention_interval != 0 and
+                std.mem.eql(u8, self.config.model_type, "qwen3_5_moe"));
     }
 
     /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -10168,6 +10194,15 @@ pub const Transformer = struct {
                 decode_prof.mlp_ns += pclk.lap();
             }
 
+            // DFlash capture: Qwen3.5/3.6 reaches this dispatcher for both
+            // dense and MoE checkpoints. Capture the completed layer output,
+            // matching the `hidden_states[li+1]` contract of other forwards.
+            if (ctx.capture_layers) |cl| {
+                for (cl.ids, cl.out) |cid, *slot| {
+                    if (cid == li) _ = mlx.mlx_array_set(slot, h);
+                }
+            }
+
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % moe_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
@@ -10611,6 +10646,12 @@ pub const Transformer = struct {
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
 
+        // DFlash/MTP/PLD verify rollback: GatedDeltaNet records its state after
+        // each verify position. Targets using the hybrid dispatcher route here;
+        // Qwen3.5/3.6 uses the MoE/GDN path with the same lifetime discipline.
+        self.spec_capture_ssm = ctx.capture_ssm_seq;
+        defer self.spec_capture_ssm = false;
+
         var h = try self.embedding(token_ids);
 
         // Splice vision embeddings at image_token_id positions (prefill only).
@@ -10673,6 +10714,14 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
                 _ = mlx.mlx_array_free(h);
                 h = h_next;
+            }
+
+            // DFlash capture: the completed hybrid layer's residual stream is
+            // the same `hidden_states[li+1]` contract used by standard models.
+            if (ctx.capture_layers) |cl| {
+                for (cl.ids, cl.out) |cid, *slot| {
+                    if (cid == li) _ = mlx.mlx_array_set(slot, h);
+                }
             }
 
             if (prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % hybrid_eval_cadence == 0) {

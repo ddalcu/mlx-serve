@@ -83,7 +83,6 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
-
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -133,7 +132,8 @@ fn printUsage(io: std.Io) void {
         \\                        either a Gemma 4 cross-attention drafter or
         \\                        a DFlash block-drafter (auto-detected from
         \\                        its config: block_size + mask_token_id +
-        \\                        target_layer_ids). Loaded at startup, bound
+        \\                        target_layer_ids, either at root or under
+        \\                        dflash_config for DFlash 2). Loaded at startup, bound
         \\                        to the target model, default draft source
         \\                        for new requests (priority: MTP > dflash >
         \\                        drafter > PLD > regular).
