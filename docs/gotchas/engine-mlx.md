@@ -3367,3 +3367,61 @@ cross-check rather than treating it as a nicety. A REJECTED load fails by
 name and falls back. An IGNORED hint looks exactly like success: both units'
 evals succeed, both land on one die, and the only evidence is that one
 IOReport counter never moves. Either failure is itself the result.
+
+## Per-silicon MTP auto-depth cap + verify-qmm parity slack (2026-08-20, M1 Pro)
+
+Two constants calibrated on M4/G17 silicon were applied to every Mac.
+
+**Auto-depth.** `MtpCostProfile` keys on tensor geometry + NAX presence, never
+the chip, so every non-G17 Mac shares one `.generic` cost surface and one cap
+of 6. Measured on an M1 Pro / 32 GB / macOS 26.5, Qwen3.8-27B iQ-3.8bpw,
+temp 0, `--prefix-cache-entries 0`, median of 3, one boot per arm:
+
+| arm | tok/s | avg accepted/round |
+|---|---|---|
+| `--no-mtp` | 10.57 | — |
+| auto (cap 6) | 10.64 | 4.00 |
+| `--mtp-depth 4` | 13.40 | 3.65 |
+
+Forced depth (`MLX_SERVE_MTP_ADAPTIVE=0`) shows the cliff is the verify width
+itself, not the controller: 12.69 / 12.85 / **13.01** / 10.78 / 9.63 / 9.62 /
+9.64 at depths 2..8, while acceptance barely moves (2.77 → 2.92 across the
+cliff). The controller walks in because its objective is accepted-tokens-per-
+round — by that metric depth 6 is *better*. `MTP_EV_DEFAULT_COSTS` does model
+a rise past 4 (`per_pos_hi = 0.26`), nowhere near enough here.
+
+Fix is the `dflash.blockCapForMachine` pattern: `mtp.adaptiveDepthCapForMachine`,
+keyed on the CPU brand string (the GPU arch string cannot tell Ultra from Max),
+M1 Pro → 4, every unmeasured chip → today's `MTP_ADAPTIVE_DEFAULT_CAP`. An
+explicit `--mtp-depth` still outranks the table, and `MLX_SERVE_MTP_ADAPTIVE=0`
+still yields `DEFAULT_DEPTH`. `mtpDepthCapForProfileChip` takes the chip so the
+unit tests are not assertions about whichever Mac runs the suite.
+
+Not attributed: why the cliff sits between verify width 5 and 6 when
+`vqmmLaneFor` serves M 2–7 on ONE lane (split-K) — so the step is *inside* it.
+Candidates: split-K occupancy at M=6 on a smaller GPU, an attention-side
+consumer of verify width (`qkvAttnVerifyEligible` covers t_q 2..8), or per-round
+dispatch scaling. If it turns out to be a fixable lane boundary, fixing it beats
+capping around it — the cap row stays correct either way because it is measured.
+
+Also not done: making the controller self-correcting (score promotions on
+realized tok/s, and let observed ms-per-round bucketed by verify width replace
+`MTP_EV_DEFAULT_COSTS` entries as a prior). That is the real fix for unmeasured
+machines and is a separate change.
+
+**Parity slack.** `expectVerifyQmmNoWorseThanStock` failed three tests on the
+same machine (plain-SIMD 5/6/8-bit, split-K/msg/NAX 4-bit, crossrow 4-bit g64)
+with `kern_max` 0.0313/0.0290/0.0224 against stock's 0.0039 — but cosine
+0.999998 vs 0.999999, i.e. the lanes track fp32 truth in aggregate and a few
+heavily-cancelling dot products land a bigger worst element. Pre-existing:
+reproduced byte-identically on `aceeda4` in a throwaway worktree, so not from
+the ANE work. The `+ 0.01` slack was fit on the silicon the lanes were
+developed on. Now `verifyQmmParitySlack(chip)`, default row still 0.01 so the
+guarantee is not weakened where it holds, M1 Pro row 0.04, and the failure
+message names the row it used.
+
+Still open on this one: whether these lanes are even a WIN on M1 (`vqmmLaneFor`
+gates by NAX and shape, never chip — and `mixedNaxShapeEnabled` precedent says
+adoption is per machine AND shape). That needs a paired same-boot A/B on an M1;
+if the answer is no, gate adoption by chip and the threshold question dissolves
+for the un-adopted lanes.

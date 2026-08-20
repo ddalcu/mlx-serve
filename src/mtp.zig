@@ -33,6 +33,7 @@ const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -52,6 +53,23 @@ const Weights = model_mod.Weights;
 /// controller demotes/promotes within [1, configured].
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
+
+/// Per-silicon adaptive depth cap for machines on the `.generic` cost
+/// surface. The cap is a MACHINE measurement, so each row is one, never
+/// interpolated between chips; an unmeasured chip keeps the default row.
+///   M1 Pro: 4 (2026-08-20, Qwen3.8-27B iQ-3.8bpw, forced-depth sweep:
+///     13.01 tok/s at depth 4 vs 10.78/9.63 at 5/6 — the verify width 6
+///     cliff; auto at cap 6 measured 10.64, barely over --no-mtp's 10.57).
+/// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrandString`
+/// (the GPU arch string cannot tell Ultra from Max); "" lands on default.
+pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) u32 {
+    if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return 4;
+    return default_cap;
+}
+
+pub fn chipBrandString(buf: []u8) []const u8 {
+    return ane_mod.chipBrandString(buf);
+}
 
 /// Exact full-round cost surfaces known to the adaptive MTP controller.
 /// Selection is based on runtime tensor geometry, never a model/repository
@@ -4185,4 +4203,11 @@ test "mtp: draftTop32 matches a host top-32 reference (bf16, ties, -inf)" {
         }
         try testing.expectEqual(@as(u32, 0), expect_set.count());
     }
+}
+
+test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the default" {
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M1 Pro", 6));
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6));
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6));
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6));
 }

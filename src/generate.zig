@@ -5352,6 +5352,8 @@ pub const Generator = struct {
     /// the split-K verify-qmm kernel's ceiling on M1-M4. Eligible M5/G17
     /// targets use MTP_ADAPTIVE_NAX_CAP instead: their measured NAX round-cost
     /// surface makes depths 7/8 profitable. Explicit depths always win.
+    /// This is the DEFAULT ROW only: `mtp.adaptiveDepthCapForMachine` lowers
+    /// it on chips whose verify-width cliff was measured (M1 Pro: 4).
     pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
     pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
     /// Rounds of legacy (fixed-depth windowed) behavior while the EMAs fill.
@@ -5560,10 +5562,16 @@ pub const Generator = struct {
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
     pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
+        var chip_buf: [128]u8 = undefined;
+        return mtpDepthCapForProfileChip(configured, adaptive, profile, mtp_mod.chipBrandString(&chip_buf));
+    }
+
+    /// Same, with the chip string injected (tests, and the one live caller).
+    pub fn mtpDepthCapForProfileChip(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile, chip: []const u8) u32 {
         if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
         if (!adaptive) return mtp_mod.DEFAULT_DEPTH;
         return switch (profile) {
-            .generic => MTP_ADAPTIVE_DEFAULT_CAP,
+            .generic => mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP),
             .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
         };
     }
@@ -9772,8 +9780,14 @@ test "MTP cross-round pre-draft defaults on and explicit zero disables" {
 
 test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
     // 0 = auto (--mtp-depth not passed).
-    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfile(0, true, .generic));
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapForProfile(0, true, .generic));
+    // .generic's auto cap is per-silicon, so the chip must be injected here
+    // or the assertion is a property of whichever Mac runs the suite.
+    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfileChip(0, true, .generic, "Apple M4 Max"));
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapForProfileChip(0, true, .generic, ""));
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapForProfileChip(0, true, .generic, "Apple M1 Pro"));
+    // An explicit depth still outranks the table on a measured chip.
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfileChip(8, true, .generic, "Apple M1 Pro"));
+    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfileChip(0, false, .generic, "Apple M1 Pro"));
     for ([_]mtp_mod.MtpCostProfile{ .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
         try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapForProfile(0, true, profile));
         try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(0, true, profile));
@@ -9792,7 +9806,9 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
 
     // The original boolean helpers remain source-compatible and map true to
     // the pre-existing q8 profile.
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapFor(0, true, false));
+    var chip_buf: [128]u8 = undefined;
+    const live_generic = mtp_mod.adaptiveDepthCapForMachine(mtp_mod.chipBrandString(&chip_buf), Generator.MTP_ADAPTIVE_DEFAULT_CAP);
+    try testing.expectEqual(live_generic, Generator.mtpDepthCapFor(0, true, false));
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }
 
