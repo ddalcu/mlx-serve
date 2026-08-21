@@ -186,6 +186,13 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// Sizes between buckets are off-distribution: they generate, just worse.
     static let sdxlResolutions: [ResolutionOption] = fluxResolutions
 
+    /// Turbo's native canvas. Looked up IN the shared list rather than built
+    /// here: `ResolutionOption` is `Hashable` over its label too, so a
+    /// same-size option with a different label is not `==` to the menu row and
+    /// `validResolution` would reject the preset's own default.
+    private static let sdxlSquare512: ResolutionOption =
+        sdxlResolutions.first { $0.width == 512 && $0.height == 512 } ?? sdxlResolutions[0]
+
     // FLUX is trained at ~1 MP across a stable bucket of aspect ratios.
     // The architecture is shared across versions, so the bucket is too.
     private static let fluxResolutions: [ResolutionOption] = [
@@ -418,8 +425,6 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
-    /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
-    /// 4B Q4 — smallest download.
     /// Stable Diffusion XL base 1.0 — the full base model, not a distill.
     ///
     /// The odd one out in this list: everything else here is a few-step
@@ -451,33 +456,42 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "The classic Stable Diffusion XL. Slower than the distilled models here because it runs real guidance, but it takes a negative prompt and has the widest LoRA ecosystem of any open image model."
     )
 
+    /// SDXL Turbo — the adversarially distilled few-step build of the same
+    /// architecture, so it loads through the same server backend and the same
+    /// LoRAs bind. It generates guidance-free, which is why it does NOT get a
+    /// negative prompt box: there is no unconditional branch for one to steer.
+    ///
+    /// Its default canvas is 512², not base's 1024²: Turbo was distilled at
+    /// 512 and the larger buckets are off-distribution for it. The full bucket
+    /// list is still offered, since a LoRA can move where it is happy.
     static let sdxlTurbo = ImageModelPreset(
-    id: "stabilityai/sdxl-turbo",
-    name: "Stable Diffusion XL Turbo (~7 GB)",
-    variant: .sdxlTurbo,          // use the new case
-    configName: "sdxl",           // still routes to the same server backend
-    repo: "stabilityai/sdxl-turbo",
-    approxDownloadGB: 7,
-    approxRAMGB: 10,
-    resolutions: sdxlResolutions,
-    defaultResolution: sdxlResolutions[0],
-    qualityProfiles: [
-        .fast:         .init(steps: 1),
-        .good:         .init(steps: 2),
-        .quality:      .init(steps: 4),
-        .superQuality: .init(steps: 8),
-    ],
-    defaultQuality: .good,
-    description: "Distilled few‑step SDXL — generates in 1‑4 steps with no CFG."
+        id: "stabilityai/sdxl-turbo",
+        name: "Stable Diffusion XL Turbo (~7 GB)",
+        variant: .sdxlTurbo,
+        configName: "sdxl", // same server backend as base
+        repo: "stabilityai/sdxl-turbo",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlSquare512,
+        qualityProfiles: [
+            .fast:         .init(steps: 1),
+            .good:         .init(steps: 2),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 8),
+        ],
+        defaultQuality: .good,
+        description: "Distilled few-step SDXL — a picture in 1-4 steps, no guidance. Takes the same LoRAs as the base model."
     )
 
+    /// Catalog ordered cheapest → heaviest (by `approxRAMGB`). Default
+    /// (`first`) is FLUX.2-klein 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
+        .sdxlBase10, .sdxlTurbo,                       // 10, 10
         .krea2Turbo,                                   // 15
-        .sdxlBase10,                                   // 10
-        .sdxlTurbo,
     ]
 }
 
@@ -1888,11 +1902,14 @@ extension ImageModelPreset {
         // widest preset edge.
         case .flux2Klein4B, .flux2Klein9B:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
-
-        case .sdxlTurbo, .sdxlBase10:
-            return ResolutionGrid(alignment: 16, minDim: 512, maxDim:1536)
+        // Mirrors the server's `gen.clampSdxlDim`: SDXL's VAE only needs a
+        // multiple of 8, but the model is trained on a /64 bucket list and
+        // drifts off-distribution between them, so 64 is the grid and 512 the
+        // floor. Drift here shows up as the app accepting a size the server
+        // then silently snaps somewhere else.
+        case .sdxlBase10, .sdxlTurbo:
+            return ResolutionGrid(alignment: 64, minDim: 512, maxDim: 2048)
         }
-
     }
 
     /// Instruction editing (in-context reference conditioning) is a trained

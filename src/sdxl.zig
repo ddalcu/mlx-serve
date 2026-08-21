@@ -53,6 +53,15 @@ pub const BETA_END: f64 = 0.012;
 /// the `LtxVersion` class — a config field deciding numerics.
 pub const TimestepSpacing = enum { leading, trailing, linspace };
 
+/// Parse a declared/requested spacing name. Null for anything else, so both
+/// callers can tell "not named" from "named something we do not serve": the
+/// checkpoint reader falls back to `leading` (SDXL's own default) while the
+/// request handler answers a named 400 rather than silently denoising on a
+/// schedule the caller did not ask for.
+pub fn spacingFromString(name: []const u8) ?TimestepSpacing {
+    return std.meta.stringToEnum(TimestepSpacing, name);
+}
+
 /// `beta_schedule: "scaled_linear"` — betas are the SQUARE of a linear ramp
 /// between the square roots of the endpoints, not a linear ramp between the
 /// endpoints. This is the single easiest constant to transcribe wrongly, and
@@ -673,14 +682,14 @@ test "tower configs match the shipped checkpoint" {
 /// towers use identical names — only the shapes differ — so the loader is one
 /// implementation over `ClipTextConfig`.
 pub const CLIP_LAYER_TENSORS = [_][]const u8{
-    "layer_norm1.weight",     "layer_norm1.bias",
-    "self_attn.q_proj.weight", "self_attn.q_proj.bias",
-    "self_attn.k_proj.weight", "self_attn.k_proj.bias",
-    "self_attn.v_proj.weight", "self_attn.v_proj.bias",
+    "layer_norm1.weight",        "layer_norm1.bias",
+    "self_attn.q_proj.weight",   "self_attn.q_proj.bias",
+    "self_attn.k_proj.weight",   "self_attn.k_proj.bias",
+    "self_attn.v_proj.weight",   "self_attn.v_proj.bias",
     "self_attn.out_proj.weight", "self_attn.out_proj.bias",
-    "layer_norm2.weight",     "layer_norm2.bias",
-    "mlp.fc1.weight",         "mlp.fc1.bias",
-    "mlp.fc2.weight",         "mlp.fc2.bias",
+    "layer_norm2.weight",        "layer_norm2.bias",
+    "mlp.fc1.weight",            "mlp.fc1.bias",
+    "mlp.fc2.weight",            "mlp.fc2.bias",
 };
 
 /// Tensors outside the layer stack, present in BOTH towers.

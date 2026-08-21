@@ -43,10 +43,10 @@ struct ImageGenView: View {
     /// Source-image mode: true = instruction edit (FLUX.2 in-context reference,
     /// keeps the subject), false = variation (renoise remix).
     @State private var editMode: Bool = true
-    /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
     /// What to steer away from. Only shown for models that read it — see
     /// `ImageModelPreset.supportsNegativePrompt`.
     @State private var negativePrompt: String = ""
+    /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
     @State private var condWeightsText: String = ""
@@ -488,7 +488,7 @@ struct ImageGenView: View {
                     TextField("things to avoid — e.g. blurry, extra fingers, watermark", text: $negativePrompt)
                         .textFieldStyle(.roundedBorder)
                         .font(.callout)
-                    Text("Steered away from, not banned. Leaving this empty is not the same as typing nothing into it — empty means the model gets a blank unconditional pass, which is the usual default.")
+                    Text("Steered away from, not banned. Leave it empty and the model runs its usual unguided-side pass; anything typed here pushes the picture away from it.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -828,6 +828,7 @@ struct ImageGenView: View {
         keepResident = s.keepResident
         strength = s.strength
         editMode = s.editMode
+        negativePrompt = s.negativePrompt
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         loras = s.loras
@@ -853,6 +854,7 @@ struct ImageGenView: View {
         s.keepResident = keepResident
         s.strength = strength
         s.editMode = editMode
+        s.negativePrompt = negativePrompt
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loras = loras

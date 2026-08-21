@@ -1295,10 +1295,10 @@ pub fn attachLora(u: *Unet, stack: *const lora_mod.Stack) u32 {
             }
             for (t.blocks, 0..) |*b, bi| {
                 const leaves = .{
-                    .{ "attn1_to_q", &b.attn1.q }, .{ "attn1_to_k", &b.attn1.k },
-                    .{ "attn1_to_v", &b.attn1.v }, .{ "attn1_to_out", &b.attn1.o },
-                    .{ "attn2_to_q", &b.attn2.q }, .{ "attn2_to_k", &b.attn2.k },
-                    .{ "attn2_to_v", &b.attn2.v }, .{ "attn2_to_out", &b.attn2.o },
+                    .{ "attn1_to_q", &b.attn1.q },    .{ "attn1_to_k", &b.attn1.k },
+                    .{ "attn1_to_v", &b.attn1.v },    .{ "attn1_to_out", &b.attn1.o },
+                    .{ "attn2_to_q", &b.attn2.q },    .{ "attn2_to_k", &b.attn2.k },
+                    .{ "attn2_to_v", &b.attn2.v },    .{ "attn2_to_out", &b.attn2.o },
                     .{ "ff_net_0_proj", &b.ff_proj }, .{ "ff_net_2", &b.ff_out },
                 };
                 inline for (leaves) |lf| {

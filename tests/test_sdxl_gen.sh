@@ -65,7 +65,7 @@ for _ in $(seq 1 40); do
   sleep 1
 done
 
-echo "[1/5] discovery + classification"
+echo "[1/6] discovery + classification"
 MODELS=$(curl -s "http://127.0.0.1:$PORT/v1/models")
 ID=$(echo "$MODELS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['data'][0]['id'] if d.get('data') else '')")
 check "the repo is discovered" "$ID" "stabilityai/sdxl-base-1.0"
@@ -82,13 +82,13 @@ check "advertises the image capability" "$CAPS" "image"
 BYTES=$(echo "$MODELS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['data'][0].get('bytes_on_disk',0) if d.get('data') else 0)")
 if [ "$BYTES" -gt 1000000000 ]; then ok "sized on disk ($BYTES bytes)"; else bad "bytes_on_disk not measured ($BYTES)"; fi
 
-echo "[2/5] a text request against an image model is refused, not prefilled"
+echo "[2/6] a text request against an image model is refused, not prefilled"
 CODE=$(curl -s -o /tmp/sdxl_chat_$PORT.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
 check "chat on an image model 400s" "$CODE" "400"
 
-echo "[3/5] generation (cold load on first request)"
+echo "[3/6] generation (cold load on first request)"
 CODE=$(curl -s -o /tmp/sdxl_img_$PORT.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"$ID\",\"prompt\":\"a photo of a cat sitting on a wooden table\",\"size\":\"512x512\",\"steps\":8,\"seed\":42}")
@@ -123,7 +123,7 @@ if grep -q "loaded unet: stages=" "$LOG"; then ok "the SDXL engine loaded (unet 
 if grep -q "loaded tokenizer_2: .*pad_id=0" "$LOG"; then ok "tokenizer_2 pads with 0"; else bad "tokenizer_2 pad_id not 0"; fi
 if grep -q "loaded tokenizer: .*pad_id=49407" "$LOG"; then ok "tokenizer pads with EOS"; else bad "tokenizer pad_id not 49407"; fi
 
-echo "[4/5] the render is an image, not static"
+echo "[4/6] the render is an image, not static"
 if "$PY_BIN" -c "import numpy, PIL" 2>/dev/null; then
   "$PY_BIN" - "$PORT" <<'PY'
 import sys
@@ -144,7 +144,38 @@ else
   echo "  SKIP: numpy/PIL unavailable"
 fi
 
-echo "[5/5] size snapping and unload"
+echo "[5/6] guidance-surface 400s, before any pixels are spent"
+# `guidance`, `guidance_scale` and `timestep_spacing` are the three fields only
+# a guided backend reads, and all three can refuse. Each refusal is asserted
+# TWICE — once plain, once with "stream": true — because the streaming arm is
+# where this class breaks: `sendError` on a socket that has already been handed
+# `text/event-stream` headers writes a second status line into the event body,
+# and curl reports the FIRST one, so a 400 emitted too late still reads as 200.
+bad_request() { # <label> <json-fragment>
+  local label="$1" frag="$2"
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$ID\",\"prompt\":\"a red cube\",\"steps\":1,\"seed\":1,$frag}")
+  check "$label" "$code" "400"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$ID\",\"prompt\":\"a red cube\",\"steps\":1,\"seed\":1,\"stream\":true,$frag}")
+  check "$label (streaming)" "$code" "400"
+}
+bad_request "an unserved timestep_spacing is refused" '"timestep_spacing":"quadratic"'
+bad_request "guidance below the range is refused"     '"guidance":0.5'
+bad_request "guidance above the range is refused"     '"guidance":99'
+bad_request "guidance_scale is range-checked too"     '"guidance_scale":99'
+
+# The same fields at legal values must not be refused — a range check that
+# rejects everything would pass every assertion above.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$ID\",\"prompt\":\"a red cube\",\"size\":\"512x512\",\"steps\":2,\"seed\":1,\"guidance\":7.5,\"timestep_spacing\":\"trailing\",\"negative_prompt\":\"blurry\"}")
+check "a fully-specified guided request generates" "$CODE" "200"
+
+echo "[6/6] size snapping and unload"
 # 500 is not a multiple of 64; SDXL is trained on /64 buckets, so it snaps up
 # rather than generating off-distribution.
 CODE=$(curl -s -o /tmp/sdxl_snap_$PORT.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \

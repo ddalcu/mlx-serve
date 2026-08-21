@@ -228,8 +228,9 @@ pub const Engine = struct {
         self.force_zeros_for_empty_prompt = readForceZeros(io, allocator, model_dir);
         self.sched_cfg = readSchedulerConfig(io, allocator, model_dir);
         log.info("[sdxl] schedule: spacing={s} offset={d} prediction={s} ancestral={} guidance={d:.1}\n", .{
-            @tagName(self.sched_cfg.spacing), self.sched_cfg.effectiveOffset(),
-            @tagName(self.sched_cfg.prediction), self.sched_cfg.ancestral, self.sched_cfg.default_guidance,
+            @tagName(self.sched_cfg.spacing),    self.sched_cfg.effectiveOffset(),
+            @tagName(self.sched_cfg.prediction), self.sched_cfg.ancestral,
+            self.sched_cfg.default_guidance,
         });
 
         self.tok_l = try clip_tok.load(io, allocator, model_dir, "tokenizer");
@@ -568,9 +569,10 @@ pub fn parseSchedulerConfig(allocator: std.mem.Allocator, content: []const u8) S
 
     if (o.get("timestep_spacing")) |v| {
         if (v == .string) {
-            if (std.mem.eql(u8, v.string, "trailing")) cfg.spacing = .trailing
-            else if (std.mem.eql(u8, v.string, "linspace")) cfg.spacing = .linspace
-            else cfg.spacing = .leading;
+            // An unrecognised name falls back to SDXL's own declared default
+            // rather than refusing: this is the CHECKPOINT talking, and a pack
+            // that names a spacing we do not serve should still generate.
+            cfg.spacing = sdxl.spacingFromString(v.string) orelse .leading;
         }
     }
     if (o.get("steps_offset")) |v| {

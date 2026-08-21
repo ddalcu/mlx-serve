@@ -285,7 +285,16 @@ pub const TextTower = struct {
             var attn = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn);
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
-                &attn, qh, kh, vh, scale, "causal", mlx.mlx_array_new(), mlx.mlx_array_new(), false, s,
+                &attn,
+                qh,
+                kh,
+                vh,
+                scale,
+                "causal",
+                mlx.mlx_array_new(),
+                mlx.mlx_array_new(),
+                false,
+                s,
             ));
 
             // back to [1, seq, hidden]

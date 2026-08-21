@@ -34,21 +34,37 @@ final class SDXLNegativePromptTests: XCTestCase {
         // branch to steer. Every other preset here is distilled and generates
         // guidance-free — the box would be decoration.
         XCTAssertTrue(ImageModelPreset.sdxlBase10.supportsNegativePrompt)
-        for p in ImageModelPreset.all where p.variant != .sdxlBase {
+        // Turbo is SDXL too, but adversarially distilled and guidance-free —
+        // it has no unconditional branch, so it must NOT advertise the field.
+        XCTAssertFalse(ImageModelPreset.sdxlTurbo.supportsNegativePrompt)
+        for p in ImageModelPreset.all where p.variant != .sdxlBase10 {
             XCTAssertFalse(p.supportsNegativePrompt, "\(p.id) does not read a negative prompt")
         }
     }
 
-    func testSdxlPresetIsRegisteredAndOnTrainingBuckets() {
-        XCTAssertTrue(ImageModelPreset.all.contains(ImageModelPreset.sdxlBase10),
-                      "the preset must be in `all` or it never reaches the picker")
-        // SDXL is trained on /64 buckets and drifts off-distribution between
-        // them; every offered resolution must land on one.
-        for r in ImageModelPreset.sdxlBase10.resolutions {
-            XCTAssertEqual(r.width % 64, 0, "\(r.width) is not a multiple of 64")
-            XCTAssertEqual(r.height % 64, 0, "\(r.height) is not a multiple of 64")
+    func testSdxlPresetsAreRegisteredAndOnTrainingBuckets() {
+        for preset in [ImageModelPreset.sdxlBase10, .sdxlTurbo] {
+            XCTAssertTrue(ImageModelPreset.all.contains(preset),
+                          "\(preset.id) must be in `all` or it never reaches the picker")
+            // SDXL is trained on /64 buckets and drifts off-distribution
+            // between them; every offered resolution must land on one, and the
+            // grid the pane enforces must agree with the server's
+            // `gen.clampSdxlDim` or the app accepts sizes the server re-snaps.
+            for r in preset.resolutions {
+                XCTAssertEqual(r.width % 64, 0, "\(r.width) is not a multiple of 64")
+                XCTAssertEqual(r.height % 64, 0, "\(r.height) is not a multiple of 64")
+            }
+            XCTAssertEqual(preset.resolutionGrid.alignment, 64)
+            XCTAssertEqual(preset.resolutionGrid.minDim, 512)
+            XCTAssertEqual(preset.resolutionGrid.maxDim, 2048)
+            // A default the menu does not contain leaves the picker showing
+            // nothing selected (`ResolutionOption` is Hashable over its label).
+            XCTAssertTrue(preset.resolutions.contains(preset.defaultResolution),
+                          "\(preset.id)'s default resolution is not one of its own options")
         }
-        // Not a distill: it needs real step counts, not 4-8.
+        // Base is not a distill: it needs real step counts, not 4-8. Turbo is,
+        // and must stay in single digits or it is being run like the base.
         XCTAssertGreaterThanOrEqual(ImageModelPreset.sdxlBase10.settings(.good).steps, 20)
+        XCTAssertLessThanOrEqual(ImageModelPreset.sdxlTurbo.settings(.good).steps, 4)
     }
 }

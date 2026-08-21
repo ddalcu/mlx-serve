@@ -522,22 +522,17 @@ pub const ImageGenOpts = struct {
     /// ("the backend's own default") rather than to a number that would be
     /// meaningless on three of the four arms.
     guidance: ?f32 = null,
-    /// `"leading"` | `"trailing"` | `"linspace"` — overrides the checkpoint's
-    /// declared timestep spacing. Needed for SDXL-Lightning, which is a LoRA
-    /// over base SDXL and therefore inherits base's `leading` config while
-    /// being trained for `trailing`.
-    spacing: ?[]const u8 = null,
+    /// Overrides the checkpoint's declared timestep spacing. Needed for
+    /// SDXL-Lightning, which is a LoRA over base SDXL and therefore inherits
+    /// base's `leading` config while being trained for `trailing`. Parsed at
+    /// the wire through `sdxl.spacingFromString`, so a name we do not serve is
+    /// a named 400 instead of a silent fallback this far down.
+    spacing: ?sdxl_mod.TimestepSpacing = null,
     /// Negative prompt. ABSENT (null) and EMPTY ("") are different requests on
     /// SDXL — absent zeroes the unconditional branch, empty encodes the empty
     /// string. See `sdxl_pipeline.GenOpts.negative_prompt`.
     negative_prompt: ?[]const u8 = null,
 };
-
-/// SDXL base's documented guidance default. The PIPELINE owns the real
-/// default now (it reads the checkpoint's own scheduler config, so Turbo and
-/// Lightning resolve to 1.0 without the caller knowing); this stays as the
-/// documented value for the base model.
-pub const SDXL_DEFAULT_GUIDANCE: f32 = 5.0;
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
 /// internals are swappable per architecture (`ImageBackend`).
@@ -731,12 +726,7 @@ pub const ImageEngine = struct {
                     .guidance = opts.guidance,
                     .seed = seed,
                     .negative_prompt = opts.negative_prompt,
-                    .spacing = if (opts.spacing) |sp|
-                        (if (std.mem.eql(u8, sp, "trailing")) sdxl_mod.TimestepSpacing.trailing
-                         else if (std.mem.eql(u8, sp, "linspace")) sdxl_mod.TimestepSpacing.linspace
-                         else sdxl_mod.TimestepSpacing.leading)
-                    else
-                        null,
+                    .spacing = opts.spacing,
                 }, progress);
             },
         };
@@ -2081,16 +2071,15 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
-    const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
-    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
-    const prog: ?sse.Progress = sctx.progress();
-    if (want_stream) try conn.writeAll(sse.headers);
-
-    // `negative_prompt` and `guidance` are read ONLY here — every other image
-    // backend runs guidance-free and ignores both, so `condWeightCount`-style
-    // per-backend gating would be noise. A model that cannot use them simply
-    // does not look at them.
+    // `negative_prompt`, `guidance` and `timestep_spacing` are read ONLY here —
+    // every other image backend runs guidance-free and ignores all three, so
+    // `condWeightCount`-style per-backend gating would be noise. A model that
+    // cannot use them simply does not look at them.
+    //
+    // This sits ABOVE the SSE header write on purpose: all three can 400, and
+    // `sendError` on a socket that has already been handed `text/event-stream`
+    // headers writes a second status line into the event body. Every other 400
+    // in this handler is above that line for the same reason.
     //
     // The ABSENT/EMPTY distinction is load-bearing on SDXL and is preserved
     // all the way from the wire: a body with no `negative_prompt` key leaves
@@ -2098,21 +2087,25 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // arrives as an empty slice and gets ENCODED. Collapsing the two is worth
     // cos 0.975 vs 0.997 against diffusers — see sdxl_pipeline.GenOpts.
     const negative_prompt: ?[]const u8 = extractJsonString(body, "negative_prompt");
-    const spacing: ?[]const u8 = blk: {
+    const spacing: ?sdxl_mod.TimestepSpacing = blk: {
         const sp = extractJsonString(body, "timestep_spacing") orelse break :blk null;
-        if (!std.mem.eql(u8, sp, "leading") and !std.mem.eql(u8, sp, "trailing") and !std.mem.eql(u8, sp, "linspace"))
+        break :blk sdxl_mod.spacingFromString(sp) orelse
             return sendError(conn, 400, "'timestep_spacing' must be 'leading', 'trailing' or 'linspace'");
-        break :blk sp;
     };
-    var guidance: ?f32 = null;
-    if (extractJsonFloat(body, "guidance")) |gv| {
+    // `guidance_scale` is diffusers' own spelling, accepted so a pasted script
+    // works; `guidance` wins when a body carries both.
+    const guidance: ?f32 = blk: {
+        const gv = extractJsonFloat(body, "guidance") orelse
+            extractJsonFloat(body, "guidance_scale") orelse break :blk null;
         if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance' must be in [1,30]");
-        guidance = @floatCast(gv);
-    } else if (extractJsonFloat(body, "guidance_scale")) |gv| {
-        // diffusers' own spelling, accepted so a pasted script works.
-        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance_scale' must be in [1,30]");
-        guidance = @floatCast(gv);
-    }
+        break :blk @as(f32, @floatCast(gv));
+    };
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
 
     const gen_opts = ImageGenOpts{
         .init_image = init_img, // null in edit mode

@@ -164,6 +164,15 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 - **LTX first and last frame** (#260): `last_frame_image` pins the final frame the same way `first_frame_image` pins the first, on every LTX pipeline including two-stage. A request the model cannot honour (no VAE encoder, fewer than 9 frames) is a named 400 rather than a plausible video of something else.
 - `instrumental: true` beside non-empty lyrics is a named 400 instead of a silent choice.
 
+### Stable Diffusion XL
+
+- **Stable Diffusion XL runs natively.** Pick **Stable Diffusion XL 1.0** or **SDXL Turbo** in the Image window; both are ~7 GB and about 10 GB to run. Not a distilled flow model like everything else we ship: SDXL predicts noise on a discrete beta schedule and runs real classifier-free guidance, two UNet forwards a step, which is why its step counts are 20-50 rather than 4-12. Turbo is the distilled build of the same architecture and generates in 1-4 steps with no guidance.
+- **The reason to want it is the LoRAs.** SDXL has by far the largest adapter ecosystem of any open image model, and those adapters bind here through the same stacked-LoRA grammar the other backends use — up to 8 at once, summed at forward time, never merged.
+- **Negative prompts.** A new Advanced field on the models that read one. Every other image model we ship generates guidance-free and has no unconditional branch for a negative prompt to steer, so the box appears only where it does something. Leaving it empty is not the same request as omitting it, and the app sends what you meant.
+- Over the API: `POST /v1/images/generations` with `model` set to an SDXL pack, plus optional `negative_prompt`, `guidance` (`guidance_scale` is accepted too) and `timestep_spacing`. Sizes snap to SDXL's /64 training buckets between 512 and 2048.
+- Downloads take the parts that are used. Stability's repo is ~77 GB — fp32 duplicates of every weight, single-file merged checkpoints, and ONNX/OpenVINO export trees — and the fetch pulls only the fp16 diffusers subfolders.
+- Every stage is pinned numerically against diffusers: both CLIP towers, the UNet (including a fixture driven by real text embeddings, not noise), the VAE decoder and the full pipeline.
+
 ### App
 
 - **Send a video to Qwen3-VL models** and chat about it. Thanks @justinluque (#246).
