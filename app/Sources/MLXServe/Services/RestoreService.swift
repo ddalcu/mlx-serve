@@ -69,9 +69,18 @@ enum RestoreGeometry {
     /// so there's no "losing the photo's own pixels" concern the crop path
     /// has, and rounding to nearest keeps the result closest to the factor
     /// the user actually picked.
-    static func upscaledTarget(width: Int, height: Int, factor: Int) -> (width: Int, height: Int) {
-        func nearest16(_ v: Int) -> Int { max(16, ((v + 8) / 16) * 16) }
-        return (nearest16(width * factor), nearest16(height * factor))
+    static func upscaledTarget(width: Int, height: Int, factor: Double) -> (width: Int, height: Int) {
+        func nearest16(_ v: Double) -> Int { max(16, Int((v / 16).rounded()) * 16) }
+        return (nearest16(Double(width) * factor), nearest16(Double(height) * factor))
+    }
+
+    /// "2×" for a whole factor, "1.5×" for anything with a fractional part —
+    /// the slider's step (0.1) means most picks are whole, and a trailing
+    /// ".0" on every label would read as false precision.
+    static func formatFactor(_ factor: Double) -> String {
+        factor.rounded() == factor
+            ? String(format: "%.0f×", factor)
+            : String(format: "%.1f×", factor)
     }
 }
 
@@ -118,7 +127,7 @@ final class RestoreService: ObservableObject {
     /// restore model on demand, POST the image, then unload unless the user
     /// pinned "Keep loaded". Coexists with a chat model on the same process.
     func restore(sourcePath: String, model: RestoreModelPreset, lanModelId: String?,
-                 scale: Int = 1, seed: Int, keepResident: Bool, server: ServerManager) {
+                 scale: Double = 1, seed: Int, keepResident: Bool, server: ServerManager) {
         guard FileManager.default.fileExists(atPath: sourcePath) else {
             phase = .failed("Could not read \(sourcePath).")
             return
@@ -185,7 +194,7 @@ final class RestoreService: ObservableObject {
     /// param: both resize to a target canvas FIRST, then let the DiT fill in
     /// detail at that size), so a scale factor is this client-side resize,
     /// not a server capability.
-    nonisolated static func preparedImageData(sourcePath: String, scale: Int) throws -> (data: Data, note: String?) {
+    nonisolated static func preparedImageData(sourcePath: String, scale: Double) throws -> (data: Data, note: String?) {
         guard let src = NSImage(contentsOfFile: sourcePath),
               let cgImage = src.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw APIError.badStatus(code: 0, detail: "Could not decode \((sourcePath as NSString).lastPathComponent) as an image.")
@@ -197,7 +206,7 @@ final class RestoreService: ObservableObject {
             guard let resized = resize(cgImage, to: target), let data = pngData(from: resized) else {
                 throw APIError.badStatus(code: 0, detail: "Could not upscale the source image.")
             }
-            let note = "upscaled \(w)×\(h) → \(target.width)×\(target.height) (\(scale)×) before restoring detail"
+            let note = "upscaled \(w)×\(h) → \(target.width)×\(target.height) (\(RestoreGeometry.formatFactor(scale))) before restoring detail"
             return (data, note)
         }
 

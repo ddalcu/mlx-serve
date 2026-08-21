@@ -43,7 +43,9 @@ struct RestoreUpscaleView: View {
     /// has no built-in upscale — a factor above 1x is a bicubic resize to
     /// that target canvas BEFORE restoration, so the model fills in real
     /// detail at the larger size instead of the resize just looking soft.
-    @State private var scale: Int = 2
+    /// Continuous (a slider, not fixed 1×/2×/4× stops) so "1.5×" is a drag,
+    /// not a compromise between two menu items.
+    @State private var scale: Double = 2
     @State private var seed: Int = -1
     @State private var keepResident: Bool = false
     @State private var showAdvanced: Bool = false
@@ -160,20 +162,26 @@ struct RestoreUpscaleView: View {
     /// run log. nil when the photo's already on-grid, or when scaling up
     /// (a resize hits the target canvas exactly — no crop needed).
     private var cropNote: String? {
-        guard scale == 1, let (w, h) = sourcePixelSize else { return nil }
+        guard scale <= 1, let (w, h) = sourcePixelSize else { return nil }
         guard let crop = RestoreGeometry.centeredCrop(width: w, height: h) else { return nil }
         return "Will be center-cropped to \(crop.width) × \(crop.height) — SeedVR2 needs both dimensions divisible by 16."
     }
 
     private var scaleSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Scale").font(.subheadline.weight(.semibold))
-            Picker("", selection: $scale) {
-                Text("1× (restore only)").tag(1)
-                Text("2×").tag(2)
-                Text("4×").tag(4)
+            HStack {
+                Text("Scale").font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(scale <= 1 ? "1× (restore only)" : RestoreGeometry.formatFactor(scale))
+                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
-            .pickerStyle(.segmented)
+            Slider(value: $scale, in: 1...4, step: 0.1) {
+                Text("Scale")
+            } minimumValueLabel: {
+                Text("1×").font(.caption2).foregroundStyle(.secondary)
+            } maximumValueLabel: {
+                Text("4×").font(.caption2).foregroundStyle(.secondary)
+            }
             .labelsHidden()
             if scale > 1, let (w, h) = sourcePixelSize {
                 let t = RestoreGeometry.upscaledTarget(width: w, height: h, factor: scale)

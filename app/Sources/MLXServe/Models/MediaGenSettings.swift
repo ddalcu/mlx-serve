@@ -457,10 +457,11 @@ struct Model3DGenSettings: Codable, Equatable {
 
 struct RestoreGenSettings: Codable, Equatable {
     var modelId: String = RestoreModelPreset.seedvr2_3b.id
-    /// 1 = restore only (same resolution). 2/4 = bicubic-resize to that
+    /// 1 = restore only (same resolution). >1 = bicubic-resize to that
     /// factor before restoring, so SeedVR2 fills in real detail at the
-    /// larger canvas rather than the resize just looking soft.
-    var scale: Int = 2
+    /// larger canvas rather than the resize just looking soft. Continuous
+    /// (slider-driven, 0.1 steps from 1 to 4) rather than fixed 1/2/4 stops.
+    var scale: Double = 2
     var seed: Int = -1
     var keepResident: Bool = false
 
@@ -493,7 +494,9 @@ extension RestoreGenSettings {
         self.init()
         let c = try decoder.container(keyedBy: CodingKeys.self)
         if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
-        if let v = try c.decodeIfPresent(Int.self, forKey: .scale) { scale = v }
+        // A build before this change persisted an Int (1/2/4); JSON has no
+        // type tag, so decoding straight to Double reads those the same way.
+        if let v = try c.decodeIfPresent(Double.self, forKey: .scale) { scale = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
     }
