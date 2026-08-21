@@ -3656,6 +3656,7 @@ fn restorePass(
 
     // 1. Encode, take the posterior MEAN (never a sample — a restorer has no
     //    business adding VAE noise on top of the diffusion noise), and scale.
+    seedvr2_vae.memProbe("== restore start");
     const moments = try seedvr2_vae.encode(&engine.encoder, x_in, s);
     defer _ = mlx.mlx_array_free(moments);
     const mean = try seedvr2_vae.latentMean(moments, @intCast(cfg.latent_channels), s);
@@ -3702,7 +3703,16 @@ fn restorePass(
 
     // 4. ONE forward at t = T. The resolution-dependent timestep transform is
     //    the identity at T, so it is deliberately not applied here.
+    // The stage probes force an eval so the timing means something — MLX is
+    // lazy, so without it every stage would report ~0 and the decode would
+    // report the whole restoration. Gated ON THE PROBE, never unconditional:
+    // an extra sync per stage is exactly the kind of thing that quietly
+    // becomes the measurement.
+    if (seedvr2_vae.memProbeEnabled()) try mlx.check(mlx.mlx_array_eval(vin));
+    seedvr2_vae.memProbe("== encode done");
     const pred = try seedvr2_dit.forward(&engine.dit, allocator, vin, engine.pos_emb, lat, seedvr2_pipe.OneStep.timestep(), s);
+    if (seedvr2_vae.memProbeEnabled()) try mlx.check(mlx.mlx_array_eval(pred));
+    seedvr2_vae.memProbe("== dit done");
     defer _ = mlx.mlx_array_free(pred);
 
     // 5. x_0 = noise - pred, then undo the scaling_factor.
@@ -3726,6 +3736,8 @@ fn restorePass(
     //    `mlx_array_data_float32` read on a strided view is the class of bug
     //    that produces a plausible, scrambled picture.
     const decoded = try seedvr2_vae.decode(&engine.decoder, z5, s);
+    if (seedvr2_vae.memProbeEnabled()) try mlx.check(mlx.mlx_array_eval(decoded));
+    seedvr2_vae.memProbe("== decode done");
     defer _ = mlx.mlx_array_free(decoded);
     var out_px = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out_px);

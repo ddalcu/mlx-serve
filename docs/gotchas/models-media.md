@@ -1460,3 +1460,61 @@ this one it is strictly worse, and the number says so.
 resident tops out near 2.6 Mpx — roughly 1600x1600. Bigger canvases are refused
 by name, which is the point: the alternative is not a slower restore, it is a
 flat rectangle with a 200 behind it.
+
+## SeedVR2 optimisation scan: what the time is, and three things that do not work (2026-08-21)
+
+Stage split of a 1024x1024 restore, measured warm with `MLX_SERVE_SEEDVR2_MEM=1`
+(which now prints elapsed time per stage beside the bytes) on an M4 Pro / 20-core:
+
+| stage | time | share |
+| --- | --- | --- |
+| VAE encode | 1.49 s | 17% |
+| DiT (one forward) | 4.41 s | 50% |
+| VAE decode | 3.18 s | 36% |
+
+**The DiT is at roofline and there is nothing to take.** ~3.15B parameters over
+4096 video tokens is ~26 TFLOP; 4.41 s is ~5.9 TFLOPS effective, which on a
+20-core M4 Pro (~7.2 TFLOPS fp32, bf16 GEMM maybe 1.5-2x that) is most of what
+the part can do. Wall clock there moves only by doing fewer forwards, and
+SeedVR2 already does exactly one.
+
+**Rejected 1: fusing the window attention.** `attend` rounds q/k/v to bf16, then
+widens them to f32, runs a hand-composed attention that materialises
+`[heads, L, L]` scores, rounds the result and widens it again — eight dtype
+conversions per window per layer, 512 of those at 1024x1024, to simulate a
+precision the arrays are ALREADY at under the default compute dtype. Replacing
+it with `mlx_fast_scaled_dot_product_attention` on the bf16 arrays directly
+(head_dim 128, inside the kernel's width) measured **4.41 -> 4.39 s**, i.e.
+nothing. Engagement was proven by its own log line (`fused attention engaged
+(L=458 heads=20 hd=128)`), not assumed — attention simply is not where the DiT's
+time is, the linear projections are. Reverted: an unmeasured numerical change to
+a sensitive path buys nothing.
+
+**Rejected 2: running the VAE in bf16.** This one is worth knowing because the
+numbers are GOOD and it still fails. Halving the VAE's dtype (statistics kept in
+f32, with the f32 scalars in the norm and the attention cast back so they cannot
+promote a frame) measured:
+
+- peak at 1024x1024 **11.27 -> 8.81 GB**, transient exactly halved,
+  3.84 -> 1.92 KB per output pixel — which would have roughly doubled the
+  largest canvas that fits
+- encode 1.49 -> 1.09 s, decode 3.18 -> 2.28 s, total ~9.1 -> ~7.8 s
+
+And the picture is visibly worse: the white background comes back mottled
+green-grey with a checkerboard, the apple loses its speckle texture and the leaf
+its veins (PSNR 14.5 dB against the f32 output, while the global mean and std
+stay put — so the summary statistics do NOT catch it and only looking does).
+The file's existing "the VAE stays f32" note is right, and its reasoning
+generalises: a VAE is the one component with no later stage to wash out a bias,
+its GroupNorm reduces over a whole frame, and its output IS the picture. This is
+the MageFlow rule ("only the sensitive component needs the wide dtype") pointed
+at the component that turns out to be sensitive.
+
+**Rejected 3 (earlier, same session): spatial tiling.** See the previous entry —
+MLX's functional array API makes assembling tiled output cost a `concatenate`,
+so a tiled op costs its input, its tiles and its output.
+
+**What that leaves.** The remaining levers are not code: keeping the model
+resident between upscales (the pane's "Keep loaded", off by default, otherwise
+every restore re-reads 6.3 GB of weights — measured as the difference between a
+4.80 s and a 4.41 s DiT stage), and the canvas size itself.

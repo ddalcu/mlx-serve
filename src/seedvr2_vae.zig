@@ -224,16 +224,30 @@ fn extendHead(x: mlx.mlx_array, times: u32, s: S) !mlx.mlx_array {
 /// Env-gated per-stage memory probe. `MLX_SERVE_SEEDVR2_MEM=1` prints active
 /// and peak bytes at each VAE stage boundary — the only way to attribute a
 /// peak that only appears at sizes too big to hold twice.
-fn memProbe(tag: []const u8) void {
-    const v = std.c.getenv("MLX_SERVE_SEEDVR2_MEM") orelse return;
-    if (std.mem.span(v).len == 0) return;
+var probe_last_ms: i64 = 0;
+
+pub fn memProbeEnabled() bool {
+    const v = std.c.getenv("MLX_SERVE_SEEDVR2_MEM") orelse return false;
+    return std.mem.span(v).len > 0;
+}
+
+/// Env-gated per-stage probe: active/peak bytes AND the wall time since the
+/// previous probe. The two belong together — this restoration's cost splits
+/// roughly encode/DiT/decode, and which stage owns a number is the whole
+/// question every time one of them moves.
+pub fn memProbe(tag: []const u8) void {
+    if (!memProbeEnabled()) return;
     var active: usize = 0;
     var peak: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_peak_memory(&peak);
     const gb = 1024.0 * 1024.0 * 1024.0;
-    std.debug.print("[seedvr2-mem] {s}: active={d:.2} GB peak={d:.2} GB\n", .{
-        tag, @as(f64, @floatFromInt(active)) / gb, @as(f64, @floatFromInt(peak)) / gb,
+    const now = std.Io.Timestamp.now(
+        std.Io.Threaded.global_single_threaded.io(), .boot).toMilliseconds();
+    const dt: f64 = if (probe_last_ms == 0) 0 else @as(f64, @floatFromInt(now - probe_last_ms)) / 1e3;
+    probe_last_ms = now;
+    std.debug.print("[seedvr2-mem] {s}: active={d:.2} GB peak={d:.2} GB (+{d:.2}s)\n", .{
+        tag, @as(f64, @floatFromInt(active)) / gb, @as(f64, @floatFromInt(peak)) / gb, dt,
     });
 }
 
