@@ -931,4 +931,34 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertFalse(fp16Markers.contains("transformer.safetensors"))
     }
 
+    func testSeedVr2SevenBPresetsAreRegisteredAndCostMoreThanTheThreeB() {
+        let all = RestoreModelPreset.all
+        let sevenB: [RestoreModelPreset] = [
+            .seedvr2_7b_int8, .seedvr2_7b, .seedvr2_7b_sharp_int8, .seedvr2_7b_sharp,
+        ]
+        for p in sevenB {
+            XCTAssertTrue(all.contains(where: { $0.id == p.id }),
+                          "\(p.id) must be in `all` or it never reaches the picker")
+            // Every 7B pack is an mflux-shaped export, so its completeness
+            // marker is the mirror's filename, never our converter's.
+            let markers = p.bundle.components[0].readyMarkers
+            XCTAssertTrue(markers.contains("transformer.safetensors"), "\(p.id) marker")
+            XCTAssertFalse(markers.contains("dit.safetensors"), "\(p.id) marker")
+            // A bigger model cannot be cheaper than the 3B it sits beside —
+            // the numbers are what the pane budgets and refuses against.
+            XCTAssertGreaterThan(p.approxDownloadGB, RestoreModelPreset.seedvr2_3b_int8.approxDownloadGB)
+            XCTAssertGreaterThan(p.approxRAMGB, RestoreModelPreset.seedvr2_3b_int8.approxRAMGB)
+        }
+        // 8-bit is the smaller half of each pair, in both dimensions.
+        XCTAssertLessThan(RestoreModelPreset.seedvr2_7b_int8.approxDownloadGB, RestoreModelPreset.seedvr2_7b.approxDownloadGB)
+        XCTAssertLessThan(RestoreModelPreset.seedvr2_7b_int8.approxRAMGB, RestoreModelPreset.seedvr2_7b.approxRAMGB)
+        // The sharp finetune is the same architecture, so it costs the same.
+        XCTAssertEqual(RestoreModelPreset.seedvr2_7b_sharp.approxRAMGB, RestoreModelPreset.seedvr2_7b.approxRAMGB)
+        XCTAssertEqual(RestoreModelPreset.seedvr2_7b_sharp_int8.approxDownloadGB, RestoreModelPreset.seedvr2_7b_int8.approxDownloadGB)
+        // Ids and repos are unique across the whole catalog — a duplicate id
+        // silently shadows a preset in every `first(where:)` lookup.
+        XCTAssertEqual(Set(all.map(\.id)).count, all.count)
+        XCTAssertEqual(Set(all.map(\.repo)).count, all.count)
+    }
+
 }

@@ -44,6 +44,7 @@ const multipart = @import("multipart.zig");
 const discovery = @import("model_discovery.zig");
 const seedvr2_vae = @import("seedvr2_vae.zig");
 const seedvr2_dit = @import("seedvr2_dit.zig");
+const seedvr2_manifest = @import("seedvr2_manifest.zig");
 const seedvr2_pipe = @import("seedvr2_pipeline.zig");
 const seedvr2_shape = @import("seedvr2_vae_shape.zig");
 const stb = @import("stb");
@@ -879,6 +880,23 @@ pub const AudioEngine = struct {
 /// Both halves stay resident — unlike the mesh/H3 staged loaders, this pipeline
 /// runs encode -> ONE denoise step -> decode in a single pass, so there is no
 /// stage boundary at which the DiT could be freed and reloaded profitably.
+/// Read a SeedVR2 pack's `config.json` into the DiT geometry.
+///
+/// A missing or unreadable file is the 3B default, which is exactly right for
+/// our own converter's packs — the geometry only became a question when a
+/// second SIZE appeared.
+fn readSeedvr2Config(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) seedvr2_manifest.Config {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return .{};
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return .{};
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return .{};
+    defer allocator.free(bytes);
+    return seedvr2_manifest.configFromJson(allocator, bytes);
+}
+
 pub const RestoreEngine = struct {
     allocator: std.mem.Allocator,
     encoder: seedvr2_vae.Encoder,
@@ -909,6 +927,18 @@ pub const RestoreEngine = struct {
         var dw = try model_mod.loadWeightsSingleFile(allocator, dit_path);
         defer dw.deinit();
 
+        // The DiT's geometry is the pack's to state. The 3B packs either say
+        // nothing or repeat the defaults; the 7B states it in the
+        // `transformer_overrides` block its exporter passes to the reference
+        // constructor. Reading it is what makes a 7B pack a different model
+        // rather than a 3B that cannot find its weights.
+        const dit_cfg = readSeedvr2Config(io, allocator, model_dir);
+        log.info("[seedvr2] geometry: dim={d} heads={d} layers={d} mm={d} rope={d} mlp={s} out_ada={}\n", .{
+            dit_cfg.vid_dim,   dit_cfg.heads,    dit_cfg.num_layers,
+            dit_cfg.mm_layers, dit_cfg.rope_dim, @tagName(dit_cfg.mlp_type),
+            dit_cfg.use_output_ada,
+        });
+
         const emb_path = try std.fmt.allocPrint(allocator, "{s}/pos_emb.safetensors", .{model_dir});
         defer allocator.free(emb_path);
         var ew = try model_mod.loadWeightsSingleFile(allocator, emb_path);
@@ -924,7 +954,7 @@ pub const RestoreEngine = struct {
             .allocator = allocator,
             .encoder = try seedvr2_vae.loadEncoder(allocator, &vw, s),
             .decoder = try seedvr2_vae.loadDecoder(allocator, &vw, s),
-            .dit = try seedvr2_dit.load(allocator, &dw, .{}, s),
+            .dit = try seedvr2_dit.load(allocator, &dw, dit_cfg, s),
             .pos_emb = pos,
         };
         return self;

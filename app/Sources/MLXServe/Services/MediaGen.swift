@@ -1248,9 +1248,66 @@ struct RestoreModelPreset: Identifiable, Hashable {
         ditFilename: "transformer.safetensors"
     )
 
-    /// Catalog, newest/smallest first — the 8-bit build is the one most Macs
-    /// should reach for.
-    static let all: [RestoreModelPreset] = [.seedvr2_3b_int8, .seedvr2_3b]
+    /// SeedVR2 7B — the larger checkpoint of the same family, and a different
+    /// CONFIGURATION rather than a scaled-up 3B: every layer is multimodal
+    /// (36 of 36, against the 3B's first 10), the MLP is a plain GELU instead
+    /// of gated SwiGLU, rope is half as wide and rotates video only, and the
+    /// output modulation the 3B closes with does not exist. The server reads
+    /// all of that from the pack's own `transformer_overrides` block.
+    static let seedvr2_7b_int8 = RestoreModelPreset(
+        id: "seedvr2-7b-8bit",
+        name: "SeedVR2 7B (8-bit)",
+        repo: "benc0/SeedVR2-7B-mlx-int8",
+        approxRAMGB: 16,
+        approxDownloadGB: 9.3,
+        description: "The larger SeedVR2. Holds fine texture and small faces better than the 3B, and takes about twice as long. This 8-bit build is the one to pick unless you have memory to spare.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    static let seedvr2_7b = RestoreModelPreset(
+        id: "seedvr2-7b",
+        name: "SeedVR2 7B (fp16)",
+        repo: "benc0/SeedVR2-7B-mlx",
+        approxRAMGB: 24,
+        approxDownloadGB: 17.0,
+        description: "The larger SeedVR2 at full precision. Needs a lot of memory — 32 GB or more — and is otherwise the same model as the 8-bit build.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    /// The `sharp` finetune — ByteDance's own second 7B checkpoint, tuned for
+    /// stronger detail sharpening. Identical architecture, different weights,
+    /// so it costs exactly what the standard 7B costs.
+    static let seedvr2_7b_sharp_int8 = RestoreModelPreset(
+        id: "seedvr2-7b-sharp-8bit",
+        name: "SeedVR2 7B Sharp (8-bit)",
+        repo: "benc0/SeedVR2-7B-sharp-mlx-int8",
+        approxRAMGB: 16,
+        approxDownloadGB: 9.3,
+        description: "The 7B tuned to sharpen harder. Worth trying on soft or heavily compressed sources; on already-clean photos it can look overdone.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    static let seedvr2_7b_sharp = RestoreModelPreset(
+        id: "seedvr2-7b-sharp",
+        name: "SeedVR2 7B Sharp (fp16)",
+        repo: "benc0/SeedVR2-7B-sharp-mlx",
+        approxRAMGB: 24,
+        approxDownloadGB: 17.0,
+        description: "The sharpening-tuned 7B at full precision. Needs 32 GB or more.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    /// Catalog, smallest first — the 3B 8-bit build is the one most Macs
+    /// should reach for, and the fp16 7B entries sit last because they are the
+    /// only ones that will not fit in 16 GB.
+    static let all: [RestoreModelPreset] = [
+        .seedvr2_3b_int8,       // ~13 GB
+        .seedvr2_3b,            // ~18 GB
+        .seedvr2_7b_int8,       // ~16 GB
+        .seedvr2_7b_sharp_int8, // ~16 GB
+        .seedvr2_7b,            // ~24 GB
+        .seedvr2_7b_sharp,      // ~24 GB
+    ]
 }
 
 /// Which music ENGINE a checkpoint drives. The two families share the

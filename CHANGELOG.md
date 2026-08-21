@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### SeedVR2 image restoration
+
+- **SeedVR2 upscaling.** One-step diffusion restoration for photos: sharpens detail, removes compression artifacts, and fills in real detail rather than resizing. Pick a model in the Image window.
+- **Four sizes.** The 3B in fp16 or 8-bit, and now the 7B — standard or `sharp` (ByteDance's second checkpoint, tuned to sharpen harder), each in fp16 or 8-bit. The 8-bit builds halve the download and the memory; the 7B holds fine texture and small faces better and takes about twice as long.
+- **Community mirrors load as they ship.** mlx-community's 3B packs and the benc0 7B packs are exported from a different converter than ours: they name the shared attention weights per-stream, store the VAE's convolutions pre-permuted, and state their geometry in a `transformer_overrides` block. The server reads all of that off the pack instead of assuming one converter's conventions.
+- The 7B is not a scaled-up 3B — every layer is multimodal, the MLP is a plain GELU instead of gated SwiGLU, rope is half as wide and rotates video only, and the 3B's closing modulation does not exist. Each of those is read from the pack's own config, so a future variant that flips one of them needs no new code.
+- Over the API: `POST /v1/images/upscales` with a base64 `image`.
+
 ## v26.8.9 — Launch your coding agent, richer chat, faster decode
 
 ### Highlights

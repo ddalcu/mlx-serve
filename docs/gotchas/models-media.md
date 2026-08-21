@@ -1518,3 +1518,48 @@ so a tiled op costs its input, its tiles and its output.
 resident between upscales (the pane's "Keep loaded", off by default, otherwise
 every restore re-reads 6.3 GB of weights — measured as the difference between a
 4.80 s and a 4.41 s DiT stage), and the canvas size itself.
+
+## SeedVR2's 7B is a second configuration, not a bigger 3B
+
+Adding the 7B looked like a preset change and was four forward-path branches.
+The two sizes share tensor NAMES, the VAE, the pos-emb conditioning and the
+one-step sampler, which is exactly what makes the differences easy to miss:
+
+| | 3B | 7B |
+| --- | --- | --- |
+| MLP | gated SwiGLU, 3 linears, no biases, hidden `ceil256(2·d·4/3)` = 8192 | plain GELU, 2 linears **with biases**, hidden `d·expand_ratio` = 12288 |
+| layers | 32, first 10 multimodal | 36, **all** multimodal — no `.all` weight set exists |
+| rope | dim 128, 21 stored freqs, applied to both streams | dim **64**, 10 freqs, **video only**, positions on `linspace(-1,1,extent)` |
+| head | `vid_out_norm` + `out_shift`/`out_scale` | `use_output_ada: false` — none of the three ship |
+
+The geometry is not guessed: every pack states it in `transformer_overrides`,
+which is the reference transformer's constructor argument list verbatim
+(mflux does `SeedVR2Transformer(**cfg["transformer_overrides"])`, and the
+packs are exported against that). So the parser reads that block, ignores
+keys it does not model — a constructor signature grows, and a future field
+must not make an existing pack unloadable — and treats an ABSENT block as
+the 3B, which is what keeps both 3B packs loading unchanged.
+
+Two things worth keeping:
+
+**The output norm and its modulation are ONE switch.** The reference builds
+`vid_out_norm`, `out_shift` and `out_scale` inside a single `if
+use_output_ada`. Treating the norm as unconditional (it looks like plumbing,
+not modulation) means reaching for a tensor a complete 7B pack does not
+contain.
+
+**The temporal rope offset belongs to `rope_on_text`, not to the frequency
+basis.** Video positions continue the text's coordinate space only on the
+multimodal rope path; the video-only path starts every axis at the origin.
+The first cut keyed that offset on `freqs_for == "pixel"`, which gives the
+right answer for both shipped configs — the 7B is the only one that is
+`pixel`, and it is also the only one that skips text rope — and the wrong
+one for any `lang` pack that does not rotate its text. A branch that is
+correct by coincidence reads exactly like a branch that is correct.
+
+Verified end to end on the int8 pack: the geometry line reports
+`dim=3072 heads=24 layers=36 mm=36 rope=64 mlp=normal out_ada=false`, the
+restore correlates 0.9922 with its source (the 3B manages 0.9851 on the same
+photo), and the 3B's own output is BYTE-IDENTICAL across the change — which
+is the check that matters, since all four branches sit in code both sizes
+run.

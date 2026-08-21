@@ -242,6 +242,7 @@ pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array,
 
 pub extern "c" fn mlx_arange(res: *mlx_array, start: f64, stop: f64, step: f64, dtype: mlx_dtype, s: mlx_stream) c_int;
 pub extern "c" fn mlx_full(res: *mlx_array, shape: [*]const c_int, shape_num: usize, val: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_linspace(res: *mlx_array, start: f64, stop: f64, num: c_int, dtype: mlx_dtype, s: mlx_stream) c_int;
 pub extern "c" fn mlx_zeros(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
 pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
 

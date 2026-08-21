@@ -145,9 +145,51 @@ fn siluA(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(o);
     return mulA(x, o, s);
 }
+/// `gelu_approx` — MLX's tanh GELU, which is what the reference's plain MLP
+/// calls: `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))`. NOT the erf gelu and
+/// NOT `gelu_fast_approx`'s sigmoid form; the three disagree in the third
+/// decimal, which over 36 blocks is a visibly different picture.
+fn geluTanh(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const c_cube = mlx.mlx_array_new_float(0.044715);
+    defer _ = mlx.mlx_array_free(c_cube);
+    const c_sqrt = mlx.mlx_array_new_float(0.7978845608028654); // sqrt(2/pi)
+    defer _ = mlx.mlx_array_free(c_sqrt);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    const half = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(half);
+
+    const x2 = try mulA(x, x, s);
+    defer _ = mlx.mlx_array_free(x2);
+    const x3 = try mulA(x2, x, s);
+    defer _ = mlx.mlx_array_free(x3);
+    const cx3 = try mulA(x3, c_cube, s);
+    defer _ = mlx.mlx_array_free(cx3);
+    const inner = try addA(x, cx3, s);
+    defer _ = mlx.mlx_array_free(inner);
+    const scaled = try mulA(inner, c_sqrt, s);
+    defer _ = mlx.mlx_array_free(scaled);
+    var th = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(th);
+    try mlx.check(mlx.mlx_tanh(&th, scaled, s));
+    const onep = try addA(th, one, s);
+    defer _ = mlx.mlx_array_free(onep);
+    const hx = try mulA(x, half, s);
+    defer _ = mlx.mlx_array_free(hx);
+    return mulA(hx, onep, s);
+}
+
 fn takeRows(x: mlx.mlx_array, idx: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_take_axis(&o, x, idx, 0, s));
+    return o;
+}
+
+/// A new owning handle on an existing array, so a branch that passes its input
+/// straight through still returns something the caller can free unconditionally.
+fn ownArray(x: mlx.mlx_array) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&o, x));
     return o;
 }
 
@@ -424,10 +466,19 @@ const Rope = struct {
 
 /// `[len]` positional angles for one axis: `outer(pos, freqs)` with each column
 /// duplicated, giving `[len, 2n]`.
-fn axisAngles(freqs: mlx.mlx_array, start: c_int, len: c_int, s: S) !mlx.mlx_array {
+fn axisAngles(freqs: mlx.mlx_array, start: c_int, len: c_int, mode: manifest.RopeFreqs, s: S) !mlx.mlx_array {
     var pos = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pos);
-    try mlx.check(mlx.mlx_arange(&pos, @floatFromInt(start), @floatFromInt(start + len), 1.0, mlx.mlx_dtype.float32, s));
+    switch (mode) {
+        // `lang`: integer positions, offset into the shared txt+vid space.
+        .lang => try mlx.check(mlx.mlx_arange(&pos, @floatFromInt(start), @floatFromInt(start + len), 1.0, mlx.mlx_dtype.float32, s)),
+        // `pixel`: each axis NORMALISED onto [-1, 1] across its own extent, so
+        // there is no `start` to offset by — the reference builds the grid from
+        // the exact per-window extent for this reason ("slicing a larger
+        // precomputed grid changes spacing and introduces spatial bias"). A
+        // single-element axis is the endpoint, matching mx.linspace.
+        .pixel => try mlx.check(mlx.mlx_linspace(&pos, -1.0, 1.0, len, mlx.mlx_dtype.float32, s)),
+    }
     const p2 = try reshape(pos, &[_]c_int{ len, 1 }, s);
     defer _ = mlx.mlx_array_free(p2);
     const n = mlx.getShape(freqs)[0];
@@ -448,14 +499,20 @@ fn axisAngles(freqs: mlx.mlx_array, start: c_int, len: c_int, s: S) !mlx.mlx_arr
 /// `(t, h, w)`. The temporal axis starts at `txt_len` — video positions follow
 /// the text in one shared coordinate space — while H and W start at 0. Window
 /// extents are LOCAL, so every window restarts from the same origin.
-fn videoAngles(freqs: mlx.mlx_array, t: c_int, h: c_int, w: c_int, txt_len: c_int, a: std.mem.Allocator, s: S) !mlx.mlx_array {
+fn videoAngles(freqs: mlx.mlx_array, t: c_int, h: c_int, w: c_int, txt_len: c_int, mode: manifest.RopeFreqs, a: std.mem.Allocator, s: S) !mlx.mlx_array {
     _ = a;
     const n = mlx.getShape(freqs)[0];
-    const at = try axisAngles(freqs, txt_len, t, s);
+    // `txt_len` is 0 whenever the text is not rotated. The offset belongs to
+    // the MULTIMODAL rope path, where video positions continue the text's own
+    // coordinate space; the video-only path (`rope_on_text` off) starts every
+    // axis at the origin. Keying this on the frequency basis instead would
+    // give the right answer for both shipped configs and the wrong one for a
+    // `lang` checkpoint that does not rotate its text.
+    const at = try axisAngles(freqs, txt_len, t, mode, s);
     defer _ = mlx.mlx_array_free(at);
-    const ah = try axisAngles(freqs, 0, h, s);
+    const ah = try axisAngles(freqs, 0, h, mode, s);
     defer _ = mlx.mlx_array_free(ah);
-    const aw = try axisAngles(freqs, 0, w, s);
+    const aw = try axisAngles(freqs, 0, w, mode, s);
     defer _ = mlx.mlx_array_free(aw);
 
     // Broadcast each axis over the other two, then concat on the feature axis.
@@ -483,8 +540,8 @@ fn videoAngles(freqs: mlx.mlx_array, t: c_int, h: c_int, w: c_int, txt_len: c_in
 
 /// `[txt_len, 6n]` — the 1-D language table TILED THREE TIMES, not a 3-axis
 /// table. Text has one position; it simply has to fill the same width.
-fn textAngles(freqs: mlx.mlx_array, txt_len: c_int, s: S) !mlx.mlx_array {
-    const a1 = try axisAngles(freqs, 0, txt_len, s);
+fn textAngles(freqs: mlx.mlx_array, txt_len: c_int, mode: manifest.RopeFreqs, s: S) !mlx.mlx_array {
+    const a1 = try axisAngles(freqs, 0, txt_len, mode, s);
     defer _ = mlx.mlx_array_free(a1);
     return concatA(&[_]mlx.mlx_array{ a1, a1, a1 }, 1, s);
 }
@@ -610,9 +667,13 @@ const Stream = struct {
     out_b: mlx.mlx_array,
     nq_w: mlx.mlx_array,
     nk_w: mlx.mlx_array,
-    gate_wt: DitLinear,
+    /// SwiGLU's SiLU'd branch. Null on the plain GELU MLP, which has no gate.
+    gate_wt: ?DitLinear,
     up_wt: DitLinear,
     down_wt: DitLinear,
+    /// The plain MLP's linears carry biases; SwiGLU's are bias-free.
+    up_b: ?mlx.mlx_array,
+    down_b: ?mlx.mlx_array,
     ada: [6]mlx.mlx_array, // [layer][kind] flattened: l*3 + kind
 
     fn load(a: std.mem.Allocator, w: *const Weights, layer: u32, key: []const u8, cfg: Config, scheme: KeyScheme, dt: mlx.mlx_dtype, s: S) !Stream {
@@ -637,15 +698,23 @@ const Stream = struct {
         // MLP naming is identical across schemes.
         // proj_in_gate is the SiLU'd branch; proj_in is the linear one. The
         // names invite the opposite reading and both shapes match.
-        const gate_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in_gate", .{ layer, key });
-        defer a.free(gate_prefix);
-        st.gate_wt = try loadMixedLinT(w, a, gate_prefix, cfg.vid_dim, dt, s);
+        if (cfg.mlp_type == .swiglu) {
+            const gate_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in_gate", .{ layer, key });
+            defer a.free(gate_prefix);
+            st.gate_wt = try loadMixedLinT(w, a, gate_prefix, cfg.vid_dim, dt, s);
+        } else {
+            st.gate_wt = null;
+        }
         const up_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in", .{ layer, key });
         defer a.free(up_prefix);
         st.up_wt = try loadMixedLinT(w, a, up_prefix, cfg.vid_dim, dt, s);
         const down_prefix = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_out", .{ layer, key });
         defer a.free(down_prefix);
         st.down_wt = try loadMixedLinT(w, a, down_prefix, cfg.mlpHidden(), dt, s);
+        // Biases exist only on the plain arm — `bias=True` there, `bias=False`
+        // throughout SwiGLU.
+        st.up_b = if (cfg.mlp_type == .normal) try loadVecAt(w, a, up_prefix, "bias", dt, s) else null;
+        st.down_b = if (cfg.mlp_type == .normal) try loadVecAt(w, a, down_prefix, "bias", dt, s) else null;
 
         const lnames = [_][]const u8{ "attn", "mlp" };
         const knames = [_][]const u8{ "shift", "scale", "gate" };
@@ -667,7 +736,12 @@ const Stream = struct {
     }
 
     fn deinit(st: *Stream) void {
-        for ([_]*DitLinear{ &st.qkv_wt, &st.out_wt, &st.gate_wt, &st.up_wt, &st.down_wt }) |p| p.deinit();
+        for ([_]*DitLinear{ &st.qkv_wt, &st.out_wt, &st.up_wt, &st.down_wt }) |p| p.deinit();
+        if (st.gate_wt) |*g| g.deinit();
+        for ([_]*?mlx.mlx_array{ &st.up_b, &st.down_b }) |p|
+            if (p.*) |v| {
+                _ = mlx.mlx_array_free(v);
+            };
         for ([_]*mlx.mlx_array{ &st.out_b, &st.nq_w, &st.nk_w }) |p|
             _ = mlx.mlx_array_free(p.*);
         for (&st.ada) |*p| _ = mlx.mlx_array_free(p.*);
@@ -678,7 +752,17 @@ const Stream = struct {
     }
 
     fn mlp(st: *const Stream, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const g = try linT(x, &st.gate_wt, null, s);
+        // Plain GELU arm (7B): proj_in -> gelu -> proj_out, both with biases.
+        // No gate, and the hidden width is `dim * expand_ratio` rather than
+        // SwiGLU's two-thirds rounding.
+        const gate = st.gate_wt orelse {
+            const h = try linT(x, &st.up_wt, st.up_b, s);
+            defer _ = mlx.mlx_array_free(h);
+            const act = try geluTanh(h, s);
+            defer _ = mlx.mlx_array_free(act);
+            return linT(act, &st.down_wt, st.down_b, s);
+        };
+        const g = try linT(x, &gate, null, s);
         defer _ = mlx.mlx_array_free(g);
         const act = try siluA(g, s);
         defer _ = mlx.mlx_array_free(act);
@@ -719,9 +803,11 @@ pub const Model = struct {
     emb_in_wt: [3]DitLinear,
     emb_in_b: [3]mlx.mlx_array,
     blocks: []Block,
-    out_norm_w: mlx.mlx_array,
-    out_shift: mlx.mlx_array,
-    out_scale: mlx.mlx_array,
+    out_norm_w: ?mlx.mlx_array,
+    /// All three null when `use_output_ada` is off (7B): the reference builds
+    /// them together or not at all.
+    out_shift: ?mlx.mlx_array,
+    out_scale: ?mlx.mlx_array,
     vid_out_wt: DitLinear,
     vid_out_b: mlx.mlx_array,
     /// The dtype every weight was widened to. `forward` casts its f32 inputs
@@ -733,8 +819,12 @@ pub const Model = struct {
         m.vid_in_wt.deinit();
         m.txt_in_wt.deinit();
         m.vid_out_wt.deinit();
-        for ([_]*mlx.mlx_array{ &m.vid_in_b, &m.txt_in_b, &m.out_norm_w, &m.out_shift, &m.out_scale, &m.vid_out_b }) |p|
+        for ([_]*mlx.mlx_array{ &m.vid_in_b, &m.txt_in_b, &m.vid_out_b }) |p|
             _ = mlx.mlx_array_free(p.*);
+        for ([_]*?mlx.mlx_array{ &m.out_norm_w, &m.out_shift, &m.out_scale }) |p|
+            if (p.*) |v| {
+                _ = mlx.mlx_array_free(v);
+            };
         for (&m.emb_in_wt) |*p| p.deinit();
         for (&m.emb_in_b) |*p| _ = mlx.mlx_array_free(p.*);
         for (m.blocks) |*b| b.deinit();
@@ -797,15 +887,25 @@ pub fn loadAs(a: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_
         m.blocks[i] = b;
     }
 
-    m.out_norm_w = try loadVec(w, a, "vid_out_norm.weight", .{}, dt, s);
-    m.out_shift = switch (scheme) {
-        .ours => try loadVec(w, a, "vid_out_ada.out_shift", .{}, dt, s),
-        .mlx_community => try loadVec(w, a, "out_shift", .{}, dt, s),
-    };
-    m.out_scale = switch (scheme) {
-        .ours => try loadVec(w, a, "vid_out_ada.out_scale", .{}, dt, s),
-        .mlx_community => try loadVec(w, a, "out_scale", .{}, dt, s),
-    };
+    // The output norm and its modulation are ONE switch in the reference — a
+    // single `if use_output_ada` builds all three — and the 7B ships none of
+    // them, so a load that reached for `vid_out_norm.weight` here would fail
+    // on a checkpoint that is complete.
+    if (cfg.use_output_ada) {
+        m.out_norm_w = try loadVec(w, a, "vid_out_norm.weight", .{}, dt, s);
+        m.out_shift = switch (scheme) {
+            .ours => try loadVec(w, a, "vid_out_ada.out_shift", .{}, dt, s),
+            .mlx_community => try loadVec(w, a, "out_shift", .{}, dt, s),
+        };
+        m.out_scale = switch (scheme) {
+            .ours => try loadVec(w, a, "vid_out_ada.out_scale", .{}, dt, s),
+            .mlx_community => try loadVec(w, a, "out_scale", .{}, dt, s),
+        };
+    } else {
+        m.out_norm_w = null;
+        m.out_shift = null;
+        m.out_scale = null;
+    }
     m.vid_out_wt = try loadMixedLinT(w, a, "vid_out.proj", cfg.vid_dim, dt, s);
     m.vid_out_b = try loadVecAt(w, a, "vid_out.proj", "bias", dt, s);
     return m;
@@ -1136,14 +1236,26 @@ fn attention(
     defer _ = mlx.mlx_array_free(tk0);
 
     // Text rope is the same in every window (window-local positions restart),
-    // so it is built once.
-    const tang = try textAngles(b.rope_freqs, txt_len, s);
-    defer _ = mlx.mlx_array_free(tang);
-    var trope = try ropeFromAngles(tang, dt, s);
-    defer trope.deinit();
-    const tq = try applyRope(tq0, &trope, s);
+    // so it is built once — and on the 7B it is not built at all: with
+    // `rope_on_text` off the reference takes the video-only rope path and the
+    // text q/k go into attention unrotated.
+    const tq = if (cfg.rope_on_text) blk: {
+        const tang = try textAngles(b.rope_freqs, txt_len, cfg.rope_freqs_for, s);
+        defer _ = mlx.mlx_array_free(tang);
+        var trope = try ropeFromAngles(tang, dt, s);
+        defer trope.deinit();
+        const q = try applyRope(tq0, &trope, s);
+        errdefer _ = mlx.mlx_array_free(q);
+        break :blk q;
+    } else try ownArray(tq0);
     defer _ = mlx.mlx_array_free(tq);
-    const tk = try applyRope(tk0, &trope, s);
+    const tk = if (cfg.rope_on_text) blk: {
+        const tang = try textAngles(b.rope_freqs, txt_len, cfg.rope_freqs_for, s);
+        defer _ = mlx.mlx_array_free(tang);
+        var trope = try ropeFromAngles(tang, dt, s);
+        defer trope.deinit();
+        break :blk try applyRope(tk0, &trope, s);
+    } else try ownArray(tk0);
     defer _ = mlx.mlx_array_free(tk);
 
     // ONE RoPE table per DISTINCT window extent, not per window. A 3x3 split
@@ -1154,7 +1266,8 @@ fn attention(
     var built: usize = 0;
     defer for (ropes[0..built]) |*r| r.deinit();
     for (plan.extents) |ext| {
-        const vang = try videoAngles(b.rope_freqs, @intCast(ext[0]), @intCast(ext[1]), @intCast(ext[2]), txt_len, a, s);
+        const rope_txt_off: c_int = if (cfg.rope_on_text) txt_len else 0;
+        const vang = try videoAngles(b.rope_freqs, @intCast(ext[0]), @intCast(ext[1]), @intCast(ext[2]), rope_txt_off, cfg.rope_freqs_for, a, s);
         defer _ = mlx.mlx_array_free(vang);
         ropes[built] = try ropeFromAngles(vang, dt, s);
         built += 1;
@@ -1404,15 +1517,20 @@ pub fn forward(
     _ = mlx.mlx_array_free(cur_t);
     defer _ = mlx.mlx_array_free(cur_v);
 
-    const n = try rmsNorm(cur_v, m.out_norm_w, 1e-5, s);
-    defer _ = mlx.mlx_array_free(n);
-    // THE CACHE COLLISION (docs/seedvr2-arch.md §1.3.1): vid_out_ada reuses the
-    // ATTN modulation slot, because AdaSingle's memo key for layers=["out"] is
-    // `emb_repeat_0_vid` — exactly what the blocks' attn ada already stored. Its
-    // own 1-layer view is malformed and never evaluated.
-    const modded = try adaIn(n, &mod, LAYER_ATTN, m.out_shift, m.out_scale, s);
-    defer _ = mlx.mlx_array_free(modded);
-    const proj_dt = try linT(modded, &m.vid_out_wt, m.vid_out_b, s);
+    // `use_output_ada` off (7B): the reference goes straight from the last
+    // block to `vid_out`, with no norm and no modulation in between.
+    const head_in: mlx.mlx_array = if (m.out_norm_w) |nw| blk: {
+        const n = try rmsNorm(cur_v, nw, 1e-5, s);
+        defer _ = mlx.mlx_array_free(n);
+        // THE CACHE COLLISION (docs/seedvr2-arch.md §1.3.1): vid_out_ada reuses
+        // the ATTN modulation slot, because AdaSingle's memo key for
+        // layers=["out"] is `emb_repeat_0_vid` — exactly what the blocks' attn
+        // ada already stored. Its own 1-layer view is malformed and never
+        // evaluated.
+        break :blk try adaIn(n, &mod, LAYER_ATTN, m.out_shift.?, m.out_scale.?, s);
+    } else try ownArray(cur_v);
+    defer _ = mlx.mlx_array_free(head_in);
+    const proj_dt = try linT(head_in, &m.vid_out_wt, m.vid_out_b, s);
     defer _ = mlx.mlx_array_free(proj_dt);
     // Back to f32 at the boundary: the sampler's `x_0 = noise - pred` and the
     // VAE downstream are f32, and a bf16 prediction subtracted from f32 noise

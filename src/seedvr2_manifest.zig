@@ -22,6 +22,17 @@
 const std = @import("std");
 
 /// 3B geometry. Everything derived, nothing hardcoded twice.
+/// Which MLP a block runs. The 3B is gated SwiGLU; the 7B is a plain
+/// GELU MLP, which differs in TENSOR SET (two linears WITH biases, no
+/// `proj_in_gate`), in hidden width, and in the forward math.
+pub const MlpType = enum { swiglu, normal };
+
+/// Which basis the rope frequency table was built on. We LOAD the table from
+/// the checkpoint either way, so this does not change the frequencies — it
+/// changes the POSITIONS they multiply: `lang` walks integer positions, while
+/// `pixel` normalises each axis onto `linspace(-1, 1, extent)`.
+pub const RopeFreqs = enum { lang, pixel };
+
 pub const Config = struct {
     vid_dim: u32 = 2560,
     txt_in_dim: u32 = 5120,
@@ -40,6 +51,16 @@ pub const Config = struct {
     patch_w: u32 = 2,
     sinusoidal_dim: u32 = 256,
     rope_dim: u32 = 128,
+    /// 3B: gated SwiGLU. 7B: plain GELU with biases.
+    mlp_type: MlpType = .swiglu,
+    /// 3B applies rope to both streams; the 7B rotates video only.
+    rope_on_text: bool = true,
+    rope_freqs_for: RopeFreqs = .lang,
+    /// 3B closes with `vid_out_norm` + an `out_shift`/`out_scale` modulation.
+    /// The 7B ships NEITHER tensor and skips both.
+    use_output_ada: bool = true,
+    /// 3B's last layer runs its txt stream through no MLP. The 7B's does.
+    last_layer_vid_only: bool = true,
 
     pub fn txtDim(self: Config) u32 {
         return self.vid_dim;
@@ -59,8 +80,12 @@ pub const Config = struct {
         return self.innerDim() * 3;
     }
 
-    /// `hidden = ceil_to_256(int(2 * dim * expand_ratio / 3))`.
+    /// SwiGLU: `ceil_to_256(int(2 * dim * expand_ratio / 3))` — the two thirds
+    /// is what keeps a GATED MLP's parameter count level with a plain one.
+    /// Plain GELU: the ungated `dim * expand_ratio`, no rounding, which is why
+    /// the 7B's is 12288 where the same dim under SwiGLU would give 8192.
     pub fn mlpHidden(self: Config) u32 {
+        if (self.mlp_type == .normal) return self.vid_dim * self.expand_ratio;
         const raw = (2 * self.vid_dim * self.expand_ratio) / 3; // int() truncates
         const m = self.mlp_multiple_of;
         return ((raw + m - 1) / m) * m;
@@ -118,7 +143,83 @@ pub fn branchKeys(b: Branch) []const []const u8 {
 /// bug that does not exist; a forward that runs txt through the last MLP is
 /// the real one.
 pub fn txtSkipsMlp(cfg: Config, layer: u32) bool {
-    return layer == cfg.num_layers - 1;
+    return cfg.last_layer_vid_only and layer == cfg.num_layers - 1;
+}
+
+/// Read a pack's `config.json` into a `Config`.
+///
+/// The geometry lives in `transformer_overrides`, which is the argument list
+/// the reference transformer's constructor takes — mflux passes it straight to
+/// `SeedVR2Transformer(**cfg["transformer_overrides"])`, and the packs are
+/// exported against exactly that. An ABSENT block leaves every field at the 3B
+/// default, which is what the two 3B packs rely on: `mlx-community/SeedVR2-3B-mlx`
+/// declares an EMPTY `transformer_overrides` and our own converter's config
+/// carries the geometry as flat top-level keys instead. Both still load.
+///
+/// Unknown keys are ignored rather than refused: this is a constructor
+/// signature, and a future field we do not model yet must not make an existing
+/// pack unloadable. Fields we DO model but cannot honour are the loader's
+/// problem, not the parser's — it reports what the file says.
+pub fn configFromJson(allocator: std.mem.Allocator, bytes: []const u8) Config {
+    var cfg = Config{};
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return cfg;
+    defer parsed.deinit();
+    if (parsed.value != .object) return cfg;
+    const root = parsed.value.object;
+
+    // Our own converter writes the geometry flat; mflux-shaped packs nest it.
+    applyFields(&cfg, root);
+    if (root.get("transformer_overrides")) |ov| {
+        if (ov == .object) applyFields(&cfg, ov.object);
+    }
+    return cfg;
+}
+
+fn applyFields(cfg: *Config, o: std.json.ObjectMap) void {
+    readU32(o, "vid_dim", &cfg.vid_dim);
+    readU32(o, "txt_in_dim", &cfg.txt_in_dim);
+    readU32(o, "heads", &cfg.heads);
+    readU32(o, "head_dim", &cfg.head_dim);
+    readU32(o, "num_layers", &cfg.num_layers);
+    readU32(o, "mm_layers", &cfg.mm_layers);
+    readU32(o, "expand_ratio", &cfg.expand_ratio);
+    readU32(o, "vid_in_channels", &cfg.vid_in_channels);
+    readU32(o, "vid_out_channels", &cfg.vid_out_channels);
+    readU32(o, "rope_dim", &cfg.rope_dim);
+    readBool(o, "rope_on_text", &cfg.rope_on_text);
+    readBool(o, "use_output_ada", &cfg.use_output_ada);
+    readBool(o, "last_layer_vid_only", &cfg.last_layer_vid_only);
+    if (o.get("mlp_type")) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, "normal")) cfg.mlp_type = .normal;
+        if (v == .string and std.mem.eql(u8, v.string, "swiglu")) cfg.mlp_type = .swiglu;
+    }
+    if (o.get("rope_freqs_for")) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, "pixel")) cfg.rope_freqs_for = .pixel;
+        if (v == .string and std.mem.eql(u8, v.string, "lang")) cfg.rope_freqs_for = .lang;
+    }
+    // `patch_size` is a 3-list, and the ONLY one of these the 3B config states
+    // as an array. A malformed entry leaves the default rather than a 0 patch.
+    if (o.get("patch_size")) |v| {
+        if (v == .array and v.array.items.len == 3) {
+            var dims: [3]u32 = .{ cfg.patch_t, cfg.patch_h, cfg.patch_w };
+            for (v.array.items, 0..) |it, i| {
+                if (it == .integer and it.integer > 0) dims[i] = @intCast(it.integer);
+            }
+            cfg.patch_t = dims[0];
+            cfg.patch_h = dims[1];
+            cfg.patch_w = dims[2];
+        }
+    }
+}
+
+fn readU32(o: std.json.ObjectMap, key: []const u8, out: *u32) void {
+    const v = o.get(key) orelse return;
+    if (v == .integer and v.integer > 0) out.* = @intCast(v.integer);
+}
+
+fn readBool(o: std.json.ObjectMap, key: []const u8, out: *bool) void {
+    const v = o.get(key) orelse return;
+    if (v == .bool) out.* = v.bool;
 }
 
 /// One expected tensor.
@@ -187,9 +288,16 @@ pub fn manifest(allocator: std.mem.Allocator, cfg: Config) ![]Tensor {
             try pushFmt(&out, allocator, "blocks.{d}.attn.norm_q.{s}.weight", .{ i, k }, .{ cfg.head_dim, 0 }, 1);
             try pushFmt(&out, allocator, "blocks.{d}.attn.norm_k.{s}.weight", .{ i, k }, .{ cfg.head_dim, 0 }, 1);
             // SwiGLU, all bias-free. proj_in_gate is the SiLU'd branch.
-            try pushFmt(&out, allocator, "blocks.{d}.mlp.{s}.proj_in_gate.weight", .{ i, k }, .{ cfg.mlpHidden(), d }, 2);
+            // The plain arm has no gate and DOES carry biases, so this is a
+            // different tensor set, not just a different forward.
+            if (cfg.mlp_type == .swiglu)
+                try pushFmt(&out, allocator, "blocks.{d}.mlp.{s}.proj_in_gate.weight", .{ i, k }, .{ cfg.mlpHidden(), d }, 2);
             try pushFmt(&out, allocator, "blocks.{d}.mlp.{s}.proj_in.weight", .{ i, k }, .{ cfg.mlpHidden(), d }, 2);
             try pushFmt(&out, allocator, "blocks.{d}.mlp.{s}.proj_out.weight", .{ i, k }, .{ d, cfg.mlpHidden() }, 2);
+            if (cfg.mlp_type == .normal) {
+                try pushFmt(&out, allocator, "blocks.{d}.mlp.{s}.proj_in.bias", .{ i, k }, .{ cfg.mlpHidden(), 0 }, 1);
+                try pushFmt(&out, allocator, "blocks.{d}.mlp.{s}.proj_out.bias", .{ i, k }, .{ d, 0 }, 1);
+            }
             // AdaSingle: layers ["attn","mlp"] x modes ["in","out"].
             for ([_][]const u8{ "attn", "mlp" }) |layer_name| {
                 for ([_][]const u8{ "shift", "scale", "gate" }) |p| {
@@ -200,11 +308,16 @@ pub fn manifest(allocator: std.mem.Allocator, cfg: Config) ![]Tensor {
     }
 
     // ---- head ----
-    // vid_out_norm IS affine (elementwise_affine=True at the call site).
-    try push(&out, allocator, "vid_out_norm.weight", .{ d, 0 }, 1);
-    // vid_out_ada uses modes=["in"] only -> shift+scale, NO gate.
-    try push(&out, allocator, "vid_out_ada.out_shift", .{ d, 0 }, 1);
-    try push(&out, allocator, "vid_out_ada.out_scale", .{ d, 0 }, 1);
+    // The output norm and its modulation are ONE switch, not two: the
+    // reference builds `vid_out_norm`, `out_shift` and `out_scale` inside a
+    // single `if use_output_ada`, and the 7B ships none of the three.
+    if (cfg.use_output_ada) {
+        // vid_out_norm IS affine (elementwise_affine=True at the call site).
+        try push(&out, allocator, "vid_out_norm.weight", .{ d, 0 }, 1);
+        // vid_out_ada uses modes=["in"] only -> shift+scale, NO gate.
+        try push(&out, allocator, "vid_out_ada.out_shift", .{ d, 0 }, 1);
+        try push(&out, allocator, "vid_out_ada.out_scale", .{ d, 0 }, 1);
+    }
     try push(&out, allocator, "vid_out.proj.weight", .{ cfg.patchOutDim(), d }, 2);
     try push(&out, allocator, "vid_out.proj.bias", .{ cfg.patchOutDim(), 0 }, 1);
 
@@ -238,6 +351,130 @@ fn hasName(m: []const Tensor, name: []const u8) bool {
 fn shapeOf(m: []const Tensor, name: []const u8) ?[2]u32 {
     for (m) |t| if (std.mem.eql(u8, t.name, name)) return t.shape;
     return null;
+}
+
+test "seedvr2 7b: the config's transformer_overrides decide the geometry" {
+    const a = testing.allocator;
+    // benc0/SeedVR2-7B-mlx-int8's config.json, verbatim.
+    const seven_b =
+        \\{"model_type":"seedvr2","variant":"seedvr2-7b","transformer_overrides":{
+        \\"vid_dim":3072,"heads":24,"num_layers":36,"mm_layers":36,"rope_dim":64,
+        \\"rope_on_text":false,"rope_freqs_for":"pixel","mlp_type":"normal",
+        \\"use_output_ada":false,"last_layer_vid_only":false},
+        \\"pos_emb_shape":[58,5120],"dtype":"float16","quantization":{"bits":8,"group_size":64}}
+    ;
+    const cfg = configFromJson(a, seven_b);
+    try testing.expectEqual(@as(u32, 3072), cfg.vid_dim);
+    try testing.expectEqual(@as(u32, 24), cfg.heads);
+    try testing.expectEqual(@as(u32, 128), cfg.head_dim); // 3072/24, not stated
+    try testing.expectEqual(@as(u32, 36), cfg.num_layers);
+    try testing.expectEqual(@as(u32, 36), cfg.mm_layers); // every layer split
+    try testing.expectEqual(@as(u32, 64), cfg.rope_dim);
+    try testing.expectEqual(false, cfg.rope_on_text);
+    try testing.expectEqual(RopeFreqs.pixel, cfg.rope_freqs_for);
+    try testing.expectEqual(MlpType.normal, cfg.mlp_type);
+    try testing.expectEqual(false, cfg.use_output_ada);
+    try testing.expectEqual(false, cfg.last_layer_vid_only);
+
+    // The derived numbers the checkpoint can be checked against:
+    // rope_dim 64 -> axis 21 -> 10 stored freqs (the 3B's are 21), and a
+    // PLAIN mlp is dim*4 = 12288 where SwiGLU on the same dim gives 8192.
+    try testing.expectEqual(@as(u32, 10), ropeFreqCount(cfg));
+    try testing.expectEqual(@as(u32, 12288), cfg.mlpHidden());
+    var swiglu = cfg;
+    swiglu.mlp_type = .swiglu;
+    try testing.expectEqual(@as(u32, 8192), swiglu.mlpHidden());
+
+    // mm_layers == num_layers means NO shared layer exists at all.
+    try testing.expectEqual(Branch.split, branchForLayer(cfg, 35));
+    // ...and with last_layer_vid_only off, the last layer keeps its txt MLP.
+    try testing.expect(!txtSkipsMlp(cfg, 35));
+}
+
+test "seedvr2 3b: a config with no overrides is the 3B, byte for byte" {
+    const a = testing.allocator;
+    // mlx-community/SeedVR2-3B-mlx declares an EMPTY overrides block; if that
+    // were read as "unknown geometry" both 3B packs would stop loading.
+    const three_b =
+        \\{"model_type":"seedvr2","variant":"seedvr2-3b","transformer_overrides":{},
+        \\"pos_emb_shape":[58,5120],"dtype":"float16"}
+    ;
+    try testing.expectEqual(Config{}, configFromJson(a, three_b));
+    // Junk, an absent file, or a config that is not even an object must all
+    // fall back rather than half-apply.
+    try testing.expectEqual(Config{}, configFromJson(a, "not json at all"));
+    try testing.expectEqual(Config{}, configFromJson(a, "[1,2,3]"));
+    try testing.expectEqual(Config{}, configFromJson(a, "{}"));
+
+    // Our own converter writes the geometry FLAT, with no overrides block.
+    const ours =
+        \\{"model_type":"seedvr2","vid_dim":2560,"num_layers":32,"mm_layers":10,
+        \\"heads":20,"head_dim":128,"patch_size":[1,2,2],"rope_dim":128}
+    ;
+    try testing.expectEqual(Config{}, configFromJson(a, ours));
+
+    // An unmodelled key is ignored, not fatal: this block is a constructor
+    // signature and will grow.
+    const future =
+        \\{"transformer_overrides":{"vid_dim":3072,"some_new_switch":true}}
+    ;
+    try testing.expectEqual(@as(u32, 3072), configFromJson(a, future).vid_dim);
+}
+
+test "seedvr2 7b: the manifest names the tensor set the 7B pack actually ships" {
+    const a = testing.allocator;
+    var cfg = Config{
+        .vid_dim = 3072,
+        .heads = 24,
+        .num_layers = 36,
+        .mm_layers = 36,
+        .rope_dim = 64,
+        .mlp_type = .normal,
+        .use_output_ada = false,
+        .last_layer_vid_only = false,
+    };
+    cfg.rope_on_text = false;
+    cfg.rope_freqs_for = .pixel;
+
+    const m = try manifest(a, cfg);
+    defer freeManifest(a, m);
+
+    // Plain MLP: two linears WITH biases, and no gate anywhere. Checked on the
+    // last layer too, since that is where the 3B's txt stream has no MLP at
+    // all and an unguarded `last_layer_vid_only` would drop these.
+    for ([_][]const u8{ "vid", "txt" }) |k| {
+        for ([_]u32{ 0, 35 }) |i| {
+            const inw = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in.weight", .{ i, k });
+            defer a.free(inw);
+            const inb = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in.bias", .{ i, k });
+            defer a.free(inb);
+            const outb = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_out.bias", .{ i, k });
+            defer a.free(outb);
+            const gate = try std.fmt.allocPrint(a, "blocks.{d}.mlp.{s}.proj_in_gate.weight", .{ i, k });
+            defer a.free(gate);
+            try testing.expect(hasName(m, inw));
+            try testing.expect(hasName(m, inb));
+            try testing.expect(hasName(m, outb));
+            try testing.expect(!hasName(m, gate));
+        }
+    }
+
+    // mm_layers == num_layers: every layer is split, so no `.all` name exists.
+    for (m) |t| try testing.expect(std.mem.indexOf(u8, t.name, ".all.") == null);
+
+    // The output head the 7B does not ship.
+    try testing.expect(!hasName(m, "vid_out_norm.weight"));
+    try testing.expect(!hasName(m, "vid_out_ada.out_shift"));
+    try testing.expect(!hasName(m, "vid_out_ada.out_scale"));
+    // ...but the projection itself is still there.
+    try testing.expect(hasName(m, "vid_out.proj.weight"));
+
+    // The 3B keeps every one of those, so the switches cannot be no-ops.
+    const three = try manifest(a, Config{});
+    defer freeManifest(a, three);
+    try testing.expect(hasName(three, "vid_out_norm.weight"));
+    try testing.expect(hasName(three, "blocks.0.mlp.vid.proj_in_gate.weight"));
+    try testing.expect(!hasName(three, "blocks.0.mlp.vid.proj_in.bias"));
 }
 
 test "the shared_weights boundary sits at layer 10 exactly" {
