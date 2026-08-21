@@ -30,12 +30,25 @@ struct ToolModelRoots: Equatable {
         self.osaurus = osaurus
     }
 
-    /// Scan order, absent tools dropped. LM Studio stays first because it was
-    /// there before the others and a reordering would change which copy of a
-    /// duplicated repo id wins the first-wins merge.
-    var ordered: [String] {
-        [lmStudio, mtplx, osaurus].compactMap { $0 }
+    /// Scan order paired with the `LocalModelSource` each root's models are
+    /// listed under, absent tools dropped. The pairing lives here so a root
+    /// and its heading cannot drift apart: the picker enumerates from this
+    /// list, and a path listed under a foreign tool's heading sends you to the
+    /// wrong app to manage the file.
+    ///
+    /// LM Studio stays first because it was there before the others and a
+    /// reordering would change which copy of a duplicated repo id wins the
+    /// first-wins merge.
+    var orderedWithSource: [(path: String, source: LocalModelSource)] {
+        var out: [(path: String, source: LocalModelSource)] = []
+        if let p = lmStudio { out.append((p, .lmStudio)) }
+        if let p = mtplx { out.append((p, .mtplx)) }
+        if let p = osaurus { out.append((p, .osaurus)) }
+        return out
     }
+
+    /// Just the paths, for `--model-dir` flags, which have no notion of source.
+    var ordered: [String] { orderedWithSource.map(\.path) }
 
     /// Resolve every tool folder against `home`. Each one is existence-gated
     /// by `ModelRoots.existingDirectory`, so an uninstalled tool contributes

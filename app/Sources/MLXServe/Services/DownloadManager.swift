@@ -1717,9 +1717,10 @@ class DownloadManager: ObservableObject {
         // enumeration exists only because the picker walks folders separately
         // from `ModelRoots.scanRoots`, and a root added to one and not the
         // other is served but unselectable. Read-only: another tool's tree.
-        for root in ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).ordered
-        where root != lmStudioRoot {
-            out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "tool:", source: .toolFolder))
+        for tool in ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
+        where tool.path != lmStudioRoot {
+            out.append(contentsOf: Self.dualLayoutModels(
+                atRoot: tool.path, idPrefix: "tool:", source: tool.source))
         }
 
         // User-configured custom root — same dual-layout scan as the owned

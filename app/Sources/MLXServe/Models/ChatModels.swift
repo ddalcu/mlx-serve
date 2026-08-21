@@ -640,10 +640,16 @@ enum LocalModelSource: String, Codable, Hashable, CaseIterable {
     /// cache's blob/ref/symlink structure is managed by `huggingface-cli`.
     case huggingFace
     /// The canonical model folder of ANOTHER local-inference tool, found by
-    /// `ToolModelRoots.detected()` rather than configured by anyone — MTPLX
-    /// (`~/.mtplx/models`) and Osaurus (`~/MLXModels`) today. LM Studio
-    /// predates this case and keeps its own for its settings-driven path.
-    case toolFolder
+    /// `ToolModelRoots.detected()` rather than configured by anyone.
+    ///
+    /// One case per tool, deliberately. A single shared "other tools" bucket
+    /// tells you a folder exists but not whose it is, and the whole point of
+    /// the read-only badge is to send you to the app that owns the file — a
+    /// heading that cannot name that app cannot do it. LM Studio and the
+    /// Hugging Face cache were already per-source for the same reason; adding
+    /// a tool is one case here plus one path in `ToolModelRoots`.
+    case mtplx
+    case osaurus
     case custom
 
     /// Heading for this source's group in a model picker. `allCases` order is
@@ -657,7 +663,8 @@ enum LocalModelSource: String, Codable, Hashable, CaseIterable {
         case .mlxServe: "MLX-Serve Models"
         case .lmStudio: "LM Studio Models"
         case .huggingFace: "Hugging Face Cache"
-        case .toolFolder: "Other Discovered Models"
+        case .mtplx: "MTPLX Models"
+        case .osaurus: "Osaurus Models"
         case .custom: "Custom Folder"
         }
     }
@@ -766,7 +773,8 @@ struct LocalModel: Identifiable, Hashable {
         case .mlxServe: return nil
         case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX Core loads it read-only."
         case .huggingFace: return "In the Hugging Face cache \u{2014} manage with huggingface-cli. MLX Core loads it read-only."
-        case .toolFolder: return "In another local AI app\u{2019}s models folder \u{2014} manage it there. MLX Core loads it read-only."
+        case .mtplx: return "In MTPLX\u{2019}s models folder \u{2014} manage it in MTPLX. MLX Core loads it read-only."
+        case .osaurus: return "In Osaurus\u{2019}s models folder \u{2014} manage it in Osaurus. MLX Core loads it read-only."
         case .custom: return "In a custom models folder you added \u{2014} MLX Core loads it read-only and won\u{2019}t delete it."
         }
     }

@@ -172,14 +172,48 @@ final class ToolFolderListingTests: XCTestCase {
 
         let flat = DownloadManager.dualLayoutModels(
             atRoot: (scratch as NSString).appendingPathComponent("mtplx"),
-            idPrefix: "tool:", source: .toolFolder)
+            idPrefix: "tool:", source: .mtplx)
         let nested = DownloadManager.dualLayoutModels(
             atRoot: (scratch as NSString).appendingPathComponent("osaurus"),
-            idPrefix: "tool:", source: .toolFolder)
+            idPrefix: "tool:", source: .osaurus)
 
         XCTAssertEqual(flat.map(\.name), ["Youssofal--Some-Model"])
         XCTAssertEqual(nested.map(\.name), ["SomeOrg/Some-Repo"])
-        XCTAssertTrue((flat + nested).allSatisfy { $0.source == .toolFolder })
+        XCTAssertTrue(flat.allSatisfy { $0.source == .mtplx })
+        XCTAssertTrue(nested.allSatisfy { $0.source == .osaurus })
+    }
+
+    /// A model listed under the wrong tool's heading sends you to the wrong app
+    /// to manage it. Each detected root carries the source it will be listed
+    /// under, so the enumeration cannot pair a path with a foreign heading.
+    func testEachToolRootCarriesItsOwnSource() {
+        let home: String = scratch
+        for rel in [".mtplx/models", "MLXModels", ".lmstudio/models"] {
+            try? FileManager.default.createDirectory(
+                atPath: (home as NSString).appendingPathComponent(rel),
+                withIntermediateDirectories: true)
+        }
+        let roots = ToolModelRoots.detected(home: home)
+        let pairs = roots.orderedWithSource
+
+        XCTAssertEqual(pairs.map(\.source), [.lmStudio, .mtplx, .osaurus])
+        XCTAssertEqual(pairs.map(\.path), roots.ordered,
+                       "orderedWithSource and ordered must walk the same roots in the same order")
+        // Suffix, not prefix: the temp dir is reached through a symlink, so a
+        // standardized root does not literally begin with `home`.
+        XCTAssertEqual(pairs.map { ($0.path as NSString).lastPathComponent },
+                       ["models", "models", "MLXModels"])
+    }
+
+    /// Two tools sharing a heading is the bug this split fixes: "Other
+    /// Discovered Models" told you a folder existed but not whose it was.
+    func testEveryToolSourceHasItsOwnHeading() {
+        let titles = LocalModelSource.allCases.map(\.sectionTitle)
+        XCTAssertEqual(Set(titles).count, titles.count, "two sources share a heading: \(titles)")
+        XCTAssertEqual(LocalModelSource.mtplx.sectionTitle, "MTPLX Models")
+        XCTAssertEqual(LocalModelSource.osaurus.sectionTitle, "Osaurus Models")
+        XCTAssertFalse(titles.contains("Other Discovered Models"),
+                       "the generic bucket is gone — every folder names its owner")
     }
 
     /// Another tool's tree is never ours to delete, and the badge that replaces
@@ -188,9 +222,11 @@ final class ToolFolderListingTests: XCTestCase {
         _ = writeModel("mtplx/Org--M")
         let model = try XCTUnwrap(DownloadManager.dualLayoutModels(
             atRoot: (scratch as NSString).appendingPathComponent("mtplx"),
-            idPrefix: "tool:", source: .toolFolder).first)
+            idPrefix: "tool:", source: .mtplx).first)
         XCTAssertFalse(model.isDeletable)
         XCTAssertNotNil(model.externalReadOnlyReason)
+        XCTAssertTrue(try XCTUnwrap(model.externalReadOnlyReason).contains("MTPLX"),
+                      "the reason must name the app that owns the folder")
     }
 
     /// A new source that no picker renders is a model you cannot select. Every
@@ -202,17 +238,17 @@ final class ToolFolderListingTests: XCTestCase {
                           "\(source) has no group in the model browser")
             XCTAssertFalse(source.sectionTitle.isEmpty)
         }
-        XCTAssertTrue(ModelBrowserUse.sourceOrder.contains(.toolFolder))
+        XCTAssertTrue(ModelBrowserUse.sourceOrder.contains(.mtplx))
+        XCTAssertTrue(ModelBrowserUse.sourceOrder.contains(.osaurus))
     }
 
-    /// LM Studio's group was titled "Other Discovered Models" back when it was
-    /// the only non-owned folder. Now that it isn't, the generic title belongs
-    /// to the generic bucket and LM Studio gets named.
-    func testTheGenericTitleBelongsToTheGenericBucket() {
-        XCTAssertEqual(LocalModelSource.toolFolder.sectionTitle, "Other Discovered Models")
-        XCTAssertEqual(LocalModelSource.lmStudio.sectionTitle, "LM Studio Models")
-        XCTAssertEqual(ModelBrowserUse.groupTitle(.toolFolder), LocalModelSource.toolFolder.sectionTitle)
-        XCTAssertEqual(ModelBrowserUse.groupTitle(.lmStudio), LocalModelSource.lmStudio.sectionTitle)
+    /// `sectionTitle` and `ModelBrowserUse.groupTitle` are separate switches
+    /// over the same enum and have drifted before.
+    func testTheTwoTitleTablesAgree() {
+        for source in LocalModelSource.allCases where source != .mlxServe {
+            XCTAssertEqual(ModelBrowserUse.groupTitle(source), source.sectionTitle,
+                           "title tables disagree for .\(source.rawValue)")
+        }
     }
 
     /// The tray picker hardcodes its section headings rather than reading

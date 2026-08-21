@@ -195,14 +195,15 @@ enum ModelBrowserUse {
     /// sections (`StatusMenuView`), which is the point — the old "Downloaded"
     /// tab filtered to `.mlxServe` only and so never matched what you could
     /// actually select.
-    static let sourceOrder: [LocalModelSource] = [.mlxServe, .lmStudio, .huggingFace, .toolFolder, .custom]
+    static let sourceOrder: [LocalModelSource] = [.mlxServe, .lmStudio, .huggingFace, .mtplx, .osaurus, .custom]
 
     static func groupTitle(_ source: LocalModelSource) -> String {
         switch source {
         case .mlxServe:    return "Downloaded by MLX Core"
         case .lmStudio:    return "LM Studio Models"
         case .huggingFace: return "Hugging Face Cache"
-        case .toolFolder:  return "Other Discovered Models"
+        case .mtplx:       return LocalModelSource.mtplx.sectionTitle
+        case .osaurus:     return LocalModelSource.osaurus.sectionTitle
         case .custom:      return "Custom Folder"
         }
     }
