@@ -27,12 +27,15 @@ struct ComposerTip: Equatable {
     // next to New Chat now (a session's agent is fixed once it exists), and a
     // card for a control that no longer renders is a sentence nobody can reach.
 
-    static func attachments(audioSupported: Bool) -> ComposerTip {
-        ComposerTip(
-            title: "Attach",
-            body: audioSupported
-                ? "Image, PDF or audio — or a folder to ask questions about."
-                : "Image or PDF — or a folder to ask questions about.")
+    static func attachments(audioSupported: Bool, videoSupported: Bool = false) -> ComposerTip {
+        let body: String
+        switch (videoSupported, audioSupported) {
+        case (true, true): body = "Image, video, PDF or audio — or a folder to ask questions about."
+        case (true, false): body = "Image, video or PDF — or a folder to ask questions about."
+        case (false, true): body = "Image, PDF or audio — or a folder to ask questions about."
+        case (false, false): body = "Image or PDF — or a folder to ask questions about."
+        }
+        return ComposerTip(title: "Attach", body: body)
     }
 
     static func thinking(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {

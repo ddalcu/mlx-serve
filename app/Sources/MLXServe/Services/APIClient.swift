@@ -149,6 +149,11 @@ class APIClient {
         // server runs with `--no-vision` (the encoder isn't loaded), so this is
         // the live "can this model see images right now?" signal.
         let supportsVision = caps.contains("vision") || mods.contains("image")
+        // Video rides input_modalities only (no separate "video" capability —
+        // that string is already claimed by media-GENERATION models); it can
+        // never be true without supportsVision, since video piggybacks the
+        // same vision tower server-side.
+        let supportsVideo = supportsVision && mods.contains("video")
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
@@ -167,6 +172,7 @@ class APIClient {
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
             supportsVision: supportsVision,
+            supportsVideo: supportsVideo,
             supportsEmbeddings: supportsEmbeddings,
             capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
@@ -345,6 +351,16 @@ class APIClient {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
         return MemoryInfo.parse(mem)
+    }
+
+    /// Live throughput feed. 503s when the server was launched without
+    /// `--metrics`, which reads as nil (the tray hides the rows).
+    func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
+        let url = URL(string: "http://127.0.0.1:\(port)/metrics.json")!
+        let (data, response) = try await session.data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)
     }
 
     // MARK: - Agent Tool Calling

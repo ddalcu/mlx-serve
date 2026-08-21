@@ -28,6 +28,7 @@ const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -1278,7 +1279,14 @@ pub fn serve(
     // `runSingleDecodeTick` — sequential through the inference thread,
     // safe).
     if (max_concurrent > 1) {
-        if (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()) {
+        // A dense GatedDeltaNet trunk (qwen3_5 family) has its OWN batched
+        // kernel since `forwardMoeBatchedDecode`, so it is no longer part of
+        // the hybrid clamp — ask the shared predicate rather than re-deriving
+        // the arch list here, or this site silently disables batching that
+        // the scheduler is willing to do.
+        if (!config.supportsBatchedGdnDecode() and
+            (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()))
+        {
             log.info("Concurrency: requested {d} but model is hybrid/MoE/encoder; falling back to 1\n", .{max_concurrent});
             max_concurrent = 1;
         } else {
@@ -2658,13 +2666,20 @@ pub fn applyMlxCacheLimit() void {
 /// (total − wired − compressed − internal-anon) — tightens it. See
 /// `physicalMemoryCeiling`.
 fn currentGpuMemoryCeiling(active_mem: u64) u64 {
+    // The ANE's int8 copies are wired host buffers: invisible to MLX's own
+    // accounting, but genuinely gone from free RAM. Left to leak in through
+    // the noisy free-RAM term they made auto-context swing across boots of the
+    // SAME build (measured 5,120 / 10,240 / 55,296 tokens, 27B iQ on a 32 GB
+    // M1 Pro). Add them back and subtract the known figure once. Zero — and so
+    // exactly the old expression — whenever no offload is resident.
+    const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
     return physicalMemoryCeiling(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        metrics.getAvailableMemBytes(),
-    );
+        metrics.getAvailableMemBytes() +| ane_bytes,
+    ) -| ane_bytes;
 }
 
 /// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
@@ -2767,6 +2782,32 @@ pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u6
     );
 }
 
+/// The ANE admission gate's headroom for THIS model at THIS chunk: the KV
+/// cache for a context worth serving, the hot prefix cache, the prefill
+/// chunk's transient envelope, and the non-model baseline. Every term is one
+/// the auto-context sizer also reserves — the gate must not admit an offload
+/// into memory the sizer has already spoken for.
+///
+/// Both model terms already exist as estimators — this is the "a gate that
+/// runs BEFORE the estimator that knows better is the estimator" rule applied
+/// to `ane.gateAllows`, which carried a flat 12 GB instead. That constant was
+/// calibrated for the 27B at chunk 8192 and was wrong in BOTH directions once
+/// `resolvePrefillChunk` sized the chunk down: measured on that geometry, the
+/// envelope is 12.66 GB at chunk 8192 but 2.13 GB at chunk 1024.
+///
+/// The KV term is a RESERVE, not a prediction: see `ane.MIN_CONTEXT_TOKENS`.
+pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
+    const kv_bits: u64 = defaultKvBits();
+    const ctx: u64 = if (config.max_position_embeddings > 0)
+        @min(ane_mod.MIN_CONTEXT_TOKENS, config.max_position_embeddings)
+    else
+        ane_mod.MIN_CONTEXT_TOKENS;
+    return ane_mod.GATE_BASELINE_BYTES +|
+        (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
+        prefix_cache_mem_bytes +|
+        prefillTransientReserve(config, kv_bits, chunk);
+}
+
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
@@ -2816,7 +2857,7 @@ pub fn resolvePrefillChunk(
 /// transient reserve, and `checkAttentionMemory` and
 /// `generate.effectivePrefillChunk` then read the same frozen value, so the
 /// bill and the forward cannot drift.
-fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
+pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
@@ -3407,6 +3448,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
+        if (has_vision and config.video_token_id != 0) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -3564,7 +3606,9 @@ fn renderModelEntry(
     };
     defer allocator.free(caps_part);
 
-    const mods_part: []const u8 = if (sm.found and sm.has_vision)
+    const mods_part: []const u8 = if (sm.found and sm.has_vision and sm.has_video)
+        ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
+    else if (sm.found and sm.has_vision)
         ",\"input_modalities\":[\"text\",\"image\"]"
     else if ((sm.found and sm.has_chat) or is_gguf_stub)
         ",\"input_modalities\":[\"text\"]"
@@ -4056,6 +4100,7 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
+    ane_json: []const u8,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
@@ -4067,7 +4112,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -4077,7 +4122,35 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
+        ane_json,
     });
+}
+
+/// The /props "ane" object (A8): mode, coverage, geometry and the int8
+/// bill of the resident ANE prefill engine, so "what is the Neural Engine
+/// holding" is answerable without log-grepping. Pure — the handler feeds
+/// it the engine's fields; returns a leading-comma fragment spliced before
+/// the props root close (empty when there is no engine).
+/// One ANE unit's dispatch evidence. Under dual this is the ONLY in-process
+/// proof that both dies were addressed — a silently ignored affinity hint
+/// looks identical from here, so the counters pair with the out-of-process
+/// `macpow --dump | grep ANE0_` check, never replace it.
+const AneUnitStat = struct { instance: i64, evals: u64, eval_failures: u64 };
+
+fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, units: []const AneUnitStat) ![]u8 {
+    var evals: u64 = 0;
+    var eval_failures: u64 = 0;
+    for (units) |u| {
+        evals += u.evals;
+        eval_failures += u.eval_failures;
+    }
+    var rows_buf: [512]u8 = undefined;
+    var used: usize = 0;
+    for (units, 0..) |u, i| {
+        const row = try std.fmt.bufPrint(rows_buf[used..], "{s}{{\"instance\":{d},\"evals\":{d},\"eval_failures\":{d}}}", .{ if (i == 0) "" else ",", u.instance, u.evals, u.eval_failures });
+        used += row.len;
+    }
+    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"units\":{d},\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d},\"unit_evals\":[{s}]}}", .{ mode_name, units.len, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures, rows_buf[0..used] });
 }
 
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
@@ -4129,7 +4202,24 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem);
+    // ANE prefill engine state (A8) — absent when the offload is off.
+    const ane_json = blk: {
+        if (lm.transformer) |x| {
+            if (x.ane_prefill) |eng| {
+                var stats: [ane_mod.MAX_UNITS]AneUnitStat = undefined;
+                for (eng.units, 0..) |*u, i| stats[i] = .{
+                    .instance = u.instance,
+                    .evals = u.evals_ok.load(.monotonic),
+                    .eval_failures = u.evals_failed.load(.monotonic),
+                };
+                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
+            }
+        }
+        break :blk try allocator.dupe(u8, "");
+    };
+    defer allocator.free(ane_json);
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -4865,11 +4955,13 @@ fn handleChatCompletions(
         // Content can be null for assistant messages with tool_calls
         const content_val = obj.get("content");
         var msg_images: ?[]const chat_mod.ImageData = null;
+        var msg_videos: ?[]const chat_mod.VideoData = null;
         var msg_audio: ?[]const chat_mod.AudioData = null;
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
                 var image_list = std.ArrayList(chat_mod.ImageData).empty;
+                var video_list = std.ArrayList(chat_mod.VideoData).empty;
                 var audio_list = std.ArrayList(chat_mod.AudioData).empty;
                 for (arr.items) |part| {
                     if (part != .object) continue;
@@ -4882,6 +4974,21 @@ fn handleChatCompletions(
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
                         appendImageUrlContent(allocator, &image_list, url_val.string, visionPreprocFromConfig(config));
+                    } else if (std.mem.eql(u8, ptype.string, "video_url")) {
+                        // A video is, on the wire, an ordered array of already-
+                        // decoded frame images — no video codec exists anywhere
+                        // in this codebase, so frame extraction is the CLIENT's
+                        // job. Each frame string is an ordinary image data URL.
+                        const vid_obj = part.object.get("video_url") orelse continue;
+                        if (vid_obj != .object) continue;
+                        const frames_val = vid_obj.object.get("frames") orelse continue;
+                        if (frames_val != .array) continue;
+                        var frame_urls = std.ArrayList([]const u8).empty;
+                        defer frame_urls.deinit(allocator);
+                        for (frames_val.array.items) |f| {
+                            if (f == .string) frame_urls.append(allocator, f.string) catch continue;
+                        }
+                        appendVideoUrlContent(allocator, &video_list, frame_urls.items, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
@@ -4902,6 +5009,11 @@ fn handleChatCompletions(
                     msg_images = image_list.toOwnedSlice(allocator) catch null;
                 } else {
                     image_list.deinit(allocator);
+                }
+                if (video_list.items.len > 0) {
+                    msg_videos = video_list.toOwnedSlice(allocator) catch null;
+                } else {
+                    video_list.deinit(allocator);
                 }
                 if (audio_list.items.len > 0) {
                     msg_audio = audio_list.toOwnedSlice(allocator) catch null;
@@ -4957,8 +5069,8 @@ fn handleChatCompletions(
         else
             null;
 
-        // Skip messages with no content, no tool_calls, and no images/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        // Skip messages with no content, no tool_calls, and no images/videos/audio
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -4966,6 +5078,7 @@ fn handleChatCompletions(
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
             .images = msg_images,
+            .videos = msg_videos,
             .audio = msg_audio,
             .reasoning_content = msg_reasoning,
         });
@@ -5331,13 +5444,14 @@ fn handleChatCompletions(
     }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
+        var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -5391,7 +5505,13 @@ fn handleChatCompletions(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -5653,7 +5773,13 @@ fn handleCompletions(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -7946,6 +8072,10 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     _ = mlx.mlx_get_cache_memory(&mlx_cache);
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
+    // ANE prefill offload totals — published by the engines themselves
+    // (ane.publishLive / deinit), so this is a lock-free read.
+    ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
+    ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -8440,6 +8570,26 @@ test "every continuation surface consults continuationRejectReason before render
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, src, i, binding)) |at| : (i = at + binding.len) count += 1;
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "every input_modalities gate that advertises image beside a video-capable model also advertises video" {
+    // Video piggybacks the SAME "does this model take image input?" signal —
+    // Qwen3-VL-family checkpoints declare `video_token_id` alongside
+    // `vision_config`/`vision_encoder` — so a future edit to either the READY
+    // (live config) or STUB (unloaded, config.json-only) input_modalities
+    // builder that touches the image gate but forgets video would silently
+    // under-report every video-capable model to the app forever (the attach
+    // menu's video option reads exactly this field). Two independent checks:
+    // the two sites read DIFFERENT underlying signals (config.video_token_id
+    // vs StubMeta.has_video) and must each carry their own gate.
+    const src = @embedFile("server.zig");
+
+    const ready_anchor = "if (has_vision) try mods.appendSlice(allocator, ";
+    const ready_at = std.mem.indexOf(u8, src, ready_anchor) orelse return error.ReadyImageGateMissing;
+    const ready_window = src[ready_at .. ready_at + 260];
+    try std.testing.expect(std.mem.indexOf(u8, ready_window, "video_token_id") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "sm.found and sm.has_vision and sm.has_video") != null);
 }
 
 test "routeExists answers endpoint existence without consulting the model" {
@@ -9305,30 +9455,35 @@ fn processVisionImages(
     vision_enc: *VisionEncoder,
     msgs: []const chat_mod.Message,
     out_n_vision: *usize,
+    out_n_video: *usize,
     out_n_audio: *usize,
 ) !?mlx.mlx_array {
     out_n_vision.* = 0;
+    out_n_video.* = 0;
     out_n_audio.* = 0;
     // Only process media from the LAST user message. Previous turns' images /
-    // audio were already processed in their original request; re-processing
-    // wastes context and causes stale feature confusion.
+    // videos / audio were already processed in their original request;
+    // re-processing wastes context and causes stale feature confusion.
     var last_user_images: ?[]const chat_mod.ImageData = null;
+    var last_user_videos: ?[]const chat_mod.VideoData = null;
     var last_user_audio: ?[]const chat_mod.AudioData = null;
     var i = msgs.len;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, msgs[i].role, "user")) {
             last_user_images = msgs[i].images;
+            last_user_videos = msgs[i].videos;
             last_user_audio = msgs[i].audio;
             break;
         }
     }
 
     const images: []const chat_mod.ImageData = last_user_images orelse &.{};
+    const videos: []const chat_mod.VideoData = last_user_videos orelse &.{};
     const audio: []const chat_mod.AudioData = last_user_audio orelse &.{};
-    if (images.len == 0 and audio.len == 0) return null;
+    if (images.len == 0 and videos.len == 0 and audio.len == 0) return null;
 
-    log.info("Multimodal: processing {d} image(s), {d} audio clip(s)\n", .{ images.len, audio.len });
+    log.info("Multimodal: processing {d} image(s), {d} video(s), {d} audio clip(s)\n", .{ images.len, videos.len, audio.len });
 
     // Phase A4: route encoding to the scheduler's inference thread when
     // available. Conn thread only decodes pixels/PCM (CPU); the mlx ops
@@ -9347,6 +9502,17 @@ fn processVisionImages(
                 .grid_w = img.grid_w,
             });
         }
+        var vid_list = std.ArrayList(scheduler_mod.VisionVideoPixels).empty;
+        defer vid_list.deinit(allocator);
+        try vid_list.ensureTotalCapacity(allocator, videos.len);
+        for (videos) |vid| {
+            vid_list.appendAssumeCapacity(.{
+                .pixels = vid.pixels,
+                .grid_t = vid.grid_t,
+                .grid_h = vid.grid_h,
+                .grid_w = vid.grid_w,
+            });
+        }
         var aud_list = std.ArrayList([]const u8).empty;
         defer aud_list.deinit(allocator);
         try aud_list.ensureTotalCapacity(allocator, audio.len);
@@ -9354,6 +9520,7 @@ fn processVisionImages(
         var req = scheduler_mod.VisionEncodeRequest{
             .model = lm,
             .images = pix_list.items,
+            .videos = vid_list.items,
             .audio = aud_list.items,
             .allocator = allocator,
         };
@@ -9365,10 +9532,11 @@ fn processVisionImages(
             return err;
         };
         out_n_vision.* = req.n_vision_tokens;
+        out_n_video.* = req.n_video_tokens;
         out_n_audio.* = req.n_audio_tokens;
         const ve_shape = mlx.getShape(arr);
         if (ve_shape.len >= 3) {
-            log.info("  Multimodal: → [{d},{d},{d}] tokens ({d} vision + {d} audio)\n", .{ ve_shape[0], ve_shape[1], ve_shape[2], req.n_vision_tokens, req.n_audio_tokens });
+            log.info("  Multimodal: → [{d},{d},{d}] tokens ({d} vision + {d} video + {d} audio)\n", .{ ve_shape[0], ve_shape[1], ve_shape[2], req.n_vision_tokens, req.n_video_tokens, req.n_audio_tokens });
         }
         return arr;
     }
@@ -9401,6 +9569,18 @@ fn processVisionImages(
         }
         const es = mlx.getShape(emb);
         out_n_vision.* += @intCast(es[1]);
+        try emb_parts.append(allocator, emb);
+    }
+
+    for (videos) |vid| {
+        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+        const feat: usize = (vid.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = try vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
+        const es = mlx.getShape(emb);
+        out_n_video.* += @intCast(es[1]);
         try emb_parts.append(allocator, emb);
     }
 
@@ -9532,22 +9712,29 @@ pub const MropeData = struct {
 /// model isn't Qwen-vision or there are no images. Caller owns `pos`.
 fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs: []const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
     if (!config.qwen_vision) return .{};
-    // Collect the last user message's image grids (full patch grid per image).
-    var grids = std.ArrayList(mrope_mod.ImageGrid).empty;
-    defer grids.deinit(allocator);
+    // Collect the last user message's image AND video grids (full patch grid
+    // per block, in their own modality's document order — getRopeIndex
+    // interleaves the two lists by whichever marker occurs first in tokens).
+    var image_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
+    defer image_grids.deinit(allocator);
+    var video_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
+    defer video_grids.deinit(allocator);
     var i = msgs.len;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, msgs[i].role, "user")) {
             if (msgs[i].images) |imgs| for (imgs) |im| {
-                if (im.grid_h > 0) try grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+                if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+            };
+            if (msgs[i].videos) |vids| for (vids) |vd| {
+                try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
             };
             break;
         }
     }
-    if (grids.items.len == 0) return .{};
+    if (image_grids.items.len == 0 and video_grids.items.len == 0) return .{};
 
-    var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
+    var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, image_grids.items, video_grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
         log.warn("M-RoPE get_rope_index failed ({s}); falling back to scalar RoPE\n", .{@errorName(err)});
         return .{};
     };
@@ -9557,7 +9744,7 @@ fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs:
     @memcpy(flat[0..total], ri.pos[0]);
     @memcpy(flat[total .. 2 * total], ri.pos[1]);
     @memcpy(flat[2 * total .. 3 * total], ri.pos[2]);
-    log.info("  M-RoPE: {d} images, position ids over {d} tokens, decode delta {d}\n", .{ grids.items.len, total, ri.delta });
+    log.info("  M-RoPE: {d} images, {d} videos, position ids over {d} tokens, decode delta {d}\n", .{ image_grids.items.len, video_grids.items.len, total, ri.delta });
     return .{ .pos = flat, .total = total, .delta = ri.delta };
 }
 
@@ -9630,20 +9817,23 @@ fn insertMultimodalTokens(
     prompt_ids: []const u32,
     image_token_id: u32,
     n_image: usize,
+    video_token_id: u32,
+    n_video: usize,
     audio_token_id: u32,
     n_audio: usize,
     config: *const model_mod.ModelConfig,
     msgs: []const chat_mod.Message,
 ) ![]u32 {
     const want_image = image_token_id != 0 and n_image > 0;
+    const want_video = video_token_id != 0 and n_video > 0;
     const want_audio = audio_token_id != 0 and n_audio > 0;
-    if (!want_image and !want_audio) return try allocator.dupe(u32, prompt_ids);
+    if (!want_image and !want_video and !want_audio) return try allocator.dupe(u32, prompt_ids);
 
     const insert_pos = userTurnInsertPos(prompt_ids, config);
 
-    // Qwen3-VL wraps the image-pad run with <|vision_start|>/<|vision_end|>
-    // (get_rope_index keys on vision_start immediately followed by image tokens);
-    // Gemma uses BOI/EOI.
+    // Qwen3-VL wraps the image-pad run (and, identically, the video-pad run)
+    // with <|vision_start|>/<|vision_end|> (get_rope_index keys on vision_start
+    // immediately followed by an image OR video token); Gemma uses BOI/EOI.
     const boi = if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id;
     const eoi = if (config.qwen_vision) config.vision_end_token_id else config.eoi_token_id;
     const boa = config.boa_token_id;
@@ -9663,6 +9853,11 @@ fn insertMultimodalTokens(
             if (eoi > 0) try seg.append(allocator, eoi);
         }
     }
+    if (want_video) {
+        if (boi > 0) try seg.append(allocator, boi);
+        try seg.appendNTimes(allocator, video_token_id, n_video);
+        if (eoi > 0) try seg.append(allocator, eoi);
+    }
     if (want_audio) {
         if (boa > 0) try seg.append(allocator, boa);
         try seg.appendNTimes(allocator, audio_token_id, n_audio);
@@ -9675,7 +9870,7 @@ fn insertMultimodalTokens(
     @memcpy(result[insert_pos .. insert_pos + seg.items.len], seg.items);
     @memcpy(result[insert_pos + seg.items.len ..], prompt_ids[insert_pos..]);
 
-    log.info("  Inserted {d} image + {d} audio soft tokens at position {d} (prompt: {d} -> {d} tokens)\n", .{ n_image, n_audio, insert_pos, prompt_ids.len, new_len });
+    log.info("  Inserted {d} image + {d} video + {d} audio soft tokens at position {d} (prompt: {d} -> {d} tokens)\n", .{ n_image, n_video, n_audio, insert_pos, prompt_ids.len, new_len });
     return result;
 }
 
@@ -10142,6 +10337,108 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 
     log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW\n", .{ src_w, src_h, target, target });
     return .{ .pixels = out_buf, .width = target, .height = target };
+}
+
+/// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
+/// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
+/// this codebase, so frame extraction is the client's job — into ONE
+/// `chat_mod.VideoData`. All frames share ONE smart-resize target, computed
+/// from the FIRST frame and applied to every frame (a video's whole patch grid
+/// must be identical across frames), then grouped into `vp.tps`-sized temporal-
+/// patch groups — the last group pads by repeating its final frame, matching
+/// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
+fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
+    if (vp.mode != .qwen or frame_urls.len == 0) return null;
+    const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
+    if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
+
+    // Decode every frame to RGB8 first — frame 0's natural size decides the
+    // resize target every later frame must also resize to.
+    var decoded = std.ArrayList(DecodedRgb).empty;
+    defer {
+        for (decoded.items) |d| d.deinit(allocator);
+        decoded.deinit(allocator);
+    }
+    for (frame_urls) |url| {
+        const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
+        const b64 = url[sep + 8 ..];
+        const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+        const raw = allocator.alloc(u8, decoded_size) catch return null;
+        defer allocator.free(raw);
+        std.base64.standard.Decoder.decode(raw, b64) catch return null;
+        const rgb = decodeRgbOwned(allocator, raw) orelse return null;
+        decoded.append(allocator, rgb) catch {
+            rgb.deinit(allocator);
+            return null;
+        };
+    }
+
+    const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
+    const max_pixels = if (vp.max_pixels >= min_pixels) vp.max_pixels else @max(qwen_vision.MAX_PIXELS, min_pixels);
+    const first = decoded.items[0];
+    const rs = qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
+    const rh = rs.h;
+    const rw = rs.w;
+    const C: u32 = 3;
+    const gh = rh / vp.patch;
+    const gw = rw / vp.patch;
+    const n_per_group: usize = @as(usize, gh) * gw;
+    const feat: usize = @as(usize, C) * vp.tps * vp.patch * vp.patch;
+
+    // Resize every frame to the shared (rh, rw) target.
+    var frames_chw = std.ArrayList([]f32).empty;
+    defer {
+        for (frames_chw.items) |f| allocator.free(f);
+        frames_chw.deinit(allocator);
+    }
+    for (decoded.items) |d| {
+        const source_len: usize = @as(usize, d.h) * d.w * C;
+        const chw = allocator.alloc(f32, @as(usize, C) * rh * rw) catch return null;
+        qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp)) catch {
+            allocator.free(chw);
+            return null;
+        };
+        frames_chw.append(allocator, chw) catch {
+            allocator.free(chw);
+            return null;
+        };
+    }
+
+    // Group into tps-sized temporal patches, padding the last group by
+    // repeating its final frame.
+    const grid_t: usize = (frames_chw.items.len + vp.tps - 1) / vp.tps;
+    const pv_bytes = allocator.alloc(u8, grid_t * n_per_group * feat * 4) catch return null;
+    const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. grid_t * n_per_group * feat];
+
+    var group_frames: [8][]const f32 = undefined;
+    var g: usize = 0;
+    while (g < grid_t) : (g += 1) {
+        var k: usize = 0;
+        while (k < vp.tps) : (k += 1) {
+            const idx = @min(g * vp.tps + k, frames_chw.items.len - 1);
+            group_frames[k] = frames_chw.items[idx];
+        }
+        const out_slice = pv_f32[g * n_per_group * feat ..][0 .. n_per_group * feat];
+        qwen_vision.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
+    }
+
+    log.info("  Decoded {d} frames → qwen video grid_t={d} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+        frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
+    });
+    return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
+}
+
+/// Decode a `video_url` block's `frames` array into `list`, mirroring
+/// `appendImageUrlContent`'s append-or-drop shape.
+pub fn appendVideoUrlContent(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.VideoData),
+    frame_urls: []const []const u8,
+    vp: chat_mod.VisionPreproc,
+) void {
+    if (decodeVideoUrlContent(allocator, frame_urls, vp)) |vid| {
+        list.append(allocator, vid) catch allocator.free(vid.pixels);
+    }
 }
 
 // ── Anthropic Messages API ──
@@ -10821,13 +11118,14 @@ fn handleAnthropicMessages(
     }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
+        var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -10843,7 +11141,13 @@ fn handleAnthropicMessages(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }
-            if (enable_drafter and !drafter_explicit_in_json) {
+            // A DFlash drafter is exempt: its runtime yield gate disables on
+            // REALIZED acceptance within a few rounds (~4 wasted verifies at
+            // worst), strictly better evidence than a prompt-time heuristic
+            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // carry enable_drafter:true. The gemma cross-attention drafter
+            // (0.55x measured on novel) keeps the gate.
+            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
@@ -12386,13 +12690,14 @@ fn handleResponses(
     }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
+        var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, pi.messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, pi.messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -12586,7 +12891,8 @@ fn handleResponses(
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld_resp = false;
             }
-            if (enable_drafter_resp and !drafter_explicit_in_json) {
+            // DFlash exemption — same rule as the other three surfaces.
+            if (enable_drafter_resp and !drafter_explicit_in_json and lm.dflash == null) {
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter_resp = false;
             }
@@ -14656,6 +14962,43 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
     try t.expect(narrow > got);
 }
 
+test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    cfg.num_hidden_layers = 64;
+    cfg.full_attention_interval = 4;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 48;
+    cfg.max_position_embeddings = 262144;
+
+    const wide = aneGateHeadroom(&cfg, 8192);
+    const narrow = aneGateHeadroom(&cfg, 1024);
+    const gib = 1024 * 1024 * 1024;
+
+    // Dominated by the chunk envelope, which is the whole point: the flat
+    // 12 GB it replaces refused a measured +38% prefill at chunk 1024 while
+    // under-reserving at chunk 8192.
+    try t.expect(wide > 12 * gib);
+    try t.expect(narrow < wide / 2);
+
+    // The KV reserve is exactly MIN_CONTEXT_TOKENS worth — the guarantee that
+    // an admitted offload leaves a usable context behind.
+    try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
+        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
+        prefix_cache_mem_bytes +
+        prefillTransientReserve(&cfg, defaultKvBits(), 1024));
+
+    // A model that cannot reach the reserve context only reserves its own max.
+    cfg.max_position_embeddings = 8192;
+    try t.expect(aneGateHeadroom(&cfg, 1024) < narrow);
+}
+
 test "auto-context never sizes past the ceiling as weights grow" {
     const t = std.testing;
     const ceiling: u64 = 10_600 * 1000 * 1000;
@@ -15065,8 +15408,8 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
     config.eoa_token_id = 301; // EOA
 
     const prompt = [_]u32{ 2, 500, 105, 2364, 107, 900, 901 };
-    // image_token=999 ×2, audio_token=888 ×3.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 3, &config, &.{});
+    // image_token=999 ×2, video absent (token=777, n=0), audio_token=888 ×3.
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 3, &config, &.{});
     defer testing.allocator.free(out);
 
     // Inserted after marker (position 5): [BOI 999 999 EOI][BOA 888 888 888 EOA].
@@ -15079,7 +15422,34 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
     try testing.expectEqualSlices(u32, &expected, out);
 }
 
-test "insertMultimodalTokens handles audio-only and image-only" {
+test "insertMultimodalTokens lays out image block then video block then audio block" {
+    // Qwen3-VL-style: image and video pad runs both wrap in vision_start/end
+    // (get_rope_index keys on vision_start immediately followed by EITHER
+    // pad token), inserted image-block-first, then video, then audio.
+    var config = model_mod.ModelConfig{};
+    config.qwen_vision = true;
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.vision_start_token_id = 200;
+    config.vision_end_token_id = 201;
+    config.boa_token_id = 300;
+    config.eoa_token_id = 301;
+    const prompt = [_]u32{ 1, 105, 7 };
+
+    // image_token=999 ×2, video_token=777 ×3, audio_token=888 ×1.
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 3, 888, 1, &config, &.{});
+    defer testing.allocator.free(out);
+    const expected = [_]u32{
+        1, 105,
+        200, 999, 999, 201, // image block
+        200, 777, 777, 777, 201, // video block
+        300, 888, 301, // audio block
+        7,
+    };
+    try testing.expectEqualSlices(u32, &expected, out);
+}
+
+test "insertMultimodalTokens handles audio-only, image-only, and video-only" {
     var config = model_mod.ModelConfig{};
     config.user_turn_marker_ids[0] = 105;
     config.user_turn_marker_len = 1;
@@ -15089,18 +15459,25 @@ test "insertMultimodalTokens handles audio-only and image-only" {
     config.eoa_token_id = 301;
     const prompt = [_]u32{ 1, 105, 7 };
 
-    // Audio only (n_image=0) → just the audio block.
-    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 2, &config, &.{});
+    // Audio only (n_image=0, n_video=0) → just the audio block.
+    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 2, &config, &.{});
     defer testing.allocator.free(ao);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 7 }, ao);
 
-    // Image only (n_audio=0) → just the image block.
-    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 0, &config, &.{});
+    // Image only (n_video=0, n_audio=0) → just the image block.
+    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 0, &config, &.{});
     defer testing.allocator.free(io);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 7 }, io);
 
+    // Video only (n_image=0, n_audio=0) → just the video block, wrapped in the
+    // SAME BOI/EOI as an image block (non-Qwen config here; Qwen's vision_start
+    // is exercised by the interleaved test above).
+    const vo = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 2, 888, 0, &config, &.{});
+    defer testing.allocator.free(vo);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 777, 777, 201, 7 }, vo);
+
     // Neither → unchanged.
-    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 0, &config, &.{});
+    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 0, &config, &.{});
     defer testing.allocator.free(none);
     try testing.expectEqualSlices(u32, &prompt, none);
 }
@@ -15176,10 +15553,61 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
+    // No ANE engine => no ane object, and the body is still valid JSON.
+    try testing.expect(std.mem.indexOf(u8, body, "\"ane\"") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    parsed.deinit();
+}
+
+test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 112, .eval_failures = 0 }};
+    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &one);
+    defer testing.allocator.free(frag);
+    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"units\":1,\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104,\"evals\":112,\"eval_failures\":0,\"unit_evals\":[{\"instance\":0,\"evals\":112,\"eval_failures\":0}]}", frag);
+    // Spliced into a props body it stays valid JSON with the object present.
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const ane = parsed.value.object.get("ane") orelse return error.MissingAne;
+    try testing.expectEqualStrings("channel", ane.object.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 48), ane.object.get("gdn_layers").?.integer);
+    // The M3 Ultra tester could not verify DISPATCH from /props (the
+    // engagement lines live only in the log) — evals is the probe a bench
+    // harness reads: zero with a green boot = built-but-never-dispatched.
+    try testing.expectEqual(@as(i64, 112), ane.object.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 0), ane.object.get("eval_failures").?.integer);
+
+    // Dual: `evals` is the TOTAL, and `unit_evals` names each die. A
+    // silently ignored affinity hint is invisible in-process — both units
+    // report evals and both land on one ANE — so this row is what a tester
+    // cross-checks against `macpow --dump | grep ANE0_`, which must show
+    // BOTH counters moving.
+    const two = [_]AneUnitStat{
+        .{ .instance = 1, .evals = 112, .eval_failures = 0 },
+        .{ .instance = 2, .evals = 112, .eval_failures = 3 },
+    };
+    const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
+    defer testing.allocator.free(dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, dual);
+    defer testing.allocator.free(dual_body);
+    var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
+    defer dual_parsed.deinit();
+    const dane = dual_parsed.value.object.get("ane").?.object;
+    try testing.expectEqual(@as(i64, 2), dane.get("units").?.integer);
+    try testing.expectEqual(@as(i64, 224), dane.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 3), dane.get("eval_failures").?.integer);
+    const rows_json = dane.get("unit_evals").?.array;
+    try testing.expectEqual(@as(usize, 2), rows_json.items.len);
+    try testing.expectEqual(@as(i64, 1), rows_json.items[0].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 2), rows_json.items[1].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 112), rows_json.items[1].object.get("evals").?.integer);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
@@ -15195,7 +15623,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.

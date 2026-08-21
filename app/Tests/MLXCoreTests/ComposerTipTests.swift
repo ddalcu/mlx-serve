@@ -8,6 +8,7 @@ final class ComposerTipTests: XCTestCase {
 
     private var all: [ComposerTip] {
         [.attachments(audioSupported: true), .attachments(audioSupported: false),
+         .attachments(audioSupported: true, videoSupported: true), .attachments(audioSupported: false, videoSupported: true),
          .thinking(isOn: true), .thinking(isOn: false),
          .tools(isOn: true, workspace: "/tmp/w"), .tools(isOn: false, workspace: nil),
          .mcp(isOn: true), .mcp(isOn: false)]
@@ -84,6 +85,15 @@ final class ComposerTipTests: XCTestCase {
     func testAttachmentTipMentionsAudioOnlyWhenTheModelCanHearIt() {
         XCTAssertTrue(ComposerTip.attachments(audioSupported: true).body.lowercased().contains("audio"))
         XCTAssertFalse(ComposerTip.attachments(audioSupported: false).body.lowercased().contains("audio"))
+    }
+
+    /// Same dead-control class as audio, for video (Qwen3-VL-family only).
+    func testAttachmentTipMentionsVideoOnlyWhenTheModelCanSeeIt() {
+        XCTAssertTrue(ComposerTip.attachments(audioSupported: false, videoSupported: true).body.lowercased().contains("video"))
+        XCTAssertFalse(ComposerTip.attachments(audioSupported: false, videoSupported: false).body.lowercased().contains("video"))
+        // Both together — neither offer crowds out the other.
+        let both = ComposerTip.attachments(audioSupported: true, videoSupported: true).body.lowercased()
+        XCTAssertTrue(both.contains("audio") && both.contains("video"))
     }
 
     /// A card that appears the instant the pointer crosses a disc flashes five

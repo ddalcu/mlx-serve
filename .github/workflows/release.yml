@@ -16,6 +16,10 @@ on:
         description: "Build + test + package only — skip tag, notarize, and release. Use to verify the workflow on a branch before cutting a real release."
         type: boolean
         default: false
+      pre_release:
+        description: "Cut this as a pre-release: tag v<YY.M.N>-pre-release.<n> instead of v<YY.M.N>"
+        type: boolean
+        default: false
 
 # A PR force-push mid-notarization should cancel the stale run; release runs
 # (tag push / dispatch) are never cancelled.
@@ -126,6 +130,21 @@ jobs:
               --jq "[.[] | .tagName | select(test(\"^v${PREFIX}\\\\.[0-9]+$\")) | sub(\"^v${PREFIX}\\\\.\"; \"\") | tonumber] | max // 0")
             N=$((LAST_N + 1))
             VERSION="${PREFIX}.${N}"
+            # A pre-release does NOT consume the version number: it tags
+            # v<VERSION>-pre-release.<P>, which the `^vYY.M.[0-9]+$` match above
+            # ignores, so the next run still mints the same N for the real
+            # release. P counts the pre-releases of THIS version from 1, read
+            # off the existing tags the same way N is, so a sequence reads
+            # v26.8.10-pre-release.1, .2, .3 and then v26.8.10. Every
+            # pre-release is numbered, including the first — an unnumbered one
+            # sorts ambiguously against .2 and reads like a different kind of
+            # thing rather than the first of a series.
+            if [ "${{ inputs.pre_release }}" = "true" ]; then
+              LAST_P=$(git ls-remote --tags origin "v${VERSION}-pre-release.*" \
+                | sed -n "s#.*refs/tags/v${VERSION}-pre-release\\.\\([0-9][0-9]*\\)\$#\\1#p" \
+                | sort -n | tail -1)
+              VERSION="${VERSION}-pre-release.$(( ${LAST_P:-0} + 1 ))"
+            fi
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then

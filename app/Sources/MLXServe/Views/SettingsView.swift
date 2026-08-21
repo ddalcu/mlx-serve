@@ -1398,6 +1398,30 @@ private struct PerformanceSectionContent: View {
                 }
             }
         }
+        if let m = meta["anePrefill"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.anePrefill)
+            ) {
+                // The switch works everywhere (the server declines by name
+                // where it can't run), so the per-Mac caution rides beside
+                // it rather than gating it — a hidden or disabled switch on
+                // a Mac that gets RAM tomorrow is the dead-control class.
+                VStack(alignment: .trailing, spacing: 4) {
+                    Toggle("", isOn: opts.anePrefill)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    if let caution = AnePrefillAdvice.liveCaution {
+                        Text(caution)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
         if let m = meta["decodeAttnQuant"] {
             SettingsRow(
                 title: m.title,

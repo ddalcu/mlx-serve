@@ -20,9 +20,12 @@ protocol TurnRunning: AnyObject {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
+                 videos: [ChatVideo]?,
                  audio: [ChatAudio]?,
                  config: ChatTurnEngine.TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool)
+    // (No default for `videos` here — Swift protocol requirements can't carry
+    // default argument values; every call site names it explicitly.)
     /// Cancel every in-flight turn (the legacy app-wide stop).
     func stop()
     /// Cancel one session's in-flight turn, leaving the others running.
@@ -448,11 +451,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
+                 videos: [ChatVideo]? = nil,
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
         let text = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || images != nil || audio != nil,
+        guard !text.isEmpty || images != nil || videos != nil || audio != nil,
               server.status == .running else { return }
 
         // A new submission to the SAME session supersedes its in-flight turn.
@@ -471,10 +475,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
 
         if config.agentMode || config.mcpMode || config.documentIndex != nil {
-            runAgentTurn(sessionId: sessionId, text: text, images: images, audio: audio,
+            runAgentTurn(sessionId: sessionId, text: text, images: images, videos: videos, audio: audio,
                          config: config, token: token, approval: approval)
         } else {
-            runPlainTurn(sessionId: sessionId, text: text, images: images, audio: audio,
+            runPlainTurn(sessionId: sessionId, text: text, images: images, videos: videos, audio: audio,
                          config: config, token: token)
         }
     }
@@ -540,12 +544,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     ///   no placeholder is appended — the trailing assistant message IS the
     ///   placeholder, and the server is told to treat it as a prefill.
     private func runPlainTurn(sessionId: UUID, text: String,
-                              images: [ChatImage]?, audio: [ChatAudio]?,
+                              images: [ChatImage]?, videos: [ChatVideo]? = nil, audio: [ChatAudio]?,
                               config: TurnConfig, token: UUID,
                               continuing: Bool = false) {
         if !continuing {
             var userMsg = ChatMessage(role: .user, content: text)
             userMsg.images = images
+            userMsg.videos = videos
             userMsg.audio = audio
             appState.appendMessage(to: sessionId, message: userMsg)
         }
@@ -554,18 +559,19 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
         // Build the request from the session (its source of truth). We append
         // the streaming placeholder AFTER this so it never lands in the
-        // request — same pattern the agent loop uses. Image handling: only
-        // the latest user message's images are sent (older turns' images are
-        // stripped for bandwidth).
+        // request — same pattern the agent loop uses. Image/video handling:
+        // only the latest user message's attachments are sent (older turns'
+        // are stripped for bandwidth).
         let sessionMsgs = session(sessionId)?.messages ?? []
         let lastUserIdx = sessionMsgs.lastIndex { $0.role == .user }
         let useServerPreprocess = wantsServerImagePreprocess
         let history: [[String: Any]] = sessionMsgs.enumerated().map { i, msg in
             if i == lastUserIdx, msg.role == .user {
                 let imgs = msg.images ?? []
+                let vids = msg.videos ?? []
                 let clips = msg.audio ?? []
-                if !imgs.isEmpty || !clips.isEmpty {
-                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, audio: clips, serverPreprocess: useServerPreprocess)]
+                if !imgs.isEmpty || !vids.isEmpty || !clips.isEmpty {
+                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, videos: vids, audio: clips, serverPreprocess: useServerPreprocess)]
                 }
             }
             return Self.plainHistoryDict(msg)
@@ -698,11 +704,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     // MARK: - Agent mode (native tool calling)
 
     private func runAgentTurn(sessionId: UUID, text: String,
-                              images: [ChatImage]?, audio: [ChatAudio]?,
+                              images: [ChatImage]?, videos: [ChatVideo]? = nil, audio: [ChatAudio]?,
                               config: TurnConfig, token: UUID,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) {
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.images = images
+        userMsg.videos = videos
         userMsg.audio = audio
         appState.appendMessage(to: sessionId, message: userMsg)
 
@@ -1624,15 +1631,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     }
 
     /// Build OpenAI-style content blocks for a message with images (and,
-    /// optionally, audio). Delegates to the pure, unit-tested `MultimodalContent`
-    /// builder. Two overloads so the `buildAgentHistory` closure (images only)
-    /// and the plain-chat path (images + audio) can both reference it.
+    /// optionally, video/audio). Delegates to the pure, unit-tested
+    /// `MultimodalContent` builder. Two overloads so the `buildAgentHistory`
+    /// closure (images only — the agent tool-loop doesn't send video/audio
+    /// attachments to the model, same as audio today) and the plain-chat path
+    /// (images + video + audio) can both reference it.
     nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], serverPreprocess: Bool = false) -> Any {
-        MultimodalContent.build(text: text, images: images, audio: [], serverPreprocess: serverPreprocess)
+        MultimodalContent.build(text: text, images: images, videos: [], audio: [], serverPreprocess: serverPreprocess)
     }
 
-    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], audio: [ChatAudio], serverPreprocess: Bool = false) -> Any {
-        MultimodalContent.build(text: text, images: images, audio: audio, serverPreprocess: serverPreprocess)
+    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], videos: [ChatVideo] = [], audio: [ChatAudio], serverPreprocess: Bool = false) -> Any {
+        MultimodalContent.build(text: text, images: images, videos: videos, audio: audio, serverPreprocess: serverPreprocess)
     }
 
     var wantsServerImagePreprocess: Bool {

@@ -1,16 +1,18 @@
 import Foundation
 
-/// Splits an assistant reply at fenced code blocks.
+/// Splits an assistant reply at fenced code blocks only.
 ///
 /// The renderer needs this because prose and code want different surfaces: a
 /// run of prose becomes ONE NSTextView (so drag-selection crosses paragraphs,
-/// lists and tables in a single motion) while a code block becomes a view with
-/// a language header and a copy button.
+/// lists, and tables in a single motion — see `MarkdownText.parseBlocks`,
+/// which detects tables via `MarkdownTable.parse` and renders them as an
+/// `NSTextTable` inside that same continuous run), while a code block becomes
+/// a view with a language header and a copy button.
 ///
 /// So segmentation happens at FENCES, not at markdown blocks — consecutive
-/// prose blocks must stay in one segment or selection breaks at every heading.
-/// Block-level parsing still belongs to `MarkdownText`, which each prose run is
-/// handed verbatim.
+/// prose blocks (including tables) must stay in one segment or selection
+/// breaks at every boundary. Block-level parsing belongs to `MarkdownText`,
+/// which each prose run is handed verbatim.
 enum MarkdownSegmenter {
 
     enum Segment: Equatable {
@@ -29,8 +31,6 @@ enum MarkdownSegmenter {
         let lines = source.components(separatedBy: "\n")
         var i = 0
 
-        /// Flush the pending prose run. Whitespace-only runs are dropped: an
-        /// empty text view between two blocks renders as a stray gap.
         func flushProse() {
             let text = prose.joined(separator: "\n")
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -41,24 +41,24 @@ enum MarkdownSegmenter {
 
         while i < lines.count {
             let line = lines[i]
-            guard line.hasPrefix(Self.fence) else {
-                prose.append(line)
+
+            if line.hasPrefix(Self.fence) {
+                flushProse()
+                let language = String(line.dropFirst(Self.fence.count))
+                    .trimmingCharacters(in: .whitespaces)
+                var body: [String] = []
                 i += 1
+                while i < lines.count, !lines[i].hasPrefix(Self.fence) {
+                    body.append(lines[i])
+                    i += 1
+                }
+                if i < lines.count { i += 1 }
+                out.append(.code(language: language, code: body.joined(separator: "\n")))
                 continue
             }
-            flushProse()
-            let language = String(line.dropFirst(Self.fence.count))
-                .trimmingCharacters(in: .whitespaces)
-            var body: [String] = []
+
+            prose.append(line)
             i += 1
-            while i < lines.count, !lines[i].hasPrefix(Self.fence) {
-                body.append(lines[i])
-                i += 1
-            }
-            // Unterminated fence (mid-stream) — emit what exists rather than
-            // letting a half-written block reflow as prose until it closes.
-            if i < lines.count { i += 1 }
-            out.append(.code(language: language, code: body.joined(separator: "\n")))
         }
         flushProse()
         return out

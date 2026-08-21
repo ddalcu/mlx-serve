@@ -10,6 +10,55 @@
 - The 7B is not a scaled-up 3B — every layer is multimodal, the MLP is a plain GELU instead of gated SwiGLU, rope is half as wide and rotates video only, and the 3B's closing modulation does not exist. Each of those is read from the pack's own config, so a future variant that flips one of them needs no new code.
 - Over the API: `POST /v1/images/upscales` with a base64 `image`.
 
+## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
+
+### Highlights
+
+- **The Neural Engine now helps with long prompts.** Opt-in `--ane-prefill`, +19% at 16k and +26% at 32k on Qwen 3.8 27B.
+- **Concurrent chats on Qwen 3.5/3.6/3.8 decode together instead of one after another** — 2.76x aggregate throughput at 4 streams.
+- **DFlash 2 draft heads are supported**, and warm turns keep their draft history across the SSD prefix cache instead of drafting blind.
+- **Per-machine tuning**: the Neural Engine share, the draft block size and the speculative depth cap are now measured per chip rather than one number for every Mac in auto mode.
+- **Markdown tables**: chat now render as a real grid instead of monospaced ASCII-art text: bold header row, one divider, no vertical borders, with inline markdown (bold, code, links) rendered inside cells instead of shown as literal characters.
+
+### Neural Engine prefill
+
+- **The Neural Engine now helps with long prompts.** New opt-in `--ane-prefill` (Settings ▸ "Neural Engine prefill boost") runs a slice of each Qwen-family projection on the Apple Neural Engine in parallel with the GPU: the ANE owns part of the MLP and GatedDeltaNet output channels through its own int8 copy of that slice, the GPU computes the rest, and long-prompt processing gets +19% at 16k and +26% at 32k tokens on Qwen 3.8 27B (306/301 tok/s on an M4 Max). Reply speed is unchanged. The extra copy is ~11 GB on a 27B, ~1 GB on a small model, and the server checks the exact fit per model at load, declining by name when it doesn't fit.
+- Covers Qwen 3.5/3.6/3.8 dense checkpoints (MLP + GatedDeltaNet) and MoE ones like the 35B-A3B (GatedDeltaNet only, +4% at 16k for ~0.5 GB). First load of a model compiles the ANE programs once (~1-2 minutes, cached after); a build that would run the disk out is refused by name instead of shipping partial coverage; `/props` and `/metrics` report what the Neural Engine is holding. Levers: `MLX_SERVE_ANE_MODE=row` (row split instead of channel slices), `MLX_SERVE_ANE_SPLIT` (share), `MLX_SERVE_ANE_GDN=0` (MLP-only).
+- The share of each projection the Neural Engine takes is now per chip: 0.45 on M4, 0.35 on M3 Ultra (+8.5%/+13.7% at 16k/32k, dual ANE more but I need hardware to test).
+- `--ane-prefill` is refused by name on M5-class GPUs, where the GPU prefill already outruns the offload and two testers measured a loss. `MLX_SERVE_ANE_FORCE=1` keeps it for future measurement.
+- `/props` reports Neural Engine dispatch counts and failures, so you can tell a built-but-never-used offload from a working one without reading the log.
+- Experimental `MLX_SERVE_ANE_DUAL=1` (off by default, M3 Ultra only) pins two Neural Engine units to the two dies and splits the share between them. Untested on hardware so far.
+
+### Concurrency
+
+- **Concurrent requests on a Qwen 3.5/3.6/3.8 trunk now decode as one batch.** They used to run strictly serially, each stream re-reading the whole model. Measured 2.76x aggregate at 4 streams. Two separate gates were cancelling it: the server clamped concurrency to 1 on these architectures, and a prompt that merely armed predictive decoding lost batching permanently even after that speculation turned itself back off (9.6 → 12.4 tok/s per stream on 4 concurrent 5.5k-token prompts on a Mac Mini).
+- A batch mixing one very long conversation with short ones no longer builds a padded attention tensor sized by the longest stream — the long ones fall out to serial for that step and everything still advances. Left unchecked this was several GB per step that nothing accounted for, ending in an unrecoverable GPU out-of-memory.
+
+### Speculative decoding
+
+- **DFlash 2 draft heads load and run** (the nested `dflash_config` sidecars), including the trained path selector and its convolutions. On an M4 the built-in MTP head is still the faster option; the selector's win needs the wider draft blocks only larger machines serve.
+- Draft-head history now survives the on-disk prefix cache, not just the in-memory one. Resuming a conversation after a restart used to draft blind.
+- The draft block size is capped per chip (8 on M3 Ultra), and so is the automatic speculation depth (4 on M1 Pro, where forcing depth 4 is +27% while the shipping cap of 6 was worth +0.7%). The log names which machine row it applied, so a depth of 4 is distinguishable from the planner having chosen it.
+- +3% decode from removing a redundant copy in the draft gate, plus a re-scored draft shortlist: 62 → 64 tok/s on an M4 Max, and +5% on novel content.
+- A model that ships a draft head but fails to load it now says so instead of quietly falling back to the slower predictive path.
+
+### Models
+
+- **Ling 3.0 flash-line checkpoints** that ship a direct query projection (`"q_lora_rank": null`) are no longer refused at load, and Ling 3.0 tiny loads under both converter layouts. Thanks @Fe2-O3 (#232). The published flash quants need a further layout change and still do not load.
+- **Alis (avlp12) Qwen packs are served**: their quantized draft-head projection binds, the vision tower's prefix and convolution layout are probed instead of assumed, and a false "broken norm" repair that was halving draft acceptance is fixed (33% → 70%).
+- Embedded DeepSeek and llama.cpp engines updated to their latest upstream versions.
+
+### Releases
+
+- The release workflow gained a **Pre-release** checkbox: it tags `v<version>-pre-release.1`, `.2`, `.3` instead of `v<version>`, so a build can go out for testing without spending the version number that the real release will use. Still created as a draft, still kept out of Homebrew.
+
+### App
+
+- **Music mode gained an instrumental switch** plus tempo and key controls, and remembers your settings between generations. Instrumental is marked experimental on MiniMax Music 3, where the open weights have no real switch and the tag alone still leaves vocal texture in; ACE-Step's is documented and works. Closes #225.
+- **Media checkpoints in My Models stopped reading as "Unsupported"** and gained a Use button. MiniMax Music 3, MageFlow and Kokoro were missing from the app's copy of the architecture list, so a model the app itself offers to download came back with a red badge. Thanks @justinluque (#229).
+- **The tray shows live prefill and decode tokens/s** Metrics are on by default now so those rows always have something to read — the cost is a few counters per request, never per token.
+- **The memory meter is one bar** — model, everything else in use, free — instead of two bars measured against the same total, which invited reading them as if they added up.
+
 ## v26.8.9 — Launch your coding agent, richer chat, faster decode
 
 ### Highlights

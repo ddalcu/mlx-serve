@@ -518,6 +518,13 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Chained-window long clips (server `chain_windows`): N windows joined by
     /// fl2va keyframe conditioning, so the REF2VA pack cannot serve it.
     var supportsChainedWindows: Bool = false
+    /// Last-frame keyframe conditioning (server `last_frame_image`). The other
+    /// half of fl2va — first-LAST frame to video+audio — where the first frame
+    /// is the geometry anchor (plain stretch) and the last is a follower
+    /// (aspect-preserving center-cover). LTX's handler has no such field at
+    /// all, and a reference has no keyframe row to anchor, so this rides the
+    /// same partition complement as Turbo and chaining.
+    var supportsLastFrame: Bool = false
     /// Denoising-step range the Steps slider offers. LTX's is the default; a
     /// backend whose floor is higher declares it, because a slider that goes
     /// somewhere the model does not work is a dead range, not a fast option.
@@ -948,6 +955,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             // derived here so the two fl2va presets cannot drift apart.
             supportsTurbo: !supportsReferences,
             supportsChainedWindows: !supportsReferences,
+            supportsLastFrame: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
             // maximum — so this range is OURS. 16 is the lowest tier we have a
             // verdict on, and below ~6 the fast recipe's warmup and tail windows
@@ -1987,6 +1995,10 @@ struct VideoGenRequest {
     /// by every pipeline mode (the server VAE-encodes it and pins it as the
     /// clean first latent frame).
     var firstFrameImagePath: String? = nil
+    /// Optional last-frame image (H3 fl2va): the frame the clip lands on. The
+    /// first frame sets the geometry and this one follows it, so a pair with
+    /// mismatched aspects still produces a clean landing.
+    var lastFrameImagePath: String? = nil
     /// Optional speech/audio clip for audio-to-video: the soundtrack is frozen
     /// as conditioning (voices, lip sync and performance follow it) and the
     /// ORIGINAL clip is muxed into the mp4. Any AVFoundation-readable format;
@@ -2013,6 +2025,14 @@ struct VideoGenRequest {
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
     /// by keyframe conditioning. 1 = a single ordinary window.
     var chainWindows: Int = 1
+    /// Steps for LTX's two-stage refine pass (`stage2_steps`). 0 = Auto, which
+    /// is the server's own "all 3" — sent only when the user picks a number,
+    /// so the absent field keeps meaning the default everywhere.
+    var stage2Steps: Int = 0
+    /// Audio-guidance strength for audio-to-video (`cfg_audio_scale`). Only
+    /// meaningful with a clip attached: without one there is no audio guider
+    /// to scale.
+    var cfgAudioScale: Double = 7.0
     /// ref2va references (REF2VA pack only). Images the generation follows for
     /// character/style, clips for motion and scene, audio for voice and score.
     /// Paths, resolved to base64 at request time.

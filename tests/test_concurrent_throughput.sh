@@ -57,15 +57,24 @@ fi
 # Skip MoE / hybrid / encoder-only models — those clamp max_concurrent to 1
 # at server start because the batched kernel doesn't model their state. The
 # test wouldn't be measuring continuous batching on them.
+#
+# EXCEPT a dense GatedDeltaNet trunk (qwen3_5 family): it has its own batched
+# kernel (`Transformer.forwardMoeBatchedDecode`) and is explicitly NOT clamped
+# any more. Skipping it here would hide regressions in the one arch the GDN
+# batching was built for — mirrors `ModelConfig.supportsBatchedGdnDecode`.
 ARCH=$(python3 -c "
 import json, sys
 with open('$MODEL/config.json') as f:
     c = json.load(f)
+tc = c.get('text_config') or c
 mt = c.get('model_type', '')
-moe_layers = c.get('num_local_experts', 0) > 0 or c.get('num_experts', 0) > 0
+moe_layers = tc.get('num_local_experts', 0) > 0 or tc.get('num_experts', 0) > 0
+gdn_dense = tc.get('full_attention_interval', 0) > 0 and not moe_layers
 hybrid = mt in ('qwen3_5', 'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next', 'nemotron_h', 'lfm2', 'lfm2_vl')
-encoder = c.get('is_encoder_only', False) or 'bert' in mt.lower()
-if moe_layers or hybrid or encoder:
+encoder = tc.get('is_encoder_only', False) or 'bert' in mt.lower()
+if gdn_dense and not encoder:
+    print(f'OK {mt}')
+elif moe_layers or hybrid or encoder:
     print(f'SKIP_INCOMPATIBLE {mt}')
 else:
     print(f'OK {mt}')

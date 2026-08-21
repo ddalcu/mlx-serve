@@ -6224,9 +6224,13 @@ test "minimax h3: sparseAttend attends exactly its subset (uniform-score closed 
         defer _ = mlx.mlx_array_free(of);
         try mlx.check(mlx.mlx_array_eval(of));
         const data = mlx.mlx_array_data_float32(of).?;
+        // Tolerance 2e-3: the closed form is exact only in exact arithmetic —
+        // sdpa's softmax/accumulation runs at fp16 scale on some machines'
+        // dispatch arms (M5 measured 1.9995117 vs 2, PR #223). A wrong SUBSET
+        // is off by >= 0.1 here, so the widened bar still convicts it.
         for (0..seq) |r| {
-            try testing.expectApproxEqAbs(case.want[r], data[r * 4], 1e-5);
-            try testing.expectApproxEqAbs(case.want[r], data[r * 4 + 3], 1e-5);
+            try testing.expectApproxEqAbs(case.want[r], data[r * 4], 2e-3);
+            try testing.expectApproxEqAbs(case.want[r], data[r * 4 + 3], 2e-3);
         }
     }
 }

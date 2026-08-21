@@ -441,9 +441,8 @@ struct StatusMenuView: View {
                     if !loadedModels.isEmpty {
                         TrayRowSeparator()
                     }
-                    // Shared meter — the same GPU + Available RAM bars the
-                    // Recommended pane and welcome screen show. Both bars share
-                    // total physical RAM as the denominator.
+                    // Shared meter — the same bar the Recommended pane and
+                    // welcome screen show.
                     MemoryMeter(
                         gpuBytes: mem.activeBytes,
                         gpuLabel: mem.gpuMemoryLabel,
@@ -451,8 +450,32 @@ struct StatusMenuView: View {
                         totalBytes: Int64(ProcessInfo.processInfo.physicalMemory)
                     )
                 }
+                if let t = server.throughput {
+                    TrayRowSeparator()
+                    throughputRows(t)
+                }
             }
         }
+    }
+
+    /// Serving throughput, from `/metrics.json` (present only when the server
+    /// was launched with --metrics). "now" is the gauge delta between the last
+    /// two polls; the averages are whole-session.
+    @ViewBuilder private func throughputRows(_ t: ThroughputSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
+            statRow("Decode", "\(ThroughputSnapshot.formatTPS(server.decodeTPSNow)) now · \(ThroughputSnapshot.formatTPS(t.avgDecodeTPS)) avg tok/s")
+            statRow("Prefill", "\(ThroughputSnapshot.formatTPS(server.prefillTPSNow)) now · \(ThroughputSnapshot.formatTPS(t.avgPrefillTPS)) avg tok/s")
+        }
+    }
+
+    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).monospacedDigit()
+        }
+        .font(.caption2)
     }
 
     // MARK: - Media generation

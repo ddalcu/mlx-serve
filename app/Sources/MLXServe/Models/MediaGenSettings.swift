@@ -304,6 +304,12 @@ struct VideoGenSettings: Codable, Equatable {
     var diffusionDecoder: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling.
     var turbo: Bool = false
+    /// Steps in LTX's two-stage refine pass. 0 = Auto (the server's own "all 3").
+    var stage2Steps: Int = 0
+    /// Audio-guidance strength for audio-to-video. The LTX reference default.
+    var cfgAudioScale: Double = 7.0
+    /// Chained windows (H3 fl2va): 1 = a single ordinary window.
+    var chainWindows: Int = 1
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
     /// Empty = none attached.
     var loras: [LoraAdapter] = []

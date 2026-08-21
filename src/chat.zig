@@ -68,12 +68,26 @@ pub const AudioData = struct {
     samples: []const u8, // Raw float32-LE bytes (n_samples * 4)
 };
 
+/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
+/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
+/// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
+/// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
+/// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
+/// are the shared per-frame patch grid every frame in the video was resized to.
+pub const VideoData = struct {
+    pixels: []const u8, // merge-order patches [grid_t*(grid_h*grid_w)*feat*4]
+    grid_t: u32,
+    grid_h: u32,
+    grid_w: u32,
+};
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
     images: ?[]const ImageData = null, // Preprocessed image data for vision
+    videos: ?[]const VideoData = null, // Preprocessed video data for vision
     audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
     /// Reasoning the client round-trips on assistant HISTORY messages
     /// (`reasoning_content`/`reasoning` on chat completions, `thinking`
@@ -986,7 +1000,7 @@ pub fn templateConsumesEffort(tpl: []const u8) bool {
 pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     const e = effort orelse return "low";
     if (std.mem.eql(u8, e, "high")) return "high";
-    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max")) return "max";
+    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
     return "low";
 }
 
@@ -8671,6 +8685,8 @@ test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max"
     try testing.expectEqualStrings("high", dsv4EffortFor("high"));
     try testing.expectEqualStrings("max", dsv4EffortFor("xhigh"));
     try testing.expectEqualStrings("max", dsv4EffortFor("max"));
+    // `ultra` is an EXPLICIT ask for the top tier — the unknown-string fallback would invert it into low.
+    try testing.expectEqualStrings("max", dsv4EffortFor("ultra"));
 }
 
 test "serializeExtraContext: dsv4 gets the reference's default reasoning effort" {

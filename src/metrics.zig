@@ -109,6 +109,12 @@ pub const Metrics = struct {
     // signature; without these two the gap has no name on any surface.
     mlx_active_bytes: Gauge,
     mlx_cache_bytes: Gauge,
+    // ANE prefill offload (`--ane-prefill`, A8): what the Neural Engine is
+    // holding right now — int8 weight-copy bytes and covered layer count
+    // (mlp + gdn) summed across resident engines. Zero whenever the offload
+    // is off or no covered model is resident (zero-when-off invariant).
+    ane_int8_bytes: Gauge,
+    ane_layers: Gauge,
 
     pub fn init() Metrics {
         return .{
@@ -135,6 +141,8 @@ pub const Metrics = struct {
             .requests_prefilling = Gauge.init(),
             .mlx_active_bytes = Gauge.init(),
             .mlx_cache_bytes = Gauge.init(),
+            .ane_int8_bytes = Gauge.init(),
+            .ane_layers = Gauge.init(),
         };
     }
 
@@ -245,6 +253,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
     try writeGauge(w, "mlx_serve:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
     try writeGauge(w, "mlx_serve:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
+    try writeGauge(w, "mlx_serve:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
+    try writeGauge(w, "mlx_serve:ane_layers", "Layers covered by compiled ANE prefill programs, mlp + gdn (0 when off)", m.ane_layers.load());
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -285,7 +295,9 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"prefill_tokens_live\":{d}," ++
             "\"requests_prefilling\":{d}," ++
             "\"mlx_active_bytes\":{d}," ++
-            "\"mlx_cache_bytes\":{d}" ++
+            "\"mlx_cache_bytes\":{d}," ++
+            "\"ane_int8_bytes\":{d}," ++
+            "\"ane_layers\":{d}" ++
             "}},\"histograms\":{{",
         .{
             m.prompt_tokens_total.load(),
@@ -305,6 +317,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.requests_prefilling.load(),
             m.mlx_active_bytes.load(),
             m.mlx_cache_bytes.load(),
+            m.ane_int8_bytes.load(),
+            m.ane_layers.load(),
         },
     );
 

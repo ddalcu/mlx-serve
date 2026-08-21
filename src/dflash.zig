@@ -35,6 +35,7 @@ const transformer_mod = @import("transformer.zig");
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -67,6 +68,22 @@ pub const DflashConfig = struct {
     block_size: u32,
     mask_token_id: u32,
     target_layer_ids: []u32, // owned, ascending
+    // ── DFlash2 extension (all 0/absent on a v1 assistant) ──
+    selector_rank: u32 = 0,
+    selector_top_k: u32 = 0,
+    conv_kernel_size: u32 = 0,
+    conv_group_size: u32 = 0,
+    /// Reference `compute_logits`: `logits * output_multiplier`, then
+    /// `tanh(l/cap)*cap`. The trunk head we borrow is the BARE Linear — an
+    /// argmax draft is invariant to these (monotone), but the selector SUMS
+    /// unary logits with codebook edges, so the muse sidecar's declared
+    /// scale is load-bearing there. 0 cap / 1.0 multiplier = no transform.
+    logit_softcap: f32 = 0,
+    output_multiplier: f32 = 1.0,
+
+    pub fn isDflash2(self: *const DflashConfig) bool {
+        return self.selector_rank > 0 or self.conv_kernel_size > 0;
+    }
 
     pub fn deinit(self: *DflashConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.layer_types);
@@ -78,9 +95,24 @@ pub const DflashConfig = struct {
 /// be present — `model_type` (`*_assistant`) is only the discovery-level
 /// "this is a drafter" signal, never the DFlash detection.
 pub fn isDflashConfigJson(root: std.json.ObjectMap) bool {
-    return root.get("block_size") != null and
-        root.get("mask_token_id") != null and
-        root.get("target_layer_ids") != null;
+    return dflashContractObject(root) != null;
+}
+
+/// The object holding the DFlash contract triple: DFlash2 checkpoints nest it
+/// under `dflash_config`, v1 assistants declare it at the root. Null when
+/// neither shape declares all three fields.
+fn dflashContractObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (root.get("dflash_config")) |dc| {
+        if (dc == .object and hasContractTriple(dc.object)) return dc.object;
+    }
+    if (hasContractTriple(root)) return root;
+    return null;
+}
+
+fn hasContractTriple(o: std.json.ObjectMap) bool {
+    return o.get("block_size") != null and
+        o.get("mask_token_id") != null and
+        o.get("target_layer_ids") != null;
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -139,13 +171,39 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     if (parsed.value != .object) return error.NotDflashConfig;
     const root = parsed.value.object;
 
-    if (!isDflashConfigJson(root)) return error.NotDflashConfig;
+    const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
 
-    const block_size: u32 = try jsonU32(root.get("block_size").?);
+    const block_size: u32 = try jsonU32(contract.get("block_size").?);
     if (block_size < 2) return error.InvalidDflashBlockSize;
-    const mask_token_id: u32 = try jsonU32(root.get("mask_token_id").?);
+    const mask_token_id: u32 = try jsonU32(contract.get("mask_token_id").?);
 
-    const tl_val = root.get("target_layer_ids").?;
+    // Our block forward is bidirectional-only (v1 parity-pinned); the z-lab
+    // reference defaults sliding layers CAUSAL inside the block. DFlash2
+    // ships an explicit false — a true must refuse, not silently mis-attend.
+    if (root.get("is_causal")) |ic| {
+        if (ic == .bool and ic.bool) return error.DflashCausalBlockUnsupported;
+    }
+
+    const selector_rank: u32 = if (contract.get("selector_rank")) |v| try jsonU32(v) else 0;
+    const selector_top_k: u32 = if (contract.get("selector_top_k")) |v| try jsonU32(v) else 0;
+    const conv_kernel_size: u32 = if (contract.get("conv_kernel_size")) |v| try jsonU32(v) else 0;
+    const conv_group_size: u32 = if (contract.get("conv_group_size")) |v| try jsonU32(v) else 0;
+    // The pairs travel together: a selector needs a candidate width, a conv
+    // needs a group width. Half-declared is a converter bug worth naming.
+    if ((selector_rank > 0) != (selector_top_k > 1)) return error.InvalidDflashConfigValue;
+    if ((conv_kernel_size > 0) != (conv_group_size > 0)) return error.InvalidDflashConfigValue;
+
+    // Reference load_draft reads the softcap from the dflash section, falling
+    // back to the root; the multiplier lives in the dflash section only.
+    var logit_softcap: f32 = 0;
+    if (contract.get("final_logit_softcapping") orelse root.get("final_logit_softcapping")) |v| logit_softcap = jsonFloat(v);
+    var output_multiplier: f32 = 1.0;
+    if (contract.get("output_multiplier")) |v| {
+        output_multiplier = jsonFloat(v);
+        if (output_multiplier == 0) return error.InvalidDflashConfigValue;
+    }
+
+    const tl_val = contract.get("target_layer_ids").?;
     if (tl_val != .array or tl_val.array.items.len == 0) return error.InvalidDflashTargetLayers;
     const target_layer_ids = try allocator.alloc(u32, tl_val.array.items.len);
     errdefer allocator.free(target_layer_ids);
@@ -157,6 +215,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     }
 
     const hidden_size: u32 = try jsonU32(root.get("hidden_size") orelse return error.IncompleteDflashConfig);
+    if (conv_group_size > 0 and hidden_size % conv_group_size != 0) return error.InvalidDflashConfigValue;
     const num_layers: u32 = try jsonU32(root.get("num_hidden_layers") orelse return error.IncompleteDflashConfig);
     const n_heads: u32 = try jsonU32(root.get("num_attention_heads") orelse return error.IncompleteDflashConfig);
     const kv_heads: u32 = if (root.get("num_key_value_heads")) |v| try jsonU32(v) else n_heads;
@@ -194,6 +253,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .block_size = block_size,
         .mask_token_id = mask_token_id,
         .target_layer_ids = target_layer_ids,
+        .selector_rank = selector_rank,
+        .selector_top_k = selector_top_k,
+        .conv_kernel_size = conv_kernel_size,
+        .conv_group_size = conv_group_size,
+        .logit_softcap = logit_softcap,
+        .output_multiplier = output_multiplier,
     };
 }
 
@@ -234,17 +299,38 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
 /// (M5-class) have a real M 8..16 lane and keep the checkpoint's block.
 pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
 
+/// A no-wide-lane block cap with the machine row it came from, for the
+/// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
+pub const BlockCap = struct { cap: u32, label: []const u8 };
+
+/// Per-silicon cap table for machines WITHOUT the NAX m16 verify lane. The
+/// cap is a MACHINE measurement, so each row is one: the M4 row is
+/// NO_WIDE_LANE_BLOCK_CAP (see above); the M3 Ultra row is 8 on oMLX PR
+/// #2850's evidence — block-8 DFlash2 measured 1.33-1.43x over serial at
+/// T=0.7 on the same Qwen3.8-27B + incoai drafter pairing there. New
+/// silicon rows are one-liners (an M1 row lands when the user measures it).
+/// `chip` is sysctl machdep.cpu.brand_string ("Apple M3 Ultra"); the GPU
+/// arch string cannot tell Ultra from Max, hence the CPU brand.
+pub fn blockCapForMachine(chip: []const u8) BlockCap {
+    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return .{ .cap = 8, .label = "m3-ultra" };
+    return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
+}
+
+/// Chip name via sysctl ("Apple M3 Ultra"); empty on failure, which lands
+/// on the default cap row. Canonical copy lives in ane.zig (the ANE share
+/// table keys on the same string).
 /// Resolve the effective block size: the config's value, capped by what the
-/// machine's verify lanes serve, then clamped DOWNWARD by an explicit
+/// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
+/// when there is no wide lane), then clamped DOWNWARD by an explicit
 /// `--draft-block-size` (never raised past the config — the assistant was
 /// trained at its config block). Floor 2 (1 draft + t1).
-pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool) u32 {
+pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32) u32 {
     const base = if (cli_explicit)
         @min(config_block, cli_block)
     else if (wide_verify_lane)
         config_block
     else
-        @min(config_block, NO_WIDE_LANE_BLOCK_CAP);
+        @min(config_block, no_lane_cap);
     return @max(base, 2);
 }
 
@@ -351,6 +437,47 @@ pub const DflashLinear = struct {
 
 // ── Model ──
 
+/// DFlash2 grouped dynamic causal conv (one per sublayer): two-tap depthwise
+/// conv whose kernels are `base + dynamic`, the dynamic part projected
+/// per-position from the sublayer's normed input. `base_kernel` axes are
+/// `[prepare|finish, tap, channel]` — BOTH leading dims are 2 at ksize 2, so
+/// the order is pinned by the parity fixture, never by shape.
+pub const DynConv = struct {
+    base_kernel: mlx.mlx_array, // [2, ksize, hidden] bf16
+    kernel_projection: DflashLinear, // [2*ksize*groups ← hidden]
+
+    fn deinit(self: *DynConv) void {
+        _ = mlx.mlx_array_free(self.base_kernel);
+        self.kernel_projection.deinit();
+    }
+
+    fn appendEval(self: *const DynConv, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.base_kernel);
+        self.kernel_projection.appendEval(vec);
+    }
+};
+
+/// DFlash2 path selector: per-position top-k candidates scored pairwise
+/// through two per-token codebooks + a hidden→rank projection. Codebooks are
+/// GATHER-read tables — bf16, never quantized (the NEVER_QUANTIZE class).
+pub const Selector = struct {
+    pred_codebook: mlx.mlx_array, // [vocab, rank] bf16
+    succ_codebook: mlx.mlx_array, // [vocab, rank] bf16
+    hidden_projection: DflashLinear, // [rank ← hidden]
+
+    fn deinit(self: *Selector) void {
+        _ = mlx.mlx_array_free(self.pred_codebook);
+        _ = mlx.mlx_array_free(self.succ_codebook);
+        self.hidden_projection.deinit();
+    }
+
+    fn appendEval(self: *const Selector, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.pred_codebook);
+        _ = mlx.mlx_vector_array_append_value(vec, self.succ_codebook);
+        self.hidden_projection.appendEval(vec);
+    }
+};
+
 /// Per-layer assistant weights.
 pub const DflashLayer = struct {
     layer_type: LayerType,
@@ -369,7 +496,13 @@ pub const DflashLayer = struct {
     up: DflashLinear, // [hidden → intermediate]
     down: DflashLinear, // [intermediate → hidden]
 
+    // DFlash2 only — null on a v1 assistant.
+    attention_conv: ?DynConv = null,
+    mlp_conv: ?DynConv = null,
+
     fn deinit(self: *DflashLayer) void {
+        if (self.attention_conv) |*c| c.deinit();
+        if (self.mlp_conv) |*c| c.deinit();
         _ = mlx.mlx_array_free(self.input_norm);
         _ = mlx.mlx_array_free(self.post_attn_norm);
         _ = mlx.mlx_array_free(self.q_norm);
@@ -391,6 +524,8 @@ pub const DflashLayer = struct {
         for ([_]*const DflashLinear{ &self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down }) |lin| {
             lin.appendEval(vec);
         }
+        if (self.attention_conv) |*c| c.appendEval(vec);
+        if (self.mlp_conv) |*c| c.appendEval(vec);
     }
 };
 
@@ -413,8 +548,12 @@ pub const DflashModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
+    /// DFlash2 path selector — null on a v1 assistant.
+    selector: ?Selector = null,
+
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
+        if (self.selector) |*sel| sel.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -448,8 +587,19 @@ pub const DflashModel = struct {
             });
             return err;
         };
-        if (!target.usesStandardForward()) {
-            log.err("[dflash] target arch '{s}' does not run the standard forward path (capture seam v1)\n", .{
+        if (self.selector) |*sel| {
+            // Candidate ids come from the TRUNK head's logits and gather
+            // codebook rows — a trunk vocab wider than the tables reads OOB.
+            const rows: u32 = @intCast(mlx.getShape(sel.pred_codebook)[0]);
+            if (target.config.vocab_size > rows) {
+                log.err("[dflash] selector codebook rows {d} < target vocab {d}\n", .{
+                    rows, target.config.vocab_size,
+                });
+                return error.DflashTargetMismatch;
+            }
+        }
+        if (!target.supportsLayerCapture()) {
+            log.err("[dflash] target arch '{s}' does not run a capture-capable forward path\n", .{
                 target.config.model_type,
             });
             return error.DflashTargetMismatch;
@@ -537,11 +687,16 @@ pub const DflashModel = struct {
     }
 
     /// Draft logits for the block hidden: the low-bit draft head when one was
-    /// built, else the trunk's own head. Both are the bare Linear — softcap /
-    /// output_multiplier are monotone, so draft argmax is unaffected.
+    /// built, else the trunk's own head. Both are the bare Linear; when the
+    /// sidecar DECLARES a softcap / output_multiplier (muse DFlash2) they are
+    /// applied here — argmax drafts are invariant (monotone), but the
+    /// selector sums these logits with codebook edges and the sampled arm
+    /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        var out: mlx.mlx_array = undefined;
         if (self.draft_head) |*dh| {
-            var out = mlx.mlx_array_new();
+            out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_quantized_matmul(
                 &out,
                 x,
@@ -554,11 +709,58 @@ pub const DflashModel = struct {
                 "affine",
                 self.s,
             ));
-            return out;
+        } else {
+            out = try target.lmHeadForDraft(x);
         }
-        return target.lmHeadForDraft(x);
+        if (self.config.output_multiplier == 1.0 and self.config.logit_softcap <= 0) return out;
+        defer _ = mlx.mlx_array_free(out);
+        return applyLogitTransforms(out, self.config.output_multiplier, self.config.logit_softcap, self.s);
     }
 };
+
+/// Reference `compute_logits`: `l * multiplier`, then `tanh(l/cap) * cap`.
+/// Scalars are cast to the logits' own dtype — a f32 scalar would silently
+/// promote a bf16 stream (the activation-dtype rule).
+pub fn applyLogitTransforms(logits: mlx.mlx_array, multiplier: f32, softcap: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const dtype = mlx.mlx_array_dtype(logits);
+    var cur = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(cur);
+    try mlx.check(mlx.mlx_array_set(&cur, logits));
+    if (multiplier != 1.0) {
+        const m = try scalarAs(multiplier, dtype, s);
+        defer _ = mlx.mlx_array_free(m);
+        var scaled = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&scaled, cur, m, s));
+        _ = mlx.mlx_array_free(cur);
+        cur = scaled;
+    }
+    if (softcap > 0) {
+        const inv = try scalarAs(1.0 / softcap, dtype, s);
+        defer _ = mlx.mlx_array_free(inv);
+        const cap = try scalarAs(softcap, dtype, s);
+        defer _ = mlx.mlx_array_free(cap);
+        var normed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(normed);
+        try mlx.check(mlx.mlx_multiply(&normed, cur, inv, s));
+        var squashed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(squashed);
+        try mlx.check(mlx.mlx_tanh(&squashed, normed, s));
+        var capped = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&capped, squashed, cap, s));
+        _ = mlx.mlx_array_free(cur);
+        cur = capped;
+    }
+    return cur;
+}
+
+/// 0-dim scalar in the given dtype.
+fn scalarAs(v: f32, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+    const f = mlx.mlx_array_new_float(v);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, dtype, s));
+    return out;
+}
 
 // ── Weight loading ──
 
@@ -570,6 +772,14 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     var owned = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&owned, arr));
     return owned;
+}
+
+/// `key`, falling back to `alt` — the DFlash2 codebooks ship WITHOUT a
+/// `.weight` suffix (the reference loader renames them before load_weights);
+/// a re-export through transformers would put the suffix back.
+fn ownWeightEither(w: *const Weights, key: []const u8, alt: []const u8) !mlx.mlx_array {
+    if (w.get(key) != null) return ownWeight(w, key);
+    return ownWeight(w, alt);
 }
 
 /// Load `<prefix>.weight` as an assistant linear. A checkpoint that already
@@ -677,9 +887,13 @@ pub fn loadDflashQuant(
     const q_out = cfg.num_attention_heads * cfg.head_dim;
     const fc_in: u32 = @intCast(cfg.target_layer_ids.len * hidden);
 
-    var fc = try loadLinear(&weights, "encoder.fc", fc_in, bits, s);
+    // Two encoder spellings in the wild: transformers assistants (muse) ship
+    // `encoder.fc` + `encoder.output_norm_enc`, z-lab DFlash2 ships root
+    // `fc` + `hidden_norm`. Same tensors, keyed on which one the file has.
+    const zlab_names = weights.get("fc.weight") != null;
+    var fc = try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, bits, s);
     errdefer fc.deinit();
-    const enc_norm = try ownWeight(&weights, "encoder.output_norm_enc.weight");
+    const enc_norm = try ownWeight(&weights, if (zlab_names) "hidden_norm.weight" else "encoder.output_norm_enc.weight");
     errdefer _ = mlx.mlx_array_free(enc_norm);
     const final_norm = try ownWeight(&weights, "norm.weight");
     errdefer _ = mlx.mlx_array_free(final_norm);
@@ -710,6 +924,21 @@ pub fn loadDflashQuant(
             .down = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj", .{li}), cfg.intermediate_size, bits, s),
         };
         layers_inited += 1;
+        if (cfg.conv_kernel_size > 0) {
+            layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, bits, s);
+            layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, bits, s);
+        }
+    }
+
+    var selector: ?Selector = null;
+    errdefer if (selector) |*sel| sel.deinit();
+    if (cfg.selector_rank > 0) {
+        const pred = try ownWeightEither(&weights, "candidate_selector.predecessor_codebook", "candidate_selector.predecessor_codebook.weight");
+        errdefer _ = mlx.mlx_array_free(pred);
+        const succ = try ownWeightEither(&weights, "candidate_selector.successor_codebook", "candidate_selector.successor_codebook.weight");
+        errdefer _ = mlx.mlx_array_free(succ);
+        const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, bits, s);
+        selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
 
     // Force-eval all weights so serve time never faults a lazy transpose or
@@ -721,6 +950,7 @@ pub fn loadDflashQuant(
         _ = mlx.mlx_vector_array_append_value(eval_vec, enc_norm);
         _ = mlx.mlx_vector_array_append_value(eval_vec, final_norm);
         for (layers) |*lw| lw.appendEval(eval_vec);
+        if (selector) |*sel| sel.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
 
@@ -734,6 +964,12 @@ pub fn loadDflashQuant(
         });
     }
 
+    if (cfg.isDflash2()) {
+        log.info("[dflash] dflash2: selector rank={d} top_k={d}, dyn-convs ksize={d} group={d}\n", .{
+            cfg.selector_rank, cfg.selector_top_k, cfg.conv_kernel_size, cfg.conv_group_size,
+        });
+    }
+
     return DflashModel{
         .config = cfg,
         .allocator = allocator,
@@ -742,7 +978,26 @@ pub fn loadDflashQuant(
         .enc_norm = enc_norm,
         .final_norm = final_norm,
         .layers = layers,
+        .selector = selector,
     };
+}
+
+/// Load one DFlash2 dynamic conv pair (`base_kernel` + `kernel_projection`)
+/// for layer `li`. Both weights are REQUIRED once the config declares
+/// `conv_kernel_size` — a DFlash2 pack missing them is a broken download.
+fn loadDynConv(
+    w: *const Weights,
+    li: u32,
+    comptime which: []const u8,
+    hidden: u32,
+    bits: u32,
+    s: mlx.mlx_stream,
+) !DynConv {
+    var key_buf: [256]u8 = undefined;
+    const base = try ownWeight(w, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".base_kernel", .{li}));
+    errdefer _ = mlx.mlx_array_free(base);
+    const proj = try loadLinear(w, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".kernel_projection", .{li}), hidden, bits, s);
+    return .{ .base_kernel = base, .kernel_projection = proj };
 }
 
 // ── Per-request context cache ──
@@ -932,6 +1187,464 @@ fn buildBlockMask(
     return bias_4d;
 }
 
+// ── DFlash2 grouped dynamic causal conv (forward) ──
+
+/// The reference's `_grouped_dynamic_convolve`, transcribed verbatim:
+/// `out_t = Σ_tap (base[tap] + dyn_t[tap]) ⊙ x_{t-tap}`, with positions
+/// before the block start reading ZERO — the block is self-contained, so the
+/// anchor's predecessor tap is the reference's zero pad, never the previous
+/// block. `base` is per-CHANNEL `[ksize, H]`; `dynamic` is per-GROUP
+/// `[1, L, ksize, groups]`, each coefficient broadcasting over `group_size`
+/// channels. Two separate multiply-adds per tap keep the reference's bf16
+/// rounding order.
+pub fn groupedDynConv(
+    hidden: mlx.mlx_array, // [1, L, H]
+    dynamic: mlx.mlx_array, // [1, L, ksize, groups]
+    base: mlx.mlx_array, // [ksize, H]
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    const hsh = mlx.getShape(hidden);
+    const len = hsh[1];
+    const h = hsh[2];
+    const groups = @divExact(h, @as(c_int, @intCast(group_size)));
+    const ksize: usize = @intCast(mlx.getShape(base)[0]);
+    const dtype = mlx.mlx_array_dtype(hidden);
+
+    const blk_shape = [_]c_int{ 1, len, groups, @intCast(group_size) };
+    var blocks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blocks);
+    try mlx.check(mlx.mlx_reshape(&blocks, hidden, &blk_shape, 4, s));
+
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_zeros(&out, &blk_shape, 4, dtype, s));
+
+    var tap: usize = 0;
+    while (tap < ksize) : (tap += 1) {
+        // values = hidden shifted right by `tap`, zero-padded at the front.
+        var values = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(values);
+        if (tap == 0) {
+            try mlx.check(mlx.mlx_array_set(&values, blocks));
+        } else {
+            const pad_shape = [_]c_int{ 1, @intCast(tap), groups, @intCast(group_size) };
+            var pad = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad);
+            try mlx.check(mlx.mlx_zeros(&pad, &pad_shape, 4, dtype, s));
+            var head = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(head);
+            const start = [_]c_int{ 0, 0, 0, 0 };
+            const stop = [_]c_int{ 1, len - @as(c_int, @intCast(tap)), groups, @intCast(group_size) };
+            const strides = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&head, blocks, &start, 4, &stop, 4, &strides, 4, s));
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, pad);
+            _ = mlx.mlx_vector_array_append_value(vec, head);
+            try mlx.check(mlx.mlx_concatenate_axis(&values, vec, 1, s));
+        }
+
+        // base[tap] as [1, 1, groups, group_size] (per-channel).
+        var kernel = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kernel);
+        {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            const start = [_]c_int{ @intCast(tap), 0 };
+            const stop = [_]c_int{ @as(c_int, @intCast(tap)) + 1, h };
+            const strides = [_]c_int{ 1, 1 };
+            try mlx.check(mlx.mlx_slice(&row, base, &start, 2, &stop, 2, &strides, 2, s));
+            const k_shape = [_]c_int{ 1, 1, groups, @intCast(group_size) };
+            try mlx.check(mlx.mlx_reshape(&kernel, row, &k_shape, 4, s));
+        }
+        // dynamic[:, :, tap, :] as [1, L, groups, 1] (per-group).
+        var dslice = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dslice);
+        {
+            var cut = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cut);
+            const start = [_]c_int{ 0, 0, @intCast(tap), 0 };
+            const stop = [_]c_int{ 1, len, @as(c_int, @intCast(tap)) + 1, groups };
+            const strides = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&cut, dynamic, &start, 4, &stop, 4, &strides, 4, s));
+            const d_shape = [_]c_int{ 1, len, groups, 1 };
+            try mlx.check(mlx.mlx_reshape(&dslice, cut, &d_shape, 4, s));
+        }
+
+        inline for (.{ kernel, dslice }) |coeff| {
+            var term = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(term);
+            try mlx.check(mlx.mlx_multiply(&term, coeff, values, s));
+            var next = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&next, out, term, s));
+            _ = mlx.mlx_array_free(out);
+            out = next;
+        }
+    }
+
+    var flat = mlx.mlx_array_new();
+    const out_shape = [_]c_int{ 1, len, h };
+    try mlx.check(mlx.mlx_reshape(&flat, out, &out_shape, 3, s));
+    _ = mlx.mlx_array_free(out);
+    return flat;
+}
+
+const ConvPrep = struct {
+    hidden: mlx.mlx_array, // conv'd sublayer input
+    finish_dyn: mlx.mlx_array, // [1, L, ksize, groups] — kernels for finish()
+};
+
+/// Reference `GroupedDynamicCausalConv.prepare`: project BOTH tap sets from
+/// the normed sublayer input (the finish kernels come from the INPUT, not the
+/// sublayer output), convolve with `base_kernel[0]`, hand the finish set back.
+fn convPrepare(
+    conv: *const DynConv,
+    normed: mlx.mlx_array, // [1, L, H]
+    ksize: u32,
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !ConvPrep {
+    const nsh = mlx.getShape(normed);
+    const len = nsh[1];
+    const h = nsh[2];
+    const groups = @divExact(h, @as(c_int, @intCast(group_size)));
+
+    const dyn_flat = try conv.kernel_projection.apply(normed, s);
+    defer _ = mlx.mlx_array_free(dyn_flat);
+    var dyn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dyn);
+    const dyn_shape = [_]c_int{ 1, len, 2, @intCast(ksize), groups };
+    try mlx.check(mlx.mlx_reshape(&dyn, dyn_flat, &dyn_shape, 5, s));
+
+    var prep_dyn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prep_dyn);
+    var finish_dyn = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(finish_dyn);
+    const set_shape = [_]c_int{ 1, len, @intCast(ksize), groups };
+    inline for (.{ .{ 0, &prep_dyn }, .{ 1, &finish_dyn } }) |sel| {
+        var cut = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cut);
+        const start = [_]c_int{ 0, 0, sel[0], 0, 0 };
+        const stop = [_]c_int{ 1, len, sel[0] + 1, @intCast(ksize), groups };
+        const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&cut, dyn, &start, 5, &stop, 5, &strides, 5, s));
+        try mlx.check(mlx.mlx_reshape(sel[1], cut, &set_shape, 4, s));
+    }
+
+    const base0 = try baseKernelHalf(conv.base_kernel, 0, s);
+    defer _ = mlx.mlx_array_free(base0);
+    const hidden_out = try groupedDynConv(normed, prep_dyn, base0, group_size, s);
+    return .{ .hidden = hidden_out, .finish_dyn = finish_dyn };
+}
+
+/// Reference `GroupedDynamicCausalConv.finish`: convolve the sublayer OUTPUT
+/// with `base_kernel[1]` + the finish kernels captured at prepare time.
+fn convFinish(
+    conv: *const DynConv,
+    sub_out: mlx.mlx_array,
+    finish_dyn: mlx.mlx_array,
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    const base1 = try baseKernelHalf(conv.base_kernel, 1, s);
+    defer _ = mlx.mlx_array_free(base1);
+    return groupedDynConv(sub_out, finish_dyn, base1, group_size, s);
+}
+
+/// `base_kernel[half]` → `[ksize, H]`.
+fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const bsh = mlx.getShape(base_kernel); // [2, ksize, H]
+    var cut = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cut);
+    const start = [_]c_int{ half, 0, 0 };
+    const stop = [_]c_int{ half + 1, bsh[1], bsh[2] };
+    const strides = [_]c_int{ 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(&cut, base_kernel, &start, 3, &stop, 3, &strides, 3, s));
+    var out = mlx.mlx_array_new();
+    const out_shape = [_]c_int{ bsh[1], bsh[2] };
+    try mlx.check(mlx.mlx_reshape(&out, cut, &out_shape, 2, s));
+    return out;
+}
+
+// ── DFlash2 path selector (forward + host trace) ──
+
+pub const SelectedPath = struct {
+    ids: []u32, // [m] chosen draft token ids
+    chosen_idx: []u32, // [m] index of the choice within its candidate row
+    cand_ids: []i32, // [m * top_k] candidate token ids per position
+    /// [m * top_k] softmax(scores / temperature) per step — the proposal
+    /// density q over the candidate set (zero everywhere else). Null on the
+    /// greedy trace.
+    q: ?[]f32,
+
+    pub fn deinit(self: *SelectedPath, allocator: std.mem.Allocator) void {
+        allocator.free(self.ids);
+        allocator.free(self.chosen_idx);
+        allocator.free(self.cand_ids);
+        if (self.q) |qv| allocator.free(qv);
+    }
+};
+
+/// Reference `CandidateSelector.select`: top-k candidates per position by
+/// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
+/// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
+/// edge scores are precomputed in ONE batched GPU dispatch ([m-1, k, k] +
+/// the anchor row) and the 16-wide trace runs on host — same math as the
+/// reference's sequential loop, chosen path identical, no per-step sync.
+///
+/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (row 0 =
+/// anchor, dropped here — the reference's `logits_start=1`); `draft_logits`
+/// already has the anchor row dropped (`[1, m, V]`).
+pub fn selectPath(
+    allocator: std.mem.Allocator,
+    sel: *const Selector,
+    top_k: u32,
+    blk_hidden: mlx.mlx_array,
+    draft_logits: mlx.mlx_array,
+    anchor_id: u32,
+    temperature: f32,
+    rand: std.Random,
+    s: mlx.mlx_stream,
+) !SelectedPath {
+    const dl_shape = mlx.getShape(draft_logits);
+    const m: usize = @intCast(dl_shape[1]);
+    const vocab: c_int = dl_shape[2];
+    const k: usize = @min(@as(usize, top_k), @as(usize, @intCast(vocab)));
+    const hsh = mlx.getShape(blk_hidden);
+    std.debug.assert(hsh[1] == dl_shape[1] + 1); // anchor row present on hidden
+
+    // ── Candidates + unary logits ──
+    var cands_i32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cands_i32);
+    var unary_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(unary_f32);
+    {
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        try mlx.check(mlx.mlx_argpartition_axis(&part, draft_logits, vocab - @as(c_int, @intCast(k)), 2, s));
+        var cands_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cands_raw);
+        const start = [_]c_int{ 0, 0, vocab - @as(c_int, @intCast(k)) };
+        const stop = [_]c_int{ 1, @intCast(m), vocab };
+        const strides = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&cands_raw, part, &start, 3, &stop, 3, &strides, 3, s));
+        try mlx.check(mlx.mlx_astype(&cands_i32, cands_raw, .int32, s));
+        var unary = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(unary);
+        try mlx.check(mlx.mlx_take_along_axis(&unary, draft_logits, cands_i32, 2, s));
+        try mlx.check(mlx.mlx_astype(&unary_f32, unary, .float32, s));
+    }
+
+    // ── Hidden projection over the draft rows ──
+    var hidden_rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden_rows);
+    {
+        const start = [_]c_int{ 0, 1, 0 };
+        const stop = [_]c_int{ 1, hsh[1], hsh[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&hidden_rows, blk_hidden, &start, 3, &stop, 3, &strides, 3, s));
+    }
+    const hp = try sel.hidden_projection.apply(hidden_rows, s);
+    defer _ = mlx.mlx_array_free(hp);
+    const rank: c_int = mlx.getShape(hp)[2];
+
+    // ── Codebook rows for every candidate ──
+    var cands_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cands_flat);
+    {
+        const flat_shape = [_]c_int{@intCast(m * k)};
+        try mlx.check(mlx.mlx_reshape(&cands_flat, cands_i32, &flat_shape, 1, s));
+    }
+    var succ_rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(succ_rows);
+    var pred_rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pred_rows);
+    {
+        var succ_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(succ_flat);
+        try mlx.check(mlx.mlx_take_axis(&succ_flat, sel.succ_codebook, cands_flat, 0, s));
+        var pred_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pred_flat);
+        try mlx.check(mlx.mlx_take_axis(&pred_flat, sel.pred_codebook, cands_flat, 0, s));
+        const rows_shape = [_]c_int{ @intCast(m), @intCast(k), rank };
+        try mlx.check(mlx.mlx_reshape(&succ_rows, succ_flat, &rows_shape, 3, s));
+        try mlx.check(mlx.mlx_reshape(&pred_rows, pred_flat, &rows_shape, 3, s));
+    }
+
+    // ── Edge scores: anchor row [k] + pairwise [m-1, k, k] ──
+    var e0_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(e0_f32);
+    {
+        const aid: i32 = @intCast(anchor_id);
+        const a_shape = [_]c_int{1};
+        const aid_arr = mlx.mlx_array_new_data(&aid, &a_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(aid_arr);
+        var anchor_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(anchor_row);
+        try mlx.check(mlx.mlx_take_axis(&anchor_row, sel.pred_codebook, aid_arr, 0, s)); // [1, rank]
+        var h0 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h0);
+        {
+            var cut = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cut);
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ 1, 1, rank };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&cut, hp, &start, 3, &stop, 3, &strides, 3, s));
+            const h0_shape = [_]c_int{ 1, rank };
+            try mlx.check(mlx.mlx_reshape(&h0, cut, &h0_shape, 2, s));
+        }
+        var ah = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ah);
+        try mlx.check(mlx.mlx_multiply(&ah, anchor_row, h0, s)); // [1, rank]
+        var succ0_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(succ0_t);
+        {
+            var succ0 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(succ0);
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ 1, @intCast(k), rank };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&succ0, succ_rows, &start, 3, &stop, 3, &strides, 3, s));
+            var succ0_2d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(succ0_2d);
+            const s2 = [_]c_int{ @intCast(k), rank };
+            try mlx.check(mlx.mlx_reshape(&succ0_2d, succ0, &s2, 2, s));
+            const perm = [_]c_int{ 1, 0 };
+            try mlx.check(mlx.mlx_transpose_axes(&succ0_t, succ0_2d, &perm, 2, s));
+        }
+        var e0 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(e0);
+        try mlx.check(mlx.mlx_matmul(&e0, ah, succ0_t, s)); // [1, k]
+        try mlx.check(mlx.mlx_astype(&e0_f32, e0, .float32, s));
+    }
+    var e_f32: mlx.mlx_array = .{ .ctx = null };
+    defer if (e_f32.ctx != null) {
+        _ = mlx.mlx_array_free(e_f32);
+    };
+    if (m > 1) {
+        // A = pred_rows[0..m-1] ⊙ H[1..m]  → [m-1, k, rank]
+        var pred_head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pred_head);
+        {
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ @intCast(m - 1), @intCast(k), rank };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&pred_head, pred_rows, &start, 3, &stop, 3, &strides, 3, s));
+        }
+        var h_tail = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h_tail);
+        {
+            var cut = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cut);
+            const start = [_]c_int{ 0, 1, 0 };
+            const stop = [_]c_int{ 1, @intCast(m), rank };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&cut, hp, &start, 3, &stop, 3, &strides, 3, s));
+            const t_shape = [_]c_int{ @intCast(m - 1), 1, rank };
+            try mlx.check(mlx.mlx_reshape(&h_tail, cut, &t_shape, 3, s));
+        }
+        var a_mat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a_mat);
+        try mlx.check(mlx.mlx_multiply(&a_mat, pred_head, h_tail, s));
+        var succ_tail_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(succ_tail_t);
+        {
+            var succ_tail = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(succ_tail);
+            const start = [_]c_int{ 1, 0, 0 };
+            const stop = [_]c_int{ @intCast(m), @intCast(k), rank };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&succ_tail, succ_rows, &start, 3, &stop, 3, &strides, 3, s));
+            const perm = [_]c_int{ 0, 2, 1 };
+            try mlx.check(mlx.mlx_transpose_axes(&succ_tail_t, succ_tail, &perm, 3, s));
+        }
+        var e = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(e);
+        try mlx.check(mlx.mlx_matmul(&e, a_mat, succ_tail_t, s)); // [m-1, k, k]
+        e_f32 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&e_f32, e, .float32, s));
+    }
+
+    // ── ONE batched eval, then the host trace ──
+    {
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        _ = mlx.mlx_vector_array_append_value(eval_vec, cands_i32);
+        _ = mlx.mlx_vector_array_append_value(eval_vec, unary_f32);
+        _ = mlx.mlx_vector_array_append_value(eval_vec, e0_f32);
+        if (e_f32.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, e_f32);
+        try mlx.check(mlx.mlx_eval(eval_vec));
+    }
+    const cand_data = mlx.mlx_array_data_int32(cands_i32) orelse return error.MlxArrayDataNull;
+    const unary_data = mlx.mlx_array_data_float32(unary_f32) orelse return error.MlxArrayDataNull;
+    const e0_data = mlx.mlx_array_data_float32(e0_f32) orelse return error.MlxArrayDataNull;
+    const e_data: ?[*]const f32 = if (e_f32.ctx != null)
+        (mlx.mlx_array_data_float32(e_f32) orelse return error.MlxArrayDataNull)
+    else
+        null;
+
+    const stochastic = temperature > 0;
+    var out = SelectedPath{
+        .ids = try allocator.alloc(u32, m),
+        .chosen_idx = undefined,
+        .cand_ids = undefined,
+        .q = null,
+    };
+    errdefer allocator.free(out.ids);
+    out.chosen_idx = try allocator.alloc(u32, m);
+    errdefer allocator.free(out.chosen_idx);
+    out.cand_ids = try allocator.alloc(i32, m * k);
+    errdefer allocator.free(out.cand_ids);
+    @memcpy(out.cand_ids, cand_data[0 .. m * k]);
+    if (stochastic) out.q = try allocator.alloc(f32, m * k);
+
+    var scores_buf: [64]f32 = undefined; // top_k is 16 on the real checkpoint
+    std.debug.assert(k <= scores_buf.len);
+    var prev_idx: usize = 0;
+    var t: usize = 0;
+    while (t < m) : (t += 1) {
+        const scores = scores_buf[0..k];
+        for (scores, 0..) |*sc, j| {
+            const edge = if (t == 0) e0_data[j] else e_data.?[(t - 1) * k * k + prev_idx * k + j];
+            sc.* = unary_data[t * k + j] + edge;
+        }
+        var choice: usize = 0;
+        if (!stochastic) {
+            for (scores, 0..) |sc, j| {
+                if (sc > scores[choice]) choice = j;
+            }
+        } else {
+            // Reference `_sampling_probs(scores, temperature)`: f32 softmax
+            // over the candidate set — no top-p/top-k inside the selector.
+            var mx: f32 = -std.math.inf(f32);
+            for (scores) |sc| mx = @max(mx, sc);
+            var total: f32 = 0;
+            const q_row = out.q.?[t * k .. (t + 1) * k];
+            for (scores, q_row) |sc, *qv| {
+                qv.* = @exp((sc - mx) / temperature);
+                total += qv.*;
+            }
+            for (q_row) |*qv| qv.* /= total;
+            const u = rand.float(f32);
+            var acc: f32 = 0;
+            choice = k - 1;
+            for (q_row, 0..) |qv, j| {
+                acc += qv;
+                if (u < acc) {
+                    choice = j;
+                    break;
+                }
+            }
+        }
+        out.ids[t] = @intCast(cand_data[t * k + choice]);
+        out.chosen_idx[t] = @intCast(choice);
+        prev_idx = choice;
+    }
+    return out;
+}
+
 // ── Context append + block forward ──
 
 /// Project trunk captures through the encoder and append per-layer K/V for
@@ -1032,11 +1745,25 @@ pub fn forwardBlock(
         const normed = try rmsNormFn(x, lw.input_norm, cfg.rms_norm_eps, s);
         defer _ = mlx.mlx_array_free(normed);
 
-        const q = try projectHeads(normed, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
+        // DFlash2: conv the normed input; attention runs on the conv'd
+        // hidden and its output is conv'd again with kernels projected from
+        // the SAME normed input. v1 layers (`attention_conv == null`) take
+        // the exact original path.
+        var attn_prep: ?ConvPrep = if (lw.attention_conv) |*cv|
+            try convPrepare(cv, normed, cfg.conv_kernel_size, cfg.conv_group_size, s)
+        else
+            null;
+        defer if (attn_prep) |*cp| {
+            _ = mlx.mlx_array_free(cp.hidden);
+            _ = mlx.mlx_array_free(cp.finish_dyn);
+        };
+        const attn_in = if (attn_prep) |*cp| cp.hidden else normed;
+
+        const q = try projectHeads(attn_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
         defer _ = mlx.mlx_array_free(q);
-        const bk = try projectHeads(normed, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
+        const bk = try projectHeads(attn_in, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
         defer _ = mlx.mlx_array_free(bk);
-        const bv = try projectHeadsNoNorm(normed, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
+        const bv = try projectHeadsNoNorm(attn_in, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(bv);
 
         // Append block K/V into spare capacity; the view spans ctx + block.
@@ -1064,25 +1791,52 @@ pub fn forwardBlock(
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
         const o_out = try lw.o.apply(attn_flat, s);
         defer _ = mlx.mlx_array_free(o_out);
+        var attn_fin: mlx.mlx_array = .{ .ctx = null };
+        defer if (attn_fin.ctx != null) {
+            _ = mlx.mlx_array_free(attn_fin);
+        };
+        var attn_add = o_out;
+        if (lw.attention_conv) |*cv| {
+            attn_fin = try convFinish(cv, o_out, attn_prep.?.finish_dyn, cfg.conv_group_size, s);
+            attn_add = attn_fin;
+        }
 
         var h_new = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&h_new, x, o_out, s));
+        try mlx.check(mlx.mlx_add(&h_new, x, attn_add, s));
         _ = mlx.mlx_array_free(x);
         x = h_new;
 
         const ff_normed = try rmsNormFn(x, lw.post_attn_norm, cfg.rms_norm_eps, s);
         defer _ = mlx.mlx_array_free(ff_normed);
-        const gate = try lw.gate.apply(ff_normed, s);
+        var mlp_prep: ?ConvPrep = if (lw.mlp_conv) |*cv|
+            try convPrepare(cv, ff_normed, cfg.conv_kernel_size, cfg.conv_group_size, s)
+        else
+            null;
+        defer if (mlp_prep) |*cp| {
+            _ = mlx.mlx_array_free(cp.hidden);
+            _ = mlx.mlx_array_free(cp.finish_dyn);
+        };
+        const mlp_in = if (mlp_prep) |*cp| cp.hidden else ff_normed;
+        const gate = try lw.gate.apply(mlp_in, s);
         defer _ = mlx.mlx_array_free(gate);
-        const up = try lw.up.apply(ff_normed, s);
+        const up = try lw.up.apply(mlp_in, s);
         defer _ = mlx.mlx_array_free(up);
         const act = try swiglu(gate, up, s);
         defer _ = mlx.mlx_array_free(act);
         const down = try lw.down.apply(act, s);
         defer _ = mlx.mlx_array_free(down);
+        var mlp_fin: mlx.mlx_array = .{ .ctx = null };
+        defer if (mlp_fin.ctx != null) {
+            _ = mlx.mlx_array_free(mlp_fin);
+        };
+        var mlp_add = down;
+        if (lw.mlp_conv) |*cv| {
+            mlp_fin = try convFinish(cv, down, mlp_prep.?.finish_dyn, cfg.conv_group_size, s);
+            mlp_add = mlp_fin;
+        }
 
         var h_next = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&h_next, x, down, s));
+        try mlx.check(mlx.mlx_add(&h_next, x, mlp_add, s));
         _ = mlx.mlx_array_free(x);
         x = h_next;
     }
@@ -1165,6 +1919,123 @@ test "dflash: muse assistant config parses with the full DFlash contract" {
     for (cfg.layer_types) |lt| try testing.expectEqual(LayerType.sliding_attention, lt);
 }
 
+// The real incoai/Qwen3.8-27B-DFlash2 config shape (fetched 2026-08-18):
+// the contract nests under `dflash_config`, model_type is a bare "qwen3".
+const DFLASH2_CONFIG_JSON =
+    \\{
+    \\  "architectures": ["DFlash2DraftModel"],
+    \\  "is_causal": false,
+    \\  "dflash_config": {
+    \\    "block_size": 8,
+    \\    "conv_group_size": 16,
+    \\    "conv_kernel_size": 2,
+    \\    "mask_token_id": 248070,
+    \\    "selector_rank": 256,
+    \\    "selector_top_k": 16,
+    \\    "target_layer_ids": [5, 19, 33, 47, 61]
+    \\  },
+    \\  "head_dim": 128,
+    \\  "hidden_size": 5120,
+    \\  "intermediate_size": 17408,
+    \\  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+    \\  "max_position_embeddings": 262144,
+    \\  "model_type": "qwen3",
+    \\  "num_attention_heads": 32,
+    \\  "num_hidden_layers": 5,
+    \\  "num_key_value_heads": 8,
+    \\  "rms_norm_eps": 1e-06,
+    \\  "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
+    \\  "sliding_window": 2048,
+    \\  "vocab_size": 248320
+    \\}
+;
+
+test "dflash: DFlash2 nested dflash_config contract parses with selector + conv fields" {
+    const allocator = testing.allocator;
+
+    // Detection accepts the nested shape…
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, DFLASH2_CONFIG_JSON, .{});
+    defer parsed.deinit();
+    try testing.expect(isDflashConfigJson(parsed.value.object));
+
+    // …and the parser reads the triple + the four DFlash2 fields from it.
+    var cfg = try parseConfigFromJson(allocator, DFLASH2_CONFIG_JSON);
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 8), cfg.block_size);
+    try testing.expectEqual(@as(u32, 248070), cfg.mask_token_id);
+    try testing.expectEqualSlices(u32, &[_]u32{ 5, 19, 33, 47, 61 }, cfg.target_layer_ids);
+    try testing.expectEqual(@as(u32, 16), cfg.conv_group_size);
+    try testing.expectEqual(@as(u32, 2), cfg.conv_kernel_size);
+    try testing.expectEqual(@as(u32, 256), cfg.selector_rank);
+    try testing.expectEqual(@as(u32, 16), cfg.selector_top_k);
+    try testing.expectEqual(@as(u32, 5120), cfg.hidden_size);
+    try testing.expectEqual(@as(u32, 5), cfg.num_hidden_layers);
+    try testing.expectApproxEqAbs(@as(f32, 1e7), cfg.rope_theta, 1.0);
+
+    // A v1 config carries none of the new fields → all zero / neutral.
+    var v1 = try parseConfigFromJson(allocator, MUSE_ASSISTANT_CONFIG_JSON);
+    defer v1.deinit(allocator);
+    try testing.expectEqual(@as(u32, 0), v1.selector_rank);
+    try testing.expectEqual(@as(u32, 0), v1.conv_kernel_size);
+    try testing.expectEqual(@as(f32, 0), v1.logit_softcap);
+    try testing.expectEqual(@as(f32, 1.0), v1.output_multiplier);
+}
+
+test "dflash2: muse sidecar's softcap + output_multiplier parse and transform the draft logits" {
+    // incoai/Muse-Glimmer-30B-DFlash2 nests final_logit_softcapping 20 +
+    // output_multiplier 0.196… under dflash_config — the trunk head we borrow
+    // is the BARE Linear, so without these the selector's unary term is on
+    // the wrong scale against the codebook edges (argmax drafts are invariant
+    // to monotone transforms; pairwise SUMS are not).
+    const allocator = testing.allocator;
+    const muse2_json =
+        \\{"model_type":"qwen3","is_causal":false,
+        \\ "dflash_config":{"block_size":16,"mask_token_id":201818,"target_layer_ids":[1,13],
+        \\   "conv_kernel_size":2,"conv_group_size":16,"selector_rank":256,"selector_top_k":16,
+        \\   "final_logit_softcapping":20.0,"output_multiplier":0.19611613513818404},
+        \\ "hidden_size":6656,"num_hidden_layers":1,"num_attention_heads":32,"head_dim":128,
+        \\ "intermediate_size":19968,"rms_norm_eps":1e-5,"sliding_window":2048,
+        \\ "rope_parameters":{"rope_theta":500000.0,"rope_type":"default"},
+        \\ "layer_types":["sliding_attention"]}
+    ;
+    var cfg = try parseConfigFromJson(allocator, muse2_json);
+    defer cfg.deinit(allocator);
+    try testing.expectApproxEqAbs(@as(f32, 20.0), cfg.logit_softcap, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.19611613), cfg.output_multiplier, 1e-6);
+
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    // Reference compute_logits: l*mult, then tanh(l/cap)*cap. Hand-computed.
+    const vals = [_]f32{ 0.0, 51.0, -102.0, 300.0 };
+    const shape = [_]c_int{ 1, 1, 4 };
+    const raw = mlx.mlx_array_new_data(&vals, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(raw);
+    const out = try applyLogitTransforms(raw, 0.19611613513818404, 20.0, s);
+    defer _ = mlx.mlx_array_free(out);
+    const got = try TinyFix.readF32(out, allocator, s);
+    defer testing.allocator.free(got);
+    for (vals, got) |x, g| {
+        const want = 20.0 * std.math.tanh(x * 0.19611613513818404 / 20.0);
+        try testing.expect(@abs(g - want) < 1e-4);
+    }
+}
+
+test "dflash: a config declaring is_causal true is refused by name" {
+    // Our block forward is bidirectional-only (v1 parity-pinned); the z-lab
+    // reference defaults sliding layers CAUSAL inside the block, so a future
+    // checkpoint shipping is_causal:true must refuse rather than silently
+    // draft against the wrong attention pattern. DFlash2 ships false.
+    const allocator = testing.allocator;
+    const causal_json =
+        \\{"model_type":"qwen3","is_causal":true,
+        \\ "dflash_config":{"block_size":4,"mask_token_id":7,"target_layer_ids":[1,3]},
+        \\ "hidden_size":64,"num_hidden_layers":1,"num_attention_heads":4,"head_dim":16,
+        \\ "intermediate_size":128,"rms_norm_eps":1e-5,
+        \\ "layer_types":["full_attention"]}
+    ;
+    try testing.expectError(error.DflashCausalBlockUnsupported, parseConfigFromJson(allocator, causal_json));
+}
+
 test "dflash: gemma assistant config is NOT detected as DFlash" {
     const allocator = testing.allocator;
     // Detection helper says no…
@@ -1191,13 +2062,13 @@ test "dflash: out-of-range target_layer_ids rejected by name" {
 
 test "dflash: block size resolves from config, clamped downward by explicit CLI" {
     // A machine WITH a wide verify lane keeps the checkpoint's own block.
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP));
     // Explicit smaller CLI clamps down.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP));
     // Explicit LARGER CLI never raises past the config (training contract).
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP));
     // Floor 2.
-    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true));
+    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
@@ -1245,14 +2116,33 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
 test "dflash: no wide verify lane caps the block at the split-K width" {
     // Without an M 8..16 verify lane the trunk forward falls off a cliff at
     // width 8, so the block is capped even though the checkpoint asks for 16.
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false));
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP));
     // The cap is a CEILING, never a floor: an explicit smaller CLI still wins,
     // and a checkpoint whose own block is already narrow is left alone.
-    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false));
-    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false));
+    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
     // Explicit CLI is the escape hatch for a wider block on capped hardware:
     // it clamps against the CONFIG block, not the cap.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    // An explicit CLI also bypasses a per-silicon cap entirely.
+    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8));
+}
+
+test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
+    // The cap is a MACHINE measurement, keyed on the CPU brand string (the
+    // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX PR #2850:
+    // 1.33-1.43x at block 8 on the same pairing); everything else without a
+    // wide lane keeps the M4-measured default.
+    const ultra = blockCapForMachine("Apple M3 Ultra");
+    try testing.expectEqual(@as(u32, 8), ultra.cap);
+    try testing.expectEqualStrings("m3-ultra", ultra.label);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M4 Max").cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M3 Max").cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("").cap);
+    // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
+    // block-8 one is left alone.
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap));
 }
 
 // ── Hermetic fixtures: tiny llama trunk + tiny DFlash assistant ──
@@ -1422,7 +2312,11 @@ pub const TinyFix = struct {
         defer _ = mlx.mlx_map_string_to_array_free(map);
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try putV1AssistantWeights(map, s, quantize);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
 
+    fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool) !void {
         const q_out = N_HEADS * HEAD_DIM;
         const kv_out = N_KV * HEAD_DIM;
         const putLin = struct {
@@ -1449,6 +2343,89 @@ pub const TinyFix = struct {
             try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj.weight", .{li}), INTER, HIDDEN, 150 + li, s, quantize);
             try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj.weight", .{li}), INTER, HIDDEN, 160 + li, s, quantize);
             try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj.weight", .{li}), HIDDEN, INTER, 170 + li, s, quantize);
+        }
+    }
+
+    // DFlash2 tiny fixture: v1 dims + nested contract, selector rank 16 /
+    // top_k 4 and 2-tap convs at group 8 (hidden 64 → 8 groups). model_type
+    // is a bare "qwen3" — exactly the real checkpoint's shape.
+    pub const SEL_RANK: usize = 16;
+    pub const SEL_TOPK: usize = 4;
+    pub const CONV_K: usize = 2;
+    pub const CONV_GS: usize = 8;
+
+    pub const ASSISTANT2_CONFIG =
+        \\{
+        \\  "architectures": ["DFlash2DraftModel"],
+        \\  "model_type": "qwen3",
+        \\  "is_causal": false,
+        \\  "dflash_config": {
+        \\    "block_size": 4,
+        \\    "mask_token_id": 127,
+        \\    "target_layer_ids": [0, 2],
+        \\    "conv_kernel_size": 2,
+        \\    "conv_group_size": 8,
+        \\    "selector_rank": 16,
+        \\    "selector_top_k": 4
+        \\  },
+        \\  "hidden_size": 64,
+        \\  "intermediate_size": 128,
+        \\  "num_hidden_layers": 2,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 16,
+        \\  "rms_norm_eps": 1e-5,
+        \\  "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        \\  "sliding_window": 8,
+        \\  "vocab_size": 128,
+        \\  "layer_types": ["sliding_attention", "full_attention"]
+        \\}
+    ;
+
+    /// bf16 array with an arbitrary shape (base_kernel is 3-D).
+    pub fn bf16ArrShaped(shape: []const c_int, seed: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        var total: usize = 1;
+        for (shape) |d| total *= @intCast(d);
+        const data = try testing.allocator.alloc(f32, total);
+        defer testing.allocator.free(data);
+        for (data, 0..) |*x, i| x.* = val(i, seed);
+        const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        var bf = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(bf);
+        try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(bf));
+        return bf;
+    }
+
+    pub fn writeAssistant2(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT2_CONFIG });
+        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        defer testing.allocator.free(st_path);
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try putV1AssistantWeights(map, s, false);
+
+        // Selector: codebooks ship SUFFIX-LESS, like the real checkpoint.
+        try putW(map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
+        try putW(map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
+        try putW(map, "candidate_selector.hidden_projection.weight", SEL_RANK, HIDDEN, 302, s);
+
+        // Dynamic convs per layer: base [2, ksize, H] + projection
+        // [2*ksize*groups, H].
+        const groups = HIDDEN / CONV_GS;
+        var key_buf: [128]u8 = undefined;
+        var li: usize = 0;
+        while (li < ASSISTANT_LAYERS) : (li += 1) {
+            inline for (.{ "attention_conv", "mlp_conv" }) |which| {
+                const base_shape = [_]c_int{ 2, CONV_K, HIDDEN };
+                const base = try bf16ArrShaped(&base_shape, 310 + li * 7 + which.len, s);
+                defer _ = mlx.mlx_array_free(base);
+                try put(map, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".base_kernel", .{li}), base);
+                try putW(map, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".kernel_projection.weight", .{li}), 2 * CONV_K * groups, HIDDEN, 330 + li * 7 + which.len, s);
+            }
         }
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
@@ -1713,6 +2690,209 @@ test "dflash: a sidecar shipping packed weights loads at its own declared width"
     const p = try paritySlices(a, b);
     try testing.expect(p.cos > 0.99);
     try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
+}
+
+test "dflash2: loader picks up selector + dyn convs; v1 assistant loads with neither" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s);
+
+    var m = try loadDflashQuant(io, allocator, s, dir_path, 0);
+    defer m.deinit();
+
+    try testing.expect(m.config.isDflash2());
+    try testing.expectEqual(@as(u32, TinyFix.SEL_RANK), m.config.selector_rank);
+    try testing.expectEqual(@as(u32, TinyFix.SEL_TOPK), m.config.selector_top_k);
+    const sel = m.selector orelse return error.TestExpectedSelector;
+    // Codebooks are gather tables: bf16, NEVER quantized, [vocab, rank].
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(sel.pred_codebook));
+    try testing.expectEqualSlices(c_int, &[_]c_int{ TinyFix.VOCAB, TinyFix.SEL_RANK }, mlx.getShape(sel.succ_codebook));
+    for (m.layers) |*lw| {
+        const ac = lw.attention_conv orelse return error.TestExpectedConv;
+        const mc = lw.mlp_conv orelse return error.TestExpectedConv;
+        try testing.expectEqualSlices(c_int, &[_]c_int{ 2, TinyFix.CONV_K, TinyFix.HIDDEN }, mlx.getShape(ac.base_kernel));
+        try testing.expectEqualSlices(c_int, &[_]c_int{ 2, TinyFix.CONV_K, TinyFix.HIDDEN }, mlx.getShape(mc.base_kernel));
+    }
+
+    // A v1 assistant never even looks for the DFlash2 weights.
+    var tmp_v1 = std.testing.tmpDir(.{});
+    defer tmp_v1.cleanup();
+    var v1_buf: [512]u8 = undefined;
+    const v1_path = v1_buf[0..try tmp_v1.dir.realPath(io, &v1_buf)];
+    try TinyFix.writeAssistant(io, tmp_v1.dir, v1_path, s);
+    var v1 = try loadDflashQuant(io, allocator, s, v1_path, 0);
+    defer v1.deinit();
+    try testing.expect(v1.selector == null);
+    try testing.expect(v1.layers[0].attention_conv == null);
+}
+
+test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // L=2 positions, H=4 channels, group_size=2 → 2 groups, ksize=2 taps.
+    const x_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const x_shape = [_]c_int{ 1, 2, 4 };
+    const x = mlx.mlx_array_new_data(&x_data, &x_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    // base[tap][channel]
+    const base_data = [_]f32{ 0.5, 0.5, 1.0, 1.0, 0.25, 0.25, 0.5, 0.5 };
+    const base_shape = [_]c_int{ 2, 4 };
+    const base = mlx.mlx_array_new_data(&base_data, &base_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(base);
+
+    // dynamic[pos][tap][group]
+    const dyn_data = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    const dyn_shape = [_]c_int{ 1, 2, 2, 2 };
+    const dyn = mlx.mlx_array_new_data(&dyn_data, &dyn_shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(dyn);
+
+    const out = try groupedDynConv(x, dyn, base, 2, s);
+    defer _ = mlx.mlx_array_free(out);
+    const got = try TinyFix.readF32(out, allocator, s);
+    defer allocator.free(got);
+
+    // out[t][c] = (base[0][c] + dyn[t][0][c/2]) * x[t][c]
+    //           + (base[1][c] + dyn[t][1][c/2]) * x[t-1][c], x[-1] == 0.
+    var want: [8]f32 = undefined;
+    for (0..2) |t| for (0..4) |c| {
+        const g = c / 2;
+        const tap0 = (base_data[c] + dyn_data[t * 4 + g]) * x_data[t * 4 + c];
+        const prev: f32 = if (t == 0) 0 else x_data[(t - 1) * 4 + c];
+        const tap1 = (base_data[4 + c] + dyn_data[t * 4 + 2 + g]) * prev;
+        want[t * 4 + c] = tap0 + tap1;
+    };
+    for (got, want) |a, b| try testing.expect(@abs(a - b) < 1e-5);
+}
+
+test "dflash2: convPrepare taps base_kernel[0], convFinish taps [1], kernels from the INPUT" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // H=4, group_size=2, ksize=2. Zero kernel_projection isolates the base
+    // halves: prepare must convolve with base[0] only, finish with base[1]
+    // only — with both leading dims equal to 2 a transposed reshape is
+    // silent, so the halves get DISTINCT values.
+    const H: usize = 4;
+    const groups: usize = 2;
+    const base_data = [_]f32{
+        // half 0 (prepare): tap0, tap1
+        2, 2, 2, 2, 0, 0, 0, 0,
+        // half 1 (finish): tap0, tap1
+        3, 3, 3, 3, 1, 1, 1, 1,
+    };
+    const base_shape = [_]c_int{ 2, 2, @intCast(H) };
+    const base = mlx.mlx_array_new_data(&base_data, &base_shape, 3, .float32);
+    var zeros_w = mlx.mlx_array_new();
+    const zw_shape = [_]c_int{ @intCast(H), @intCast(2 * 2 * groups) }; // dense pre-transposed [in, out]
+    try mlx.check(mlx.mlx_zeros(&zeros_w, &zw_shape, 2, .float32, s));
+    var conv = DynConv{
+        .base_kernel = base,
+        .kernel_projection = .{ .w = zeros_w, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() },
+    };
+    defer conv.deinit();
+
+    const x_data = [_]f32{ 1, 1, 1, 1, 2, 2, 2, 2 };
+    const x_shape = [_]c_int{ 1, 2, @intCast(H) };
+    const x = mlx.mlx_array_new_data(&x_data, &x_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    const cp = try convPrepare(&conv, x, 2, 2, s);
+    defer {
+        _ = mlx.mlx_array_free(cp.hidden);
+        _ = mlx.mlx_array_free(cp.finish_dyn);
+    }
+    const prep = try TinyFix.readF32(cp.hidden, allocator, s);
+    defer allocator.free(prep);
+    // prepare: out[t] = 2*x[t] + 0*x[t-1] → [2,2,2,2, 4,4,4,4]
+    for (prep[0..4]) |v| try testing.expectApproxEqAbs(@as(f32, 2), v, 1e-6);
+    for (prep[4..8]) |v| try testing.expectApproxEqAbs(@as(f32, 4), v, 1e-6);
+
+    const fin = try convFinish(&conv, x, cp.finish_dyn, 2, s);
+    defer _ = mlx.mlx_array_free(fin);
+    const finv = try TinyFix.readF32(fin, allocator, s);
+    defer allocator.free(finv);
+    // finish: out[t] = 3*x[t] + 1*x[t-1] → [3,3,3,3, 7,7,7,7]
+    for (finv[0..4]) |v| try testing.expectApproxEqAbs(@as(f32, 3), v, 1e-6);
+    for (finv[4..8]) |v| try testing.expectApproxEqAbs(@as(f32, 7), v, 1e-6);
+}
+
+test "dflash2: selectPath traces the pairwise-scored path, edges outvote unary logits" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // vocab 8, rank 2, k 2, m 2, H 2. Codebooks: pred[v] = [v, 1],
+    // succ[v] = [1, v]; hidden_projection = identity.
+    var pred_data: [16]f32 = undefined;
+    var succ_data: [16]f32 = undefined;
+    for (0..8) |v| {
+        pred_data[v * 2] = @floatFromInt(v);
+        pred_data[v * 2 + 1] = 1;
+        succ_data[v * 2] = 1;
+        succ_data[v * 2 + 1] = @floatFromInt(v);
+    }
+    const cb_shape = [_]c_int{ 8, 2 };
+    const eye = [_]f32{ 1, 0, 0, 1 };
+    const eye_shape = [_]c_int{ 2, 2 };
+    var sel = Selector{
+        .pred_codebook = mlx.mlx_array_new_data(&pred_data, &cb_shape, 2, .float32),
+        .succ_codebook = mlx.mlx_array_new_data(&succ_data, &cb_shape, 2, .float32),
+        .hidden_projection = .{ .w = mlx.mlx_array_new_data(&eye, &eye_shape, 2, .float32), .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() },
+    };
+    defer sel.deinit();
+
+    // blk_hidden rows: anchor (ignored), H1=[1,0], H2=[0,1].
+    const hid_data = [_]f32{ 9, 9, 1, 0, 0, 1 };
+    const hid_shape = [_]c_int{ 1, 3, 2 };
+    const hid = mlx.mlx_array_new_data(&hid_data, &hid_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(hid);
+
+    // draft logits: pos 0 favors {3:10, 5:9}; pos 1 favors {1:5, 6:4}.
+    var lg_data: [16]f32 = @splat(0);
+    lg_data[3] = 10;
+    lg_data[5] = 9;
+    lg_data[8 + 1] = 5;
+    lg_data[8 + 6] = 4;
+    const lg_shape = [_]c_int{ 1, 2, 8 };
+    const lg = mlx.mlx_array_new_data(&lg_data, &lg_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(lg);
+
+    var prng = std.Random.DefaultPrng.init(7);
+    var path = try selectPath(allocator, &sel, 2, hid, lg, 2, 0.0, prng.random(), s);
+    defer path.deinit(allocator);
+
+    // Pos 0: pred=anchor(2) → pred_row [2,1]; H1 ⊙ → [2,0]; edge = 2 for
+    // both candidates → unary decides: token 3 (12 vs 11).
+    try testing.expectEqual(@as(u32, 3), path.ids[0]);
+    // Pos 1: pred=3 → [3,1]; H2 ⊙ → [0,1]; edge = candidate id. Scores:
+    // token 1 → 5+1=6, token 6 → 4+6=10 — the EDGE flips the unary order.
+    try testing.expectEqual(@as(u32, 6), path.ids[1]);
+    try testing.expect(path.q == null);
+
+    // Sampled arm: q is a proper distribution over each candidate row and
+    // the drawn token's q is positive (the acceptance ratio's denominator).
+    var path_s = try selectPath(allocator, &sel, 2, hid, lg, 2, 1.0, prng.random(), s);
+    defer path_s.deinit(allocator);
+    const q = path_s.q orelse return error.TestExpectedQ;
+    for (0..2) |t| {
+        var total: f32 = 0;
+        for (q[t * 2 .. t * 2 + 2]) |qv| {
+            try testing.expect(qv >= 0);
+            total += qv;
+        }
+        try testing.expectApproxEqAbs(@as(f32, 1.0), total, 1e-5);
+        try testing.expect(q[t * 2 + path_s.chosen_idx[t]] > 0);
+    }
 }
 
 test "dflash: the draft-only lm_head shrinks the draft read and leaves verify alone" {
@@ -2164,6 +3344,107 @@ test "dflash fixture parity: encoder + two draft rounds vs transformers referenc
         std.debug.print("[dflash-fixture] round2 cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
         try testing.expect(p.cos > 0.99);
         try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
+    }
+}
+
+test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab model_mlx" {
+    // Fixtures: tests/dump_dflash2_fixtures.py on the real
+    // incoai/Qwen3.8-27B-DFlash2. Bars: block hidden cos + rms_ratio (the
+    // scale rule), and the selector path ids EXACTLY — both sides read the
+    // identical sparse logits and the identical bf16 hidden, so the trace is
+    // a pure-math question.
+    const fixtures_path = std.c.getenv("DFLASH2_FIXTURES") orelse return;
+    const assistant_dir = std.c.getenv("DFLASH2_ASSISTANT_DIR") orelse return;
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const file = try std.Io.Dir.openFileAbsolute(io, std.mem.span(fixtures_path), .{});
+    var rb: [65536]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = try rs.interface.allocRemaining(allocator, .limited(1 << 30));
+    file.close(io);
+    defer allocator.free(content);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const h: usize = @intCast(root.get("hidden_size").?.integer);
+    const nt: usize = @intCast(root.get("n_targets").?.integer);
+    const bs: usize = @intCast(root.get("block_size").?.integer);
+    const n_ctx: usize = @intCast(root.get("n_ctx").?.integer);
+    const anchor_id: u32 = @intCast(root.get("anchor_id").?.integer);
+    const vocab: usize = @intCast(root.get("vocab_size").?.integer);
+    const n_active: usize = @intCast(root.get("n_active").?.integer);
+    const m = bs - 1;
+
+    const ctx_stream = try fixtureF32Slice(allocator, root.get("ctx_stream").?);
+    defer allocator.free(ctx_stream);
+    const noise1 = try fixtureF32Slice(allocator, root.get("noise1").?);
+    defer allocator.free(noise1);
+    const round1_hidden = try fixtureF32Slice(allocator, root.get("round1_hidden").?);
+    defer allocator.free(round1_hidden);
+    const active_vals = try fixtureF32Slice(allocator, root.get("active_vals").?);
+    defer allocator.free(active_vals);
+
+    // Dense bf16 load — parity isolates the conv/selector math from the
+    // 8-bit serving default.
+    var model = try loadDflashQuant(io, allocator, s, std.mem.span(assistant_dir), 0);
+    defer model.deinit();
+    try testing.expect(model.config.isDflash2());
+    try testing.expect(model.selector != null);
+    try testing.expectEqual(bs, model.config.block_size);
+
+    // ── Conv block forward parity ──
+    var dctx = try DflashCtx.init(allocator, &model, 0);
+    defer dctx.deinit();
+    const caps = try fixtureCaptures(allocator, ctx_stream, n_ctx, nt, h, s);
+    defer {
+        for (caps) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(caps);
+    }
+    try appendContext(&model, &dctx, caps, 0);
+    const noise = try fixtureArr(noise1, bs, h, s);
+    defer _ = mlx.mlx_array_free(noise);
+    const hidden = try forwardBlock(&model, &dctx, noise, n_ctx);
+    defer _ = mlx.mlx_array_free(hidden);
+    {
+        const p = try parityVs(hidden, round1_hidden, allocator, s);
+        std.debug.print("[dflash2-fixture] block hidden cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
+        try testing.expect(p.cos > 0.99);
+        try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
+    }
+
+    // ── Selector path parity, on the REFERENCE's hidden (decoupled) ──
+    const ref_hidden = try fixtureArr(round1_hidden, bs, h, s);
+    defer _ = mlx.mlx_array_free(ref_hidden);
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    {
+        const buf = try allocator.alloc(f32, m * vocab);
+        defer allocator.free(buf);
+        @memset(buf, -10.0);
+        const ids_val = root.get("active_ids").?.array;
+        for (0..m) |t| {
+            for (0..n_active) |j| {
+                const id: usize = @intCast(ids_val.items[t * n_active + j].integer);
+                buf[t * vocab + id] = active_vals[t * n_active + j];
+            }
+        }
+        const l_shape = [_]c_int{ 1, @intCast(m), @intCast(vocab) };
+        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &l_shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        try mlx.check(mlx.mlx_array_set(&logits, f32_arr));
+    }
+    var prng = std.Random.DefaultPrng.init(1);
+    var path = try selectPath(allocator, &model.selector.?, model.config.selector_top_k, ref_hidden, logits, anchor_id, 0.0, prng.random(), s);
+    defer path.deinit(allocator);
+    const want_path = root.get("path_ids").?.array;
+    std.debug.print("[dflash2-fixture] path got={any}\n", .{path.ids});
+    try testing.expectEqual(@as(usize, m), want_path.items.len);
+    for (path.ids, want_path.items) |got, want| {
+        try testing.expectEqual(@as(u32, @intCast(want.integer)), got);
     }
 }
 

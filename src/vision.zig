@@ -430,6 +430,15 @@ pub const VisionEncoder = struct {
         return error.NoPatchGridEncoder;
     }
 
+    /// Encode one VIDEO: `patches` holds `grid_t` temporal-patch groups'
+    /// pixel_values concatenated (see `qwen_vision.buildPixelValuesVideo`).
+    /// Only Qwen3-VL-family checkpoints declare `video_token_id` — muse and
+    /// lfm2 have no video path.
+    pub fn forwardVideoPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        if (self.qwen) |*qv| return qv.forwardVideo(patches, grid_t, grid_h, grid_w);
+        return error.NoVideoEncoder;
+    }
+
     /// Apply a quantized (or dense) Linear y = x · Wᵀ (+ optional bias). `sc`
     /// non-empty (ndim>0) selects the quantized path; otherwise a plain matmul.
     fn quantLinear(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, qb: mlx.mlx_array, bits: u32, bias: ?mlx.mlx_array) !mlx.mlx_array {

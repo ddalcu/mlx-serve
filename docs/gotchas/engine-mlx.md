@@ -2648,3 +2648,942 @@ held the same 31 accepts and 68.9% per-draft rate at 249.9/247.1 tok/s, with
 identical output plus a restore line and preserved warm throughput—not
 identical speculative round partitioning, which may legitimately improve
 when the restored history extends the accepted chain.
+
+## ANE prefill-MLP offload (`--ane-prefill`, 2026-08-17, perf-plan-aug-17 P5)
+
+Splits each FULL-width prefill chunk's dense SwiGLU MLP rows between the GPU
+and the Apple Neural Engine (private AppleNeuralEngine.framework via the
+bridge vendored from maderix/h3.c-ane in `lib/ane/`, int8 per-row weights, fp16 datapath).
+Measured M4 Max, Qwen3.8-27B MTPLX 6-bit, ABA-counterbalanced boots vs the
+same binary without the flag: prefill **+12% median at 16k, +18% at 32k**
+(best boots +15/+20), decode byte-flat, greedy echo output byte-identical
+on/off at 200 tokens, prose coherent. Opt-in, default OFF, lossy by design
+(decode-attn-quant precedent).
+
+War stories, each of which cost real time:
+
+- **`ANECCompile() FAILED` bare on every layer, while the identical program
+  compiled in the standalone harness.** The only difference was the staging
+  directory: the compile runs inside `aned`, a separate daemon that cannot
+  read `~/.mlx-serve/...`. Staging must stay in `$TMPDIR`; only the
+  content-addressed cache entries persist under `~/.mlx-serve/ane-cache`
+  (same APFS Data volume, so the bridge's hardlink mirror still costs
+  nothing). The error string carries NO reason — if every layer fails
+  instantly, suspect the path before the program.
+- **A single K=17408 down conv runs the whole MLP at 4.3 TFLOPS; K-chunking
+  it into 4x4352 in-graph slabs (slice_by_size + partial convs + adds)
+  restores 11.8 TFLOPS** — flat across rows 512-4096, above the stage-1
+  blended GEMM estimate. ANE convs fall off a cliff somewhere past K~14336
+  (h3's own fc2 width, which works). The weight blob must be re-packed as
+  contiguous [out, K/n] slabs — BLOBFILE reads are contiguous.
+- **The share optimum is a measured hump, not a rate ratio**: 0.30 → +10/+14,
+  0.40 → +12/+18, 0.50 → back to the 0.30 level (ANE becomes the critical
+  path; its 11.8 TFLOPS vs the GPU's effective MLP rate would have predicted
+  ~0.45). `MLX_SERVE_ANE_SPLIT` overrides the 0.40 default.
+- **Stage-A parity method that made this safe to ship**: real layer-0 weights
+  from the bf16 source pack, int8-per-row requant, numpy fp32 ground truth,
+  cos >= 0.999 AND rms_ratio ~1 (cosine alone cannot see scale errors), THEN
+  16x amplitude probes for fp16 range. Per-row int8 alone is ~free
+  (cos 1.0000); the fp16 datapath lands at cos 0.99993. The down conv always
+  wears h3's (1/16..x16) power-of-two wrap: exact in fp16, zero measured
+  cost, 16x accumulator headroom against later-layer activation outliers.
+- **Fixed shapes bind the whole design**: one compiled program per layer per
+  ROW TILE; the forward seam (`denseMLPMaybeAne`) engages only when
+  `seq_len == chunk_rows` exactly, so tail chunks and short prompts run
+  GPU-only by construction, and the tile must be derived from the SAME
+  chunk resolver the forward uses (`server.pinPrefillChunk`, passed into the
+  scheduler as a function pointer — the scheduler deliberately has no
+  server.zig import). The build runs on the inference thread (mlx dequant =
+  sole-MLX-caller rule); only `msv_ane_mlp_eval` runs on the dedicated ANE
+  thread.
+- **`msv_ane_model_eval` (h3_ane_* before the 2026-08-18 rename) returns 1 on SUCCESS** — the
+  stage-1 spike lost an hour to reading it as a C error code.
+- Boot cost: cold build ~80-95 s for 64 layers (compile + dequant + host int8
+  quant), warm cache ~25-60 s; int8 copy ~16.3 GB wired for the 27B, hence
+  the >= 96 GB total-RAM gate (named refusal, GPU-only serve).
+- **Addendum (2026-08-18): the compile cache is content-addressed and NOTHING
+  invalidates it** — every distinct (weights x rows) combination adds a
+  ~250 MB entry forever. One evening's share sweep left 221 entries / 49 GB,
+  the Data volume hit 100%, and the NEXT model's ANE build failed from layer
+  17 on with a bare `ANECCompile() FAILED` — the server came up happily
+  advertising `[ane] prefill offload ready: 19/64 layers` and ran the A/B at
+  30% coverage. Two lessons: (a) `bridge_cache_prune` now LRU-prunes past
+  `MLX_SERVE_ANE_CACHE_CAP_GB` (default 40) on the cold-compile path, with
+  restores touching the entry mtime; (b) when ANE compiles fail with no
+  error text, check DISK before blaming the program — the same bare failure
+  spelling covers both the unreadable-staging-path and the no-space cases.
+- **Cross-engine note (same pack, same instrument, M4 Max, 2026-08-18)**:
+  oMLX 0.6.1's ANE prefill uses the SAME private-API technique
+  (byte-identical MIL boilerplate) but splits each projection's OUTPUT
+  CHANNELS (fraction 0.53) and also offloads GDN input projections; ours
+  splits TOKEN ROWS through one fused MLP graph. On
+  Qwen3.8-27B-oQ4e-mtp, TTFT-measured: their on/off +21.0/+21.1% at
+  16k/32k, ours +14.1/+19.6% from MLP-only — absolute prefill near-tie at
+  16k (298.4 vs 294.5), ours ahead at 32k (285.2 vs 277.9), and our OFF
+  baseline is 4-5% faster to begin with. Their `dual_ane` default FAILS its
+  bank compile on single-ANE Macs and falls back slower — set it false
+  there. GDN-prework offload is the coverage we lack; it is the v2 lever.
+
+## ANE prefill v2: fp16 planes, GDN offload, int4 NO-GO (2026-08-18)
+
+- **fp16 I/O planes are NOT bit-lossless vs the f32 planes, and the reason is
+  the COMPILER, not the seam**: bf16→fp16 is exact in fp16's normal range and
+  the graph computed fp16 either way, so the v2 plan assumed byte-identity.
+  Measured (production emitter vs the validated Stage-A f32-plane dump, same
+  weights, same input, rows=1024): 8 of 5,242,880 values differ by exactly
+  one fp16 ulp (1.5e-5). With a trailing cast-to-fp32 in the graph,
+  ANECCompile evidently keeps the last op(s) wider before the output cast;
+  with a bare fp16 output it rounds earlier — double-rounding on near-tie
+  values. Consequence: greedy 16k output on the 6-bit 27B is no longer
+  byte-identical ANE-on vs off (v1's byte-identity was one prompt's luck on
+  a LOSSY-by-design path — ane.zig's own header always said bytes are not
+  expected to match). The bars that survive: reference parity per program
+  (cos/rms vs fp32) + perceived-content equivalence of greedy output. Both
+  live arms summarized the same text the same way with synonym-level drift.
+- **GDN input projections ride ONE fused conv**: in_proj_qkv + in_proj_z are
+  per-token-independent linears over the same input, so stacking rows into a
+  single [qkv_out+z_out, hidden] weight is byte-equivalent to two convs +
+  concat with one op fewer. K=5120 needs no chunking (the cliff was 17408)
+  and |y| < 1 measured needs no accumulator wrap — the gate/up regime.
+  Parity on real layer-0 27B weights: cos 0.999955 / rms 1.0001 vs fp32,
+  cos 1.000000 vs the int8-dequant reference; 11.2 TFLOPS eval. The seam
+  (`gdnProjMaybeAne`) mirrors `denseMLPMaybeAne`; a/b projections (48-wide)
+  stay GPU; qwen3_next's combined-proj arm stays GPU. `MLX_SERVE_ANE_GDN=0`
+  = MLP-only mode (the attribution lever), and each seam logs ITS OWN
+  one-shot engagement line — a single shared line can't tell a dead seam
+  from a live one when the other seam logs first.
+- **ANE compile failures late in a long sequential build are usually the
+  BUILD's OWN disk growth, and they are TRANSIENT either way**: a fresh
+  64-layer 27B build writes ~17 GB of cache entries AS IT GOES (~267 MB per
+  layer), so a boot started with 12-16 GB free fails from layer ~59 on with
+  the same bare "compile failed: ?" the full-disk class produces — the disk
+  was fine at boot and full by layer 59. One later boot failed 3 mid-run
+  layers with space apparently available (aned/staging transients at the
+  margin); every failed layer succeeded on the next attempt in both cases.
+  `buildAnePrefill` now runs ONE retry pass over still-null layers (2 s
+  beat first); dequant failures are deterministic and deliberately don't
+  trigger it. A partial build used to stay partial for the whole serve.
+  Budget rule: a cold build needs `entry_bytes(config) + staging` FREE
+  BEFORE it starts (the `MLX_SERVE_ANE_CACHE_CAP_GB` prune only bounds the
+  steady state, not the burst), and clearing `~/.mlx-serve/ane-cache/
+  entries/` is always safe — it is a pure compile cache.
+- **int4 ANE weights are a NO-GO on this OS build (macOS 26.x aned), fully
+  bisected**: with the int8 control compiling in the same session,
+  (a) `constexpr_affine_dequantize` with int4 data → clean `ANECCompile()
+  FAILED` (the op is int8/uint8-only by spec); (b)
+  `constexpr_blockwise_shift_scale` (ios18, the int4 op) → "Couldn't
+  communicate with a helper application" in EVERY form (int4, uint4+offset,
+  per-row or g64 scales) — the in-memory compile path's MIL parser predates
+  the op and crashes; (c) ios16 `constexpr_lut_to_dense` (16-entry palette =
+  4-bit) → `ANECCompile() FAILED` too. No sub-byte constexpr form exists
+  here, so the ANE copy stays int8 (~20.2 GB wired with GDN on the 27B:
+  16.3 MLP + 3.9 GDN). Memory parity with
+  oMLX's channel-split (~5-9 GB) is NOT reachable by width on this OS;
+  channel-split redesign is the separate decision the plan named. The
+  ADMISSION side was fixed instead (2026-08-18, follow-up): the flat
+  96 GB total-RAM gate refused a 1 GB bill on a 64 GB Mac and said
+  nothing about why — it is now a per-model bill (`ane.engineBillBytes`:
+  int8 copies + the per-layer fp16 IOSurface planes, ~32 GB on the 27B
+  at rows 3264 — the planes are ~11 GB of that, a shared-plane
+  optimization candidate) admitted by `gateAllows(total, resident,
+  bill)` with 12 GB headroom, resident read from mlx active memory at
+  build time. The refusal quotes every number it compared (the
+  context-overflow-400 rule). Any affine pack width feeds the build
+  (4/6/8-bit measured; the dequant→int8 path is width-blind); only
+  dense bf16 declines. Probes:
+  ~/claude-tmp/perf-aug17/p5-ane-v2/probe_int4.c + probe_lut4.c. Also
+  learned there: a probe conv at ROWS=16 reads garbage columns — the
+  IOSurface plane row pitch wants 64-byte alignment, so probe shapes use
+  ROWS≥32 (fp16) before concluding anything about op semantics.
+
+## ANE staging leak + the compile-budget mystery, RESOLVED (2026-08-18, late)
+
+The "transient aned pressure" and "build fails itself with entry bytes"
+stories above were both wrong about the mechanism (kept for the record; the
+numbers were real). One night of declining coverage (112 → 63 → 36 → 29
+programs per boot) bisected to TWO interacting facts:
+
+- **A killed ANE server leaks its staging.** Nothing frees
+  `$TMPDIR/<identifier>` when the process dies (h3-era free() only runs on
+  clean deinit), so every killed `--ane-prefill` boot left 8-20 GB of
+  orphans, and internal free disk marched to zero across the night.
+- **A compile session's budget IS the internal free disk at boot.** The
+  compiler service keeps per-connection intermediates (root tmp, invisible
+  to the user) for the client's LIFETIME: ~260 MB per program. When they
+  exhaust free space, `saveModelFiles`/`ANECCompile` fail — the unified log
+  says `Write weightsFilePath failed` (our pid), our error string is the
+  bare "compile failed: ?" — and IN-SESSION retries can never succeed, which
+  is why the escalating-drain retry experiment recovered almost nothing.
+  A fresh process gets a fresh connection and a fresh budget.
+
+Consequences and fixes:
+- Marker + reap: every staging dir gets `msv-ane.pid`; the first create of a
+  process removes marked dirs whose owner is dead. (Path-scoping is
+  impossible: `_ANEInMemoryModel` operates at `$TMPDIR/<identifier>`
+  EXACTLY — a subdirectory fails every compile.)
+- Weights blob + MIL text are deleted post-load (compile inputs only —
+  proven by warm mirrors, which never had them). The COMPILED artifacts
+  must stay: aned demand-reads them during serving; deleting them passes an
+  immediate eval and then fails later evals with "ANEProgramProcessRequest
+  ... Program Inference error" (352 failures over one benchmark serve).
+- Cold builds bigger than free-disk/260MB converge ACROSS boots via the
+  entries cache (warm restores consume no compile budget). Bench harness:
+  `converge_boot.sh` boots until the ready line reports full coverage, then
+  the measured boot runs warm. `MLX_SERVE_ANE_CACHE_DIR` + TMPDIR can both
+  point at an external volume (aned reads it fine; same-volume hardlinks
+  keep restores free) — but the SERVICE's own intermediates stay internal,
+  so internal headroom still bounds fresh compiles per boot.
+- Dead theories, tested: not the compiler-service lifetime (fresh service
+  via the int4 poison-MIL crash still failed), not wired/kernel ANE memory
+  (ioclasscount clean), not TM snapshots (none), not external-SSD latency.
+
+## ANE v3 (ane-plan-aug-18): the 0.35 "tiling cliff" was eval-death, shared planes, and the channel split (2026-08-18)
+
+### A3 — the share-0.35 collapse was never a rate cliff: fp16 plane pitch must sit on the 64-byte grid
+
+The v2 sweep's share-0.35 cell (rows 2864) landed BELOW the off arm at full
+coverage and was recorded as a "suspected ANE tiling cliff on non-64-multiple
+row tiles". The standalone harness answered it in minutes and the suspicion
+was wrong twice over:
+
+- Rows 2864 and 2896 (both ≡ 16 mod 32) do not run slow — their compiled
+  programs FAIL EVERY EVAL with a bare `ANEProgramProcessRequestDirect ...
+  Program Inference error` (status 0x1d). The compile succeeds silently.
+- Rows 2880, 2912, 3264 and 3680 (all ≡ 0 mod 32, including two that are
+  NOT 64-multiples) all run at the same flat ~11.7–11.9 TFLOPS. There is no
+  rate cliff among legal tiles at all.
+
+The mechanism is the plane layout: a channel-major fp16 plane's per-channel
+pitch is `rows × 2` bytes, and the ANE wants each channel row on a 64-byte
+boundary → rows ≡ 0 mod 32 for fp16. v1's f32 planes only needed rows ≡ 0
+mod 16 (`16 × 4 = 64`), which is why v1's 0.30 arm (rows 2448, ≡ 16 mod 32)
+worked and v2's fp16 planes broke exactly when the share sweep left the
+64-multiple rows. The 16-row probe-conv garbage-columns note from v2 is the
+same rule one octave down.
+
+What made the live cell collapse below OFF: the engine's per-chunk fallback.
+Every chunk paid pack + kick + failed eval + a full GPU recompute of the ANE
+rows, serially — 448 `[ane] eval failed` lines in the 0.35 sweep log, zero
+in 0.40's. An eval-time failure that presents as a perf number is the
+worst-dressed dispatch hole yet.
+
+Fixes: `aneShareRows` floors to 32-row multiples; both C emitters REFUSE
+rows % 32 by name at create time ("the fp16 plane pitch (rows x 2 bytes)
+must sit on the 64-byte grid") so the class dies at build, not at serve.
+The second A3 loose end also closed: row-mode share 0.45 at FULL coverage
+(the v2 sweep's 0.45 ran partial GDN) measured 294.8/291.3 vs row-0.40's
+304.3/294.6 same-session — 0.40 stays the row-mode optimum.
+
+### A9 — shared I/O planes: evals are serial, so planes are per SHAPE CLASS
+
+Every compiled program allocated its own input + output IOSurface pair
+(~11 GB across 112 programs on the 27B at rows 3264) while evals are
+strictly serial — one in-flight kick/wait. Three surfaces serve everything:
+one input (hidden × rows — MLP and GDN read the same shape), one MLP output
+(hidden × rows), one GDN output ((qkv+z) × rows). Proven by harness before
+wiring: two programs with DIFFERENT weights bound to the same pair,
+interleaved evals A/B/A, each matching its own fp32 reference
+(~/claude-tmp/ane-v3/probe_shared.c). The engine (`AnePrefill.init`) owns
+the planes (`msv_ane_plane_create`), creates retain them, `engineBillBytes`
+bills per shape class — the 27B's row-mode bill fell ~32 GB → ~20 GB in the
+same change (the gate must not keep billing memory the engine stopped
+using). One care point inherited by the C side: `mlp_bind_planes` must not
+memset a SHARED plane (that would wipe another program's live contents);
+only fresh per-program surfaces are cleared.
+
+### A1 — channel split: same speed as row at 40% of the bytes, and it wins the sweep at 0.45
+
+Design shipped behind `MLX_SERVE_ANE_MODE` (channel is now the DEFAULT; row
+remains selectable): the ANE holds output channels [0..k) of gate/up (and
+qkv/z), the GPU the rest, both units see ALL chunk rows; the down projection
+contributes a PARTIAL sum over the ANE's K-slabs, added to the GPU partial
+at the seam (one extra add per layer). Key implementation facts:
+
+- **The spike needed no new MIL**: a channel-slice MLP program IS
+  `msv_ane_mlp_create` at `ffn' = k` with sliced weights (gate[:k,:],
+  up[:k,:], down[:,:k]) — the emitter already K-chunks the down conv and
+  wraps the accumulator. Slice-width rates measured flat (11.6–12.3 TFLOPS
+  at k ∈ {5184, 6912, 8704, 12160} × S 8192); the share-0.4-equivalent cell
+  is ~3% FASTER than row-split's same-FLOPs tile.
+- **The GPU complement's gate/up/qkv/z rests are zero-copy axis-0 slice
+  VIEWS of the resident packed weights** — pinned bit-exact through
+  quantized_matmul against both the materialized copy and the full-output
+  slice (the "axis-0 slice VIEW" test in transformer.zig). Only the down
+  rest (axis-1, not contiguous) is materialized (~1.7 GB at share 0.45 on
+  the 27B). Slice boundaries align to 128 (`CHANNEL_ALIGN`) so every quant
+  geometry's group and packed-word grids divide.
+- **Counterbalanced A/B** (27B oQ4e, M4 Max, 2 boots/arm, 2 reps/cell,
+  medians): channel-0.45 **306.4/301.1**, row-0.40 300.7/294.3, off
+  258.2/239.0 at 16k/32k → channel +18.7%/+26.0% over off at 9.3 GB ANE
+  bytes (9.0 int8 + 0.27 planes) vs row's 20.4 GB. Channel share sweep:
+  0.40 → 305.4/291.4, 0.45 → 310.8/303.6, 0.50 → 296.9/289.9 (same
+  ANE-becomes-critical-path rollover as row, one notch later; per-mode
+  defaults: channel 0.45, row 0.40). Greedy 16k perceived-content
+  equivalence held (summaries fork at a mid-sentence near-tie — the
+  lossy-by-design signature). RSS on-arm ≈ off + 5–9 GB vs row's +12–20.
+- **Failure containment**: a failed channel eval cannot use the GPU rest
+  partial alone — the whole layer recomputes from the ORIGINAL weights
+  (denseMLP(x, dw)); same for GDN.
+
+### A7 + the chunk-policy dispatch hole — MoE gets GDN-only coverage, and the ANE tile must be sized by effectivePrefillChunk
+
+The A7 arithmetic spike on the 35B-A3B: offloadable per-token weight MACs
+are 37.5% — but the shared expert is only 5.4% (stays GPU, as the plan
+guessed) while the separate-proj GDN input projections are 32.1% (hidden
+2048 × qkv+z 12288 vs tiny 512-wide expert MLPs). So `buildAnePrefill` now
+accepts MoE qwen3_5_moe checkpoints for GDN-ONLY coverage (the dense-MLP
+loop finds no .dense arms; routed experts can never ride fixed shapes).
+
+First live run: 30 GDN programs built, ZERO engagements, on == off. The
+engine compiled its tile at the PINNED chunk (8192) while the MoE forward
+chunks at 4096 — `boundedPrefillChunk`'s MoE cap, applied per request by
+`effectivePrefillChunk`, which the build never consulted. Built-but-never-
+dispatched, invisible to everything but the engagement count (and latent
+for DENSE models under an explicit `--prefill-chunk` narrower than the
+pin). The scheduler's build site now resolves the tile through
+`generate.effectivePrefillChunk` with a representative-large total_ctx
+(ctx-independent under the default fused-causal mode), source-scan-pinned.
+Fixed: 35B-A3B GDN-only measured **+3.9% at 16k** (median 1767 vs 1701,
+counterbalanced, engagement-verified) for 315 MB int8 + ~230 MB planes.
+
+### A8 — observability + the disk floor
+
+`/props` gains an `"ane"` object (mode, mlp/gdn layer counts, rows,
+chunk_rows, share, int8_bytes) and `--metrics` the gauge pair
+`mlx_serve:ane_int8_bytes` / `mlx_serve:ane_layers`, fed by process-global
+atomics the engines publish (`ane.publishLive` / deinit — zero-when-off
+holds by construction). Pre-build, `buildAnePrefill` probes internal free
+disk (`msv_ane_internal_free_disk`, /private/tmp — aned's scratch volume
+regardless of TMPDIR): under a 1 GiB hard floor the build is REFUSED by
+name (below it even cache restores and the framework's own saves fail bare
+and coverage ships partial — the 2026-08-18 class); under a fully-cold
+build's budget it logs the convergence expectation instead. Still open
+from A8: building in the background after serving starts (the dequant
+stage is inference-thread-bound; queue it between requests).
+
+## DFlash 2 port (incoai/Qwen3.8-27B-DFlash2, 2026-08-18)
+
+inco.ai's DFlash 2 extends the v1 block drafter with two trained modules
+(blog: 4.80 mean acceptance vs MTP 4.28 on this trunk): a **path selector**
+(top-16 candidates per position by draft logit; adjacent pairs scored
+`S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t), succ(b)>` through two 256-dim
+per-token codebooks + a hidden→rank projection; path traced from the anchor)
+and **grouped dynamic causal convs** (two-tap depthwise, `base + dynamic`
+kernels, the dynamic part projected per position from each sublayer's normed
+input, 16 channels per coefficient) wrapped around every attention and MLP
+sublayer. Everything else is v1 machinery unchanged. The oracle is
+z-lab/dflash's `dflash/model_mlx.py` — read the code, not the blog.
+
+What bit, in order:
+
+- **The checkpoint's names are z-lab's, not transformers'**: root `fc` +
+  `hidden_norm` where the muse assistant says `encoder.fc` +
+  `encoder.output_norm_enc`, and the codebooks ship with NO `.weight`
+  suffix (`candidate_selector.predecessor_codebook`) — the reference loader
+  renames them before `load_weights`. The loader probes both spellings.
+- **`model_type` is a bare "qwen3"**, so a scanned copy registered as a
+  standalone chat model and would die at cold load (no embed weights).
+  `peekConfig` now consults `dflash.isDflashConfigJson` (the loader's own
+  contract predicate) and returns a `.drafter` classification before ever
+  reading `model_type` — the `*_assistant` suffix rule alone was a list of
+  the exports that happened to be polite.
+- **The trunk-side capture seam had been REVERTED with the DSpark port**
+  (2026-08-16, preserved at ~/claude-tmp/dspark-qwen38/). Plan said "the
+  seam already works on Qwen3.8" — it had been PROVEN, then reverted with
+  the rest of that experiment. Re-landed from the patch: capture site in
+  `forwardMoeWith`, bind gate `supportsLayerCapture` (standard + moe/GDN),
+  and nextDflash's GDN arms (anchor = `moe_seq_offset`, `capture_ssm_seq`
+  verify, `ssmRollbackFromCapture` + kv_step preservation on partial
+  accept — mirrors nextMtp).
+- **The ngram spec-gate scores the PROMPT and every novel prompt scored
+  0.000** (< threshold 0.010), so the drafter silently never engaged — the
+  muse arm of test_dflash.sh had been passing on template luck (harmony
+  markers recur; qwen's template doesn't). All dflash-on test arms now
+  pass `enable_drafter:true`, the documented explicit override. Gate
+  retune for DFlash2's novel-content acceptance stays a measured question.
+- **Selector implementation shape**: all pairwise edges precomputed on GPU
+  in ONE batched eval (anchor row [k] + [m-1, k, k] via
+  `(pred_rows ⊙ H) @ succᵀ`), then a trivial 16-wide host trace — same
+  math as the reference's sequential loop, chosen path identical, no
+  per-step sync. Sampled arm: q = softmax(scores/temp) over the 16 (no
+  top-p/top-k inside the selector, reference behavior), exact for the
+  Leviathan ratio; residual correction scatters the 16 q values into a
+  [1, V] row (`selectorQRow`, put_along_axis).
+- **Conv transcription traps**: `base_kernel` axes are `[prepare|finish,
+  tap, channel]` — BOTH leading dims are 2 at ksize 2, so a transposed
+  reshape is silent; the finish kernels come from the sublayer's INPUT
+  (prepare time), not its output; block position 0's predecessor tap is
+  the reference's ZERO pad (block-local, never the previous block). The
+  hermetic prepare/finish orientation test uses distinct base halves +
+  zero projection; the real-checkpoint fixture
+  (`tests/dump_dflash2_fixtures.py`) pins block hidden at cos 0.9998 /
+  rms 1.0018 and the greedy path ids EXACTLY (sparse synthetic logits +
+  the reference's own bf16 hidden on both sides, so the trace is pure
+  math).
+
+Live (M4 Max, oQ4e trunk, block capped 5): novel prose 58.3% per-draft /
+2.33 accepted per round, echo 83-96%, hybrid DflashSnap prefix-cache
+restore works (cold==hit). test_dflash.sh 14/14 on qwen, 13/13 muse v1.
+
+Bench (same session, oQ4e trunk, greedy, prefix cache off, 2 counterbalanced
+boots per arm, per-cell medians of 3 reps; one prompt per cell — thin, treat
+deltas under ~5% as suggestive): novel — MTP 65.7 tok/s (2.49/round) >
+dflash2 v1-arms 64.6 (2.75) > dflash2 selector 62.5 (2.66); echo — MTP 79.5
+(4.89) > 78.5 ≈ 78.2; serial 28. At the M4-capped block 5 the SELECTOR
+slightly loses to plain argmax drafts; at its trained block 8 it wins
+(+16% acceptance, 3.69 vs 3.17, 44.7 vs 39.6 tok/s novel) — but block 8 is
+the split-K dead zone on M4, so block 5 stays optimal and **MTP stays the
+default on this machine**. The selector's value is real and width-gated:
+re-measure on an M5/NAX box where block 8 is servable. No default flipped.
+
+Follow-ups (same day): inco also released Muse-Glimmer-30B-DFlash2
+(finetuned from the official muse assistant). Its config adds
+`final_logit_softcapping: 20` + `output_multiplier: 0.196` under
+`dflash_config` — the borrowed trunk head is the BARE Linear and argmax
+drafts don't care (monotone), but the selector SUMS unary logits with
+codebook edges and the sampled arm softmaxes them, so both fields are
+parsed and applied in `draftLogits` (`applyLogitTransforms`, scalars cast
+to the logits dtype). 14/14 live on muse, byte-equal greedy at 8-bit.
+Muse bench (single boot, block 5): DFlash2 ≈ v1 assistant — echo both at
+the block-5 ceiling (3.97 vs 3.87 per round; their README's "acceptance
+length" counts accepted+1, so our 3.97 is 4.97 on their scale, the max at
+block 5), novel both runtime-gate-disabled at 0.50/round. Two findings:
+(1) drafter acceptance is a THINKING-MODE property — same prompt, muse
+DFlash2 thinking-off 12.5% per-draft (gate-disabled in 4 rounds) vs
+thinking-on 47.8% (engaged throughout); the sidecars are trained on
+reasoning-mode outputs and inco's own eval runs high reasoning strength.
+(2) The ngram spec-gate is now DFLASH-EXEMPT (all four surfaces,
+`lm.dflash == null` conjunct): the runtime yield gate already cuts losses
+within ~4 rounds on realized acceptance, and llmprobe/bench request
+bodies cannot carry `enable_drafter:true`, so the ngram gate made every
+external tool silently bench serial decode. The gemma cross-attention
+drafter keeps the gate. Guard: test_dflash.sh [3b] (an implicit novel
+request must still produce a mode=dflash stats line, counted by [6]).
+
+---
+
+## The Alis MTP head: a quantized `fc`, and a norm "repair" that broke a correct pack (2026-08-19)
+
+Three `avlp12/Qwen3.8-27B-Alis-MLX-{4,6,8}bit` packs measured well on divergence
+(96.3 / 94.7 / 86.5 top-1) but could not get an honest speed row: their MTP head was
+disabled at load with `MTP sidecar incompatible with target (MtpTargetMismatch)`.
+
+**1. `fc` can ship QUANTIZED.** Every pack we had served ships `mtp.fc.weight` dense
+bf16 `[5120, 10240]`. Alis ships `fc.weight` U32 `[5120, 1280]` + `fc.scales`/`.biases`
+bf16 `[5120, 160]` (4-bit: 1280 × 8 = 10240 logical, 10240/64 = 160 groups). `bind`
+compared the PACKED shape against `hidden_size * 2` and refused the whole head. `fc`
+was the last dense-only linear in the head for two mechanical reasons — it was loaded
+by `ownAndTranspose2D` instead of `loadLinear`, and its forward was a plain
+`mlx_matmul` — even though the Hy3 arm three lines above that matmul already did the
+quantized thing through `qLinearFwd`. It is now a `QLinear` like every other weight:
+`loadLinear` takes the `.scales` branch for free, `bind` solves the logical input width
+from packed geometry (`fcMatchesHidden` → `affineParamsFromGeometry`), and the forward
+is `qLinearFwd`. No transpose and no dequant: packed `[out=H, in=2H]` is exactly what
+`quantized_matmul(transpose=true)` wants. Two smaller sites move with it — the
+hidden-size inference reads axis 0 on the quantized arm (packed columns are not `H`)
+and axis 1 on the pre-transposed dense one, and the warmup eval list carries the scales
+and biases. The m5Nax cost profile still requires `fc` to be bf16, so a quantized-fc
+pack falls to `.generic` rather than claiming a surface nobody calibrated — right
+answer, not a bug.
+
+**2. The head-norm repair convicted a correct norm.** With the head bound, the first
+live boot logged `[mtp] repairing head norm …post_attention_layernorm: mean 1.206 <
+backbone anchor 1.930 (+1)` and decoded at 33.3% per-draft acceptance, half of what a
+4-bit Qwen3.8 head gets. The oQ repair fires when a head norm sits more than 0.4 below
+the mean-of-means of its backbone counterparts. Alis's norms are ALREADY folded — its
+post_attn is 1.2063, the exact value `ddalcu-4bit`'s delta 0.2063 folds to, and
+identical to `jundot-oQ4e`'s — but this model's backbone post_attn norms span 0.02 to
+2.24 with a 1.93 mean, so a correct head norm sits 0.72 under the anchor and got a
+second +1. Whether the repair fires at all depended on which shards the head's keys
+pulled in (no backbone counterpart in the payload ⇒ no anchor ⇒ no repair), which is
+why `jundot-oQ4e` — the same norms, the same values — never tripped it.
+
+The gap alone was never evidence. `mtpNormNeedsRepair` now also takes the norm's OWN
+negative fraction: a folded gamma is strictly positive by construction (the same
+evidence the whole-head `mtpNormsAreDeltaEncoded` reads), a delta one always carries
+some negatives. The per-tensor bar is `> 0`, NOT the detector's 5%: measured on
+`ddalcu-4bit`, the vulnerable norms are only 0.16–0.78% negative (input_layernorm at
+50% is what makes the whole-head probe work), so a 5% bar here would block every legit
+repair. After the fix the same boot drafts at 70.5% and decodes 44.4 → the
+speed-cell 68.7 tok/s.
+
+Guards: `mtp: a QUANTIZED fc loads verbatim and binds (avlp12 Alis layout)` (packed
+`fc` through `loadMtp`, plus `fcMatchesHidden` accepting hidden 16 and rejecting 8),
+the repair-rule unit test (a positive norm 0.72 under its anchor is NOT repaired), and
+the in-checkpoint oQ4e loader test, whose "broken" q_norm fixture had to become an
+actually delta-encoded tensor (one negative in 32 — under the 5% whole-head bar, or the
+global fold fires and the test measures the wrong path).
+
+## ANE prefill is M4-and-below: NAX-class GPUs refuse it by name (PR #223, 2026-08-19)
+
+The M4 win never transferred up. Two independent M5 Max testers ran the counterbalanced
+ANE A/B from `NOTE_TO_TESTER_ANE_DFLASH2.md` and both measured a LOSS at the shipped
+default (channel mode, share 0.45): median −11% prefill at 16k and −7.5% at 32k against
+the same boot without `--ane-prefill`. The mechanism is not an ANE regression — the M5's
+NAX-class GPU prefill is simply faster than the ANE seam's critical path, so every token
+the ANE takes is a token the GPU would have finished sooner. The share sweep does not
+rescue it: the rollover the M4 sees at 0.50 arrives before the seam breaks even on M5.
+
+Decision (user, 2026-08-19): ANE prefill is for M4-and-below. `ane.anePrefillAllowed`
+(pure: nax bool + the `MLX_SERVE_ANE_FORCE` env value, hermetically tested) gates the
+build at the scheduler's ANE site — a NAX machine logs
+`[ane] --ane-prefill disabled: NAX-class GPU prefill already outruns the ANE seam
+(measured a loss on M5 Max, PR #223); MLX_SERVE_ANE_FORCE=1 overrides` and skips the
+build entirely. `/props` ane stays absent, exactly as an off boot; no new state. The
+force env exists so future silicon (M6 etc.) can be measured without a rebuild. The M3
+Ultra (no NAX, older ANE gen, two instances) remains the open measurement target.
+
+## DFlash block cap is a PER-SILICON table; M3 Ultra defaults to 8 (oMLX evidence, 2026-08-19)
+
+`NO_WIDE_LANE_BLOCK_CAP = 5` was an M4 measurement wearing a universal constant's name:
+every non-NAX machine got the M4's split-K cliff cap. oMLX PRs #2850/#2840 shipped
+DFlash2 with M3 Ultra numbers — 1.33–1.43x over serial at T=0.7 at block 8 on our exact
+model pairing (Qwen3.8-27B + the incoai drafter) — which the cap-5 default silently
+blocks there. Meanwhile PR #223's M5 verdict settled the NAX side: DFlash2 ties MTP at
+block 8 (35.2 vs 35.3 novel; the selector holds at +17% acceptance, 1.6x accepted/verify
+vs MTP), so the checkpoint-block path is correct on NAX machines and the fight is
+per-machine.
+
+`dflash.blockCapForMachine(chip)` is the table (plain fn, one-liner rows): "M3 Ultra" →
+8, everything else → 5. Ultra-vs-Max is invisible to `gpuArchitecture` ("applegpu_g15"
+either way), so the key is sysctl `machdep.cpu.brand_string` ("Apple M3 Ultra") read by
+`dflash.chipBrandString`; a failed sysctl lands on the default row. `resolveBlockSize`
+takes the cap as a PARAMETER so its unit tests stay hermetic (no sysctl in tests), an
+explicit `--draft-block-size` still bypasses the cap (clamping against the CONFIG only),
+and the `DFlash drafter ready` line names the row when capped — e.g.
+`capped (m3-ultra cap 8)` — so tester logs are self-describing. Muse's block-16 drafter
+also caps at 8 on the Ultra (unmeasured there; the row is the qwen evidence). An M1 row
+lands when the user measures one. The runtime yield gate already scales by
+`(effective_block−1)/15`, so no change on that side.
+
+## Spec snapshots ride the SSD prefix-cache tier too (manifest v4, PR #223 round, 2026-08-19)
+
+The RAM tier learned this lesson twice (dflash context 2026-08-16, MTP history in the
+mlxfast round): a prefix restore forwards NO trunk layers, so any state derived from
+trunk hiddens starts empty unless it rides the cache entry — dflash per-draft acceptance
+collapsed 92.6% → 66.5% on reused prefixes until `Entry.dflash`/`Entry.mtp` carried the
+snapshots. The SSD tier (`--prefix-cache-disk`) never got the same treatment, so a
+disk-tier restore — fresh boot, post-eviction — handed back a warm trunk and a blind
+drafter: multi-turn across a server restart paid for the cache and lost the acceptance
+anyway. oMLX PR #2850 shipped exactly this (their dflash/MTP state survives their L2 SSD
+cache), which is what put it on the list.
+
+Manifest v4 (`kv_disk_cache.zig`): each entry may carry ONE `spec.safetensors` sidecar
+holding the dflash assistant context and/or the MTP committed history, tensors keyed
+`d{layer}.*` / `m{layer}.*` (trunk-chunk kind suffixes, sliced to the snapshot's `step` —
+the buffer can hold a stale draft tail past it), with `base`/`step`/`layers`/quant per
+snap in the manifest's `"spec"` object. v2/v3 entries keep restoring — they just carry no
+spec (today's behavior); a spec whose file size mismatches the record is dropped ALONE
+(kill -9 salvage — a blind restore is valid, a wrong one is not), never the entry.
+Eligibility is enforced UPSTREAM exactly as for RAM (`commitWithState` already receives
+only committable snaps: dflash at `absLen == full_prompt + generated`, MTP trimmed to
+`mtpCommittedLen`), so `flushPendingDisk` persists verbatim what the RAM entry holds, and
+the sidecar is REPLACED wholesale per commit (a commit with no payload deletes a stale
+one — the RAM supersede rule). Restore reuses `prefix_cache.restoreSpecSnap` — the ONE
+clamp (`base ≤ matched`, `matched − base ≤ step`, truncate to matched, every failure →
+null/blind) — via `DiskTier.loadSpecSnap`, which declines a target whose layer count or
+quant config doesn't match BEFORE `KVCache.restore`'s equal-length assert can fire.
+Spec bytes bill into the entry's disk footprint; whole-entry invalidation covers them.
+
+Guards: `kv_disk_cache` "v4 spec snapshots round-trip; geometry mismatches decline; v3
+restores clean" (exact K/V values, V = −K so a swap can't false-pass), `prefix_cache`
+"dflash + mtp snapshots survive the SSD tier across a restart" (two sessions over one
+root, full-match clamp `base + step == matched`, mismatched-geometry target stays blind
+and untouched), and `tests/test_dflash.sh` [12] (live: same prompt across a real server
+restart with `--prefix-cache-disk`, asserting `[disk-cache] restored` + `dflash context
+restored` + cold≈hit per-draft rate).
+
+## M3 Ultra ANE results: the share optimum is per SILICON, the second ANE is idle, and a spec collapse can be MACHINE state (PR #223 tester, 2026-08-19)
+
+An M3 Ultra 512 GB tester ran the full ANE matrix from `NOTE_TO_TESTER_ANE_DFLASH2.md`
+(Qwen3.8-27B-MLX-Serve-4bit, llmprobe --full capped at 32k, counters via IOReport).
+Report + all 11 llmprobe JSONs archived by the tester; summary rows are 32k prefill tok/s.
+
+**The M4 default share was worth ~nothing there.** At the shipped channel 0.45 the
+ON/OFF pairs read 398 vs 393 at 32k (~+1%) — two alternating pairs, both arms flat. The
+downward sweep found the real optimum: 0.45/0.40/0.35/0.30 → 398/421/440/438, with 0.35
+reproduced three times (455/440, 457/443, and a clean post-reboot A/B at +0.2%/+8.5%/
++13.7% over OFF at 8k/16k/32k). ANE energy scaled with the share exactly as expected
+(1.86 MJ per run at 0.35 vs 2.40 at 0.45, repeatable to ~0.5% across a reboot), so the
+mechanism is the same rollover the M4 shows at 0.50 — the older, slower ANE becomes the
+critical path one-and-a-half notches earlier. The int8 copy also drops 9.47 → 7.30 GB.
+`ane.defaultShare(mode, chip)` is now the per-silicon table (sysctl brand string, the
+same key as `dflash.blockCapForMachine`); M3 Ultra channel → 0.35. Hermetic test pins
+the rows; a new chip gets a row only with its own sweep.
+
+**The second ANE is idle, and `powermetrics` can't see either.** `ioreg` lists two
+services (H11ANE/H11ANE1) and IOReport two counters (ANE0_0/ANE0_1); every ANE-on run
+accumulated essentially all energy on ANE0_0 (ANE0_1 ≤ 0.05%), confirming aned schedules
+our serial evals onto one instance — the dual-ANE exploration in the tester note remains
+open but the "is it already load-balanced?" question is answered: no. Practical probe
+note: `powermetrics --samplers ane_power` returned EMPTY samples on that build despite
+confirmed activity; `macpow --dump | grep ANE0_` is the working instrument.
+
+**The tested build couldn't prove DISPATCH from `/props`.** The `"ane"` object carried
+mode/coverage/share/int8_bytes but no eval counts, so a harness had to log-grep for the
+one-shot engagement lines. `/props` ane now carries `evals` + `eval_failures` (atomics
+counted in the eval loop): zero evals with a green boot is the built-but-never-dispatched
+class (A7) made visible to a curl.
+
+**A spec-decode collapse that survives server restarts is MACHINE state.** Mid-session,
+spec-predictable decode fell 134 → 82 → 62 tok/s (5.45 → 2.0 tok/step) and STAYED down
+across mlx-serve restarts, config changes, and an ANE-OFF control — then a macOS reboot
+fully restored 133-135 / 5.45, persisting in both post-reboot arms. Root cause unknown
+(it FIRST appeared during the 0.30 run but the OFF control degrading too acquits our
+process — the state lived in the OS: aned, Metal, or memory pressure). The rule for
+benching: when a spec cell collapses and a fresh server boot doesn't recover it, stop
+attributing to the build — reboot the machine and re-baseline before concluding anything.
+
+## Dual ANE: procedure banks, instance pinning, and why the proof is out-of-process (2026-08-20)
+
+Everything before this round used exactly ONE Neural Engine. `ane_bridge.m`
+passed an empty `@{}` options dict at every `compileWithQoS:` /
+`loadWithQoS:` / `evaluateWithQoS:` site, so no device was ever named and
+aned scheduled wherever it liked. The M3 Ultra tester round (2026-08-19)
+measured what that means: two physical services (`H11ANE`/`H11ANE1`), two
+IOReport counters, and essentially all energy on `ANE0_0` across all 11 runs
+while `ANE0_1` stayed flat. `src/ane.zig` was structurally single-ANE too —
+strictly serial evals, which is the only reason the A9 shared I/O planes
+were legal.
+
+### The affinity handle needs BOTH keys
+
+oMLX found it (`omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm:381`):
+
+```objc
+@{ @"kANEFProcedureVariantHint" : @1,
+   @"kANEFAneInstanceHint" : @(ane_instance) }
+```
+
+passed to compile, load AND eval — the same dict at all three, plus our
+reload site. The variant hint is not decoration: the scheduler only honours
+an instance hint for its single-ANE procedure variant, so naming a die
+without it is silently ignored. Their measurement: two pinned evals 41.51 ms
+against one unpinned eval 57.90 ms for the same work (28.3% faster), and a
+full dual path at 1.356x over GPU-only on the M3 Ultra. They also state the
+driver does NOT stripe one procedure across dies, which independently
+matches our tester's idle `ANE0_1`.
+
+Instance 0 keeps the literal `@{}` dict, so every single-ANE build — the M4
+row, and an Ultra with dual off — is byte-identical to before.
+
+### ~121 resident handles is why programs are BANKS
+
+The private runtime accepted only ~121 resident model handles in oMLX's
+probe. We created one handle per layer (64 MLP + 48 GDN = 112 on the 27B),
+so a naive dual build would want 224 and would hit the wall. Every covered
+layer's slice is now one `func procedureNNN` inside ONE program, with one
+`_ANERequest` per procedure carrying its own `procedureIndex`. ### A procedure's symbol indices come from `procedureInfoForProcedureIndex:`, and nothing else answers
+
+Procedure N's request must bind surfaces to symbol index N, not to 0. Three
+layers of this were wrong before it worked, and none of them errored:
+
+1. **The selectors live on `_ANEModel`; `_ANEInMemoryModel` is not a
+   subclass of it.** It OWNS one, behind a `-model` accessor
+   (`instancesRespondToSelector:` on the in-memory class returns NO; its
+   ivar list carries `_model : @"_ANEModel"`).
+2. **`inputSymbolIndicesForProcedureIndex:` /
+   `outputSymbolIndicesForProcedureIndex:` return `0` for EVERY procedure**
+   even asked on the right object — measured, all 24 procedures of an MLP
+   bank.
+3. **`procedureInfoForProcedureIndex:` is the one that answers**, as a
+   dictionary: `{ANEFModelInputSymbolIndexArray = (N);
+   ANEFModelOutputSymbolIndexArray = (N); ANEFModelProcedureID = N;}`. That
+   is what we read.
+
+The failure mode is why this is written down. Identity indices are CORRECT
+for procedure 0 and wrong for every other one, so on a 5-chunk prefill
+exactly 10 of 210 evals succeeded — one per bank per chunk — and the other
+200 came back `ANEProgramProcessRequestDirect() ... Program Inference
+error`. The seam's per-chunk GPU recompute swallowed every one, the answer
+stayed correct, and the whole thing read as **banks costing 23% of prefill**
+(5.37k vs 7.01k tok/s, three counterbalanced reps). It is not a cost: with
+the indices right, banks measure 5658 against per-layer's 5715 tok/s on the
+same boot discipline — a wash, as expected for a packaging change. The tell
+was `eval_failures`, never the rate, which is why every arm of
+`tests/test_ane_prefill.sh` now asserts zero of them. A bank of more than
+one procedure is also REFUSED by name when the procedure-info API cannot be
+reached, so the split ladder walks down to banks of one rather than shipping
+a bank that evaluates into the fallback.
+
+MIL function scopes ought to be per-function, but a bank is not worth
+betting a silent compile failure on: every emitted tensor and const name
+carries its procedure index. The op set stays OURS —
+`constexpr_affine_dequantize` with `zero_point=int8(0)`;
+`constexpr_blockwise_shift_scale` is on the known-bad list above (it crashes
+the compile helper) and oMLX's emitter is not adopted wholesale.
+
+The content-hash cache key covers MIL text plus weights, so a bank is
+naturally ONE large cache entry instead of N small ones.
+
+### The bank cap is TWO constraints wearing one number
+
+oMLX hit an `0x20004` load failure once a bank exceeded roughly a 4 GiB
+per-instance device address window. Independently, our builder holds a
+group's quantized payloads AND the assembled blob at once, so the cap is
+also the build's transient host peak (2x). `MLX_SERVE_ANE_BANK_MAX_BYTES`
+(default 2 GiB) governs both, and `bankGroupLen` partitions by it. Under the
+cap a model banks monolithically — which is what oMLX measured bit-stable
+across five greedy runs, against split banks that were ~1% faster but
+occasionally diverged at a tie.
+
+A refused bank walks a LADDER: halve the program count, retry, halve again,
+and only a bank of ONE that still fails drops its layer to the GPU. The
+ladder is load-bearing, not defensive: the 27B at share 0.35 is ~7.3 GB of
+int8, ~3.65 GB per unit under dual, right against the observed window.
+
+### Per-instance OUTPUT planes are mandatory; the input copy is deliberate
+
+A9's shared planes assume serial evals. Concurrent units break that
+assumption for outputs outright. For the INPUT it is subtler: two live evals
+reading one surface is an unproven read-concurrency assumption on private
+API whose failure mode is silently wrong numbers, not an error. So the pack
+happens once and is memcpy'd into each unit's plane (~1.7 ms on the 27B
+against a ~20 ms eval), and `MLX_SERVE_ANE_DUAL_SHARE_INPUT=1` is the lever
+to try the optimisation once dual itself is proven.
+
+The pack wait stays BLOCKING and on the inference thread. oMLX measured that
+moving it to a worker, or launching the ANE from the Metal completion
+callback, destroyed device overlap — a fused layer went 47.5 ms → 71.0 ms —
+and that persistent high-priority eval workers regressed against
+short-lived paired launches.
+
+### MLX_SERVE_ANE_SPLIT stays the TOTAL share
+
+The share is the fraction of channels taken off the GPU, halved across the
+units, so every measurement in the sections above and every row of
+`ane.defaultShare` carries over unchanged. Unit u takes channels
+`[u*k, (u+1)*k)`, the GPU takes `[units*k, width)`, every boundary
+`CHANNEL_ALIGN`-aligned. The prediction is that the optimum RISES from the
+M3 Ultra's 0.35 — halving the ANE critical path is the whole point, and
+oMLX landed at 0.53 MLP / 0.50 GDN — but that is a re-sweep, never an
+interpolation.
+
+### A silently ignored hint cannot be detected in-process
+
+This is why `/props` `"ane"` grew `units` and a `unit_evals` row per
+instance, and why the deliverable includes the `macpow --dump | grep ANE0_`
+cross-check rather than treating it as a nicety. A REJECTED load fails by
+name and falls back. An IGNORED hint looks exactly like success: both units'
+evals succeed, both land on one die, and the only evidence is that one
+IOReport counter never moves. Either failure is itself the result.
+
+## Per-silicon MTP auto-depth cap + verify-qmm parity slack (2026-08-20, M1 Pro)
+
+Two constants calibrated on M4/G17 silicon were applied to every Mac.
+
+**Auto-depth.** `MtpCostProfile` keys on tensor geometry + NAX presence, never
+the chip, so every non-G17 Mac shares one `.generic` cost surface and one cap
+of 6. Measured on an M1 Pro / 32 GB / macOS 26.5, Qwen3.8-27B iQ-3.8bpw,
+temp 0, `--prefix-cache-entries 0`, median of 3, one boot per arm:
+
+| arm | tok/s | avg accepted/round |
+|---|---|---|
+| `--no-mtp` | 10.57 | — |
+| auto (cap 6) | 10.64 | 4.00 |
+| `--mtp-depth 4` | 13.40 | 3.65 |
+
+Forced depth (`MLX_SERVE_MTP_ADAPTIVE=0`) shows the cliff is the verify width
+itself, not the controller: 12.69 / 12.85 / **13.01** / 10.78 / 9.63 / 9.62 /
+9.64 at depths 2..8, while acceptance barely moves (2.77 → 2.92 across the
+cliff). The controller walks in because its objective is accepted-tokens-per-
+round — by that metric depth 6 is *better*. `MTP_EV_DEFAULT_COSTS` does model
+a rise past 4 (`per_pos_hi = 0.26`), nowhere near enough here.
+
+Fix is the `dflash.blockCapForMachine` pattern: `mtp.adaptiveDepthCapForMachine`,
+keyed on the CPU brand string (the GPU arch string cannot tell Ultra from Max),
+M1 Pro → 4, every unmeasured chip → today's `MTP_ADAPTIVE_DEFAULT_CAP`. An
+explicit `--mtp-depth` still outranks the table, and `MLX_SERVE_MTP_ADAPTIVE=0`
+still yields `DEFAULT_DEPTH`. `mtpDepthCapForProfileChip` takes the chip so the
+unit tests are not assertions about whichever Mac runs the suite.
+
+Not attributed: why the cliff sits between verify width 5 and 6 when
+`vqmmLaneFor` serves M 2–7 on ONE lane (split-K) — so the step is *inside* it.
+Candidates: split-K occupancy at M=6 on a smaller GPU, an attention-side
+consumer of verify width (`qkvAttnVerifyEligible` covers t_q 2..8), or per-round
+dispatch scaling. If it turns out to be a fixable lane boundary, fixing it beats
+capping around it — the cap row stays correct either way because it is measured.
+
+Also not done: making the controller self-correcting (score promotions on
+realized tok/s, and let observed ms-per-round bucketed by verify width replace
+`MTP_EV_DEFAULT_COSTS` entries as a prior). That is the real fix for unmeasured
+machines and is a separate change.
+
+**Parity slack.** `expectVerifyQmmNoWorseThanStock` failed three tests on the
+same machine (plain-SIMD 5/6/8-bit, split-K/msg/NAX 4-bit, crossrow 4-bit g64)
+with `kern_max` 0.0313/0.0290/0.0224 against stock's 0.0039 — but cosine
+0.999998 vs 0.999999, i.e. the lanes track fp32 truth in aggregate and a few
+heavily-cancelling dot products land a bigger worst element. Pre-existing:
+reproduced byte-identically on `aceeda4` in a throwaway worktree, so not from
+the ANE work. The `+ 0.01` slack was fit on the silicon the lanes were
+developed on. Now `verifyQmmParitySlack(chip)`, default row still 0.01 so the
+guarantee is not weakened where it holds, M1 Pro row 0.04, and the failure
+message names the row it used.
+
+Still open on this one: whether these lanes are even a WIN on M1 (`vqmmLaneFor`
+gates by NAX and shape, never chip — and `mixedNaxShapeEnabled` precedent says
+adoption is per machine AND shape). That needs a paired same-boot A/B on an M1;
+if the answer is no, gate adoption by chip and the threshold question dissolves
+for the un-adopted lanes.
+A cap that fires silently is half a fix. `adaptiveDepthCapForMachine`
+returns `{cap, label}` (the `dflash.blockCapForMachine` shape) and the live
+resolver logs it once when a row actually lowers the default:
+
+```
+[mtp] adaptive depth cap 4 (m1-pro row, default 6)
+```
+
+Verified both ways with the chip string injected: the M1 Pro row logs and runs
+`depth=4`, an M4 stays silent at `depth=6`. Without the line, `[spec-stats]
+… depth=4` on that machine is indistinguishable from the EV controller having
+promoted no further on its own, or from someone having passed `--mtp-depth 4`
+— three very different situations with one symptom. The resolve site is
+source-scan-pinned to keep naming the row.
+
+## The armed spec flags vetoed batched decode, and PLD then turned itself off (2026-08-20)
+
+`Scheduler.batchable` opened with `if (slot.enable_pld or slot.enable_drafter
+or slot.enable_mtp) return false;`. Those three are the REQUEST's wish, set
+before the generator exists. `specTickMode` is what the decode tick actually
+dispatches on, and it takes the generator's state as well — that split is the
+same one CLAUDE.md already names as "a guard that shapes INIT options does not
+bind DISPATCH".
+
+The chain, measured on a Mac mini M4 with 4 concurrent 5467-token repetitive
+prompts on Qwen3.5-4B:
+
+1. The prompt is repetitive, so the ngram spec-gate scores it 0.386 against a
+   0.010 threshold and arms PLD.
+2. `batchable` sees `enable_pld` and refuses the slot. Four slots decode
+   serial.
+3. PLD drafts nothing (the model is answering, not echoing), so its own yield
+   gate logs `pld=disabled (yield gate: 0 drafted tokens over 8 steps <
+   0.25/step)` and stops speculating.
+
+From step 3 on the server is running neither speculation nor batching. Same
+binary, same prompt, same flags, counterbalanced against a `--no-pld` control:
+
+| arm | `[batched] gdn batched decode engaged` | decode tok/s per stream |
+|---|---|---|
+| pre-fix, default (PLD armed) | no | 9.5 / 9.5 / 9.6 / 9.7 |
+| fixed, default | yes | 12.3 / 12.3 / 12.4 / 12.5 |
+| fixed, `--no-pld` | yes | 12.2 / 12.4 / 12.7 / 12.8 |
+
+The bug was free while qwen3_5 had no batched kernel, which is why it sat
+there unnoticed; `forwardMoeBatchedDecode` is what turned it into 1.28x.
+
+The fix is `slotTicksRegular`, read by `batchable` in place of the flag line.
+Both of its clauses carry weight and only one of them recovers the throughput:
+
+- `specTickMode(...) == .regular` covers a slot whose generator never armed
+  spec at all (`!gen.pld_enabled`, permanent — `generate.zig`'s dsv4
+  chokepoint says no re-enable check can resurrect it).
+- `gen.spec_disabled_runtime` covers the measured case. `pld_enabled` stays
+  TRUE through the yield-gate kill, so `specTickMode` still answers `.pld`
+  there and the first clause alone changes nothing.
+
+Why pausing PLD's re-enable is the right trade: `runDecodeTick` only reaches
+the batched kernel at `group.len >= 2`. A solo slot always goes through
+`runSingleDecodeTick` -> `nextPld` -> the periodic re-enable check, so
+re-enable is only deferred while 2+ slots are decoding, which is exactly the
+regime where batching (2.76x aggregate, measured) beats one stream's
+speculative recovery. A slot that is genuinely speculating still returns false
+and decodes serial: verified live on the MTPLX 9B pack, where 4 concurrent
+streams all logged `mode=mtp avg_per_round≈5.0 per_draft_pct=100%` with zero
+batched-engagement lines.
+
+Guard: the class test `the batched gate reads DISPATCH, not the armed spec
+flags` scans `batchable`'s body for any `slot.enable_*` read (red on revert)
+and pins that the helper consults both `spec_disabled_runtime` and
+`specTickMode`. Byte-equivalence across the batched path is unchanged and was
+re-run on all three checkpoints (qwen35-4b, qwen35-9b, gemma-4-e2b).
+
+## The verify-lane parity bar had to stop referencing stock's worst element (2026-08-20)
+
+`expectVerifyQmmNoWorseThanStock` is the machine-independent guard on every
+verify qmm lane: run the lane, run stock, run an fp32 dequant ground truth, and
+require the lane be no less accurate than stock. It compared WORST ELEMENTS,
+clamped-relative, with 0.01 of slack.
+
+On an M1 Pro it went red. Measured there: `kern_max` 0.0313 / 0.0290 / 0.0224
+for the plain-SIMD, split-K and crossrow lanes against a stock 0.0039, all at
+cosine 0.999998 vs 0.999999. The first fix widened the slack to 0.04 on a
+chip-string row (`verifyQmmParitySlack`), on the reasoning that each GPU's
+reduction order is its own measurement.
+
+That was wrong twice.
+
+**Cosine cannot cover for a widened max.** Cosine is a global measure over the
+whole tensor. The defects this function exists to catch — a partial-sum race, a
+register spill, a bad index — corrupt ONE element while leaving every other one
+intact, which moves cosine by nothing at all. Widening the max is precisely a
+blindfold for the failure mode the doc comment names.
+
+**`stock_max` is not a stable reference.** Instrumenting the same shapes on M4
+Max (`MLX_SERVE_VQMM_PARITY_DEBUG=1`) measured stock_max 0.017-0.036 across all
+111 lane checks — the same order as the M1 Pro *kernel* reading. So the M1 Pro
+row was never a lane landing 8x worse than normal; it was STOCK landing
+unusually well on that data, and the lane sitting exactly at the bf16 output's
+own rounding floor. Any bar keyed to stock's worst element inherits that
+instability and gets re-fit per machine forever.
+
+The bars are now three, none fit per GPU (`VerifyQmmParity`):
+
+- `GROSS_CEILING` 0.5 — an ABSOLUTE ceiling on the worst element. The
+  clamped-relative metric's noise floor is 0.02-0.035 on every machine measured,
+  so this is ~14x headroom, and a corrupted accumulator lands orders of
+  magnitude past it. This is the single-element bar cosine cannot provide.
+- `RMS_FACTOR` 3.0 — the lane's RMS error over stock's. Scale-free, so an
+  unusually accurate stock does not tighten it into a false red. This is the
+  systematic bar. M4 Max measures ratio 1.000 on all 111 checks.
+- The cosine pair, unchanged: no worse than stock's by 1e-5, and a 0.999 floor
+  that catches a broken reference.
+
+`verifyQmmParityVerdict` is pure, so each failure shape is unit-tested without a
+GPU, and the failure print carries every number needed to judge a new machine.
+
+## A batched decode group is bounded by padding waste, not slot count (2026-08-20)
+
+`padAndStackBatchedKV` pads every slot's KV to the group's longest and
+concatenates, so the tensor the batched kernel reads is `N x kv_max` — not
+`sum(kv_len)`. Nothing bounded the spread of the group.
+
+The arithmetic on a qwen3_5 trunk (hd 256, and the app launches with
+`--ctx-size 262144`): four slots where one sits at 100k and three at 1k build
+`[4, kv_h, 100000, 256]` bf16 per full-attention layer, ~410 MB each, ~6.5 GB
+across the 16 of them — for three slots that needed 1k of context between them.
+It is a per-tick transient, so `prefillTransientReserve` never sees it and the
+load-time gate never bills it. The failure mode is an uncatchable Metal OOM,
+which is exactly the class that reads as "the model crashed the server".
+
+`batchedKvKeepCount` caps the group by the quantity that actually hurts — the
+padding waste — rather than a length ratio: sort ascending by kv_len and keep
+the largest prefix whose padded tensor stays within `MAX_PAD_WASTE` of the bytes
+the group needs. The slots that fall out are the LONGEST ones (the ones setting
+kv_max), and they decode serially the same tick, so every slot still advances.
+
+`MAX_PAD_WASTE` is 1.5 and has to stay **below 2.0**: for N=2 the worst possible
+waste is exactly 2x (a 1-token slot beside a 200k one), so at a bar of 2.0 a
+pair can never be vetoed — which is the pathological case the cap was written
+for.
+
+## A batched-decode guard that only runs at N=1 pins a shape that never ships (2026-08-20)
+
+`MLX_SERVE_FORCE_BATCHED=1` routes a single slot through the batched kernel, and
+`test_batched_equivalence.sh` used it for every arm. But at one slot the forward
+still has `batch == 1`, and that value is not inert:
+
+- `attnProj` takes `batch == 1 and !is_prefill` as its `decode_shape`, which is
+  what arms `--decode-attn-quant` (default ON) — so the lossy side copies engage
+  at forced-N=1 and do NOT at real N>1.
+- Both fused QK-norm+RoPE gates (`hd 128` and the `hd 256` sibling) require
+  `batch == 1`, so the batched path takes the composed chain instead.
+
+None of that is a correctness bug — the batched path is the more accurate one —
+but the guard's "byte-equivalence" claim covered a width that never serves a
+real concurrent request. The script now runs a real two-stream arm against the
+serial answer, and both batched kernels emit a one-shot
+`[batched] ... engaged (slots=N)` line: output equality alone cannot distinguish
+a batched run from N serial ones, and two concurrent curls are not guaranteed to
+overlap, so the arm reports NOT-RUN rather than passing for free when they
+don't.

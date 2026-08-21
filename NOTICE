@@ -81,9 +81,22 @@ Used in mlx-serve (`src/transformer.zig`):
   * The per-dispatch key-chunk budget in the head-dim-256 fused causal
     attention path, whose design comes from `qwen35_fa256_attention.py`.
 
+Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
+
+  * The Neural Engine instance-affinity option keys and the requirement that
+    they be passed together, from `custom_kernels/qwen35_prefill/csrc/
+    qwen35_ane.mm`; the per-procedure request construction and the practice
+    of reading a procedure's symbol indices from the model rather than
+    assuming them come from the same file.
+  * The procedure-bank program layout (many linears as procedures inside one
+    compiled program) as a response to the runtime's resident-handle limit.
+
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the fa256
 chunking carries exact online-softmax state between dispatches so a chunked run
-is bit-identical to a single dispatch.
+is bit-identical to a single dispatch. The ANE MIL emitter is our own
+(`constexpr_affine_dequantize` with an int8 zero point, our K-chunked down
+conv and power-of-two accumulator wrap); only the bank structure and the
+affinity handle are theirs.
 
 --------------------------------------------------------------------------------
 jinja.cpp
@@ -104,6 +117,27 @@ additions providing the C interface the Zig side calls.
 ================================================================================
 MIT License
 ================================================================================
+
+--------------------------------------------------------------------------------
+h3.c-ane (Apple Neural Engine port of h3.c)
+https://github.com/maderix/h3.c-ane
+https://github.com/maderix/ANE
+Copyright (c) 2026 Manjeet Singh (maderix)
+Licensed under the MIT License.
+
+Vendored into `lib/ane/ane_bridge.{h,m}` (from `h3_ane_bridge.{h,m}`): the
+objc-runtime bridge to the private AppleNeuralEngine framework — in-memory
+MIL model compile/load/evaluate, IOSurface I/O binding, and the
+content-addressed compile cache. The ANE port is maderix's addition to a
+fork of antirez's h3.c (whose own code is Metal/GPU only and none of which
+is vendored here), building on the private-API groundwork in
+https://github.com/maderix/ANE. mlx-serve changes: the persistent cache
+entries move to `~/.mlx-serve/ane-cache` (staging stays in $TMPDIR — the
+compile runs inside aned, which cannot read a home-directory path) and the
+cache env var is renamed `MLX_SERVE_ANE_CACHE`. `lib/ane/ane_mlp.m` (the
+per-layer SwiGLU-MLP MIL program builder used by `--ane-prefill`) is an
+mlx-serve addition modeled on the same project's `h3_ane_linear.m` blob
+layout and int8 constexpr-dequantize idioms.
 
 --------------------------------------------------------------------------------
 SwaTex
@@ -258,6 +292,15 @@ ported in August 2026 (each item names the submission's co-author handle):
     activations against masked (unshifted) nibbles. Ships opt-in
     (`MLX_SERVE_VERIFY_QMM_CROSSROW=1`) — measured slower than stock in our
     stack, retained as an A/B lever.
+  * The draft-rerank top-32 shortlist kernels (`msv_mtp_top32_partial` /
+    `msv_mtp_top32_finalize` in `src/mtp.zig`), from
+    `qwen35DraftTop32PartialKernel` / `qwen35DraftTop32FinalizeKernel` in
+    their `Qwen35.swift` at 474c750 (submission 942e5ab2): an exact top-32
+    of a full-vocab row in two dispatches (per-thread slot selection under a
+    taken-bitmask, simd_max rounds, ordinal-mapped floats), replacing a
+    full GPU argsort. The surrounding scheme (coarse 2-bit proposal readout
+    re-scored by the exact head's own 32 rows) is theirs as well; our
+    re-score uses the trunk lm_head instead of a compact draft head.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c; the query
 split is gated per shape and kill-switched (`MLX_SERVE_SDPA_SPLIT`), the

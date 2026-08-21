@@ -63,13 +63,18 @@ mkdir -p "$OUT"
 # that can.
 MD="$HOME/.mlx-serve/models"
 LMS_DIR="$HOME/.lmstudio/models"
+GD="/Volumes/G Drive SSD"
+# Qwen3.6 is discontinued (packs removed): the 27B row is the Qwen3.8-27B
+# oQ4e pack from 2026-08-18 on — a NEW row in benchmarks.md, never diffed
+# against the old qwen36-27b cells. ANE=1 adds --ane-prefill to every boot
+# (a named refusal on non-qwen3_5-dense models, so it is safe matrix-wide);
+# ane-on cells are their own column, never diffed against ane-off ones.
 TARGETS=(
     "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit"
     "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit"
     "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit"
-    "qwen36-27b|$MD/Jundot/Qwen3.6-27B-oQ4e-mtp"
+    "qwen38-27b|$GD/models-dl/Jundot/Qwen3.8-27B-oQ4e-mtp"
     "qwen36-35b-a3b|$MD/stamsam/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP"
-    "qwen36-27b-mtplxopt|$LMS_DIR/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at
@@ -95,10 +100,13 @@ probe() { # logical host model_id
 # MoE targets, which is exactly where it pays most (35B-A3B reads 157 without
 # and 191 with). On a dense MTP checkpoint it restates the default.
 spec_flags() { # model_path
+    local f=""
     if ls "$1"/*mtp*.safetensors >/dev/null 2>&1 || [ -d "$1/mtp" ] \
        || grep -qi '"mtp' "$1/config.json" 2>/dev/null; then
-        echo " --mtp"
+        f=" --mtp"
     fi
+    [[ "${ANE:-0}" == "1" ]] && f+=" --ane-prefill"
+    echo "$f"
 }
 
 # ── Run ──

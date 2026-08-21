@@ -50,6 +50,10 @@ var ds4_mtp: bool = true;
 // auto-found support GGUF carries DSpark stages (the same flag opts the
 // native dsv4 engine into its draft stages via MLX_SERVE_DSV4_DSPARK).
 var ds4_dspark: bool = false;
+// `--ane-prefill`: opt-in ANE prefill-MLP offload (qwen3_5-family dense MLP,
+// lossy int8/fp16). File-level like ds4_dspark so the headless serve path
+// reads the same flag (the runHeadlessServe flag-eater class).
+var ane_prefill: bool = false;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -147,6 +151,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
+        \\  --ane-prefill       Offload a share of each prefill chunk's dense
+        \\                        MLP rows to the Neural Engine (qwen3_5-family
+        \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
+        \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
         \\  --mtp               Force the MTP head ON for MoE targets too.
         \\                        Requests default to MTP only on DENSE models;
         \\                        a MoE checkpoint that ships a sidecar is
@@ -603,6 +611,12 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
+            // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
+            // by design (int8 fp16 datapath). Eligibility + machine gates
+            // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
+            // the row share.
+            ane_prefill = true;
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
@@ -1251,6 +1265,9 @@ pub fn main(init: std.process.Init) !void {
             .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
             .mtp_depth = mtp_depth,
+            .ane_prefill = ane_prefill,
+            .ane_chunk_resolver = server_mod.pinPrefillChunk,
+            .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
@@ -1671,6 +1688,9 @@ fn runGenServe(
         .tokenize_cache_entries = 0,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
+        .ane_prefill = ane_prefill,
+        .ane_chunk_resolver = server_mod.pinPrefillChunk,
+            .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1797,6 +1817,9 @@ fn runHeadlessServe(
         // --no-ds4-mtp / --dspark for every embedded-engine load.
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
+        .ane_prefill = ane_prefill,
+        .ane_chunk_resolver = server_mod.pinPrefillChunk,
+            .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 

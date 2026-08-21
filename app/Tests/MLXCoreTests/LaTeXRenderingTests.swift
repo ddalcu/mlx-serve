@@ -36,6 +36,23 @@ final class LaTeXRenderingTests: XCTestCase {
         XCTAssertEqual(LaTeXCopyText.string(from: rendered), source)
     }
 
+    func testInlineFormulaRendersInsideATableCell() {
+        // Exercises the MarkdownTableView → renderInline path: a cell string
+        // containing an inline LaTeX formula must produce an attachment with
+        // the correct source, mirroring the deleted
+        // testInlineFormulaRendersInsideAMarkdownTable that used the old
+        // attributedString(for:) path which no longer renders tables.
+        let cellText = "$\\text{e}^{i\\pi} + 1 = 0$"
+        let rendered = MarkdownText.renderInline(cellText, theme: .light)
+
+        XCTAssertEqual(values(for: .attachment, in: rendered).count, 1)
+        XCTAssertEqual(
+            values(for: .mlxLaTeXSource, in: rendered) as? [String],
+            [#"$\text{e}^{i\pi} + 1 = 0$"#]
+        )
+        XCTAssertEqual(LaTeXCopyText.string(from: rendered), cellText)
+    }
+
     func testParenthesizedDollarFormulaWithTextCommandRendersInAHeading() {
         let source = #"## 1. Euler's Identity ($\text{e}^{i\pi} + 1 = 0$)"#
         let rendered = MarkdownText.attributedString(for: source)
@@ -45,25 +62,6 @@ final class LaTeXRenderingTests: XCTestCase {
             values(for: .mlxLaTeXSource, in: rendered) as? [String],
             [#"$\text{e}^{i\pi} + 1 = 0$"#]
         )
-    }
-
-    func testInlineFormulaRendersInsideAMarkdownTable() {
-        let source = #"""
-        | Feature | Equation |
-        | :--- | :--- |
-        | Euler 🧠 | ($\text{e}^{i\pi} + 1 = 0$) |
-        | Code | `$HOME` stays literal |
-        """#
-        let rendered = MarkdownText.attributedString(for: source)
-
-        XCTAssertEqual(values(for: .attachment, in: rendered).count, 1)
-        XCTAssertEqual(
-            values(for: .mlxLaTeXSource, in: rendered) as? [String],
-            [#"$\text{e}^{i\pi} + 1 = 0$"#]
-        )
-        XCTAssertTrue(rendered.string.contains("Euler 🧠"))
-        XCTAssertTrue(rendered.string.contains("`$HOME`"))
-        XCTAssertTrue(LaTeXCopyText.string(from: rendered).contains(#"$\text{e}^{i\pi} + 1 = 0$"#))
     }
 
     func testInvalidFormulaFallsBackToItsExactSource() {

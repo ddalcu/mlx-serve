@@ -88,6 +88,7 @@ final class VideoGenService: ObservableObject {
         let steps = request.steps
         let keep = request.keepResident
         let firstFramePath = request.firstFrameImagePath
+        let lastFramePath = request.lastFrameImagePath
         let audioPath = request.audioPath
 
         task = Task {
@@ -102,6 +103,14 @@ final class VideoGenService: ObservableObject {
                 // as the clean first frame. Mirrors AudioGenService's `ref_audio`.
                 let firstFrameB64: String? = await Task.detached(priority: .userInitiated) {
                     firstFramePath.flatMap { path in
+                        (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+                    }
+                }.value
+                // The last-frame anchor reads the same way. Both keyframes are
+                // ordinary image files; the server owns the per-anchor resize
+                // policy (first stretches, last center-covers).
+                let lastFrameB64: String? = await Task.detached(priority: .userInitiated) {
+                    lastFramePath.flatMap { path in
                         (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
                     }
                 }.value
@@ -139,6 +148,7 @@ final class VideoGenService: ObservableObject {
                 if Task.isCancelled { setPhase(.cancelled, for: gen); return }
                 let body = Self.requestBody(model: modelId, prompt: prompt,
                                             request: request, firstFrameB64: firstFrameB64,
+                                            lastFrameB64: lastFrameB64,
                                             audioB64: audioB64, refs: refs)
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
@@ -364,6 +374,7 @@ final class VideoGenService: ObservableObject {
     /// tests pin every field here so the UI model can't drift from the wire.
     nonisolated static func requestBody(model: String, prompt: String,
                                         request: VideoGenRequest, firstFrameB64: String?,
+                                        lastFrameB64: String? = nil,
                                         audioB64: String? = nil,
                                         refs: VideoRefPayloads = .init()) -> [String: Any] {
         var pipeline: String
@@ -399,8 +410,27 @@ final class VideoGenService: ObservableObject {
         if request.model.supportsCFG, !dropGuidance {
             body["cfg_scale"] = request.cfgScale
             body["stg_scale"] = request.stgScale
+            // The audio guider only exists on the a2vid path, so the scale
+            // rides the clip rather than the preset: without one it would set
+            // a knob on a guider that never runs. It drops with the rest of
+            // the guidance on an upgraded one-stage request, because the whole
+            // point of that drop is to let the server's reference two-stage
+            // defaults (3.0 video / 7.0 audio) apply as a SET.
+            if hasAudio { body["cfg_audio_scale"] = request.cfgAudioScale }
+        }
+        // Stage-2 refine steps. Two-stage only — one-stage has no refine pass,
+        // so the field would be a no-op the server still parses. 0 is Auto and
+        // stays absent, keeping "absent = the server's default" true.
+        if request.model.supportsPipelineModes, pipeline != "one_stage", request.stage2Steps > 0 {
+            body["stage2_steps"] = request.stage2Steps
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
+        // The other half of fl2va. Capability-gated like every field above: a
+        // preset switch leaves the picked file in state, and LTX's handler has
+        // no `last_frame_image` to ignore it with.
+        if request.model.supportsLastFrame, let lastFrameB64 {
+            body["last_frame_image"] = lastFrameB64
+        }
         // The fast recipe is the SERVER's default — the app only speaks up to
         // opt OUT, and only on a backend that has the recipe at all.
         if request.model.supportsFastRecipe, request.bestQuality { body["fast"] = false }

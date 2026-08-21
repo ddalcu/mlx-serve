@@ -786,6 +786,34 @@ pub const ModelConfig = struct {
         return self.canvas_length > 0;
     }
 
+    /// Pure-config half of "can this arch ride the batched GatedDeltaNet
+    /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
+    /// GDN trunk with periodic full attention, i.e. the qwen3_5 family.
+    ///
+    /// This exists because the answer is needed in TWO places that see
+    /// different things: `server.zig` decides whether `--max-concurrent`
+    /// clamps to 1 with only a ModelConfig in hand, while
+    /// `Transformer.supportsBatchedGdnDecode` also checks the built layer
+    /// set. Both MUST read this predicate — when they were hand-rolled
+    /// separately, the server kept clamping qwen3_5 to serial decode while
+    /// the scheduler was happily batching it, so `--max-concurrent 4` (the
+    /// obvious serving config) silently DISABLED the batched path.
+    ///
+    /// Says nothing about MoE/hybrid archs that merely share the same
+    /// forward — those stay serial, by name, in both callers.
+    pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        if (self.full_attention_interval == 0) return false; // not a GDN trunk
+        if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
+        if (self.is_encoder_only) return false;
+        if (self.isMoe()) return false; // routed experts: not modelled yet
+        if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
+        if (self.isDiffusion()) return false;
+        if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
+        if (std.mem.eql(u8, self.model_type, "laguna")) return false;
+        if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
+        return true;
+    }
+
     /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
     /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
     /// proportional RoPE on full layers). DiffusionGemma reuses the Gemma 4
@@ -3149,7 +3177,10 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         std.mem.startsWith(u8, key, "model.vision_adapter.") or
         std.mem.startsWith(u8, key, "model.vision_projection.") or
         std.mem.startsWith(u8, key, "vision_adapter.") or
-        std.mem.startsWith(u8, key, "vision_projection."))) return false;
+        std.mem.startsWith(u8, key, "vision_projection.") or
+        // avlp12's Qwen3.8 "Alis" packs spell the Qwen3-VL tower
+        // `model.visual.` (pure rename of `vision_tower.`).
+        std.mem.startsWith(u8, key, "model.visual."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -3780,6 +3811,10 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
+    // avlp12 Alis spells the Qwen3-VL tower `model.visual.` — same gate, or
+    // --no-vision cannot drop it and we hold ~0.9 GB we never read.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));

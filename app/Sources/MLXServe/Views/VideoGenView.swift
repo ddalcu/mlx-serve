@@ -39,11 +39,21 @@ struct VideoGenView: View {
     @State private var steps: Int = 12
     @State private var cfgScale: Double = 1.0
     @State private var stgScale: Double = 0.0
+    // 0 = Auto (the server's own "all 3"), so the control has an explicit Auto
+    // position rather than a 0 that reads as "no refine at all".
+    @State private var stage2Steps: Int = 0
+    @State private var cfgAudioScale: Double = 7.0
+    @State private var chainWindows: Int = 1
     @State private var seed: Int = 42
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
     @State private var loras: [LoraAdapter] = []
     @State private var firstFrameImageURL: URL? = nil
+    // The other half of fl2va. Kept across preset changes like the first
+    // frame; the SERVICE gates the field on `supportsLastFrame`, so a leftover
+    // pick can never reach a backend without the anchor.
+    @State private var lastFrameImageURL: URL? = nil
+    @State private var isLastFrameDropTargeted = false
     // ref2va references, kept across preset changes like firstFrameImageURL —
     // `requestBody` gates the fields on the pack's own capability, so state
     // left behind by a preset switch can never reach an FL2VA request.
@@ -113,6 +123,9 @@ struct VideoGenView: View {
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: cfgScale) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: stgScale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: stage2Steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: cfgAudioScale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: chainWindows) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
@@ -151,6 +164,7 @@ struct VideoGenView: View {
                     resolutionSection
                     framesSection
                     firstFrameSection
+                    lastFrameSection
                     referencesSection
                     speechSection
                     if showAdvanced { advancedSection } else { advancedToggle }
@@ -502,51 +516,82 @@ struct VideoGenView: View {
     // falls back to text-to-video if the VAE encoder isn't downloaded — so the
     // picker is never disabled.
     private var firstFrameSection: some View {
+        keyframeWell(title: "First frame",
+                     note: model.supportsLastFrame ? "optional — starts here" : "optional — I2V",
+                     url: $firstFrameImageURL,
+                     isTargeted: $isDropTargeted,
+                     help: "Select an image to use as the first frame of the video.")
+    }
+
+    // fl2va's second anchor. Hidden rather than offered-and-ignored on a
+    // backend without it (the `pipeline`-on-H3 rule): LTX's handler has no
+    // `last_frame_image`, and ref2va has no keyframe row to land on.
+    @ViewBuilder
+    private var lastFrameSection: some View {
+        if model.supportsLastFrame {
+            VStack(alignment: .leading, spacing: 6) {
+                keyframeWell(title: "Last frame",
+                             note: "optional — ends here",
+                             url: $lastFrameImageURL,
+                             isTargeted: $isLastFrameDropTargeted,
+                             help: "Select the image the clip should land on. The first frame sets the size; this one is fitted to it.")
+                if lastFrameImageURL != nil && firstFrameImageURL == nil {
+                    Text("With only a last frame the model invents the opening and works toward it. Add a first frame to pin both ends.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    /// One keyframe slot: thumbnail + clear when filled, drop well when empty.
+    /// Both anchors draw the same shape so they read as a pair.
+    private func keyframeWell(title: String, note: String, url: Binding<URL?>,
+                              isTargeted: Binding<Bool>, help: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("First frame").font(.subheadline.weight(.semibold))
+                Text(title).font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("optional — I2V")
+                Text(note)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let url = firstFrameImageURL {
+            if let picked = url.wrappedValue {
                 HStack(spacing: 8) {
-                    if let img = NSImage(contentsOf: url) {
+                    if let img = NSImage(contentsOf: picked) {
                         Image(nsImage: img)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
                             .frame(width: 64, height: 48)
                             .clipShape(RoundedRectangle(cornerRadius: 4))
                     }
-                    Text(url.lastPathComponent)
+                    Text(picked.lastPathComponent)
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
                     Button {
-                        firstFrameImageURL = nil
+                        url.wrappedValue = nil
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
-                    .help("Clear first frame")
+                    .help("Clear \(title.lowercased())")
                 }
             } else {
                 // The same well the Image and 3D panes' empty states draw —
                 // one shape for "a picture goes here" across the four panes.
                 MediaDropWell(title: "Choose image...",
                               systemImage: "photo.on.rectangle.angled",
-                              isTargeted: isDropTargeted) { chooseFirstFrameImage() }
-                    .help("Select an image to use as the first frame of the video.")
+                              isTargeted: isTargeted.wrappedValue) { chooseKeyframeImage(into: url) }
+                    .help(help)
             }
         }
         // One image slot, so a drop REPLACES whatever is there — same as
         // picking again. Drops land on this section rather than the whole
         // window; see `MediaDropTarget`.
-        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
-            if let url = urls.first { firstFrameImageURL = url }
+        .mediaDrop(.image, isTargeted: isTargeted) { urls in
+            if let dropped = urls.first { url.wrappedValue = dropped }
         }
     }
 
@@ -921,6 +966,52 @@ struct VideoGenView: View {
                           help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
                 Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
                     .font(.caption2).foregroundStyle(.secondary)
+
+                // STG was sent on every LTX request from the day the wire was
+                // fixed, with nothing to set it — so it sat at whatever was in
+                // storage. A field on the wire with no control is worse than an
+                // absent one: the request looks right.
+                sliderRow("STG scale", value: $stgScale, range: 0...4, step: 0.5,
+                          help: "Spatio-temporal guidance. 0 = off (the default). Steadies motion and structure at the cost of speed.")
+                Text("Steadies motion and shape by re-running part of the model with its attention perturbed. 0 = off, which is the default. Around 1.0 helps wobbly motion; higher costs time and can flatten detail.")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                // Audio guidance belongs to the a2vid guider, so it only shows
+                // with a clip attached — otherwise it is a knob on something
+                // that never runs.
+                if model.supportsAudioInput, audioURL != nil {
+                    sliderRow("Audio guidance", value: $cfgAudioScale, range: 1...12, step: 0.5,
+                              help: "How closely the picture follows the attached soundtrack. LTX default: 7.0.")
+                    Text("How hard the video is pushed to match your clip — lip sync, timing, performance. 7.0 is the LTX default. Lower drifts from the audio; higher locks to it and can look stiff.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
+            // Two-stage refine. One-stage has no second pass, so the control is
+            // hidden rather than shown doing nothing.
+            if model.supportsPipelineModes, mode != .oneStage {
+                Picker("Refine steps", selection: $stage2Steps) {
+                    Text("Auto").tag(0)
+                    ForEach(1...6, id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.menu)
+                .font(.caption)
+                .help("Steps in the second, full-resolution pass. Auto uses the reference schedule (3).")
+                Text("The second pass sharpens the upscaled frames. Auto is the reference schedule. More steps clean up detail and cost time; fewer are faster and softer.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            // Chained windows. Already wired end to end — this is the control
+            // that never existed, which is why long clips were unreachable.
+            if model.supportsChainedWindows {
+                Stepper(value: $chainWindows, in: 1...8) {
+                    Text("Chained windows: \(chainWindows)").font(.caption)
+                }
+                .help("Join several generations end to end, each starting from the last frame of the one before.")
+                Text(chainWindows > 1
+                     ? "\(chainWindows) windows joined end to end — about \(numFrames * chainWindows) frames, and roughly \(chainWindows)x the time of a single window."
+                     : "Joins several generations end to end for a longer clip. Each window costs another full generation.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
 
             HStack {
@@ -1117,14 +1208,14 @@ struct VideoGenView: View {
         }
     }
 
-    private func chooseFirstFrameImage() {
+    private func chooseKeyframeImage(into slot: Binding<URL?>) {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
-            firstFrameImageURL = url
+            slot.wrappedValue = url
         }
     }
 
@@ -1301,6 +1392,11 @@ struct VideoGenView: View {
         steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
         cfgScale = min(10, max(1, s.cfgScale))
         stgScale = s.stgScale
+        // Clamped like the sliders above: a value saved before a range moved
+        // would otherwise sit off-scale, and 0 stays Auto.
+        stage2Steps = min(6, max(0, s.stage2Steps))
+        cfgAudioScale = min(12, max(1, s.cfgAudioScale))
+        chainWindows = model.supportsChainedWindows ? min(8, max(1, s.chainWindows)) : 1
         seed = s.seed
         keepResident = s.keepResident
         bestQuality = s.bestQuality
@@ -1325,6 +1421,9 @@ struct VideoGenView: View {
         s.steps = steps
         s.cfgScale = cfgScale
         s.stgScale = stgScale
+        s.stage2Steps = stage2Steps
+        s.cfgAudioScale = cfgAudioScale
+        s.chainWindows = chainWindows
         s.seed = seed
         s.keepResident = keepResident
         s.bestQuality = bestQuality
@@ -1372,6 +1471,9 @@ struct VideoGenView: View {
         steps = min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, s.steps))
         cfgScale = s.cfgScale
         stgScale = s.stgScale
+        // A tier does not describe chaining, but a preset switch can land on a
+        // partition without it — collapse rather than carry a dead value.
+        if !model.supportsChainedWindows { chainWindows = 1 }
         numFrames = s.numFrames
         clampFramesToRAM()
         // Keep firstFrameImageURL across preset changes so users can swap
@@ -1414,6 +1516,7 @@ struct VideoGenView: View {
             cfgScale: cfgScale,
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
+            lastFrameImagePath: lastFrameImageURL?.path,
             // Belt-and-braces with the requestBody gate: a clip must never
             // reach the transcode (whose failure is a hard error) on a
             // backend that generates its own soundtrack.
@@ -1428,6 +1531,11 @@ struct VideoGenView: View {
             // Belt-and-braces with the requestBody gate (turbo state survives
             // preset switches, like the reference files below).
             turbo: turboEngaged,
+            // Gated here too: the stepper's value survives a preset switch,
+            // and only the fl2va partition has a keyframe row to chain.
+            chainWindows: model.supportsChainedWindows ? chainWindows : 1,
+            stage2Steps: stage2Steps,
+            cfgAudioScale: cfgAudioScale,
             // Belt-and-braces with the requestBody gate, same as `audioPath`
             // above: reference files must never reach the reader (whose
             // failure is a hard error) on a pack that cannot use them.
