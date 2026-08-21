@@ -28,6 +28,38 @@ enum RestoreGeometry {
         return CropRect(x: (width - w) / 2, y: (height - h) / 2, width: w, height: h)
     }
 
+    /// What one OUTPUT pixel costs in transient GPU memory, on top of the
+    /// resident checkpoint. Mirrors `RESTORE_TRANSIENT_BYTES_PER_PIXEL` in
+    /// `src/gen.zig`, where it was measured — the server owns the number and
+    /// enforces it; this copy exists only so the pane can say so BEFORE
+    /// spending minutes loading a model that is going to be refused.
+    static let transientBytesPerPixel = 5400
+
+    /// A sentence to show before starting, when the target canvas cannot fit
+    /// on this Mac at all, or nil.
+    ///
+    /// WHY A GATE ON THE TARGET AND NOT THE SOURCE: the failure it replaces
+    /// was a small photo at 2x. MLX at the Metal working-set edge returns
+    /// degenerate values rather than erroring, so the restore came back as a
+    /// full-size PNG of a single flat colour with a 200 behind it — a pure
+    /// white 1808x1920 in the user's own output folder. The source was never
+    /// the expensive part; the canvas is.
+    ///
+    /// `totalRAMGB == 0` means the machine could not be measured, and a gate
+    /// that cannot see must not warn about everything.
+    static func memoryWarning(targetWidth: Int, targetHeight: Int,
+                              modelGB: Int, totalRAMGB: Int) -> String? {
+        guard totalRAMGB > 0, targetWidth > 0, targetHeight > 0 else { return nil }
+        let bytes = Double(targetWidth) * Double(targetHeight) * Double(transientBytesPerPixel)
+        let transientGB = bytes / 1_073_741_824
+        let needed = Double(modelGB) + transientGB
+        guard needed > Double(totalRAMGB) else { return nil }
+        return String(
+            format: "A %d × %d result needs about %.0f GB of memory (%.0f GB of working space plus the %d GB model), "
+                  + "but your Mac has %d GB. Lower the scale or pick a smaller photo — otherwise this can come back blank.",
+            targetWidth, targetHeight, needed.rounded(), transientGB.rounded(), modelGB, totalRAMGB)
+    }
+
     /// The canvas an upscale targets: `width`x`height` scaled by `factor`,
     /// rounded to the NEAREST multiple of 16 (never just down) — this canvas
     /// is synthesized by the resize step below, not sampled from the source,
@@ -235,7 +267,7 @@ final class RestoreService: ObservableObject {
     }
 
     private func loadRecent() {
-        let root = MediaStorage.restoredRoot
+        let root = MediaStorage.upscalesRoot
         let fm = FileManager.default
         guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
         var paths: [(String, Date)] = []
@@ -255,13 +287,13 @@ final class RestoreService: ObservableObject {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
         let day = df.string(from: Date())
-        let dayDir = (MediaStorage.restoredRoot as NSString).appendingPathComponent(day)
+        let dayDir = (MediaStorage.upscalesRoot as NSString).appendingPathComponent(day)
         try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
         let tf = DateFormatter()
         tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let base = (sourcePath as NSString).lastPathComponent
         let stem = (base as NSString).deletingPathExtension
-        let filename = "\(tf.string(from: Date()))_\(stem)_restored.png"
+        let filename = "\(tf.string(from: Date()))_\(stem)_upscaled.png"
         return (dayDir as NSString).appendingPathComponent(filename)
     }
 }

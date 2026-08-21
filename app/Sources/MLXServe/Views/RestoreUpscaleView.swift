@@ -307,13 +307,13 @@ struct RestoreUpscaleView: View {
 
     private var outputFolderLink: some View {
         Button {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.restoredRoot)])
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.upscalesRoot)])
         } label: {
             Label("Open output folder in Finder", systemImage: "folder").font(.caption)
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(MediaStorage.restoredRoot)
+        .help(MediaStorage.upscalesRoot)
     }
 
     // MARK: - Actions
@@ -322,7 +322,10 @@ struct RestoreUpscaleView: View {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url { sourceURL = url }
+        // Through AppActivation, never a raw `panel.runModal()`: this is an
+        // accessory app, so a picker opened without bringing it forward first
+        // comes up unfocused and swallows the click (`testNoRawPanelPresentation`).
+        if AppActivation.runModal(panel) == .OK, let url = panel.url { sourceURL = url }
     }
 
     /// Soft gate — see ImageGenView.tryGenerate for the rationale.
@@ -337,6 +340,23 @@ struct RestoreUpscaleView: View {
             pendingRequest = (sourceURL.path, model)
             showRAMWarning = true
             return
+        }
+
+        // The TARGET canvas, not the model, is what makes a restore run out of
+        // memory — and the server only discovers that after the checkpoint has
+        // loaded, which is minutes. Say it here, while it is still one click
+        // to pick a smaller scale.
+        if let (w, h) = sourcePixelSize {
+            let t = scale > 1
+                ? RestoreGeometry.upscaledTarget(width: w, height: h, factor: scale)
+                : (width: RestoreGeometry.snap(w), height: RestoreGeometry.snap(h))
+            if let msg = RestoreGeometry.memoryWarning(targetWidth: t.width, targetHeight: t.height,
+                                                      modelGB: needed, totalRAMGB: total) {
+                ramWarningMessage = msg
+                pendingRequest = (sourceURL.path, model)
+                showRAMWarning = true
+                return
+            }
         }
 
         service.restore(sourcePath: sourceURL.path, model: model, lanModelId: lanModel,

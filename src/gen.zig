@@ -3595,6 +3595,37 @@ pub fn restoreGeometryRefusal(buf: []u8, frames: u32, w: u32, h: u32) ?[]const u
     return null;
 }
 
+/// What ONE output pixel costs in transient GPU memory, on top of the resident
+/// weights, for a whole-frame SeedVR2 pass.
+///
+/// MEASURED, not derived (M4 Max, 24 GB, 3B checkpoint, 2026-08-21): peak
+/// minus resident over 512, 768, 1024, 1280 and 1536 px squares came to 4.77,
+/// 4.80, 4.79, 4.79 and 5.27 KB per pixel — flat, because the VAE runs the
+/// whole frame at f32 and every stage of it is proportional to area. The
+/// constant takes the TOP of that range: under-billing here does not produce
+/// an error, it produces a flat rectangle.
+pub const RESTORE_TRANSIENT_BYTES_PER_PIXEL: u64 = 5400;
+
+/// Why this restore will not fit in memory, as a sentence, or null when it
+/// will. `available` is free system RAM; 0 means "could not measure", which
+/// must NOT refuse — a gate that cannot see has nothing to say.
+///
+/// This exists because the failure it replaces is a 200 with a ruined picture
+/// in it: MLX at the Metal working-set edge returns zeros rather than raising,
+/// so the restore comes back a flat colour with nothing anywhere saying why.
+pub fn restoreMemoryRefusal(buf: []u8, frames: u32, w: u32, h: u32, available: u64) ?[]const u8 {
+    if (available == 0) return null;
+    const pixels: u64 = @as(u64, frames) * @as(u64, w) * @as(u64, h);
+    const need = pixels * RESTORE_TRANSIENT_BYTES_PER_PIXEL;
+    if (need <= available) return null;
+    const gb = 1024.0 * 1024.0 * 1024.0;
+    return std.fmt.bufPrint(
+        buf,
+        "restoring {d}x{d} ({d} frame(s)) needs about {d:.1} GB of free memory beyond the loaded model, but only {d:.1} GB is free; use a smaller scale or source, or close other apps",
+        .{ w, h, frames, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(available)) / gb },
+    ) catch "not enough free memory to restore an image this large";
+}
+
 /// The whole SeedVR2 recipe, shared by both routes.
 ///
 /// `x_in` is `[1, T, H, W, 3]` f32 in [-1, 1]; the return is the decoded
@@ -3736,6 +3767,8 @@ pub fn handleUpscale(allocator: std.mem.Allocator, conn: *Conn, body: []const u8
     if (restoreGeometryRefusal(&rbuf, 1, uw, uh)) |msg| return sendError(conn, 400, msg);
     const lat = seedvr2_shape.latentShape(.{}, 1, uh, uw) orelse
         return sendError(conn, 400, "unsupported image geometry");
+    if (restoreMemoryRefusal(&rbuf, 1, uw, uh, metrics.getAvailableMemBytes())) |msg|
+        return sendError(conn, 400, msg);
 
     const s = mlx.gpuStream();
     const npix: usize = @as(usize, uw) * uh * 3;
@@ -3849,6 +3882,10 @@ pub fn handleUpscaleVideo(allocator: std.mem.Allocator, conn: *Conn, body: []con
     const nf: u32 = @intCast(frames.items.len);
     var rbuf: [220]u8 = undefined;
     if (restoreGeometryRefusal(&rbuf, nf, fw, fh)) |msg| return sendError(conn, 400, msg);
+    // Same gate as the image route: the VAE is whole-frame, so a clip bills
+    // every frame and runs out of memory long before a still of the same size.
+    if (restoreMemoryRefusal(&rbuf, nf, fw, fh, metrics.getAvailableMemBytes())) |msg|
+        return sendError(conn, 400, msg);
     const lat = seedvr2_shape.latentShape(.{}, nf, fh, fw) orelse
         return sendError(conn, 400, "unsupported clip geometry");
 
@@ -4755,6 +4792,47 @@ test "the restore geometry rule is ONE rule, and it names what it refused" {
     try testing.expect(std.mem.indexOf(u8, too_many, "21") != null);
     try testing.expect(std.mem.indexOf(u8, too_many, "17") != null);
     try testing.expect(restoreGeometryRefusal(&buf, 0, 512, 512) != null);
+}
+
+test "a restore too big for free memory is refused, not silently ruined" {
+    // THE FAILURE THIS PREVENTS IS A GOOD-LOOKING 200. MLX at the Metal
+    // working-set edge returns ZEROS rather than erroring (root `## Rules`),
+    // so a restore that does not fit comes back as a FLAT RECTANGLE with a
+    // 200 and no log line — measured live 2026-08-21 at 1536x1536 on a 24 GB
+    // Mac (a brown frame one run, a green one the next, which is how a
+    // memory-edge symptom announces itself) — or, once past Metal's max
+    // buffer size, kills the process outright at 2048x2048.
+    //
+    // The bill is LINEAR IN OUTPUT PIXELS and was measured, not derived:
+    // peak-minus-resident over 512/768/1024/1280/1536 px squares came to
+    // 4.77, 4.80, 4.79, 4.79 and 5.27 KB per pixel.
+    var buf: [256]u8 = undefined;
+    const gb: u64 = 1024 * 1024 * 1024;
+
+    // A 512x512 still needs ~1.3 GB. It fits in 8 GB and is not refused.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 512, 512, 8 * gb) == null);
+    // 2048x2048 needs ~21 GB and does not.
+    const msg = restoreMemoryRefusal(&buf, 1, 2048, 2048, 8 * gb) orelse {
+        std.debug.print("2048x2048 with 8 GB free was NOT refused\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    // A refusal quotes the numbers it COMPARED, or it reads as "this should
+    // have worked" and the user has nothing to act on.
+    try testing.expect(std.mem.indexOf(u8, msg, "GB") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "2048") != null);
+
+    // The SAME geometry passes when the memory is actually there, so the gate
+    // tracks the machine rather than banning a size outright.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 2048, 2048, 64 * gb) == null);
+
+    // Frames multiply: a 17-frame clip bills seventeen frames' worth, so a
+    // video that fits as a still can still be refused.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 512, 512, 2 * gb) == null);
+    try testing.expect(restoreMemoryRefusal(&buf, 17, 512, 512, 2 * gb) != null);
+
+    // Unknown free memory (the sysctl failed) must not refuse everything —
+    // a gate that cannot measure has nothing to say.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 2048, 2048, 0) == null);
 }
 
 test "seedvr2's residency bill follows the LOAD dtype, not the file sizes" {

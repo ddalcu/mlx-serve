@@ -201,6 +201,22 @@ fn extendHead(x: mlx.mlx_array, times: u32, s: S) !mlx.mlx_array {
     return concat(parts[0 .. times + 1], 1, s);
 }
 
+/// Env-gated per-stage memory probe. `MLX_SERVE_SEEDVR2_MEM=1` prints active
+/// and peak bytes at each VAE stage boundary — the only way to attribute a
+/// peak that only appears at sizes too big to hold twice.
+fn memProbe(tag: []const u8) void {
+    const v = std.c.getenv("MLX_SERVE_SEEDVR2_MEM") orelse return;
+    if (std.mem.span(v).len == 0) return;
+    var active: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    const gb = 1024.0 * 1024.0 * 1024.0;
+    std.debug.print("[seedvr2-mem] {s}: active={d:.2} GB peak={d:.2} GB\n", .{
+        tag, @as(f64, @floatFromInt(active)) / gb, @as(f64, @floatFromInt(peak)) / gb,
+    });
+}
+
 /// Causal 3D conv. `temporal_padding` is the padding the PyTorch module was
 /// DECLARED with — it is converted to a head extension of `2 * temporal_padding`
 /// frames and the conv itself runs with zero temporal padding.
@@ -213,7 +229,37 @@ fn causalConv3d(
     spatial_padding: c_int,
     s: S,
 ) !mlx.mlx_array {
-    const ext = try extendHead(x, shape.extendHeadTimes(temporal_padding), s);
+    // A SINGLE-FRAME input makes the whole temporal machinery a 3x memory
+    // waste. `extendHead` prepends `times` copies of frame 0, so at T == 1
+    // every temporal tap of the kernel reads the SAME frame and the output is
+    // `sum_k w[:,k] conv x0` — identical to a one-tap conv with the taps
+    // summed. Taking that shortcut skips the 3x concatenation AND the
+    // contiguous copy it forces: measured at 1024x1024x128, that pair is
+    // 3.2 GB of the encoder block's 5.0 GB peak, and it scales with pixel
+    // area, which is what put a 1536x1536 restore past physical memory.
+    //
+    // EXACT, not an approximation — but only because the frames are literally
+    // replicas. A real video (T > 1) reads different frames per tap and must
+    // take the general path below.
+    const times = shape.extendHeadTimes(temporal_padding);
+    const in_t = mlx.getShape(x)[1];
+    const kt = mlx.getShape(w)[1];
+    if (in_t == 1 and times > 0 and kt == 1 + @as(c_int, @intCast(times))) {
+        var wsum = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wsum);
+        try mlx.check(mlx.mlx_sum_axis(&wsum, w, 1, true, s));
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_conv3d(
+            &o, x, wsum,
+            stride[0], stride[1], stride[2],
+            0, spatial_padding, spatial_padding,
+            1, 1, 1, 1, s,
+        ));
+        defer _ = mlx.mlx_array_free(o);
+        return addA(o, b, s);
+    }
+
+    const ext = try extendHead(x, times, s);
     defer _ = mlx.mlx_array_free(ext);
     const xc = try contig(ext, s);
     defer _ = mlx.mlx_array_free(xc);
@@ -359,18 +405,20 @@ const Resnet = struct {
     /// the reference's divide is omitted rather than multiplied by one.
     fn forward(r: *const Resnet, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         const n1 = try groupNormPerFrame(x, r.norm1_w, r.norm1_b, s);
-        defer _ = mlx.mlx_array_free(n1);
         const a1 = try siluA(n1, s);
-        defer _ = mlx.mlx_array_free(a1);
+        _ = mlx.mlx_array_free(n1);
         const c1 = try causalConv3d(a1, r.conv1_w, r.conv1_b, .{ 1, 1, 1 }, 1, 1, s);
-        defer _ = mlx.mlx_array_free(c1);
+        _ = mlx.mlx_array_free(a1);
+        try mlx.check(mlx.mlx_array_eval(c1));
 
         const n2 = try groupNormPerFrame(c1, r.norm2_w, r.norm2_b, s);
-        defer _ = mlx.mlx_array_free(n2);
         const a2 = try siluA(n2, s);
-        defer _ = mlx.mlx_array_free(a2);
+        _ = mlx.mlx_array_free(n2);
         const c2 = try causalConv3d(a2, r.conv2_w, r.conv2_b, .{ 1, 1, 1 }, 1, 1, s);
+        _ = mlx.mlx_array_free(a2);
+        _ = mlx.mlx_array_free(c1);
         defer _ = mlx.mlx_array_free(c2);
+        try mlx.check(mlx.mlx_array_eval(c2));
 
         if (r.short_w.ctx == null) return addA(x, c2, s);
         // 1x1x1 conv: no time mixing, so no head extension and no padding.
@@ -380,10 +428,58 @@ const Resnet = struct {
     }
 };
 
+/// How many bytes ONE query tile of the mid-block score matrix may cost.
+///
+/// The scores are `[T, q_chunk, HW]` f32 and the `precise=true` softmax keeps
+/// its own f32 copy, so a tile costs this twice over. 256 MiB therefore peaks
+/// around half a gigabyte of transient whatever the image size, against the
+/// 17 GB a 2048x2048 restore asked for unchunked.
+///
+/// Not a tuning knob so much as a ceiling: the chunk loop's only cost is one
+/// extra matmul dispatch per tile, and at the sizes that matter the tile count
+/// is in the dozens.
+pub const ATTN_SCORE_TILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Query rows per attention tile for a key axis of `key_len`.
+///
+/// Returns `key_len` itself whenever the whole matrix already fits, so the
+/// geometries that worked before this existed take the identical single-tile
+/// path. Floored at 1: a key axis long enough that ONE row busts the budget
+/// must still make progress rather than divide to zero.
+pub fn attnQueryChunk(key_len: u32) u32 {
+    const row_bytes: u64 = @as(u64, key_len) * 4;
+    if (row_bytes == 0) return 1;
+    const rows = ATTN_SCORE_TILE_BYTES / row_bytes;
+    if (rows == 0) return 1;
+    return @intCast(@min(rows, @as(u64, key_len)));
+}
+
+/// One `[T, q_rows, C] x [T, C, HW] -> [T, q_rows, C]` attention tile:
+/// scaled scores, `precise=true` softmax (the reference's
+/// `upcast_softmax=True`), and the value gather. Whole-matrix and tiled paths
+/// share it so the two cannot drift in scale or softmax precision.
+fn attendTile(q: mlx.mlx_array, kt: mlx.mlx_array, v: mlx.mlx_array, scale: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var scores = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores);
+    try mlx.check(mlx.mlx_matmul(&scores, q, kt, s));
+    const sc = try mulA(scores, scale, s);
+    defer _ = mlx.mlx_array_free(sc);
+    var pr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pr);
+    try mlx.check(mlx.mlx_softmax_axis(&pr, sc, -1, true, s));
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_matmul(&o, pr, v, s));
+    return o;
+}
+
 /// Single-head spatial self-attention, applied PER FRAME. `heads =
 /// in_channels // attention_head_dim = 512 // 512 = 1`, `residual_connection`,
 /// `rescale_output_factor = 1`, and its own GroupNorm(32).
 const Attention = struct {
+    /// Only for the query-tile list in `forward` — the weights themselves are
+    /// mlx-owned handles.
+    alloc: std.mem.Allocator,
     gn_w: mlx.mlx_array,
     gn_b: mlx.mlx_array,
     q_wt: mlx.mlx_array,
@@ -397,6 +493,7 @@ const Attention = struct {
 
     fn load(a: std.mem.Allocator, w: *const Weights, prefix: []const u8, s: S) !Attention {
         return .{
+            .alloc = a,
             .gn_w = try loadVec(w, a, "{s}.group_norm.weight", .{prefix}, s),
             .gn_b = try loadVec(w, a, "{s}.group_norm.bias", .{prefix}, s),
             .q_wt = try loadLinT(w, a, "{s}.to_q.weight", .{prefix}, s),
@@ -442,20 +539,41 @@ const Attention = struct {
         // Single head: [T, HW, C] is already [batch, seq, head_dim].
         const kt = try transpose(k, &[_]c_int{ 0, 2, 1 }, s);
         defer _ = mlx.mlx_array_free(kt);
-        var scores = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scores);
-        try mlx.check(mlx.mlx_matmul(&scores, q, kt, s));
         const scale = mlx.mlx_array_new_float(1.0 / @sqrt(@as(f32, @floatFromInt(c))));
         defer _ = mlx.mlx_array_free(scale);
-        const sc = try mulA(scores, scale, s);
-        defer _ = mlx.mlx_array_free(sc);
-        var pr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(pr);
-        // precise=true mirrors the reference's upcast_softmax=True.
-        try mlx.check(mlx.mlx_softmax_axis(&pr, sc, -1, true, s));
-        var ctx = mlx.mlx_array_new();
+
+        // QUERY-TILED. The score matrix is `HW x HW` and HW is quadratic in
+        // pixel area, so an unchunked mid block asks for 17 GB at 2048x2048
+        // and lands on the Metal working-set edge (where MLX returns zeros
+        // rather than failing) well before that. Softmax runs along the KEY
+        // axis, so tiling the QUERY axis is exact — see the chunk test.
+        const seq_len: u32 = @intCast(h * wd);
+        const chunk = attnQueryChunk(seq_len);
+        const ctx = if (chunk >= seq_len)
+            try attendTile(q, kt, v, scale, s)
+        else blk: {
+            var parts: std.ArrayList(mlx.mlx_array) = .empty;
+            defer {
+                for (parts.items) |pt| _ = mlx.mlx_array_free(pt);
+                parts.deinit(at.alloc);
+            }
+            var lo: u32 = 0;
+            while (lo < seq_len) : (lo += chunk) {
+                const hi = @min(lo + chunk, seq_len);
+                const qs = try sliceAxis(q, 1, @intCast(lo), @intCast(hi), s);
+                defer _ = mlx.mlx_array_free(qs);
+                const part = try attendTile(qs, kt, v, scale, s);
+                errdefer _ = mlx.mlx_array_free(part);
+                try parts.append(at.alloc, part);
+                // Every tile is its own shape at the ragged tail, and the
+                // pool otherwise holds one 256 MiB score tile per iteration
+                // for the whole block.
+                try mlx.check(mlx.mlx_array_eval(part));
+                _ = mlx.mlx_clear_cache();
+            }
+            break :blk try concat(parts.items, 1, s);
+        };
         defer _ = mlx.mlx_array_free(ctx);
-        try mlx.check(mlx.mlx_matmul(&ctx, pr, v, s));
 
         const out = try linT(ctx, at.o_wt, at.o_b, s);
         defer _ = mlx.mlx_array_free(out);
@@ -766,6 +884,7 @@ pub fn loadDecoder(a: std.mem.Allocator, w: *const Weights, s: S) !Decoder {
 /// The `scaling_factor` is NOT undone here — pass the same representation
 /// `encode` produced.
 pub fn decode(d: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
+    memProbe("decode enter");
     var cur = try causalConv3d(z, d.conv_in_w, d.conv_in_b, .{ 1, 1, 1 }, 1, 1, s);
     {
         const r0 = try d.mid_r0.forward(cur, s);
@@ -775,11 +894,17 @@ pub fn decode(d: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
         const r1 = try d.mid_r1.forward(at, s);
         _ = mlx.mlx_array_free(at);
         cur = r1;
+        try mlx.check(mlx.mlx_array_eval(cur));
+        _ = mlx.mlx_clear_cache();
+        memProbe("decode mid");
     }
     for (&d.blocks) |*b| {
         const nxt = try b.forward(cur, s);
         _ = mlx.mlx_array_free(cur);
         cur = nxt;
+        try mlx.check(mlx.mlx_array_eval(cur));
+        _ = mlx.mlx_clear_cache();
+        memProbe("decode block");
     }
     const n = try groupNormPerFrame(cur, d.norm_out_w, d.norm_out_b, s);
     _ = mlx.mlx_array_free(cur);
@@ -797,12 +922,16 @@ pub fn decode(d: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// `scaling_factor` is deliberately NOT applied here: the caller decides
 /// whether it wants the distribution or the scaled sample.
 pub fn encode(e: *const Encoder, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    memProbe("encode enter");
     var cur = try causalConv3d(x, e.conv_in_w, e.conv_in_b, .{ 1, 1, 1 }, 1, 1, s);
 
     for (&e.blocks) |*b| {
         const nxt = try b.forward(cur, s);
         _ = mlx.mlx_array_free(cur);
         cur = nxt;
+        try mlx.check(mlx.mlx_array_eval(cur));
+        _ = mlx.mlx_clear_cache();
+        memProbe("encode block");
     }
 
     {
@@ -1110,6 +1239,45 @@ test "the decoder ladder mirrors the encoder without being derived from it" {
     try testing.expect(decoderBlockIn(cfg, 2) != decoderBlockOut(cfg, 2));
     try testing.expect(decoderBlockIn(cfg, 3) != decoderBlockOut(cfg, 3));
     try testing.expect(decoderBlockIn(cfg, 0) == decoderBlockOut(cfg, 0));
+}
+
+test "the mid-block attention chunks its queries so the score tile is bounded" {
+    // THE SCORE MATRIX IS QUADRATIC IN PIXEL AREA, and nothing upstream caps
+    // it: the mid block runs at latent resolution, so `HW = (px/8)^2` and the
+    // `[T, HW, HW]` f32 scores are `HW^2 * 4` bytes. Measured live 2026-08-21
+    // on a 24 GB Mac with the 3B resident (12.8 GB):
+    //
+    //   1024x1024 -> HW 16384 ->  1.07 GB  restored correctly
+    //   1536x1536 -> HW 36864 ->  5.44 GB  flat brown rectangle
+    //   2048x2048 -> HW 65536 -> 17.18 GB  server DIED on the allocation
+    //
+    // The 2048 case is the exact byte count in the crash log
+    // (`Attempting to allocate 17179869184 bytes`, past Metal's 14.3 GB
+    // max buffer). 1536 is the same term one rung down and allocates it
+    // TWICE — `precise=true` softmax keeps its own f32 copy — which lands on
+    // the Metal working-set edge, where MLX returns ZEROS instead of failing.
+    // A degenerate flat image is what that looks like from the outside.
+    //
+    // Chunking the QUERY axis is EXACT, not an approximation: the softmax
+    // runs along the KEY axis, so a query row's output does not depend on
+    // which other rows share its tile.
+    const budget: u64 = ATTN_SCORE_TILE_BYTES;
+    for ([_]u32{ 1024, 4096, 16384, 36864, 65536, 262144 }) |kl| {
+        const q = attnQueryChunk(kl);
+        try testing.expect(q >= 1);
+        try testing.expect(q <= kl);
+        // One tile never exceeds the budget (unless a single row already does,
+        // which no reachable geometry reaches but must still not divide to 0).
+        try testing.expect(q == 1 or @as(u64, q) * kl * 4 <= budget);
+        // ...and it is not needlessly small: one more row would exceed it.
+        if (q < kl) try testing.expect(@as(u64, q + 1) * kl * 4 > budget);
+    }
+    // A grid small enough to fit stays in ONE tile, so the sizes that already
+    // worked pay nothing for the bookkeeping. 512x512 pixels -> HW 4096.
+    try testing.expectEqual(@as(u32, 4096), attnQueryChunk(4096));
+    // And the two broken sizes are genuinely divided.
+    try testing.expect(attnQueryChunk(36864) < 36864);
+    try testing.expect(attnQueryChunk(65536) < 65536);
 }
 
 test "the encoder's shortcut plan matches the checkpoint's" {

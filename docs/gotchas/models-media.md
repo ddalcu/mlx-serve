@@ -1337,3 +1337,78 @@ The fix is a dtype-conditional cast at the ONE place the scores enter the expert
 2. **Byte-equality between the chunked and unchunked arms is an unsound bar.** Chunk width changes GEMM shapes; a 4-bit checkpoint flips near-tie argmaxes across widths (measured text-only: chunk 512 vs 16384 diverge mid-answer on LFM2.5-VL-1.6B-4bit) — same class as MTP verify-width divergence. The A/B bar is the perceived-content invariant: both arms must name the SAME color set for a quadrant image (checkpoint-agnostic — gemma-4-qat calls dark yellow "brown" in BOTH arms), the off arm must read the top row at all, and the class bug shows as the chunked arm's set collapsing.
 
 **Validated live** on LFM2-VL (hybrid arm, image split across chunks 1–3 at chunk 32: identical answers), gemma-4-12B-qat (standard arm + PLE), and Muse-Glimmer-30B-4bit (muse arm, window-attention ViT). Qwen3.5-VL (M-RoPE) rides the same shared splice but had no local checkpoint in the loop — M-RoPE indexes its position table by absolute offset and rebuilds cos/sin per forward, so a chunk boundary inside an image is positionally safe there by construction. Guards: `tests/test_vision_chunked_prefill.sh` (two-arm engagement + color-set invariant), `spliceVisionRows` chunk-equivalence + audio-ordering tests (transformer.zig), `countSpliceRows` + wiring scan (generate.zig), guard-billing scan (server.zig).
+
+## SeedVR2: an upscale came back PURE WHITE, and nothing anywhere said so (2026-08-21)
+
+**Live failure.** A 904x960 photo at 2x produced a 1808x1920 PNG in which every
+pixel was 255. The run before it produced the same geometry as a flat grey
+(min 123, max 128). Status 200, a plausible file on disk, nothing in the log.
+Both files were still in `~/.mlx-serve/generations/restored/` and are what
+turned this from a guess into a measurement.
+
+**It was never a math bug.** The port is correct: 128, 256, 512, 768 and 1024 px
+squares all restore properly, and 1024 was byte-identical across the first fix
+(so the recipe was not touched). The whole failure is memory. SeedVR2's VAE runs
+the WHOLE frame at f32, so its transient cost is LINEAR IN OUTPUT PIXELS —
+measured peak-minus-resident on an M4 Max / 24 GB / 3B checkpoint:
+
+| canvas | pixels | transient | KB/px |
+| --- | --- | --- | --- |
+| 512x512 | 0.26 M | 1.25 GB | 4.77 |
+| 768x768 | 0.59 M | 2.83 GB | 4.80 |
+| 1024x1024 | 1.05 M | 5.02 GB | 4.79 |
+| 1280x1280 | 1.64 M | 7.85 GB | 4.79 |
+| 1536x1536 | 2.36 M | 12.43 GB | 5.27 |
+
+Past what the machine has, **MLX returns degenerate values rather than raising**
+(root `## Rules`) — which is what a flat rectangle IS. The colour changed run to
+run (brown, then green, at the same size) and that non-determinism is the tell:
+a code bug repeats, a working-set-edge symptom does not.
+
+**Three separate things were wrong, in the order they bite.**
+
+1. **The VAE mid-block attention materialised a dense `[T, HW, HW]` f32 score
+   matrix.** `HW` is `(px/8)^2`, so the matrix is QUARTIC in linear size: 1.07 GB
+   at 1024, 5.44 GB at 1536 (twice over — `precise=true` softmax keeps its own
+   f32 copy), and **17179869184 bytes at 2048**, which is past Metal's 14.3 GB
+   max buffer and killed the process. That byte count is exactly `65536^2 * 4`
+   and `65536 = (2048/8)^2`, which is how it was attributed without a profiler.
+   Fixed by tiling the QUERY axis (`attnQueryChunk`, 256 MiB tiles). Exact, not
+   an approximation — softmax runs along the KEY axis, so a query row's output
+   does not depend on which rows share its tile — and pinned by a 1024 px
+   restore that came back BYTE-IDENTICAL to the dense path.
+
+2. **`extendHead` tripled every conv's input for a still image.** The causal
+   conv prepends `times` copies of frame 0, then `contig` copies the result:
+   two 1.6 GB arrays per conv at 1024x1024x128. At T == 1 all three frames are
+   the SAME frame, so the output is `sum_k w[:,k] conv x0` — a one-tap conv
+   with the taps summed. Folding it cut the encoder block's peak 5.02 -> 4.02 GB,
+   total 13.27 -> 12.27 GB, and made a 1024 restore ~33% faster. Exact only
+   because the frames are literal replicas; video (T > 1) keeps the general path.
+
+3. **Nothing billed the geometry.** Now `restoreMemoryRefusal` compares
+   `pixels * RESTORE_TRANSIENT_BYTES_PER_PIXEL` against free RAM and 400s BY
+   NAME on both routes, quoting both numbers. The user's exact geometry now says
+   "restoring 1808x1920 needs about 17.5 GB of free memory beyond the loaded
+   model, but only 9.3 GB is free".
+
+**Two dead ends worth not repeating.** Banding the convolution's output rows to
+cap an im2col expansion made peak WORSE (13.3 -> 17.1 GB): MLX has a real kernel
+at these shapes and never unfolded, so the banding only added a padded copy, the
+band outputs and a concatenation. And rewriting `groupNormPerFrame` from five
+concurrent frame-sized temporaries down to two moved peak by **exactly zero
+bytes** — MLX is lazy, so Zig-side handle lifetimes do not decide residency, the
+scheduler does. Both were reverted. What DID move the number was forcing
+evaluation at stage boundaries (block: -2.25 GB, per-resnet: -1.0 GB), because
+that bounds what one command buffer holds.
+
+**The rule that generalises.** A media pass whose cost scales with pixel area
+owes a BILL and a refusal, not a best effort — because the failure mode is not
+an error, it is a good-looking 200 with a ruined picture in it. And measure the
+peak per stage (`MLX_SERVE_SEEDVR2_MEM=1`) before attributing it: the attention
+matrix, the conv unfold and the temporal replication are three different terms
+that all scale together, and two of the three theories here were wrong.
+
+Guards: `tests/test_seedvr2_upscale.sh` (verified red — without the gate an
+8000x8000 request kills the server), `attnQueryChunk` /
+`restoreMemoryRefusal` unit tests, `RestoreGeometryTests` app-side.
