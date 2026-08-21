@@ -41,11 +41,14 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, pixtral } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
     min_pixels: u32 = 0,
+    /// qwen: max PIXEL AREA. pixtral: max LONGEST EDGE in pixels (Pixtral's
+    /// resize caps a single dimension, not an area) — same field, different
+    /// unit per mode, since the two never coexist on one request.
     max_pixels: u32 = 0,
     /// muse/lfm2: the resize cap is on MERGED tokens, not pixels.
     max_tokens: u32 = 0,

@@ -41,6 +41,7 @@ const supported_model_types = [_][]const u8{
     "qwen3_moe_text",   "qwen3_next",
     "qwen4_exp",        "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",            "mistral",
+    "mistral3", // Mistral Small 3.1/3.2 (Mistral3ForConditionalGeneration); text via the flat "mistral" arch + Pixtral vision (src/pixtral_vision.zig)
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
     "bert",
@@ -1776,6 +1777,13 @@ test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
     // top-level model_type "gemma3_text" and must be discoverable, not skipped.
     try testing.expect(isSupportedModelType("gemma3_text"));
     try testing.expect(isSupportedModelType("gemma3"));
+}
+
+test "isSupportedModelType accepts mistral3 (Mistral Small 3.1/3.2)" {
+    // Without this, discovery skips the directory before model.zig ever
+    // gets to collapse the outer "mistral3" tag onto the flat "mistral" arch.
+    try testing.expect(isSupportedModelType("mistral3"));
+    try testing.expect(isSupportedModelType("mistral"));
 }
 
 test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {

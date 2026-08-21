@@ -11,6 +11,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const pixtral_vision = @import("pixtral_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -10530,6 +10531,14 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.pixtral_vision) {
+        return .{
+            .mode = .pixtral,
+            .patch = config.vision_patch_size,
+            .merge = config.pv_spatial_merge,
+            .max_pixels = config.pv_image_size,
+        };
+    }
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -11003,6 +11012,36 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
+
+    // Pixtral (mistral3): its own resize algorithm (caps the LONGEST EDGE in
+    // pixels, floor-then-ceil-div to patch multiples — no merge-factor area
+    // bound like Qwen/Muse) and its own CLIP mean/std normalization (not the
+    // 0.5/0.5 every other tower shares), so it gets its own branch rather
+    // than folding into the generic factor/min/max-pixels block below.
+    if (vp.mode == .pixtral) {
+        const rs = pixtral_vision.resizePixtral(src_h, src_w, if (vp.max_pixels > 0) vp.max_pixels else 1024, vp.patch);
+        const rh = rs.h;
+        const rw = rs.w;
+        const C: u32 = 3;
+        const gh = rh / vp.patch;
+        const gw = rw / vp.patch;
+        const n: usize = @as(usize, gh) * gw;
+        const feat: usize = @as(usize, C) * vp.patch * vp.patch;
+        const plane: usize = @as(usize, rh) * rw;
+
+        const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
+        defer allocator.free(chw);
+        const source_len: usize = @as(usize, src_h) * src_w * C;
+        pixtral_vision.resizeRgbBicubicClipNormalizedChw(allocator, chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
+
+        const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
+        const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
+        pixtral_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch);
+        log.info("  Decoded {d}x{d} image → pixtral grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+            src_w, src_h, gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh,
+        });
+        return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
+    }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that

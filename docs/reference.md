@@ -83,6 +83,7 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `lfm2`, `lfm2_vl` | Liquid LFM2.5 / LFM2.5-VL | `model` | -- | `vision_tower` + `multi_modal_projector` | Hybrid gated conv + full attention; the VL tag adds a SigLIP2-NaFlex tower (`src/lfm2_vision.zig`) |
 | `laguna` | poolside Laguna S 2.1 | `model` | -- | 256/top-10 | Pure-attention MoE coder (nvfp4 experts); per-layer Q-heads, softplus attn gate, YaRN rope. See "Laguna" below. |
 | `llama`, `mistral` | Llama/Mistral | `model` | -- | -- | |
+| `mistral3` | Mistral Small 3.1/3.2 | `language_model.model` | Pixtral | -- | Collapses onto the flat `mistral` text arch (`text_config.model_type == "mistral"`); vision is a Pixtral tower — no CLS, 2D RoPE, patch-merger projector. See "Mistral3 / Pixtral vision" below. |
 | `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
 **TODO**: `phi`/`phi3` (different layout), `command-r` (different arch).
@@ -94,6 +95,34 @@ A `.gguf` model path (or a directory containing one) bypasses the MLX safetensor
 GGUF dirs are also **discoverable + cold-loadable** (issue #59 — pulled GGUF repos ship NO config.json): discovery and `probeModelDir` classify a dir holding a non-mmproj `.gguf` as `model_type "gguf"` — GGUF presence WINS over a stray config.json, mirroring `--model` routing — with `bytes_on_disk` = the file `resolveGgufFile` will pick (alphabetically-smallest LLM quant), not the sum of every quant. On demand, `ensureLoaded` routes through the same engine arms as startup: `preloadCpuState` builds a stub CpuState (`buildGgufStubCpuState`; ctx from `LoadParams.ctx_size`, else llama 8192 / ds4 clamp) and sets `LoadRequest.{ds4,llama}_path`. The GGUF path helpers (`isGgufModelPath`/`resolveGgufFile`) live in `model_discovery.zig`, shared by main.zig and the scheduler. Guard: the headless section of `tests/test_llama_gguf.sh` (discover → cold-load → chat → unload → reload) + the GGUF discovery/probe/resolve tests in `model_discovery.zig`.
 
 Models with `vision_config` but no vision weights (e.g., text-only quantized Qwen 3.5) gracefully disable vision at init. Swift app flags unsupported archs via `supportedModelTypes` in `HFModels.swift`.
+
+### Mistral3 / Pixtral vision
+
+`model_type: mistral3` (Mistral Small 3.1/3.2) wraps the already-supported
+`mistral` text arch (`text_config.model_type == "mistral"`, collapsed at
+parse time — zero `transformer.zig` changes) plus a Pixtral vision tower
+(`src/pixtral_vision.zig`). Pixtral has no CLS token and no learned absolute
+position embedding — a bias-less non-overlapping `Conv2d` patch embed
+(implemented as patchify+matmul, same trick as the other patch-grid towers)
+followed by 2D RoPE (θ from `vision_config.rope_theta`, position id
+`h*max_patches_per_side+w`). One image per `forwardPatches` call, so — unlike
+the HF reference, which batches multiple images with a block-diagonal
+attention mask — no cross-image masking is needed. Mistral3's own
+`Mistral3MultiModalProjector`: RMSNorm (at the **text** config's
+`rms_norm_eps`) → patch-merger (space-to-depth `spatial_merge_size²` merge,
+channel-major-then-within-block-position feature order — `c*(k*k)+kh*k+kw`,
+confirmed against the reference `unfold` helper) → `linear_1` → GELU →
+`linear_2`. Preprocessing caps the LONGEST EDGE in pixels
+(`vision_config.image_size`, floor-then-ceil-div to patch multiples) with
+bicubic resample and CLIP mean/std normalization — distinct from every other
+tower's shared 0.5/0.5 normalization, so it gets its own resize/normalize
+path (`pixtral_vision.resizePixtral` / `resizeRgbBicubicClipNormalizedChw`)
+rather than folding into the generic Qwen/Muse/LFM2 block in
+`server.zig:decodeImageToPixels`. Weight prefixes confirmed against a real
+`mistralai/Mistral-Small-3.1-24B-Instruct-2503` safetensors index: text under
+`language_model.model.*`, vision/projector flat at `vision_tower.*` /
+`multi_modal_projector.*` (already covered by `shouldKeepWeightKey`'s generic
+vision-key gate — no new code there).
 
 ### DiffusionGemma (block diffusion)
 

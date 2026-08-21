@@ -127,19 +127,19 @@ fn sinc(x: f64) f64 {
 
 const RESAMPLE_PRECISION_BITS: u6 = 22;
 const RESAMPLE_PRECISION_SCALE: f64 = @floatFromInt(@as(i64, 1) << RESAMPLE_PRECISION_BITS);
-const RESAMPLE_ROUNDING_BIAS: i64 = @as(i64, 1) << (RESAMPLE_PRECISION_BITS - 1);
+pub const RESAMPLE_ROUNDING_BIAS: i64 = @as(i64, 1) << (RESAMPLE_PRECISION_BITS - 1);
 
-const ResampleBound = struct {
+pub const ResampleBound = struct {
     start: usize,
     len: usize,
 };
 
-const ResampleCoefficients = struct {
+pub const ResampleCoefficients = struct {
     bounds: []ResampleBound,
     weights: []i32,
     kernel_size: usize,
 
-    fn deinit(self: *ResampleCoefficients, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResampleCoefficients, allocator: std.mem.Allocator) void {
         allocator.free(self.weights);
         allocator.free(self.bounds);
         self.* = undefined;
@@ -195,7 +195,7 @@ const AxisGeometry = struct {
     }
 };
 
-fn buildResampleCoefficients(
+pub fn buildResampleCoefficients(
     allocator: std.mem.Allocator,
     input_len: usize,
     output_len: usize,
@@ -260,7 +260,7 @@ pub fn resampleWeightMatrix(
     }
 }
 
-fn clipFixedResample(value: i64) u8 {
+pub fn clipFixedResample(value: i64) u8 {
     const rounded = @divFloor(value, @as(i64, 1) << RESAMPLE_PRECISION_BITS);
     return @intCast(std.math.clamp(rounded, 0, 255));
 }

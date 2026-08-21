@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const pixtral_vision = @import("pixtral_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -123,12 +124,14 @@ pub const VisionEncoder = struct {
     qwen: ?qwen_vision.QwenVision = null,
     muse: ?muse_vision.MuseVision = null,
     lfm2: ?lfm2_vision.Lfm2Vision = null,
+    pixtral: ?pixtral_vision.PixtralVision = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
         if (config.qwen_vision) return initQwen(allocator, config, weights);
         if (config.muse_vision) return initMuse(allocator, config, weights);
         if (config.lfm2_vision) return initLfm2(allocator, config, weights);
+        if (config.pixtral_vision) return initPixtral(allocator, config, weights);
         const s = mlx.mlx_default_gpu_stream_new();
 
         var name_buf: [256]u8 = undefined;
@@ -253,6 +256,7 @@ pub const VisionEncoder = struct {
         if (self.qwen) |*q| q.deinit();
         if (self.muse) |*m| m.deinit();
         if (self.lfm2) |*l| l.deinit();
+        if (self.pixtral) |*p| p.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -420,6 +424,33 @@ pub const VisionEncoder = struct {
         };
     }
 
+    /// Build a VisionEncoder wrapping the Mistral3 Pixtral tower. Same
+    /// sentinel shape as `initQwen`/`initMuse`/`initLfm2`; `pixtral` drives
+    /// `forwardPatches`.
+    fn initPixtral(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const s = mlx.mlx_default_gpu_stream_new();
+        const pv = try pixtral_vision.PixtralVision.init(allocator, config, weights);
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = config.quant_group_size,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6,
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+            .pixtral = pv,
+        };
+    }
+
     /// Encode one image on a patch-grid tower: `patches` is the processor's
     /// pixel_values [N, feat]; `grid_h/grid_w` is the full patch grid.
     /// Returns [1, N/merge², out_hidden].
@@ -427,6 +458,7 @@ pub const VisionEncoder = struct {
         if (self.muse) |*mv| return mv.forward(patches, grid_h, grid_w);
         if (self.qwen) |*qv| return qv.forward(patches, grid_h, grid_w);
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
+        if (self.pixtral) |*pv| return pv.forward(patches, grid_h, grid_w);
         return error.NoPatchGridEncoder;
     }
 

@@ -544,6 +544,16 @@ pub const ModelConfig = struct {
     lv_pixels_tolerance: f32 = 2.0,
     lv_thumbnail_token_id: u32 = 0,
     lv_row_col_base_id: u32 = 0, // id of `<|img_row_1_col_1|>`; the block is row-major
+    // Mistral3 vision (src/pixtral_vision.zig): Pixtral ViT (no CLS, no learned
+    // absolute pos embed — 2D RoPE instead) + a patch-merger projector. Shares
+    // the generic vision_* fields above for tower geometry (hidden/heads/
+    // layers/head_dim/intermediate/patch_size/rope_theta all read generically
+    // since Pixtral's vision_config spells them the same way); these are the
+    // Mistral3-specific wrapper fields (top-level config.json, not nested).
+    pixtral_vision: bool = false,
+    pv_spatial_merge: u32 = 2, // patch-merger downsample factor (2×2 patches → 1 token)
+    pv_projector_bias: bool = false, // multimodal_projector_bias
+    pv_image_size: u32 = 1024, // longest-edge resize cap in pixels (vision_config.image_size)
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -1905,6 +1915,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                     if (rp.object.get("rope_theta")) |v| config.vision_rope_theta = jsonFloat(v);
                 }
             }
+            // Pixtral (mistral3) spells rope_theta flat, not under rope_parameters.
+            if (vc.get("rope_theta")) |v| config.vision_rope_theta = jsonFloat(v);
+            // Pixtral's resize cap in pixels (Mistral3's own preprocessor uses
+            // this as the longest_edge bound).
+            if (vc.get("image_size")) |v| {
+                if (v == .integer) config.pv_image_size = @intCast(v.integer);
+            }
             if (vc.get("use_clipped_linears")) |v| {
                 if (v == .bool) config.vision_use_clipped_linears = v.bool;
             }
@@ -1969,6 +1986,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     }
     if (root.get("eoi_token_id")) |v| {
         if (v == .integer) config.eoi_token_id = @intCast(v.integer);
+    }
+    // Mistral3's projector knobs — top-level, not nested under vision_config.
+    if (root.get("spatial_merge_size")) |v| {
+        if (v == .integer) config.pv_spatial_merge = @intCast(v.integer);
+    }
+    if (root.get("multimodal_projector_bias")) |v| {
+        if (v == .bool) config.pv_projector_bias = v.bool;
     }
 
     // Set model-family defaults based on model_type
@@ -3293,7 +3317,17 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.model_type = "qwen2";
         } else if (std.mem.eql(u8, model_type, "llama")) {
             config.model_type = "llama";
-        } else if (std.mem.eql(u8, model_type, "mistral")) {
+        } else if (std.mem.eql(u8, model_type, "mistral") or
+            std.mem.eql(u8, model_type, "mistral3"))
+        {
+            // "mistral3" (Mistral Small 3.1/3.2, Mistral3ForConditionalGeneration)
+            // wraps the SAME text backbone as flat "mistral" inside a
+            // "text_config", plus a "vision_config" for a Pixtral tower we
+            // don't implement. Collapse onto "mistral" so the fully generic
+            // dense-attention forward path fires with no new branching;
+            // cfg_obj already reads out of text_config when present (see the
+            // resolution near the top of this function), so every per-field
+            // read below lands correctly for either shape.
             config.model_type = "mistral";
         } else {
             config.model_type = "unknown";
@@ -3330,6 +3364,25 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.has_qk_norm = true;
+        }
+
+        if (std.mem.eql(u8, model_type, "mistral3")) {
+            // Nested container (text_config present) ⇒ weights live under
+            // "language_model.model.*", mirroring the gemma3/lfm2 VL split;
+            // resolveWeightPrefix self-heals against the real checkpoint's
+            // key names if this guess is off. Confirmed against a real
+            // Mistral-Small-3.1-24B-Instruct-2503 safetensors index.
+            config.weight_prefix = if (root.get("text_config") != null) "language_model.model" else "model";
+            // The vision_config-presence block earlier in this function
+            // already set has_vision true and populated the generic tower
+            // geometry fields (Pixtral spells hidden_size/num_attention_heads/
+            // num_hidden_layers/head_dim/intermediate_size/patch_size/
+            // rope_theta the same way those fields are already read). Arm
+            // the Pixtral tower; VisionEncoder.init's existing benign
+            // MissingVisionWeights opt-out (scheduler.zig) is what gracefully
+            // disables vision on a checkpoint that ships vision_config but no
+            // vision weights (mirrors Qwen3.5 quantized-text-only handling).
+            config.pixtral_vision = root.get("vision_config") != null;
         }
     }
 
@@ -5654,6 +5707,70 @@ test "parseConfigFromJson mistral honors explicit head_dim (≠ hidden/heads), f
     try testing.expectEqual(@as(u32, 131072), config.vocab_size);
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expect(!config.tie_word_embeddings);
+}
+
+test "parseConfigFromJson mistral3 collapses onto mistral, reads text_config, arms pixtral vision" {
+    // Mistral-Small-3.1/3.2 (Mistral3ForConditionalGeneration): outer
+    // model_type "mistral3" wraps a "text_config" whose OWN model_type is
+    // "mistral" (the already-supported flat arch) plus a "vision_config" for
+    // the Pixtral tower. The arm must collapse config.model_type onto
+    // "mistral" (so transformer.zig's fully generic dense-attention path
+    // fires with zero new branching), read every text field out of
+    // text_config (not struct defaults), pick the nested weight_prefix
+    // (text_config present ⇒ "language_model.model", mirroring the
+    // gemma3/lfm2 rule — confirmed against a real checkpoint's safetensors
+    // index), and arm pixtral_vision + the Pixtral-specific geometry fields.
+    const json =
+        \\{
+        \\  "model_type": "mistral3",
+        \\  "image_token_index": 10,
+        \\  "spatial_merge_size": 2,
+        \\  "multimodal_projector_bias": false,
+        \\  "text_config": {
+        \\    "model_type": "mistral",
+        \\    "hidden_size": 5120,
+        \\    "num_attention_heads": 32,
+        \\    "num_hidden_layers": 40,
+        \\    "num_key_value_heads": 8,
+        \\    "head_dim": 128,
+        \\    "intermediate_size": 32768,
+        \\    "max_position_embeddings": 131072,
+        \\    "rope_theta": 1000000000.0,
+        \\    "rms_norm_eps": 1e-05,
+        \\    "vocab_size": 131072
+        \\  },
+        \\  "vision_config": {
+        \\    "model_type": "pixtral",
+        \\    "hidden_size": 1024,
+        \\    "num_attention_heads": 16,
+        \\    "num_hidden_layers": 24,
+        \\    "head_dim": 64,
+        \\    "patch_size": 14,
+        \\    "image_size": 1540,
+        \\    "rope_theta": 10000.0
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("mistral", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.has_vision);
+    try testing.expect(config.pixtral_vision);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 5120), config.hidden_size);
+    try testing.expectEqual(@as(u32, 131072), config.vocab_size);
+    try testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 24), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 64), config.vision_head_dim);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(f32, 10000.0), config.vision_rope_theta);
+    try testing.expectEqual(@as(u32, 1540), config.pv_image_size);
+    try testing.expectEqual(@as(u32, 2), config.pv_spatial_merge);
+    try testing.expect(!config.pv_projector_bias);
 }
 
 test "parseConfigFromJson dense bf16 qwen3_5_moe → quant_bits 0" {
