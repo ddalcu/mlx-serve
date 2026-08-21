@@ -156,10 +156,12 @@ final class ToolFolderListingTests: XCTestCase {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? #"{"model_type":"\#(modelType)"}"#.write(toFile: (dir as NSString).appendingPathComponent("config.json"),
                                                      atomically: true, encoding: .utf8)
-        // A config alone is not a model: `makeLocalModels` requires weights, so
-        // an interrupted download never becomes a picker entry.
-        FileManager.default.createFile(atPath: (dir as NSString).appendingPathComponent("model.safetensors"),
-                                       contents: Data("weights".utf8))
+        // A config alone is not a model, and neither is a stub: the weight
+        // payload has to clear `minimumWeightBytes` or this fixture describes
+        // an orphan rather than a checkpoint (see `ModelDefectTests`).
+        FileManager.default.createFile(
+            atPath: (dir as NSString).appendingPathComponent("model.safetensors"),
+            contents: Data(count: Int(DownloadManager.minimumWeightBytes) + 1))
         return dir
     }
 

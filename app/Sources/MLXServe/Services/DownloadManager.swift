@@ -1614,7 +1614,11 @@ class DownloadManager: ObservableObject {
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configPath) else { return [] }
 
-        guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return [] }
+        // A defect does NOT drop the directory. Dropping it is how two junk
+        // folders stayed invisible in the app while the server registered them
+        // and would have died loading either one — you cannot delete what you
+        // cannot see. It is listed, unpickable, and deletable instead.
+        let defect = weightDefect(inDir: resolved, entries: entries)
 
         let meta = parseConfigMetadata(atPath: configPath)
         let modelType = meta.modelType
@@ -1639,8 +1643,54 @@ class DownloadManager: ObservableObject {
             quantBits: meta.quantBits,
             contextLength: meta.contextLength,
             numExperts: meta.numExperts,
-            activeExperts: meta.activeExperts
+            activeExperts: meta.activeExperts,
+            defect: defect
         )]
+    }
+
+    /// Smallest total weight payload that could be a real checkpoint.
+    ///
+    /// This is a "nothing loadable is this small" floor, NOT a guess about
+    /// model size: the smallest quantized checkpoint anyone serves is orders of
+    /// magnitude past a mebibyte. It exists because a file-EXISTS check let a
+    /// 48 KB stub `jangtq_runtime.safetensors` present its folder as a real,
+    /// selectable model. Where the checkpoint declares its own parts we do not
+    /// use the floor at all — a shard index is exact.
+    nonisolated static let minimumWeightBytes: UInt64 = 1024 * 1024
+
+    /// Classify a safetensors directory: nil when it holds a loadable
+    /// checkpoint, else why it does not.
+    ///
+    /// Order matters. An interrupted download is reported ahead of thin
+    /// weights because it EXPLAINS them — the transfer stopped, so "re-download
+    /// or delete" is the honest advice, where "this folder is junk" is not.
+    nonisolated static func weightDefect(inDir dir: String, entries: [String]) -> ModelDefect? {
+        if entries.contains(where: { $0.hasSuffix(".partial") || $0.hasSuffix(".incomplete") }) {
+            return .interruptedDownload
+        }
+
+        // Exact path: the index names every shard the checkpoint needs.
+        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
+        if let data = FileManager.default.contents(atPath: indexPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let map = obj["weight_map"] as? [String: String] {
+            let declared = Set(map.values)
+            if !declared.isEmpty {
+                let missing = declared.contains {
+                    !FileManager.default.fileExists(
+                        atPath: (dir as NSString).appendingPathComponent($0))
+                }
+                return missing ? .missingShards : nil
+            }
+        }
+
+        // Inexact path: no index, so all we can say is whether the bytes on
+        // disk could possibly be a checkpoint.
+        let weights = entries.filter { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }
+        let bytes = weights.reduce(UInt64(0)) {
+            $0 + resolvedFileSize((dir as NSString).appendingPathComponent($1))
+        }
+        return bytes >= minimumWeightBytes ? nil : .missingWeights
     }
 
     /// Metadata read from a model's `config.json` — the authoritative source for
@@ -1950,7 +2000,11 @@ class DownloadManager: ObservableObject {
         // defensive backstop, and the roots are scoped to modelsDir so a stray call
         // can never prune into an external tree.
         guard model.isDeletable else { return }
-        let roots = ownedRoots
+        // A broken folder is deletable wherever it sits, so the ROOT LIST it is
+        // bounded by has to widen with it: `roots` is what `removeModelFiles`
+        // refuses to remove and stops pruning at, and a foreign root missing
+        // from that set is a root this call would happily delete.
+        let roots = model.defect != nil ? readRoots : ownedRoots
         if model.quantFile != nil {
             // One quant of a GGUF repo — remove that file only. Its siblings are
             // separate models the user didn't ask to delete.

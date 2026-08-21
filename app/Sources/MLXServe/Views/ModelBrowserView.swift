@@ -743,7 +743,7 @@ private struct MyModelsPane: View {
                                 Divider().padding(.horizontal, 12)
                             }
                         } header: {
-                            Text(ModelBrowserUse.groupTitle(group.source))
+                            Text(group.title)
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1705,6 +1705,17 @@ private struct LocalModelRow: View {
                     // just aren't loadable as a target on their own. Show a
                     // distinct badge instead of the red "unsupported" warning
                     // that the generic check would otherwise render.
+                    // A folder that cannot load says so on the row itself. The
+                    // alternative — hiding it — is how two junk folders sat in
+                    // this library unnoticed while the server registered both.
+                    if let defect = model.defect {
+                        Text(defect.label)
+                            .font(.system(size: 10).weight(.medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.15), in: Capsule())
+                            .help(defect.explanation)
+                    }
                     if model.kind == .drafter {
                         Text("Drafter")
                             .font(.system(size: 10).weight(.medium))
@@ -1725,7 +1736,9 @@ private struct LocalModelRow: View {
                 // the row actually tells the user what the model is — previously
                 // it was just a name and a delete button.
                 HStack(spacing: 6) {
-                    Text(model.metadataSummary)
+                    // For a broken folder the architecture summary is noise —
+                    // what it IS matters less than why it cannot load.
+                    Text(model.defect?.explanation ?? model.metadataSummary)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1793,7 +1806,9 @@ private struct LocalModelRow: View {
                     }
                     .buttonStyle(.plain)
                     .font(.callout)
-                    .help(model.quantFile != nil ? "Delete this quant" : "Delete model")
+                    .help(model.defect != nil
+                          ? "Delete this broken folder"
+                          : (model.quantFile != nil ? "Delete this quant" : "Delete model"))
                     .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
                         Button("Cancel", role: .cancel) {}
                         Button("Delete", role: .destructive) {
@@ -1803,9 +1818,16 @@ private struct LocalModelRow: View {
                     } message: {
                         // A GGUF row is ONE quant of a repo — deleting it must not
                         // promise (or perform) the removal of its siblings.
-                        Text(model.quantFile != nil
-                             ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
-                             : "Delete \(model.name)? This will remove all downloaded files.")
+                        if let defect = model.defect {
+                            // This row is offered for deletion inside another
+                            // tool's folder, so the confirmation names the
+                            // folder and the reason rather than just the model.
+                            Text("\(defect.explanation)\n\nDelete \(model.path)?")
+                        } else {
+                            Text(model.quantFile != nil
+                                 ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
+                                 : "Delete \(model.name)? This will remove all downloaded files.")
+                        }
                     }
                 }
             }

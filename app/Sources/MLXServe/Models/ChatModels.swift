@@ -720,6 +720,53 @@ enum ModelEngine: String, Hashable {
     }
 }
 
+/// Why a directory that LOOKS like a model cannot be one.
+///
+/// Discovery used to answer this question by dropping the folder: no
+/// `.safetensors`, no entry. That hid the folder from the only app willing to
+/// tell you it was junk, while the server — which does not run this check —
+/// registered it and would have died on the first load. Worse, the check was
+/// file-EXISTS, so a directory whose entire weight payload is a 48 KB stub
+/// passed it and was offered as a real, selectable model.
+///
+/// A defective folder is LISTED, never picked, and always deletable. It is the
+/// one case where the read-only rule for other tools' trees does not apply:
+/// nobody wants to keep a broken folder, and the app that owns it is not
+/// showing it to you either.
+enum ModelDefect: String, Codable, Hashable, CaseIterable {
+    /// `config.json` present, but the weight bytes beside it could not be a
+    /// checkpoint. Covers both "no `.safetensors` at all" and "a stub file".
+    case missingWeights
+    /// `model.safetensors.index.json` names shards that are not on disk. This
+    /// one is EXACT — the checkpoint lists its own parts, so nothing is
+    /// inferred from size.
+    case missingShards
+    /// A `.partial` / `.incomplete` file is still sitting in the directory.
+    case interruptedDownload
+
+    /// Short badge text for the row.
+    var label: String {
+        switch self {
+        case .missingWeights: "No weights"
+        case .missingShards: "Missing shards"
+        case .interruptedDownload: "Interrupted"
+        }
+    }
+
+    /// What it is and what to do about it. Shown on the row and in the delete
+    /// confirmation — a row you are invited to delete has to justify itself.
+    var explanation: String {
+        switch self {
+        case .missingWeights:
+            return "This folder has a config but no usable model weights, so nothing can load it. It is safe to delete."
+        case .missingShards:
+            return "Some of this checkpoint\u{2019}s weight files are missing, so it cannot load. Re-download it or delete it."
+        case .interruptedDownload:
+            return "A download into this folder was interrupted and never finished. Re-download it or delete it."
+        }
+    }
+}
+
 struct LocalModel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -752,6 +799,11 @@ struct LocalModel: Identifiable, Hashable {
     /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
     var quantLabel: String? = nil
 
+    /// Non-nil when this directory cannot serve as a model. See `ModelDefect`.
+    /// A defective row is listed so you can see and remove it, and is excluded
+    /// from every picker.
+    var defect: ModelDefect? = nil
+
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
     }
@@ -763,12 +815,19 @@ struct LocalModel: Identifiable, Hashable {
     /// delete into them (deleting an HF snapshot orphans shared blobs and
     /// dangles `refs/main`; the others simply aren't ours to remove).
     var isDeletable: Bool {
-        source == .mlxServe
+        // Junk in a foreign tree is still junk. The read-only rule exists so we
+        // never remove another app's WORKING model; a folder that cannot load
+        // is not one, and the owning app is not offering to clean it up either.
+        if defect != nil { return true }
+        return source == .mlxServe
     }
 
     /// Non-nil when this model is read-only (not `isDeletable`): the user-facing
     /// reason shown on the badge that replaces the trash. nil for `.mlxServe`.
     var externalReadOnlyReason: String? {
+        // A deletable row must not also claim to be read-only — the badge and
+        // the trash are the same slot, and `isDeletable` already said trash.
+        if defect != nil { return nil }
         switch source {
         case .mlxServe: return nil
         case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX Core loads it read-only."
@@ -789,7 +848,8 @@ struct LocalModel: Identifiable, Hashable {
     /// them (size + delete) and, since they ARE supported architectures,
     /// no longer flags them "Unsupported".
     var isChatPickable: Bool {
-        kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
+        guard defect == nil else { return false }
+        return kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the
