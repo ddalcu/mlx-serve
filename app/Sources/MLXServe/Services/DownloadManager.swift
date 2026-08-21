@@ -106,7 +106,7 @@ class DownloadManager: ObservableObject {
     /// Every folder to scan, download destination first. This is what the
     /// server is handed, one `--model-dir` per entry.
     func scanRoots() -> [String] {
-        ModelRoots().scanRoots(lmStudioRoot: lmStudioRoot)
+        ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
     }
 
     /// The folders the app owns for READS — where a repo the user already
@@ -127,7 +127,7 @@ class DownloadManager: ObservableObject {
     /// hermetic tests must never resolve into the developer's real library.
     var readRoots: [String] {
         guard pinnedRoot == nil else { return [modelsDir] }
-        return ModelRoots().readRoots(lmStudioRoot: lmStudioRoot)
+        return ModelRoots().readRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
     }
 
     // MARK: - Path resolution
@@ -542,8 +542,12 @@ class DownloadManager: ObservableObject {
 
     /// The same resolution, reachable from `nonisolated` code — the launch-flag
     /// builder needs it and cannot touch this `@MainActor` instance.
-    nonisolated static func lmStudioRootPath() -> String? {
-        let settingsPath = NSString(string: "~/.lmstudio/settings.json").expandingTildeInPath
+    /// `home` is a parameter for the same reason `ToolModelRoots.detected` has
+    /// one: a resolver that reaches the real home directory cannot be tested
+    /// without depending on whether the machine running the tests happens to
+    /// have LM Studio installed.
+    nonisolated static func lmStudioRootPath(home: String = NSHomeDirectory()) -> String? {
+        let settingsPath = (home as NSString).appendingPathComponent(".lmstudio/settings.json")
         let configured: String? = {
             guard let data = FileManager.default.contents(atPath: settingsPath),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -551,7 +555,7 @@ class DownloadManager: ObservableObject {
                   !folder.isEmpty else { return nil }
             return (folder as NSString).expandingTildeInPath
         }()
-        let fallback = NSString(string: "~/.lmstudio/models").expandingTildeInPath
+        let fallback = (home as NSString).appendingPathComponent(".lmstudio/models")
         let candidate = configured ?? fallback
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else { return nil }
@@ -1705,6 +1709,17 @@ class DownloadManager: ObservableObject {
         // with the active snapshot named by `refs/main`. Read-only.
         if let root = huggingFaceRoot {
             out.append(contentsOf: Self.discoverHuggingFaceModels(in: root))
+        }
+
+        // Other local-inference tools' canonical folders, auto-detected. Both
+        // layouts they use are already read by `dualLayoutModels` — MTPLX
+        // writes flat `Org--Name` dirs, Osaurus writes `org/repo` — so this
+        // enumeration exists only because the picker walks folders separately
+        // from `ModelRoots.scanRoots`, and a root added to one and not the
+        // other is served but unselectable. Read-only: another tool's tree.
+        for root in ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).ordered
+        where root != lmStudioRoot {
+            out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "tool:", source: .toolFolder))
         }
 
         // User-configured custom root — same dual-layout scan as the owned

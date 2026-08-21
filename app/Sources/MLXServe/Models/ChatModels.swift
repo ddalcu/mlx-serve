@@ -639,15 +639,25 @@ enum LocalModelSource: String, Codable, Hashable, CaseIterable {
     /// where `huggingface_hub` / `mlx_lm` download). Read-only in the app — the
     /// cache's blob/ref/symlink structure is managed by `huggingface-cli`.
     case huggingFace
+    /// The canonical model folder of ANOTHER local-inference tool, found by
+    /// `ToolModelRoots.detected()` rather than configured by anyone — MTPLX
+    /// (`~/.mtplx/models`) and Osaurus (`~/MLXModels`) today. LM Studio
+    /// predates this case and keeps its own for its settings-driven path.
+    case toolFolder
     case custom
 
     /// Heading for this source's group in a model picker. `allCases` order is
     /// the order pickers render, so it also decides which group comes first.
+    ///
+    /// LM Studio held the generic "Other Discovered Models" back when it was
+    /// the only folder MLX Core did not own. It no longer is, so the generic
+    /// title moved to the generic bucket and LM Studio says its own name.
     var sectionTitle: String {
         switch self {
         case .mlxServe: "MLX-Serve Models"
-        case .lmStudio: "Other Discovered Models"
+        case .lmStudio: "LM Studio Models"
         case .huggingFace: "Hugging Face Cache"
+        case .toolFolder: "Other Discovered Models"
         case .custom: "Custom Folder"
         }
     }
@@ -756,6 +766,7 @@ struct LocalModel: Identifiable, Hashable {
         case .mlxServe: return nil
         case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX Core loads it read-only."
         case .huggingFace: return "In the Hugging Face cache \u{2014} manage with huggingface-cli. MLX Core loads it read-only."
+        case .toolFolder: return "In another local AI app\u{2019}s models folder \u{2014} manage it there. MLX Core loads it read-only."
         case .custom: return "In a custom models folder you added \u{2014} MLX Core loads it read-only and won\u{2019}t delete it."
         }
     }
