@@ -20,6 +20,10 @@ struct ImageGenView: View {
     @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     @State private var resolution: ResolutionOption = ImageModelPreset.flux2Klein4B_Q4.defaultResolution
+    // Held as text, not Int: a size field has to be allowed to be empty or
+    // half-typed while the user edits it, which a numeric binding fights.
+    @State private var customWidthText: String = "1024"
+    @State private var customHeightText: String = "1024"
     @State private var steps: Int = 8
     @State private var seed: Int = -1
     @State private var showRAMWarning: Bool = false
@@ -82,6 +86,8 @@ struct ImageGenView: View {
         // Persist every other sticky field on change (model/quality persist in
         // their sections after applying preset defaults).
         .onChange(of: resolution) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
@@ -391,7 +397,61 @@ struct ImageGenView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            if resolution.isCustom { customResolutionFields }
         }
+    }
+
+    /// Width/height for the Custom… row, with the one line of feedback the
+    /// grid produced. The server rewrites anything off-grid regardless, so the
+    /// point of this is to say so BEFORE the request rather than leave the user
+    /// reading an unexpected size off a finished image.
+    @ViewBuilder
+    private var customResolutionFields: some View {
+        let verdict = customResolutionVerdict
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                labelledSizeField("Width", text: $customWidthText)
+                Text("×").foregroundStyle(.secondary)
+                labelledSizeField("Height", text: $customHeightText)
+            }
+            if let hint = verdict.hint {
+                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                    .font(.caption2)
+                    // A correction is information; a refusal is the reason
+                    // Generate is disabled, so only that one is coloured.
+                    .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
+            }
+        }
+    }
+
+    private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            TextField("", text: text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
+        }
+    }
+
+    /// Only gates while Custom is actually selected — a stale unparseable value
+    /// left in the fields must not disable Generate for a fixed bucket.
+    private var customSizeValid: Bool {
+        !resolution.isCustom || customResolutionVerdict.isValid
+    }
+
+    /// What the selected model's grid makes of the typed size. Non-numeric or
+    /// empty text reads as 0, which the grid already refuses by name.
+    private var customResolutionVerdict: CustomResolution {
+        model.resolutionGrid.resolve(width: Int(customWidthText) ?? 0,
+                                     height: Int(customHeightText) ?? 0)
+    }
+
+    /// The size the request should carry: the grid's corrected numbers while
+    /// Custom is selected, the picked bucket otherwise. Generate is gated on
+    /// the same verdict, so the `?? ` fallback is never the one that ships.
+    private var effectiveSize: (width: Int, height: Int) {
+        guard resolution.isCustom else { return (resolution.width, resolution.height) }
+        return customResolutionVerdict.size ?? (resolution.width, resolution.height)
     }
 
     private var advancedToggle: some View {
@@ -657,7 +717,7 @@ struct ImageGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid || !customSizeValid)
                 }
             }
         }
@@ -762,6 +822,8 @@ struct ImageGenView: View {
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         loras = s.loras
+        customWidthText = String(s.customWidth)
+        customHeightText = String(s.customHeight)
         // A LoRA file may have moved since last session — drop stale entries.
         loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
     }
@@ -772,6 +834,11 @@ struct ImageGenView: View {
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.quality = quality
         s.resolutionId = resolution.id
+        // Persist what the fields HOLD, not the corrected value: rewriting the
+        // user's own number under them mid-edit is the thing a hint exists to
+        // avoid. Unparseable text keeps the previous saved size.
+        s.customWidth = Int(customWidthText) ?? ImageGenSettings().customWidth
+        s.customHeight = Int(customHeightText) ?? ImageGenSettings().customHeight
         s.steps = steps
         s.seed = seed
         s.safeMode = safeMode
@@ -808,8 +875,8 @@ struct ImageGenView: View {
             model: model,
             prompt: prompt,
             seed: seed,
-            width: resolution.width,
-            height: resolution.height,
+            width: effectiveSize.width,
+            height: effectiveSize.height,
             steps: steps,
             keepResident: keepResident,
             lanModelId: lanModel,

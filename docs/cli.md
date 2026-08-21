@@ -7,7 +7,10 @@ mlx-serve run gemma4        # downloads Gemma 4 E4B (4-bit), serves it, chats ri
 mlx-serve pull qwen3.6:27b  # just download (resumable, straight from Hugging Face)
 mlx-serve list              # what's on disk
 mlx-serve serve             # serve everything you've pulled — models load on demand by name
+mlx-serve launch claude     # configure + launch a coding agent CLI against the local server
 ```
+
+`launch` supports claude, pi, omp, opencode, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent. If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). Full per-agent detail in [integrations.md](integrations.md).
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX Core app uses too.
 

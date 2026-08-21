@@ -143,7 +143,9 @@ final class ModelBrowserSectionTests: XCTestCase {
         XCTAssertNil(ModelBrowserUse.pickableModel(atPath: "/m/draft", in: models))
     }
 
-    func testUseIsUnavailableForAnEncoderOrMediaModel() {
+    /// Media models DO get a Use button now (#228), but it opens their create
+    /// pane — it never goes through the CHAT use path this function guards.
+    func testChatUseIsUnavailableForAnEncoderOrMediaModel() {
         let bert = [local("bge-small", path: "/m/bge", type: "bert")]
         XCTAssertNil(ModelBrowserUse.pickableModel(atPath: "/m/bge", in: bert))
 

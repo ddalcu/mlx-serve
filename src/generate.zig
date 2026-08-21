@@ -12,6 +12,7 @@ const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -237,6 +238,26 @@ pub const MtpHeadRef = union(enum) {
         _ = allocator;
     }
 
+    /// Draft-rerank scheme (see mtp.zig): greedy drafts pick via a coarse
+    /// 2-bit readout + trunk-head top-32 re-score instead of a full
+    /// draft-head projection + argmax.
+    pub fn canRerankDrafts(self: MtpHeadRef) bool {
+        return switch (self) {
+            .qwen => |h| h.canRerankDrafts(),
+        };
+    }
+
+    pub fn draftSelect(
+        self: MtpHeadRef,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        return switch (self) {
+            .qwen => |h| h.draftSelect(target, x, suppress_mask),
+        };
+    }
+
     /// The G17/NAX cost surfaces are calibrated against the dense Qwen3.6-27B
     /// sidecar geometry specifically, so every other head plans under
     /// `generic` — an off-profile head served by a calibrated surface would
@@ -273,6 +294,14 @@ pub const MtpCacheRef = union(enum) {
         };
     }
 
+    /// The underlying KVCache — what the prefix cache's spec-snap machinery
+    /// snapshots and restores (every current variant is KVCache-backed).
+    pub fn kv(self: *MtpCacheRef) *KVCache {
+        return switch (self.*) {
+            .qwen => |*c| c,
+        };
+    }
+
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
@@ -298,6 +327,10 @@ pub const MtpCacheRef = union(enum) {
         }
     }
 };
+
+/// An MTP committed-history cache restored from the prefix cache, plus the
+/// absolute target position its index 0 represents.
+pub const MtpRestored = struct { cache: MtpCacheRef, base: usize };
 
 pub const Constraint = struct {
     grammar: *json_grammar.Grammar,
@@ -616,13 +649,45 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
-/// Vision embeddings are scattered from the beginning of their source tensor
-/// within a forward pass, so checkpoint-aligned chunk boundaries would restart
-/// that scatter and reuse the first image features in every chunk. Keep vision
-/// prefill single-pass; image-bearing prompts are excluded from prefix reuse
-/// independently because equal placeholder IDs do not imply equal images.
+/// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
+/// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
+/// equal images) — so vision prefills skip checkpointing even now that they
+/// chunk (the splice scatter itself is chunk-safe via vision_splice_offset).
 pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
     return stride > 0 and has_ssm and !has_vision;
+}
+
+/// Chunked vision prefill (issue #197). Default ON: the splice resumes its
+/// row index across chunk boundaries via `ForwardCtx.vision_splice_offset`,
+/// so an image-bearing prompt prefills under the same chunk-bounded memory
+/// envelope as text. MLX_SERVE_VISION_CHUNKED=0 restores the whole-prompt
+/// single forward (and the memory guard's full-width bill with it).
+var vision_chunked_cached: ?bool = null;
+pub fn visionChunkedPrefillEnabled() bool {
+    if (vision_chunked_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_VISION_CHUNKED");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    vision_chunked_cached = on;
+    return on;
+}
+
+/// What the memory guard should bill a prefill at: full width only for a
+/// vision prompt with chunking killed. The guard and this loop must agree or
+/// admission either over-refuses (bills seq for a chunked prefill) or
+/// under-bills (uncatchable Metal OOM).
+pub fn visionPrefillUnchunked(has_vision: bool) bool {
+    return has_vision and !visionChunkedPrefillEnabled();
+}
+
+/// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
+/// source rows a chunk's splice consumes. Host-side count, no GPU sync.
+pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32) usize {
+    var n: usize = 0;
+    for (ids) |id| {
+        if (id == @as(i32, @intCast(image_token_id)) or
+            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id)))) n += 1;
+    }
+    return n;
 }
 
 /// Number of chunks a cold prefill of `prefix_len` tokens splits into for the
@@ -1353,6 +1418,12 @@ pub const Generator = struct {
         /// the offset (a restore forwards no trunk layers, so a cold context
         /// is what a reused prefix would otherwise get).
         dflash_ctx_restored: ?dflash_mod.DflashCtx = null,
+        /// An MTP committed-history cache restored from the prefix cache,
+        /// whose `base + cache.step()` already equals
+        /// `ssm_checkpoint_pos_offset`. Ownership transfers to the
+        /// Generator. Null = start the history blind at the offset (same
+        /// contract as `dflash_ctx_restored`).
+        mtp_cache_restored: ?MtpRestored = null,
         /// Cooperative abort for abandoned requests: checked between prefill
         /// chunks. The scheduler passes `&slot.cancelled`, set by the conn
         /// thread when the client disconnects mid-prefill. When it flips,
@@ -1376,6 +1447,20 @@ pub const Generator = struct {
         /// prefill saturates the GPU while both tiles read 0 / "—". The
         /// scheduler resets it to 0 when the prefill ends.
         prefill_progress: ?*std.atomic.Value(u64) = null,
+
+        /// Called once per completed prefill chunk boundary (chunk state
+        /// evaluated, allocator cache cleared), except the final one. The
+        /// scheduler runs decode ticks for the streams already decoding at
+        /// this seam, so a long cold prefill stalls them for at most one
+        /// chunk-forward instead of its whole duration. Null = the prefill
+        /// runs atomically (pre-interleave behavior, and the
+        /// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch).
+        interleave_hook: ?InterleaveHook = null,
+    };
+
+    pub const InterleaveHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) void,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -1622,10 +1707,23 @@ pub const Generator = struct {
         // forwarded tail — RoPE offsets are cache-relative, so a late-starting
         // history is self-consistent (sliding-window history semantics).
         const mtp_active = options.mtp_enabled and options.mtp != null;
-        var mtp_cache: ?MtpCacheRef = if (mtp_active) try options.mtp.?.makeCache(allocator) else null;
-        errdefer if (mtp_cache) |*mc| mc.deinit();
+        var mtp_cache: ?MtpCacheRef = null;
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
+        if (mtp_active) {
+            if (options.mtp_cache_restored) |restored| {
+                // A restored history already covers [base, ssm_cp_offset);
+                // the tail prefill APPENDS to it (RoPE offsets are
+                // cache-relative, so continuation is self-consistent).
+                std.debug.assert(restored.base + restored.cache.step() == ssm_cp_offset);
+                mtp_cache = restored.cache;
+                mtp_position_base = restored.base;
+                mtp_history_started = true;
+            } else {
+                mtp_cache = try options.mtp.?.makeCache(allocator);
+            }
+        }
+        errdefer if (mtp_cache) |*mc| mc.deinit();
 
         // DFlash: build the assistant's context cache during prefill — every
         // chunk's target_layer_ids captures project through the encoder and
@@ -1657,13 +1755,22 @@ pub const Generator = struct {
         // ssmSnapshotBackoff), and the final forward covers the held-back
         // tail + the last token in the same weight sweep.
         var final_start: usize = prompt_ids.len - 1;
+        // Chunked vision prefill (issue #197): placeholder rows consumed by
+        // completed chunks, fed to ctx.vision_splice_offset per forward
+        // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
+        // so that path is byte-identical to the old whole-prompt behavior.
+        const vision_chunked = has_vision and visionChunkedPrefillEnabled();
+        var vision_rows_consumed: usize = 0;
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
-            const default_chunk = if (has_vision) loop_end else PREFILL_CHUNK;
+            // Vision prompts chunk like text (issue #197) — the splice offset
+            // below keeps the row scatter chunk-exact. Kill switch restores
+            // the whole-prompt forward.
+            const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
@@ -1688,6 +1795,7 @@ pub const Generator = struct {
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
                 const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                if (vision_chunked) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -1835,11 +1943,23 @@ pub const Generator = struct {
                     }
                 }
 
+                if (vision_chunked) {
+                    vision_rows_consumed += countSpliceRows(
+                        ids_i32[pos..end],
+                        xfm.config.image_token_id,
+                        xfm.config.audio_token_id,
+                    );
+                }
                 pos = end;
                 n_chunks += 1;
                 // Publish progress once per chunk — same cadence discipline as
                 // `inflight_generated_tokens` (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
+                // Yield to the scheduler between chunks — never after the
+                // last (the post-prefill decode tick covers that boundary).
+                if (pos < loop_end) {
+                    if (options.interleave_hook) |hk| hk.call(hk.ctx);
+                }
             }
 
             // Phase 1: always-on snapshot at the post-prefill position
@@ -1881,6 +2001,15 @@ pub const Generator = struct {
                     }
                 }
             }
+        }
+
+        // Chunked vision: the final-span forward continues the row scatter
+        // where the chunk loop left it (an image ending in the final span
+        // otherwise re-splices from row 0). One-shot engagement line — the
+        // silent-no-op class; tests grep for it per arm.
+        if (vision_chunked) {
+            ctx.vision_splice_offset = vision_rows_consumed;
+            if (n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
         }
 
         // Process the final span — the last token, plus (under SSM
@@ -3530,7 +3659,12 @@ pub const Generator = struct {
         const bs: u32 = @max(self.dflash_block_size, 2);
         const m: u32 = bs - 1;
         const t1: u32 = self.next_token_id;
-        const anchor_pos: usize = self.ctx.cache.step;
+        // On the moe/GDN path positions come from moe_seq_offset (cache.step
+        // is a bookkeeping counter the model never reads there — same rule as
+        // nextMtp); the standard path keeps cache.step as the anchor.
+        const moe_path = self.xfm.moe_layers != null;
+        const anchor_pos: usize = if (moe_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
+        const kv_step_snap = self.ctx.cache.step;
         std.debug.assert(dctx.absLen() == anchor_pos);
 
         const tracing = dflashTraceEnabled();
@@ -3581,14 +3715,45 @@ pub const Generator = struct {
         // requests keep the argmax path untouched, so the byte-equality
         // guard is unaffected.
         const stochastic = self.sampling.temperature > 0.01;
-        const sample_drafts = stochastic and dflashSampledDraftsEnabled();
+        // DFlash2 path selector: when the sidecar ships one, drafts come from
+        // the pairwise-scored path trace instead of per-position argmax /
+        // block sampling. Greedy requests keep the byte-equality bar (a
+        // selector draft only survives verify if it IS the trunk argmax);
+        // stochastic requests sample the selector's own candidate softmax and
+        // accept through min(1, p/q) with q read off the traced path —
+        // exact by construction. `MLX_SERVE_DFLASH_SELECTOR=0` forces the v1
+        // arms for A/Bs.
+        const use_selector = model.selector != null and dflashSelectorEnabled();
+        const sample_drafts = stochastic and !use_selector and dflashSampledDraftsEnabled();
+        var sel_path: ?dflash_mod.SelectedPath = null;
+        defer if (sel_path) |*sp| sp.deinit(allocator);
         var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
         defer if (draft_q.ctx != null) {
             _ = mlx.mlx_array_free(draft_q);
         };
         var draft_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_ids);
-        if (sample_drafts) {
+        if (use_selector) {
+            const sel_temp: f32 = if (stochastic) self.sampling.temperature else 0.0;
+            sel_path = try dflash_mod.selectPath(
+                allocator,
+                &model.selector.?,
+                model.config.selector_top_k,
+                blk_hidden,
+                draft_logits,
+                t1,
+                sel_temp,
+                self.prng.random(),
+                s,
+            );
+            const ids_i32 = try allocator.alloc(i32, m);
+            defer allocator.free(ids_i32);
+            for (sel_path.?.ids, ids_i32) |v, *d| d.* = @intCast(v);
+            const row_shape = [_]c_int{ 1, @intCast(m) };
+            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(host_arr);
+            try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
+        } else if (sample_drafts) {
             draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
             var logq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(logq);
@@ -3641,7 +3806,14 @@ pub const Generator = struct {
         var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
+        // Per-position SSM capture on a GDN trunk so partial accept can roll
+        // back the recurrent state without re-forwarding (mirrors nextMtp).
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        self.ctx.capture_ssm_seq = false;
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
         self.dflash_attempted += 1;
         if (tracing) {
             // Captures ride the same forward — eval them here or their cost
@@ -3692,7 +3864,9 @@ pub const Generator = struct {
         }
         var drafts = try allocator.alloc(u32, m);
         errdefer allocator.free(drafts);
-        {
+        if (sel_path) |*sp| {
+            @memcpy(drafts, sp.ids);
+        } else {
             try mlx.check(mlx.mlx_array_eval(draft_ids));
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
             for (drafts, 0..) |*d, idx| d.* = @intCast(draft_data[idx]);
@@ -3710,6 +3884,11 @@ pub const Generator = struct {
                     const q_row = try sliceProbRow(draft_q, k, s);
                     defer _ = mlx.mlx_array_free(q_row);
                     break :blk specAcceptProb(p_draft, try probAt(q_row, drafts[k], s));
+                } else if (sel_path) |*sp| blk: {
+                    // Selector-sampled draft: q is the traced step's own
+                    // candidate softmax — exact, no GPU read.
+                    const kk = sp.cand_ids.len / @as(usize, m);
+                    break :blk specAcceptProb(p_draft, sp.q.?[@as(usize, k) * kk + sp.chosen_idx[k]]);
                 } else @min(1.0, p_draft);
                 const u: f32 = self.prng.random().float(f32);
                 if (u >= accept_prob) break;
@@ -3746,6 +3925,8 @@ pub const Generator = struct {
                     // sampled draft, and wrong silently.
                     const q_row = if (draft_q.ctx != null)
                         try sliceProbRow(draft_q, accepted, s)
+                    else if (sel_path) |*sp|
+                        try selectorQRow(sp, accepted, m, vl_shape[2], s)
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
@@ -3769,6 +3950,22 @@ pub const Generator = struct {
         const n_commit: usize = 1 + @as(usize, accepted);
         if (accepted < m) {
             try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+            if (moe_path) {
+                // Same bookkeeping as nextMtp's GDN arm: preserve the
+                // pre-verify cache.step (prefix-cache kv_step contract),
+                // roll every linear layer's recurrent state back to the
+                // accepted position from the verify pass's capture, and
+                // re-point moe_seq_offset at the committed length.
+                self.ctx.cache.step = kv_step_snap;
+                if (self.ctx.ssm_entries) |entries| {
+                    const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
+                    if (!gdn_captured) return error.SpecRollbackUnavailable;
+                    for (entries) |*entry| {
+                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                    }
+                }
+                self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
+            }
         }
         if (accepted == m) {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
@@ -3907,6 +4104,30 @@ pub const Generator = struct {
         return cache_step;
     }
 
+    /// Committed-history length actually IN the head cache at rest — what a
+    /// prefix-cache commit may snapshot. Everything past it is speculative:
+    /// a pending stash's entries are NOT in the cache yet (the cache past
+    /// `stash.off0` is the producing round's stale draft tail), and a built
+    /// cross-round pre-draft has already appended NEXT-round draft entries
+    /// past ITS `off0`. The min over both boundaries is always safe.
+    pub fn mtpCommittedLen(cache_step: usize, pre_draft_off0: ?usize, stash_off0: ?usize) usize {
+        var committed = cache_step;
+        if (pre_draft_off0) |o| committed = @min(committed, o);
+        if (stash_off0) |o| committed = @min(committed, o);
+        return committed;
+    }
+
+    /// `mtpCommittedLen` over this Generator's live state; 0 when MTP is
+    /// not active.
+    pub fn mtpCommittedHistoryLen(self: *const Generator) usize {
+        if (self.mtp_cache == null) return 0;
+        return mtpCommittedLen(
+            self.mtp_cache.?.step(),
+            if (self.mtp_pre_draft) |*pd| pd.off0 else null,
+            if (self.mtp_hist_stash) |*st| st.off0 else null,
+        );
+    }
+
     fn mtpMropeContext(self: *const Generator) ?mtp_mod.MropeContext {
         const positions = self.ctx.mrope_pos orelse return null;
         return .{
@@ -4007,11 +4228,19 @@ pub const Generator = struct {
         const mc = &self.mtp_cache.?;
         const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
         const mtp_mrope_ctx = self.mtpMropeContext();
+        const rerank_drafts = head.canRerankDrafts();
         std.debug.assert(chain.n_drafted == from);
         var i: u32 = from;
         while (i < to) : (i += 1) {
             const h_prev_arg: mlx.mlx_array = if (chain.h_chain) |h| h else self.last_hidden;
             const prev_tok_arr: mlx.mlx_array = if (i == 0) chain.t1_arr else chain.draft_arrs[i - 1];
+            // Rerank drafts skip the head's own logits projection entirely:
+            // the token comes from `draftSelect` on the chained hidden. The
+            // sharp-proposal (q_probs) and confidence paths still need the
+            // full distribution, so they keep want_logits.
+            const need_logits = chain.q_probs != null or
+                (chain.conf_arrs != null and i < chain.plan.m_lo);
+            const use_rerank = rerank_drafts and !need_logits;
             const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
@@ -4043,9 +4272,11 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true, mtp_mrope_ctx);
-            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), true, mtp_mrope_ctx);
-            if (chain.q_probs) |slots| {
+                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), !use_rerank, mtp_mrope_ctx);
+            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), !use_rerank, mtp_mrope_ctx);
+            if (use_rerank) {
+                chain.draft_arrs[i] = try head.draftSelect(xfm, step_out.hidden_next, draft_sampling.suppress_mask);
+            } else if (chain.q_probs) |slots| {
                 // Sharp proposal: q = filtered softmax of the draft-head
                 // logits at the FIXED sharpened constants; the draft is
                 // sampled from exactly this distribution (log+categorical
@@ -4065,7 +4296,7 @@ pub const Generator = struct {
                 chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
                 chain.n_conf = i + 1;
             }
-            _ = mlx.mlx_array_free(step_out.logits);
+            if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
             if (chain.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
             chain.h_chain = step_out.hidden_next;
         }
@@ -5122,8 +5353,13 @@ pub const Generator = struct {
     /// the split-K verify-qmm kernel's ceiling on M1-M4. Eligible M5/G17
     /// targets use MTP_ADAPTIVE_NAX_CAP instead: their measured NAX round-cost
     /// surface makes depths 7/8 profitable. Explicit depths always win.
+    /// This is the DEFAULT ROW only: `mtp.adaptiveDepthCapForMachine` lowers
+    /// it on chips whose verify-width cliff was measured (M1 Pro: 4).
     pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
     pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
+    /// One-shot guard for the per-silicon cap log (the row is a property of
+    /// the machine, so it is worth saying once per process, not per request).
+    var mtp_depth_cap_logged: bool = false;
     /// Rounds of legacy (fixed-depth windowed) behavior while the EMAs fill.
     /// Warmup, but converges in ROUNDS, not 43 s of offline calibration.
     pub const MTP_EV_WARMUP_ROUNDS: u32 = 10;
@@ -5186,21 +5422,27 @@ pub const Generator = struct {
         nax_from: u32 = 0,
         per_pos_nax: f32 = 0.0,
     };
-    /// 2026-07-22 refit #3, AFTER round pipelining (early draft dispatch +
-    /// cross-round pre-draft + GDN capture-tail trim): same-session
-    /// saturated ECHO sweep on the Jundot oQ4e 27B @8K, M4 Max — T(1)=45.4,
-    /// T(2)=53.3 (two fully-saturated m_avg=2.0 windows; deeper depths
-    /// can't saturate on this head, chained acceptance ~0.5) → floor
-    /// ≈ 37.9 ms, flat marginal ≈ 7.5 ms/pos = 0.20 floor units. The
-    /// pipelining hid the CPU graph-build (floor down from ~40), so
-    /// per-position marginals RISE in floor units (draft+lo 0.12 → 0.20).
-    /// per_pos_hi carries over from refit #2 (ramp unmeasurable on this
-    /// head; conservative — higher hi only raises tau). sync = 0.01: the
-    /// chunk-A boundary read is near-free now that pre-drafted ids are
-    /// materialized before the round starts.
-    /// (Refit #2, 2026-07-13, post-verify-qmm, for the record: T(1)=44.6,
-    /// T(3)=54.4, T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
-    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.24, .flat_max = 3, .sync = 0.01 };
+    /// 2026-08-15 refit #4, AFTER the hd-256 causal sdpa split
+    /// (`splitCausalSdpa` — dense verify q 6..9 now rides the vector path,
+    /// invalidating the ramp the old hi partially priced): same-session
+    /// saturated ECHO sweep, Jundot oQ4e 27B @8K cold reps
+    /// (--prefix-cache-entries 0), M4 Max, MLX_SERVE_MTP_ADAPTIVE=0 forced
+    /// depths, saturated (m_avg==N) trace windows only — T(1)=44.6,
+    /// T(2)=51.0, T(3)=59.2, T(4)=68.2, T(6)=95.4, T(8)=142.3 ms → floor
+    /// ≈ 38.2 ms. Composite marginals in floor units: k<=4 ≈ 0.20 (6.4-9.0
+    /// ms/pos — flat_max moves 3 → 4, the old hi over-priced k4 at 0.34 and
+    /// under-drafted it on moderate content), k5-6 ≈ 0.36 (13.6 ms/pos),
+    /// k7-8 ≈ 0.62 (23.5 ms/pos — the plain-SIMD verify-qmm register cliff
+    /// at M 8/9, expressed through the generic third region; only reachable
+    /// when --mtp-depth forces past the generic cap of 6). The G17 NAX
+    /// tables below predate the sdpa split — refit them on an M5 when one
+    /// is available. draft/verify split not separately identifiable; only
+    /// the sums enter the controller.
+    /// (Refit #3, 2026-07-22, post round-pipelining, for the record:
+    /// T(1)=45.4, T(2)=53.3 → .10/.10/.24@3/.01 on a ~37.9 ms floor.
+    /// Refit #2, 2026-07-13, post-verify-qmm: T(1)=44.6, T(3)=54.4,
+    /// T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
+    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52 };
     /// M5 Max/G17 refit (2026-07-17), same-session saturated fixed-depth
     /// sweep after the NAX m16 verify lane landed: T(1..4) ~= 41.35 ms,
     /// T(6)=62.15 ms, T(8)=68.39 ms. In floor units this identifies
@@ -5233,6 +5475,55 @@ pub const Generator = struct {
         .sync = 0.02,
         .nax_from = 7,
         .per_pos_nax = 0.02,
+    };
+    /// M5 Max/G17 uniform affine-4/gs-64 Qwen3.8-27B refit (2026-08-16).
+    /// Temperature-gated, reversed two-pass saturated echo gave T(1)=
+    /// 33.61-33.91, T(3)=38.455-38.465, T(6)=56.555-57.000, and NAX T(8)=
+    /// 61.890-61.925 ms/round. NAX-off T(8)=88.535-88.610 while depth-6
+    /// on/off stayed within 0.8%, isolating the M>=8 lane. A 31.4 ms fitted
+    /// floor gives rounded composite marginals .075/.195/.08. The profile
+    /// stays distinct because this trunk is uniform q4, not mixed q4/q5/q6.
+    pub const MTP_EV_G17_NAX_Q4_GS64_COSTS: MtpEvCosts = .{
+        .draft = 0.02,
+        .per_pos_lo = 0.055,
+        .per_pos_hi = 0.175,
+        .flat_max = 3,
+        .sync = 0.01,
+        .nax_from = 7,
+        .per_pos_nax = 0.06,
+    };
+    /// M5 Max/G17 uniform affine-6/gs-64 Qwen3.8-27B refit (2026-08-17).
+    /// Temperature-gated, six-pass counterbalanced calibration gave median
+    /// traced T(1)=44.98, T(3)=49.895, T(6)=64.495, and NAX T(8)=76.79
+    /// ms/round. A 42.52 ms fitted floor yields rounded composite marginals
+    /// .06/.115/.145 and reproduces T(8)/T(6): 1.815/1.525=1.1902 versus
+    /// 1.1907 measured. Depth 8 was 108.86 tok/s versus 102.93 at depth 7.
+    pub const MTP_EV_G17_NAX_Q6_GS64_COSTS: MtpEvCosts = .{
+        .draft = 0.02,
+        .per_pos_lo = 0.04,
+        .per_pos_hi = 0.095,
+        .flat_max = 3,
+        .sync = 0.01,
+        .nax_from = 7,
+        .per_pos_nax = 0.125,
+    };
+    /// M5 Max/G17 uniform affine-8/gs-64 Qwen3.8-27B refit (2026-08-17).
+    /// Five settled counterbalanced pairs found the q8-specific NAX takeover
+    /// at verify M=7: depth 6 rose from 73.42 to 77.89 tok/s (+6.09%), while
+    /// M=6 was -1.14%. Median traced NAX T(6)=85.94 ms and T(8)=90.68 ms over
+    /// the 53.0575 ms floor give normalized 1.62/1.71. The additive controller
+    /// cannot encode the one-time M7 kernel transition separately, so k=5..6
+    /// are a positive .19 bridge and the subsequent k=7..8 NAX marginal is
+    /// .045. This reproduces both measured endpoints without negative costs.
+    /// The profile is revoked when q8 NAX is off.
+    pub const MTP_EV_G17_NAX_Q8_GS64_COSTS: MtpEvCosts = .{
+        .draft = 0.005,
+        .per_pos_lo = 0.055,
+        .per_pos_hi = 0.185,
+        .flat_max = 4,
+        .sync = 0.01,
+        .nax_from = 7,
+        .per_pos_nax = 0.04,
     };
     /// M5 Max/G17 oQ4e mixed affine q4/q5/q6, gs64 refit (2026-07-23).
     /// Saturated deterministic echo, same-session fixed widths:
@@ -5275,11 +5566,33 @@ pub const Generator = struct {
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
     pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
+        const chip = ane_mod.chipBrand();
+        const cap = mtpDepthCapForProfileChip(configured, adaptive, profile, chip);
+        // Name the row ONCE when a per-silicon measurement is what fenced the
+        // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
+        // as the EV controller having chosen 4, or as `--mtp-depth 4` — and
+        // the fence is exactly what someone debugging MTP there needs to see.
+        if (configured == 0 and adaptive and !mtp_depth_cap_logged) {
+            const row = mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP);
+            if (cap == row.cap and row.cap < MTP_ADAPTIVE_DEFAULT_CAP) {
+                mtp_depth_cap_logged = true;
+                log.info("[mtp] adaptive depth cap {d} ({s} row, default {d})\n", .{
+                    row.cap,
+                    row.label,
+                    MTP_ADAPTIVE_DEFAULT_CAP,
+                });
+            }
+        }
+        return cap;
+    }
+
+    /// Same, with the chip string injected (tests, and the one live caller).
+    pub fn mtpDepthCapForProfileChip(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile, chip: []const u8) u32 {
         if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
         if (!adaptive) return mtp_mod.DEFAULT_DEPTH;
         return switch (profile) {
-            .generic => MTP_ADAPTIVE_DEFAULT_CAP,
-            .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
+            .generic => mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP).cap,
+            .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
         };
     }
 
@@ -5524,6 +5837,21 @@ pub const Generator = struct {
         return on;
     }
 
+    /// `MLX_SERVE_DFLASH_SELECTOR`: default ON when the sidecar ships a
+    /// selector (DFlash2). "0" forces the v1 draft arms (argmax / block
+    /// sampling) for A/Bs — the conv layers stay, they are the checkpoint.
+    var dflash_selector_cache: ?bool = null;
+    fn dflashSelectorEnabled() bool {
+        if (dflash_selector_cache) |v| return v;
+        var on = true;
+        if (std.c.getenv("MLX_SERVE_DFLASH_SELECTOR")) |p| {
+            const val = std.mem.span(p);
+            if (val.len > 0 and val[0] == '0') on = false;
+        }
+        dflash_selector_cache = on;
+        return on;
+    }
+
     var dflash_trace_cache: ?bool = null;
     fn dflashTraceEnabled() bool {
         if (dflash_trace_cache) |v| return v;
@@ -5650,6 +5978,11 @@ pub const Generator = struct {
         c.per_pos_lo = values[1];
         c.per_pos_hi = values[2];
         c.sync = values[3];
+        // The override contract is the two-region surface: never inherit a
+        // third region (M5 NAX or the generic k>=7 cliff) the four values
+        // can't express.
+        c.nax_from = 0;
+        c.per_pos_nax = 0.0;
         return c;
     }
 
@@ -5663,6 +5996,9 @@ pub const Generator = struct {
             .generic => MTP_EV_DEFAULT_COSTS,
             .g17_nax_q8_gs32 => MTP_EV_G17_NAX_COSTS,
             .g17_nax_q4_gs32 => MTP_EV_G17_NAX_Q4_GS32_COSTS,
+            .g17_nax_q4_gs64 => MTP_EV_G17_NAX_Q4_GS64_COSTS,
+            .g17_nax_q6_gs64 => MTP_EV_G17_NAX_Q6_GS64_COSTS,
+            .g17_nax_q8_gs64 => MTP_EV_G17_NAX_Q8_GS64_COSTS,
             .g17_nax_oq4e_q4_gs64 => MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS,
         };
         if (override) |raw| {
@@ -6532,6 +6868,27 @@ fn sliceProbRow(rows_2d: mlx.mlx_array, row: u32, s: mlx.mlx_stream) !mlx.mlx_ar
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, rows_2d, &start, 2, &stop, 2, &strides, 2, s));
+    return out;
+}
+
+/// The DFlash2 selector's proposal density for one step as a `[1, V]` row:
+/// its per-candidate softmax scattered into zeros — q is zero off the
+/// candidate set by construction, so this is the exact density the draft was
+/// drawn from (the residual-correction contract).
+fn selectorQRow(sp: *const dflash_mod.SelectedPath, step: usize, m: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const kk = sp.cand_ids.len / @as(usize, m);
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    const z_shape = [_]c_int{ 1, vocab };
+    try mlx.check(mlx.mlx_zeros(&zeros, &z_shape, 2, .float32, s));
+    const row_shape = [_]c_int{ 1, @intCast(kk) };
+    const ids_arr = mlx.mlx_array_new_data(sp.cand_ids.ptr + step * kk, &row_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+    const vals_arr = mlx.mlx_array_new_data(sp.q.?.ptr + step * kk, &row_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(vals_arr);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_put_along_axis(&out, zeros, ids_arr, vals_arr, 1, s));
     return out;
 }
 
@@ -9443,13 +9800,19 @@ test "MTP cross-round pre-draft defaults on and explicit zero disables" {
 
 test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
     // 0 = auto (--mtp-depth not passed).
-    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfile(0, true, .generic));
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapForProfile(0, true, .generic));
-    for ([_]mtp_mod.MtpCostProfile{ .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 }) |profile| {
+    // .generic's auto cap is per-silicon, so the chip must be injected here
+    // or the assertion is a property of whichever Mac runs the suite.
+    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfileChip(0, true, .generic, "Apple M4 Max"));
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapForProfileChip(0, true, .generic, ""));
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapForProfileChip(0, true, .generic, "Apple M1 Pro"));
+    // An explicit depth still outranks the table on a measured chip.
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfileChip(8, true, .generic, "Apple M1 Pro"));
+    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfileChip(0, false, .generic, "Apple M1 Pro"));
+    for ([_]mtp_mod.MtpCostProfile{ .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
         try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapForProfile(0, true, profile));
         try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(0, true, profile));
     }
-    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 }) |profile| {
+    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
         try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfile(0, false, profile));
     }
     // Explicit values ignore both controller mode and profile, and remain
@@ -9463,7 +9826,20 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
 
     // The original boolean helpers remain source-compatible and map true to
     // the pre-existing q8 profile.
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapFor(0, true, false));
+    // The live resolver must NAME the row it applied, once. A silicon fence
+    // nobody can see in the log is indistinguishable from the EV controller's
+    // own choice at the same depth (dflash's ready line does the same).
+    {
+        const src = @embedFile("generate.zig");
+        const start = std.mem.indexOf(u8, src, "pub fn mtpDepthCapForProfile(configured") orelse return error.MissingResolver;
+        const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingResolverEnd;
+        const body = src[start..end];
+        try testing.expect(std.mem.indexOf(u8, body, "row.label") != null);
+        try testing.expect(std.mem.indexOf(u8, body, "mtp_depth_cap_logged") != null);
+    }
+
+    const live_generic = mtp_mod.adaptiveDepthCapForMachine(ane_mod.chipBrand(), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
+    try testing.expectEqual(live_generic, Generator.mtpDepthCapFor(0, true, false));
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }
 
@@ -9598,13 +9974,17 @@ test "mtpEvCostsFor: G17 profiles are explicit and env tuning stays generic" {
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, q4);
     try testing.expectEqual(@as(u32, 7), q4.nax_from);
 
+    const q4_gs64 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs64, null);
+    try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, q4_gs64);
+    try testing.expectEqual(@as(u32, 7), q4_gs64.nax_from);
+
     const oq4e = Generator.mtpEvCostsForProfile(.g17_nax_oq4e_q4_gs64, null);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS, oq4e);
     try testing.expectEqual(@as(u32, 7), oq4e.nax_from);
 
     // An explicit four-value override retains its historical meaning instead
     // of inheriting an implicit hardware-only third region, for every profile.
-    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 }) |profile| {
+    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
         const tuned = Generator.mtpEvCostsForProfile(profile, "0.10, 0.11, 0.22, 0.03");
         try testing.expectApproxEqAbs(@as(f32, 0.10), tuned.draft, 1e-6);
         try testing.expectApproxEqAbs(@as(f32, 0.11), tuned.per_pos_lo, 1e-6);
@@ -9628,6 +10008,7 @@ test "mtpEvCostsFor: G17 profiles are explicit and env tuning stays generic" {
         try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, Generator.mtpEvCostsForProfile(.generic, raw));
         try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32, raw));
         try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32, raw));
+        try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q4_gs64, raw));
         try testing.expectEqual(Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_oq4e_q4_gs64, raw));
     }
 
@@ -9659,6 +10040,46 @@ test "MTP_EV_G17_NAX_Q4_GS32_COSTS encodes calibrated composite marginals" {
     try testing.expectApproxEqAbs(@as(f32, 2.03), Generator.mtpEvRoundCost(costs, 8, false), 1e-5);
 }
 
+test "MTP_EV_G17_NAX_Q4_GS64_COSTS reproduces the calibrated M5 surface" {
+    const costs = Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS;
+    try testing.expectApproxEqAbs(@as(f32, 0.075), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.195), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.08), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
+    const t1 = Generator.mtpEvRoundCost(costs, 1, false);
+    const t3 = Generator.mtpEvRoundCost(costs, 3, false);
+    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
+    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
+    try testing.expectApproxEqAbs(@as(f32, 1.075), t1, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.225), t3, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.81), t6, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.97), t8, 1e-5);
+}
+
+test "MTP_EV_G17_NAX_Q6_GS64_COSTS reproduces the calibrated M5 surface" {
+    const costs = Generator.MTP_EV_G17_NAX_Q6_GS64_COSTS;
+    try testing.expectApproxEqAbs(@as(f32, 0.06), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.115), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.145), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
+    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
+    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
+    try testing.expectApproxEqAbs(@as(f32, 1.525), t6, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.815), t8, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 76.79 / 64.495), t8 / t6, 1e-3);
+}
+
+test "MTP_EV_G17_NAX_Q8_GS64_COSTS bridges the discontinuous NAX takeover" {
+    const costs = Generator.MTP_EV_G17_NAX_Q8_GS64_COSTS;
+    try testing.expectApproxEqAbs(@as(f32, 0.06), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.19), Generator.mtpEvMarginalCost(costs, 5), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.045), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
+    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
+    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
+    try testing.expectApproxEqAbs(@as(f32, 1.62), t6, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.71), t8, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 85.94 / 53.0575), t6, 2e-3);
+    try testing.expectApproxEqAbs(@as(f32, 90.68 / 53.0575), t8, 2e-3);
+}
+
 test "MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS reproduces the measured M5 surface" {
     const costs = Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS;
     try testing.expectApproxEqAbs(@as(f32, 0.095), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
@@ -9682,7 +10103,7 @@ test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
 
     // The M5 fit captures both its cheaper intermediate widths and the NAX
     // takeover at draft position 7, so the same evidence reaches depth 8.
-    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS }) |costs| {
+    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, Generator.MTP_EV_G17_NAX_Q6_GS64_COSTS, Generator.MTP_EV_G17_NAX_Q8_GS64_COSTS, Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS }) |costs| {
         const nax = Generator.mtpEvPlanFor(&a, 8, costs, 3);
         try testing.expectEqual(@as(u32, 3), nax.m_lo);
         try testing.expectEqual(@as(u32, 8), nax.m_hi);
@@ -9695,6 +10116,13 @@ test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
         try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
         try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
     }
+    // Qwen3.8's measured depth-1 marginal is cheap enough that even this
+    // synthetic 20% first-draft case clears the exploration floor narrowly.
+    // The base stays at one and only one confidence-gated position is exposed.
+    const q38_cold = Generator.mtpEvPlanFor(&cold, 8, Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, 8);
+    try testing.expectEqual(@as(u32, 1), q38_cold.m_lo);
+    try testing.expectEqual(@as(u32, 2), q38_cold.m_hi);
+    try testing.expect(q38_cold.tau_ln < 0.0);
 }
 
 test "mtpEvPlanFor: mid-decay acceptance picks a shallow base and a confidence-gated extension" {
@@ -9773,32 +10201,30 @@ test "mtpEvPlanFor: unobserved deep indices at the prior still open the extensio
     try testing.expectApproxEqAbs(@as(f32, -0.1168), plan.tau_ln, 5e-3);
 }
 
-test "mtpEvPlanFor: DEFAULT costs carry the round-pipelined surface (2026-07-22 refit #3)" {
-    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER round
-    // pipelining (early dispatch + cross-round pre-draft + capture-tail
-    // trim; same-session saturated echo sweep, Jundot oQ4e 27B @8K,
-    // M4 Max: T(1)=45.4, T(2)=53.3 → floor ≈ 37.9 ms, flat marginal
-    // draft+lo ≈ 0.20; the ramp is unmeasurable on this head — chained
-    // acceptance can't saturate depth > 2 — so per_pos_hi carries over).
-    // The pipelining hid the CPU graph-build, so the FLOOR dropped and the
-    // per-position marginals grew in floor units (0.12 → 0.20): the
-    // controller now correctly prefers m_lo 2 on this head's decayed
-    // chain (~{0.78, 0.5, ...}) instead of riding a stale cheap flat region.
+test "mtpEvPlanFor: DEFAULT costs carry the post-sdpa-split surface (2026-08-15 refit #4)" {
+    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER the hd-256
+    // causal sdpa split (same-session saturated forced-depth echo sweep,
+    // Jundot oQ4e 27B @8K cold reps, M4 Max: T(1)=44.6 .. T(8)=142.3 →
+    // floor ≈ 38.2 ms, marginals k<=4 ≈ 0.20, k5-6 ≈ 0.36, k7-8 ≈ 0.62).
+    // flat_max 4: the old hi over-priced k4 at 0.34 (measured 0.24), so
+    // moderate content under-drafted it. The k>=7 third region carries the
+    // plain-SIMD verify-qmm register cliff — only reachable when
+    // --mtp-depth forces past the generic cap of 6.
     const costs = Generator.MTP_EV_DEFAULT_COSTS;
-    // Hot uniform 90%: base rides the flat region, extension into the ramp.
+    // Hot uniform 90%: base now rides the WIDER flat region (m_lo 4, was 3
+    // under refit #3), extension one step into the ramp.
     const hot = [_]f32{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 };
     const hot_plan = Generator.mtpEvPlanFor(&hot, 8, costs, 8);
-    try testing.expectEqual(@as(u32, 3), hot_plan.m_lo);
+    try testing.expectEqual(@as(u32, 4), hot_plan.m_lo);
     try testing.expectEqual(@as(u32, 5), hot_plan.m_hi);
-    try testing.expectApproxEqAbs(@as(f32, -0.1569), hot_plan.tau_ln, 5e-3);
-    // Marginal 75%: base stays 3 on the flat region, short extension.
+    try testing.expectApproxEqAbs(@as(f32, -0.0943), hot_plan.tau_ln, 5e-3);
+    // Marginal 75%: base stays 3, one cheap flat extension position.
     const mid = [_]f32{ 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75 };
     const mid_plan = Generator.mtpEvPlanFor(&mid, 8, costs, 8);
     try testing.expectEqual(@as(u32, 3), mid_plan.m_lo);
     try testing.expectEqual(@as(u32, 4), mid_plan.m_hi);
-    try testing.expectApproxEqAbs(@as(f32, -0.2552), mid_plan.tau_ln, 5e-3);
-    // The oQ4e head's measured decayed chain plans a 2-deep base — the
-    // shape the refit exists to unlock (d2 wins on the new cost surface).
+    try testing.expectApproxEqAbs(@as(f32, -0.786), mid_plan.tau_ln, 5e-3);
+    // The oQ4e head's measured decayed chain still plans a 2-deep base.
     const oq4e = [_]f32{ 0.78, 0.50, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45 };
     const oq4e_plan = Generator.mtpEvPlanFor(&oq4e, 8, costs, 8);
     try testing.expectEqual(@as(u32, 2), oq4e_plan.m_lo);
@@ -9946,6 +10372,16 @@ test "mtpEvPlanFor: cap 1 is a plain depth-1 round" {
     const plan = Generator.mtpEvPlanFor(&a, 1, costs, 8);
     try testing.expectEqual(@as(u32, 1), plan.m_lo);
     try testing.expectEqual(@as(u32, 1), plan.m_hi);
+}
+
+test "mtpCommittedLen: speculative tails (pre-draft, stash) bound the committable history" {
+    try testing.expectEqual(@as(usize, 42), Generator.mtpCommittedLen(42, null, null));
+    // Pending stash: the cache past off0 is the producing round's stale draft tail.
+    try testing.expectEqual(@as(usize, 40), Generator.mtpCommittedLen(46, null, 40));
+    // Built pre-draft: next-round draft entries sit past ITS off0.
+    try testing.expectEqual(@as(usize, 43), Generator.mtpCommittedLen(47, 43, null));
+    // Both live: the min wins.
+    try testing.expectEqual(@as(usize, 40), Generator.mtpCommittedLen(47, 43, 40));
 }
 
 test "mtpRoundOff0: a pending history stash overrides the stale cache length" {
@@ -10788,4 +11224,81 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, gen.generated_ids.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
+
+    // DFlash2 arm: selector-traced greedy drafts + dyn-conv forward. The bar
+    // is unchanged — a selector draft only survives verify when it IS the
+    // trunk argmax, so the emitted stream must still be byte-identical to
+    // serial at every accepted count.
+    {
+        var tmp_a2 = std.testing.tmpDir(.{});
+        defer tmp_a2.cleanup();
+        var a2_buf: [512]u8 = undefined;
+        const a2_path = a2_buf[0..try tmp_a2.dir.realPath(io, &a2_buf)];
+        try dflash_mod.TinyFix.writeAssistant2(io, tmp_a2.dir, a2_path, s);
+
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var dm = try dflash_mod.loadDflash(io, allocator, s, a2_path);
+        defer dm.deinit();
+        try testing.expect(dm.selector != null);
+        try dm.bind(&xfm);
+
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+            .dflash_enabled = true,
+            .dflash = &dm,
+            .dflash_min_accepted_per_round = 0,
+        });
+        defer gen.deinit(allocator);
+
+        var got = std.ArrayList(u32).empty;
+        defer got.deinit(allocator);
+        while (true) {
+            const attempts_before = gen.dflash_attempted;
+            const res = (try gen.nextDflash(allocator)) orelse break;
+            defer allocator.free(res.tokens);
+            try got.appendSlice(allocator, res.tokens);
+            try testing.expect(gen.dflash_attempted != attempts_before);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+        }
+        try testing.expect(gen.dflash_attempted > 0);
+        try testing.expectEqual(want, got.items.len);
+        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
+    }
+}
+
+test "prefill chunk loop yields to the interleave hook between chunks, never after the last" {
+    // The scheduler runs decode ticks for active streams at this seam so a
+    // long prefill cannot stall them for its whole duration. The final
+    // boundary is excluded: the post-prefill decode tick covers it.
+    const src = @embedFile("generate.zig");
+    const progress = "if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);";
+    const at = std.mem.indexOf(u8, src, progress) orelse return error.ProgressPublishMissing;
+    const guard = "if (pos < loop_end) {";
+    const guard_at = std.mem.indexOfPos(u8, src, at, guard) orelse return error.InterleaveGuardMissing;
+    const call = "if (options.interleave" ++ "_hook) |hk| hk.call(hk.ctx);";
+    const call_at = std.mem.indexOfPos(u8, src, guard_at, call) orelse return error.InterleaveCallMissing;
+    // The call sits INSIDE the guard (same statement block, before the loop
+    // re-tests `pos`), not somewhere later in the file.
+    try std.testing.expect(call_at - guard_at < 200);
+}
+
+test "countSpliceRows counts image and audio placeholders, audio only when declared" {
+    const ids = [_]i32{ 7, 99, 99, 8, 88, 9 };
+    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
+    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88));
+    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88));
+}
+
+test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
+    // Source scan: the chunk-size pick keys on the kill switch (not bare
+    // has_vision), the chunk loop and the final-span forward both set
+    // ctx.vision_splice_offset, and the loop advances the consumed-row count.
+    const src = @embedFile("generate.zig");
+    const marker = "const default_chunk = if (has_vision and !vision" ++ "_chunked) loop_end else PREFILL_CHUNK;";
+    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
+    const set_off = "ctx.vision_splice" ++ "_offset = vision_rows_consumed;";
+    const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
+    try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
+    try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
 }

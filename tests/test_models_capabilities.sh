@@ -174,6 +174,32 @@ case "$VIS" in
     *) run_test "vision model advertises vision+image" "FAIL" "$VIS" ;;
 esac
 
+# ── Test 4b: context advertised at the ROW top level, not just meta ──
+# openai-models-list discovery clients (oh-my-pi, vLLM-shaped readers) look for
+# top-level `max_model_len` / `context_length` on each /v1/models row and fall
+# back to their own defaults (omp: 128k) when absent — issue #188. Both must
+# mirror meta.context_length.
+TOPCTX=$(echo "$RESULT" | python3 -c '
+import sys, json
+r = json.loads(sys.stdin.read())
+for m in r["data"]:
+    meta_ctx = (m.get("meta") or {}).get("context_length")
+    if meta_ctx is None:
+        continue  # rows with no readable config advertise nothing
+    mid = m.get("id")
+    top = m.get("context_length")
+    mml = m.get("max_model_len")
+    if top != meta_ctx:
+        print("fail:top_level_context_length:%s:%r!=%r" % (mid, top, meta_ctx))
+        sys.exit()
+    if mml != meta_ctx:
+        print("fail:top_level_max_model_len:%s:%r!=%r" % (mid, mml, meta_ctx))
+        sys.exit()
+print("ok")
+' 2>&1)
+run_test "top-level context_length/max_model_len mirror meta" \
+    "$( [ "$TOPCTX" = ok ] && echo PASS || echo FAIL )" "$TOPCTX"
+
 # ── Test 5: existing meta block still present (no regression) ──
 META=$(echo "$RESULT" | python3 -c '
 import sys, json

@@ -32,7 +32,10 @@ BASE="http://127.0.0.1:$PORT"
 BIN="$(dirname "$0")/../zig-out/bin/mlx-serve"
 LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
 
-"$BIN" --model "$MODEL" --drafter "$DRAFTER" --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
+# --no-mtp: spec priority is MTP > dflash, and a trunk shipping an
+# in-checkpoint MTP head (Qwen3.8 packs) would silently win every round —
+# the whole script would then measure MTP with green dflash boot lines.
+"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -45,6 +48,22 @@ for _ in $(seq 1 120); do
     fi
     sleep 3
 done
+# /health answers as soon as the socket binds — the model is still loading
+# behind it (a 17 GB checkpoint takes minutes). Wait for the load itself via
+# the server's own ready line, timeout scaled to the checkpoint size.
+MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
+echo "waiting for model load (up to ${READY_SECS}s)..."
+for _ in $(seq 1 $((READY_SECS / 3))); do
+    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
+    fi
+    sleep 3
+done
+if ! grep -q "Model ready (loaded on inference thread)" "$LOG"; then
+    echo "FAIL: model did not finish loading in ${READY_SECS}s"; tail -20 "$LOG"; exit 1
+fi
 
 pass=0; fail=0
 ok()   { echo "PASS $1"; pass=$((pass+1)); }
@@ -52,6 +71,17 @@ bad()  { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; fail=
 
 # [1] The probe classified the sidecar as DFlash at boot.
 if grep -q "DFlash drafter ready" "$LOG"; then ok "boot: DFlash sidecar detected"; else bad "boot: DFlash sidecar detected" "$(grep -i drafter "$LOG" | head -3)"; fi
+
+# [1b] DFlash2 sidecars (config declares `dflash_config`) must load their
+# selector + dyn convs — the drafter still runs v1-style without them, so
+# only the load line can prove the trained modules are in the forward.
+if grep -q '"dflash_config"' "$DRAFTER/config.json" 2>/dev/null; then
+    if grep -q "\[dflash\] dflash2: selector" "$LOG"; then
+        ok "dflash2: selector + dyn convs loaded ($(grep -o 'dflash2: selector[^\"]*' "$LOG" | head -1))"
+    else
+        bad "dflash2: selector + dyn convs loaded" "$(grep '\[dflash\]' "$LOG" | head -3)"
+    fi
+fi
 
 # Greedy request helper: returns reasoning_content + content concatenated.
 gen() { # prompt, max_tokens, extra_json_fragment
@@ -67,7 +97,7 @@ gen() { # prompt, max_tokens, extra_json_fragment
 # [2] Echo-ish greedy round WITH dflash (the default when the sidecar loads) —
 # long enough to accumulate spec-stats rounds.
 DFLASH_ON_REQS=0
-LONG=$(gen "List the numbers from 1 to 15, one per line, then repeat the same list once more." 200 "")
+LONG=$(gen "List the numbers from 1 to 15, one per line, then repeat the same list once more." 200 ", \"enable_drafter\": true")
 DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on generation non-empty"; fi
 
@@ -77,9 +107,17 @@ if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on
 # Fresh prompt (different leading text) so neither arm rides the other's
 # prefix-cache entry; the OFF arm turns off PLD too — fully serial.
 EQ_PROMPT="Explain in one short paragraph why the sky is blue."
-ON=$(gen "$EQ_PROMPT" 30 "")
+ON=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": true")
 DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 OFF=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
+
+# [3b] The ngram spec-gate must not silently strand a DFlash drafter: an
+# IMPLICIT novel request (no enable_drafter in the body, prompt scores ~0)
+# still engages — dflash's runtime yield gate is its only economics gate.
+# Counted into [6]: if the ngram gate disabled it, no stats line appears and
+# the per-request count mismatches.
+gen "Describe how a refrigerator keeps food cold, in one short paragraph." 40 "" > /dev/null
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 
 # [4] Engagement COUNTS: at least one dflash round ran, with accepts.
 STATS=$(grep "mode=dflash" "$LOG" | tail -1)
@@ -156,7 +194,7 @@ case "$EQ_VERDICT" in
         ok "greedy dflash-on == dflash-off (byte-equal exact window, ${QUANT_BITS}-bit)" ;;
     narrow:*)
         SHARED="${EQ_VERDICT##*:}"
-        ON2=$(gen "$EQ_PROMPT" 30 "")
+        ON2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": true")
         DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
         OFF2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
         if [ "$ON" != "$ON2" ]; then
@@ -190,7 +228,8 @@ CAP=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/j
     "model": "mlx-serve",
     "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
     "temperature": 0.0,
-    "max_tokens": 17
+    "max_tokens": 17,
+    "enable_drafter": true
 }')
 if echo "$CAP" | python3 -c '
 import json, sys
@@ -208,6 +247,7 @@ CAP_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: app
     "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
     "temperature": 0.0,
     "max_tokens": 17,
+    "enable_drafter": true,
     "stream": true,
     "stream_options": {"include_usage": true}
 }')
@@ -247,7 +287,8 @@ TOOLS=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application
     "messages": [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}],
     "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
     "temperature": 0.0,
-    "max_tokens": 400
+    "max_tokens": 400,
+    "enable_drafter": true
 }')
 if echo "$TOOLS" | python3 -c '
 import json, sys
@@ -281,15 +322,23 @@ else
     bad "drafts route through the trunk lm_head by default" "$(grep -i 'draft.*lm_head' "$LOG" | head -2)"
 fi
 
-# [10] The block is capped to what this machine's verify lanes serve. Without
-# the NAX m16 tile the checkpoint's own block (16) is a 4x-cost verify.
+# [10] The block is capped to what this machine's verify lanes serve. The
+# uncapped expectation is the DRAFTER'S OWN declared block (root or nested
+# dflash_config, the loader's probe order) — a literal here was a checkpoint
+# expectation: muse declares 16, the qwen assistants declare 8.
+DECLARED_BLOCK=$(python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+dc = cfg.get("dflash_config") or cfg
+print(dc.get("block_size", ""))
+' "$DRAFTER/config.json")
 BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
-if echo "$BLINE" | grep -q "capped (no wide verify lane"; then
-    ok "block capped on a machine with no wide verify lane ($BLINE)"
-elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=16"; then
-    ok "wide verify lane present, checkpoint block kept ($BLINE)"
+if echo "$BLINE" | grep -q ", capped ("; then
+    ok "block capped for this machine's verify lanes ($BLINE)"
+elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
+    ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
 else
-    bad "block resolves against the machine's verify lanes" "$BLINE"
+    bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
 fi
 
 # [11] The assistant context rides the prefix cache. A restore forwards no
@@ -297,14 +346,78 @@ fi
 # collapsed 92.6% -> 66.5% live. Same prompt twice: the second is a hit, and
 # BOTH turns must report the same per-draft rate.
 CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea state and the ships that had passed by the point before dawn."
-gen "$CTX_PROMPT" 120 "" > /dev/null
+gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
-gen "$CTX_PROMPT" 120 "" > /dev/null
+gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
 if grep -q "dflash context restored" "$LOG" && [ "$RATE_COLD" = "$RATE_HIT" ]; then
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
 else
     bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$(grep -c 'dflash context restored' "$LOG")"
+fi
+
+# [12] The assistant context also survives the SSD tier (v4 spec sidecar):
+# same prompt across a SERVER RESTART with --prefix-cache-disk must restore
+# the trunk from disk AND the dflash context beside it — a disk hit used to
+# draft blind (the same 92.6% -> 66.5% class [11] pins for the RAM tier).
+# Isolated HOME so the real kv-cache is never touched. Opt out with
+# DFLASH_SKIP_DISK=1 (two extra boots of the target).
+if [ "${DFLASH_SKIP_DISK:-0}" != "1" ]; then
+    cleanup
+    trap - EXIT
+    DISK_HOME=$(mktemp -d /tmp/dflash_disk_home.XXXXXX)
+    DISK_PROMPT="Repeat this sentence exactly, word for word: the harbor master counted the lanterns twice and noted the tide tables in the margin before the ferry cast off for the northern islands at first light. $(python3 -c 'print(" ".join(f"filler{i}" for i in range(400)))')"
+    disk_boot() { # $1 = logfile
+        HOME="$DISK_HOME" "$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-disk 2GB \
+            --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$1" 2>&1 &
+        SERVER_PID=$!
+        trap cleanup EXIT
+        for _ in $(seq 1 $((READY_SECS / 3)) ); do
+            grep -q "Model ready (loaded on inference thread)" "$1" && return 0
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 3
+        done
+        return 1
+    }
+    LOG_D1=$(mktemp /tmp/dflash_disk1.XXXXXX)
+    LOG_D2=$(mktemp /tmp/dflash_disk2.XXXXXX)
+    if disk_boot "$LOG_D1"; then
+        gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+        DISK_RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D1" | tail -1)
+        sleep 2 # let the post-response disk flush land
+        cleanup
+        trap - EXIT
+        if disk_boot "$LOG_D2"; then
+            gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+            DISK_RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D2" | tail -1)
+            # Rate equality is tolerant (5pp): a HYBRID trunk's prefix restore
+            # is legitimately not bit-identical (re-run recurrence block size),
+            # so near-tie flips can nudge the generation. The blind-draft
+            # collapse this pins is ~26pp.
+            RATES_CLOSE=$(python3 -c "
+import sys
+try:
+    c = float('${DISK_RATE_COLD#per_draft_pct=}' or 'nan')
+    h = float('${DISK_RATE_HIT#per_draft_pct=}' or 'nan')
+    print('yes' if abs(c - h) <= 5.0 else 'no')
+except ValueError:
+    print('no')
+")
+            if grep -q "\[disk-cache\] restored" "$LOG_D2" && grep -q "dflash context restored" "$LOG_D2" \
+                && [ -n "$DISK_RATE_HIT" ] && [ "$RATES_CLOSE" = "yes" ]; then
+                ok "assistant context restored from the SSD tier across a restart (cold==hit $DISK_RATE_HIT)"
+            else
+                bad "assistant context restored from the SSD tier across a restart" \
+                    "cold=$DISK_RATE_COLD hit=$DISK_RATE_HIT" \
+                    "disk-restores=$(grep -c '\[disk-cache\] restored' "$LOG_D2") dflash-restores=$(grep -c 'dflash context restored' "$LOG_D2")"
+            fi
+        else
+            bad "disk-tier arm: second boot did not become ready" "$(tail -5 "$LOG_D2")"
+        fi
+    else
+        bad "disk-tier arm: first boot did not become ready" "$(tail -5 "$LOG_D1")"
+    fi
+    rm -rf "$DISK_HOME"
 fi
 
 echo

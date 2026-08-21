@@ -5,8 +5,8 @@ import XCTest
 /// `DOCS_RAG_FOLDER` (skipped in CI). Uses the local server's encoder via DOCS_RAG_PORT
 /// (probe-only), else lexical-only retrieval — run it to eyeball what the searchDocuments tool would return:
 ///
-///   DOCS_RAG_FOLDER=~/path/to/folder swift test -Xswiftc -swift-version \
-///     -Xswiftc 5 --filter DocumentIndexRealDataTests
+///   DOCS_RAG_FOLDER=~/path/to/folder swift test \
+///     --filter DocumentIndexRealDataTests
 ///
 /// Assertions are deliberately structural (chunks line-aligned, metadata fields
 /// kept intact, known-relevant files surfaced) rather than score thresholds —

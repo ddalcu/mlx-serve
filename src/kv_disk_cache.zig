@@ -97,9 +97,43 @@ pub const IndexEntry = struct {
     /// individual positions whose file size mismatches). Owned.
     ssm_positions: []u32,
     ssm_bytes: []u64,
+    /// v4: spec-snapshot sidecar (`spec.safetensors`) byte size; 0 = none.
+    /// The same kill -9 salvage as chunks — a size mismatch at scan drops the
+    /// SPEC only (a restore then starts blind), never the entry.
+    spec_bytes: u64 = 0,
+    /// v4: dflash assistant context / MTP committed history persisted in the
+    /// spec sidecar. DRAFT-side state — a missing or dropped snap costs
+    /// acceptance on the first reused turn, never a token.
+    spec_dflash: ?SpecMeta = null,
+    spec_mtp: ?SpecMeta = null,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
+
+/// v4 spec-snapshot metadata for one speculative-side cache (dflash assistant
+/// context or MTP committed history). The tensors live in the entry's ONE
+/// `spec.safetensors` file, keyed `d{layer}.*` / `m{layer}.*`.
+pub const SpecMeta = struct {
+    /// Absolute trunk position the snapshot's index 0 represents.
+    base: u64,
+    /// Positions persisted (the snapshot's logical length).
+    step: u32,
+    /// Layer count of the source cache — a restore target with a different
+    /// count declines (KVCache.restore asserts equal lengths).
+    layers: u32,
+    quant: kv_quant.KVQuantConfig,
+};
+
+/// What `appendCommitWithSpec` reads to persist one spec snapshot — the same
+/// snapshot-shaped parts the trunk flush takes, plus the base position.
+pub const SpecCommit = struct {
+    entries: []const transformer_mod.KVCacheEntry,
+    step: usize,
+    config: kv_quant.KVQuantConfig,
+    base_pos: usize,
+};
+
+pub const SpecKind = enum { dflash, mtp };
 
 pub const Match = struct {
     idx: usize,
@@ -518,6 +552,24 @@ pub const DiskTier = struct {
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !bool {
+        return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s);
+    }
+
+    /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
+    /// MTP committed history). Eligibility is enforced UPSTREAM, same as the
+    /// RAM tier: the caller passes only what `commitWithState` was handed.
+    pub fn appendCommitWithSpec(
+        self: *DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        config: kv_quant.KVQuantConfig,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        dflash_snap: ?SpecCommit,
+        mtp_snap: ?SpecCommit,
+        s: mlx.mlx_stream,
+    ) !bool {
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
         // land in `tokens`). Persist the prefix covered by the record —
@@ -569,7 +621,9 @@ pub const DiskTier = struct {
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
-                        if (!self.ssmWorkPending(e, ssm_checkpoints, e.kv_len)) {
+                        if (!self.ssmWorkPending(e, ssm_checkpoints, e.kv_len) and
+                            !specWorkPending(e, dflash_snap, mtp_snap))
+                        {
                             e.last_used = self.bump();
                             return true;
                         }
@@ -585,7 +639,7 @@ pub const DiskTier = struct {
                 extend_idx = i;
             }
         }
-        if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, s);
+        if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, s);
 
         const sw = io_util.Stopwatch.init(self.io);
 
@@ -649,6 +703,15 @@ pub const DiskTier = struct {
         errdefer ssm_res.deinit(self.allocator);
         const complete = chunk_complete and ssm_res.complete;
 
+        // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
+        // commit (a commit with no payload deletes a stale one, the RAM
+        // tier's supersede rule). Best-effort DRAFT-side state: a failed
+        // write costs the entry its spec, never the entry.
+        const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
+            log.warn("  [disk-cache] spec persist failed: {s} — entry keeps no spec\n", .{@errorName(err)});
+            break :blk .{};
+        };
+
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
         // earlier chunks were committed against). Rewritten only on growth;
@@ -671,6 +734,7 @@ pub const DiskTier = struct {
         var bytes: u64 = 0;
         for (chunk_sizes.items) |b| bytes += b;
         for (ssm_res.bytes) |b| bytes += b;
+        bytes += spec_res.bytes;
         bytes += @as(u64, record.len) * 4;
 
         const new_entry: IndexEntry = .{
@@ -683,6 +747,9 @@ pub const DiskTier = struct {
             .chunk_bytes = try chunk_sizes.toOwnedSlice(self.allocator),
             .ssm_positions = ssm_res.positions,
             .ssm_bytes = ssm_res.bytes,
+            .spec_bytes = spec_res.bytes,
+            .spec_dflash = spec_res.dflash,
+            .spec_mtp = spec_res.mtp,
             .last_used = self.bump(),
         };
         errdefer {
@@ -719,12 +786,19 @@ pub const DiskTier = struct {
         return complete;
     }
 
-    /// SSM-only append: KV chunks are already fully on disk (superseded on KV)
-    /// but the entry has pending SSM checkpoints (byte-capped across turns).
-    /// Writes the missing ones into the existing dir + rewrites meta. Never
-    /// touches the KV chunks or the token record.
-    fn appendSsmOnly(self: *DiskTier, idx: usize, ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint, s: mlx.mlx_stream) !bool {
-        _ = s;
+    /// Sidecar-only append: KV chunks are already fully on disk (superseded
+    /// on KV) but the entry has pending SSM checkpoints (byte-capped across
+    /// turns) and/or a missing spec snapshot this commit carries. Writes the
+    /// missing pieces into the existing dir + rewrites meta. Never touches
+    /// the KV chunks or the token record.
+    fn appendSsmOnly(
+        self: *DiskTier,
+        idx: usize,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        dflash_snap: ?SpecCommit,
+        mtp_snap: ?SpecCommit,
+        s: mlx.mlx_stream,
+    ) !bool {
         const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, self.entries.items[idx].id });
         defer self.allocator.free(dir_rel);
         const e = &self.entries.items[idx];
@@ -732,11 +806,21 @@ pub const DiskTier = struct {
         var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, e.kv_len, e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes);
         errdefer ssm_res.deinit(self.allocator);
 
+        if (specWorkPending(e, dflash_snap, mtp_snap)) {
+            const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
+                log.warn("  [disk-cache] spec persist failed: {s} — entry keeps its old spec\n", .{@errorName(err)});
+                break :blk .{ .bytes = e.spec_bytes, .dflash = e.spec_dflash, .mtp = e.spec_mtp };
+            };
+            e.spec_bytes = spec_res.bytes;
+            e.spec_dflash = spec_res.dflash;
+            e.spec_mtp = spec_res.mtp;
+        }
+
         // Recompute total bytes: chunks + token record are unchanged; only the
-        // ssm contribution changed.
+        // ssm/spec contributions changed.
         var kv_and_tokens: u64 = @as(u64, e.tokens.len) * 4;
         for (e.chunk_bytes) |b| kv_and_tokens += b;
-        var new_bytes: u64 = kv_and_tokens;
+        var new_bytes: u64 = kv_and_tokens + e.spec_bytes;
         for (ssm_res.bytes) |b| new_bytes += b;
 
         self.allocator.free(e.ssm_positions);
@@ -750,6 +834,211 @@ pub const DiskTier = struct {
         try self.writeMeta(e.*);
         self.gcToBudget();
         return ssm_res.complete;
+    }
+
+    // ── Spec-snapshot persistence (v4: dflash context / MTP history) ──
+
+    const SpecSidecarResult = struct {
+        bytes: u64 = 0,
+        dflash: ?SpecMeta = null,
+        mtp: ?SpecMeta = null,
+    };
+
+    /// Does this commit carry a spec payload the entry lacks? Mirrors
+    /// `ssmWorkPending`'s role for the superseded no-op decision. A present
+    /// spec is never "updated" at the same tokens — same tokens, same
+    /// committed state.
+    fn specWorkPending(e: *const IndexEntry, dflash: ?SpecCommit, mtp: ?SpecCommit) bool {
+        return (dflash != null and e.spec_dflash == null) or
+            (mtp != null and e.spec_mtp == null);
+    }
+
+    /// Write (or delete) the entry's ONE spec sidecar from this commit's
+    /// snapshots. Tensors are sliced to `step` positions (the snapshot buffer
+    /// can hold a stale draft tail past it) and keyed `d{layer}.*` /
+    /// `m{layer}.*` with the trunk chunks' kind suffixes.
+    fn writeSpecSidecar(self: *DiskTier, dir_abs: []const u8, dflash: ?SpecCommit, mtp: ?SpecCommit, s: mlx.mlx_stream) !SpecSidecarResult {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors\x00", .{dir_abs});
+        defer self.allocator.free(path);
+        if (dflash == null and mtp == null) {
+            std.Io.Dir.deleteFileAbsolute(self.io, path[0 .. path.len - 1]) catch {};
+            return .{};
+        }
+        const tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        var res: SpecSidecarResult = .{};
+        if (dflash) |dc| res.dflash = try self.insertSpecTensors(tensor_map, "d", dc, s);
+        if (mtp) |mc| res.mtp = try self.insertSpecTensors(tensor_map, "m", mc, s);
+        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
+        res.bytes = fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
+        return res;
+    }
+
+    fn insertSpecTensors(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, sc: SpecCommit, s: mlx.mlx_stream) !SpecMeta {
+        if (sc.step == 0) return error.DiskCacheEmptyEntry;
+        const limit: u32 = @intCast(sc.step);
+        const affine = sc.config.scheme != .off;
+        for (sc.entries, 0..) |*entry, li| {
+            if (!entry.initialized) continue;
+            try self.insertSpecSlice(map, prefix, li, "k", entry.keys, limit, s);
+            try self.insertSpecSlice(map, prefix, li, "v", entry.values, limit, s);
+            if (affine) {
+                try self.insertSpecSlice(map, prefix, li, "ks", entry.keys_scales, limit, s);
+                try self.insertSpecSlice(map, prefix, li, "kb", entry.keys_biases, limit, s);
+                try self.insertSpecSlice(map, prefix, li, "vs", entry.values_scales, limit, s);
+                try self.insertSpecSlice(map, prefix, li, "vb", entry.values_biases, limit, s);
+            }
+        }
+        return .{
+            .base = sc.base_pos,
+            .step = limit,
+            .layers = @intCast(sc.entries.len),
+            .quant = sc.config,
+        };
+    }
+
+    fn insertSpecSlice(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, layer: usize, kind: []const u8, buf: mlx.mlx_array, limit: u32, s: mlx.mlx_stream) !void {
+        const shape = mlx.getShape(buf);
+        if (shape.len != 4) return error.DiskCacheBadShape;
+        if (shape[2] < limit) return error.DiskCacheBadShape;
+        var sliced = mlx.mlx_array_new();
+        const st = [_]c_int{ 0, 0, 0, 0 };
+        const sp = [_]c_int{ shape[0], shape[1], @intCast(limit), shape[3] };
+        const sd = [_]c_int{ 1, 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&sliced, buf, &st, 4, &sp, 4, &sd, 4, s));
+        defer _ = mlx.mlx_array_free(sliced);
+        const key = try std.fmt.allocPrint(self.allocator, "{s}{d}.{s}\x00", .{ prefix, layer, kind });
+        defer self.allocator.free(key);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(map, @ptrCast(key.ptr), sliced));
+    }
+
+    /// Load one persisted spec snapshot as a transient `KVCacheSnapshot` the
+    /// caller restores from and then deinits. Best-effort in every direction:
+    /// null when the entry has none, the recorded geometry doesn't fit the
+    /// target (layer count / quant config — `KVCache.restore` asserts equal
+    /// lengths, so the check lives here), or the file is unreadable. The
+    /// caller then starts blind, never wrong.
+    pub fn loadSpecSnap(
+        self: *DiskTier,
+        idx: usize,
+        which: SpecKind,
+        expected_layers: usize,
+        target_config: kv_quant.KVQuantConfig,
+    ) ?struct { snap: transformer_mod.KVCacheSnapshot, base: usize } {
+        const e = &self.entries.items[idx];
+        const meta = (switch (which) {
+            .dflash => e.spec_dflash,
+            .mtp => e.spec_mtp,
+        }) orelse return null;
+        if (meta.layers != expected_layers) return null;
+        if (!std.meta.eql(meta.quant, target_config)) return null;
+
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors\x00", .{ self.root, e.id }) catch return null;
+        defer self.allocator.free(path);
+        var tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        var meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu)) catch return null;
+
+        const prefix: []const u8 = switch (which) {
+            .dflash => "d",
+            .mtp => "m",
+        };
+        const kinds: []const []const u8 = if (meta.quant.scheme == .off)
+            &.{ "k", "v" }
+        else
+            &.{ "k", "v", "ks", "kb", "vs", "vb" };
+
+        const entries = self.allocator.alloc(transformer_mod.KVCacheEntry, expected_layers) catch return null;
+        for (entries) |*en| en.* = transformer_mod.newEmptyKVEntry();
+        var snap: transformer_mod.KVCacheSnapshot = .{
+            .entries = entries,
+            .step = meta.step,
+            .allocator = self.allocator,
+            .config = meta.quant,
+        };
+        var ok = true;
+        outer: for (entries, 0..) |*en, li| {
+            for (kinds, 0..) |kind, ki| {
+                const key = std.fmt.allocPrint(self.allocator, "{s}{d}.{s}\x00", .{ prefix, li, kind }) catch {
+                    ok = false;
+                    break :outer;
+                };
+                defer self.allocator.free(key);
+                var arr = mlx.mlx_array_new();
+                if (mlx.mlx_map_string_to_array_get(&arr, tensor_map, @ptrCast(key.ptr)) != 0) {
+                    _ = mlx.mlx_array_free(arr);
+                    if (ki == 0) continue :outer; // layer absent — stays uninitialized
+                    ok = false; // partial layer = corrupt
+                    break :outer;
+                }
+                // transfer the +1 handed by _get, replacing the empty handle
+                switch (ki) {
+                    0 => {
+                        _ = mlx.mlx_array_free(en.keys);
+                        en.keys = arr;
+                    },
+                    1 => {
+                        _ = mlx.mlx_array_free(en.values);
+                        en.values = arr;
+                    },
+                    2 => {
+                        _ = mlx.mlx_array_free(en.keys_scales);
+                        en.keys_scales = arr;
+                    },
+                    3 => {
+                        _ = mlx.mlx_array_free(en.keys_biases);
+                        en.keys_biases = arr;
+                    },
+                    4 => {
+                        _ = mlx.mlx_array_free(en.values_scales);
+                        en.values_scales = arr;
+                    },
+                    5 => {
+                        _ = mlx.mlx_array_free(en.values_biases);
+                        en.values_biases = arr;
+                    },
+                    else => unreachable,
+                }
+            }
+            en.offset = meta.step;
+            en.initialized = true;
+        }
+        if (!ok) {
+            snap.deinit();
+            return null;
+        }
+        // Checked eval: a corrupt file surfaces its MLX error HERE (lazy Load
+        // reads data at eval), not mid-forward after the restore.
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var count: usize = 0;
+            for (entries) |*en| {
+                if (!en.initialized) continue;
+                _ = mlx.mlx_vector_array_append_value(vec, en.keys);
+                _ = mlx.mlx_vector_array_append_value(vec, en.values);
+                if (meta.quant.scheme != .off) {
+                    _ = mlx.mlx_vector_array_append_value(vec, en.keys_scales);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.keys_biases);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.values_scales);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.values_biases);
+                }
+                count += 1;
+            }
+            if (count > 0) {
+                mlx.check(mlx.mlx_eval(vec)) catch {
+                    snap.deinit();
+                    return null;
+                };
+            }
+        }
+        return .{ .snap = snap, .base = meta.base };
     }
 
     fn writeChunkFile(
@@ -1069,7 +1358,7 @@ pub const DiskTier = struct {
             var wb: [1024]u8 = undefined;
             var fw = f.writer(self.io, &wb);
             try fw.interface.print(
-                "{{\"v\":3,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
+                "{{\"v\":4,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
                 .{
                     e.kv_len,
                     e.tokens.len,
@@ -1092,7 +1381,17 @@ pub const DiskTier = struct {
                 if (i > 0) try fw.interface.writeAll(",");
                 try fw.interface.print("{{\"pos\":{d},\"bytes\":{d}}}", .{ pos, sz });
             }
-            try fw.interface.writeAll("]}");
+            try fw.interface.writeAll("]");
+            // v4: spec snapshots (dflash context / MTP history) — the file
+            // byte size drives the same kill -9 salvage as chunk_bytes, but a
+            // mismatch drops only the SPEC (a restore then starts blind).
+            if (e.spec_bytes > 0 and (e.spec_dflash != null or e.spec_mtp != null)) {
+                try fw.interface.print(",\"spec\":{{\"bytes\":{d}", .{e.spec_bytes});
+                if (e.spec_dflash) |sm| try writeSpecMetaJson(&fw.interface, "dflash", sm);
+                if (e.spec_mtp) |sm| try writeSpecMetaJson(&fw.interface, "mtp", sm);
+                try fw.interface.writeAll("}");
+            }
+            try fw.interface.writeAll("}");
             try fw.interface.flush();
         }
         try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
@@ -1165,11 +1464,12 @@ pub const DiskTier = struct {
         const obj = parsed.value.object;
 
         const version = jsonU64(obj, "v") orelse return null;
-        // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints. Both
-        // restore — a v2 entry is treated as an empty-SSM v3 entry, so an
-        // upgrade doesn't nuke existing pure-attention disk caches. Older
-        // layouts are dropped, not migrated.
-        if (version != 2 and version != 3) return null;
+        // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
+        // adds optional spec snapshots (dflash context / MTP history). All
+        // restore — a lower-version entry just carries none of the newer
+        // optional state, so an upgrade doesn't nuke existing disk caches.
+        // Older layouts are dropped, not migrated.
+        if (version != 2 and version != 3 and version != 4) return null;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
         const n_tokens = jsonU64(obj, "tokens") orelse return null;
         const chunk_tokens = jsonU64(obj, "chunk_tokens") orelse return null;
@@ -1330,6 +1630,30 @@ pub const DiskTier = struct {
             return null;
         }
 
+        // v4 spec snapshots: validated by recorded file size (kill -9
+        // salvage), but a bad spec drops only the SPEC — a restore then
+        // starts blind, which is today's v2/v3 behavior anyway.
+        var spec_bytes: u64 = 0;
+        var spec_dflash: ?SpecMeta = null;
+        var spec_mtp: ?SpecMeta = null;
+        if (obj.get("spec")) |spec_v| parse_spec: {
+            if (spec_v != .object) break :parse_spec;
+            const so = spec_v.object;
+            const rec_bytes = jsonU64(so, "bytes") orelse break :parse_spec;
+            const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors", .{ self.root, id }) catch break :parse_spec;
+            defer self.allocator.free(sp);
+            const have = fileSize(self.io, sp) orelse break :parse_spec;
+            if (have != rec_bytes) {
+                log.info("  [disk-cache] e{d}: spec sidecar size mismatch — dropping the spec\n", .{id});
+                break :parse_spec;
+            }
+            spec_dflash = parseSpecMeta(so, "dflash");
+            spec_mtp = parseSpecMeta(so, "mtp");
+            if (spec_dflash == null and spec_mtp == null) break :parse_spec;
+            spec_bytes = rec_bytes;
+            total += rec_bytes;
+        }
+
         return .{
             .e = .{
                 .id = id,
@@ -1341,6 +1665,9 @@ pub const DiskTier = struct {
                 .chunk_bytes = chunk_bytes,
                 .ssm_positions = ssm_positions,
                 .ssm_bytes = ssm_bytes,
+                .spec_bytes = spec_bytes,
+                .spec_dflash = spec_dflash,
+                .spec_mtp = spec_mtp,
                 .last_used = 0,
             },
             .mtime = stat.mtime.nanoseconds,
@@ -1403,6 +1730,38 @@ fn jsonU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
     if (v != .integer) return null;
     if (v.integer < 0) return null;
     return @intCast(v.integer);
+}
+
+fn writeSpecMetaJson(w: *std.Io.Writer, name: []const u8, sm: SpecMeta) !void {
+    try w.print(",\"{s}\":{{\"base\":{d},\"step\":{d},\"layers\":{d},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d}}}", .{
+        name, sm.base, sm.step, sm.layers, @tagName(sm.quant.scheme), sm.quant.bits, sm.quant.group_size,
+    });
+}
+
+fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
+    const v = obj.get(key) orelse return null;
+    if (v != .object) return null;
+    const o = v.object;
+    const base = jsonU64(o, "base") orelse return null;
+    const step = jsonU64(o, "step") orelse return null;
+    const layers = jsonU64(o, "layers") orelse return null;
+    if (step == 0 or layers == 0) return null;
+    const scheme_v = o.get("scheme") orelse return null;
+    if (scheme_v != .string) return null;
+    const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
+    const bits = jsonU64(o, "bits") orelse 0;
+    const gs = jsonU64(o, "group_size") orelse 0;
+    const quant: kv_quant.KVQuantConfig = switch (scheme) {
+        .off => kv_quant.KVQuantConfig.dense,
+        .affine => blk: {
+            if (bits == 0 or gs == 0) return null;
+            var q = kv_quant.KVQuantConfig.affine(@intCast(bits));
+            q.group_size = @intCast(gs);
+            break :blk q;
+        },
+        else => return null,
+    };
+    return .{ .base = base, .step = @intCast(step), .layers = @intCast(layers), .quant = quant };
 }
 
 // ── Tests ──
@@ -2212,6 +2571,125 @@ test "DiskTier: short caches and TurboQuant schemes are never persisted" {
     for (&tokens, 0..) |*t, i| t.* = @intCast(i);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 restores clean" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    // dflash assistant context: 2 layers over the full 600 positions, base 0;
+    // MTP committed history: 1 layer, 590 (the deferred-stash lag), base 0.
+    var dfl = try KVCache.init(testing.allocator, 2);
+    defer dfl.deinit();
+    try fillCache(&dfl, s, 2, 600, 8, 3.5, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 },
+        .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
+        s,
+    );
+    try testing.expect(tier.entries.items[0].spec_bytes > 0);
+
+    // Restart shape: a fresh tier over the same root re-reads the spec meta.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+
+    var loaded = tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    try testing.expectEqual(@as(usize, 0), loaded.base);
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    var dfl2 = try KVCache.init(testing.allocator, 2);
+    defer dfl2.deinit();
+    try dfl2.restore(&loaded.snap);
+    loaded.snap.deinit();
+    // Exact values, K and V (V = -K in fillCache — a swap can't false-pass).
+    const probes = [_][2]u32{ .{ 0, 0 }, .{ 300, 3 }, .{ 599, 7 } };
+    for (probes) |p| {
+        var li: u32 = 0;
+        while (li < 2) : (li += 1) {
+            try testing.expectEqual(
+                try cacheValueAt(&dfl, li, p[0], p[1], s),
+                try cacheValueAt(&dfl2, li, p[0], p[1], s),
+            );
+            try testing.expectEqual(
+                try cacheBufValueAt(&dfl, li, p[0], p[1], s, true),
+                try cacheBufValueAt(&dfl2, li, p[0], p[1], s, true),
+            );
+        }
+    }
+
+    var mloaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer mloaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 590), mloaded.snap.step);
+
+    // A target the geometry doesn't fit DECLINES (KVCache.restore asserts
+    // equal layer counts — the check must fire before it).
+    try testing.expect(tier2.loadSpecSnap(m.idx, .dflash, 3, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expect(tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.affine(8)) == null);
+
+    // A commit WITHOUT spec payloads carries none (and, per the supersede
+    // rule, would delete a stale sidecar on its own entry).
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
+    _ = try tier2.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expect(tier2.loadSpecSnap(mb.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
+
+    // v3 entry (written by an older binary): rewrite the manifest to v3 with
+    // no spec object — the entry must restore CLEAN, spec-less.
+    {
+        const e_id = tier2.entries.items[m.idx].id;
+        const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/fp-spec/e{d}/meta.json", .{ base, e_id });
+        defer testing.allocator.free(meta_path);
+        const content = readFileAlloc(testing.allocator, io, meta_path, 64 * 1024) orelse return error.TestMetaUnreadable;
+        defer testing.allocator.free(content);
+        const spec_at = std.mem.indexOf(u8, content, ",\"spec\":") orelse return error.TestSpecFieldMissing;
+        var rewritten = std.ArrayList(u8).empty;
+        defer rewritten.deinit(testing.allocator);
+        try rewritten.appendSlice(testing.allocator, content[0..spec_at]);
+        try rewritten.append(testing.allocator, '}');
+        _ = std.mem.replace(u8, rewritten.items, "\"v\":4", "\"v\":3", rewritten.items);
+        const f = try std.Io.Dir.createFileAbsolute(io, meta_path, .{});
+        defer f.close(io);
+        var wb: [4096]u8 = undefined;
+        var fw = f.writer(io, &wb);
+        try fw.interface.writeAll(rewritten.items);
+        try fw.interface.flush();
+    }
+    var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
+    defer tier3.deinit();
+    try testing.expectEqual(@as(usize, 2), tier3.entryCount());
+    const m3 = tier3.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(u32, 600), m3.usable);
+    try testing.expect(tier3.loadSpecSnap(m3.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
+    var cache3 = try KVCache.init(testing.allocator, 2);
+    defer cache3.deinit();
+    const restored = try tier3.restoreInto(&cache3, m3.idx, s);
+    try testing.expectEqual(@as(u32, 600), restored);
 }
 
 test "modelFingerprint: stable per path, rolls with config.json changes" {

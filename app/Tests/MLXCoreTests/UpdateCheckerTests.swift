@@ -42,6 +42,21 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertTrue(UpdateChecker.isNewer("v26.7.10", than: "26.7.9"))
     }
 
+    /// A build cut as a pre-release runs `26.8.10-pre-release.1` (the tag exists
+    /// so the plain number stays free for the real release). It must sort BELOW
+    /// the bare version, or everyone on the pre-release is stranded on it.
+    func testAPreReleaseBuildIsOfferedTheRealRelease() {
+        XCTAssertTrue(UpdateChecker.isNewer("v26.8.10", than: "26.8.10-pre-release.1"))
+        XCTAssertTrue(UpdateChecker.isNewer("v26.8.11", than: "26.8.10-pre-release.1"))
+        XCTAssertFalse(UpdateChecker.isNewer("v26.8.9", than: "26.8.10-pre-release.1"))
+        // Repeat pre-releases of the same number are peers, not updates.
+        XCTAssertFalse(UpdateChecker.isNewer("v26.8.10-pre-release.2", than: "26.8.10-pre-release.1"))
+        // A remote tag with a suffix still never announces an update.
+        XCTAssertFalse(UpdateChecker.isNewer("v26.8.11-pre-release", than: "26.8.10"))
+        // Garbage before the dash is still garbage.
+        XCTAssertFalse(UpdateChecker.isNewer("v26.8.11", than: "latest-pre-release"))
+    }
+
     /// Component-count mismatches zero-pad instead of failing: v26.8 == 26.8.0.
     func testIsNewerZeroPadsShorterVersions() {
         XCTAssertFalse(UpdateChecker.isNewer("v26.8", than: "26.8.0"))

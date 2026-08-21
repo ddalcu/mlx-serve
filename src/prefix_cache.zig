@@ -42,10 +42,16 @@ pub const LookupResult = struct {
     full_match: bool,
     /// Non-null iff a DFlash assistant context was restored into the caller's
     /// target: the absolute trunk position its index 0 represents, with
-    /// `base + cache.step == matched` on return. Null on EVERY other path
-    /// (no target, no payload, disk tier, miss) and the target is untouched —
+    /// `base + cache.step == matched` on return. Both tiers serve it (the
+    /// SSD tier persists the snapshot in the v4 spec sidecar). Null on EVERY
+    /// other path (no target, no payload, miss) and the target is untouched —
     /// the caller then starts the assistant blind at `matched`.
     dflash_base: ?usize = null,
+    /// Same contract for the MTP head's committed-history cache: the head's
+    /// history is built from trunk hiddens, and a restore forwards NOTHING —
+    /// without this every reused prefix drafts against an empty history
+    /// (measured on Qwen3.6-27B echo: ~70 → ~38 tok/s on warm repeats).
+    mtp_base: ?usize = null,
 };
 
 const Entry = struct {
@@ -98,11 +104,21 @@ const Entry = struct {
     dflash: ?DflashSnap = null,
     /// Bytes resident in `dflash`, folded into `kv_bytes` like `ssm_bytes`.
     dflash_bytes: u64 = 0,
+    /// MTP committed-history cache for this prefix (the head's own dense
+    /// KVCache, mtp.zig). Same lifecycle and contract as `dflash`: DRAFT-side
+    /// state, best-effort in both directions — a missing or declined snap
+    /// starts the history blind, which costs acceptance, never a token. The
+    /// committer must snapshot ONLY committed history (no speculative draft
+    /// tail — Generator.mtpCommittedHistoryLen is the boundary).
+    mtp: ?DflashSnap = null,
+    /// Bytes resident in `mtp`, folded into `kv_bytes` like `ssm_bytes`.
+    mtp_bytes: u64 = 0,
 };
 
-/// A committed assistant context: the snapshot plus the absolute trunk
+/// A committed speculative-side cache: the snapshot plus the absolute trunk
 /// position its index 0 represents (nonzero when the committing request was
-/// itself a cache hit).
+/// itself a cache hit). Shared by the DFlash assistant context and the MTP
+/// committed-history cache — identical semantics, two Entry fields.
 pub const DflashSnap = struct {
     snapshot: KVCacheSnapshot,
     base_pos: usize,
@@ -183,31 +199,69 @@ pub const HotPrefixCache = struct {
             d.deinit();
             e.dflash = null;
         }
+        if (e.mtp) |*m| {
+            m.deinit();
+            e.mtp = null;
+        }
     }
 
-    /// Restore this entry's assistant context into the caller's cache,
-    /// clamped to the trunk's restored length. Returns the base position on
-    /// success, null when there is nothing to restore or the context starts
-    /// PAST what the trunk actually reused (a context that begins later than
-    /// the trunk's cursor cannot be positioned against it). Best-effort by
+    /// Restore a committed speculative-side cache (DFlash context or MTP
+    /// history) into the caller's cache, clamped to the trunk's restored
+    /// length. Returns the base position on success, null when there is
+    /// nothing to restore, the snap starts PAST what the trunk actually
+    /// reused, or the snap ends BEFORE it (a history with a gap right below
+    /// the generation point is worse than a blind start). Best-effort by
     /// contract: a failure leaves the caller blind, never wrong.
-    fn restoreDflash(e: *const Entry, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream) ?usize {
+    fn restoreSpecSnap(snap_opt: ?*const DflashSnap, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream, what: []const u8) ?usize {
         const t = target orelse return null;
-        const snap = if (e.dflash) |*d| d else return null;
+        const snap = snap_opt orelse return null;
         if (snap.base_pos > matched) return null;
         const want = matched - snap.base_pos;
         if (want > snap.snapshot.step) return null;
         t.cache.restore(&snap.snapshot) catch |err| {
-            log.warn("  [hot-cache] dflash context restore failed: {s} — assistant starts blind\n", .{@errorName(err)});
+            log.warn("  [hot-cache] {s} restore failed: {s} — starts blind\n", .{ what, @errorName(err) });
             return null;
         };
         t.cache.truncate(want, s) catch |err| {
-            log.warn("  [hot-cache] dflash context clamp failed: {s} — assistant starts blind\n", .{@errorName(err)});
+            log.warn("  [hot-cache] {s} clamp failed: {s} — starts blind\n", .{ what, @errorName(err) });
             return null;
         };
         t.base_pos.* = snap.base_pos;
-        log.debug("  [hot-cache] dflash context restored: {d} tokens from base {d}\n", .{ want, snap.base_pos });
+        log.debug("  [hot-cache] {s} restored: {d} tokens from base {d}\n", .{ what, want, snap.base_pos });
         return snap.base_pos;
+    }
+
+    fn restoreDflash(e: *const Entry, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream) ?usize {
+        return restoreSpecSnap(if (e.dflash) |*d| d else null, target, matched, s, "dflash context");
+    }
+
+    fn restoreMtp(e: *const Entry, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream) ?usize {
+        return restoreSpecSnap(if (e.mtp) |*m| m else null, target, matched, s, "mtp history");
+    }
+
+    /// Disk-tier variant: load the persisted spec snapshot (v4 sidecar) as a
+    /// transient and adopt it under the EXACT same clamp rule as the RAM
+    /// tier (`restoreSpecSnap`). The trunk restore already forwarded nothing,
+    /// so without this a disk hit drafted blind — the 92.6% → 66.5%
+    /// acceptance class the RAM tier already fixed.
+    fn diskRestoreSpec(
+        d: *kv_disk_cache.DiskTier,
+        idx: usize,
+        target: ?DflashTarget,
+        matched: usize,
+        s: mlx.mlx_stream,
+        which: kv_disk_cache.SpecKind,
+    ) ?usize {
+        const t = target orelse return null;
+        const loaded = d.loadSpecSnap(idx, which, t.cache.entries.len, t.cache.config) orelse return null;
+        // restore() refcount-shares the arrays into the target, so the
+        // transient snapshot is freed right after.
+        var snap = DflashSnap{ .snapshot = loaded.snap, .base_pos = loaded.base };
+        defer snap.deinit();
+        return restoreSpecSnap(&snap, target, matched, s, switch (which) {
+            .dflash => "dflash context",
+            .mtp => "mtp history",
+        });
     }
 
     /// The largest checkpoint whose `pos ≤ limit` (checkpoints are sorted
@@ -336,6 +390,7 @@ pub const HotPrefixCache = struct {
         prompt_ids: []const u32,
         has_tools: bool,
         dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
     ) !LookupResult {
         const match = self.findBestMatch(prompt_ids, has_tools, target_cache.config);
 
@@ -372,7 +427,12 @@ pub const HotPrefixCache = struct {
                 target_moe_seq_offset.* = restored;
                 const ms = sw.read() / std.time.ns_per_ms;
                 log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
-                return .{ .matched = restored, .full_match = false };
+                return .{
+                    .matched = restored,
+                    .full_match = false,
+                    .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, restored, s, .dflash),
+                    .mtp_base = diskRestoreSpec(d, dm.idx, mtp_target, restored, s, .mtp),
+                };
             }
 
             const ram_len: usize = if (match) |m| m.shared else 0;
@@ -397,7 +457,12 @@ pub const HotPrefixCache = struct {
             target_moe_seq_offset.* = final_len;
             const ms = sw.read() / std.time.ns_per_ms;
             log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
-            return .{ .matched = final_len, .full_match = full_match };
+            return .{
+                .matched = final_len,
+                .full_match = full_match,
+                .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
+                .mtp_base = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp),
+            };
         }
 
         if (match == null) {
@@ -471,6 +536,7 @@ pub const HotPrefixCache = struct {
                 .matched = effective_matched - 1,
                 .full_match = true,
                 .dflash_base = restoreDflash(e, dflash_target, effective_matched - 1, s),
+                .mtp_base = restoreMtp(e, mtp_target, effective_matched - 1, s),
             };
         }
 
@@ -479,6 +545,7 @@ pub const HotPrefixCache = struct {
             .matched = effective_matched,
             .full_match = full_match,
             .dflash_base = restoreDflash(e, dflash_target, effective_matched, s),
+            .mtp_base = restoreMtp(e, mtp_target, effective_matched, s),
         };
     }
 
@@ -493,7 +560,7 @@ pub const HotPrefixCache = struct {
         tokens: []const u32,
         has_tools: bool,
     ) !void {
-        return self.commitWithSsm(source_cache, tokens, has_tools, null, null);
+        return self.commitWithSsm(source_cache, tokens, has_tools, null, null, null);
     }
 
     /// Commit with optional SSM checkpoint array (Phase 1). The caller
@@ -507,8 +574,9 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
     ) !void {
-        return self.commitWithState(source_cache, tokens, has_tools, ssm_cps, dflash);
+        return self.commitWithState(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
     }
 
     /// Commit with SSM checkpoints; ownership of the payload transfers to
@@ -520,6 +588,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
     ) !void {
         const quant_config = source_cache.config;
 
@@ -538,8 +607,8 @@ pub const HotPrefixCache = struct {
         }
 
         const new_snap = try source_cache.snapshot();
-        // The assistant context is best-effort: a snapshot failure must not
-        // cost the trunk KV entry it rides on.
+        // The speculative-side payloads are best-effort: a snapshot failure
+        // must not cost the trunk KV entry they ride on.
         var new_dflash: ?DflashSnap = null;
         var new_dflash_bytes: u64 = 0;
         if (dflash) |d| {
@@ -550,16 +619,27 @@ pub const HotPrefixCache = struct {
                 log.warn("  [hot-cache] dflash context snapshot failed: {s}\n", .{@errorName(err)});
             }
         }
+        var new_mtp: ?DflashSnap = null;
+        var new_mtp_bytes: u64 = 0;
+        if (mtp) |m2| {
+            if (m2.cache.snapshot()) |snap| {
+                new_mtp = .{ .snapshot = snap, .base_pos = m2.base_pos };
+                new_mtp_bytes = snapshotBytes(&new_mtp.?.snapshot);
+            } else |err| {
+                log.warn("  [hot-cache] mtp history snapshot failed: {s}\n", .{@errorName(err)});
+            }
+        }
         const new_kv_bytes = snapshotBytes(&new_snap);
         var new_ssm_bytes: u64 = 0;
         if (ssm_cps) |cps| {
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
         }
-        const new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes;
+        const new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
         const tokens_owned = self.allocator.dupe(u32, tokens) catch |err| {
             var snap = new_snap;
             snap.deinit();
             if (new_dflash) |*d| d.deinit();
+            if (new_mtp) |*m3| m3.deinit();
             if (ssm_cps) |cps| {
                 for (cps) |*cp| cp.deinit(self.allocator);
                 self.allocator.free(cps);
@@ -636,12 +716,14 @@ pub const HotPrefixCache = struct {
             // ssm_checkpoints, which were moved above.
             self.allocator.free(e.tokens);
             e.snapshot.deinit();
-            // The old assistant context describes a strict PREFIX of the new
-            // tokens, but it is keyed to its own base_pos and length; the new
-            // one supersedes it outright. A commit with no dflash payload
-            // drops it rather than keeping a shorter stale context around.
+            // The old speculative payloads describe a strict PREFIX of the
+            // new tokens, but they are keyed to their own base_pos and
+            // length; the new ones supersede them outright. A commit with no
+            // payload drops the old rather than keeping a shorter stale one.
             if (e.dflash) |*d| d.deinit();
             e.dflash = null;
+            if (e.mtp) |*m4| m4.deinit();
+            e.mtp = null;
             self.current_kv_bytes -|= e.kv_bytes;
 
             // Recompute ssm bytes from the merged list.
@@ -653,11 +735,13 @@ pub const HotPrefixCache = struct {
             e.snapshot = new_snap;
             e.has_tools = has_tools;
             e.quant_config = quant_config;
-            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes;
+            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
             e.ssm_checkpoints = merged_cps;
             e.ssm_bytes = merged_ssm_bytes;
             e.dflash = new_dflash;
             e.dflash_bytes = new_dflash_bytes;
+            e.mtp = new_mtp;
+            e.mtp_bytes = new_mtp_bytes;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
             if (self.disk != null) self.disk_dirty = true;
@@ -685,11 +769,14 @@ pub const HotPrefixCache = struct {
             .ssm_bytes = new_ssm_bytes,
             .dflash = new_dflash,
             .dflash_bytes = new_dflash_bytes,
+            .mtp = new_mtp,
+            .mtp_bytes = new_mtp_bytes,
         }) catch |err| {
             self.allocator.free(tokens_owned);
             var snap = new_snap;
             snap.deinit();
             if (new_dflash) |*d| d.deinit();
+            if (new_mtp) |*m5| m5.deinit();
             if (ssm_cps) |cps| {
                 for (cps) |*cp| cp.deinit(self.allocator);
                 self.allocator.free(cps);
@@ -719,13 +806,30 @@ pub const HotPrefixCache = struct {
         // KV chunks (immutable per-position s*.safetensors). The snapshot
         // arrays are refcount-shared with the RAM entry, so `appendCommit`
         // reads the same buffers the commit captured.
-        const complete = d.appendCommit(
+        // v4: the spec snapshots (dflash context / MTP history) ride along —
+        // eligibility was enforced at commitWithState, so the disk tier
+        // persists exactly what the RAM entry holds.
+        const dflash_spec: ?kv_disk_cache.SpecCommit = if (newest.dflash) |*df| .{
+            .entries = df.snapshot.entries,
+            .step = df.snapshot.step,
+            .config = df.snapshot.config,
+            .base_pos = df.base_pos,
+        } else null;
+        const mtp_spec: ?kv_disk_cache.SpecCommit = if (newest.mtp) |*mm| .{
+            .entries = mm.snapshot.entries,
+            .step = mm.snapshot.step,
+            .config = mm.snapshot.config,
+            .base_pos = mm.base_pos,
+        } else null;
+        const complete = d.appendCommitWithSpec(
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
             newest.tokens,
             newest.has_tools,
             newest.ssm_checkpoints,
+            dflash_spec,
+            mtp_spec,
             s,
         ) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
@@ -937,7 +1041,7 @@ test "HotPrefixCache: restore clamps an inflated snapshot to the matched length 
     var dst = try KVCache.init(testing.allocator, 2);
     defer dst.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false, null);
+    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false, null, null);
 
     try testing.expect(!res.full_match);
     try testing.expectEqual(@as(usize, 64), res.matched);
@@ -966,7 +1070,7 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer hc.deinit();
-    try hc.commitWithSsm(&trunk, &toks, false, null, .{ .cache = &assist, .base_pos = 10 });
+    try hc.commitWithSsm(&trunk, &toks, false, null, .{ .cache = &assist, .base_pos = 10 }, null);
     // The assistant context is billed like SSM state, so the memory cap sees it.
     try testing.expect(hc.entries.items[0].dflash_bytes > 0);
     try testing.expect(hc.entries.items[0].kv_bytes > hc.entries.items[0].dflash_bytes);
@@ -989,6 +1093,7 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
         toks[0..32],
         false,
         .{ .cache = &dfl, .base_pos = &base },
+        null,
     );
     try testing.expect(res.full_match);
     try testing.expectEqual(@as(usize, 31), res.matched);
@@ -1016,10 +1121,68 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
         toks[0..32],
         false,
         .{ .cache = &dfl2, .base_pos = &base2 },
+        null,
     );
     try testing.expectEqual(@as(usize, 31), res2.matched);
     try testing.expectEqual(@as(?usize, null), res2.dflash_base);
     try testing.expectEqual(@as(usize, 0), dfl2.step);
+    try testing.expectEqual(@as(usize, 7), base2); // untouched
+}
+
+test "prefix cache: MTP committed history round-trips, clamped; a history ending short is declined" {
+    // Same DflashSnap machinery, second Entry field: the head's history is
+    // built from trunk hiddens and a restore forwards nothing, so without
+    // this every reused prefix drafts blind (~70 -> ~38 tok/s on warm echo,
+    // Qwen3.6-27B). Unlike the trunk KV, a history that ends BEFORE the
+    // matched cursor cannot be adopted — the missing tail's hiddens are
+    // unrecoverable, and a gap right below the generation point is worse
+    // than a blind start.
+    const s = mlx.gpuStream();
+    var toks: [64]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 5);
+
+    var trunk = try KVCache.init(testing.allocator, 2);
+    defer trunk.deinit();
+    try testFillCache(&trunk, s, 2, 64);
+    // Committed history covers 60 of the 64 tokens (the deferred-stash lag).
+    var hist = try KVCache.init(testing.allocator, 1);
+    defer hist.deinit();
+    try testFillCache(&hist, s, 1, 60);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try hc.commitWithSsm(&trunk, &toks, false, null, null, .{ .cache = &hist, .base_pos = 0 });
+    try testing.expect(hc.entries.items[0].mtp_bytes > 0);
+    try testing.expect(hc.entries.items[0].kv_bytes > hc.entries.items[0].mtp_bytes);
+
+    // Shorter prompt fully covered by the entry: full-match arm lands the
+    // trunk at 31 and the history clamps to 31 (base 0).
+    var dst = try KVCache.init(testing.allocator, 2);
+    defer dst.deinit();
+    var mtp_dst = try KVCache.init(testing.allocator, 1);
+    defer mtp_dst.deinit();
+    var moe_off: usize = 0;
+    var base: usize = 99;
+    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, toks[0..32], false, null, .{ .cache = &mtp_dst, .base_pos = &base });
+    try testing.expect(res.full_match);
+    try testing.expectEqual(@as(usize, 31), res.matched);
+    try testing.expectEqual(@as(?usize, 0), res.mtp_base);
+    try testing.expectEqual(@as(usize, 0), base);
+    try testing.expectEqual(@as(usize, 31), mtp_dst.step);
+    try testing.expectEqual(base + mtp_dst.step, res.matched);
+
+    // Full 64-token re-issue: matched 63 > the 60 the history covers →
+    // declined, target untouched, caller starts blind.
+    var dst2 = try KVCache.init(testing.allocator, 2);
+    defer dst2.deinit();
+    var mtp2 = try KVCache.init(testing.allocator, 1);
+    defer mtp2.deinit();
+    var moe2: usize = 0;
+    var base2: usize = 7;
+    const res2 = try hc.lookupAndRestore(&dst2, &moe2, null, s, &toks, false, null, .{ .cache = &mtp2, .base_pos = &base2 });
+    try testing.expectEqual(@as(usize, 63), res2.matched);
+    try testing.expectEqual(@as(?usize, null), res2.mtp_base);
+    try testing.expectEqual(@as(usize, 0), mtp2.step);
     try testing.expectEqual(@as(usize, 7), base2); // untouched
 }
 
@@ -1086,7 +1249,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, null);
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, null, null);
         // Full match: identical re-issue semantics — truncate to len-1 and
         // re-forward the last token, exactly like a RAM full-match hit.
         try testing.expect(res.full_match);
@@ -1105,7 +1268,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var cache3 = try KVCache.init(testing.allocator, 2);
         defer cache3.deinit();
         var moe_off3: usize = 0;
-        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, null);
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, null, null);
         try testing.expect(!res3.full_match);
         try testing.expectEqual(@as(usize, 400), res3.matched);
         try testing.expectEqual(@as(usize, 400), cache3.step);
@@ -1114,6 +1277,110 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         // stored entry (5 chunks). Loading the full entry to serve a short
         // shared prefix makes a diverged "hit" slower than a cold prefill.
         try testing.expectEqual(@as(u32, 4), hc2.disk.?.chunks_loaded_last);
+    }
+}
+
+test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a restart" {
+    // A disk-tier restore forwards NO trunk layers, so state derived from
+    // trunk hiddens (dflash context, MTP history) started EMPTY on every
+    // disk hit — multi-turn across a restart drafted blind (the same
+    // 92.6% → 66.5% acceptance class the RAM tier fixed). v4 persists both
+    // in the entry's spec sidecar and restores them under the RAM tier's
+    // exact clamp rule.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Session 1: commit with BOTH spec payloads through the normal RAM path,
+    // then flush (the post-markFinished call the scheduler makes).
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec-hc", 0, 128);
+        defer hc.deinit();
+
+        var trunk = try KVCache.init(testing.allocator, 2);
+        defer trunk.deinit();
+        try testFillCache(&trunk, s, 2, 600);
+        var assist = try KVCache.init(testing.allocator, 2);
+        defer assist.deinit();
+        try testFillCache(&assist, s, 2, 600);
+        var hist = try KVCache.init(testing.allocator, 1);
+        defer hist.deinit();
+        try testFillCache(&hist, s, 1, 600);
+
+        try hc.commitWithSsm(&trunk, &tokens, false, null, .{ .cache = &assist, .base_pos = 0 }, .{ .cache = &hist, .base_pos = 0 });
+        hc.flushPendingDisk(s);
+        try testing.expect(!hc.disk_dirty);
+        try testing.expect(hc.disk.?.entries.items[0].spec_dflash != null);
+        try testing.expect(hc.disk.?.entries.items[0].spec_mtp != null);
+    }
+
+    // Session 2 ("server restart"): RAM empty, disk serves the prefix AND
+    // both spec snapshots, clamped to the trunk's matched length.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec-hc", 0, 128);
+        defer hc2.deinit();
+        try testing.expectEqual(@as(usize, 0), hc2.entryCount());
+
+        var trunk2 = try KVCache.init(testing.allocator, 2);
+        defer trunk2.deinit();
+        var dfl = try KVCache.init(testing.allocator, 2);
+        defer dfl.deinit();
+        var mtp_dst = try KVCache.init(testing.allocator, 1);
+        defer mtp_dst.deinit();
+        var moe_off: usize = 0;
+        var dbase: usize = 99;
+        var mbase: usize = 99;
+        const res = try hc2.lookupAndRestore(
+            &trunk2,
+            &moe_off,
+            null,
+            s,
+            &tokens,
+            false,
+            .{ .cache = &dfl, .base_pos = &dbase },
+            .{ .cache = &mtp_dst, .base_pos = &mbase },
+        );
+        // Full match: identical re-issue → trunk lands at 599; both spec
+        // caches clamp to base + step == matched.
+        try testing.expect(res.full_match);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(@as(?usize, 0), res.dflash_base);
+        try testing.expectEqual(@as(usize, 0), dbase);
+        try testing.expectEqual(@as(usize, 599), dfl.step);
+        try testing.expectEqual(@as(?usize, 0), res.mtp_base);
+        try testing.expectEqual(@as(usize, 599), mtp_dst.step);
+
+        // A geometry the persisted snap doesn't fit starts BLIND, never
+        // wrong: a 3-layer dflash target declines.
+        var trunk3 = try KVCache.init(testing.allocator, 2);
+        defer trunk3.deinit();
+        var dfl3 = try KVCache.init(testing.allocator, 3);
+        defer dfl3.deinit();
+        var moe3: usize = 0;
+        var dbase3: usize = 42;
+        const res3 = try hc2.lookupAndRestore(
+            &trunk3,
+            &moe3,
+            null,
+            s,
+            &tokens,
+            false,
+            .{ .cache = &dfl3, .base_pos = &dbase3 },
+            null,
+        );
+        try testing.expectEqual(@as(usize, 599), res3.matched);
+        try testing.expectEqual(@as(?usize, null), res3.dflash_base);
+        try testing.expectEqual(@as(usize, 0), dfl3.step);
+        try testing.expectEqual(@as(usize, 42), dbase3); // untouched
     }
 }
 
@@ -1145,7 +1412,7 @@ test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
     var cache2 = try KVCache.init(testing.allocator, 1);
     defer cache2.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, null);
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, null, null);
     try testing.expect(res.full_match);
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
 }
@@ -1293,7 +1560,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
         cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
         // commitWithSsm takes ownership of `cps`.
-        try hc.commitWithSsm(&cache, &tokens, false, cps, null);
+        try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
         try testing.expect(hc.disk_dirty);
         hc.flushPendingDisk(s);
         try testing.expect(!hc.disk_dirty);
@@ -1315,7 +1582,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var ssm2 = pcEmptySsm();
         defer pcFreeHybrid(&ssm2);
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, null);
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, null, null);
         // Highest checkpoint ≤ 600 is 512 — never a full match on hybrid.
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 512), res.matched);
@@ -1337,7 +1604,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var ssm3 = pcEmptySsm();
         defer pcFreeHybrid(&ssm3);
         var moe_off3: usize = 0;
-        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens_div, false, null);
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens_div, false, null, null);
         try testing.expect(!res3.full_match);
         try testing.expectEqual(@as(usize, 256), res3.matched);
         try testing.expectEqual(@as(usize, 256), cache3.step);
@@ -1369,7 +1636,7 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
     defer pcFreeHybrid(&src512);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
-    try hc.commitWithSsm(&cache, &tokens, false, cps, null);
+    try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
     hc.flushPendingDisk(s);
     const disk_uses_before = hc.disk.?.counter;
 
@@ -1381,7 +1648,7 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
     var ssm2 = pcEmptySsm();
     defer pcFreeHybrid(&ssm2);
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, null);
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, null, null);
     try testing.expectEqual(@as(usize, 512), res.matched);
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
     // RAM restore installed the SSM state just the same.

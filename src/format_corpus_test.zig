@@ -39,6 +39,46 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
+const mtp = @import("mtp.zig");
+
+test "format corpus: MTP cost profiles classify full target tensor surfaces" {
+    const Case = struct {
+        bits: u32,
+        group_size: u32,
+        target: mtp.MtpNaxTargetSurface,
+        want: mtp.MtpCostProfile,
+    };
+    const cases = [_]Case{
+        .{ .bits = 8, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q8_gs32 },
+        .{ .bits = 4, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q4_gs32 },
+        .{ .bits = 4, .group_size = 64, .target = .uniform_quantized_embedding, .want = .generic },
+        .{ .bits = 4, .group_size = 64, .target = .uniform_bf16_embedding, .want = .g17_nax_q4_gs64 },
+        .{ .bits = 6, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .g17_nax_q6_gs64 },
+        .{ .bits = 8, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .g17_nax_q8_gs64 },
+        .{ .bits = 8, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .generic },
+        .{ .bits = 6, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .generic },
+        .{ .bits = 4, .group_size = 64, .target = .oqe_quantized_embedding, .want = .g17_nax_oq4e_q4_gs64 },
+        .{ .bits = 4, .group_size = 64, .target = .none, .want = .generic },
+        .{ .bits = 4, .group_size = 32, .target = .uniform_bf16_embedding, .want = .generic },
+        .{ .bits = 8, .group_size = 32, .target = .oqe_quantized_embedding, .want = .generic },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(
+            case.want,
+            mtp.m5NaxCostProfileForFingerprint(case.bits, case.group_size, case.target),
+        );
+    }
+
+    // A sidecar's quantization label never selects a calibrated target
+    // surface by itself. Unsupported sidecars remain generic for every target.
+    inline for (std.meta.tags(mtp.MtpNaxTargetSurface)) |target| {
+        try testing.expectEqual(
+            mtp.MtpCostProfile.generic,
+            mtp.m5NaxCostProfileForFingerprint(3, 32, target),
+        );
+    }
+}
 
 const Expect = struct {
     family: []const u8,
@@ -1500,24 +1540,28 @@ const corpus = [_]Expect{
 /// family. `<|"|>` is Gemma 4's string delimiter; the rest are think/tool
 /// markers from every supported template family.
 const leak_tags = [_][]const u8{
-    "<think>",            "</think>",          "<|channel>",       "<channel|>",
-    "<|tool_call",        "<tool_call",        "<|\"|>",
+    "<think>",              "</think>",        "<|channel>",        "<channel|>",
+    "<|tool_call",          "<tool_call",      "<|\"|>",
     // Inkling message-channel markers (each a single special token).
-    "<|content_text|>",   "<|content_thinking|>", "<|end_message|>", "<|message_model|>",
-    "<|content_invoke_tool_json|>",
+               "<|content_text|>",
+    "<|content_thinking|>", "<|end_message|>", "<|message_model|>", "<|content_invoke_tool_json|>",
     // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
     "<｜DSML｜",
     // Muse-Glimmer channel markers (each a single special token). The
     // `assistant to=` header TEXT between them is covered by the split tests.
-    "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
+    "<|start|>",            "<|message|>",     "<|eom|>",           "<|eot|>",
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
 /// either. Mirrors `chat.tool_markup_openers` (the cut list) — kept spelled
 /// out here so the guard fails if the cut list is narrowed.
 const reasoning_leak_tags = [_][]const u8{
-    "<｜DSML｜",  "<|tool_call", "<tool_call",
-    "<tool_calls:", "<|content_invoke_tool_json|>", "<atem:",
+    "<｜DSML｜",
+    "<|tool_call",
+    "<tool_call",
+    "<tool_calls:",
+    "<|content_invoke_tool_json|>",
+    "<atem:",
 };
 
 fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {
@@ -1816,8 +1860,8 @@ test "format corpus: streaming tool buffer never flushes Inkling call text" {
     // leak (NAME + full JSON streamed as visible content deltas, landing in
     // pi's transcript and contaminating every later turn's history).
     const inkling_markers = [_][]const u8{
-        "<|message_model|>",    "<|end_message|>",
-        "<|content_text|>",     "<|content_thinking|>",
+        "<|message_model|>",            "<|end_message|>",
+        "<|content_text|>",             "<|content_thinking|>",
         "<|content_invoke_tool_json|>",
     };
     for (corpus) |entry| {
@@ -1952,40 +1996,61 @@ const Dialect = struct {
 
 const dialects = [_]Dialect{
     .{
-        .family = "qwen3.5/3.6", .dialect = "tool_call wrapper + JSON body",
+        .family = "qwen3.5/3.6",
+        .dialect = "tool_call wrapper + JSON body",
         .raw = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n</tool_call>",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
     .{
         // The dialect the checkpoint's OWN template mandates.
-        .family = "qwen3.5/3.6", .dialect = "tool_call wrapper + <function=> body",
+        .family = "qwen3.5/3.6",
+        .dialect = "tool_call wrapper + <function=> body",
         .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>\n</tool_call>",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
     .{
-        .family = "qwen3.5/3.6", .dialect = "bare <function=>, no wrapper",
+        .family = "qwen3.5/3.6",
+        .dialect = "bare <function=>, no wrapper",
         .raw = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
     .{
-        .family = "hermes/chatml", .dialect = "tool_call wrapper, single line",
+        .family = "hermes/chatml",
+        .dialect = "tool_call wrapper, single line",
         .raw = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}</tool_call>",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
     .{
-        .family = "gemma4", .dialect = "channel tool_call",
+        .family = "gemma4",
+        .dialect = "channel tool_call",
         .raw = "<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>,content:<|\"|>hi<|\"|>}<tool_call|>",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
     .{
-        .family = "llama3", .dialect = "raw JSON, name+parameters",
+        .family = "llama3",
+        .dialect = "raw JSON, name+parameters",
         .raw = "{\"name\": \"write_file\", \"parameters\": {\"path\": \"a.txt\", \"content\": \"hi\"}}",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
     .{
-        .family = "lfm2", .dialect = "pythonic call expression",
+        .family = "lfm2",
+        .dialect = "pythonic call expression",
         .raw = "<|tool_call_start|>[write_file(path=\"a.txt\", content=\"hi\")]<|tool_call_end|>",
-        .name = "write_file", .key = "path", .value = "a.txt",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
     },
 };
 
@@ -2055,10 +2120,8 @@ test "format corpus: a parameter VALUE never decides the call" {
     // around it — a format string would have to be comptime.
     const Shape = struct { pre: []const u8, post: []const u8 };
     const shapes = [_]Shape{
-        .{ .pre = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n",
-           .post = "\n</parameter>\n</function>\n</tool_call>" },
-        .{ .pre = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n",
-           .post = "\n</parameter>\n</function>" },
+        .{ .pre = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>\n</tool_call>" },
+        .{ .pre = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>" },
     };
 
     for (shapes) |shape| {

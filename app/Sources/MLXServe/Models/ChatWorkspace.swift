@@ -67,10 +67,17 @@ enum ChatWorkspace: Equatable {
     static let defaultEntry: ChatWorkspace = .models(.recommended)
 
     /// Whether the "you need a model to chat" gate may cover the window.
+    ///
+    /// - Parameter palettePresented: the ⌘L model switcher. Two sheets on one
+    ///   window is one sheet plus a thing nobody can see, so the gate stands
+    ///   down for it exactly as it does for the welcome sheet and the models
+    ///   pane — deferred, not dismissed.
     static func gateShouldPresent(gateIsBlocking: Bool,
                                   cancelled: Bool,
                                   workspace: ChatWorkspace,
-                                  welcomePresented: Bool) -> Bool {
-        gateIsBlocking && !cancelled && workspace.isConversation && !welcomePresented
+                                  welcomePresented: Bool,
+                                  palettePresented: Bool = false) -> Bool {
+        gateIsBlocking && !cancelled && workspace.isConversation
+            && !welcomePresented && !palettePresented
     }
 }

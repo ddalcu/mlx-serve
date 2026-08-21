@@ -1,8 +1,8 @@
 import XCTest
 @testable import MLXCore
 
-/// Unit tests for the pure multimodal content-block builder that feeds the
-/// Gemma 4 12B unified engine (image_url + input_audio + text blocks).
+/// Unit tests for the pure multimodal content-block builder (image_url +
+/// video_url + input_audio + text blocks).
 final class MultimodalContentTests: XCTestCase {
 
     private func blocks(_ any: [[String: Any]]) -> [[String: Any]] { any }
@@ -95,5 +95,36 @@ final class MultimodalContentTests: XCTestCase {
         let clip = ChatAudio(name: "x", pcm: Data(count: 16_000 * 4))
         XCTAssertEqual(clip.sampleCount, 16_000)
         XCTAssertEqual(clip.durationSeconds, 1.0, accuracy: 1e-6)
+    }
+
+    func testVideoEmitsVideoUrlBlockWithOrderedFrameDataUrls() {
+        let frames = [Data([0xFF, 0xD8, 0xFF, 1]), Data([0xFF, 0xD8, 0xFF, 2])]
+        let vid = ChatVideo(name: "clip.mov", frames: frames)
+        let out = MultimodalContent.build(text: "what happens?", images: [], videos: [vid], audio: [])
+        XCTAssertEqual(out.count, 2) // video + text
+        XCTAssertEqual(out[0]["type"] as? String, "video_url")
+        let videoDict = out[0]["video_url"] as? [String: Any]
+        let urls = videoDict?["frames"] as? [String]
+        XCTAssertEqual(urls?.count, 2)
+        XCTAssertEqual(urls?[0], "data:image/jpeg;base64,\(frames[0].base64EncodedString())")
+        XCTAssertEqual(urls?[1], "data:image/jpeg;base64,\(frames[1].base64EncodedString())")
+        XCTAssertEqual(out[1]["type"] as? String, "text")
+    }
+
+    func testImageThenVideoThenAudioThenTextOrdering() {
+        // Mirrors the server's insertion order (image block, then video block,
+        // then audio block) so a reader of the wire body sees the same order
+        // the prompt places the placeholders in.
+        let img = ChatImage(data: Data([1]))
+        let vid = ChatVideo(name: "clip.mov", frames: [Data([2])])
+        let clip = ChatAudio(name: "a.wav", pcm: Data([0, 0, 0, 0]))
+        let out = MultimodalContent.build(text: "q", images: [img], videos: [vid], audio: [clip],
+                                          preprocessImage: { _ in Data([9]) })
+        XCTAssertEqual(out.map { $0["type"] as? String }, ["image_url", "video_url", "input_audio", "text"])
+    }
+
+    func testChatVideoFrameCount() {
+        let vid = ChatVideo(name: "clip.mov", frames: [Data([1]), Data([2]), Data([3])])
+        XCTAssertEqual(vid.frameCount, 3)
     }
 }

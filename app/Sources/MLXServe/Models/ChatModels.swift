@@ -213,6 +213,25 @@ struct ChatAudio: Identifiable, Codable, Equatable {
     var durationSeconds: Double { Double(sampleCount) / 16_000.0 }
 }
 
+/// A video attached to a message. `frames` are JPEG bytes sampled evenly
+/// across the whole clip (`VideoPreprocessor.extractFrames`) — Qwen3-VL-family
+/// models are the only ones that read video input, and the server decodes each
+/// frame the same way it decodes a plain `image_url` (no video codec exists
+/// anywhere in mlx-serve, so frame extraction is the client's job).
+struct ChatVideo: Identifiable, Codable, Equatable {
+    let id: UUID
+    let name: String // original filename, for the attachment chip
+    let frames: [Data] // JPEG bytes, one per sampled frame
+
+    init(name: String, frames: [Data]) {
+        self.id = UUID()
+        self.name = name
+        self.frames = frames
+    }
+
+    var frameCount: Int { frames.count }
+}
+
 struct ChatMessage: Identifiable, Codable {
     let id: UUID
     var role: Role
@@ -230,6 +249,7 @@ struct ChatMessage: Identifiable, Codable {
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
     var images: [ChatImage]?  // Images attached to this message
+    var videos: [ChatVideo]?  // Videos attached to this message
     var audio: [ChatAudio]?   // Audio clips attached to this message
     // Generated media attached BY PATH (see ChatMediaRef) — the tracks and clips
     // the in-chat media tools produce. Absent on every message saved before they
@@ -253,6 +273,12 @@ struct ChatMessage: Identifiable, Codable {
     // back to the model as history, and the old in-content banner taught it
     // the warning text. Absent forever on messages saved before the field.
     var truncationNotice: TruncationNotice.Notice? = nil
+    /// Every generated version of this reply, oldest first, populated only
+    /// once it has been regenerated at least once. `content` mirrors the
+    /// selected one — the transcript, the history builder and every existing
+    /// reader keep reading `content` and never learn this field exists.
+    var revisions: [MessageRevision] = []
+    var activeRevision: Int = 0
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -274,8 +300,8 @@ struct ChatMessage: Identifiable, Codable {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
-        case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
-        case errorNotice, media, truncationNotice
+        case toolCallId, toolName, toolCalls, images, videos, audio, failedRetry, processHandles
+        case errorNotice, media, truncationNotice, revisions, activeRevision
     }
 
     init(from decoder: Decoder) throws {
@@ -296,6 +322,7 @@ struct ChatMessage: Identifiable, Codable {
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
+        videos = try c.decodeIfPresent([ChatVideo].self, forKey: .videos)
         audio = try c.decodeIfPresent([ChatAudio].self, forKey: .audio)
         media = try c.decodeIfPresent([ChatMediaRef].self, forKey: .media)
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
@@ -303,6 +330,10 @@ struct ChatMessage: Identifiable, Codable {
         errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
         // Tolerant: a cause this build doesn't know must not fail the message.
         truncationNotice = (try? c.decodeIfPresent(TruncationNotice.Notice.self, forKey: .truncationNotice)) ?? nil
+        // Tolerant, like every other optional here: a session written by an
+        // older build has neither key and decodes as an ordinary reply.
+        revisions = (try? c.decodeIfPresent([MessageRevision].self, forKey: .revisions)) ?? []
+        activeRevision = (try? c.decodeIfPresent(Int.self, forKey: .activeRevision)) ?? 0
     }
 }
 
@@ -342,6 +373,11 @@ struct ModelInfo {
     /// was launched with `--no-vision`. The Telegram bridge reads this to
     /// decide whether to forward an incoming photo or refuse it.
     var supportsVision: Bool = false
+    /// True when the model advertises `video` in `input_modalities` (Qwen3-VL-
+    /// family checkpoints that declare `video_token_id` alongside vision).
+    /// Never true without `supportsVision` also being true — video piggybacks
+    /// the same vision tower. Gates the video-attach option in chat.
+    var supportsVideo: Bool = false
     /// True when the model advertises the `embeddings` capability (encoder-
     /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
     /// GPU embedder for folder indexing.
@@ -399,6 +435,15 @@ struct ModelInfo {
     /// modality, so empty counts as chat and nothing else.
     func lanAdvertises(_ capability: String) -> Bool {
         guard lanPeer != nil else { return false }
+        // "audio" is the MODALITY, and the server advertises a music backend
+        // ADDITIVELY as ["audio","music"] on both the ready and stub paths
+        // (src/server.zig) — so a peer running ACE-Step or MiniMax Music 3
+        // matched the Voice pane's "audio" ask and offered itself as a TTS
+        // voice. Speech is audio-and-not-music; the Music pane's own "music"
+        // ask was already exact, because no TTS backend advertises it.
+        if capability == "speech" {
+            return capabilities.contains("audio") && !capabilities.contains("music")
+        }
         if capabilities.contains(capability) { return true }
         return capability == "chat" && capabilities.isEmpty
     }

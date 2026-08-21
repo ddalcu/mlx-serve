@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import SwiftUI
@@ -130,6 +131,14 @@ class AppState: ObservableObject {
     private var modelSwitchGeneration = 0
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
+    /// Sidebar selection (multi-select). Bind the sidebar List to this set so
+    /// macOS-style multi-selection (Cmd/Shift click, drag) works naturally.
+    @Published var sidebarSelection: Set<UUID> = []
+    /// Chats waiting on the delete confirmation. It lives out here rather than
+    /// in the sidebar because the File menu's ⌘⌫ has to reach it too, and two
+    /// confirmations for one decision is how they start disagreeing; the
+    /// sidebar owns the single dialog that presents it.
+    @Published var pendingChatDeletion: Set<UUID>?
     /// Set when a task notification is tapped — the Tasks window observes this to
     /// focus the relevant task, then clears it.
     @Published var pendingTaskDeepLink: UUID?
@@ -265,6 +274,39 @@ class AppState: ObservableObject {
     /// list and the detail are SEPARATE columns of the chat window's own
     /// `NavigationSplitView` — neither can own the other's state.
     @Published var selectedTaskId: UUID?
+
+    /// Is the ⌘L model switcher up? A SHEET on the chat window, like the
+    /// welcome screen — so the flag lives here rather than in the view, because
+    /// the thing that opens it is a menu command with no view to talk to.
+    @Published var modelPalettePresented = false
+
+    /// Open the model switcher — the ONE way in, same shape as `showModels()`:
+    /// it must both raise the picker AND bring the chat window forward, or ⌘L
+    /// from the tray opens a sheet on a window nobody is looking at.
+    ///
+    /// Refused while the welcome sheet is up: that screen is the first-run
+    /// model picker, and a second sheet over it is the one-sheet rule.
+    func showModelPalette() {
+        guard !showWelcome else { return }
+        modelPalettePresented = true
+        pendingChatOpenTick += 1
+    }
+
+    /// Apply a `ChatModelSelection` tag — what picking a model MEANS, in one
+    /// place. The tray, the composer's pill and the ⌘L palette all call this:
+    /// each had its own copy of "clear the LAN id, then set the path", which is
+    /// the per-surface-copy class the tag semantics were centralised to avoid.
+    func applyChatModelPick(_ tag: String) {
+        switch ChatModelSelection.action(for: tag) {
+        case .selectLan(let id):
+            selectLanModel(id)
+        case .selectLocal(let path):
+            // Picking a local model always clears the LAN choice, or the chat
+            // keeps being answered by the other Mac.
+            server.lanChatModelId = nil
+            selectedModelPath = path
+        }
+    }
 
     /// Show the model browser — the ONE way in.
     func showModels(_ section: ModelBrowserSection = .recommended) {
@@ -693,25 +735,83 @@ class AppState: ObservableObject {
         return newChatSession(agentId: agentId)
     }
 
-    func deleteSession(_ id: UUID) {
-        // Kill any background processes this session started before dropping it —
-        // otherwise they'd survive untracked for the rest of the app's life.
-        processRegistry.killSession(id)
-        documentIndexes[id]?.cancel()
-        documentIndexes.removeValue(forKey: id)
-        // Drop the session's security-scoped bookmarks with it — a deleted chat
-        // must not keep durable access to the folders it was granted.
-        SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
-        SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
-        chatSessions.removeAll { $0.id == id }
-        // Stop the in-flight turn if it belonged to this session — otherwise
-        // it ghost-runs invisibly with no Stop control anywhere, and no server
-        // restart can clear it. The sweep is per turn: only the deleted chat's
-        // turn stops. See ChatTurnEngine.stopIfOrphaned / TurnLedger.orphaned.
-        chatEngine.stopIfOrphaned()
-        if activeChatId == id {
-            activeChatId = chatSessions.first?.id
+    /// What the File menu's Delete Chat (⌘⌫) would act on, and nil when that
+    /// is nothing — the menu item reads this to disable itself rather than
+    /// offer a command that does nothing when you pick it.
+    var chatDeletionTarget: Set<UUID>? {
+        SidebarDeleteConfirm.target(selection: sidebarSelection, activeChatId: activeChatId)
+    }
+
+    /// The File menu's Delete Chat (⌘⌫). A menu command, NOT a key handler:
+    /// the sidebar's conversation column is a ScrollView of plain Buttons, so
+    /// nothing there ever becomes first responder and a bare `.onDeleteCommand`
+    /// never fired. Routed through the same rule every delete control reads, so
+    /// the keyboard cannot become the one path that skips the confirmation.
+    ///
+    /// It also has to give the keystroke BACK when something is being typed
+    /// into: a menu key equivalent is offered the event ahead of the first
+    /// responder, so this command otherwise stole ⌘⌫ from the composer, where
+    /// it deletes to the start of the line (`ChatDeleteShortcut`). Performing
+    /// that deletion here rather than returning early is the load-bearing part
+    /// — the menu has already swallowed the event, and nothing else will run.
+    func requestChatDeletionFromMenu() {
+        let responder = NSApp.keyWindow?.firstResponder
+        switch ChatDeleteShortcut.route(editingText: KeyboardFocus.isTextEditor(responder),
+                                        selectedChats: sidebarSelection.count) {
+        case .deleteToLineStart:
+            (responder as? NSTextView)?.deleteToBeginningOfLine(nil)
+            return
+        case .deleteChats:
+            break
         }
+        guard let ids = chatDeletionTarget else { return }
+        if SidebarDeleteConfirm.required(count: ids.count, keyboard: true) {
+            pendingChatDeletion = ids
+        } else {
+            deleteSessions(ids)
+        }
+    }
+
+    /// Delete one session. Deliberately the bulk path with a set of one rather
+    /// than its own copy of the body: the two DID drift — one fell back to
+    /// `chatSessions.first`, the other to `visibleChatSessions.first` — so a
+    /// single delete could land you on a hidden session the sidebar has no row
+    /// for.
+    func deleteSession(_ id: UUID) {
+        deleteSessions([id])
+    }
+
+    /// Delete a set of sessions — the ONE deletion path, whether the sidebar's
+    /// multi-select asked or a single row did. Kill any background processes
+    /// those sessions started (otherwise they survive untracked for the rest of
+    /// the app's life), drop attached indexes and the security-scoped bookmarks
+    /// (a deleted chat must not keep durable access to folders it was granted),
+    /// then drop the session objects. If the active chat was among them, adopt
+    /// the first VISIBLE session — a hidden one is a transcript the sidebar
+    /// cannot point at.
+    func deleteSessions(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            processRegistry.killSession(id)
+            documentIndexes[id]?.cancel()
+            documentIndexes.removeValue(forKey: id)
+            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
+            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
+        }
+        chatSessions.removeAll { ids.contains($0.id) }
+        // Stop the in-flight turns that belonged to these sessions — otherwise
+        // they ghost-run invisibly with no Stop control anywhere, and no server
+        // restart can clear them. The sweep is per turn: only the deleted
+        // chats' turns stop. See ChatTurnEngine.stopIfOrphaned / TurnLedger.orphaned.
+        chatEngine.stopIfOrphaned()
+        if let active = activeChatId, ids.contains(active) {
+            activeChatId = visibleChatSessions.first?.id
+        }
+        // Remove deleted ids from the sidebar selection so UI state stays sane.
+        sidebarSelection.subtract(ids)
+        // A pending confirmation naming chats that are already gone would ask
+        // about nothing (or, worse, re-present after the deletion it asked for).
+        pendingChatDeletion = nil
         saveChatHistory()
     }
 
@@ -742,6 +842,164 @@ class AppState: ObservableObject {
                 chatSessions[idx] = newValue
             }
         }
+    }
+
+    /// Branch a conversation at a message: the transcript up to that point
+    /// becomes a new chat, and the original is left untouched.
+    ///
+    /// The fork opens immediately — you asked to go somewhere else, so being
+    /// left in the old thread wondering whether it worked is the wrong answer
+    /// (the same reason regenerate scrolls to the reply it asked for). Both the
+    /// active chat and the sidebar selection move, or the panel lights a row
+    /// that is not the transcript on screen.
+    ///
+    /// Returns nil when there is nothing to fork, which is also what stops the
+    /// menu item offering it (`ChatFork.isForkable`).
+    @discardableResult
+    func forkSession(_ sessionId: UUID, from messageId: UUID) -> UUID? {
+        guard let source = chatSessions.first(where: { $0.id == sessionId }) else { return nil }
+        let messages = ChatFork.prefix(source.messages, through: messageId)
+        guard !messages.isEmpty else { return nil }
+        let fork = ChatFork.session(from: source, messages: messages)
+        chatSessions.insert(fork, at: 0)
+        activeChatId = fork.id
+        sidebarSelection = [fork.id]
+        showConversation()
+        saveChatHistory()
+        return fork.id
+    }
+
+    /// The version list a regeneration in flight will put on whatever reply it
+    /// produces, per session.
+    ///
+    /// Held rather than written straight onto a message because the message
+    /// does not exist yet. `runPlainTurn` appends its streaming placeholder
+    /// synchronously, so the gap there is one statement wide — but
+    /// `runAgentLoop` appends one per tool round from inside a Task, and the
+    /// reply the pager belongs to is the LAST of them. Writing at the start
+    /// landed the seed on the user's own message, where the role guard dropped
+    /// it, and the pager silently never appeared with Tools on.
+    private var pendingRevisionSeed: [UUID: [MessageRevision]] = [:]
+
+    /// Start a regeneration's revision list, carrying the reply being replaced.
+    ///
+    /// `regenerate` truncates the transcript back to the last user message, so
+    /// the old reply is destroyed before the new one streams. Capturing it here
+    /// is what makes the pager possible at all; `finishRevisions` applies it
+    /// when the turn ends.
+    func seedRevisions(in sessionId: UUID, from prior: ChatMessage) {
+        let priorRevision = MessageRevision(content: prior.content,
+                                            reasoningContent: prior.reasoningContent)
+        let seeded = MessageRevisions.seeding(prior: priorRevision, existing: prior.revisions)
+        // An empty seed is the "there was nothing worth stepping back to" case,
+        // and leaving a stale one behind would attach it to a later turn.
+        if seeded.isEmpty { pendingRevisionSeed.removeValue(forKey: sessionId) }
+        else { pendingRevisionSeed[sessionId] = seeded }
+    }
+
+    /// Sessions whose in-flight turn EXTENDS the reply already at the end of
+    /// the transcript instead of producing a new one.
+    ///
+    /// The pager counts REGENERATIONS — answers to the same question — and a
+    /// continuation is not one of those: it is the reply you are reading,
+    /// carrying on. Without this marker `finishRevisions` reached
+    /// `MessageRevisions.committing` and filed the extended text as a new
+    /// version, so a reply that had been regenerated once went to 3/3 the
+    /// moment you finished it, and stepping back to 2/3 showed the same reply
+    /// with the ending removed. Same shape as `pendingRevisionSeed`: the turn
+    /// exit is the only place that knows the turn is over, so the fact has to
+    /// be held from the moment the continuation is asked for.
+    private var continuingSessions: Set<UUID> = []
+
+    /// Declare this session's next turn a continuation. Must be called AFTER
+    /// `stop(sessionId:)` — stop is a turn exit, and a mark placed before it
+    /// would be consumed immediately (the `seedRevisions` ordering hazard).
+    func markContinuing(_ sessionId: UUID) {
+        continuingSessions.insert(sessionId)
+    }
+
+    /// Apply any held seed to the reply this turn produced and record that
+    /// reply as the newest version. Called from turn EXITS only — a
+    /// per-iteration call inside the agent loop would land the pager on the
+    /// first tool round's bubble instead of on the answer.
+    ///
+    /// Targets the last ASSISTANT message rather than the last message: a turn
+    /// stopped mid-tool-execution ends on a `tool` row, and the reply above it
+    /// is still the one the pager belongs to.
+    func finishRevisions(in sessionId: UUID) {
+        let continuing = continuingSessions.remove(sessionId) != nil
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.lastIndex(where: { $0.role == .assistant })
+        else {
+            // Nothing to attach it to, and holding it would leak the seed onto
+            // an unrelated later turn.
+            pendingRevisionSeed.removeValue(forKey: sessionId)
+            return
+        }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        let seed = pendingRevisionSeed.removeValue(forKey: sessionId)
+        // A continuation is an in-place extension of the version being read,
+        // exactly like an edit — and for the same reason `applyingEdit` exists:
+        // stepping away and back reloads `content` from the stored revision, so
+        // an unsynced list silently discards the text the model just added.
+        if continuing {
+            guard !msg.revisions.isEmpty else { return }
+            chatSessions[sIdx].messages[mIdx].revisions =
+                MessageRevisions.applyingEdit(msg.content, to: msg.revisions, at: msg.activeRevision)
+            return
+        }
+        guard seed != nil || !msg.revisions.isEmpty else { return }
+        let finished = MessageRevision(content: msg.content, reasoningContent: msg.reasoningContent)
+        let result = MessageRevisions.finishing(seed: seed, existing: msg.revisions, finished: finished)
+        chatSessions[sIdx].messages[mIdx].revisions = result.revisions
+        chatSessions[sIdx].messages[mIdx].activeRevision = result.index
+    }
+
+    /// Rewrite the model's own reply in place.
+    ///
+    /// Unlike editing YOUR message — which drops everything after it and
+    /// resubmits, because the conversation past that point answered something
+    /// you no longer said — editing a reply changes only that reply. It is
+    /// putting words in the model's mouth: the turn already happened, and the
+    /// point is to steer what comes NEXT (Continue, or the following turn),
+    /// not to re-run it. Deleting the rest of the thread would take the choice
+    /// away; the messages after it are still there to delete by hand.
+    func editAssistantMessage(in sessionId: UUID, messageId: UUID, newText: String) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        chatSessions[sIdx].messages[mIdx].content = newText
+        chatSessions[sIdx].messages[mIdx].revisions =
+            MessageRevisions.applyingEdit(newText, to: msg.revisions, at: msg.activeRevision)
+        // The notice described the text that was there. It is not that text
+        // any more, and an edited reply is not a truncated one.
+        chatSessions[sIdx].messages[mIdx].truncationNotice = nil
+        chatSessions[sIdx].updatedAt = Date()
+    }
+
+    /// Show a different version of a reply. `content` is what every reader
+    /// uses, so switching writes the selected version into it.
+    func selectRevision(in sessionId: UUID, messageId: UUID, index: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let msg = chatSessions[sIdx].messages[mIdx]
+        guard index >= 0, index < msg.revisions.count else { return }
+        chatSessions[sIdx].messages[mIdx].activeRevision = index
+        chatSessions[sIdx].messages[mIdx].content = msg.revisions[index].content
+        chatSessions[sIdx].messages[mIdx].reasoningContent = msg.revisions[index].reasoningContent
+    }
+
+    /// Drop the "this reply was cut short" footnote from the last message.
+    ///
+    /// Called when a continuation starts: the notice is a statement about the
+    /// reply, and the reply is about to stop being cut. Leaving it would put
+    /// "Stopped — hit the output limit" under a paragraph that carried on.
+    func clearTruncationNotice(in sessionId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.indices.last else { return }
+        chatSessions[sIdx].messages[mIdx].truncationNotice = nil
     }
 
     func appendMessage(to sessionId: UUID, message: ChatMessage) {
@@ -775,7 +1033,27 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
-    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, truncation: TruncationNotice.Notice? = nil) {
+    /// Drops every message from `count` onward, keeping only the first `count`.
+    /// Used by regenerate (drop the old user turn + reply so `runTurn` can
+    /// re-append a fresh copy) and by edit-and-resend (drop everything from
+    /// the edited message onward before resubmitting its new text).
+    func truncateMessages(in sessionId: UUID, keepingFirst count: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              count < chatSessions[sIdx].messages.count else { return }
+        chatSessions[sIdx].messages.removeSubrange(count...)
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
+    /// - Parameter addingCompletionTokens: the usage describes a SECOND
+    ///   generation into a message that already holds one (a continuation), so
+    ///   the completion count is added rather than replaced. `content` is
+    ///   appended here by construction, and a footnote reading "42 tokens"
+    ///   under a reply of 900 describes only the sentence that finished it.
+    ///   The prompt count and the rate stay the latest generation's: the prompt
+    ///   for a continuation already includes everything before it, and a rate
+    ///   is not a quantity to sum.
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, addingCompletionTokens: Bool = false, truncation: TruncationNotice.Notice? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
         let mIdx = chatSessions[sIdx].messages.count - 1
@@ -783,7 +1061,9 @@ class AppState: ObservableObject {
         if let truncation { chatSessions[sIdx].messages[mIdx].truncationNotice = truncation }
         if let usage {
             chatSessions[sIdx].messages[mIdx].promptTokens = usage.promptTokens
-            chatSessions[sIdx].messages[mIdx].completionTokens = usage.completionTokens
+            chatSessions[sIdx].messages[mIdx].completionTokens = addingCompletionTokens
+                ? (chatSessions[sIdx].messages[mIdx].completionTokens ?? 0) + usage.completionTokens
+                : usage.completionTokens
             chatSessions[sIdx].messages[mIdx].tokensPerSecond = usage.tokensPerSecond
         }
         if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }

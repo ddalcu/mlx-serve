@@ -352,6 +352,109 @@ superseded by the field.
 Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
 history builders carry neither field nor legacy text, tolerant decode).
 
+## The badges stopped where the small window had ended (fullscreen, 2026-08-13)
+
+⌘-held numbers the sidebar's conversation rows, and only the rows in the
+CLEAR get one — the list scrolls under the pinned destination block, so a
+number behind frosted glass names a shortcut you cannot read. That band was
+measured from three `frame(in: .global)` readers: the block's bottom edge, the
+column's bottom edge, and each row's own span.
+
+In fullscreen the badge count stopped tracking the window. Reproduced in an
+isolated SwiftUI harness with the same structure (`ScrollView` of rows +
+`.safeAreaInset(.top)` block + the two background readers), stepped through
+900x600 → 900x1300 → fullscreen:
+
+```
+windowed    blockMaxY=370.0  rows 378…406, 408…436, …   in band 16
+TALL        blockMaxY=370.0  rows 378…406, …            in band 16
+FULLSCREEN  blockMaxY=370.0  rows 396…424, 426…454, …   in band 18
+```
+
+`blockMaxY` is the same 370.0 in every state while the rows genuinely move
+(378 → 396). **A `.global` frame is not re-published when a view merely MOVES
+rather than resizes** — entering fullscreen translates the whole column, and
+the pinned block keeps whatever global maxY it had in the window that last
+laid it out. The band's top edge is then a number from a different window
+size, which is exactly what it looked like: badges based on the geometry the
+feature happened to be written at.
+
+The second `SidebarClearBandTopKey` publisher, `frame.minY +
+safeAreaInsets.top`, was documented as the same line derived a second way. It
+never was — measured, it reports **104** against a frost line at **370**,
+because that reader sits below the toolbar (it has already lost that inset)
+and the block's height is not part of what it reads back. It was harmless only
+because the key reduces by `max` and the real number was always larger. A
+fallback that can only ever be wrong is worse than no fallback: deleted.
+
+Fix: one named coordinate space on the column (`ChatSidebar.bandSpace`), and
+all three measurements taken in it. In the column's own space the top edge is
+the block's HEIGHT and the bottom edge is the column's HEIGHT — neither can be
+invalidated by the window moving, and both re-publish when there is genuinely
+a new layout. Same harness, same three states, container space: top constant
+at 318, bottom 825 → 827 → 897, and fullscreen numbers 19 of 19 measured rows
+where the global version numbered 18.
+
+The filter itself moved out of the view to `ChatQuickSwitch.numbering(rowSpans:
+clearBandTop:clearBandBottom:)`, which is what makes "a taller window numbers
+more rows" a test rather than a screenshot. Guards: `ChatQuickSwitchTests`
+(band cases + a source scan pinning zero `.global` frames and exactly three
+readers in the named space — verified red by reverting one reader).
+
+## Continuing a reply filed itself as a new version of it (2026-08-14)
+
+Three features landed together and two of them meet on one message. Regenerate
+puts a version pager under a reply; Continue hands the reply back to the model
+to finish. Both end at the same place — `ChatTurnEngine.endTurn` →
+`AppState.finishRevisions`, the ONE turn exit — and that exit could not tell
+them apart:
+
+```swift
+let seed = pendingRevisionSeed.removeValue(forKey: sessionId)   // nil after a continuation
+guard seed != nil || !msg.revisions.isEmpty else { return }     // …but revisions is not
+```
+
+So a reply that had been regenerated once (pager reading 2/2) went to **3/3**
+the moment you continued it, with 2/3 holding the same reply minus the ending
+that had just been written. Nothing errors and nothing is lost — the text is in
+v3 — which is what makes it the quiet kind: the pager silently grew a page that
+is not another answer to the question.
+
+The rule is that **the pager counts REGENERATIONS**, and a continuation is not
+one. It is the reply you are reading, carrying on — the same relationship an
+edit has to the version it changes, which is why `MessageRevisions.applyingEdit`
+already exists and says so: stepping away and back reloads `content` from the
+stored revision, so any in-place change that does not sync into the list is
+discarded the first time you touch an arrow.
+
+The fact has to be HELD, for the same reason `pendingRevisionSeed` is held: the
+turn exit is the only place that knows the turn is over, and by then the request
+that started it is gone. `AppState.markContinuing(_:)` is that marker, and it
+carries the seed's ordering hazard too — `continueReply` opens with
+`stop(sessionId:)`, which IS a turn exit, so a mark set before it is consumed
+immediately and the continuation records itself as a new version anyway. Set
+after `stop`, pinned by a scan that reads the two statements in order.
+
+Two more things describing a message that a continuation changes and the first
+cut did not carry over. The truncation notice was already cleared (the reply was
+cut; it is being un-cut). Token usage was not: `updateLastMessage` **replaces**
+`completionTokens`, so a 900-token reply finished by a 42-token continuation
+reported 42 in its footnote. `addingCompletionTokens:` adds instead, driven by
+`runPlainTurn`'s own `continuing` flag — the prompt count and the rate stay the
+latest generation's, since a continuation's prompt already contains everything
+before it and a rate is not a quantity to sum.
+
+And the affordance itself: `ContinueReply.isEligible` takes the `ServerEngine`
+now. ds4 renders its chat template inside the embedded engine, where there is
+nowhere to append a prefill, so the server refuses by name
+(`continuationRejectReason`) — a live button over a guaranteed 400 is the
+dead-control class, and the same rule as a locked composer disc.
+
+Guards: `ContinuedReplyBookkeepingTests`, `ContinueReplyTests` engine cases,
+`RegenerationSeedWiringTests` continuation cases (both verified red by
+reverting each half separately — the AppState branch and the `markContinuing`
+ordering fail independently).
+
 ## A typed `onDrop(of:)` never saw the Create panes' drops (2026-08-13)
 
 The media panes' shared drop target (`MediaDropTarget.swift`) shipped as
@@ -523,3 +626,15 @@ all and whatever is arriving is the reason.
 Media BUNDLES stay per-component: a bundle is N repos and the manager learns a repo's total
 only when it starts, so a weighted bundle fraction would need sizes it doesn't have. That
 bar resets once per model, and its label already says which one ("Downloading model 1/2").
+
+## The abandoned connect() leak (MCP stdio connect race, 2026-08-15)
+
+Symptom: user's RAG chat hung after 3-4 turns. Server idle and healthy (`/health` sub-2ms, `requests_running=0`, `last-agent-request.json` untouched 11+ min — rules out the server and the "ghost turn" class). App at ~160% CPU over 23h (spikes ~700%), 5326 threads. `sample <pid>`: two threads parked in `Client.connect(transport:)`, awaiting the stdio transport's `AsyncThrowingStream`. A completed connect RETURNS from that call — a thread still inside it after 23h never finished.
+
+Root cause: `connectOrFailFast` races `client.connect(transport:)` (Path A) against a death-watcher (Path B, 10 Hz) and a 30s hard cap. The winner resumes the outer continuation; Path A's Task is abandoned, never cancelled ("the loser keeps running" — deliberate, to avoid `withThrowingTaskGroup`'s destructor hanging on an unresponsive child). The gap: nothing on the losing paths called `client.disconnect()`. Per the swift-sdk (`Client.swift:287-320`), `disconnect()` is the ONLY thing that resumes a pending `withCheckedThrowingContinuation` — cancelling the Task or killing the child does not unstick it. `executeToolCall`'s watchdog, a few hundred lines above, already documents and applies this exact break-glass for tool calls; the connect race never got the same treatment.
+
+Each failed connect (server dead or no answer within 30s) leaks one permanently-scheduled task. They accumulate over the session, starve the cooperative thread pool, and the agent's next turn — which awaits a tool call on that same pool — can't complete. The spin and thread count are the leak; the hung chat is the starvation.
+
+Fix: both losing paths call `client.disconnect()` (via `Task.detached` so it doesn't block the resume closure); the timeout path also terminates the child first. `connectOrFailFast` gained an injectable `hardCapSeconds` (default 30) and `onPathASettled` hook, and went `private`→`internal` for `@testable import`. Guard: `MCPConnectLeakTests.testAbandonedConnectSettlesAfterLosingTheRace` — real `sleep 60` child (accepts pipes, never speaks MCP, so the death-watcher never fires), 0.3s cap, asserts Path A settles within 5s.
+
+Rule: any race that abandons one arm must ask whether the abandoned arm can unstick itself — here, only `disconnect()` does. A "loser keeps running" comment is a code smell: re-read it whenever a related watchdog is added nearby, in case the treatments have diverged (they did, for ~months, between the tool-call watchdog and this race). Diagnosis: `/health` + `requests_running` rule out the server in under a second; `sample <pid>` on the app is the fastest way to catch a CPU-spinning leak — a thread still inside a one-shot async call hours in is the tell.

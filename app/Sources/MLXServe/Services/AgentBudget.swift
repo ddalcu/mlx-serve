@@ -284,6 +284,149 @@ enum AgentConfigs {
                      entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
     }
 
+    /// oh-my-pi (omp) `models.yml` — written to the dedicated
+    /// `~/.mlx-serve/omp/` config dir, never the user's real `~/.omp/agent`.
+    /// The dir is selected via `PI_CODING_AGENT_DIR` — measured against omp
+    /// v17: the changelog's `OMP_CODING_AGENT_DIR` rename reached only its
+    /// help text, the env read is still the pi spelling (launch scripts
+    /// export BOTH so a completed rename keeps working).
+    ///
+    /// The model list is STATIC, one entry per chat-capable model, like
+    /// opencode's — deliberately NOT omp's `discovery: openai-models-list`:
+    /// discovery lists every /v1/models row, so media/embedding models would
+    /// enter the coding agent's picker (each at omp's 128k default context,
+    /// since a media row has no context to advertise). Users who wire omp's
+    /// discovery themselves still get real per-model context from the rows'
+    /// top-level `max_model_len`/`context_length` twins (issue #188).
+    /// `compat` keys verified against the omp schema (same vocabulary as
+    /// pi's, `thinkingFormat: qwen` included).
+    static func ompModelsYML(baseURL: String, defaultModel: String,
+                             entries: [AgentModelEntry],
+                             apiKey: String = "mlx-serve") -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == defaultModel }) {
+            list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
+                                        vision: false), at: 0)
+        }
+        let models = list.map { e -> String in
+            """
+                  - id: "\(e.id)"
+                    name: "\(e.id) (mlx-serve)"
+                    reasoning: true
+                    input: [\(e.vision ? "text, image" : "text")]
+                    cost:
+                      input: 0
+                      output: 0
+                      cacheRead: 0
+                      cacheWrite: 0
+                    contextWindow: \(e.budget.context)
+                    maxTokens: \(e.budget.output)
+            """
+        }.joined(separator: "\n")
+        return """
+        # written by mlx-serve — custom `mlx` provider for oh-my-pi (omp).
+        # Regenerated at each launch; edits here are overwritten.
+        providers:
+          mlx:
+            baseUrl: \(baseURL)/v1
+            api: openai-completions
+            apiKey: \(apiKey)
+            compat:
+              supportsDeveloperRole: false
+              supportsReasoningEffort: true
+              maxTokensField: max_tokens
+              thinkingFormat: qwen
+            models:
+        \(models)
+        """
+    }
+
+    /// Single-model convenience — the MAS instructions panel's shape.
+    static func ompModelsYML(baseURL: String, model: String,
+                             budget: AgentBudget.Budget) -> String {
+        ompModelsYML(baseURL: baseURL, defaultModel: model,
+                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+    }
+
+    /// codex `config.toml` — written into a dedicated `CODEX_HOME`
+    /// (`~/.mlx-serve/codex`; codex requires the dir to EXIST, so every
+    /// writer creates it first) so the user's real `~/.codex` is never
+    /// touched. Current codex speaks ONLY the Responses wire API (`WireApi`
+    /// has one variant in codex-rs), so this points at our `/v1/responses`.
+    /// No `env_key`: with `requires_openai_auth` false (the default) and no
+    /// key var, codex skips login entirely — the loopback server ignores
+    /// keys anyway.
+    static func codexConfigTOML(baseURL: String, model: String,
+                                budget: AgentBudget.Budget) -> String {
+        """
+        # written by mlx-serve — dedicated CODEX_HOME, regenerated at each launch.
+        model = "\(model)"
+        model_provider = "mlx"
+        model_context_window = \(budget.context)
+
+        [model_providers.mlx]
+        name = "MLX Serve (local)"
+        base_url = "\(baseURL)/v1"
+        wire_api = "responses"
+        """
+    }
+
+    /// Shell snippet that resolves the codex binary: PATH first, then the
+    /// CLI bundled inside the desktop app (codex's rebranded app installs as
+    /// ChatGPT.app or Codex.app — its own launcher checks both names in
+    /// /Applications and ~/Applications, bundle id com.openai.codex — and
+    /// ships the CLI at Contents/Resources/codex). Shared by the DMG launch
+    /// script, the MAS instructions tab, and mirrored by `mlx-serve launch`
+    /// (launch.zig), so a desktop-app-only user gets a working launch.
+    static let codexBinResolver = """
+        CODEX_BIN="$(command -v codex)"
+        if [ -z "$CODEX_BIN" ]; then
+          for app in "/Applications/ChatGPT.app" "/Applications/Codex.app" "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app"; do
+            if [ -x "$app/Contents/Resources/codex" ]; then CODEX_BIN="$app/Contents/Resources/codex"; break; fi
+          done
+        fi
+        if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
+        """
+
+    /// aider model metadata (litellm's registry format) — tells aider the
+    /// real context window of every `openai/<id>` model so its budgeting and
+    /// warnings work; without it unknown models get litellm defaults. One
+    /// entry per chat-capable model, the served model force-included.
+    static func aiderModelMetadataJSON(model: String, budget: AgentBudget.Budget,
+                                       entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        let rows = list.map { e -> String in
+            """
+              "openai/\(e.id)": {
+                "max_input_tokens": \(e.budget.context),
+                "max_output_tokens": \(e.budget.output),
+                "max_tokens": \(e.budget.output),
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+                "litellm_provider": "openai",
+                "mode": "chat"
+              }
+            """
+        }.joined(separator: ",\n")
+        return "{\n\(rows)\n}"
+    }
+
+    /// hermes `.env` — the first-run wizard kill switch: hermes's
+    /// `_has_any_provider_configured()` is satisfied by `OPENAI_BASE_URL`
+    /// alone, and the file lives under HERMES_HOME (hermes_constants.py), so
+    /// it rides the same dedicated dir as config.yaml.
+    static func hermesEnvFile(baseURL: String, apiKey: String = "mlx-serve") -> String {
+        """
+        # written by mlx-serve — OPENAI_BASE_URL marks a provider as configured,
+        # which is what keeps the first-run setup wizard out of the session.
+        OPENAI_BASE_URL=\(baseURL)/v1
+        OPENAI_API_KEY=\(apiKey)
+        """
+    }
+
     /// hermes `config.yaml` — mirrors EXACTLY what `hermes setup`'s
     /// custom-endpoint flow saves (verified against hermes_cli source, never
     /// its docs), plus one entry under `custom_providers[].models` per

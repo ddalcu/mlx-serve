@@ -351,10 +351,13 @@ final class MusicGenTests: XCTestCase {
         XCTAssertEqual(ace.durationRange, 10...600)
     }
 
-    func testRequestBodyDropsAcestepOnlyFieldsForMusic3() {
-        // Fields left over from an ACE-Step session must NOT ride the wire —
-        // the server names each one a 400 (the app gates the FIELDS, not just
-        // the controls).
+    func testRequestBodyDropsOnlyTheUndocumentedAcestepFieldsForMusic3() {
+        // Only the two the server still names a 400 are dropped. `bpm` and
+        // `keyscale` used to be in that list, wrongly: MiniMax's card lists BPM
+        // and key under Global Metadata, so the server folds them into the
+        // caption instead of refusing them. Meter and vocal language have no
+        // documented equivalent, so they stay gated at the FIELD level — values
+        // linger in @State across a model switch.
         let req = MusicGenRequest(
             model: .miniMaxMusic3_8bit,
             prompt: "upbeat synthwave",
@@ -367,8 +370,8 @@ final class MusicGenTests: XCTestCase {
             seed: 7
         )
         let body = MusicGenService.requestBody(req, modelName: "m")
-        XCTAssertNil(body["bpm"])
-        XCTAssertNil(body["keyscale"])
+        XCTAssertEqual(body["bpm"] as? Int, 128)
+        XCTAssertEqual(body["keyscale"] as? String, "F# minor")
         XCTAssertNil(body["timesignature"])
         XCTAssertNil(body["vocal_language"])
         XCTAssertEqual(body["lyrics"] as? String, "[verse]\nneon lights")
@@ -384,7 +387,7 @@ final class MusicGenTests: XCTestCase {
         XCTAssertEqual(MusicGenService.requestBody(short, modelName: "m")["duration_seconds"] as? Int, 10)
     }
 
-    func testSettingsSidecarOmitsAcestepFieldsForMusic3() {
+    func testSettingsSidecarOmitsOnlyTheUndocumentedAcestepFieldsForMusic3() {
         let req = MusicGenRequest(
             model: .miniMaxMusic3_8bit,
             prompt: "synthwave",
@@ -397,8 +400,8 @@ final class MusicGenTests: XCTestCase {
             seed: 3
         )
         let text = MusicGenService.settingsText(req, resolvedSeed: 3, modelName: "m")
-        XCTAssertFalse(text.contains("bpm:"))
-        XCTAssertFalse(text.contains("keyscale:"))
+        XCTAssertTrue(text.contains("bpm: 128"))
+        XCTAssertTrue(text.contains("keyscale: F# minor"))
         XCTAssertFalse(text.contains("timesignature:"))
         XCTAssertFalse(text.contains("vocal_language:"))
         XCTAssertTrue(text.contains("# Lyrics\n[verse]"))

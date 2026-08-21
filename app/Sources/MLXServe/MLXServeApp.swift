@@ -211,6 +211,23 @@ struct MLXCoreApp: App {
         .defaultSize(width: 900, height: 640)
 
         .commands {
+            CommandGroup(replacing: .newItem) {
+                    Button("New Chat") {
+                        openAndFocus("chat")
+                        _ = appState.newChatSession()
+                    }
+                    .keyboardShortcut("n", modifiers: [.command])
+
+                    // ⌘⌫, Finder's own "move to trash". A MENU command rather
+                    // than a key handler on the sidebar: `.onDeleteCommand`
+                    // there only fires while that view is first responder, and
+                    // a ScrollView of plain Buttons never is — see the note in
+                    // `ChatSidebar.conversationsSidebar`. It also makes the
+                    // shortcut discoverable, which a bare key never was.
+                    Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
+                        .keyboardShortcut(.delete, modifiers: [.command])
+                        .disabled(appState.chatDeletionTarget == nil)
+                }
             CommandMenu("Agent") {
                 Button("Agents…") { openAndFocus("agents") }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -261,6 +278,13 @@ struct MLXCoreApp: App {
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
             CommandMenu("Tools") {
+                // ⌘L: the model switcher, over the same rows the composer's
+                // pill offers. A menu key equivalent so it works from every
+                // window, and it goes through AppState's door — which raises
+                // the picker AND brings the chat window forward.
+                Button("Switch Model…") { appState.showModelPalette() }
+                    .keyboardShortcut("l", modifiers: [.command])
+
                 Button("Browse Models…") { appState.showModels() }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
 
