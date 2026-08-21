@@ -76,6 +76,26 @@ fn astype(x: mlx.mlx_array, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     return o;
 }
 
+/// Evaluate `x` and hand it straight back, so a stage boundary reads as one
+/// expression.
+///
+/// WHY THE VAE IS FULL OF THESE. MLX is lazy and batches an unevaluated graph
+/// into ONE command buffer, and it does not release a buffer's arrays until
+/// that buffer completes — so the peak is set by how much of the frame is in
+/// flight at once, NOT by how promptly this file drops its handles (measured:
+/// cutting `groupNormPerFrame` from five frame-sized temporaries to two moved
+/// peak by exactly zero bytes). Every full-frame intermediate here is
+/// hundreds of megabytes, so cutting the graph at each one is what bounds
+/// residency: at 1024x1024 the encoder block's peak went 5.02 -> 4.02 -> 3.02
+/// GB as these were added, with no measurable time cost — these are big ops
+/// and the sync disappears into them.
+///
+/// Semantically a no-op: evaluation order never changes a result.
+fn evalA(x: mlx.mlx_array) !mlx.mlx_array {
+    try mlx.check(mlx.mlx_array_eval(x));
+    return x;
+}
+
 fn addA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&o, a, b, s));
@@ -404,27 +424,25 @@ const Resnet = struct {
     /// projected) residual. `output_scale_factor` is 1 throughout this VAE, so
     /// the reference's divide is omitted rather than multiplied by one.
     fn forward(r: *const Resnet, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const n1 = try groupNormPerFrame(x, r.norm1_w, r.norm1_b, s);
-        const a1 = try siluA(n1, s);
+        const n1 = try evalA(try groupNormPerFrame(x, r.norm1_w, r.norm1_b, s));
+        const a1 = try evalA(try siluA(n1, s));
         _ = mlx.mlx_array_free(n1);
-        const c1 = try causalConv3d(a1, r.conv1_w, r.conv1_b, .{ 1, 1, 1 }, 1, 1, s);
+        const c1 = try evalA(try causalConv3d(a1, r.conv1_w, r.conv1_b, .{ 1, 1, 1 }, 1, 1, s));
         _ = mlx.mlx_array_free(a1);
-        try mlx.check(mlx.mlx_array_eval(c1));
 
-        const n2 = try groupNormPerFrame(c1, r.norm2_w, r.norm2_b, s);
-        const a2 = try siluA(n2, s);
+        const n2 = try evalA(try groupNormPerFrame(c1, r.norm2_w, r.norm2_b, s));
+        const a2 = try evalA(try siluA(n2, s));
         _ = mlx.mlx_array_free(n2);
-        const c2 = try causalConv3d(a2, r.conv2_w, r.conv2_b, .{ 1, 1, 1 }, 1, 1, s);
+        const c2 = try evalA(try causalConv3d(a2, r.conv2_w, r.conv2_b, .{ 1, 1, 1 }, 1, 1, s));
         _ = mlx.mlx_array_free(a2);
         _ = mlx.mlx_array_free(c1);
         defer _ = mlx.mlx_array_free(c2);
-        try mlx.check(mlx.mlx_array_eval(c2));
 
-        if (r.short_w.ctx == null) return addA(x, c2, s);
+        if (r.short_w.ctx == null) return evalA(try addA(x, c2, s));
         // 1x1x1 conv: no time mixing, so no head extension and no padding.
-        const sh = try causalConv3d(x, r.short_w, r.short_b, .{ 1, 1, 1 }, 0, 0, s);
+        const sh = try evalA(try causalConv3d(x, r.short_w, r.short_b, .{ 1, 1, 1 }, 0, 0, s));
         defer _ = mlx.mlx_array_free(sh);
-        return addA(sh, c2, s);
+        return evalA(try addA(sh, c2, s));
     }
 };
 
@@ -529,11 +547,11 @@ const Attention = struct {
         const seq = try reshape(gn, &[_]c_int{ t, h * wd, c }, s);
         defer _ = mlx.mlx_array_free(seq);
 
-        const q = try linT(seq, at.q_wt, at.q_b, s);
+        const q = try evalA(try linT(seq, at.q_wt, at.q_b, s));
         defer _ = mlx.mlx_array_free(q);
-        const k = try linT(seq, at.k_wt, at.k_b, s);
+        const k = try evalA(try linT(seq, at.k_wt, at.k_b, s));
         defer _ = mlx.mlx_array_free(k);
-        const v = try linT(seq, at.v_wt, at.v_b, s);
+        const v = try evalA(try linT(seq, at.v_wt, at.v_b, s));
         defer _ = mlx.mlx_array_free(v);
 
         // Single head: [T, HW, C] is already [batch, seq, head_dim].
@@ -575,12 +593,12 @@ const Attention = struct {
         };
         defer _ = mlx.mlx_array_free(ctx);
 
-        const out = try linT(ctx, at.o_wt, at.o_b, s);
+        const out = try evalA(try linT(ctx, at.o_wt, at.o_b, s));
         defer _ = mlx.mlx_array_free(out);
         const back = try reshape(out, &[_]c_int{ 1, t, h, wd, c }, s);
         defer _ = mlx.mlx_array_free(back);
         // residual_connection=True, rescale_output_factor=1.
-        return addA(back, x, s);
+        return evalA(try addA(back, x, s));
     }
 };
 
@@ -615,11 +633,11 @@ const DownBlock = struct {
         if (d.down_w.ctx == null) return cur;
         defer _ = mlx.mlx_array_free(cur);
         // Spatial padding lives OUTSIDE the conv and is asymmetric.
-        const padded = try padBottomRight(cur, s);
+        const padded = try evalA(try padBottomRight(cur, s));
         defer _ = mlx.mlx_array_free(padded);
         const tp: u32 = if (d.temporal_down) 1 else 0;
         const st: c_int = if (d.temporal_down) 2 else 1;
-        return causalConv3d(padded, d.down_w, d.down_b, .{ st, 2, 2 }, tp, 0, s);
+        return evalA(try causalConv3d(padded, d.down_w, d.down_b, .{ st, 2, 2 }, tp, 0, s));
     }
 };
 
@@ -751,15 +769,17 @@ const Upsampler = struct {
 
     fn forward(u: *const Upsampler, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         // 1x1x1: mixes no time, so no head extension and no padding.
-        const fan = try causalConv3d(x, u.up_w, u.up_b, .{ 1, 1, 1 }, 0, 0, s);
+        const fan = try evalA(try causalConv3d(x, u.up_w, u.up_b, .{ 1, 1, 1 }, 0, 0, s));
         defer _ = mlx.mlx_array_free(fan);
         const tr: c_int = if (u.temporal_up) 2 else 1;
-        const sh = try pixelShuffleUp(fan, 2, tr, s);
+        // The shuffle is where the frame QUADRUPLES, so it is the single
+        // biggest boundary in the decoder to cut the graph at.
+        const sh = try evalA(try pixelShuffleUp(fan, 2, tr, s));
         defer _ = mlx.mlx_array_free(sh);
-        if (!u.temporal_up) return causalConv3d(sh, u.conv_w, u.conv_b, .{ 1, 1, 1 }, 1, 1, s);
-        const cut = try removeHead(sh, 1, s);
+        if (!u.temporal_up) return evalA(try causalConv3d(sh, u.conv_w, u.conv_b, .{ 1, 1, 1 }, 1, 1, s));
+        const cut = try evalA(try removeHead(sh, 1, s));
         defer _ = mlx.mlx_array_free(cut);
-        return causalConv3d(cut, u.conv_w, u.conv_b, .{ 1, 1, 1 }, 1, 1, s);
+        return evalA(try causalConv3d(cut, u.conv_w, u.conv_b, .{ 1, 1, 1 }, 1, 1, s));
     }
 };
 
@@ -885,11 +905,11 @@ pub fn loadDecoder(a: std.mem.Allocator, w: *const Weights, s: S) !Decoder {
 /// `encode` produced.
 pub fn decode(d: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
     memProbe("decode enter");
-    var cur = try causalConv3d(z, d.conv_in_w, d.conv_in_b, .{ 1, 1, 1 }, 1, 1, s);
+    var cur = try evalA(try causalConv3d(z, d.conv_in_w, d.conv_in_b, .{ 1, 1, 1 }, 1, 1, s));
     {
         const r0 = try d.mid_r0.forward(cur, s);
         _ = mlx.mlx_array_free(cur);
-        const at = try d.mid_attn.forward(r0, s);
+        const at = try evalA(try d.mid_attn.forward(r0, s));
         _ = mlx.mlx_array_free(r0);
         const r1 = try d.mid_r1.forward(at, s);
         _ = mlx.mlx_array_free(at);
@@ -906,12 +926,12 @@ pub fn decode(d: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
         _ = mlx.mlx_clear_cache();
         memProbe("decode block");
     }
-    const n = try groupNormPerFrame(cur, d.norm_out_w, d.norm_out_b, s);
+    const n = try evalA(try groupNormPerFrame(cur, d.norm_out_w, d.norm_out_b, s));
     _ = mlx.mlx_array_free(cur);
     defer _ = mlx.mlx_array_free(n);
-    const act = try siluA(n, s);
+    const act = try evalA(try siluA(n, s));
     defer _ = mlx.mlx_array_free(act);
-    return causalConv3d(act, d.conv_out_w, d.conv_out_b, .{ 1, 1, 1 }, 1, 1, s);
+    return evalA(try causalConv3d(act, d.conv_out_w, d.conv_out_b, .{ 1, 1, 1 }, 1, 1, s));
 }
 
 /// Encode pixels to the RAW latent parameters.
@@ -923,7 +943,7 @@ pub fn decode(d: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// whether it wants the distribution or the scaled sample.
 pub fn encode(e: *const Encoder, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     memProbe("encode enter");
-    var cur = try causalConv3d(x, e.conv_in_w, e.conv_in_b, .{ 1, 1, 1 }, 1, 1, s);
+    var cur = try evalA(try causalConv3d(x, e.conv_in_w, e.conv_in_b, .{ 1, 1, 1 }, 1, 1, s));
 
     for (&e.blocks) |*b| {
         const nxt = try b.forward(cur, s);
@@ -937,19 +957,19 @@ pub fn encode(e: *const Encoder, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     {
         const r0 = try e.mid_r0.forward(cur, s);
         _ = mlx.mlx_array_free(cur);
-        const at = try e.mid_attn.forward(r0, s);
+        const at = try evalA(try e.mid_attn.forward(r0, s));
         _ = mlx.mlx_array_free(r0);
         const r1 = try e.mid_r1.forward(at, s);
         _ = mlx.mlx_array_free(at);
         cur = r1;
     }
 
-    const n = try groupNormPerFrame(cur, e.norm_out_w, e.norm_out_b, s);
+    const n = try evalA(try groupNormPerFrame(cur, e.norm_out_w, e.norm_out_b, s));
     _ = mlx.mlx_array_free(cur);
     defer _ = mlx.mlx_array_free(n);
-    const act = try siluA(n, s);
+    const act = try evalA(try siluA(n, s));
     defer _ = mlx.mlx_array_free(act);
-    return causalConv3d(act, e.conv_out_w, e.conv_out_b, .{ 1, 1, 1 }, 1, 1, s);
+    return evalA(try causalConv3d(act, e.conv_out_w, e.conv_out_b, .{ 1, 1, 1 }, 1, 1, s));
 }
 
 /// The mean half of `encode`'s output — the first `latent_channels` channels.

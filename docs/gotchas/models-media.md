@@ -1412,3 +1412,51 @@ that all scale together, and two of the three theories here were wrong.
 Guards: `tests/test_seedvr2_upscale.sh` (verified red — without the gate an
 8000x8000 request kills the server), `attnQueryChunk` /
 `restoreMemoryRefusal` unit tests, `RestoreGeometryTests` app-side.
+
+## SeedVR2 follow-up: where the graph is CUT is the residency, and tiling does not pay (2026-08-21)
+
+Chasing the same restore's memory bill further produced one large free win and
+two measured refusals, all from the same underlying fact: **MLX is lazy, batches
+an unevaluated graph into ONE command buffer, and does not release a buffer's
+arrays until it completes.** Residency is therefore decided by where the graph
+is cut, not by how promptly this file drops handles.
+
+**The win (kept).** `evalA` at every full-frame op boundary in the VAE — each
+GroupNorm, SiLU, convolution, pixel shuffle, residual add and the attention's
+q/k/v and output. Transient went **4.79 -> 3.84 KB per output pixel** (measured
+flat across 512/768/1024/1280 px squares), peak at 1024x1024 12.27 -> 11.27 GB,
+with **no measurable time cost** — these are big ops and the sync disappears
+into them. Output is BYTE-IDENTICAL at 1536x1536 across the change, which is
+what evaluation order guarantees and worth pinning anyway. 1536x1536 restores
+went from refused to working on a 24 GB Mac.
+
+**Refusal 1: evaluating INSIDE a fusible chain costs memory.** Adding the same
+`evalA` calls between `groupNormPerFrame`'s elementwise steps (diff, normalise,
+scale, shift) moved the encoder block's peak the WRONG way, 2.01 -> 2.51 GB,
+because each one forces a frame MLX would otherwise have fused into a single
+pass. Cut the graph BETWEEN kinds of ops, never inside an elementwise run.
+
+**Refusal 2: exact spatial tiling does not pay in MLX.** The arithmetic is
+tempting — convolutions are local and tile exactly with a halo, GroupNorm's
+statistics tile exactly in two accumulate-then-apply passes, everything else is
+pointwise — so a tiled VAE looks like it should hold one tile instead of one
+frame. It does not, because **MLX's array API is functional and has no in-place
+tile write**: assembling tiled output means `concatenate`, which allocates the
+whole frame again and copies every tile into it, so a tiled op costs its input,
+its tiles AND its output. Measured twice, in both directions:
+
+- Banding a convolution's output rows (to cap an im2col that turned out not to
+  exist) took peak from 13.27 to **17.05 GB** — the pre-padded input, the band
+  outputs and the concatenation all added frames while nothing was saved.
+- `slice_update` is not an escape hatch: it returns a NEW array, so writing N
+  tiles into a preallocated frame copies the frame N times.
+
+So the residency floor here is the two or three full frames a stage genuinely
+holds, and the way to move it is fewer frames in flight (done) rather than
+smaller ones. Tiling would pay against an API with in-place writes; against
+this one it is strictly worse, and the number says so.
+
+**What is still not possible.** ~3.84 KB/px means a 24 GB Mac with the 3B
+resident tops out near 2.6 Mpx — roughly 1600x1600. Bigger canvases are refused
+by name, which is the point: the alternative is not a slower restore, it is a
+flat rectangle with a 200 behind it.

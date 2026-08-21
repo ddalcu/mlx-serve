@@ -20,25 +20,32 @@ final class RestoreGeometryTests: XCTestCase {
         XCTAssertEqual(target.width, 1808)
         XCTAssertEqual(target.height, 1920)
 
-        // 3.47 Mpx x ~5.4 KB/px is ~17.5 GB of transient on top of the model,
-        // so on a 24 GB Mac holding a ~7 GB checkpoint it cannot fit.
+        // 3.47 Mpx x ~4.1 KB/px is ~14 GB of transient on top of the model.
+        // THIS PANE WARNS ABOUT THE IMPOSSIBLE, NOT THE UNAVAILABLE: 14 + 7 is
+        // under a 24 GB machine's total, so the pane stays quiet there and the
+        // server's free-memory gate is what refuses it in practice. On a 16 GB
+        // Mac it can never work whatever else is closed, and that is what this
+        // sentence is for.
+        XCTAssertNil(RestoreGeometry.memoryWarning(
+            targetWidth: target.width, targetHeight: target.height,
+            modelGB: 7, totalRAMGB: 24))
         let warn = RestoreGeometry.memoryWarning(
             targetWidth: target.width, targetHeight: target.height,
-            modelGB: 7, totalRAMGB: 24)
+            modelGB: 7, totalRAMGB: 16)
         XCTAssertNotNil(warn)
         // It quotes the numbers it compared, and the canvas it is talking
         // about — a warning that just says "too big" leaves nothing to act on.
         XCTAssertTrue(warn!.contains("1808"), warn!)
-        XCTAssertTrue(warn!.contains("24"), warn!)
+        XCTAssertTrue(warn!.contains("16"), warn!)
     }
 
     func testASizeThatFitsIsNotWarnedAbout() {
-        // 1024x1024 is ~5.3 GB of transient; with a 7 GB model that is 12.3 GB
-        // on a 24 GB Mac, and it is measured working.
+        // 1024x1024 is ~4.1 GB of transient (measured peak 11.27 GB against
+        // 7.25 GB resident); with a 7 GB model that is ~11 GB on a 24 GB Mac.
         XCTAssertNil(RestoreGeometry.memoryWarning(
             targetWidth: 1024, targetHeight: 1024, modelGB: 7, totalRAMGB: 24))
-        // The same canvas that fails on 24 GB is fine on 64 — the gate tracks
-        // the machine, it does not ban a size.
+        // The same canvas that is hopeless on 16 GB is fine on 64 — the gate
+        // tracks the machine, it does not ban a size.
         XCTAssertNil(RestoreGeometry.memoryWarning(
             targetWidth: 1808, targetHeight: 1920, modelGB: 7, totalRAMGB: 64))
     }

@@ -31,9 +31,12 @@ enum RestoreGeometry {
     /// What one OUTPUT pixel costs in transient GPU memory, on top of the
     /// resident checkpoint. Mirrors `RESTORE_TRANSIENT_BYTES_PER_PIXEL` in
     /// `src/gen.zig`, where it was measured — the server owns the number and
-    /// enforces it; this copy exists only so the pane can say so BEFORE
-    /// spending minutes loading a model that is going to be refused.
-    static let transientBytesPerPixel = 5400
+    /// enforces it against FREE memory; this copy exists only so the pane can
+    /// catch what is impossible on this Mac at ALL, before spending minutes
+    /// loading a model. The two gates deliberately compare different things:
+    /// the server knows what is free right now, and only total RAM is stable
+    /// enough to warn about before anything has been loaded.
+    static let transientBytesPerPixel = 4100
 
     /// A sentence to show before starting, when the target canvas cannot fit
     /// on this Mac at all, or nil.

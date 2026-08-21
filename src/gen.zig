@@ -3599,12 +3599,19 @@ pub fn restoreGeometryRefusal(buf: []u8, frames: u32, w: u32, h: u32) ?[]const u
 /// weights, for a whole-frame SeedVR2 pass.
 ///
 /// MEASURED, not derived (M4 Max, 24 GB, 3B checkpoint, 2026-08-21): peak
-/// minus resident over 512, 768, 1024, 1280 and 1536 px squares came to 4.77,
-/// 4.80, 4.79, 4.79 and 5.27 KB per pixel — flat, because the VAE runs the
-/// whole frame at f32 and every stage of it is proportional to area. The
-/// constant takes the TOP of that range: under-billing here does not produce
+/// minus resident over 512, 768, 1024 and 1280 px squares came to 3.82, 3.84,
+/// 3.84 and 3.84 KB per pixel — flat, because the VAE runs the whole frame at
+/// f32 and every stage of it is proportional to area.
+///
+/// RE-MEASURE THIS WHENEVER THE VAE'S EVALUATION BOUNDARIES MOVE. It was 4.79
+/// KB/px before the `evalA` boundaries went in: MLX batches an unevaluated
+/// graph into one command buffer and holds every array in it until the buffer
+/// completes, so where the graph is cut IS the residency. A stale constant
+/// here refuses sizes that now fit.
+///
+/// The value carries ~7% over the measurement: under-billing does not produce
 /// an error, it produces a flat rectangle.
-pub const RESTORE_TRANSIENT_BYTES_PER_PIXEL: u64 = 5400;
+pub const RESTORE_TRANSIENT_BYTES_PER_PIXEL: u64 = 4100;
 
 /// Why this restore will not fit in memory, as a sentence, or null when it
 /// will. `available` is free system RAM; 0 means "could not measure", which
