@@ -1683,12 +1683,29 @@ private struct LocalModelRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+    /// Per-row, per-session: clicking the lock arms the trash for THIS row
+    /// only, and a refresh re-locks it. The friction is worth one click; the
+    /// old dead badge was not worth anything.
+    @State private var unlocked = false
 
     private var useState: ModelUseState {
         ModelUseState.resolve(
             selected: appState.selectedModelPath == model.path,
             serverStatus: server.status
         )
+    }
+
+    /// Open Finder with the model selected. `path` is the directory for a
+    /// safetensors checkpoint and the FILE for one GGUF quant, and
+    /// `activateFileViewerSelecting` selects either — which is the behaviour
+    /// you want: a quant row reveals its own file, not its repo folder.
+    private func revealInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
+    }
+
+    private func performDelete() {
+        downloads.deleteModel(model, unlocked: unlocked)
+        appState.refreshModels()
     }
 
     var body: some View {
@@ -1788,15 +1805,20 @@ private struct LocalModelRow: View {
                         ModelUseBadge(state: useState)
                     }
                 }
-                if let reason = model.externalReadOnlyReason {
-                    // Read-only: this model lives outside ~/.mlx-serve (LM Studio,
-                    // the HF hub cache, or a user-added custom folder). The app
-                    // loads it but never deletes into another tool's / the user's
-                    // tree, so we surface a badge instead of a trash.
-                    Image(systemName: "externaldrive.badge.icloud")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .help(reason)
+                if ModelRowActions.showsLock(model, unlocked: unlocked) {
+                    // Locked, not read-only. This slot used to hold an `Image`
+                    // of an external-drive/cloud glyph nobody could read, which
+                    // did nothing when clicked. It is a Button now, and clicking
+                    // it is how you get the trash. (The old symbol name is
+                    // deliberately not spelled here — a source scan in
+                    // `ModelRowActionsTests` asserts it is gone from this file.)
+                    Button { unlocked = true } label: {
+                        Image(systemName: "lock")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(ModelRowActions.lockHelp(model))
                 } else {
                     Button {
                         confirmDelete = true
@@ -1809,32 +1831,57 @@ private struct LocalModelRow: View {
                     .help(model.defect != nil
                           ? "Delete this broken folder"
                           : (model.quantFile != nil ? "Delete this quant" : "Delete model"))
-                    .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
-                        Button("Cancel", role: .cancel) {}
-                        Button("Delete", role: .destructive) {
-                            downloads.deleteModel(model)
-                            appState.refreshModels()
-                        }
-                    } message: {
-                        // A GGUF row is ONE quant of a repo — deleting it must not
-                        // promise (or perform) the removal of its siblings.
-                        if let defect = model.defect {
-                            // This row is offered for deletion inside another
-                            // tool's folder, so the confirmation names the
-                            // folder and the reason rather than just the model.
-                            Text("\(defect.explanation)\n\nDelete \(model.path)?")
-                        } else {
-                            Text(model.quantFile != nil
-                                 ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
-                                 : "Delete \(model.name)? This will remove all downloaded files.")
-                        }
-                    }
                 }
+
+                // Reveal in Finder — rightmost, on EVERY row. Six other panes
+                // already had this control; the one pane that is entirely about
+                // files on disk did not, so a model you did not recognise could
+                // not be located from the app that listed it.
+                Button(action: revealInFinder) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .font(.callout)
+                .help(ModelRowActions.revealHelp(model))
             }
-            .frame(width: 120, alignment: .trailing)
+            .frame(width: 150, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        // The alert lives on the ROW so both the trash and the context menu
+        // raise the same confirmation — two delete paths with two dialogs is
+        // two chances to word the consequence differently.
+        .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { performDelete() }
+        } message: {
+            Text(ModelRowActions.deleteMessage(model))
+        }
+        .contextMenu {
+            if model.isChatPickable, useState == .idle {
+                Button("Use This Model") {
+                    appState.selectedModelPath = model.path
+                }
+            }
+            Button("Show in Finder", action: revealInFinder)
+            Button("Copy Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.path, forType: .string)
+            }
+            Button("Copy Model ID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.displayLabel, forType: .string)
+            }
+            Divider()
+            if ModelRowActions.showsTrash(model, unlocked: unlocked) {
+                Button("Delete\u{2026}", role: .destructive) { confirmDelete = true }
+            } else {
+                // Same two-step as the lock button: the menu never deletes
+                // another app's model on one click.
+                Button("Unlock to Delete") { unlocked = true }
+            }
+        }
     }
 }
 

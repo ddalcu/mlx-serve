@@ -1992,19 +1992,23 @@ class DownloadManager: ObservableObject {
     /// the repoId-based path resolver — and for LM Studio / custom-root models,
     /// which live outside `modelsDir` entirely. Scopes pruning to the known
     /// scan roots so it never climbs out of a model tree.
-    func deleteModel(_ model: LocalModel) {
+    /// `unlocked` is the row's explicit second click on a model outside our
+    /// own tree. It is a parameter rather than a mutation of `isDeletable`
+    /// because the DEFAULT must stay refusal: every other caller keeps the
+    /// old behaviour by not passing it.
+    func deleteModel(_ model: LocalModel, unlocked: Bool = false) {
         // Only ~/.mlx-serve/models is ours to delete. LM Studio, the Hugging Face
         // hub cache, and custom-root models are owned by another tool or the user
         // (deleting an HF snapshot orphans shared blobs and dangles refs/main; the
         // others simply aren't ours). The UI hides the trash for them; this is the
         // defensive backstop, and the roots are scoped to modelsDir so a stray call
         // can never prune into an external tree.
-        guard model.isDeletable else { return }
+        guard model.isDeletable || unlocked else { return }
         // A broken folder is deletable wherever it sits, so the ROOT LIST it is
         // bounded by has to widen with it: `roots` is what `removeModelFiles`
         // refuses to remove and stops pruning at, and a foreign root missing
         // from that set is a root this call would happily delete.
-        let roots = model.defect != nil ? readRoots : ownedRoots
+        let roots = (model.defect != nil || unlocked) ? readRoots : ownedRoots
         if model.quantFile != nil {
             // One quant of a GGUF repo — remove that file only. Its siblings are
             // separate models the user didn't ask to delete.
