@@ -305,6 +305,8 @@ struct StatusMenuView: View {
             let mlxServe = pickable.filter { $0.source == .mlxServe }
             let lmStudio = pickable.filter { $0.source == .lmStudio }
             let huggingFace = pickable.filter { $0.source == .huggingFace }
+            let mtplx = pickable.filter { $0.source == .mtplx }
+            let osaurus = pickable.filter { $0.source == .osaurus }
             let custom = pickable.filter { $0.source == .custom }
             if !mlxServe.isEmpty {
                 Section("MLX-Serve Models") {
@@ -314,8 +316,22 @@ struct StatusMenuView: View {
                 }
             }
             if !lmStudio.isEmpty {
-                Section("Other Discovered Models") {
+                Section(LocalModelSource.lmStudio.sectionTitle) {
                     ForEach(lmStudio) { model in
+                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                }
+            }
+            if !mtplx.isEmpty {
+                Section(LocalModelSource.mtplx.sectionTitle) {
+                    ForEach(mtplx) { model in
+                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                }
+            }
+            if !osaurus.isEmpty {
+                Section(LocalModelSource.osaurus.sectionTitle) {
+                    ForEach(osaurus) { model in
                         Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
                     }
                 }

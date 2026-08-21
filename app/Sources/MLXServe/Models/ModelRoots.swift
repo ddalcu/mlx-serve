@@ -96,14 +96,14 @@ struct ModelRoots {
     /// Generate could not resolve its dir). Only WRITES, cancel cleanup and
     /// deletes stay on `ownedRoots` — the extra folders are the user's or
     /// another tool's trees the app must not delete into.
-    func readRoots(lmStudioRoot: String?) -> [String] {
-        scanRoots(lmStudioRoot: lmStudioRoot)
+    func readRoots(toolRoots: ToolModelRoots) -> [String] {
+        scanRoots(toolRoots: toolRoots)
     }
 
     /// Static convenience for read sites without a DownloadManager instance
     /// (ServerManager's resolver, the voice-clone disk check).
     static func readRoots() -> [String] {
-        ModelRoots().readRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+        ModelRoots().readRoots(toolRoots: ToolModelRoots.detected())
     }
 
     /// Every folder to scan, in the order the server should take them:
@@ -113,7 +113,12 @@ struct ModelRoots {
     /// The built-in root stays in the list after the destination moves —
     /// everything downloaded before the change is there, and dropping it would
     /// make a library disappear from the picker.
-    func scanRoots(lmStudioRoot: String?) -> [String] {
+    /// Other tools' folders come after ours and before the custom slot: a repo
+    /// id we hold a copy of keeps resolving to OUR copy, and the custom folder
+    /// stays last because it is the one the person chose explicitly and the
+    /// server's root cap could otherwise spend every slot on tools they did
+    /// not ask about.
+    func scanRoots(toolRoots: ToolModelRoots) -> [String] {
         var out: [String] = []
         var seen = Set<String>()
         func add(_ path: String?) {
@@ -126,7 +131,7 @@ struct ModelRoots {
         }
         add(resolvedDownloadRoot)
         add(Self.builtInRoot)
-        add(lmStudioRoot)
+        for tool in toolRoots.ordered { add(tool) }
         if allowCustomFolders { add(customRoot) }
         return out
     }
