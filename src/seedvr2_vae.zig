@@ -159,13 +159,52 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     return o;
 }
 
-/// A conv weight in the layout `mlx_conv3d` wants:
-/// `[O, I, kt, kh, kw]` (PyTorch) -> f32 `[O, kt, kh, kw, I]`.
+/// Which axis order a checkpoint's conv weights are STORED in.
+///
+/// `mlx_conv3d` wants `[O, kt, kh, kw, I]`. Our own converter ships PyTorch's
+/// `[O, I, kt, kh, kw]` and is permuted once at load; the mlx-community
+/// mirror ships the destination layout already, and permuting that again is
+/// an uncatchable MLX abort rather than a wrong number.
+///
+/// Decided ONCE per checkpoint rather than per tensor, because per tensor it
+/// is not decidable: `encoder.conv_in` is `[C, 3, 3, 3, 3]` under BOTH orders
+/// (in_channels 3 is also the kernel extent), so any shape heuristic has to
+/// guess on exactly the tensor that starts the encoder. The probe is a
+/// mid-block resnet conv, where in_channels is 512 and the two orders differ
+/// unmistakably.
+const ConvLayout = enum {
+    pytorch,
+    mlx,
+
+    /// Absent probe ⇒ `.pytorch`, the layout every load before the mirror
+    /// existed used. A missing tensor is not evidence of a new layout.
+    fn detect(w: *const Weights) ConvLayout {
+        for ([_][]const u8{
+            "decoder.mid_block.resnets.0.conv1.weight",
+            "encoder.mid_block.resnets.0.conv1.weight",
+            "decoder.conv_in.weight",
+        }) |probe| {
+            const t = w.get(probe) orelse continue;
+            const shp = mlx.getShape(t);
+            if (shp.len != 5) continue;
+            // Axis 1 is in_channels under PyTorch and the temporal kernel
+            // extent under MLX. The probe's in_channels is 16 or 512, so a
+            // small axis 1 beside a large last axis can only be MLX order.
+            return if (shp[1] <= 7 and shp[4] > 7) .mlx else .pytorch;
+        }
+        return .pytorch;
+    }
+};
+
+/// A conv weight in the layout `mlx_conv3d` wants: `[O, kt, kh, kw, I]`,
+/// permuted from PyTorch's `[O, I, kt, kh, kw]` only when that is what the
+/// checkpoint actually stores (`ConvLayout`).
 fn loadConvW(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
     const name = try std.fmt.allocPrint(a, fmt, args);
     defer a.free(name);
     const raw = try ownWeight(w, name);
     defer _ = mlx.mlx_array_free(raw);
+    if (ConvLayout.detect(w) == .mlx) return astype(raw, mlx.mlx_dtype.float32, s);
     const tr = try transpose(raw, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
     defer _ = mlx.mlx_array_free(tr);
     const trc = try contig(tr, s);
@@ -1246,6 +1285,48 @@ test "seedvr2 vae live: decoder matches the reference reconstruction" {
             return err;
         };
     }
+}
+
+test "seedvr2 vae: the conv layout is read from the checkpoint, not assumed" {
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // The two SeedVR2 converters ship conv weights in DIFFERENT axis orders:
+    // ours in PyTorch's `[O, I, kt, kh, kw]`, the mlx-community mirror already
+    // in the `[O, kt, kh, kw, I]` that `mlx_conv3d` consumes. Permuting the
+    // mirror's again is what produced
+    //   [conv] input: (1,1,512,512,128) weight: (128,1,3,128,3)
+    // — an uncatchable MLX abort, live 2026-08-21, immediately after the DiT
+    // half started loading. 64 of the VAE's tensors are affected.
+    const mk = struct {
+        fn f(dims: []const c_int, st: S) mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            _ = mlx.mlx_zeros(&o, dims.ptr, dims.len, mlx.mlx_dtype.float32, st);
+            return o;
+        }
+    }.f;
+
+    // The probe tensor is unambiguous in a way `encoder.conv_in` is not: an
+    // RGB input conv is `[C, 3, 3, 3, 3]` in BOTH layouts, so a per-tensor
+    // size heuristic cannot decide it and the choice has to be made once, for
+    // the whole checkpoint, from a tensor whose channel count is not 3.
+    var ours = Weights.init(a);
+    defer ours.deinit();
+    try ours.map.put(try a.dupe(u8, "decoder.mid_block.resnets.0.conv1.weight"),
+        mk(&[_]c_int{ 512, 512, 3, 3, 3 }, s));
+    try testing.expectEqual(ConvLayout.pytorch, ConvLayout.detect(&ours));
+
+    var mirror = Weights.init(a);
+    defer mirror.deinit();
+    try mirror.map.put(try a.dupe(u8, "decoder.mid_block.resnets.0.conv1.weight"),
+        mk(&[_]c_int{ 512, 3, 3, 3, 512 }, s));
+    try testing.expectEqual(ConvLayout.mlx, ConvLayout.detect(&mirror));
+
+    // No probe tensor at all ⇒ the layout every load before the mirror
+    // existed used, never a guess that silently reshapes someone's weights.
+    var empty = Weights.init(a);
+    defer empty.deinit();
+    try testing.expectEqual(ConvLayout.pytorch, ConvLayout.detect(&empty));
 }
 
 test "the decoder ladder mirrors the encoder without being derived from it" {

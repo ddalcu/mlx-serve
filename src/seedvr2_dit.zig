@@ -578,10 +578,24 @@ const KeyScheme = enum {
 /// `blocks.{layer}.attn.<field>.<stream>` (ours) or
 /// `blocks.{layer}.attn.<field>_<stream>` (mlx-community) — the tensor-name
 /// PREFIX; the caller appends `.weight`/`.bias`/`.scales`/`.biases`.
+///
+/// The joiner is not the only difference. A layer past `mm_layers` has ONE
+/// attention weight set serving both streams, which our converter names
+/// `.all` — and the mirror emits NO `_all` attention tensor at any layer.
+/// It materialises that single set under BOTH stream names instead, so `all`
+/// resolves to either duplicate (`_vid` by choice; verified byte-identical to
+/// `_txt` for all four fields across layers 10-31 of the real int8 pack).
+/// Without this the whole shared half of the model is unloadable, which is
+/// what `MissingSeedVr2DitWeight` on `blocks.10.attn.proj_qkv_all.weight` was.
+/// The MLP and ada groups are NOT affected — the mirror keeps a real `all`
+/// there, which is why only the attention family needs the substitution.
 fn attnPrefix(a: std.mem.Allocator, layer: u32, comptime field: []const u8, stream: []const u8, scheme: KeyScheme) ![]u8 {
     return switch (scheme) {
         .ours => std.fmt.allocPrint(a, "blocks.{d}.attn." ++ field ++ ".{s}", .{ layer, stream }),
-        .mlx_community => std.fmt.allocPrint(a, "blocks.{d}.attn." ++ field ++ "_{s}", .{ layer, stream }),
+        .mlx_community => blk: {
+            const tok: []const u8 = if (std.mem.eql(u8, stream, "all")) "vid" else stream;
+            break :blk std.fmt.allocPrint(a, "blocks.{d}.attn." ++ field ++ "_{s}", .{ layer, tok });
+        },
     };
 }
 
@@ -1733,6 +1747,38 @@ test "seedvr2 dit: KeyScheme reads the checkpoint's OWN spelling, never the file
     var neither = model_mod.Weights.init(a);
     defer neither.deinit();
     try testing.expectEqual(KeyScheme.ours, KeyScheme.detect(&neither));
+}
+
+test "seedvr2 dit: a shared layer's attention reads the mirror's per-stream duplicate" {
+    const a = testing.allocator;
+
+    // Layers >= mm_layers carry ONE attention weight set serving both streams.
+    // Our converter names it `.all`; the mlx-community mirror emits no `_all`
+    // attention tensor at all — it materialises that single weight under BOTH
+    // stream names instead. Verified on the real int8 pack: across layers
+    // 10-31, `proj_qkv`/`proj_out`/`norm_q`/`norm_k` are byte-identical
+    // between `_txt` and `_vid`, and no `_all` attn key exists anywhere in the
+    // file. So `all` has to resolve to one of the duplicates, or the shared
+    // half of the model is unloadable (`MissingSeedVr2DitWeight` on
+    // `blocks.10.attn.proj_qkv_all.weight`, live 2026-08-21).
+    const shared = try attnPrefix(a, 10, "proj_qkv", "all", .mlx_community);
+    defer a.free(shared);
+    try testing.expectEqualStrings("blocks.10.attn.proj_qkv_vid", shared);
+
+    // The split layers are untouched: there the two streams are genuinely
+    // different tensors and each must keep addressing its own.
+    for ([_][]const u8{ "vid", "txt" }) |stream| {
+        const split = try attnPrefix(a, 0, "proj_out", stream, .mlx_community);
+        defer a.free(split);
+        const want = try std.fmt.allocPrint(a, "blocks.0.attn.proj_out_{s}", .{stream});
+        defer a.free(want);
+        try testing.expectEqualStrings(want, split);
+    }
+
+    // Our own converter does emit `.all`, so its spelling must not move.
+    const ours = try attnPrefix(a, 10, "norm_q", "all", .ours);
+    defer a.free(ours);
+    try testing.expectEqualStrings("blocks.10.attn.norm_q.all", ours);
 }
 
 test "seedvr2 dit: a quantized DitLinear reaches the same product as the dense weight" {
