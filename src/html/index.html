@@ -128,6 +128,8 @@
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/images/edits</div><div class=d>OpenAI-compatible image editing · multipart form · one or more reference images + an instruction</div></div></div>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/speech</div><div class=d>Qwen3-TTS (zero-shot voice cloning) or Kokoro (54 blendable voices) · WAV</div></div></div>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/music-generations</div><div class=d>ACE-Step text-to-music · 48 kHz stereo WAV</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/images/upscales</div><div class=d>SeedVR2 one-step diffusion restoration · one image in, restored image out · base64 PNG</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/video/upscales</div><div class=d>SeedVR2 restoration over a whole clip in one pass · 4k+1 base64 frames in, packed rgb8 out</div></div></div>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/video/generations</div><div class=d>LTX-Video or MiniMax-H3 · text / image / audio → video with its own soundtrack · frames + PCM</div></div></div>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/3d/generations</div><div class=d>Hunyuan3D-2.1 · one photo → GLB mesh · optional PBR texturing</div></div></div>
 </div>

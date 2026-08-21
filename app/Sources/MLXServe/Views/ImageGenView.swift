@@ -63,11 +63,22 @@ struct ImageGenView: View {
     /// True while a drag carrying a file is hovering the source-image section
     /// — drives that section's dashed-border highlight and the well's fill.
     @State private var isDropTargeted: Bool = false
+    /// Create (text-to-image) vs Enhance (restore/upscale an existing photo,
+    /// SeedVR2). Two different pipelines behind one window — not persisted,
+    /// so the window always opens on Create.
+    @State private var paneMode: ImagePaneMode = .create
 
     var body: some View {
         // No window-sized floor: this is a PAGE of the chat window now, and a
         // root minimum wider than the detail column overflows it and clips
         // both edges. Small windows shrink the preview side instead.
+        switch paneMode {
+        case .create: createContent
+        case .upscale: RestoreUpscaleView(mode: $paneMode)
+        }
+    }
+
+    private var createContent: some View {
         readyView
         .onAppear {
             if !didHydrate {
@@ -98,6 +109,7 @@ struct ImageGenView: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    ImagePaneModeSwitcher(mode: $paneMode)
                     promptSection
                     sourceImageSection
                     modelSection
