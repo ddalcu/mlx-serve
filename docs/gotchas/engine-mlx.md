@@ -3587,3 +3587,121 @@ serial answer, and both batched kernels emit a one-shot
 a batched run from N serial ones, and two concurrent curls are not guaranteed to
 overlap, so the arm reports NOT-RUN rather than passing for free when they
 don't.
+
+## gpt-oss: what the fused kernels could not say (2026-08-12)
+
+Two exclusions fell out of `gpt_oss` bring-up, both of the same shape — a fast
+path that computes a fixed expression, handed an arch whose expression differs.
+
+**Per-expert biases force the sorted MoE path.** gpt-oss's SwitchGLU carries
+additive `[num_experts, out]` biases on gate/up/down. All three MoE decode fast
+paths (`moeDecodeGatherQmv`, the batched-take path, stock gather) produce
+`act(gate) * up` directly out of `gather_qmm` with nowhere to add a per-expert
+term, and `moeDecodeGatherQmv` additionally bakes in the standard SwiGLU.
+Engaging any of them would have dropped both the biases and the clamp silently.
+`has_expert_bias` therefore forces `do_sort`. The cost is nil in practice: at
+decode the sort is over N = B·S·K = 4 indices, and the path's own comment
+already notes argsort overhead is negligible at that size.
+
+**The clamped SwiGLU dispatches above `computeGeglu`, not inside it.** That
+helper's fast paths are `compiled_geglu` and `fusedSwiGLU`, and `fusedSwiGLU`'s
+correctness argument is a sigmoid lookup table that is exact *by construction*
+for `silu(gate)*up` — the whole 16-bit domain was swept for it. A different
+activation routed through that table is not slow, it is wrong. So the branch
+lives one level up, in the MoE forward, keyed on `cfg.swiglu_limit > 0`.
+
+gpt-oss's activation is worth stating exactly, because two of its three parts
+are easy to drop:
+
+    x_glu    = clip(gate, max=limit)        // asymmetric — NO lower clip
+    x_linear = clip(up, -limit, +limit)
+    out      = x_glu * sigmoid(alpha*x_glu) * (x_linear + 1)
+
+The `+ 1` is part of the trained function, not a numerical guard. The unit test
+sweeps 121 (gate, up) pairs straddling both clip boundaries in both directions
+against an f64 oracle, which is what catches clipping gate on both sides,
+dropping the `+1`, or applying alpha outside the sigmoid.
+
+**Sinks cost nothing.** The one feature that usually forces a hand-rolled
+attention turned out to be free: `mlx_fast_scaled_dot_product_attention` already
+takes a `sinks` array in our pin, and in the Metal backend it is a function
+constant (`_has_sinks_`, id 302) on the *fused* kernels with the array bound as
+input 7 — not a fallback to the composed path. Verified in the built metallib,
+not just the source. Likewise `mxfp4_gather_qmm_t_nax_bfloat16_t_gs_32_b_4` is
+present, so gpt-oss's native mxfp4 expert banks stream through the NAX gather
+lanes at exactly the geometry the checkpoint ships (gs 32, bits 4).
+
+The one place sinks are deliberately NOT wired is the fused quantized-KV
+attention path: those kernels are ours and take no sink argument, so engaging
+them would drop the sinks silently. Under `--kv-quant`, `gptOssAttnWith` reads
+the dequantized `DenseKVView` that `cache.update` already returns.
+
+**The mask gate is a list you must join.** `forwardMoeWith` precomputes the
+sliding-window prefill/decode masks under `if ((is_gemma4 or is_laguna or
+is_gpt_oss) and cfg.has_sliding_window)`. An arch whose attention arm reads
+those masks but is missing from that gate receives an empty handle and attends
+over the whole history instead of the window — no error, no log. Caught here by
+reading the gate before trusting it; it would otherwise have shown up only as
+quality drift past 128 tokens on half the layers.
+
+## The mask and the K/V view are ONE decision (gpt-oss died a few hundred tokens in, 2026-08-13)
+
+Live: `gpt-oss-20b-MXFP4-Q8` answered normally, then the server process
+vanished mid-stream. Three boots, three deaths, each a few hundred tokens into
+the first generation; a 4,880-token prompt died before emitting anything. The
+server log — the documented post-mortem file — ended mid-request with no error
+line, no panic, no crash report in `DiagnosticReports`. `pld=disabled (yield
+gate…)` and a `[sliding] block trim engaged` line were the last things written,
+which is how it first looked like a spec-decode or trim bug.
+
+Neither was it. `MLX_SERVE_SLIDING_BLOCK_TRIM=0` still died; a Debug build
+produced no trace, because there was no Zig panic to trace. The message existed
+the whole time, on **stdout**:
+
+```
+MLX error: [broadcast_shapes] Shapes (1,1,6,133) and (1,64,6,128) cannot be broadcast.
+```
+
+`gptOssAttnWith` sized its K/V view with the raw `cfg.sliding_window`:
+
+```zig
+const max_kv: u32 = if (is_full) 0 else cfg.sliding_window;   // 128
+```
+
+while every mask it hands SDPA is built at `slidingViewFor(...).kv_len` —
+`window + q_len - 1`, because the FIRST query of a block reaches back furthest.
+At `q_len == 1` those are the same number, so all of decode is correct and the
+bug is invisible. The first **block-wide** forward past the window — a PLD
+verify block (q_len 6 → mask 133) or any prefill chunk (mask = the chunk's whole
+span) — asks SDPA to broadcast a mask against a K/V view of a different width,
+and an MLX error is uncatchable. With the trim OFF it is the same bug with
+bigger numbers: span 0 means "no trim", the mask is built at `total_kv` (503),
+and the view is still 128.
+
+That is why it read as "crashes after a few tokens": PLD only arms once the
+output repeats an n-gram, so the process survived exactly until its first
+speculative verify. A long prompt skips the wait and dies in prefill.
+
+The class: **an arch's mask width and its K/V view width are one decision, and
+`slidingViewFor` is where it is made.** gemma4, laguna and inkling all pass
+`sliding.span` to `cache.update` and build masks at `sliding.kv_len`; gpt_oss
+respelled one half as the config field. Any arch-specific respelling of a
+chokepoint's answer is a latent divergence — here it survived bring-up because
+the two spellings agree at exactly the width every smoke test uses.
+
+Guards: the source scan `every sliding attention arm sizes its KV view from
+slidingViewFor, never the raw window` (every `const max_kv: u32 =` binding must
+read `sliding.span`, directly or through the one pinned alias), plus a `gpt-oss`
+arm in `tests/test_sliding_window_trim.sh` — window 128 makes every multi-token
+forward a trimmed one, so the pre-fix code cannot even finish prefill there.
+
+**Second finding, and the reason this cost a debugger session:** mlx-c's default
+error handler is `printf("MLX error: %s\n"); exit(-1)` — STDOUT, and nothing
+ever reaches the log file sink. From `~/.mlx-serve/logs/mlx-serve-<port>.log`,
+every uncatchable MLX error looks like a process that stopped mid-sentence for
+no reason, and the app (which surfaces that file) shows the same nothing. We now
+install our own handler at the top of `main()` (`server.installMlxErrorHandler`
+→ `reportMlxFatal`), which writes `[mlx] FATAL: <message>` through the normal
+log path — file sink included — and then exits 255, mlx-c's own status, so
+nothing watching the exit code sees a change. The next one of these is a grep,
+not a debugger.

@@ -2609,6 +2609,37 @@ pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
     return @max(2 * GB, @min(8 * GB, total_ram / 16));
 }
 
+/// Route an MLX error through OUR log before the process dies.
+///
+/// mlx-c's default handler is `printf("MLX error: %s\n"); exit(-1)`: STDOUT,
+/// and nowhere near the file sink. `~/.mlx-serve/logs/mlx-serve-<port>.log` is
+/// documented as THE post-mortem file, so every uncatchable MLX error looked
+/// from there like a process that stopped mid-sentence for no reason — a
+/// gpt_oss mask/view shape mismatch cost a debugger session to read a message
+/// the process had already printed (2026-08-13).
+///
+/// Split from the extern handler so the logging half is testable: this returns.
+pub fn reportMlxFatal(msg: []const u8) void {
+    log.err("[mlx] FATAL: {s}\n", .{msg});
+    log.err("[mlx] MLX errors are uncatchable — the process exits here. This is a bug in mlx-serve, not in your request.\n", .{});
+}
+
+fn mlxFatalHandler(msg: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+    reportMlxFatal(std.mem.sliceTo(msg, 0));
+    // mlx-c's own status, kept so anything watching the exit code (the app's
+    // supervisor, a test's `$?`) sees no change in behaviour — only in what
+    // was written down first.
+    std.process.exit(255);
+}
+
+/// Install the handler. Called ONCE from `main()` beside `applyMlxCacheLimit`,
+/// above every subcommand branch: an MLX error can fire from any of them, and
+/// the load path is the one that fires before a log file even exists (the
+/// message still reaches stderr).
+pub fn installMlxErrorHandler() void {
+    mlx.mlx_set_error_handler(mlxFatalHandler, null, null);
+}
+
 /// PURE: resolve the cap from `MLX_SERVE_CACHE_LIMIT` (bytes) over the
 /// RAM-proportional default. `0` means "leave MLX's default alone" — the
 /// same-boot A/B off-switch. Anything unparseable falls through to the default
@@ -7227,6 +7258,27 @@ fn handleStreamingGeneration(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
+                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
+                    // gpt_oss: `[<|start|>assistant]<|channel|>analysis<|message|>`
+                    // opens a reasoning segment that closes at <|end|>. Consume
+                    // the header — every byte of it is ordinary text, and the
+                    // close matcher below assumes reasoning starts at byte 0.
+                    const skip = switch (chat_mod.harmonyThinkOpenerAt(think_buf.items)) {
+                        .analysis => |hl| hl,
+                        else => unreachable,
+                    };
+                    saw_think_open = true;
+                    think_close_tag = "<|end|>";
+                    var skip2 = skip;
+                    while (skip2 < think_buf.items.len and think_buf.items[skip2] == '\n') skip2 += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip2..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
+                    // Harmony header still arriving — wait, or `<|channel|>anal`
+                    // leaks as reasoning.
                 } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .self_opened) {
                     // Muse-Glimmer reasoning segment (` to=self<|message|>`) —
                     // closes at <|eom|>. The direct-answer header
@@ -7320,7 +7372,21 @@ fn handleStreamingGeneration(
                 }
                 break :blk_m null;
             };
+            // Harmony (gpt_oss): the analysis channel closes at <|end|> (or
+            // <|return|>, if the model skipped straight to a return). Its
+            // reasoning also has a HEADER prefix to drop, which the pos/len
+            // shape can't express — `harmony_reason_from` below carries that.
+            const harmony_close: ?struct { pos: usize, len: usize } = blk_h: {
+                if (!std.mem.eql(u8, think_close_tag, "<|end|>")) break :blk_h null;
+                if (std.mem.indexOf(u8, think_buf.items, "<|end|>")) |q|
+                    break :blk_h .{ .pos = q, .len = "<|end|>".len };
+                // The model can skip straight to the return without an <|end|>.
+                if (std.mem.indexOf(u8, think_buf.items, "<|return|>")) |q|
+                    break :blk_h .{ .pos = q, .len = "<|return|>".len };
+                break :blk_h null;
+            };
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (harmony_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
@@ -7346,6 +7412,11 @@ fn handleStreamingGeneration(
                 // content message ends at its own <|end_message|>.
                 if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
                 if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                // Harmony: the answer arrives as a whole new segment —
+                // `<|start|>assistant<|channel|>final<|message|>` — and every
+                // byte of that header is ordinary text that would otherwise
+                // ride out as content.
+                content_after = chat_mod.stripHarmonySegmentHeader(content_after);
                 if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 // Strip a muse next-segment header (<|start|>assistant
                 // to=user<|message|>). A header still ARRIVING (start marker,
@@ -11588,6 +11659,34 @@ fn handleAnthropicStreaming(
                         try sendAnthropicEvent(stream, "content_block_start", sd);
                         thinking_block_open = true;
                     }
+                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
+                    // gpt_oss: `[<|start|>assistant]<|channel|>analysis<|message|>`
+                    // opens a reasoning segment that closes at <|end|>. Consume
+                    // the header — every byte of it is ordinary text, and the
+                    // close matcher below assumes reasoning starts at byte 0.
+                    const skip = switch (chat_mod.harmonyThinkOpenerAt(think_buf.items)) {
+                        .analysis => |hl| hl,
+                        else => unreachable,
+                    };
+                    think_close_tag = "<|end|>";
+                    var skip2 = skip;
+                    while (skip2 < think_buf.items.len and think_buf.items[skip2] == '\n') skip2 += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip2..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
+                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
+                    // Harmony header still arriving — wait, or `<|channel|>anal`
+                    // leaks as reasoning.
                 } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .self_opened) {
                     // Muse-Glimmer reasoning segment (` to=self<|message|>`) —
                     // closes at <|eom|>. The direct-answer header closes via
@@ -11677,7 +11776,21 @@ fn handleAnthropicStreaming(
                 }
                 break :blk_m null;
             };
+            // Harmony (gpt_oss): the analysis channel closes at <|end|> (or
+            // <|return|>, if the model skipped straight to a return). Its
+            // reasoning also has a HEADER prefix to drop, which the pos/len
+            // shape can't express — `harmony_reason_from` below carries that.
+            const harmony_close: ?struct { pos: usize, len: usize } = blk_h: {
+                if (!std.mem.eql(u8, think_close_tag, "<|end|>")) break :blk_h null;
+                if (std.mem.indexOf(u8, think_buf.items, "<|end|>")) |q|
+                    break :blk_h .{ .pos = q, .len = "<|end|>".len };
+                // The model can skip straight to the return without an <|end|>.
+                if (std.mem.indexOf(u8, think_buf.items, "<|return|>")) |q|
+                    break :blk_h .{ .pos = q, .len = "<|return|>".len };
+                break :blk_h null;
+            };
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (harmony_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
@@ -11702,6 +11815,11 @@ fn handleAnthropicStreaming(
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
                 if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
                 if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                // Harmony: the answer arrives as a whole new segment —
+                // `<|start|>assistant<|channel|>final<|message|>` — and every
+                // byte of that header is ordinary text that would otherwise
+                // ride out as content.
+                content_after = chat_mod.stripHarmonySegmentHeader(content_after);
                 if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 // Muse next-segment header: strip when complete, arm the
                 // plain-arm skip when still arriving.
@@ -15381,6 +15499,61 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv(null, 128 * GB));
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
+}
+
+
+test "an MLX fatal is written to the log file, not just printf'd to stdout" {
+    // mlx-c's default handler is `printf(...); exit(-1)` — stdout, and the
+    // file sink never sees it. `~/.mlx-serve/logs/mlx-serve-<port>.log` is
+    // documented as THE post-mortem file, so a crash read there as a process
+    // that simply stopped: a gpt_oss mask/view mismatch (a 133-wide mask
+    // against a 128-wide K/V view on the first spec-verify block past the
+    // sliding window) cost a debugger session to recover a message that had
+    // already been printed.
+    const dir = "/tmp/mlx-serve-mlxfatal-test";
+    const path = dir ++ "/s.log";
+    _ = std.c.mkdir(dir, @as(std.c.mode_t, 0o755));
+    _ = std.c.unlink(path);
+    defer {
+        log.closeFile();
+        _ = std.c.unlink(path);
+    }
+
+    try log.openFile(path, 0);
+    reportMlxFatal("[broadcast_shapes] Shapes (1,1,6,133) and (1,64,6,128) cannot be broadcast.");
+    log.closeFile();
+
+    var buf: [4096]u8 = undefined;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    const read_n = std.c.read(fd, &buf, buf.len);
+    try testing.expect(read_n > 0);
+    const text = buf[0..@intCast(read_n)];
+    // The message itself, verbatim…
+    try testing.expect(std.mem.indexOf(u8, text, "(1,1,6,133) and (1,64,6,128)") != null);
+    // …under a marker that says which layer died, so the line is greppable
+    // next to the `jinja error:` / `[cache]` patterns in the same file.
+    try testing.expect(std.mem.indexOf(u8, text, "[mlx] FATAL:") != null);
+    // …and a sentence that stops the reader from re-debugging their request.
+    try testing.expect(std.mem.indexOf(u8, text, "uncatchable") != null);
+}
+
+test "main installs the MLX error handler beside the cache limit" {
+    // Both are process-wide, both belong above every subcommand branch, and
+    // the handler is worthless if it is installed after the thing that fails.
+    // Needles assembled at comptime so this test's source can't satisfy them.
+    const src = @embedFile("main.zig");
+    // Anchored to the line start, so a commented-out call cannot satisfy it.
+    const cache = "\n    server_mod." ++ "applyMlxCacheLimit();";
+    const handler = "\n    server_mod." ++ "installMlxErrorHandler();";
+    const at_cache = std.mem.indexOf(u8, src, cache) orelse return error.CacheLimitCallMissing;
+    const at_handler = std.mem.indexOf(u8, src, handler) orelse return error.ErrorHandlerCallMissing;
+    try testing.expect(at_handler > at_cache);
+    // Nothing may load a model before it: the first subcommand dispatch has to
+    // come after both.
+    const at_dispatch = std.mem.indexOf(u8, src, "std.mem.eql(u8, args[1], " ++ "\"serve\"") orelse src.len;
+    try testing.expect(at_handler < at_dispatch);
 }
 
 test "llama cache default keeps shared prefixes warm" {

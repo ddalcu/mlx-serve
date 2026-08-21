@@ -710,6 +710,14 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(supportedModelTypes.contains("lfm2_vl"),
                       "config.json spells it lfm2_vl; a hyphen here silently unsupports every LFM2-VL download")
     }
+
+    func testGptOssTagIsSupportedArchitecture() {
+        let m = mlx(id: "mlx-community/gpt-oss-20b-MXFP4-Q8",
+                    tags: ["mlx", "safetensors", "gpt_oss", "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "gpt_oss tags should be treated as supported architecture")
+        XCTAssertNil(m.incompatibleReason)
+    }
 }
 
 // MARK: - HFModel.quantization label parsing
