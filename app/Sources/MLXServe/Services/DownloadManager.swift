@@ -1648,6 +1648,19 @@ class DownloadManager: ObservableObject {
         )]
     }
 
+    /// A `.partial` beside a moving progress bar is not an interrupted download,
+    /// so a dir that is the destination of a live transfer loses that defect.
+    nonisolated static func clearingInFlightDefects(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
+        guard !activeDirs.isEmpty else { return models }
+        return models.map { m in
+            guard m.defect == .interruptedDownload,
+                  activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
+            var fixed = m
+            fixed.defect = nil
+            return fixed
+        }
+    }
+
     /// Smallest total weight payload that could be a real checkpoint.
     ///
     /// This is a "nothing loadable is this small" floor, NOT a guess about
@@ -1792,7 +1805,9 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return out
+        let inFlight = Set(downloads.filter { $0.value.status == .downloading }
+            .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
+        return Self.clearingInFlightDefects(out, activeDirs: inFlight)
             .filter { !Self.internalHelperRepos.contains($0.name) }
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the

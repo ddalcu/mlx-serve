@@ -123,6 +123,19 @@ final class ModelDefectTests: XCTestCase {
         XCTAssertEqual(m.defect, .interruptedDownload)
     }
 
+    /// A `.partial` under a live transfer is progress, not an interruption:
+    /// the listing drops that defect for the download's destination dir only.
+    func testALiveDownloadIsNotReportedAsInterrupted() throws {
+        let dir = makeDir("live")
+        write("live/model.safetensors.partial", bytes: 1024)
+        let other = makeDir("stale")
+        write("stale/model.safetensors.partial", bytes: 1024)
+        let all = models(dir) + models(other)
+        let fixed = DownloadManager.clearingInFlightDefects(all, activeDirs: [dir])
+        XCTAssertNil(fixed.first { $0.path == dir }?.defect)
+        XCTAssertEqual(fixed.first { $0.path == other }?.defect, .interruptedDownload)
+    }
+
     /// A defective folder must never reach a picker, and must always be
     /// deletable — including inside another tool's tree, which is the one place
     /// the read-only rule is wrong: nobody wants to keep a broken folder, and
