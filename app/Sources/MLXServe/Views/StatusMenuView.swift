@@ -597,7 +597,6 @@ struct StatusMenuView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(server.status != .running)
 
                 Button {
                     openTasks()
@@ -609,7 +608,6 @@ struct StatusMenuView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(server.status != .running)
                 .help("Scheduled Tasks")
 
                 // The App Store build can't detect or launch other apps'

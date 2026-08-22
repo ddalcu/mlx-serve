@@ -1311,7 +1311,12 @@ private struct SpecDecodeSectionContent: View {
                 // 1...6 is the fixed range it accepts — 7+ hits a measured
                 // occupancy cliff in the verify kernel, so it isn't offered.
                 Picker("", selection: opts.mtpDepth) {
-                    Text("Automatic").tag(0)
+                    // Automatic is ONE entry, probe-backed internally with the
+                    // per-silicon table as fallback — shipping "Automatic"
+                    // beside "Probe" would ask a question nobody can answer
+                    // without benchmarking. It DISPLAYS what it resolved to
+                    // instead (MLX_SERVE_SPEC_COST_PROBE=0 is the A/B arm).
+                    Text(server.specCost?.automaticLabel ?? "Automatic").tag(0)
                     ForEach(1...6, id: \.self) { n in
                         Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
                     }

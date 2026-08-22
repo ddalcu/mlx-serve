@@ -544,6 +544,13 @@ pub const ModelConfig = struct {
 
     // LFM2 gated convolution
     lfm_conv_kernel: u32 = 3,
+    /// LFM2.5-8B-A1B (`lfm2_moe`): the hybrid trunk's per-layer MLP is a
+    /// sparse MoE from `num_dense_layers` on. `model_type` collapses to
+    /// "lfm2" (same conv/attention mixers), so this flag is what tells the
+    /// layer loader which feed-forward to bind.
+    lfm2_moe: bool = false,
+    /// First N layers keep a DENSE feed-forward; the rest are MoE.
+    num_dense_layers: u32 = 0,
     lfm_conv_dim: u32 = 0, // 0 = hidden_size
 
     // Mamba2 SSM (Nemotron-H)
@@ -2638,6 +2645,21 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (v == .bool) config.tie_word_embeddings = v.bool;
         }
         if (cfg_obj.get("norm_eps")) |v| config.rms_norm_eps = jsonFloat(v);
+        if (cfg_obj.get("conv_L_cache")) |v| {
+            if (v == .integer) config.lfm_conv_kernel = @intCast(v.integer);
+        }
+        if (std.mem.eql(u8, model_type, "lfm2_moe")) {
+            config.lfm2_moe = true;
+            if (cfg_obj.get("num_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
+            if (cfg_obj.get("num_experts_per_tok")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
+            if (cfg_obj.get("moe_intermediate_size")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
+            if (cfg_obj.get("num_dense_layers")) |v| { if (v == .integer) config.num_dense_layers = @intCast(v.integer); }
+            if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+            if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+            if (config.num_experts == 0 or config.num_experts_per_tok == 0 or config.moe_intermediate_size == 0) {
+                return error.IncompleteLfm2MoeConfig;
+            }
+        }
         if (cfg_obj.get("conv_dim")) |v| config.lfm_conv_dim = switch (v) {
             .integer => |i| @intCast(i),
             else => 0,
