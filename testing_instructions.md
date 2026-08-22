@@ -66,7 +66,11 @@ cost ladder at boot; it costs ~1-2 s and is cached afterwards.
 
 ## Test 2 — MTP depth cap
 
-Forces each depth and reports decode tok/s. The best depth is your row.
+`--mtp-depth` is a **cap**, not a fixed depth: the adaptive controller picks a
+depth within `[1, cap]` every round, so sweeping it alone can give you the same
+effective depth at cap 6 and cap 8 and a flat, useless table. Pin the depth with
+`MLX_SERVE_MTP_ADAPTIVE=0` and then **check the depth actually held** — the
+`[spec-stats]` line printed after each arm is what makes the row trustworthy.
 
 ```bash
 cat > prompt.json <<'JSON'
@@ -76,23 +80,30 @@ JSON
 # replace MODEL_ID with the id from: curl -s localhost:11250/v1/models
 
 for d in 3 4 5 6 7 8; do
-  stop; serve --mtp-depth $d
+  stop; MLX_SERVE_MTP_ADAPTIVE=0 serve --mtp-depth $d
   for r in 1 2; do
     curl -s -X POST http://127.0.0.1:11250/v1/chat/completions \
       -H 'Content-Type: application/json' -d @prompt.json \
       | python3 -c "import json,sys;d=json.load(sys.stdin);print('depth $d rep $r: %.2f tok/s' % d['timings']['predicted_per_second'])"
   done
+  grep -a "spec-stats" srv.log | tail -1     # confirm depth=$d actually held
 done
 stop
 ```
 
-Report the **best of the two reps** per depth. Ignore rep 1 if it is much slower
-than rep 2 — that one paid the kernel compile.
+Report the **best of the two reps** per depth, and the `[spec-stats]` line with
+it. Ignore rep 1 if it is much slower than rep 2 — that one paid the kernel
+compile. If a `[spec-stats]` line shows a depth other than the one you asked
+for, drop that row rather than sending it: the controller moved and the number
+is not a measurement of that depth.
 
 ## Test 3 — DFlash block size
 
 Only if you have a DFlash/DSpark drafter sidecar (a `drafter/` subdirectory in
-the model, or one passed with `--drafter`). Same idea, different knob:
+the model, or one passed with `--drafter`). This knob is a real fixed width —
+no controller moves it — but it only clamps **downward** against the block the
+sidecar was trained at, so values above that are silently no-ops. The
+`DFlash drafter ready (block_size=N...)` line in `srv.log` says what you got.
 
 ```bash
 for b in 3 4 5 6 7 8; do
@@ -128,8 +139,9 @@ Test 1 ladder:
   [spec-cost] measured draft step .. ms/position
   [mtp] adaptive depth cap ..
 
-Test 2 (decode tok/s, best of 2):
+Test 2 (decode tok/s, best of 2, MLX_SERVE_MTP_ADAPTIVE=0):
   depth 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..
+  spec-stats depth= confirmed for each: yes/no
 
 Test 3 (decode tok/s, best of 2, if you ran it):
   block 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..
