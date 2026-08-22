@@ -3937,3 +3937,36 @@ marked stale so the first live sample blends at 0.5 — another boot is
 another thermal/OS state. Any version or shape mismatch is a quiet miss.
 v3 on the M4 base 9B cap 4 (the -6.6% cell): -1.0%, every arm mechanically
 identical (single-4, no gate line, bare `w4:18.0/57` tables on both arms).
+
+### v5: the row is the cold-start cap; one sample settles a cliff
+
+M1 Pro v4 (warm boots): 27B +0.04% vs the chip row and +1.0% over ungated
+cap 6, 9B short +0.03%, 9B long -0.05%; cold boot of the 27B -7.2% (three
+trial blocks of a w5 that read 94.7 vs 71.2 ms/tok on every one of its
+samples across ten boots). M4 base v4: 9B cap 6 short warm +9.2% (cold
+-0.04%), long-gen warm +5.0% (cold +4.1%). The M1 Pro tester's two
+suggestions became v5: a width whose first sample reads >= 20% worse per
+token than the base is settled after that block (`Table.clearlyWorse` — the
+plan only needs "not better"; `rawMs` floors the horizon cost past the
+widest trusted width, and the trial period is sized from the raw gap), and
+the per-silicon row stays as the COLD-START cap: `mtp_depth_free` is the
+row-less cap, the plan uses `min(free, max(row, widest trusted))` and the
+trial may reach one past it, so a box where the row is right (M1 Pro) never
+plans above it and a box where it is wrong (M4 base: 4 vs a measured 6)
+climbs on evidence. With that, MIN_WIDTHS dropped to 1: one trusted width
+anchors the prior's shape and the raw floors do the rest (with w5 settled
+after one sample the bucket could never reach two trusted widths and the
+prior kept planning the 4 -> 5 extension the table had already priced —
+the MTP sim caught it). Consequence for Phase 3: the probe goes, the rows
+stay. Both arms observe and persist, only the on arm reads, so an off
+arm's `table=` field in a warm boot carries the previous on boot's cells.
+
+Phase 4 on the M4 base (chooser opt-in, cold boots): LFM2.5-2.6B echo
+**+53%** (the chooser climbs one width at a time past the cap-5 row to
+w8/w9 on a monotone ladder w4 20.8 > w5 17.1 > w6 14.9 > w7 13.3 > w8 12.2
+ms/tok), 8B-A1B novel +1.4% (sticky-serial on its own evidence, w0 10.8 vs
+w4 16.0), 2.6B novel -1.2%, 8B-A1B echo -4.7% with the ladder inverting
+between reps (w6 11.9 -> 18.9) and the chooser walking down to w3: a MoE
+verify reads whatever experts the block's positions route to, so its
+per-width cost is content-dependent and the cells are far noisier than a
+dense trunk's. The chooser stays opt-in; MoE targets need their own bar.
