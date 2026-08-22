@@ -69,6 +69,29 @@ struct ChatSession: Identifiable, Codable {
         self.disabledTools = []
     }
 
+    /// Fork primitive: a copy of `source` with the given fresh identity and
+    /// timestamps. Transient vehicle flags are cleared — branching off a task
+    /// run or Telegram mirror yields an ordinary conversation. The attached
+    /// document folder deliberately does NOT carry over: its security-scoped
+    /// bookmark is keyed by SESSION id, so it cannot follow the fork.
+    init(forkedFrom source: ChatSession, id: UUID, now: Date) {
+        self.id = id
+        self.title = source.title
+        self.messages = []
+        self.createdAt = now
+        self.updatedAt = now
+        self.mode = source.mode
+        self.workingDirectory = source.workingDirectory
+        self.attachedFolderPath = nil
+        self.taskRunId = nil
+        self.isExternalBridge = false
+        self.enableThinking = source.enableThinking
+        self.reasoningEffort = source.reasoningEffort
+        self.useMCP = source.useMCP
+        self.agentId = source.agentId
+        self.disabledTools = source.disabledTools
+    }
+
     /// Resolve stored names to tools, silently dropping any this build no longer
     /// has. An unknown name must never be allowed to match something else.
     static func disabledToolKinds(_ names: [String]) -> Set<AgentToolKind> {
@@ -253,6 +276,33 @@ struct ChatMessage: Identifiable, Codable {
     // back to the model as history, and the old in-content banner taught it
     // the warning text. Absent forever on messages saved before the field.
     var truncationNotice: TruncationNotice.Notice? = nil
+
+    /// A copy with a FRESH identity — the fork primitive. Same content, no row
+    /// id shared between threads; a fork never resumes a stream mid-flight.
+    init(replacing original: ChatMessage) {
+        self.id = UUID()
+        self.role = original.role
+        self.content = original.content
+        self.reasoningContent = original.reasoningContent
+        self.isStreaming = false
+        self.timestamp = original.timestamp
+        self.agentPlan = original.agentPlan
+        self.toolResults = original.toolResults
+        self.isAgentSummary = original.isAgentSummary
+        self.promptTokens = original.promptTokens
+        self.completionTokens = original.completionTokens
+        self.tokensPerSecond = original.tokensPerSecond
+        self.toolCallId = original.toolCallId
+        self.toolName = original.toolName
+        self.toolCalls = original.toolCalls
+        self.images = original.images
+        self.audio = original.audio
+        self.media = original.media
+        self.failedRetry = original.failedRetry
+        self.processHandles = original.processHandles
+        self.errorNotice = original.errorNotice
+        self.truncationNotice = original.truncationNotice
+    }
 
     enum Role: String, Codable {
         case system, user, assistant

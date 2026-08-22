@@ -775,6 +775,86 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
+    /// Drop everything AFTER `index` (exclusive). The rewind primitive shared by
+    /// regenerate and edit-resend — unlike `deleteMessage` this takes a whole
+    /// tail, because re-asking a prompt invalidates every reply to it.
+    func truncateMessagesAfter(in sessionId: UUID, index: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              chatSessions[sIdx].messages.indices.contains(index + 1) else { return }
+        chatSessions[sIdx].messages.removeSubrange((index + 1)...)
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
+    /// Replace one user message's text and drop its reply (and everything
+    /// after): edit & resend's state change, before the engine re-runs the turn.
+    @discardableResult
+    func editUserMessage(in sessionId: UUID, messageId: UUID, newText: String) -> Bool {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId }),
+              let updated = Self.editedUserMessages(chatSessions[sIdx].messages,
+                                                    messageId: messageId, newText: newText)
+        else { return false }
+        chatSessions[sIdx].messages = updated
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+        return true
+    }
+
+    /// Pure core of edit & resend: nil unless `messageId` is a USER row and the
+    /// new text is non-empty (an empty edit is a delete, not an edit).
+    nonisolated static func editedUserMessages(_ messages: [ChatMessage],
+                                               messageId: UUID,
+                                               newText: String) -> [ChatMessage]? {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let idx = messages.firstIndex(where: { $0.id == messageId }),
+              messages[idx].role == .user else { return nil }
+        var out = Array(messages[...idx])
+        out[idx].content = trimmed
+        return out
+    }
+
+    /// Branch the conversation at `messageId`: a NEW session holding history up
+    /// to and including that row, inserted right after its source in the sidebar
+    /// and made active. Nothing is removed from the original.
+    @discardableResult
+    func forkSession(at messageId: UUID, in sessionId: UUID) -> UUID? {
+        guard let srcIdx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return nil }
+        let fork = Self.forkedSession(from: chatSessions[srcIdx], upTo: messageId,
+                                      newId: UUID(), now: Date())
+        guard let fork else { return nil }
+        chatSessions.insert(fork, at: srcIdx + 1)
+        activeChatId = fork.id
+        saveChatHistory()
+        return fork.id
+    }
+
+    /// Pure core of fork: prefix through the branch point inclusive, fresh ids
+    /// everywhere so no row is shared between threads.
+    nonisolated static func forkedSession(from source: ChatSession, upTo messageId: UUID,
+                                          newId: UUID, now: Date) -> ChatSession? {
+        guard let idx = source.messages.firstIndex(where: { $0.id == messageId }) else { return nil }
+        var fork = ChatSession(forkedFrom: source, id: newId, now: now)
+        fork.messages = source.messages[...idx].map { ChatMessage(replacing: $0) }
+        return fork
+    }
+
+    /// Rename a conversation from the sidebar. A whitespace-only title is
+    /// refused rather than blanking the row.
+    func renameSession(_ id: UUID, title: String) {
+        guard let newTitle = Self.renamedTitle(title),
+              let idx = chatSessions.firstIndex(where: { $0.id == id }) else { return }
+        chatSessions[idx].title = newTitle
+        saveChatHistory()
+    }
+
+    /// Trimmed title, or nil for an empty rename.
+    nonisolated static func renamedTitle(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil, truncation: TruncationNotice.Notice? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
