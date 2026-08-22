@@ -996,6 +996,8 @@ pub const Generator = struct {
     /// Width-trial schedule for the round-cost table (one 2-round block per
     /// period at m_lo+1, so the table learns the next cliff once).
     mtp_width_trial: MtpWidthTrial = .{},
+    /// Consecutive plans with the same m_lo (the base has stopped climbing).
+    mtp_m_lo_streak: u32 = 0,
     /// Drafts of the previous TWO rounds (0 = serial), every round: a round
     /// is a transition unless both predecessors ran its width (the first
     /// round after a width change is the transition, the second is still
@@ -7116,6 +7118,7 @@ pub const Generator = struct {
         // closed), and the width trial may reach one past that to measure.
         if (src.fromTable()) cap = @min(cap_free, @max(cap_row, self.xfm.round_cost.widestMeasured(src.bucket) orelse cap_row));
         var plan = mtpEvPlanSrc(self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1);
+        if (plan.m_lo == self.mtp_ev_m_lo_prev) self.mtp_m_lo_streak +|= 1 else self.mtp_m_lo_streak = 0;
         self.mtp_ev_m_lo_prev = plan.m_lo;
         // Live-cost lever: shorten dry exploration bursts when the MEASURED
         // chunk-A sync is an expensive fraction of the round (mtpExtDryThresholdFor).
@@ -7147,7 +7150,7 @@ pub const Generator = struct {
         // inside a regime trial block (that block is the regime's own
         // measurement), and only while solo.
         if (mtpCostTableEnabled() and self.spec_cost_solo and self.mtp_ev_rounds >= self.mtp_regime.trial_end) {
-            const base_settled = self.spec_round_prev_width == plan.m_lo and self.spec_round_prev_width2 == plan.m_lo;
+            const base_settled = self.mtp_m_lo_streak >= 2;
             if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free, base_settled)) |target| {
                 const period = mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
                 if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period)) {
@@ -11580,6 +11583,7 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     var prev_two = false;
     var prev_two2 = false;
     var late_wide: u32 = 0;
+    var streak: u32 = 0;
     var picked: [round_cost.MAX_WIDTH + 1]u32 = @splat(0);
     var m_lo_prev: u32 = 1;
     var last_m: u32 = 0;
@@ -11587,8 +11591,8 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     while (i < 600) : (i += 1) {
         const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, &t);
         var plan = Generator.mtpEvPlanSrc(&a, 8, src, m_lo_prev + 1);
-        m_lo_prev = plan.m_lo;
-        if (Generator.mtpWidthTrialTarget(&t, 1000, plan, 8, prev == plan.m_lo and prev2 == plan.m_lo)) |target| {
+        if (plan.m_lo == m_lo_prev) streak += 1 else streak = 0;
+        if (Generator.mtpWidthTrialTarget(&t, 1000, plan, 8, streak >= 2)) |target| {
             if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo))) plan = Generator.mtpWidthTrialPlan(target);
         }
         // Run it: a two-chunk plan extends (confidence is high), so the
@@ -11606,6 +11610,7 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
         prev = m;
         prev_two2 = prev_two;
         prev_two = two_chunk;
+        m_lo_prev = plan.m_lo;
     }
     // The cliff was found from ONE sample (clearly worse: never trusted,
     // never re-trialled at the cold period) and the loop settled under it.
