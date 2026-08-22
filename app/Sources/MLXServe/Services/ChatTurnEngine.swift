@@ -448,17 +448,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // A new submission to the SAME session supersedes its in-flight turn.
         // Other sessions' turns are untouched — the engine is multi-turn.
         stop(sessionId: sessionId)
-        let token = ledger.begin(session: sessionId)
-        publishTurnState()
-
-        // Publish the answering agent's voice for THIS turn — but only when the
-        // turn can actually be the one speaking: a voice-driven turn, or the
-        // chat the user is looking at. A BACKGROUND tab's agent finishing later
-        // must not hijack the speaking voice mid-utterance (multi-turn). nil
-        // restores the live per-utterance Settings read.
-        if config.voiceStyle || appState.activeChatId == sessionId {
-            ActiveAgentVoice.set(config.voice)
-        }
+        let token = beginTurn(sessionId: sessionId, config: config)
 
         if config.agentMode || config.mcpMode || config.documentIndex != nil {
             runAgentTurn(sessionId: sessionId, text: text, images: images, audio: audio,
@@ -469,15 +459,62 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
+    /// The per-turn bookkeeping a fresh submission and a re-run share: claim the
+    /// session's turn slot and publish the answering agent's voice FOR THIS TURN
+    /// — but only when the turn can actually be the one speaking: a voice-driven
+    /// turn, or the chat the user is looking at. A BACKGROUND tab's agent
+    /// finishing later must not hijack the speaking voice mid-utterance
+    /// (multi-turn). nil restores the live per-utterance Settings read.
+    private func beginTurn(sessionId: UUID, config: TurnConfig) -> UUID {
+        let token = ledger.begin(session: sessionId)
+        publishTurnState()
+        if config.voiceStyle || appState.activeChatId == sessionId {
+            ActiveAgentVoice.set(config.voice)
+        }
+        return token
+    }
+
+    /// Re-run the last human turn — Regenerate, and Edit & Resend after the
+    /// transcript has been rewound. The prompt ALREADY sits in history, so the
+    /// tail is dropped first and the turn streams into a fresh placeholder
+    /// WITHOUT appending a second copy of the prompt.
+    func rerunLastTurn(sessionId: UUID, config: TurnConfig,
+                       approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard server.status == .running else { return }
+        guard let plan = ChatRewind.regeneratePlan(in: session(sessionId)?.messages ?? []) else { return }
+        stop(sessionId: sessionId)
+        appState.truncateMessagesAfter(in: sessionId, index: plan.userIdx)
+        guard let messages = session(sessionId)?.messages,
+              messages.indices.contains(plan.userIdx) else { return }
+        let prompt = messages[plan.userIdx]
+        let token = beginTurn(sessionId: sessionId, config: config)
+        if config.agentMode || config.mcpMode || config.documentIndex != nil {
+            runAgentTurn(sessionId: sessionId, text: prompt.content,
+                         images: prompt.images, audio: prompt.audio,
+                         config: config, token: token, approval: approval,
+                         appendUserMessage: false)
+        } else {
+            runPlainTurn(sessionId: sessionId, text: prompt.content,
+                         images: prompt.images, audio: prompt.audio,
+                         config: config, token: token,
+                         appendUserMessage: false)
+        }
+    }
+
     // MARK: - Plain chat
 
     private func runPlainTurn(sessionId: UUID, text: String,
                               images: [ChatImage]?, audio: [ChatAudio]?,
-                              config: TurnConfig, token: UUID) {
+                              config: TurnConfig, token: UUID,
+                              appendUserMessage: Bool = true) {
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.images = images
         userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+        // A re-run's prompt is already the last row of history — appending a
+        // second copy would ask twice (rerunLastTurn passes false).
+        if appendUserMessage {
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
 
@@ -613,11 +650,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runAgentTurn(sessionId: UUID, text: String,
                               images: [ChatImage]?, audio: [ChatAudio]?,
                               config: TurnConfig, token: UUID,
-                              approval: @escaping (APIClient.ToolCall) async -> Bool) {
+                              approval: @escaping (APIClient.ToolCall) async -> Bool,
+                              appendUserMessage: Bool = true) {
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.images = images
         userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+        // A re-run's prompt is already the last row of history — appending a
+        // second copy would ask twice (rerunLastTurn passes false).
+        if appendUserMessage {
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
         let workDir = config.workingDirectory
