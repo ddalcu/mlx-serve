@@ -561,6 +561,40 @@ enum ServerEngine: String, CaseIterable {
     }
 }
 
+/// What the server's measured spec-decode cost model resolved for this load
+/// (`/props` `"spec_cost"`, absent when `MLX_SERVE_SPEC_COST_PROBE=0` or the
+/// probe declined — then the per-silicon tables applied instead).
+///
+/// The Settings picker shows this beside "Automatic" rather than offering a
+/// second "Probe" entry: a user cannot choose between "Automatic" and "Probe"
+/// without benchmarking, but they can read what Automatic landed on.
+struct SpecCostInfo: Equatable {
+    var mtpDepthCap: Int
+    var widths: [Int]
+    var msPerWidth: [Double]
+    var kvMsPerToken: Double
+
+    /// Decode the `spec_cost` object. Pure and testable; nil for a server
+    /// that published none (the tables applied), which reads as "no measured
+    /// width to show".
+    static func parse(_ json: [String: Any]) -> SpecCostInfo? {
+        guard let obj = json["spec_cost"] as? [String: Any],
+              let cap = obj["mtp_depth_cap"] as? Int, cap > 0 else { return nil }
+        return SpecCostInfo(
+            mtpDepthCap: cap,
+            widths: (obj["widths"] as? [Any])?.compactMap { ($0 as? NSNumber)?.intValue } ?? [],
+            msPerWidth: (obj["ms"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue } ?? [],
+            kvMsPerToken: (obj["kv_ms_per_token"] as? NSNumber)?.doubleValue ?? 0
+        )
+    }
+
+    /// Label for the picker's automatic entry. Names the width AND that it was
+    /// measured — a bare "Automatic (6)" reads the same as a hardcoded cap.
+    var automaticLabel: String {
+        "Automatic (measured: \(mtpDepthCap) token\(mtpDepthCap == 1 ? "" : "s"))"
+    }
+}
+
 struct MemoryInfo {
     var activeBytes: Int64
     var peakBytes: Int64

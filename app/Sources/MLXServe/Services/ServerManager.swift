@@ -41,6 +41,9 @@ class ServerManager: ObservableObject {
         allModels.filter { $0.lanAdvertises(capability) }
     }
     @Published var memoryInfo: MemoryInfo?
+    /// What the server's measured spec-decode cost model resolved for the
+    /// resident model. nil = the per-silicon tables applied.
+    @Published var specCost: SpecCostInfo?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -285,6 +288,7 @@ class ServerManager: ObservableObject {
         status = .stopped
         modelInfo = nil
         memoryInfo = nil
+        specCost = nil
         throughput = nil
         decodeTPSNow = nil
         prefillTPSNow = nil
@@ -596,8 +600,9 @@ class ServerManager: ObservableObject {
     }
 
     private func refreshStatus() async {
-        if let mem = try? await api.fetchProps(port: port) {
-            memoryInfo = mem
+        if let props = try? await api.fetchProps(port: port) {
+            memoryInfo = props.memory
+            specCost = props.specCost
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {

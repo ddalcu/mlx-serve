@@ -5332,7 +5332,7 @@ fn handleChatCompletions(
         log.info("  drafter=disabled (logprobs requested)\n", .{});
         enable_drafter = false;
     }
-    if (enable_drafter and config.has_hybrid_layers) {
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
         log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
@@ -5687,7 +5687,7 @@ fn handleCompletions(
     else
         (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -5893,7 +5893,7 @@ fn handleStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -6790,13 +6790,26 @@ const StreamingTokenStream = struct {
 /// logprobs, no grammar constraint, no hybrid SSM for drafter) apply at the
 /// request-entry parse site; `pickStreamMode` re-enforces them defensively
 /// here so a missed gate at the parse site doesn't crash the dispatch.
+/// Does this trunk's architecture rule the loaded assistant sidecar out?
+///
+/// The hybrid veto exists for the GEMMA cross-attention drafter, whose
+/// multi-token verify was never wired for a recurrent trunk. A DFlash/DSpark
+/// sidecar is a different mechanism — it reads the trunk's own layer captures
+/// and rolls the conv state back from the verify pass's per-position capture
+/// — so a hybrid target is exactly what LiquidAI ships DSpark FOR. ONE
+/// predicate, because this gate is re-derived on four request surfaces and a
+/// missed site decodes serial with everything else looking healthy.
+pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) bool {
+    return has_hybrid_layers and !dflash_loaded;
+}
+
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     drafter_loaded: bool,
     mtp_loaded: bool,
-    has_hybrid_layers: bool,
+    arch_blocks_sidecar: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
@@ -6804,7 +6817,7 @@ fn pickStreamMode(
     // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
     // it needs is the same one PLD uses.
     if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
-    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .drafter;
+    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !arch_blocks_sidecar) return .drafter;
     if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
     return .regular;
 }
@@ -6872,7 +6885,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -9872,6 +9885,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
     };
 }
 
+var vision_pixel_clamp_logged: bool = false;
+/// One-shot: the checkpoint declared more pixels than the ViT can attend.
+fn logVisionPixelClamp(declared: u32) void {
+    if (vision_pixel_clamp_logged) return;
+    vision_pixel_clamp_logged = true;
+    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ qwen_vision.ENGINE_MAX_PIXELS, declared });
+}
+
 test "visionPreprocFromConfig threads each tower's processor bounds" {
     const qwen = visionPreprocFromConfig(&.{
         .qwen_vision = true,
@@ -10092,10 +10113,10 @@ fn appendLfm2Tiles(
         }
     }
     log.info("  Decoded {d}x{d} image → lfm2 {d}x{d} tiles{s} on a {d}x{d} canvas ({d} tokens)\n", .{
-        src.w,     src.h,
-        grid.rows, grid.cols,
+        src.w,      src.h,
+        grid.rows,  grid.cols,
         thumb_note, canvas_w,
-        canvas_h,  @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
+        canvas_h,   @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
     });
 }
 
@@ -10208,11 +10229,10 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         if (factor == 0 or vp.tps == 0) return null;
-        const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
-        const max_pixels = if (vp.max_pixels >= min_pixels)
-            vp.max_pixels
-        else
-            @max(qwen_vision.MAX_PIXELS, min_pixels);
+        const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+        const min_pixels = bounds.min;
+        const max_pixels = bounds.max;
+        if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
         const rs = switch (vp.mode) {
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
@@ -10316,8 +10336,10 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         };
     }
 
-    const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
-    const max_pixels = if (vp.max_pixels >= min_pixels) vp.max_pixels else @max(qwen_vision.MAX_PIXELS, min_pixels);
+    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+    const min_pixels = bounds.min;
+    const max_pixels = bounds.max;
+    if (bounds.clamped) logVisionPixelClamp(vp.max_pixels);
     const first = decoded.items[0];
     const rs = qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
     const rh = rs.h;
@@ -10982,7 +11004,7 @@ fn handleAnthropicMessages(
     else
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
@@ -11211,7 +11233,7 @@ fn handleAnthropicNonStreaming(
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
     const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
@@ -11448,7 +11470,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -12817,7 +12839,7 @@ fn handleResponses(
     else
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
+    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
@@ -12847,7 +12869,7 @@ fn handleResponses(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -13152,7 +13174,7 @@ fn handleResponses(
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
         const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
         const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
@@ -15289,11 +15311,16 @@ test "lfm2ImageSegment labels every tile and closes on the thumbnail" {
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         125009,
-        124908, 124907,
-        124909, 124907,
-        124918, 124907,
-        124919, 124907,
-        125008, 124907,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
         125010,
     };
     try testing.expectEqualSlices(u32, &want, seg);
@@ -16123,8 +16150,7 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         try std.testing.expect(got.enable);
         try std.testing.expectEqual(case.want, got.budget);
         // The raw string rides along either way — the template still renders it.
-        try std.testing.expectEqualStrings(
-            parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
+        try std.testing.expectEqualStrings(parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
 }
 
@@ -16940,24 +16966,19 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // are the same class of parameter: derived from the CONFIG at the site, or
     // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
     // and a quantized checkpoint gets a dense one's.
-    try t.expect(std.mem.indexOf(u8, src,
-        "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
-    try t.expect(std.mem.indexOf(u8, src,
-        "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
+    try t.expect(std.mem.indexOf(u8, src, "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
+    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
 
     // Auto-context sizing reads the same helpers — the two must not drift.
     // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
     // `--kv-quant 4` server cannot size its context against fp16 while the
     // guard admits against 4-bit (that mismatch reported a third of what fits).
-    try t.expect(std.mem.indexOf(u8, src,
-        "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
-    try t.expect(std.mem.indexOf(u8, src,
-        "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src, "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src, "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
     // The prefill transient: the sizer RESERVES it once at the chunk width
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
-    try t.expect(std.mem.indexOf(u8, src,
-        "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -16993,8 +17014,7 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // scheduler sources it from `slot.model.config` — the same object the
     // guard bills against.
     const sched = @embedFile("scheduler.zig");
-    try t.expect(std.mem.indexOf(u8, sched,
-        ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
     try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
 
     // And the width has to be frozen BEFORE anything is computed from it:

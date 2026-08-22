@@ -24,6 +24,26 @@ pub const MAX_PIXELS: u32 = 14 * 14 * 4 * 1280; // 1003520
 
 pub const Resized = struct { h: u32, w: u32 };
 
+/// Engine ceiling on the image area, whatever the checkpoint's processor
+/// declares. Qwen3.8 packs ship `longest_edge: 16777216` (16.7 Mpx); the
+/// reference survives that behind flash attention, while our ViT
+/// MATERIALIZES the full bidirectional score matrix per layer — a 5100x3300
+/// photo became 65k patches and an uncatchable Metal OOM (live, 26.8.9).
+/// 1536x1536: ~9.2k patches, ~2.7 GB of bf16 scores per layer at 16 heads;
+/// a 1920x1080 screenshot is barely touched (2.07 -> 2.36 Mpx cap).
+pub const ENGINE_MAX_PIXELS: u32 = 1536 * 1536;
+
+pub const PixelBounds = struct { min: u32, max: u32, clamped: bool };
+
+/// The bounds the resize actually uses: the checkpoint's when sane, the
+/// processor defaults otherwise, and never above ENGINE_MAX_PIXELS.
+pub fn effectivePixelBounds(cfg_min: u32, cfg_max: u32) PixelBounds {
+    const min = if (cfg_min > 0) cfg_min else MIN_PIXELS;
+    const declared = if (cfg_max >= min) cfg_max else @max(MAX_PIXELS, min);
+    const max = @max(min, @min(declared, ENGINE_MAX_PIXELS));
+    return .{ .min = min, .max = max, .clamped = max < declared };
+}
+
 /// Python `round()` is round-half-to-EVEN (banker's rounding); Zig's
 /// `std.math.round` is round-half-away-from-zero. `_smart_resize_image` uses the
 /// Python builtin, so we must match it for byte-faithful grids. Inputs here are
@@ -1217,6 +1237,23 @@ test "qwen smart_resize matches reference table" {
         try std.testing.expectEqual(c.eh, r.h);
         try std.testing.expectEqual(c.ew, r.w);
     }
+}
+
+test "qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend" {
+    const b = effectivePixelBounds(65536, 16777216);
+    try std.testing.expectEqual(ENGINE_MAX_PIXELS, b.max);
+    try std.testing.expect(b.clamped);
+    // The live crash: 5100x3300 -> 16377 merged tokens. Under the cap it
+    // is ~2300, and the engine never builds a 65k-patch score matrix.
+    const r = smartResizeImage(3300, 5100, 32, b.min, b.max);
+    try std.testing.expect(imageTokenCount(r, 16, 2) <= ENGINE_MAX_PIXELS / (32 * 32));
+    try std.testing.expect(imageTokenCount(r, 16, 2) > 2000);
+    // Defaults and sane checkpoints pass through unchanged.
+    const d = effectivePixelBounds(0, 0);
+    try std.testing.expectEqual(MIN_PIXELS, d.min);
+    try std.testing.expectEqual(MAX_PIXELS, d.max);
+    try std.testing.expect(!d.clamped);
+    try std.testing.expectEqual(@as(u32, 1003520), effectivePixelBounds(3136, 1003520).max);
 }
 
 test "qwen smart_resize honors checkpoint processor pixel bounds" {

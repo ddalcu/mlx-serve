@@ -89,7 +89,12 @@ jobs:
       # Each package's manifest owns its mode (SwaTex requires Swift 6.1).
       - name: Build Swift app
         working-directory: app
-        run: swift build -c release
+        run: |
+          # Catch a drifted SwaTex font-lookup patch here rather than at release
+          # time (issue #233). Mirrors app/build.sh.
+          swift package resolve
+          bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
+          swift build -c release
 
       - name: Run Swift tests
         working-directory: app

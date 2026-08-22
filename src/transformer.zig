@@ -1567,7 +1567,7 @@ extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*us
 
 /// "kern.osproductversion" → "26.4"-style string (the sysctl mirror of
 /// Python's platform.mac_ver()[0]).
-fn macosProductVersion(buf: []u8) ?[]const u8 {
+pub fn macosProductVersion(buf: []u8) ?[]const u8 {
     var len: usize = buf.len;
     if (sysctlbyname("kern.osproductversion", buf.ptr, &len, null, 0) != 0) return null;
     var n = @min(len, buf.len);
@@ -2754,6 +2754,8 @@ pub fn splitCausalSdpa(
 
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+const io_util_mod = @import("io_util.zig");
+const round_cost_mod = @import("round_cost.zig");
 // NB `ane_offload`, not `*_mod`: the `?*<x>_mod.<Y>` field convention marks
 // module-owned ARCH state (the dsv4 class — single-flight + spec-off); the
 // ANE engine is a load-time accelerator with no per-request decode state.
@@ -3755,31 +3757,39 @@ pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
 ///
 /// No-op when the entry holds no capture (non-GDN hybrid layer); the caller
 /// only takes the fast path when capture succeeded.
-pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, s: mlx.mlx_stream) !void {
-    if (entry.spec_state_seq.ctx == null) return;
+/// `verify_len` is the number of positions the verify forward ran (T). A
+/// GatedDeltaNet layer records it implicitly in `spec_state_seq`, but a
+/// CONV-ONLY layer (LFM2's gated conv — no recurrent ssm_state at all) has
+/// only `spec_conv_input`, whose leading `kernel-1` rows cannot be told from
+/// verify positions without it. Passing it explicitly is what lets one helper
+/// roll back both shapes.
+pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
+    if (entry.spec_state_seq.ctx == null and entry.spec_conv_input.ctx == null) return;
 
-    const seq_shape = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
     const acc: c_int = @intCast(accepted);
+    if (entry.spec_state_seq.ctx != null) {
+        const seq_shape = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
 
-    // ssm_state = spec_state_seq[accepted]  →  [B, Hv, Dv, Dk]
-    {
-        const start = [_]c_int{ acc, 0, 0, 0, 0 };
-        const stop = [_]c_int{ acc + 1, seq_shape[1], seq_shape[2], seq_shape[3], seq_shape[4] };
-        const strides = [_]c_int{ 1, 1, 1, 1, 1 };
-        var sliced = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&sliced, entry.spec_state_seq, &start, 5, &stop, 5, &strides, 5, s));
-        defer _ = mlx.mlx_array_free(sliced);
-        const new_shape = [_]c_int{ seq_shape[1], seq_shape[2], seq_shape[3], seq_shape[4] };
-        var reshaped = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&reshaped, sliced, &new_shape, 4, s));
-        _ = mlx.mlx_array_free(entry.ssm_state);
-        entry.ssm_state = reshaped;
+        // ssm_state = spec_state_seq[accepted]  →  [B, Hv, Dv, Dk]
+        {
+            const start = [_]c_int{ acc, 0, 0, 0, 0 };
+            const stop = [_]c_int{ acc + 1, seq_shape[1], seq_shape[2], seq_shape[3], seq_shape[4] };
+            const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+            var sliced = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&sliced, entry.spec_state_seq, &start, 5, &stop, 5, &strides, 5, s));
+            defer _ = mlx.mlx_array_free(sliced);
+            const new_shape = [_]c_int{ seq_shape[1], seq_shape[2], seq_shape[3], seq_shape[4] };
+            var reshaped = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&reshaped, sliced, &new_shape, 4, s));
+            _ = mlx.mlx_array_free(entry.ssm_state);
+            entry.ssm_state = reshaped;
+        }
     }
 
     // conv_state = spec_conv_input[:, (1+accepted) : (1+accepted)+(kernel-1), :]
     if (entry.spec_conv_input.ctx != null) {
         const ci_shape = mlx.getShape(entry.spec_conv_input); // [B, (k-1)+T, conv_dim]
-        const t_len = seq_shape[0]; // verify length T
+        const t_len: c_int = @intCast(verify_len);
         const km1 = ci_shape[1] - t_len; // kernel - 1
         const cstart: c_int = @intCast(1 + accepted);
         const start = [_]c_int{ 0, cstart, 0 };
@@ -4345,6 +4355,9 @@ const HybridLayerWeights = struct {
     post_norm: ?mlx.mlx_array, // null for single-op blocks (Nemotron-H)
     op: HybridOp,
     mlp: ?DenseMlpWeights, // optional MLP after mixer (LFM2: always; Nemotron-H: null)
+    /// lfm2_moe: layers at/after `num_dense_layers` replace the dense MLP
+    /// with a sparse MoE block. Exactly one of `mlp` / `moe_mlp` is set.
+    moe_mlp: ?MoeMlpWeights = null,
 };
 
 // ── Quantization params cache ──
@@ -5736,6 +5749,20 @@ pub const Transformer = struct {
     /// samplers reference it non-owning via `SamplingParams.suppress_mask`.
     /// Null = suppression off (kill switch, no chat template, GGUF engines).
     suppress_mask: ?mlx.mlx_array = null,
+    /// Measured spec round-cost table (`round_cost.Table`): per draft
+    /// width, per KV bucket, fed by every MTP/DFlash round on this model and
+    /// read by the EV plan in place of the fitted surface once a bucket has
+    /// two measured widths. Lives on the model, not the request — a request
+    /// spans only its own max_tokens. Inference thread only.
+    round_cost: round_cost_mod.Table = .{},
+    /// Persistence key of `round_cost` (empty = not persisted).
+    round_cost_key_buf: [64]u8 = undefined,
+    round_cost_key_len: u8 = 0,
+    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-depth, else
+    /// the adaptive default), set at load. The row-resolved cap travels as
+    /// `mtp_depth` through server -> slot -> Generator and reads there like
+    /// an explicit flag, so the row-less value needs its own carrier.
+    mtp_depth_free: u32 = 0,
     /// Certified lm_head prune (mlxfast notes/68 class): MXFP8 g32 coarse
     /// copy of a dense bf16 lm_head, built lazily on the first eligible
     /// argmax-only decode. `lm_head_prune_tried` marks the probe so a
@@ -8494,14 +8521,14 @@ pub const Transformer = struct {
     }
 
     /// Does `forwardWith` route through a path that honors
-    /// `ForwardCtx.capture_layers`? Standard path (v1) + the moe/GDN path
-    /// (qwen3_5-family DFlash2/DSpark sidecars). `DflashModel.bind` gates on
-    /// this predicate. Mirrors the dispatch chain above IN ORDER.
+    /// `ForwardCtx.capture_layers`? Standard path (v1), the moe/GDN path
+    /// (qwen3_5-family DFlash2 sidecars) and the hybrid path (LFM2 DSpark).
+    /// `DflashModel.bind` gates on this predicate. Mirrors the dispatch chain
+    /// above IN ORDER.
     pub fn supportsLayerCapture(self: *const Transformer) bool {
         return self.dsv4 == null and
             self.bert_layers == null and
-            !self.config.use_bidirectional_attention and
-            self.hybrid_layers == null;
+            !self.config.use_bidirectional_attention;
     }
 
     /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -10969,6 +10996,13 @@ pub const Transformer = struct {
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
 
+        // Spec-decode: thread the per-position conv capture down to the
+        // gated-conv / mamba2 mixers (they don't take the ctx). Without it a
+        // partial accept leaves the conv state advanced past the accepted
+        // position and the next token is generated from a future it never had.
+        self.spec_capture_ssm = ctx.capture_ssm_seq;
+        defer self.spec_capture_ssm = false;
+
         var h = try self.embedding(token_ids);
 
         // Splice vision embeddings at image_token_id positions (prefill only).
@@ -11020,17 +11054,29 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(h);
             h = h_new;
 
-            // Optional MLP (LFM2: always present after mixer; Nemotron-H: null)
-            if (lw.mlp) |mlp_w| {
+            // Optional MLP (LFM2: always present after mixer; Nemotron-H: null).
+            // lfm2_moe swaps the dense block for a sparse one past
+            // `num_dense_layers`; both sit under the same ffn_norm.
+            if (lw.mlp != null or lw.moe_mlp != null) {
                 const ff_normed = try self.rmsNorm(h, lw.post_norm.?);
                 defer _ = mlx.mlx_array_free(ff_normed);
-                const mlp_out = try self.denseMLP(ff_normed, &mlp_w);
+                const mlp_out = if (lw.moe_mlp) |*mw|
+                    try self.moeMLP(ff_normed, mw)
+                else
+                    try self.denseMLP(ff_normed, &lw.mlp.?);
                 defer _ = mlx.mlx_array_free(mlp_out);
 
                 var h_next = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
                 _ = mlx.mlx_array_free(h);
                 h = h_next;
+            }
+
+            // DFlash/DSpark capture: this h IS `hidden_states[li+1]`.
+            if (ctx.capture_layers) |cl| {
+                for (cl.ids, cl.out) |cid, *slot| {
+                    if (cid == li) _ = mlx.mlx_array_set(slot, h);
+                }
             }
 
             if (prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % hybrid_eval_cadence == 0) {
@@ -14143,8 +14189,9 @@ pub const Transformer = struct {
         // slices (the engine widths become the sliced widths and the GPU
         // serves the complement).
         const mode = ane_offload.splitMode();
-        // Dual ANE (opt-in): two units pinned to the two dies of an Ultra
-        // part, each computing HALF the total channel share concurrently.
+        // Dual ANE (default on the M3 Ultra, MLX_SERVE_ANE_DUAL=0/1 overrides):
+        // two units pinned to the two dies, each computing HALF the total
+        // channel share concurrently.
         // A dual request that cannot be honored (single-ANE silicon, row
         // mode) self-disables by name — never a failed boot.
         const chip = ane_offload.chipBrand();
@@ -15488,6 +15535,50 @@ fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return w_t;
 }
 
+/// A depthwise conv weight is `[C, K, 1]` in MLX and `[C, 1, K]` in torch, and
+/// which one a checkpoint ships is a CONVERTER choice, not an arch property:
+/// mlx_lm's LFM2 conversion writes the MLX layout, while LiquidAI's own bf16
+/// repos (LFM2.5-1.2B-Instruct, LFM2.5-2.6B) ship the torch one straight out of
+/// the training code. This is the `patchProjLayout` class, with one mercy —
+/// reading it wrong is not a plausible-but-wrong number, it is a hard abort:
+/// mlx_conv1d solves in_channels off the LAST axis, so a [2048, 1, 3] weight at
+/// groups=2048 demands 6144 input channels and kills the load at warmup.
+///
+/// `K == 1` is the one shape the layouts share, and it is its own transpose.
+pub fn depthwiseConvNeedsTranspose(shape: []const c_int) bool {
+    if (shape.len != 3) return false;
+    return shape[1] == 1 and shape[2] > 1;
+}
+
+/// One-shot so a mixed-converter library says which layout it found, once.
+var depthwise_conv_layout_logged: bool = false;
+
+/// In-place: swap a torch-layout depthwise conv weight into the layout the
+/// forward's `mlx_conv1d` contracts against, recording the new array in `owned`
+/// so `Transformer.deinit` frees it.
+fn maybeTransposeDepthwiseConv(
+    w: *mlx.mlx_array,
+    owned: *std.ArrayList(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !void {
+    if (w.ctx == null) return;
+    if (!depthwiseConvNeedsTranspose(mlx.getShape(w.*))) return;
+    const perm = [_]c_int{ 0, 2, 1 };
+    var w_t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, w.*, &perm, 3, s));
+    // A transpose is a VIEW; the conv reads raw row-major bytes, so materialize.
+    var w_c = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&w_c, w_t, false, s));
+    _ = mlx.mlx_array_free(w_t);
+    w.* = w_c;
+    try owned.append(allocator, w_c);
+    if (!depthwise_conv_layout_logged) {
+        depthwise_conv_layout_logged = true;
+        log.info("[conv] depthwise weights are torch-layout [C, 1, K] — transposed at load\n", .{});
+    }
+}
+
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
 /// array in `owned` so we can free it on Transformer.deinit.
@@ -16468,6 +16559,7 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     .out_proj_s = getLayerScaleOpt(weights, name_buf, prefix, li, "conv.out_proj.scales"),
                     .out_proj_b = getLayerBias(weights, name_buf, prefix, li, "conv.out_proj.biases", &config),
                 } };
+                try maybeTransposeDepthwiseConv(&lw.op.gated_conv.conv_w, &owned_bf16, allocator, s);
             },
             .attention => {
                 if (is_nemotron) {
@@ -16543,18 +16635,70 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
         }
 
         // MLP: present for all LFM2 layers, absent for Nemotron-H single-op blocks
-        if (is_lfm2) {
-            // LFM2 uses feed_forward.w1 (gate), w3 (up), w2 (down) — SwiGLU
+        lw.moe_mlp = null;
+        if (is_lfm2 and config.lfm2_moe and li >= config.num_dense_layers) {
+            // lfm2_moe sparse block: sigmoid routing with a selection-only
+            // `expert_bias` (the hy3 chain), no shared expert. The switch
+            // weights are mlx-lm's SwitchGLU stack: [experts, out, in].
+            lw.mlp = null;
+            const none = mlx.mlx_array_new();
+            lw.moe_mlp = .{
+                .router_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.gate.weight"),
+                .router_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.gate.scales"),
+                .router_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.gate.biases"),
+                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.weight"),
+                .switch_gate_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.scales"),
+                .switch_gate_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.biases"),
+                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.weight"),
+                .switch_up_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.scales"),
+                .switch_up_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.biases"),
+                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.weight"),
+                .switch_down_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.scales"),
+                .switch_down_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.biases"),
+                // No shared expert on this family — null handles keep
+                // `moeMLP`'s shared arms unreached.
+                .shared_gate_w = none,
+                .shared_gate_s = none,
+                .shared_gate_b = none,
+                .shared_up_w = none,
+                .shared_up_s = none,
+                .shared_up_b = none,
+                .shared_down_w = none,
+                .shared_down_s = none,
+                .shared_down_b = none,
+                .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "feed_forward.expert_bias") orelse blk: {
+                    // use_expert_bias=false ships none; the reference
+                    // zero-inits it (selection = plain sigmoid top-k).
+                    var zeros = mlx.mlx_array_new();
+                    const zshape = [_]c_int{@intCast(config.num_experts)};
+                    try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
+                    try owned_bf16.append(allocator, zeros);
+                    break :blk zeros;
+                },
+                .route_norm = config.moe_route_norm,
+                .route_scale = config.router_scaling_factor,
+            };
+            try maybeTransposeForBf16(&lw.moe_mlp.?.router_w, lw.moe_mlp.?.router_s, &owned_bf16, allocator, s);
+        } else if (is_lfm2) {
+            // Dense SwiGLU. transformers' Lfm2 spells it w1/w3/w2; the
+            // mlx-lm lfm2_moe converter spells the same three gate/up/down —
+            // probe, because a hardcoded spelling loses one of the two packs
+            // at its first missing weight.
+            const gate_key = if (getLayerWeightOpt(weights, name_buf, prefix, li, "feed_forward.w1.weight") != null)
+                [3][]const u8{ "w1", "w3", "w2" }
+            else
+                [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
+            var kb: [64]u8 = undefined;
             lw.mlp = .{
-                .gate_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.weight"),
-                .gate_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.w1.scales"),
-                .gate_b = getLayerBias(weights, name_buf, prefix, li, "feed_forward.w1.biases", &config),
-                .up_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.weight"),
-                .up_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.w3.scales"),
-                .up_b = getLayerBias(weights, name_buf, prefix, li, "feed_forward.w3.biases", &config),
-                .down_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.weight"),
-                .down_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.w2.scales"),
-                .down_b = getLayerBias(weights, name_buf, prefix, li, "feed_forward.w2.biases", &config),
+                .gate_w = getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "weight")),
+                .gate_s = getLayerScaleOpt(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "scales")),
+                .gate_b = getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "biases"), &config),
+                .up_w = getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "weight")),
+                .up_s = getLayerScaleOpt(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "scales")),
+                .up_b = getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "biases"), &config),
+                .down_w = getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "weight")),
+                .down_s = getLayerScaleOpt(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "scales")),
+                .down_b = getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "biases"), &config),
             };
         } else {
             lw.mlp = null;
@@ -21063,6 +21207,12 @@ fn getWeightFmtOpt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const
 fn getLayerWeightOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) ?mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.layers.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
     return weights.get(name);
+}
+
+/// `feed_forward.<name>.<suffix>` into a caller-owned scratch buffer. The
+/// dense-MLP spelling is per-converter, so the three names are data.
+fn ffKey(buf: *[64]u8, name: []const u8, suffix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "feed_forward.{s}.{s}", .{ name, suffix }) catch unreachable;
 }
 
 fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) mlx.mlx_array {
@@ -27533,12 +27683,12 @@ fn expectVerifyQmmNoWorseThanStock(
             "verifyQmm parity FAIL [{s}] ({s}): n={d} kernel max={d:.4} rms={d:.6} cos={d:.6}; " ++
                 "stock max={d:.4} rms={d:.6} cos={d:.6}; bars: max<={d:.2} rms<={d:.1}x cos>=stock-{d}\n",
             .{
-                label,                          @tagName(why),
-                count,                          kern_max,
-                rms_kern,                       cos_kern,
-                stock_max,                      rms_stock,
-                cos_stock,                      VerifyQmmParity.GROSS_CEILING,
-                VerifyQmmParity.RMS_FACTOR,     VerifyQmmParity.COS_SLACK,
+                label,                      @tagName(why),
+                count,                      kern_max,
+                rms_kern,                   cos_kern,
+                stock_max,                  rms_stock,
+                cos_stock,                  VerifyQmmParity.GROSS_CEILING,
+                VerifyQmmParity.RMS_FACTOR, VerifyQmmParity.COS_SLACK,
             },
         );
         return error.TestExpectedApproxEq;
@@ -32188,6 +32338,86 @@ test "hybrid init loads a DENSE bf16 checkpoint (LFM2.5-2.6B-bf16)" {
     try std.testing.expect(mlp.gate_s.ctx == null);
     try std.testing.expectEqualSlices(c_int, &.{ H, FF }, mlx.getShape(mlp.gate_w));
     try std.testing.expectEqualSlices(c_int, &.{ FF, H }, mlx.getShape(mlp.down_w));
+}
+
+test "depthwiseConvNeedsTranspose reads the LAYOUT, not the arch" {
+    const t = std.testing;
+    // MLX layout [C, K, 1] — what mlx_lm's LFM2 conversion writes. Leave it.
+    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 3, 1 }));
+    // Torch layout [C, 1, K] — what LiquidAI's own bf16 repos ship.
+    try t.expect(depthwiseConvNeedsTranspose(&.{ 2048, 1, 3 }));
+    try t.expect(depthwiseConvNeedsTranspose(&.{ 8, 1, 4 }));
+    // K == 1 is the one ambiguous shape, and it is its own transpose.
+    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 1, 1 }));
+    // Not a depthwise conv weight at all.
+    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 3 }));
+}
+
+test "hybrid init accepts a TORCH-layout depthwise conv (LiquidAI LFM2.5 bf16)" {
+    // Live 2026-08-22: LFM2.5-1.2B-Instruct and LFM2.5-2.6B, downloaded
+    // straight from LiquidAI, both died at warmup with
+    //   "Given groups=2048 and weights of shape (2048,1,3), expected to have
+    //    6144 input channels but got 2048"
+    // because the loader assumed every checkpoint had been through an mlx_lm
+    // conversion. Same weights, same arch, different converter.
+    const allocator = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const put = struct {
+        fn add(weights: *Weights, alloc: std.mem.Allocator, name: []const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const vals = try alloc.alloc(f32, n);
+            defer alloc.free(vals);
+            @memset(vals, 0.5);
+            const f32_arr = mlx.mlx_array_new_data(vals.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var bf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+            try weights.map.put(try alloc.dupe(u8, name), bf);
+        }
+    }.add;
+
+    const H: c_int = 8;
+    const FF: c_int = 16;
+    const P = "language_model.model";
+    const pre = P ++ ".layers.0.";
+    try put(&w, allocator, pre ++ "operator_norm.weight", &.{H}, s);
+    try put(&w, allocator, pre ++ "ffn_norm.weight", &.{H}, s);
+    try put(&w, allocator, pre ++ "feed_forward.w1.weight", &.{ FF, H }, s);
+    try put(&w, allocator, pre ++ "feed_forward.w3.weight", &.{ FF, H }, s);
+    try put(&w, allocator, pre ++ "feed_forward.w2.weight", &.{ H, FF }, s);
+    try put(&w, allocator, pre ++ "conv.in_proj.weight", &.{ 3 * H, H }, s);
+    // The whole point: torch's [C, 1, K], not MLX's [C, K, 1].
+    try put(&w, allocator, pre ++ "conv.conv.weight", &.{ H, 1, 3 }, s);
+    try put(&w, allocator, pre ++ "conv.out_proj.weight", &.{ H, H }, s);
+
+    var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = P };
+    config.has_hybrid_layers = true;
+    config.num_hidden_layers = 1;
+    config.hidden_size = @intCast(H);
+    config.quant_bits = 0;
+    config.layer_block_types[0] = .gated_conv;
+
+    var name_buf: [256]u8 = undefined;
+    const hl = try initHybridLayers(allocator, config, &w, &name_buf, s);
+    defer {
+        allocator.free(hl.hybrid_layers);
+        for (hl.ssm_entries) |*e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        allocator.free(hl.ssm_entries);
+        for (hl.owned_bf16) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(hl.owned_bf16);
+    }
+
+    // It must arrive at the forward in the layout mlx_conv1d solves against.
+    const cw = hl.hybrid_layers[0].op.gated_conv;
+    try std.testing.expectEqualSlices(c_int, &.{ H, 3, 1 }, mlx.getShape(cw.conv_w));
 }
 
 test "no layer-init path DEMANDS quantization scales" {

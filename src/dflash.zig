@@ -80,9 +80,29 @@ pub const DflashConfig = struct {
     /// scale is load-bearing there. 0 cap / 1.0 multiplier = no transform.
     logit_softcap: f32 = 0,
     output_multiplier: f32 = 1.0,
+    // ── DSpark extension (0/false on a v1/v2 assistant) ──
+    /// Rank of the vanilla Markov head's low-rank bigram bias. > 0 means the
+    /// block is drafted SEMI-autoregressively: each step's logits get
+    /// `markov_w2(markov_w1[prev_token])` added before its own draft is
+    /// picked, chaining the block without a second assistant forward.
+    markov_rank: u32 = 0,
+    /// Draft row mapping. SpecForge DFlash exports (muse, z-lab DFlash2) DROP
+    /// the anchor row — mask row j predicts draft j. DSpark exports read ALL
+    /// rows and the ANCHOR row emits draft 0, so their `block_size` counts
+    /// DRAFTS, not verify width. Reading the wrong mapping is a silent
+    /// 0%-acceptance drafter, not an error.
+    anchor_row_drafts: bool = false,
+    /// GPT-J interleaved rope (`rope_is_neox_style: false`). Every DFlash
+    /// v1/v2 sidecar so far is neox (half-split); DSpark's is not, and the
+    /// wrong half rotates silently.
+    rope_traditional: bool = false,
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
+    }
+
+    pub fn isDspark(self: *const DflashConfig) bool {
+        return self.markov_rank > 0;
     }
 
     pub fn deinit(self: *DflashConfig, allocator: std.mem.Allocator) void {
@@ -101,18 +121,34 @@ pub fn isDflashConfigJson(root: std.json.ObjectMap) bool {
 /// The object holding the DFlash contract triple: DFlash2 checkpoints nest it
 /// under `dflash_config`, v1 assistants declare it at the root. Null when
 /// neither shape declares all three fields.
-fn dflashContractObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
-    if (root.get("dflash_config")) |dc| {
-        if (dc == .object and hasContractTriple(dc.object)) return dc.object;
-    }
-    if (hasContractTriple(root)) return root;
-    return null;
-}
+/// The contract fields, looked up NESTED-FIRST then at the root. DSpark
+/// splits the triple across both (`block_size` at the root, the rest under
+/// `dflash_config`), so neither object alone answers the question and a
+/// nested-only reader silently classifies the sidecar as "not a drafter".
+const Contract = struct {
+    nested: ?std.json.ObjectMap,
+    root: std.json.ObjectMap,
 
-fn hasContractTriple(o: std.json.ObjectMap) bool {
-    return o.get("block_size") != null and
-        o.get("mask_token_id") != null and
-        o.get("target_layer_ids") != null;
+    fn get(self: Contract, key: []const u8) ?std.json.Value {
+        if (self.nested) |n| {
+            if (n.get(key)) |v| return v;
+        }
+        return self.root.get(key);
+    }
+};
+
+fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
+    const nested: ?std.json.ObjectMap = blk: {
+        if (root.get("dflash_config")) |dc| {
+            if (dc == .object) break :blk dc.object;
+        }
+        break :blk null;
+    };
+    const c = Contract{ .nested = nested, .root = root };
+    if (c.get("block_size") == null) return null;
+    if (c.get("mask_token_id") == null) return null;
+    if (c.get("target_layer_ids") == null) return null;
+    return c;
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -173,7 +209,23 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
 
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
 
-    const block_size: u32 = try jsonU32(contract.get("block_size").?);
+    // DSpark export markers. `markov_rank` is the load-bearing one (the head
+    // IS DSpark); the architecture string and `projector_type` cover exports
+    // that ship the row convention without one.
+    var anchor_row_drafts = root.get("markov_rank") != null;
+    if (contract.get("projector_type")) |pt| if (pt == .string and std.mem.eql(u8, pt.string, "dspark")) {
+        anchor_row_drafts = true;
+    };
+    if (root.get("architectures")) |archs| if (archs == .array) {
+        for (archs.array.items) |a| {
+            if (a == .string and std.mem.indexOf(u8, a.string, "DSpark") != null) anchor_row_drafts = true;
+        }
+    };
+
+    const declared_block: u32 = try jsonU32(contract.get("block_size").?);
+    // Normalize to ENGINE semantics: block_size is the verify width
+    // (1 anchor + drafts) everywhere below this line.
+    const block_size: u32 = if (anchor_row_drafts) declared_block + 1 else declared_block;
     if (block_size < 2) return error.InvalidDflashBlockSize;
     const mask_token_id: u32 = try jsonU32(contract.get("mask_token_id").?);
 
@@ -224,10 +276,28 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const eps: f32 = jsonFloat(root.get("rms_norm_eps") orelse return error.IncompleteDflashConfig);
     const sliding: u32 = if (root.get("sliding_window")) |v| try jsonU32(v) else 0;
 
+    // `rope_parameters.rope_theta` is the transformers-5 spelling (muse,
+    // DFlash2); DSpark ships a flat root `rope_theta`. Reading only the
+    // nested one leaves theta at 10000 and every drafted position mis-rotated.
     var rope_theta: f32 = 10000.0;
+    if (root.get("rope_theta")) |t| rope_theta = jsonFloat(t);
     if (root.get("rope_parameters")) |rp| if (rp == .object) {
         if (rp.object.get("rope_theta")) |t| rope_theta = jsonFloat(t);
     };
+    var rope_traditional = false;
+    if (root.get("rope_is_neox_style")) |v| {
+        if (v == .bool) rope_traditional = !v.bool;
+    }
+
+    // DSpark: only the `vanilla` Markov head is ported. `gated` and `rnn`
+    // carry extra trained modules (gate_proj / joint_proj) our block forward
+    // has no arm for — refuse by name rather than draft from the base logits
+    // and read as a bad drafter.
+    const markov_rank: u32 = if (root.get("markov_rank")) |v| try jsonU32(v) else 0;
+    if (markov_rank > 0) {
+        const kind = if (root.get("markov_head_type")) |v| (if (v == .string) v.string else "vanilla") else "vanilla";
+        if (!std.mem.eql(u8, kind, "vanilla")) return error.UnsupportedMarkovHeadType;
+    }
 
     const lt_val = root.get("layer_types") orelse return error.IncompleteDflashConfig;
     if (lt_val != .array or lt_val.array.items.len != num_layers) return error.LayerTypesLengthMismatch;
@@ -259,6 +329,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .conv_group_size = conv_group_size,
         .logit_softcap = logit_softcap,
         .output_multiplier = output_multiplier,
+        .markov_rank = markov_rank,
+        .rope_traditional = rope_traditional,
+        .anchor_row_drafts = anchor_row_drafts,
     };
 }
 
@@ -301,7 +374,15 @@ pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
 
 /// A no-wide-lane block cap with the machine row it came from, for the
 /// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
-pub const BlockCap = struct { cap: u32, label: []const u8 };
+pub const BlockCap = struct {
+    cap: u32,
+    label: []const u8,
+    /// True when a HUMAN measured this chip. A measured row wins over the
+    /// probe: the probe times a forward, while these rows were measured as
+    /// realized throughput (acceptance included), which the forward ladder
+    /// cannot see.
+    measured: bool = false,
+};
 
 /// Per-silicon cap table for machines WITHOUT the NAX m16 verify lane. The
 /// cap is a MACHINE measurement, so each row is one: the M4 row is
@@ -312,13 +393,16 @@ pub const BlockCap = struct { cap: u32, label: []const u8 };
 /// `chip` is sysctl machdep.cpu.brand_string ("Apple M3 Ultra"); the GPU
 /// arch string cannot tell Ultra from Max, hence the CPU brand.
 pub fn blockCapForMachine(chip: []const u8) BlockCap {
-    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return .{ .cap = 8, .label = "m3-ultra" };
+    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return .{ .cap = 8, .label = "m3-ultra", .measured = true };
+    // The DEFAULT VALUE and the M4 ROW are the same number doing two
+    // different jobs: on an M4 it is the measured sweep at the top of this
+    // file (block 5 -> 1.97x serial, 7 -> 1.43x), on an unknown chip it is a
+    // conservative guess. Only the first is evidence, so only the first
+    // outranks a probe.
+    if (std.mem.indexOf(u8, chip, "M4") != null) return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "m4", .measured = true };
     return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
 }
 
-/// Chip name via sysctl ("Apple M3 Ultra"); empty on failure, which lands
-/// on the default cap row. Canonical copy lives in ane.zig (the ANE share
-/// table keys on the same string).
 /// Resolve the effective block size: the config's value, capped by what the
 /// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
 /// when there is no wide lane), then clamped DOWNWARD by an explicit
@@ -479,6 +563,63 @@ pub const Selector = struct {
 };
 
 /// Per-layer assistant weights.
+/// DSpark's vanilla Markov head: a rank-`markov_rank` bigram bias added to
+/// each block position's logits from the token drafted at the PREVIOUS
+/// position. It is what makes the block semi-autoregressive off ONE assistant
+/// forward — the base logits are position-parallel, the bias chains them.
+///
+/// `markov_w1` is a gather table (`[vocab, rank]`, one row per previous
+/// token) and stays DENSE: a packed table read by `mlx_take_axis` gathers
+/// uint32 words, not rows. `markov_w2` is an ordinary `rank → vocab` linear
+/// and rides the same load-time quantization as the rest of the sidecar —
+/// only the DRAFT sees it, so a lossier bias costs acceptance, never a token.
+pub const MarkovHead = struct {
+    w1: mlx.mlx_array,
+    w2: DflashLinear,
+
+    pub fn deinit(self: *MarkovHead) void {
+        _ = mlx.mlx_array_free(self.w1);
+        self.w2.deinit();
+    }
+
+    pub fn appendEval(self: *const MarkovHead, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.w1);
+        self.w2.appendEval(vec);
+    }
+
+    /// `logits + w2(w1[prev_token])` for ONE block position. `base_row` is
+    /// `[1, 1, vocab]`; the result is a fresh array the caller owns.
+    pub fn stepLogits(
+        self: *const MarkovHead,
+        base_row: mlx.mlx_array,
+        prev_token: u32,
+        s: mlx.mlx_stream,
+    ) !mlx.mlx_array {
+        const idx_i32: i32 = @intCast(prev_token);
+        const idx_shape = [_]c_int{1};
+        const idx = mlx.mlx_array_new_data(&idx_i32, &idx_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(idx);
+
+        var row = mlx.mlx_array_new(); // [1, rank]
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_take_axis(&row, self.w1, idx, 0, s));
+
+        const rsh = mlx.getShape(row);
+        const shaped = [_]c_int{ 1, 1, rsh[1] };
+        var row3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row3);
+        try mlx.check(mlx.mlx_reshape(&row3, row, &shaped, 3, s));
+
+        const bias = try self.w2.apply(row3, s);
+        defer _ = mlx.mlx_array_free(bias);
+
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_add(&out, base_row, bias, s));
+        return out;
+    }
+};
+
 pub const DflashLayer = struct {
     layer_type: LayerType,
 
@@ -551,9 +692,13 @@ pub const DflashModel = struct {
     /// DFlash2 path selector — null on a v1 assistant.
     selector: ?Selector = null,
 
+    /// DSpark Markov head — null unless the config declares `markov_rank`.
+    markov: ?MarkovHead = null,
+
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
         if (self.selector) |*sel| sel.deinit();
+        if (self.markov) |*mh| mh.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -941,6 +1086,22 @@ pub fn loadDflashQuant(
         selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
 
+    var markov: ?MarkovHead = null;
+    errdefer if (markov) |*mh| mh.deinit();
+    if (cfg.markov_rank > 0) {
+        const w1 = try ownWeight(&weights, "markov_head.markov_w1.weight");
+        errdefer _ = mlx.mlx_array_free(w1);
+        const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, bits, s);
+        markov = .{ .w1 = w1, .w2 = w2 };
+        // The confidence head trims the drafted block per request in the
+        // reference's ragged-verify mode; we serve a STATIC block, so its
+        // weights are deliberately unread. Say so rather than let a silently
+        // ignored trained module read as a port that covers it.
+        if (weights.get("confidence_head.proj.weight") != null) {
+            log.info("[dflash] dspark: confidence head present but unused (static verify width)\n", .{});
+        }
+    }
+
     // Force-eval all weights so serve time never faults a lazy transpose or
     // an un-materialized load-time quantization.
     {
@@ -951,6 +1112,7 @@ pub fn loadDflashQuant(
         _ = mlx.mlx_vector_array_append_value(eval_vec, final_norm);
         for (layers) |*lw| lw.appendEval(eval_vec);
         if (selector) |*sel| sel.appendEval(eval_vec);
+        if (markov) |*mh| mh.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
 
@@ -969,6 +1131,11 @@ pub fn loadDflashQuant(
             cfg.selector_rank, cfg.selector_top_k, cfg.conv_kernel_size, cfg.conv_group_size,
         });
     }
+    if (cfg.isDspark()) {
+        log.info("[dflash] dspark: markov head rank={d}, rope theta={d:.0} ({s})\n", .{
+            cfg.markov_rank, cfg.rope_theta, if (cfg.rope_traditional) "interleaved" else "neox",
+        });
+    }
 
     return DflashModel{
         .config = cfg,
@@ -979,6 +1146,7 @@ pub fn loadDflashQuant(
         .final_norm = final_norm,
         .layers = layers,
         .selector = selector,
+        .markov = markov,
     };
 }
 
@@ -1074,6 +1242,7 @@ fn projectHeads(
     theta: f32,
     rope_offset: usize,
     apply_rope: bool,
+    rope_traditional: bool,
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
     const proj = try lin.apply(x, s);
@@ -1098,7 +1267,7 @@ fn projectHeads(
         &roped,
         transposed,
         @intCast(head_dim),
-        false,
+        rope_traditional,
         .{ .value = theta, .has_value = true },
         1.0,
         @intCast(rope_offset),
@@ -1666,7 +1835,7 @@ pub fn appendContext(
     defer _ = mlx.mlx_array_free(enc);
 
     for (model.layers, 0..) |*lw, li| {
-        const k = try projectHeads(enc, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, s);
+        const k = try projectHeads(enc, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(k);
         const v = try projectHeadsNoNorm(enc, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(v);
@@ -1759,9 +1928,9 @@ pub fn forwardBlock(
         };
         const attn_in = if (attn_prep) |*cp| cp.hidden else normed;
 
-        const q = try projectHeads(attn_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
+        const q = try projectHeads(attn_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(q);
-        const bk = try projectHeads(attn_in, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, s);
+        const bk = try projectHeads(attn_in, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(bk);
         const bv = try projectHeadsNoNorm(attn_in, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(bv);
@@ -1949,6 +2118,64 @@ const DFLASH2_CONFIG_JSON =
     \\  "vocab_size": 248320
     \\}
 ;
+
+// LiquidAI/LFM2.5-2.6B-DSpark, fetched 2026-08-21. The contract is SPLIT:
+// `block_size` sits at the root while `mask_token_id` / `target_layer_ids`
+// nest under `dflash_config`, rope theta is a ROOT `rope_theta`, and the
+// drafter's own rope is GPT-J interleaved (`rope_is_neox_style: false`).
+const DSPARK_LFM2_CONFIG_JSON =
+    \\{
+    \\  "architectures": ["Lfm2DSparkDraftModel"],
+    \\  "model_type": "qwen3",
+    \\  "hidden_size": 2048,
+    \\  "num_hidden_layers": 5,
+    \\  "num_attention_heads": 32,
+    \\  "num_key_value_heads": 8,
+    \\  "head_dim": 64,
+    \\  "intermediate_size": 6144,
+    \\  "rms_norm_eps": 1e-05,
+    \\  "vocab_size": 128000,
+    \\  "rope_theta": 10000000.0,
+    \\  "layer_types": ["full_attention", "full_attention", "full_attention", "full_attention", "full_attention"],
+    \\  "block_size": 9,
+    \\  "dflash_config": {"mask_token_id": 125017, "target_layer_ids": [2, 9, 17, 21, 27], "num_target_layers": 30},
+    \\  "markov_rank": 256,
+    \\  "rope_is_neox_style": false,
+    \\  "enable_confidence_head": true,
+    \\  "markov_head_type": "vanilla"
+    \\}
+;
+
+test "dflash: DSpark contract splits across root and dflash_config, and both halves are read" {
+    const allocator = testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, DSPARK_LFM2_CONFIG_JSON, .{});
+    defer parsed.deinit();
+    try testing.expect(isDflashConfigJson(parsed.value.object));
+
+    var cfg = try parseConfigFromJson(allocator, DSPARK_LFM2_CONFIG_JSON);
+    defer cfg.deinit(allocator);
+    // Declared 9 counts DRAFTS (DSpark reads the anchor row); the engine
+    // speaks verify width, so it normalizes to 10.
+    try testing.expectEqual(@as(u32, 10), cfg.block_size);
+    try testing.expect(cfg.anchor_row_drafts);
+    try testing.expectEqual(@as(u32, 125017), cfg.mask_token_id); // nested
+    try testing.expectEqualSlices(u32, &[_]u32{ 2, 9, 17, 21, 27 }, cfg.target_layer_ids);
+    // Root `rope_theta` — the muse/DFlash2 spelling nests it under
+    // `rope_parameters`, and reading only that silently drafts at theta 10000.
+    try testing.expectApproxEqAbs(@as(f32, 10000000.0), cfg.rope_theta, 1.0);
+    try testing.expect(cfg.rope_traditional);
+    try testing.expectEqual(@as(u32, 256), cfg.markov_rank);
+    try testing.expect(cfg.isDspark());
+    try testing.expect(!cfg.isDflash2());
+}
+
+test "dflash: a DSpark config with an unported markov head type is refused by name" {
+    const allocator = testing.allocator;
+    const gated = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, "\"vanilla\"", "\"gated\"");
+    defer allocator.free(gated);
+    try testing.expectError(error.UnsupportedMarkovHeadType, parseConfigFromJson(allocator, gated));
+}
 
 test "dflash: DFlash2 nested dflash_config contract parses with selector + conv fields" {
     const allocator = testing.allocator;

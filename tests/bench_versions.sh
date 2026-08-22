@@ -43,7 +43,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DEV_BIN="${DEV_BIN:-$ROOT/zig-out/bin/mlx-serve}"
 SHIPPED_BIN="${SHIPPED_BIN:-/Applications/MLX Core.app/Contents/MacOS/mlx-serve}"
-LLMPROBE="${LLMPROBE:-npx --yes llmprobe@0.4.3}"
+LLMPROBE="${LLMPROBE:-npx --yes llmprobe@latest}"
 PORT="${BENCH_PORT:-11260}"
 RUNS_ROOT="${RUNS_ROOT:-$HOME/claude-tmp/bench-versions}"
 
@@ -52,6 +52,7 @@ SKIP=""
 RESUME_TAG=""
 LIST=0
 FULL=0
+QUICK=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --only)    ONLY="$2"; shift 2 ;;
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --resume)  RESUME_TAG="$2"; shift 2 ;;
         --list)    LIST=1; shift ;;
         --full)    FULL=1; shift ;;   # ladder to 64k, median-of-3 per rung
+        --quick)   QUICK=1; shift ;;  # one rung (8k), one run: the iteration smoke
         --port)    PORT="$2"; shift 2 ;;
         -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -93,8 +95,7 @@ TARGETS=(
   "laguna-xs-nvfp4|$SSD/poolside/Laguna-XS-2.1-NVFP4-mlx||serial coder, 30/40 sliding @ sw 512; prefill-chunk win"
   "inkling-small-2bit|$SSD/mlx-community/Inkling-Small-mlx-2bit||serial MoE, 35/42 sliding @ sw 512; RelativeLogits bias"
   # ── controls: no sliding layers, so these must come out FLAT ──
-  "qwen36-27b-4bit|$SSD/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve||CONTROL: no sliding; in-dir mtp/ = native MTP"
-  "qwen36-35b-a3b-oq4|$MD/stamsam/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP|--mtp|CONTROL: no sliding; MoE target so MTP needs the flag"
+  "qwen38-27b-4bit|$SSD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit||CONTROL: no sliding; in-checkpoint MTP head; the round-cost table's home cell"
   "lfm2-2.6b-nvfp4|$SSD/mlx-community/LFM2.5-2.6B-nvfp4||CONTROL: hybrid conv+full attn, no sliding; cheap smoke"
 )
 
@@ -202,6 +203,7 @@ run_unit() {
 
     local depth=(--bench-only)
     [[ "$FULL" -eq 1 ]] && depth+=(--full)
+    [[ "$QUICK" -eq 1 ]] && depth+=(--rungs 8k --runs 1)
     echo -e "  ${DIM}[$arm]${NC} probing $mid"
     local rc=0
     # shellcheck disable=SC2086
@@ -236,7 +238,7 @@ echo "=== mlx-serve build A/B ==="
 echo "  shipped: $SHIPPED_BIN  ($(bin_stamp "$SHIPPED_BIN"))"
 echo "  dev:     $DEV_BIN  ($(bin_stamp "$DEV_BIN"))"
 echo "  run dir: $RUN_DIR"
-echo "  depth:   $([[ $FULL -eq 1 ]] && echo '--full (median of 3/rung, to 64k)' || echo 'one run/rung, to 16k')"
+echo "  depth:   $([[ $FULL -eq 1 ]] && echo '--full (median of 3/rung, to 64k)' || ([[ $QUICK -eq 1 ]] && echo '--quick (8k rung, one run)' || echo 'one run/rung, to 16k'))"
 echo "  pause:   touch $RUN_DIR/PAUSE"
 echo
 
