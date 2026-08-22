@@ -7147,7 +7147,8 @@ pub const Generator = struct {
         // inside a regime trial block (that block is the regime's own
         // measurement), and only while solo.
         if (mtpCostTableEnabled() and self.spec_cost_solo and self.mtp_ev_rounds >= self.mtp_regime.trial_end) {
-            if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free)) |target| {
+            const base_settled = self.spec_round_prev_width == plan.m_lo and self.spec_round_prev_width2 == plan.m_lo;
+            if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free, base_settled)) |target| {
                 const period = mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
                 if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period)) {
                     plan = mtpWidthTrialPlan(target);
@@ -7169,9 +7170,14 @@ pub const Generator = struct {
     /// the plan reads has not measured it, else an unmeasured m_lo+1 under
     /// any shape, else a periodic m_lo+1 on single-chunk plans. Null =
     /// nothing to try.
-    pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRoundPlan, cap: u32) ?u32 {
+    pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRoundPlan, cap: u32, base_settled: bool) ?u32 {
         const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
-        if (t.measuredMs(plan.m_lo, b) == null) return plan.m_lo;
+        // A single-chunk plan feeds its own base every round; only a
+        // two-chunk plan (extensions and syncs never feed) owes a trial of
+        // it — and only once the base has stopped climbing, or the first EV
+        // rounds trial widths the plan is merely passing through (M1 Pro
+        // 27B warm boot: one block at w3 in rep 1).
+        if (t.measuredMs(plan.m_lo, b) == null) return if (plan.m_hi > plan.m_lo and base_settled) plan.m_lo else null;
         // m_lo-1 is deliberately NOT trialled: every trial block is a 3-4%
         // hit on the request that carries it (peer cells, 2026-08-22), the
         // prior below the anchor already prices narrower widths, and the
@@ -11508,7 +11514,12 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     const src1 = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 10000, &t1);
     try testing.expectEqual(@as(u32, 4), Generator.mtpEvPlanSrc(&a, 8, src1, 8).m_hi);
     // ...and the trial stops asking for it (two-chunk plan, nothing owed).
-    try testing.expect(Generator.mtpWidthTrialTarget(&t1, 10000, .{ .m_lo = 4, .m_hi = 5, .tau_ln = 0 }, 8) == null);
+    try testing.expect(Generator.mtpWidthTrialTarget(&t1, 10000, .{ .m_lo = 4, .m_hi = 5, .tau_ln = 0 }, 8, true) == null);
+    // An unmeasured base is trialled only under a two-chunk plan with a settled base.
+    const empty_t = round_cost.Table{};
+    try testing.expect(Generator.mtpWidthTrialTarget(&empty_t, 1000, .{ .m_lo = 3, .m_hi = 3, .tau_ln = 0 }, 8, true) == null);
+    try testing.expect(Generator.mtpWidthTrialTarget(&empty_t, 1000, .{ .m_lo = 3, .m_hi = 5, .tau_ln = 0 }, 8, false) == null);
+    try testing.expectEqual(@as(u32, 3), Generator.mtpWidthTrialTarget(&empty_t, 1000, .{ .m_lo = 3, .m_hi = 5, .tau_ln = 0 }, 8, true).?);
     try testing.expect(Generator.mtpWidthTrialPeriod(&t1, 10000, 4) >= 100);
     // An inactive bucket with no active neighbour is the prior, verbatim.
     const empty = round_cost.Table{};
@@ -11577,7 +11588,7 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
         const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, &t);
         var plan = Generator.mtpEvPlanSrc(&a, 8, src, m_lo_prev + 1);
         m_lo_prev = plan.m_lo;
-        if (Generator.mtpWidthTrialTarget(&t, 1000, plan, 8)) |target| {
+        if (Generator.mtpWidthTrialTarget(&t, 1000, plan, 8, prev == plan.m_lo and prev2 == plan.m_lo)) |target| {
             if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo))) plan = Generator.mtpWidthTrialPlan(target);
         }
         // Run it: a two-chunk plan extends (confidence is high), so the
