@@ -7214,8 +7214,12 @@ pub const Generator = struct {
     /// either is unmeasured, so an unknown width is learned soon.
     pub fn mtpWidthTrialPeriod(t: *const round_cost.Table, kv_len: u32, m_lo: u32) u32 {
         const b = t.bucketToRead(kv_len) orelse return round_cost.EXPLORE_PERIOD_COLD;
-        // Raw on the target: a clearly-worse single sample already sizes
-        // the gap (and the long period that goes with it).
+        // An untrusted target keeps the cold period until it is either
+        // trusted or settled as clearly worse (then its raw sample sizes
+        // the gap): a raw 10%-better w5 read as a 60-round period and no
+        // 22-round request ever trialled it again (M4 Max 27B, w5 stuck
+        // at one sample).
+        if (t.msPerTok(m_lo + 1, b) == null and !t.clearlyWorse(m_lo + 1, m_lo, b)) return round_cost.EXPLORE_PERIOD_COLD;
         return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.rawMsPerTok(m_lo + 1, b));
     }
 
@@ -11553,6 +11557,11 @@ test "mtpWidthTrial: blocks per period, idempotent per round, period grows with 
         _ = t.observe(5, 1000, 55.0, 5.0, true, false);
     }
     try testing.expectEqual(@as(u32, 60), Generator.mtpWidthTrialPeriod(&t, 1000, 4));
+    // One better-looking sample is not a period: cold until trusted.
+    var u = round_cost.Table{};
+    for (0..round_cost.MIN_SAMPLES) |_| _ = u.observe(4, 1000, 40.0, 4.0, true, false);
+    _ = u.observe(5, 1000, 45.0, 5.0, true, false);
+    try testing.expectEqual(round_cost.EXPLORE_PERIOD_COLD, Generator.mtpWidthTrialPeriod(&u, 1000, 4));
     for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(6, 1000, 90.0, 6.0, true, false);
     try testing.expectEqual(@as(u32, 219), Generator.mtpWidthTrialPeriod(&t, 1000, 5));
 }
