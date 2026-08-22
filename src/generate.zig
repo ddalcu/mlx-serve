@@ -6261,7 +6261,12 @@ pub const Generator = struct {
                         const slope = (t.lastSlope(self.bucket) orelse 0.0) * self.scale;
                         var c = t.measuredMs(w, self.bucket).? * self.scale;
                         var k: u32 = w + 1;
-                        while (k <= m) : (k += 1) c += @max(slope, mtpEvMarginalCostAt(self.costs, k, self.kv_len));
+                        while (k <= m) : (k += 1) {
+                            c += @max(slope, mtpEvMarginalCostAt(self.costs, k, self.kv_len));
+                            // One sample is evidence for WORSE, never for
+                            // cheaper: an untrusted cell floors the cost.
+                            if (t.rawMs(k, self.bucket)) |raw| c = @max(c, raw * self.scale);
+                        }
                         return c + sync;
                     }
                 }
@@ -7154,9 +7159,12 @@ pub const Generator = struct {
         // An unmeasured m_lo+1 is measured under ANY shape: a two-chunk
         // plan extends there every round on echo, blind to its cost (the
         // M1 Pro 27B's 4 -> 5 at +150 ms); the regime gate would catch it,
-        // the table should know it. A measured one is re-tried only where
-        // a single-chunk plan cannot otherwise reach it.
-        if (t.measuredMs(plan.m_lo + 1, b) == null or plan.m_hi == plan.m_lo) return plan.m_lo + 1;
+        // the table should know it — unless its first sample already
+        // settled it as clearly worse. A settled one is re-tried only where
+        // a single-chunk plan cannot otherwise reach it, at the long period.
+        const up = plan.m_lo + 1;
+        if (t.measuredMs(up, b) == null and !t.clearlyWorse(up, plan.m_lo, b)) return up;
+        if (plan.m_hi == plan.m_lo) return up;
         return null;
     }
 
@@ -7175,7 +7183,9 @@ pub const Generator = struct {
     /// either is unmeasured, so an unknown width is learned soon.
     pub fn mtpWidthTrialPeriod(t: *const round_cost.Table, kv_len: u32, m_lo: u32) u32 {
         const b = t.bucketToRead(kv_len) orelse return round_cost.EXPLORE_PERIOD_COLD;
-        return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.msPerTok(m_lo + 1, b));
+        // Raw on the target: a clearly-worse single sample already sizes
+        // the gap (and the long period that goes with it).
+        return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.rawMsPerTok(m_lo + 1, b));
     }
 
     /// Track the only evidence that can justify sticky-disable: whether the
@@ -11466,6 +11476,18 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     const measured = Generator.mtpEvPlanSrc(&a, 8, src, 8);
     try testing.expectEqual(@as(u32, 4), measured.m_hi);
     try testing.expect(measured.m_lo <= 4);
+    // ONE sample at the cliff (untrusted) already floors the horizon.
+    var t1 = round_cost.Table{};
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = t1.observe(3, 10000, 60.0, 4.0, true, false);
+        _ = t1.observe(4, 10000, 70.0, 5.0, true, false);
+    }
+    _ = t1.observe(5, 10000, 220.0, 6.0, true, false);
+    const src1 = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 10000, &t1);
+    try testing.expectEqual(@as(u32, 4), Generator.mtpEvPlanSrc(&a, 8, src1, 8).m_hi);
+    // ...and the trial stops asking for it (two-chunk plan, nothing owed).
+    try testing.expect(Generator.mtpWidthTrialTarget(&t1, 10000, .{ .m_lo = 4, .m_hi = 5, .tau_ln = 0 }, 8) == null);
+    try testing.expect(Generator.mtpWidthTrialPeriod(&t1, 10000, 4) >= 100);
     // An inactive bucket with no active neighbour is the prior, verbatim.
     const empty = round_cost.Table{};
     const cold = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 10000, &empty);
@@ -11557,8 +11579,10 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     for (picked, 0..) |n, w| {
         if (n >= 3) try testing.expect(t.measuredMs(@intCast(w), 0) != null);
     }
-    // The cliff was found (5 measured) and the loop settled under it.
-    try testing.expect(t.measuredMs(5, 0) != null);
+    // The cliff was found from ONE sample (clearly worse: never trusted,
+    // never re-trialled at the cold period) and the loop settled under it.
+    try testing.expect(t.rawMs(5, 0) != null);
+    try testing.expect(t.clearlyWorse(5, 4, 0));
     try testing.expect(t.measuredMs(4, 0) != null);
     try testing.expect(last_m == 4);
     try testing.expect(picked[4] > 450);
@@ -11566,7 +11590,7 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     // (live, the regime gate throttles that shape; the sim has no gate), so
     // the bar is the settled tail: from round 200 on, width 5 appears only
     // as scheduled re-trial blocks (period capped at 128).
-    try testing.expect(late_wide <= 4 * round_cost.EXPLORE_BLOCK);
+    try testing.expect(late_wide <= 2 * round_cost.EXPLORE_BLOCK);
     try testing.expect(picked[6] + picked[7] + picked[8] <= 4); // the prior's first rounds only
     // Identity: forced rounds == 2 * trials (each block is 2 rounds).
     try testing.expect(wt.trials >= 2);

@@ -38,6 +38,12 @@ pub const MIN_WIDTHS: u32 = 2;
 /// cell on the M4 base 9B, activated the table on {w2, w4} and anchored it
 /// at 2 — the plan then read w3 as a bargain and lost 6.6%).
 pub const MIN_SAMPLES: u32 = 3;
+/// A width whose FIRST sample already reads this much worse per token than
+/// a trusted reference is settled as worse: the plan only needs "not
+/// better", and every further trial block of it is a 3-4% hit on the
+/// request that carries it (M1 Pro 27B: w5 read 94.7 against w4's 71.2 on
+/// sample 1 and never moved; at 3-samples-to-trust that cost -7.1%).
+pub const CLEARLY_WORSE: f32 = 0.20;
 
 pub fn bucketFor(kv_len: u32) usize {
     for (BUCKET_EDGES, 0..) |edge, i| {
@@ -141,6 +147,26 @@ pub const Table = struct {
 
     pub fn msPerTok(self: *const Table, width: u32, bucket: usize) ?f32 {
         return if (self.trusted(width, bucket)) self.cells[width][bucket].msPerTok() else null;
+    }
+
+    /// Round ms / ms per token from ANY folded cell (n >= 1): evidence for
+    /// "worse", never for "better".
+    pub fn rawMs(self: *const Table, width: u32, bucket: usize) ?f32 {
+        if (width > MAX_WIDTH or self.cells[width][bucket].n == 0) return null;
+        return self.cells[width][bucket].ms;
+    }
+
+    pub fn rawMsPerTok(self: *const Table, width: u32, bucket: usize) ?f32 {
+        if (width > MAX_WIDTH) return null;
+        return self.cells[width][bucket].msPerTok();
+    }
+
+    /// `width` has at least one sample and reads CLEARLY_WORSE per token
+    /// than trusted `ref`.
+    pub fn clearlyWorse(self: *const Table, width: u32, ref: u32, bucket: usize) bool {
+        const w = self.rawMsPerTok(width, bucket) orelse return false;
+        const r = self.msPerTok(ref, bucket) orelse return false;
+        return w >= r * (1.0 + CLEARLY_WORSE);
     }
 
     pub fn measuredCount(self: *const Table, bucket: usize) u32 {
@@ -411,8 +437,8 @@ pub const WidthChooser = struct {
     pub fn trialTarget(self: *const WidthChooser, t: *const Table, bucket: usize) ?u32 {
         if (self.current == 0) return null;
         if (t.measuredMs(self.current, bucket) == null) return self.current;
-        if (self.current > 1 and t.measuredMs(self.current - 1, bucket) == null) return self.current - 1;
-        if (self.current < self.max_width and t.measuredMs(self.current + 1, bucket) == null) return self.current + 1;
+        if (self.current > 1 and t.measuredMs(self.current - 1, bucket) == null and !t.clearlyWorse(self.current - 1, self.current, bucket)) return self.current - 1;
+        if (self.current < self.max_width and t.measuredMs(self.current + 1, bucket) == null and !t.clearlyWorse(self.current + 1, self.current, bucket)) return self.current + 1;
         return null;
     }
 
@@ -771,4 +797,18 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     try testing.expect(parse("") == null);
     var kb: [64]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc1-"));
+}
+
+test "round_cost: a clearly worse first sample settles a width" {
+    var t = Table{};
+    feed(&t, 4, 1000, 70.0, 5.0);
+    try testing.expect(!t.clearlyWorse(5, 4, 0)); // unsampled: unknown
+    _ = t.observe(5, 1000, 110.0, 6.0, true, false); // 18.3 vs 14.0 ms/tok = +31%
+    try testing.expect(t.clearlyWorse(5, 4, 0));
+    try testing.expect(t.measuredMs(5, 0) == null); // still not trusted for the plan's cost
+    try testing.expectApproxEqAbs(110.0, t.rawMs(5, 0).?, 1e-4);
+    var u = Table{};
+    feed(&u, 4, 1000, 70.0, 5.0);
+    _ = u.observe(5, 1000, 86.0, 6.0, true, false); // 14.3 vs 14.0: noise, keep trialling
+    try testing.expect(!u.clearlyWorse(5, 4, 0));
 }
