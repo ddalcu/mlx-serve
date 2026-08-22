@@ -15574,6 +15574,50 @@ fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return w_t;
 }
 
+/// A depthwise conv weight is `[C, K, 1]` in MLX and `[C, 1, K]` in torch, and
+/// which one a checkpoint ships is a CONVERTER choice, not an arch property:
+/// mlx_lm's LFM2 conversion writes the MLX layout, while LiquidAI's own bf16
+/// repos (LFM2.5-1.2B-Instruct, LFM2.5-2.6B) ship the torch one straight out of
+/// the training code. This is the `patchProjLayout` class, with one mercy —
+/// reading it wrong is not a plausible-but-wrong number, it is a hard abort:
+/// mlx_conv1d solves in_channels off the LAST axis, so a [2048, 1, 3] weight at
+/// groups=2048 demands 6144 input channels and kills the load at warmup.
+///
+/// `K == 1` is the one shape the layouts share, and it is its own transpose.
+pub fn depthwiseConvNeedsTranspose(shape: []const c_int) bool {
+    if (shape.len != 3) return false;
+    return shape[1] == 1 and shape[2] > 1;
+}
+
+/// One-shot so a mixed-converter library says which layout it found, once.
+var depthwise_conv_layout_logged: bool = false;
+
+/// In-place: swap a torch-layout depthwise conv weight into the layout the
+/// forward's `mlx_conv1d` contracts against, recording the new array in `owned`
+/// so `Transformer.deinit` frees it.
+fn maybeTransposeDepthwiseConv(
+    w: *mlx.mlx_array,
+    owned: *std.ArrayList(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !void {
+    if (w.ctx == null) return;
+    if (!depthwiseConvNeedsTranspose(mlx.getShape(w.*))) return;
+    const perm = [_]c_int{ 0, 2, 1 };
+    var w_t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, w.*, &perm, 3, s));
+    // A transpose is a VIEW; the conv reads raw row-major bytes, so materialize.
+    var w_c = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&w_c, w_t, false, s));
+    _ = mlx.mlx_array_free(w_t);
+    w.* = w_c;
+    try owned.append(allocator, w_c);
+    if (!depthwise_conv_layout_logged) {
+        depthwise_conv_layout_logged = true;
+        log.info("[conv] depthwise weights are torch-layout [C, 1, K] — transposed at load\n", .{});
+    }
+}
+
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
 /// array in `owned` so we can free it on Transformer.deinit.
@@ -16554,6 +16598,7 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     .out_proj_s = getLayerScaleOpt(weights, name_buf, prefix, li, "conv.out_proj.scales"),
                     .out_proj_b = getLayerBias(weights, name_buf, prefix, li, "conv.out_proj.biases", &config),
                 } };
+                try maybeTransposeDepthwiseConv(&lw.op.gated_conv.conv_w, &owned_bf16, allocator, s);
             },
             .attention => {
                 if (is_nemotron) {
@@ -32332,6 +32377,86 @@ test "hybrid init loads a DENSE bf16 checkpoint (LFM2.5-2.6B-bf16)" {
     try std.testing.expect(mlp.gate_s.ctx == null);
     try std.testing.expectEqualSlices(c_int, &.{ H, FF }, mlx.getShape(mlp.gate_w));
     try std.testing.expectEqualSlices(c_int, &.{ FF, H }, mlx.getShape(mlp.down_w));
+}
+
+test "depthwiseConvNeedsTranspose reads the LAYOUT, not the arch" {
+    const t = std.testing;
+    // MLX layout [C, K, 1] — what mlx_lm's LFM2 conversion writes. Leave it.
+    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 3, 1 }));
+    // Torch layout [C, 1, K] — what LiquidAI's own bf16 repos ship.
+    try t.expect(depthwiseConvNeedsTranspose(&.{ 2048, 1, 3 }));
+    try t.expect(depthwiseConvNeedsTranspose(&.{ 8, 1, 4 }));
+    // K == 1 is the one ambiguous shape, and it is its own transpose.
+    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 1, 1 }));
+    // Not a depthwise conv weight at all.
+    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 3 }));
+}
+
+test "hybrid init accepts a TORCH-layout depthwise conv (LiquidAI LFM2.5 bf16)" {
+    // Live 2026-08-22: LFM2.5-1.2B-Instruct and LFM2.5-2.6B, downloaded
+    // straight from LiquidAI, both died at warmup with
+    //   "Given groups=2048 and weights of shape (2048,1,3), expected to have
+    //    6144 input channels but got 2048"
+    // because the loader assumed every checkpoint had been through an mlx_lm
+    // conversion. Same weights, same arch, different converter.
+    const allocator = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const put = struct {
+        fn add(weights: *Weights, alloc: std.mem.Allocator, name: []const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const vals = try alloc.alloc(f32, n);
+            defer alloc.free(vals);
+            @memset(vals, 0.5);
+            const f32_arr = mlx.mlx_array_new_data(vals.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var bf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+            try weights.map.put(try alloc.dupe(u8, name), bf);
+        }
+    }.add;
+
+    const H: c_int = 8;
+    const FF: c_int = 16;
+    const P = "language_model.model";
+    const pre = P ++ ".layers.0.";
+    try put(&w, allocator, pre ++ "operator_norm.weight", &.{H}, s);
+    try put(&w, allocator, pre ++ "ffn_norm.weight", &.{H}, s);
+    try put(&w, allocator, pre ++ "feed_forward.w1.weight", &.{ FF, H }, s);
+    try put(&w, allocator, pre ++ "feed_forward.w3.weight", &.{ FF, H }, s);
+    try put(&w, allocator, pre ++ "feed_forward.w2.weight", &.{ H, FF }, s);
+    try put(&w, allocator, pre ++ "conv.in_proj.weight", &.{ 3 * H, H }, s);
+    // The whole point: torch's [C, 1, K], not MLX's [C, K, 1].
+    try put(&w, allocator, pre ++ "conv.conv.weight", &.{ H, 1, 3 }, s);
+    try put(&w, allocator, pre ++ "conv.out_proj.weight", &.{ H, H }, s);
+
+    var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = P };
+    config.has_hybrid_layers = true;
+    config.num_hidden_layers = 1;
+    config.hidden_size = @intCast(H);
+    config.quant_bits = 0;
+    config.layer_block_types[0] = .gated_conv;
+
+    var name_buf: [256]u8 = undefined;
+    const hl = try initHybridLayers(allocator, config, &w, &name_buf, s);
+    defer {
+        allocator.free(hl.hybrid_layers);
+        for (hl.ssm_entries) |*e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        allocator.free(hl.ssm_entries);
+        for (hl.owned_bf16) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(hl.owned_bf16);
+    }
+
+    // It must arrive at the forward in the layout mlx_conv1d solves against.
+    const cw = hl.hybrid_layers[0].op.gated_conv;
+    try std.testing.expectEqualSlices(c_int, &.{ H, 3, 1 }, mlx.getShape(cw.conv_w));
 }
 
 test "no layer-init path DEMANDS quantization scales" {
