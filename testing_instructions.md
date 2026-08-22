@@ -1,31 +1,15 @@
-# Testing instructions — spec-decode width, per chip
+# Testing instructions — spec-decode width on your hardware
 
-Two of mlx-serve's speculative-decode settings are **per-silicon measurements**,
-not formulas: the MTP draft depth cap and the DFlash/DSpark block. Each row in
-those tables is a number somebody measured on one machine. If your chip has no
-row, you get a conservative default that is probably leaving speed on the table.
+mlx-serve no longer needs a per-chip table row from you. The speculative-decode
+width (MTP draft depth, DFlash/DSpark block) is **measured on your machine while
+it serves**: every round's cost and yield goes into a per-(chip, model, quant,
+OS) table under `~/.mlx-serve/round-cost/`, the plan reads it, and the file
+survives reboots. A chip with no hand-typed row starts from a default cap and
+converges on its own; the few rows that exist (M1 Pro, base M4/M5, M3 Ultra)
+only shape the FIRST boot.
 
-This page is how you measure your chip in ~15 minutes and send us the row.
-
----
-
-## Chips we need numbers for
-
-Run the tests marked for your chip and open a PR (or an issue) with the output.
-
-| Chip | What is unknown | Run |
-|---|---|---|
-| **M1 / M1 Max / M1 Ultra** | both caps (only M1 **Pro** was measured, depth 4) | 1, 2, 3 |
-| **M2 / Pro / Max / Ultra** | both caps — no rows at all | 1, 2, 3 |
-| **M3 / Pro / Max** | depth cap; block only measured on M3 **Ultra** | 1, 2, 3 |
-| **M3 Ultra** | depth cap (block row exists: 8) | 1, 2 |
-| **M4 Pro** | both (M4 base and M4 Max are done) | 1, 2, 3 |
-| **M5 Pro / Max / Ultra** | depth cap (base M5 is 4; the dies are their own rows) | 1, 2 |
-| **anything newer** | everything | 1, 2, 3 |
-
-Already measured, no need to re-run unless you think a row is wrong:
-M4 Max (depth 6, block 5), M3 Ultra (block 8), M1 Pro (depth 4),
-M5 base (depth 4), M4 base (depth 4).
+What is still worth sending from hardware we do not have: proof that it
+converges there, and the before/after. That is ~10 minutes.
 
 ---
 
@@ -33,8 +17,9 @@ M5 base (depth 4), M4 base (depth 4).
 
 Checkout github.com/ddalcu/mlx-serve  chore/fixes-lfm-dflash-auto-draft
 
-Any checkpoint with an MTP head works. A 27B on a 64 GB+ machine, something
-smaller otherwise — the *shape* of the answer is what we want, not the tok/s.
+Any checkpoint with an MTP head works (a Qwen3.8 pack), or one with a DFlash /
+DSpark `drafter/` subdirectory (LFM2.5). A 27B on a 64 GB+ machine, something
+smaller otherwise.
 
 ```bash
 MODEL=/path/to/your/model          # e.g. a Qwen3.8 pack with an MTP head
@@ -72,72 +57,43 @@ the per-silicon row that caps the FIRST boot (the table may plan above it once
 a width is measured). `MLX_SERVE_MTP_COST_TABLE=0` is the control arm (the
 old controller), `MLX_SERVE_ROUND_COST_PERSIST=0` disables the file.
 
-## Test 2 — MTP depth cap
+## Test 2 — before/after on an echo prompt (5 minutes)
 
-`--mtp-depth` is a **cap**, not a fixed depth: the controller picks a depth
-within `[1, cap]` every round, and **no env pins it** — `MLX_SERVE_MTP_ADAPTIVE=0`
-only swaps one controller for another, which still moves. So the cap can only be
-measured on a prompt whose acceptance is high enough to push the controller
-against it. That means an **echo** prompt (ask the model to reproduce a passage
-verbatim). On ordinary prose the controller sits at depth ~2 whatever the cap is,
-every depth reads the same, and the table is worthless — one tester's first
-attempt produced byte-identical `[spec-stats]` at depths 3, 5, 6, 7 and 8.
-
-Confirm from the `[spec-stats]` line that `avg_per_round` actually reaches the
-depth you asked for. If it does not, the cap never bound and that row is not a
-measurement of that depth.
+Same server flags, two boots: the table OFF (the old controller) and ON
+(default). Three requests each; the ON boot's LAST request is the number that
+matters (the first one may carry a trial block). Warm is the realistic state —
+do not delete `~/.mlx-serve/round-cost` between boots.
 
 ```bash
-# An ECHO prompt: acceptance is high, so the cap binds and the sweep means
-# something. Do NOT use ordinary prose here (see above).
 cat > prompt.json <<'JSON'
 {"model":"MODEL_ID","temperature":0,"max_tokens":300,"stream":false,
  "messages":[{"role":"user","content":"Repeat the following text back to me exactly, three times in a row:\n\nThe quick brown fox jumps over the lazy dog while the diligent engineer measures the throughput of a speculative decoder on a laptop that is plugged into the wall and not running on battery power."}]}
 JSON
 # replace MODEL_ID with the id from: curl -s localhost:11250/v1/models
 
-for d in 3 4 5 6 7 8; do
-  stop; serve --mtp-depth $d
-  for r in 1 2; do
+for arm in off on; do
+  stop; [[ $arm == off ]] && export MLX_SERVE_MTP_COST_TABLE=0 || unset MLX_SERVE_MTP_COST_TABLE
+  serve
+  for r in 1 2 3; do
     curl -s -X POST http://127.0.0.1:11250/v1/chat/completions \
       -H 'Content-Type: application/json' -d @prompt.json \
-      | python3 -c "import json,sys;d=json.load(sys.stdin);print('depth $d rep $r: %.2f tok/s' % d['timings']['predicted_per_second'])"
+      | python3 -c "import json,sys;d=json.load(sys.stdin);print('$arm rep $r: %.2f tok/s' % d['timings']['predicted_per_second'])"
+    grep -a "spec-stats" srv.log | tail -1
   done
-  grep -a "spec-stats" srv.log | tail -1     # avg_per_round must reach $d
 done
 stop
 ```
 
-Report the **best of the two reps** per depth, and the `[spec-stats]` line with
-it. Ignore rep 1 if it is much slower than rep 2 — that one paid the kernel
-compile. If a `[spec-stats]` line shows a depth other than the one you asked
-for, drop that row rather than sending it: the controller moved and the number
-is not a measurement of that depth.
+An echo prompt is deliberate: acceptance is high, so the width actually
+matters. On ordinary prose both arms sit at a shallow depth and read the same.
 
-## Test 3 — DFlash block size
+## Test 3 — DFlash / DSpark block chooser (optional, opt-in feature)
 
-Only if you have a DFlash/DSpark drafter sidecar (a `drafter/` subdirectory in
-the model, or one passed with `--drafter`). This knob is a real fixed width —
-no controller moves it — but it only clamps **downward** against the block the
-sidecar was trained at, so values above that are silently no-ops. The
-`DFlash drafter ready (block_size=N...)` line in `srv.log` says what you got.
-
-```bash
-for b in 3 4 5 6 7 8; do
-  stop; serve --draft-block-size $b
-  for r in 1 2; do
-    curl -s -X POST http://127.0.0.1:11250/v1/chat/completions \
-      -H 'Content-Type: application/json' -d @prompt.json \
-      | python3 -c "import json,sys;d=json.load(sys.stdin);print('block $b rep $r: %.2f tok/s' % d['timings']['predicted_per_second'])"
-  done
-  grep -a "spec-stats" srv.log | tail -1
-done
-stop
-```
-
-The `[spec-stats]` line matters as much as the tok/s: it shows how many drafts
-were accepted. A wider block that accepts no more tokens is a loss even when it
-looks cheap.
+Only with a drafter sidecar. The per-round block chooser is off by default;
+run Test 2's loop with `MLX_SERVE_DFLASH_CHOOSER=1` as the ON arm (and without
+it as OFF). Paste the `[dflash] width chooser:` lines and the `block_hist=`
+field: that is where the chooser tells you which widths it tried and settled
+on. A MoE target (LFM2.5-8B-A1B) is the known rough edge — report it either way.
 
 ---
 
@@ -151,22 +107,21 @@ macOS:       26.2                  (sysctl -n kern.osproductversion)
 Model:       <repo/name>, <quant>
 Power:       AC
 
-Test 1 table:
-  [mtp] adaptive depth cap .. (<row>, default 6)
+Test 1:
+  [mtp] adaptive depth cap .. (<row or default>)
   [spec-stats] ... width_trials=.. table=<2k:w4:../.., w5:../..
   ~/.mlx-serve/round-cost/<key>.txt contents
 
-Test 2 (decode tok/s, echo prompt, best of 2 or median of 5):
-  depth 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..
-  avg_per_round per depth: ..      ext_rounds per depth: ..
+Test 2 (decode tok/s, echo prompt):
+  off: rep1 .. rep2 .. rep3 ..     on: rep1 .. rep2 .. rep3 ..
+  the on arm's last [spec-stats] line
 
-Test 3 (decode tok/s, best of 2, if you ran it):
-  block 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..
-  accepted/round at the best block: ..
+Test 3 (if you ran it): on/off tok/s + the [dflash] width chooser lines
 ```
 
-A row lands only where somebody measured it — we never interpolate between
-chips, and we would rather have your six numbers than a guess.
+A loss is as useful as a win: the table is supposed to cost nothing where the
+default was already right, and the cases where it does not are the ones we
+cannot see from here.
 
 ---
 
