@@ -588,9 +588,33 @@ struct ChatSidebar: View {
     /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
     /// shared menu body, which needs it.
     @StateObject private var cliDetector = CLILauncher()
+    // Conversation search + rename + export. The rename alert is the ONLY
+    // alert on this window branch (one-alert-per-window rule), so it can own
+    // its presentation outright.
+    @State private var sidebarQuery = ""
+    @State private var renamingId: UUID?
+    @State private var renameText = ""
 
     var body: some View {
         conversationsSidebar
+            // The sidebar's rename dialog. The ONLY alert on this branch of the
+            // chat window, so the one-alert-per-window rule is satisfied by
+            // construction. Bound to `renamingId != nil` so Cancel and Esc both
+            // clear WHICH row was being renamed.
+            .alert("Rename Conversation",
+                   isPresented: Binding(get: { renamingId != nil },
+                                        set: { if !$0 { renamingId = nil } })) {
+                TextField("Name", text: $renameText)
+                Button("Cancel", role: .cancel) { renamingId = nil }
+                Button("Rename") {
+                    if let id = renamingId {
+                        appState.renameSession(id, title: renameText)
+                    }
+                    renamingId = nil
+                }
+            } message: {
+                Text("Choose a name for this conversation. Agent threads keep the agent's name as their title; this becomes the line beneath it.")
+            }
     }
 
     private var conversationsSidebar: some View {
@@ -613,7 +637,8 @@ struct ChatSidebar: View {
             // Two sections, one row builder. Agent threads sit above the plain
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
-            let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+            let groups = SidebarSessionGroups.split(
+                SidebarSearch.filter(sessions: appState.visibleChatSessions, query: sidebarQuery))
             LazyVStack(alignment: .leading, spacing: 2) {
                 if !groups.agents.isEmpty {
                     sectionHeader("Agents")
@@ -624,6 +649,15 @@ struct ChatSidebar: View {
                 sectionHeader("Chats")
                 ForEach(groups.chats) { session in
                     sessionRow(session)
+                }
+                if SidebarSearch.isFiltering(sidebarQuery),
+                   groups.agents.isEmpty, groups.chats.isEmpty {
+                    Text("No matching conversations")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+                        .padding(.top, 8)
                 }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
@@ -700,6 +734,12 @@ struct ChatSidebar: View {
                 // invented pane with one list in it.
                 codeLauncherRow
 
+                // Conversation search, pinned above the list it filters (the
+                // Notes pattern): titles and transcript text, case- and
+                // diacritic-insensitive.
+                sidebarSearchField
+                    .padding(.top, 10)
+
                 // No "Chats" heading here: the list carries its own section
                 // headers ("Agents", "Chats"), and one of them appears only
                 // when it has rows. A heading pinned in this inset could not
@@ -718,9 +758,56 @@ struct ChatSidebar: View {
         }
     }
 
+    /// The conversation search field. Same left/right edges as the rows under
+    /// it, one plain capsule — it is a filter for the list below, not a
+    /// destination of its own.
+    private var sidebarSearchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            TextField("Search chats", text: $sidebarQuery)
+                .textFieldStyle(.plain)
+                .font(.subheadline)
+            if SidebarSearch.isFiltering(sidebarQuery) {
+                Button {
+                    sidebarQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+        }
+        .padding(.horizontal, ChatMetrics.sidebarRowInset + 2)
+        .padding(.vertical, 5)
+        .background(
+            Capsule().fill(Color(.controlBackgroundColor).opacity(0.7))
+        )
+    }
+
+    /// Write the conversation out as Markdown through a save panel. The panel's
+    /// own grant is what lets a sandboxed build write outside its container.
+    private func exportSession(_ session: ChatSession) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = ChatExport.suggestedFilename(title: session.title)
+        let markdown = ChatExport.markdown(
+            title: ChatSessionTitle.display(title: session.title,
+                                            agentName: appState.agents.agent(id: session.agentId)?.name),
+            messages: session.messages,
+            dateText: Date.now.formatted(date: .long, time: .omitted))
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            try? markdown.data(using: .utf8)?.write(to: url, options: .atomic)
+        }
+    }
+
     /// A section heading, sitting on the same left edge as the rows under it.
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title)
+    private func sectionHeader(_ title: String) -> some View {        Text(title)
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -837,6 +924,14 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
+            Button("Rename…") {
+                renameText = session.title
+                renamingId = session.id
+            }
+            Button("Export as Markdown…") {
+                exportSession(session)
+            }
+            Divider()
             Button("Delete", role: .destructive) {
                 appState.deleteSession(session.id)
             }
@@ -982,10 +1077,22 @@ struct ChatDetailView: View {
     // id — the view is reused across tabs).
     @State private var pendingIntentPrompt: IntentPrompt?
     @State private var intentSuppress = SessionIntentSuppression()
-
+    // Per-tab composer drafts. The view is REUSED across tabs, so without a
+    // keyed store a half-typed message in one chat rode along when you switched
+    // to another — and sending it there was one Return key away.
+    @State private var drafts = ComposerDrafts()
 
     private var session: ChatSession? {
         appState.chatSessions.first { $0.id == sessionId }
+    }
+
+    /// The id of the conversation's LAST reply (failure cards don't count as
+    /// replies). Regenerate is offered on THAT row only: rewinding a middle turn
+    /// would orphan every answer after it.
+    private var lastReplyId: UUID? {
+        session?.messages.last(where: {
+            $0.role == .assistant && !$0.failedRetry && $0.errorNotice == nil && !$0.isStreaming
+        })?.id
     }
 
     /// Generation state for THIS chat. The engine runs one turn at a time, so a
@@ -1486,7 +1593,13 @@ struct ChatDetailView: View {
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    })
+                                    },
+                                    onRegenerate: canRegenerate(rowId: m.id) ? { regenerateLast() } : nil,
+                                    onEditResend: (m.role == .user && !m.isStreaming
+                                                   && !isExternalBridgeSession)
+                                        ? { newText in editResend(messageId: m.id, newText: newText) }
+                                        : nil,
+                                    onForkFromHere: canFork ? { fork(from: m.id) } : nil)
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -1730,6 +1843,8 @@ struct ChatDetailView: View {
             inputFocused = true
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            // A draft saved when you left this tab comes back with it.
+            inputText = drafts.restore(for: sessionId)
             applyScroll(.transcriptShown)
             // Cmd+V into the focused chat input: if the clipboard holds an image,
             // PDF, or folder, attach it (same as the attach button / drag-drop)
@@ -1803,13 +1918,18 @@ struct ChatDetailView: View {
         .onChange(of: composerState) { _, state in
             if state == .idle { inputFocused = true }
         }
-        .onChange(of: sessionId) { _, _ in
+        .onChange(of: sessionId) { oldId, newId in
             // The view is reused across tabs, so reload the toolbar toggles from
             // the newly-visible session. The allow-list is NOT reset here — it's
             // keyed by session id, so each tab keeps its own decision across
             // switches (a session re-arms only when its Agent toggle goes off).
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            // Drafts are per tab: stash what the outgoing field holds, restore
+            // what the incoming one saved. (Without this, a half-typed message
+            // silently rode across tab switches.)
+            drafts.stash(inputText, for: oldId)
+            inputText = drafts.restore(for: newId)
             // Scroll state is per-view, and the view is reused across tabs — so
             // without this, leaving one chat scrolled up opened the next one
             // unpinned at whatever offset the previous conversation's content
@@ -2434,13 +2554,26 @@ struct ChatDetailView: View {
         guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
               composerState != .generatingHere, server.status == .running else { return }
         inputText = ""
+        drafts.clear(for: sessionId)
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
-        // any) overrides what it declared. One builder, so no field is read from
-        // a global here — see ChatTurnEngine.TurnConfig.
+        chatEngine.runTurn(sessionId: sessionId, userText: text,
+                           images: attachedImages, audio: attachedAudio,
+                           config: currentTurnConfig(),
+                           approval: { await requestToolApproval($0) })
+        // Your own message always wins: sending from halfway up the history used
+        // to leave you exactly there, because auto-follow was off and nothing
+        // else scrolled.
+        applyScroll(.userSentMessage)
+    }
+
+    /// The TurnConfig every turn from THIS surface uses — fresh sends and
+    /// re-runs alike. The toolbar toggles are the surface's DEFAULTS; the tab's
+    /// agent (if any) overrides what it declared. One builder, so no field is
+    /// read from a global here — see ChatTurnEngine.TurnConfig.
+    private func currentTurnConfig() -> ChatTurnEngine.TurnConfig {
         let resolved = appState.resolvedAgentSettings(
             agentId: session?.agentId,
             toolsEnabled: isAgentMode,
@@ -2450,16 +2583,49 @@ struct ChatDetailView: View {
             workingDirectory: session?.workingDirectory,
             disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []),
             reasoningEffort: reasoningEffort)
-        let config = ChatTurnEngine.TurnConfig.from(
+        return ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
-                           config: config,
-                           approval: { await requestToolApproval($0) })
-        // Your own message always wins: sending from halfway up the history used
-        // to leave you exactly there, because auto-follow was off and nothing
-        // else scrolled.
+    }
+
+    // MARK: - Regenerate / edit-resend / branch
+
+    /// Regenerate applies to THE LAST reply of an idle chat (rewinding a middle
+    /// turn would orphan everything after it), never on a Telegram mirror.
+    private func canRegenerate(rowId: UUID) -> Bool {
+        rowId == lastReplyId
+            && composerState != .generatingHere
+            && !isExternalBridgeSession
+            && server.status == .running
+    }
+
+    /// Branching copies history; doing it mid-stream would copy a placeholder.
+    private var canFork: Bool {
+        composerState != .generatingHere
+    }
+
+    /// Re-run this conversation's last turn with the SAME prompt.
+    private func regenerateLast() {
+        chatEngine.rerunLastTurn(sessionId: sessionId,
+                                 config: currentTurnConfig(),
+                                 approval: { await requestToolApproval($0) })
         applyScroll(.userSentMessage)
+    }
+
+    /// Edit & Resend: replace one of YOUR messages' text, rewind its reply and
+    /// everything after it, then re-run from there.
+    private func editResend(messageId: UUID, newText: String) {
+        guard appState.editUserMessage(in: sessionId, messageId: messageId, newText: newText),
+              composerState != .generatingHere else { return }
+        chatEngine.rerunLastTurn(sessionId: sessionId,
+                                 config: currentTurnConfig(),
+                                 approval: { await requestToolApproval($0) })
+        applyScroll(.userSentMessage)
+    }
+
+    /// Branch From Here: a NEW conversation holding history up to and including
+    /// this row. The original is untouched; the fork becomes the active tab.
+    private func fork(from messageId: UUID) {
+        _ = appState.forkSession(at: messageId, in: sessionId)
     }
 
     /// Ask the user to approve a single tool call. Returns true on Allow /
@@ -2644,8 +2810,22 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Re-run this reply. Set ONLY on the last assistant row of an idle chat —
+    /// regenerating a middle turn would orphan every answer after it. nil on
+    /// read-only surfaces.
+    var onRegenerate: (() -> Void)?
+    /// Replace YOUR message's text and re-run from there (edit & resend).
+    /// nil on assistant rows and read-only surfaces.
+    var onEditResend: ((String) -> Void)?
+    /// Branch a NEW conversation off history up to and including this row.
+    var onForkFromHere: (() -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    // Edit & resend lives INSIDE this bubble: double-click (or the context
+    // menu) turns your own message into its own editor; Save & Resend hands
+    // the new text to the parent, which rewinds history and re-runs the turn.
+    @State private var isEditing = false
+    @State private var editText = ""
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -2743,6 +2923,8 @@ struct MessageBubble: View {
                         if message.role == .assistant {
                             MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content)
                                 .textSelection(.enabled)
+                        } else if isEditing {
+                            editComposer
                         } else {
                             // The user's own turn is plain text (no markdown
                             // render), so it needs the transcript size stated —
@@ -2751,6 +2933,10 @@ struct MessageBubble: View {
                             Text(message.content)
                                 .font(.system(size: ChatMetrics.transcriptFontSize))
                                 .textSelection(.enabled)
+                                // Double-click to edit & resend — the gesture
+                                // sits on the TEXT only, never the container,
+                                // so it can't swallow child buttons.
+                                .onTapGesture(count: 2) { beginEditing() }
                         }
                         if message.isStreaming {
                             GeneratingIndicator()
@@ -2791,9 +2977,59 @@ struct MessageBubble: View {
         }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
+            if onRegenerate != nil {
+                Button("Regenerate Reply") { onRegenerate?() }
+            }
+            if message.role == .user, onEditResend != nil, !message.isStreaming {
+                Button("Edit & Resend") { beginEditing() }
+            }
+            if onForkFromHere != nil {
+                Button("Branch From Here") { onForkFromHere?() }
+            }
             if onDelete != nil {
                 Button("Delete Message", role: .destructive) { onDelete?() }
             }
+        }
+    }
+
+    // MARK: - Edit & resend (your own turns)
+
+    private var canEdit: Bool {
+        message.role == .user && onEditResend != nil && !message.isStreaming && !message.content.isEmpty
+    }
+
+    private func beginEditing() {
+        guard canEdit else { return }
+        editText = message.content
+        isEditing = true
+    }
+
+    private func commitEditing() {
+        let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        isEditing = false
+        onEditResend?(trimmed)
+    }
+
+    /// The in-bubble editor shown while editing one of YOUR messages. Cancel
+    /// and Save & Resend are real Buttons inside the bubble; the double-click
+    /// gesture that opened this state sits on the text view only, never this
+    /// container, so it cannot swallow their clicks.
+    private var editComposer: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            TextField("", text: $editText, axis: .vertical)
+                .font(.system(size: ChatMetrics.transcriptFontSize))
+                .lineLimit(2...12)
+                .padding(8)
+                .background(Color.white.opacity(0.18))
+                .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius - 4))
+            HStack(spacing: 8) {
+                Button("Cancel") { isEditing = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save & Resend") { commitEditing() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .buttonStyle(.bordered)
         }
     }
 
@@ -2836,6 +3072,10 @@ struct MessageBubble: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 2) {
+                if let onRegenerate {
+                    footerButton("arrow.clockwise", help: "Regenerate this reply",
+                                 action: onRegenerate)
+                }
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
                 if let onDelete {
                     footerButton("trash", help: "Delete this message from the conversation",
