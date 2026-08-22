@@ -30,6 +30,8 @@ M4 Max (depth 6, block 5), M3 Ultra (block 8), M1 Pro (depth 4), M5 base (depth 
 
 ## Setup
 
+Checkout github.com/ddalcu/mlx-serve  chore/fixes-lfm-dflash-auto-draft
+
 Any checkpoint with an MTP head works. A 27B on a 64 GB+ machine, something
 smaller otherwise — the *shape* of the answer is what we want, not the tok/s.
 
@@ -113,8 +115,7 @@ looks cheap.
 
 ## What to send
 
-Open a PR with your numbers in this shape (or paste them in an issue and we
-will write the row):
+Add a comment to this PR https://github.com/ddalcu/mlx-serve/pull/252:
 
 ```
 Chip:        Apple M2 Max          (sysctl -n machdep.cpu.brand_string)
