@@ -906,6 +906,11 @@ pub const Generator = struct {
     /// effective draft width. Thinking requests use the lower calibration
     /// because their less-predictable reasoning preamble pays back later.
     dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+    /// Per-round width chooser over the model's round-cost table (null =
+    /// MLX_SERVE_DFLASH_CHOOSER=0, the fixed block + sticky yield gate).
+    dflash_chooser: ?round_cost.WidthChooser = null,
+    /// Drafts this round ran (0 = serial), read by the table feed.
+    dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
@@ -986,12 +991,16 @@ pub const Generator = struct {
     /// Width-trial schedule for the round-cost table (one 2-round block per
     /// period at m_lo+1, so the table learns the next cliff once).
     mtp_width_trial: MtpWidthTrial = .{},
-    /// Drafts of the previous round (0 = serial), every round: a width
-    /// change is a transition the table must not observe.
+    /// Drafts of the previous TWO rounds (0 = serial), every round: a round
+    /// is a transition unless both predecessors ran its width (the first
+    /// round after a width change is the transition, the second is still
+    /// elevated — live, every w4 sample taken beside a trial read 17% high
+    /// on the M4 base and fed the churn that produced it).
     spec_round_prev_width: ?u32 = null,
-    /// Shape of the previous MTP round: a shape change is a transition too
-    /// (the regime gate measured shape transitions 5-7% slow).
+    spec_round_prev_width2: ?u32 = null,
+    /// Shape of the previous two MTP rounds: a shape change is a transition too.
     spec_round_prev_two_chunk: bool = false,
+    spec_round_prev_two_chunk2: bool = false,
     /// Wall clock between round ends: the regime compares the quantity
     /// tok/s reports, so per-round work OUTSIDE the round stopwatch (token
     /// publish, stop checks, scheduler) must be in the denominator — fewer
@@ -1127,6 +1136,17 @@ pub const Generator = struct {
     /// break-even acceptance is several times a dense trunk's.
     pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
+    /// Width chooser — OPT-IN (MLX_SERVE_DFLASH_CHOOSER=1) until measured on
+    /// the five peer cells; default is the fixed block + sticky yield gate.
+    var dflash_chooser_cache: ?bool = null;
+    fn dflashChooserEnabled() bool {
+        if (dflash_chooser_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_DFLASH_CHOOSER");
+        const on = raw != null and std.mem.eql(u8, std.mem.span(raw.?), "1");
+        dflash_chooser_cache = on;
+        return on;
+    }
+
     pub fn dflashGateWarmup() u64 {
         const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
         if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
@@ -1223,6 +1243,7 @@ pub const Generator = struct {
     ///   "62% acceptance rate" metric.
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
+        var hist_buf: [256]u8 = undefined;
         const table_bucket = round_cost.bucketFor(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
@@ -1285,7 +1306,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -1299,6 +1320,9 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
+                    if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
+                    if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
+                    if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                 },
             );
             return;
@@ -2246,6 +2270,17 @@ pub const Generator = struct {
                 options.mtp.?.costProfile(xfm)
             else
                 .generic;
+            const dflash_bs: u32 = if (dflash_active)
+                dflash_mod.requestBlockSize(
+                    if (options.dflash_block_size > 0) options.dflash_block_size else options.dflash.?.config.block_size,
+                    options.dflash.?.config.block_size,
+                    xfm.spec_cost_curve,
+                    @intCast(prompt_ids.len),
+                )
+            else if (options.dflash_block_size > 0)
+                options.dflash_block_size
+            else
+                0;
             var gen = Generator{
                 .xfm = xfm,
                 .ctx = ctx,
@@ -2274,17 +2309,11 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
-                .dflash_block_size = if (dflash_active)
-                    dflash_mod.requestBlockSize(
-                        if (options.dflash_block_size > 0) options.dflash_block_size else options.dflash.?.config.block_size,
-                        options.dflash.?.config.block_size,
-                        xfm.spec_cost_curve,
-                        @intCast(prompt_ids.len),
-                    )
-                else if (options.dflash_block_size > 0)
-                    options.dflash_block_size
+                .dflash_block_size = dflash_bs,
+                .dflash_chooser = if (dflash_active and dflashChooserEnabled())
+                    round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
                 else
-                    0,
+                    null,
                 .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
@@ -3700,15 +3729,16 @@ pub const Generator = struct {
         // 0 when the runtime gate fell back to serial (a serial sample is
         // the "no spec" candidate a width chooser needs).
         const dflash_gen_before = self.generated_ids.items.len;
-        const dflash_table_width: u32 = if (self.spec_disabled_runtime) 0 else @max(self.dflash_block_size, 2) - 1;
-        const dflash_rounds_before = self.dflash_attempted;
+        self.dflash_round_width = 0;
+        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
             self.mtpObserveKvCost(@min(dflash_kv_width, mtp_mod.MAX_DEPTH), dflash_kv_len, ms);
             const emitted = self.generated_ids.items.len - dflash_gen_before;
-            const post_warmup = dflash_rounds_before >= MTP_EV_WARMUP_ROUNDS;
+            const post_warmup = dflash_rounds_before >= dflashGateWarmup();
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
-            self.specObserveRound(dflash_table_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
+            self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
+            if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
@@ -3729,11 +3759,45 @@ pub const Generator = struct {
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
 
+        // Per-round width: the chooser's argmax over measured tokens/ms
+        // (serial = width 0 is a candidate, so "serial wins" is the gate),
+        // the fixed block until it has data.
+        var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
+        if (self.dflash_chooser) |*ch| {
+            if (ch.rounds >= dflashGateWarmup()) {
+                const d = ch.choose(&self.xfm.round_cost, self.mtpKvLen(), ch.rounds);
+                round_width = d.width;
+                // Serial is sticky: a plain decode round does not extend the
+                // assistant context, so there is no way back this request.
+                if (round_width == 0) self.spec_disabled_runtime = true;
+                if (ch.logged != ch.current) {
+                    if (self.xfm.round_cost.bucketToRead(self.mtpKvLen())) |b| {
+                        ch.logged = ch.current;
+                        var buf: [256]u8 = undefined;
+                        log.info("[dflash] width chooser: standing w{d} ({s}) from {s} {s} (ms/tok)\n", .{
+                            ch.current,
+                            if (ch.current == 0) "serial" else "block",
+                            round_cost.BUCKET_NAMES[b],
+                            self.xfm.round_cost.formatBucket(b, &buf),
+                        });
+                    }
+                }
+            }
+        }
+        self.dflash_round_width = round_width;
+        if (round_width == 0) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
+
         const xfm = self.xfm;
         const s = xfm.s;
         const model = self.dflash.?;
         const dctx = &self.dflash_ctx.?;
-        const bs: u32 = @max(self.dflash_block_size, 2);
+        const bs: u32 = round_width + 1;
         const m: u32 = bs - 1;
         const t1: u32 = self.next_token_id;
         // On the moe/GDN path positions come from moe_seq_offset (cache.step
@@ -4193,6 +4257,9 @@ pub const Generator = struct {
         self.dflash_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
+        if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
+        // The calibrated sticky gate stays as the bootstrap that gets serial
+        // MEASURED (the chooser picks serial only from a measured w0 cell).
         self.checkDflashRuntimeGate();
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
@@ -5886,6 +5953,10 @@ pub const Generator = struct {
     fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
         self.mtpObserveKvCost(m, self.mtpKvLen(), round_ms);
         const post_warmup = self.mtp_ev_rounds >= MTP_EV_WARMUP_ROUNDS;
+        // The table wants rounds the EV controller PLANNED: the round that
+        // ends warmup was still the legacy controller's (a w2 sample there
+        // anchored the table at 2 on the M4 base 9B).
+        const ev_planned = self.mtp_ev_rounds > MTP_EV_WARMUP_ROUNDS;
         const wall = if (post_warmup) self.mtpRegimeWallMs(round_ms) else round_ms;
         const tok: f32 = @floatFromInt(tokens);
         if (post_warmup and self.spec_cost_solo and !width_trial) mtpRegimeObserve(&self.mtp_regime, two_chunk, m_lo, wall, tok);
@@ -5898,9 +5969,10 @@ pub const Generator = struct {
         // (ms biased high); observed as width m_hi it read single-chunk 6
         // as better than the 5 -> 6 two-chunk it was measured FROM (M4 Max
         // 27B @16k, -4.5%). The shape question stays the regime gate's.
-        const shape_changed = self.spec_round_prev_two_chunk != two_chunk;
+        const shape_changed = self.spec_round_prev_two_chunk != two_chunk or self.spec_round_prev_two_chunk2 != two_chunk;
+        self.spec_round_prev_two_chunk2 = self.spec_round_prev_two_chunk;
         self.spec_round_prev_two_chunk = two_chunk;
-        self.specObserveRound(m, wall, tok, post_warmup and !two_chunk, shape_changed);
+        self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
     }
 
     /// Feed the model's round-cost table (`Transformer.round_cost`, shared
@@ -5910,7 +5982,10 @@ pub const Generator = struct {
     /// sample that is not an expected drop (contended, transition) logs its
     /// numbers — a silent reject is the probe's anti-pattern.
     fn specObserveRound(self: *Generator, width: u32, wall_ms: f32, tokens: f32, observe: bool, shape_changed: bool) void {
-        const transition = shape_changed or (if (self.spec_round_prev_width) |p| p != width else true);
+        const transition = shape_changed or
+            (if (self.spec_round_prev_width) |p| p != width else true) or
+            (if (self.spec_round_prev_width2) |p| p != width else true);
+        self.spec_round_prev_width2 = self.spec_round_prev_width;
         self.spec_round_prev_width = width;
         if (!observe) return;
         const kv = self.mtpKvLen();
@@ -6198,14 +6273,27 @@ pub const Generator = struct {
         const lo_cap: u32 = @min(cap, @max(1, m_lo_max));
         var m_lo: u32 = 1;
         var best_r: f32 = 0.0;
+        // With measured costs the standing base (m_lo_max - 1, what the
+        // caller planned last round) keeps its place unless a challenger
+        // beats it by the switch margin: cells are EMAs of a few samples
+        // and a 5% reversal between neighbours is noise, while every
+        // change of base is a transition round the table will not count
+        // and the model pays for.
+        const standing: u32 = if (src.fromTable()) @min(lo_cap, m_lo_max -| 1) else 0;
+        var standing_r: f32 = 0.0;
         var m: u32 = 1;
         while (m <= lo_cap) : (m += 1) {
             const tok = src.measuredTokens(m) orelse mtpEvExpectedTokens(a, m);
             const r = tok / src.roundCost(m, false);
+            if (m == standing) standing_r = r;
             if (r > best_r) {
                 best_r = r;
                 m_lo = m;
             }
+        }
+        if (standing >= 1 and m_lo != standing and best_r <= standing_r * (1.0 + round_cost.SWITCH_MARGIN)) {
+            m_lo = standing;
+            best_r = standing_r;
         }
         if (m_lo >= cap) return .{ .m_lo = m_lo, .m_hi = m_lo, .tau_ln = 0.0 };
         var m_hi: u32 = m_lo;
@@ -7042,17 +7130,17 @@ pub const Generator = struct {
     }
 
     /// Which width a trial measures: the plan's own base when the bucket
-    /// the plan reads has not measured it (the narrowest measured width
-    /// can be the cliff itself and the prior below it cannot see that),
-    /// then m_lo-1, then the next width up on a single-chunk plan. Null =
+    /// the plan reads has not measured it, else an unmeasured m_lo+1 under
+    /// any shape, else a periodic m_lo+1 on single-chunk plans. Null =
     /// nothing to try.
     pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRoundPlan, cap: u32) ?u32 {
         const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
         if (t.measuredMs(plan.m_lo, b) == null) return plan.m_lo;
-        // The prior's climb passes m_lo-1 only in transition rounds, so the
-        // cliff BELOW the base (M1 Pro 27B: 4 -> 5 is +150 ms) is never
-        // measured unless asked for.
-        if (plan.m_lo > 1 and t.measuredMs(plan.m_lo - 1, b) == null) return plan.m_lo - 1;
+        // m_lo-1 is deliberately NOT trialled: every trial block is a 3-4%
+        // hit on the request that carries it (peer cells, 2026-08-22), the
+        // prior below the anchor already prices narrower widths, and the
+        // one cliff this was for (M1 Pro 27B, 4 -> 5) is found from 4 by
+        // the m_lo+1 trial below.
         if (plan.m_lo >= cap) return null;
         // An unmeasured m_lo+1 is measured under ANY shape: a two-chunk
         // plan extends there every round on echo, blind to its cost (the
@@ -7066,32 +7154,10 @@ pub const Generator = struct {
     /// Width-trial schedule: same shape as the regime's (explicit
     /// trial_end/next_trial, a 2-round block — transition then measurement),
     /// idempotent per round because `mtpRoundPlan` has two call sites.
-    pub const MtpWidthTrial = struct {
-        trial_end: u32 = 0,
-        next_trial: u32 = 0,
-        trials: u32 = 0,
-        last_idx: ?u32 = null,
-        last_force: bool = false,
-    };
+    pub const MtpWidthTrial = round_cost.TrialSchedule;
 
     pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32) bool {
-        if (t.last_idx == round_idx) return t.last_force;
-        t.last_idx = round_idx;
-        t.last_force = blk: {
-            if (round_idx < t.trial_end) break :blk true;
-            if (t.next_trial == 0) {
-                t.next_trial = round_idx + period;
-                break :blk false;
-            }
-            if (round_idx >= t.next_trial) {
-                t.trials += 1;
-                t.trial_end = round_idx + MTP_REGIME_EXPLORE_BLOCK;
-                t.next_trial = t.trial_end + period;
-                break :blk true;
-            }
-            break :blk false;
-        };
-        return t.last_force;
+        return t.force(round_idx, period);
     }
 
     /// Rounds between width trials: the regime's drag rule on the measured
@@ -7100,12 +7166,7 @@ pub const Generator = struct {
     /// either is unmeasured, so an unknown width is learned soon.
     pub fn mtpWidthTrialPeriod(t: *const round_cost.Table, kv_len: u32, m_lo: u32) u32 {
         const b = t.bucketToRead(kv_len) orelse return MTP_REGIME_EXPLORE_PERIOD;
-        const lo = t.msPerTok(m_lo, b) orelse return MTP_REGIME_EXPLORE_PERIOD;
-        const hi = t.msPerTok(m_lo + 1, b) orelse return MTP_REGIME_EXPLORE_PERIOD;
-        const gap = @abs(hi - lo) / @min(hi, lo);
-        const block: f32 = @floatFromInt(MTP_REGIME_EXPLORE_BLOCK);
-        const p: u32 = @intFromFloat(@ceil(block * gap / MTP_REGIME_EXPLORE_DRAG));
-        return @min(MTP_REGIME_EXPLORE_PERIOD_MAX, @max(MTP_REGIME_EXPLORE_PERIOD, p));
+        return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.msPerTok(m_lo + 1, b));
     }
 
     /// Track the only evidence that can justify sticky-disable: whether the
@@ -11378,9 +11439,11 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     const prior = Generator.mtpEvPlanForAt(&a, 8, Generator.MTP_EV_DEFAULT_COSTS, 8, 10000);
     try testing.expect(prior.m_hi >= 5);
     var t = round_cost.Table{};
-    _ = t.observe(3, 10000, 60.0, 4.0, true, false);
-    _ = t.observe(4, 10000, 70.0, 5.0, true, false);
-    _ = t.observe(5, 10000, 220.0, 6.0, true, false);
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = t.observe(3, 10000, 60.0, 4.0, true, false);
+        _ = t.observe(4, 10000, 70.0, 5.0, true, false);
+        _ = t.observe(5, 10000, 220.0, 6.0, true, false);
+    }
     const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 10000, &t);
     try testing.expect(src.fromTable());
     // Anchored at the narrowest measured width: the two sources agree
@@ -11403,7 +11466,7 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     try testing.expectEqual(prior.m_lo, cold_plan.m_lo);
 }
 
-test "mtpWidthTrial: blocks of two per period, idempotent per round, period grows with the measured gap" {
+test "mtpWidthTrial: blocks per period, idempotent per round, period grows with the measured gap" {
     var wt = Generator.MtpWidthTrial{};
     var forced: u32 = 0;
     var i: u32 = 10;
@@ -11412,17 +11475,19 @@ test "mtpWidthTrial: blocks of two per period, idempotent per round, period grow
         try testing.expectEqual(f, Generator.mtpWidthTrialForce(&wt, i, 8)); // asked twice, same answer
         if (f) forced += 1;
     }
-    // Identity checkable from the log: forced rounds == 2 * trials.
-    try testing.expectEqual(wt.trials * Generator.MTP_REGIME_EXPLORE_BLOCK, forced);
-    try testing.expect(wt.trials >= 18 and wt.trials <= 21);
-    // Unmeasured next width: default period. 10% worse: 20. 50% worse: 100.
+    // Identity checkable from the log: forced rounds == block * trials.
+    try testing.expectEqual(wt.trials * round_cost.EXPLORE_BLOCK, forced);
+    try testing.expect(wt.trials >= 17 and wt.trials <= 19);
+    // Unmeasured next width: default period. 10% worse: 30. 36% worse: 110.
     var t = round_cost.Table{};
     try testing.expectEqual(Generator.MTP_REGIME_EXPLORE_PERIOD, Generator.mtpWidthTrialPeriod(&t, 1000, 4));
-    _ = t.observe(4, 1000, 40.0, 4.0, true, false);
-    _ = t.observe(5, 1000, 55.0, 5.0, true, false);
-    try testing.expectEqual(@as(u32, 20), Generator.mtpWidthTrialPeriod(&t, 1000, 4));
-    _ = t.observe(6, 1000, 90.0, 6.0, true, false);
-    try testing.expectEqual(@as(u32, 73), Generator.mtpWidthTrialPeriod(&t, 1000, 5));
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = t.observe(4, 1000, 40.0, 4.0, true, false);
+        _ = t.observe(5, 1000, 55.0, 5.0, true, false);
+    }
+    try testing.expectEqual(@as(u32, 60), Generator.mtpWidthTrialPeriod(&t, 1000, 4));
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(6, 1000, 90.0, 6.0, true, false);
+    try testing.expectEqual(@as(u32, 219), Generator.mtpWidthTrialPeriod(&t, 1000, 5));
 }
 
 test "round_cost: a simulated round loop measures every width the chooser picks and settles under the cliff" {
@@ -11447,13 +11512,15 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     var t = round_cost.Table{};
     var wt = Generator.MtpWidthTrial{};
     var prev: ?u32 = null;
+    var prev2: ?u32 = null;
     var prev_two = false;
+    var prev_two2 = false;
     var late_wide: u32 = 0;
     var picked: [round_cost.MAX_WIDTH + 1]u32 = @splat(0);
     var m_lo_prev: u32 = 1;
     var last_m: u32 = 0;
     var i: u32 = 10;
-    while (i < 300) : (i += 1) {
+    while (i < 600) : (i += 1) {
         const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, &t);
         var plan = Generator.mtpEvPlanSrc(&a, 8, src, m_lo_prev + 1);
         m_lo_prev = plan.m_lo;
@@ -11466,11 +11533,14 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
         const m = plan.m_hi;
         const two_chunk = plan.m_hi > plan.m_lo;
         picked[m] += 1;
-        if (i >= 60 and m >= 5) late_wide += 1;
+        if (i >= 200 and m >= 5) late_wide += 1;
         last_m = m;
         const tokens: f32 = Generator.mtpEvExpectedTokens(&a, m);
-        if (!two_chunk) _ = t.observe(m, 1000, Machine.roundMs(m), tokens, true, prev_two or (if (prev) |p| p != m else true));
+        const transition = prev_two or prev_two2 or (if (prev) |p| p != m else true) or (if (prev2) |p| p != m else true);
+        if (!two_chunk) _ = t.observe(m, 1000, Machine.roundMs(m), tokens, true, transition);
+        prev2 = prev;
         prev = m;
+        prev_two2 = prev_two;
         prev_two = two_chunk;
     }
     // Every width the chooser ran is in the table (transitions excepted,
@@ -11482,12 +11552,12 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     try testing.expect(t.measuredMs(5, 0) != null);
     try testing.expect(t.measuredMs(4, 0) != null);
     try testing.expect(last_m == 4);
-    try testing.expect(picked[4] > 250);
+    try testing.expect(picked[4] > 450);
     // Before the table activates the prior extends 4 -> 5 blind every round
     // (live, the regime gate throttles that shape; the sim has no gate), so
-    // the bar is the settled tail: from round 60 on, width 5 appears only
-    // as scheduled 2-round re-trials (period capped at 128 -> one block).
-    try testing.expect(late_wide <= 2 * Generator.MTP_REGIME_EXPLORE_BLOCK);
+    // the bar is the settled tail: from round 200 on, width 5 appears only
+    // as scheduled re-trial blocks (period capped at 128).
+    try testing.expect(late_wide <= 4 * round_cost.EXPLORE_BLOCK);
     try testing.expect(picked[6] + picked[7] + picked[8] <= 4); // the prior's first rounds only
     // Identity: forced rounds == 2 * trials (each block is 2 rounds).
     try testing.expect(wt.trials >= 2);

@@ -3876,3 +3876,48 @@ Trap, caught by the simulated-loop test and nothing else: `plan = .{ .m_lo =
 plan.m_lo + 1, .m_hi = plan.m_lo + 1 }` writes m_lo first and reads it back
 for m_hi (result-location aliasing), so the "single-chunk trial" planned a
 two-chunk round. Build such plans from a scalar (`mtpWidthTrialPlan`).
+
+### v3: the cold-start loop (peer data, 2026-08-22, c8d728d)
+
+M4 base 9B at cap 4: table -6.6% vs Phase 1; M1 Pro 9B at cap 4: -3.2%. Same
+loop on both, visible in their `table=` fields: the round that ends warmup is
+still the legacy controller's (observed at `>=` warmup) and seeds a w2 cell;
+the first single-4 round seeds w4; the table activates on {w2, w4} at ONE
+sample each, anchored at 2; linear interpolation prices w3 between them and
+the plan takes m_lo 3; the horizon opens a 3 -> 4 two-chunk plan (30 ms sync
+on the M4 base); from then on every single-4 round sits beside a transition
+and reads 17-20% high (w4 29.2 on the ON arm against 24.4 on the OFF arm's
+own cell), which keeps w3 looking cheaper, which keeps m_lo at 3; and the
+regime gate flips "two-chunk every round" on a 1% tie it cannot resolve. The
+same build at cap 6 on the same M4 base measured +5.0% short and +4.2%
+long-gen (+10% over the chip row) because there the ladder is monotone (w4
+18.1 > w5 17.0 > w6 16.5) and the plan runs to 5.7-6.0 per round where Phase
+1 stalls at 4.05; and on the M1 Pro 27B it learned w4 71 / w5 95 ms/tok and
+stayed at 4 with no chip row (-4.3% in the rep that carried the w5 trial
+block, parity in the next).
+
+v3: `MIN_SAMPLES` 3 before a cell counts (`formatBucket` shows `/n`), the
+table observes only rounds the EV controller PLANNED (`>` warmup), a round is
+a transition unless BOTH predecessors ran its width and shape, the standing
+m_lo keeps `SWITCH_MARGIN` 5% hysteresis against challengers, exploration
+runs at period 16 in 3-round blocks (transition, elevated successor,
+measurement) with DRAG 0.005 and a 256 cap (the 27B's 34%-dearer w5 re-trial
+then costs ~0.5%), and a stale cell BLENDS its next sample at 0.5 instead of
+resetting to one sample — the MTP sim showed a cell re-sampled only by
+trials losing trust on every reseed, the horizon reopening, and the plan
+cycling between single-4 and blind 4 -> 5.
+
+### Phase 4: the DFlash/DSpark block chooses itself per round
+
+`nextDflash` derives everything from local `bs`/`m` and `forwardBlock` takes
+the width from the noise embeds' shape, so a per-round width is a call-site
+change. `round_cost.WidthChooser` (hermetic, simulated-loop tested for the
+"block wins, cliff at 7" and "serial wins / comes back" shapes): argmax of
+measured tokens per ms over widths 0..config-1 with serial a candidate — so
+"serial wins" IS the yield gate and `dflashGateMinimum`'s dense-calibrated
+constants stop deciding; widest+1 is the one unmeasured candidate (chain
+tokens, last-slope cost, never below flat); trials measure the standing
+width, serial, width-1, width+1 in that order, starting at once (a losing
+DFlash costs 15-20% per round, a serial trial costs one token); 5% switch
+hysteresis. `MLX_SERVE_DFLASH_CHOOSER=0` restores the fixed block + sticky
+gate. Unmeasured live as of this note.
