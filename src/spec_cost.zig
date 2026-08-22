@@ -90,17 +90,24 @@ pub const SpecCostCurve = struct {
     /// A curve is usable only when it is monotone in width and has at least
     /// three points — two points cannot tell a flat region from a ramp.
     pub fn usable(self: SpecCostCurve) bool {
-        if (self.n < 3) return false;
+        return self.unusableReason().len == 0;
+    }
+
+    /// Why `usable()` says no — empty when it says yes. A silent reject
+    /// hid a per-MODEL failure for a day (the 27B iQ-3.8bpw pack rejected
+    /// every boot while three other packs on the same box passed).
+    pub fn unusableReason(self: SpecCostCurve) []const u8 {
+        if (self.n < 3) return "fewer than 3 points";
         var prev_w: u32 = 0;
         var prev_ms: f32 = 0;
         for (self.widths[0..self.n], self.ms[0..self.n]) |w, m| {
-            if (w <= prev_w) return false;
-            if (!std.math.isFinite(m) or m <= 0) return false;
-            if (m < prev_ms) return false; // a wider forward is never cheaper
+            if (w <= prev_w) return "widths not strictly increasing";
+            if (!std.math.isFinite(m) or m <= 0) return "non-finite or non-positive ms";
+            if (m < prev_ms) return "non-monotonic step (a wider forward read cheaper)";
             prev_w = w;
             prev_ms = m;
         }
-        return true;
+        return "";
     }
 };
 
@@ -473,7 +480,8 @@ pub fn resolve(
         return null;
     };
     if (!curve.usable()) {
-        log.warn("[spec-cost] probe produced an unusable curve — per-silicon tables apply\n", .{});
+        log.warn("[spec-cost] probe produced an unusable curve ({s}) — per-silicon tables apply\n", .{curve.unusableReason()});
+        logCurve("rejected", curve);
         return null;
     }
     storeCached(io, key, curve);

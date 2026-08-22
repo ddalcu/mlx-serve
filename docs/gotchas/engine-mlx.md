@@ -3808,3 +3808,58 @@ being three constants nobody can check.
 The contention sanity run is moot as shipped — the kv term is the only thing
 the min-tracker feeds and it is off by default, so contention cannot move a
 chosen width. It becomes owed again the moment the term is enabled.
+
+## The measured round-cost table (Phase 2 of the auto draft width, 2026-08-22)
+
+Every spec width decision is throughput = accepted tokens over round wall
+time, and every cost source before this measured part of it in one regime:
+the chip rows (`adaptiveDepthCapForMachine`, `blockCapForMachine`), the
+fitted EV surfaces, the boot ladder (`spec_cost.zig`, two opt-in terms that
+both measured a loss). The peer sweeps put the DFlash answer at block 8 / 6 /
+none / 5 / 4 across five pack x chip cells and the M1 Pro 27B's depth-5 cliff
+at +150 ms/round — no chip row can be right.
+
+`src/round_cost.zig` is a pure table on `Transformer.round_cost` (the
+Generator is per request; its kv spans only max_tokens, which bit the kv term
+once): `cells[width][bucket]` with EMAs of round ms and emitted tokens, widths
+0..16 (0 = serial), buckets <2k .. 32k+. Fed by `Generator.mtpRoundEndObserve`
+(both MTP accept paths) and the `nextDflash` defer, from the inter-round wall
+clock (`mtpRegimeWallMs`), solo rounds only, warmup excluded, width transitions
+dropped (the width change is a one-off that read the minority shape 5-7% slow
+in Phase 1). MIN is wrong (thermal soak), so EMAs at 0.10 with a reseed after
+64 rounds without a sample.
+
+The EV plan reads it through `MtpCostSource`: active once the bucket (or the
+nearest active bucket — a boundary crossed mid-generation must not snap the
+plan back to the prior) has two measured widths; the table is in ms and the
+plan has one absolute threshold (`MTP_EV_EXPLORE_MIN_R`), so it is scaled
+into floor units at the narrowest measured width. Above that width: linear
+between measured widths, the last slope past the widest (a cliff is found by
+measuring it, and the slope past one is the cliff's). Below it: the prior.
+The first cut extrapolated downward with the nearest slope — and the prior's
+own extended rounds land on the cliff first (widths 5,6 on the sim), so the
+cliff's slope run downward priced width 3 at zero and the plan went narrower
+forever. A measured marginal the position cannot repay even at full
+confidence (`1 <= best_r * mc`) closes the horizon's exploration valve; the
+width trial is the exploration now. The fitted prior keeps the valve.
+
+Width trial: `mtpWidthTrialTarget` = the plan's own base when unmeasured in
+the bucket the plan reads (again: the narrowest measured width can be the
+cliff), else m_lo+1 on a single-chunk plan (a two-chunk plan measures m_lo+1
+by extending). Same 2-round block and drag-sized period as the regime gate,
+never inside a regime trial block, skipped by the regime observer (it
+compares shapes at ONE base depth), and `last_two` set to single after it.
+
+Measured M4 Max, Qwen3.8-27B 4bit, short echo (22 rounds, reps 2-3, two
+boot orders): table 105.5 vs Phase 1 97.0 vs --mtp-depth 4 97.5 (+8.7%) — the
+table read w5 10.9 / w6 9.9 ms/tok and the plan took m_lo 6 single-chunk
+(ext_rounds=0) where Phase 1 sat at a two-chunk 4/5 -> 6. 16k, ONE boot
+order: table 76.5 vs Phase 1 80.7 (-4.5%): single-chunk at 6 (80 ms, 6.0
+tok/round) lost to the two-chunk 5 -> 6 (77 ms, 5.84) — the plan models
+tokens from the acceptance EMAs while the table's own tok cells said w5 beat
+w6 per token. Unresolved at one boot; the bar is 3+ per side.
+
+Trap, caught by the simulated-loop test and nothing else: `plan = .{ .m_lo =
+plan.m_lo + 1, .m_hi = plan.m_lo + 1 }` writes m_lo first and reads it back
+for m_hi (result-location aliasing), so the "single-chunk trial" planned a
+two-chunk round. Build such plans from a scalar (`mtpWidthTrialPlan`).

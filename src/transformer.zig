@@ -2756,6 +2756,7 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
 const spec_cost_mod = @import("spec_cost.zig");
+const round_cost_mod = @import("round_cost.zig");
 // NB `ane_offload`, not `*_mod`: the `?*<x>_mod.<Y>` field convention marks
 // module-owned ARCH state (the dsv4 class — single-flight + spec-off); the
 // ANE engine is a load-time accelerator with no per-request decode state.
@@ -5755,6 +5756,12 @@ pub const Transformer = struct {
     /// place of the hand-typed per-silicon tables; null means the probe was
     /// disabled or declined, and every consumer falls back to its table.
     spec_cost_curve: ?spec_cost_mod.SpecCostCurve = null,
+    /// Measured spec round-cost table (`round_cost.Table`): per draft
+    /// width, per KV bucket, fed by every MTP/DFlash round on this model and
+    /// read by the EV plan in place of the fitted surface once a bucket has
+    /// two measured widths. Lives on the model, not the request — a request
+    /// spans only its own max_tokens. Inference thread only.
+    round_cost: round_cost_mod.Table = .{},
     /// Certified lm_head prune (mlxfast notes/68 class): MXFP8 g32 coarse
     /// copy of a dense bf16 lm_head, built lazily on the first eligible
     /// argmax-only decode. `lm_head_prune_tried` marks the probe so a
