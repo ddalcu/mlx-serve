@@ -149,6 +149,11 @@ class APIClient {
         // server runs with `--no-vision` (the encoder isn't loaded), so this is
         // the live "can this model see images right now?" signal.
         let supportsVision = caps.contains("vision") || mods.contains("image")
+        // Video rides input_modalities only (no separate "video" capability —
+        // that string is already claimed by media-GENERATION models); it can
+        // never be true without supportsVision, since video piggybacks the
+        // same vision tower server-side.
+        let supportsVideo = supportsVision && mods.contains("video")
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
@@ -167,6 +172,7 @@ class APIClient {
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
             supportsVision: supportsVision,
+            supportsVideo: supportsVideo,
             supportsEmbeddings: supportsEmbeddings,
             capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
@@ -347,6 +353,16 @@ class APIClient {
         return MemoryInfo.parse(mem)
     }
 
+    /// Live throughput feed. 503s when the server was launched without
+    /// `--metrics`, which reads as nil (the tray hides the rows).
+    func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
+        let url = URL(string: "http://127.0.0.1:\(port)/metrics.json")!
+        let (data, response) = try await session.data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)
+    }
+
     // MARK: - Agent Tool Calling
 
     struct ToolCall {
@@ -427,7 +443,11 @@ class APIClient {
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
         retryPolicy: RetryPolicy = .default,
-        modelId: String? = nil
+        modelId: String? = nil,
+        /// Extend the trailing assistant message rather than answering after
+        /// it. The server needs this stated: a trailing assistant message is
+        /// ordinary history on this endpoint unless the request says otherwise.
+        continueFinalMessage: Bool = false
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             // Cancellation plumbing: AsyncThrowingStream does NOT propagate
@@ -455,6 +475,7 @@ class APIClient {
                             toolsJSON: toolsJSON,
                             defaults: defaults,
                             modelId: modelId,
+                            continueFinalMessage: continueFinalMessage,
                             continuation: continuation
                         )
                         return  // success
@@ -499,6 +520,7 @@ class APIClient {
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
         modelId: String? = nil,
+        continueFinalMessage: Bool = false,
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
@@ -560,6 +582,7 @@ class APIClient {
             // maxTokens <= 0 means "Auto": omit so the server pegs to context.
             if maxTokens > 0 { body["max_tokens"] = maxTokens }
             if enableThinking { body["enable_thinking"] = true }
+            if continueFinalMessage { body["continue_final_message"] = true }
             if let v = reasoningEffort { body["reasoning_effort"] = v }
             if let v = defaults.topK { body["top_k"] = v }
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }

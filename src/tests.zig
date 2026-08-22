@@ -50,6 +50,7 @@ test {
     _ = @import("krea.zig");
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");
+    _ = @import("ane.zig");
     _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
@@ -77,6 +78,7 @@ test {
     _ = @import("gen_sse.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");
+    _ = @import("launch.zig");
     _ = @import("lan.zig");
     _ = @import("mlx.zig");
 }

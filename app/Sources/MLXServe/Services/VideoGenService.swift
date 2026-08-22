@@ -88,6 +88,7 @@ final class VideoGenService: ObservableObject {
         let steps = request.steps
         let keep = request.keepResident
         let firstFramePath = request.firstFrameImagePath
+        let lastFramePath = request.lastFrameImagePath
         let audioPath = request.audioPath
 
         task = Task {
@@ -102,6 +103,14 @@ final class VideoGenService: ObservableObject {
                 // as the clean first frame. Mirrors AudioGenService's `ref_audio`.
                 let firstFrameB64: String? = await Task.detached(priority: .userInitiated) {
                     firstFramePath.flatMap { path in
+                        (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+                    }
+                }.value
+                // The last-frame anchor reads the same way. Both keyframes are
+                // ordinary image files; the server owns the per-anchor resize
+                // policy (first stretches, last center-covers).
+                let lastFrameB64: String? = await Task.detached(priority: .userInitiated) {
+                    lastFramePath.flatMap { path in
                         (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
                     }
                 }.value
@@ -139,6 +148,7 @@ final class VideoGenService: ObservableObject {
                 if Task.isCancelled { setPhase(.cancelled, for: gen); return }
                 let body = Self.requestBody(model: modelId, prompt: prompt,
                                             request: request, firstFrameB64: firstFrameB64,
+                                            lastFrameB64: lastFrameB64,
                                             audioB64: audioB64, refs: refs)
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
@@ -199,6 +209,10 @@ final class VideoGenService: ObservableObject {
                                       measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
                 setPhase(.running(step: steps, total: steps, message: "Encoding mp4…"), for: gen)
                 let outFps = frames.fps > 0 ? frames.fps : fps
+                let settings = Self.settingsText(
+                    request, modelId: modelId,
+                    outputWidth: frames.width, outputHeight: frames.height,
+                    outputFrames: frames.frames, outputFps: outFps)
                 try await Task.detached(priority: .userInitiated) {
                     try VideoGenService.writeMP4(
                         rgb: frames.rgb, frames: frames.frames,
@@ -206,6 +220,9 @@ final class VideoGenService: ObservableObject {
                         fps: outFps, to: URL(fileURLWithPath: outputPath),
                         audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
                         audioChannels: frames.audioChannels)
+                    // The mp4 is the primary artifact. Match audio/music generation:
+                    // a sidecar failure must not discard a successfully encoded clip.
+                    try? VideoGenService.writeSettingsSidecar(settings, forVideo: outputPath)
                 }.value
                 setPhase(.completed(path: outputPath), for: gen)
                 insertRecent(outputPath)
@@ -276,6 +293,10 @@ final class VideoGenService: ObservableObject {
             }
             report(steps, steps, "Encoding mp4")
             let outFps = frames.fps > 0 ? frames.fps : request.fps
+            let settings = Self.settingsText(
+                request, modelId: modelId,
+                outputWidth: frames.width, outputHeight: frames.height,
+                outputFrames: frames.frames, outputFps: outFps)
             try await Task.detached(priority: .userInitiated) {
                 try VideoGenService.writeMP4(
                     rgb: frames.rgb, frames: frames.frames,
@@ -283,6 +304,7 @@ final class VideoGenService: ObservableObject {
                     fps: outFps, to: URL(fileURLWithPath: outputPath),
                     audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
                     audioChannels: frames.audioChannels)
+                try? VideoGenService.writeSettingsSidecar(settings, forVideo: outputPath)
             }.value
             await releaseIfNeeded()
             return outputPath
@@ -352,6 +374,7 @@ final class VideoGenService: ObservableObject {
     /// tests pin every field here so the UI model can't drift from the wire.
     nonisolated static func requestBody(model: String, prompt: String,
                                         request: VideoGenRequest, firstFrameB64: String?,
+                                        lastFrameB64: String? = nil,
                                         audioB64: String? = nil,
                                         refs: VideoRefPayloads = .init()) -> [String: Any] {
         var pipeline: String
@@ -387,8 +410,27 @@ final class VideoGenService: ObservableObject {
         if request.model.supportsCFG, !dropGuidance {
             body["cfg_scale"] = request.cfgScale
             body["stg_scale"] = request.stgScale
+            // The audio guider only exists on the a2vid path, so the scale
+            // rides the clip rather than the preset: without one it would set
+            // a knob on a guider that never runs. It drops with the rest of
+            // the guidance on an upgraded one-stage request, because the whole
+            // point of that drop is to let the server's reference two-stage
+            // defaults (3.0 video / 7.0 audio) apply as a SET.
+            if hasAudio { body["cfg_audio_scale"] = request.cfgAudioScale }
+        }
+        // Stage-2 refine steps. Two-stage only — one-stage has no refine pass,
+        // so the field would be a no-op the server still parses. 0 is Auto and
+        // stays absent, keeping "absent = the server's default" true.
+        if request.model.supportsPipelineModes, pipeline != "one_stage", request.stage2Steps > 0 {
+            body["stage2_steps"] = request.stage2Steps
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
+        // The other half of fl2va. Capability-gated like every field above: a
+        // preset switch leaves the picked file in state, and LTX's handler has
+        // no `last_frame_image` to ignore it with.
+        if request.model.supportsLastFrame, let lastFrameB64 {
+            body["last_frame_image"] = lastFrameB64
+        }
         // The fast recipe is the SERVER's default — the app only speaks up to
         // opt OUT, and only on a backend that has the recipe at all.
         if request.model.supportsFastRecipe, request.bestQuality { body["fast"] = false }
@@ -434,6 +476,121 @@ final class VideoGenService: ObservableObject {
             if request.refImageSize != .match { body["ref_image_size"] = request.refImageSize.rawValue }
         }
         return body
+    }
+
+    // MARK: - Settings sidecar
+
+    /// Human-readable `<clip>.txt` companion for a generated video. This is
+    /// deliberately built from paths/settings, never from the wire body: the
+    /// latter contains multi-megabyte base64 images, PCM audio, and video frames.
+    /// Optional fields are capability-gated exactly like `requestBody`, so a
+    /// stale control value left behind by a preset switch is not documented as
+    /// something the selected backend actually used.
+    nonisolated static func settingsText(_ request: VideoGenRequest, modelId: String,
+                                         outputWidth: Int? = nil, outputHeight: Int? = nil,
+                                         outputFrames: Int? = nil, outputFps: Int? = nil) -> String {
+        var lines: [String] = [
+            "model: \(modelId)",
+            "preset: \(request.model.name)",
+            "seed: \(request.seed)",
+            "width: \(request.width)",
+            "height: \(request.height)",
+            "frames: \(request.numFrames)",
+            "fps: \(request.fps)",
+            "steps: \(request.steps)",
+        ]
+
+        if let outputWidth, let outputHeight,
+           outputWidth != request.width || outputHeight != request.height {
+            lines.append("output_width: \(outputWidth)")
+            lines.append("output_height: \(outputHeight)")
+        }
+        if let outputFrames, outputFrames != request.numFrames {
+            lines.append("output_frames: \(outputFrames)")
+        }
+        if let outputFps, outputFps != request.fps {
+            lines.append("output_fps: \(outputFps)")
+        }
+
+        let hasAudio = request.model.supportsAudioInput &&
+            request.audioPath?.isEmpty == false
+        let upgradedForAudio = hasAudio && request.mode == .oneStage
+        if request.model.supportsPipelineModes {
+            let pipeline: String
+            if upgradedForAudio {
+                pipeline = "two_stage"
+            } else {
+                switch request.mode {
+                case .oneStage:   pipeline = "one_stage"
+                case .twoStage:   pipeline = "two_stage"
+                case .twoStageHQ: pipeline = "two_stage_hq"
+                }
+            }
+            lines.append("pipeline: \(pipeline)")
+        }
+        // A one-stage audio request intentionally drops its one-stage guidance
+        // values and lets the server use two-stage defaults.
+        if request.model.supportsCFG, !upgradedForAudio {
+            lines.append("cfg_scale: \(String(format: "%.2f", request.cfgScale))")
+            lines.append("stg_scale: \(String(format: "%.2f", request.stgScale))")
+        }
+        if request.model.supportsFastRecipe {
+            lines.append("fast_recipe: \(!request.bestQuality && !request.turbo)")
+        }
+        if request.model.supportsDiffusionDecoder {
+            lines.append("decoder: \(request.diffusionDecoder ? "diffusion" : "convolution")")
+        }
+        if request.model.supportsTurbo {
+            lines.append("turbo: \(request.turbo)")
+        }
+        if request.model.supportsChainedWindows {
+            lines.append("chain_windows: \(max(request.chainWindows, 1))")
+        }
+
+        func basename(_ path: String) -> String {
+            (path as NSString).lastPathComponent
+        }
+        if let path = request.firstFrameImagePath, !path.isEmpty {
+            lines.append("first_frame: \(basename(path))")
+        }
+        if hasAudio, let path = request.audioPath {
+            lines.append("input_audio: \(basename(path))")
+        }
+
+        if request.model.supportsLoRA {
+            for (index, lora) in request.loras.filter({ !$0.path.isEmpty }).enumerated() {
+                lines.append("lora_\(index + 1)_file: \(basename(lora.path))")
+                lines.append("lora_\(index + 1)_scale: \(String(format: "%.2f", lora.scale))")
+            }
+        }
+        if request.model.supportsReferences {
+            for (index, path) in request.refImagePaths.filter({ !$0.isEmpty }).enumerated() {
+                lines.append("reference_image_\(index + 1): \(basename(path))")
+            }
+            for (index, path) in request.refVideoPaths.filter({ !$0.isEmpty }).enumerated() {
+                lines.append("reference_video_\(index + 1): \(basename(path))")
+            }
+            for (index, path) in request.refAudioPaths.filter({ !$0.isEmpty }).enumerated() {
+                lines.append("reference_audio_\(index + 1): \(basename(path))")
+            }
+            lines.append("reference_image_size: \(request.refImageSize.rawValue)")
+        }
+
+        var out = lines.joined(separator: "\n")
+        out += "\n\n# Prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return out + "\n"
+    }
+
+    /// `<clip>.mp4` → `<clip>.txt` companion path.
+    nonisolated static func sidecarPath(forVideo videoPath: String) -> String {
+        (videoPath as NSString).deletingPathExtension + ".txt"
+    }
+
+    /// Kept separate from mp4 encoding so tests can pin actual filesystem
+    /// behavior without synthesizing video frames through AVFoundation.
+    nonisolated static func writeSettingsSidecar(_ text: String, forVideo videoPath: String) throws {
+        try text.write(to: URL(fileURLWithPath: sidecarPath(forVideo: videoPath)),
+                       atomically: true, encoding: .utf8)
     }
 
     /// Longest clip shipped to the server. LTX's frame ladder tops out around

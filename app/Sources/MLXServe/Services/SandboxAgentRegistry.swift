@@ -99,12 +99,7 @@ extension SandboxAgentSpec {
                         budget: budget, entries: entries)),
                 SandboxAgentFile(
                     guestPath: "/root/.hermes/.env",
-                    content: """
-                    # written by mlx-serve — OPENAI_BASE_URL marks a provider as configured,
-                    # which is what keeps the first-run setup wizard out of the session.
-                    OPENAI_BASE_URL=\(base)/v1
-                    OPENAI_API_KEY=\(key)
-                    """),
+                    content: AgentConfigs.hermesEnvFile(baseURL: base, apiKey: key)),
             ]
         },
         launchCommand: { _ in "hermes" }

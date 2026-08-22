@@ -83,6 +83,7 @@ enum SettingsReset {
             return [
                 f("tokenizeCacheEntries") { $0.tokenizeCacheEntries = $1.tokenizeCacheEntries },
                 f("maxConcurrent") { $0.maxConcurrent = $1.maxConcurrent },
+                f("anePrefill") { $0.anePrefill = $1.anePrefill },
                 f("decodeAttnQuantChoice") { $0.decodeAttnQuantChoice = $1.decodeAttnQuantChoice },
                 f("kvQuant") { $0.kvQuant = $1.kvQuant },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },

@@ -81,9 +81,22 @@ Used in mlx-serve (`src/transformer.zig`):
   * The per-dispatch key-chunk budget in the head-dim-256 fused causal
     attention path, whose design comes from `qwen35_fa256_attention.py`.
 
+Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
+
+  * The Neural Engine instance-affinity option keys and the requirement that
+    they be passed together, from `custom_kernels/qwen35_prefill/csrc/
+    qwen35_ane.mm`; the per-procedure request construction and the practice
+    of reading a procedure's symbol indices from the model rather than
+    assuming them come from the same file.
+  * The procedure-bank program layout (many linears as procedures inside one
+    compiled program) as a response to the runtime's resident-handle limit.
+
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the fa256
 chunking carries exact online-softmax state between dispatches so a chunked run
-is bit-identical to a single dispatch.
+is bit-identical to a single dispatch. The ANE MIL emitter is our own
+(`constexpr_affine_dequantize` with an int8 zero point, our K-chunked down
+conv and power-of-two accumulator wrap); only the bank structure and the
+affinity handle are theirs.
 
 --------------------------------------------------------------------------------
 jinja.cpp
@@ -104,6 +117,51 @@ additions providing the C interface the Zig side calls.
 ================================================================================
 MIT License
 ================================================================================
+
+--------------------------------------------------------------------------------
+h3.c-ane (Apple Neural Engine port of h3.c)
+https://github.com/maderix/h3.c-ane
+https://github.com/maderix/ANE
+Copyright (c) 2026 Manjeet Singh (maderix)
+Licensed under the MIT License.
+
+Vendored into `lib/ane/ane_bridge.{h,m}` (from `h3_ane_bridge.{h,m}`): the
+objc-runtime bridge to the private AppleNeuralEngine framework — in-memory
+MIL model compile/load/evaluate, IOSurface I/O binding, and the
+content-addressed compile cache. The ANE port is maderix's addition to a
+fork of antirez's h3.c (whose own code is Metal/GPU only and none of which
+is vendored here), building on the private-API groundwork in
+https://github.com/maderix/ANE. mlx-serve changes: the persistent cache
+entries move to `~/.mlx-serve/ane-cache` (staging stays in $TMPDIR — the
+compile runs inside aned, which cannot read a home-directory path) and the
+cache env var is renamed `MLX_SERVE_ANE_CACHE`. `lib/ane/ane_mlp.m` (the
+per-layer SwiGLU-MLP MIL program builder used by `--ane-prefill`) is an
+mlx-serve addition modeled on the same project's `h3_ane_linear.m` blob
+layout and int8 constexpr-dequantize idioms.
+
+--------------------------------------------------------------------------------
+SwaTex
+https://github.com/PhraseHQ/SwaTex
+Copyright (c) 2026 Phrase (https://phrase.so) and SwaTex contributors
+Licensed under the MIT License.
+
+Used by the MLX Core app to parse, lay out, and natively render LaTeX in
+assistant chat responses. SwaTex includes work derived from:
+
+  * RaTeX (https://github.com/erweixin/RaTeX), Copyright (c) erweixin,
+    licensed under the MIT License. SwaTex's engine architecture, layout
+    mathematics, generated tables, and golden corpus derive from RaTeX.
+  * KaTeX (https://katex.org), Copyright (c) 2013-2020 Khan Academy and other
+    contributors, licensed under the MIT License. Font metrics, symbols,
+    stretchy-SVG geometry, macros, and layout rules derive from KaTeX.
+  * mhchem for KaTeX, Copyright (c) Martin Hensel, licensed under the MIT
+    License. The chemistry command state machine reaches SwaTex through
+    RaTeX's Rust port.
+
+The KaTeX_*.ttf fonts bundled in SwaTexRender use the SIL Open Font License
+1.1. SwaTex_SwaTexRender.bundle includes the upstream OFL.txt and
+FONT_NOTICE.txt alongside those fonts, and the entire bundle is copied into the
+app's Resources directory by every packaging path.
 
 --------------------------------------------------------------------------------
 MLX
@@ -209,6 +267,46 @@ cos/sin by a probe row through stock `mlx_fast_rope` instead of re-deriving the
 angles; the lm_head prune is gated on argmax-only requests and ships opt-in
 behind `MLX_SERVE_LMHEAD_PRUNE=1` after our own A/B measured it slower in the
 live graph than in a microbenchmark.
+
+--------------------------------------------------------------------------------
+qwen-3.8-mtp-challenge
+https://github.com/Layr-Labs/qwen-3.8-mtp-challenge
+Copyright (c) 2026 Layr Labs, Inc. and the challenge submitters
+
+Ideas and code derived from validated challenge submissions at commit b6ce964,
+ported in August 2026 (each item names the submission's co-author handle):
+
+  * The hd-256 causal sdpa query split for 6-9-row verify blocks
+    (`splitCausalSdpa` in `src/transformer.zig`), from
+    `Vendor/mlx-swift-lm/.../AttentionUtils.swift` at b6ce964 (a-github-name):
+    split the queries at row 5 so both halves ride MLX's sdpa vector path,
+    with bottom-right causal alignment keeping each half's key window exact.
+  * Requantizing a dense bf16 MTP draft head at load time, from the 4-bit/g64
+    head declared in `mtp-head.manifest.json` at deb63ad (noskillcoding) — an
+    idea rather than code: the draft head only proposes tokens, verification
+    corrects them, so its weights can be served narrow.
+  * The crossrow multi-row QMV kernel (`verifyQmmCrossrowSource` in
+    `src/transformer.zig`), from `qmv_fast_crossrow_affine4_g64` in their
+    vendored `quantized.h` as widened to M 2..9 at 08897af (hadakang): one
+    packed-weight read serves two input rows, with /16-power prescaled
+    activations against masked (unshifted) nibbles. Ships opt-in
+    (`MLX_SERVE_VERIFY_QMM_CROSSROW=1`) — measured slower than stock in our
+    stack, retained as an A/B lever.
+  * The draft-rerank top-32 shortlist kernels (`msv_mtp_top32_partial` /
+    `msv_mtp_top32_finalize` in `src/mtp.zig`), from
+    `qwen35DraftTop32PartialKernel` / `qwen35DraftTop32FinalizeKernel` in
+    their `Qwen35.swift` at 474c750 (submission 942e5ab2): an exact top-32
+    of a full-vocab row in two dispatches (per-thread slot selection under a
+    taken-bitmask, simd_max rounds, ordinal-mapped floats), replacing a
+    full GPU argsort. The surrounding scheme (coarse 2-bit proposal readout
+    re-scored by the exact head's own 32 rows) is theirs as well; our
+    re-score uses the trunk lm_head instead of a compact draft head.
+
+Modifications by mlx-serve: reimplemented in Zig against mlx-c; the query
+split is gated per shape and kill-switched (`MLX_SERVE_SDPA_SPLIT`), the
+head requantization uses our existing per-weight quantization path, and the
+crossrow kernel is emitted by comptime codegen with our own host dispatch
+(paired input groups instead of their idle-odd-threadgroup reuse).
 
 
 ================================================================================

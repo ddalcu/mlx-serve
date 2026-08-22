@@ -65,6 +65,7 @@ pub const TokenizeCache = struct {
         tool_choice_instruction: ?[]const u8,
         enable_thinking: bool,
         reasoning_effort: ?[]const u8,
+        continue_final: bool,
     ) ?u64 {
         for (messages) |m| if (m.images != null) return null;
         var h = std.hash.Wyhash.init(0xC0DEC0DE);
@@ -97,6 +98,12 @@ pub const TokenizeCache = struct {
         // map it (dsv4's high/max preamble) — two requests differing only in
         // effort must not share a cached tokenization.
         if (reasoning_effort) |e| h.update(e) else h.update("(no-effort)");
+        h.update("\x1e");
+        // A continuation renders the SAME messages into a different prompt —
+        // the trailing assistant becomes a prefill instead of history. Without
+        // this the two collide in the cache and one of them is served the
+        // other's tokens.
+        h.update(if (continue_final) "continue=on" else "continue=off");
         return h.final();
     }
 
@@ -167,9 +174,9 @@ test "TokenizeCache key stability" {
     const m3 = [_]chat_mod.Message{
         .{ .role = "user", .content = "hello world!" }, // different content
     };
-    const k1 = TokenizeCache.keyFor(&m1, null, null, false, null).?;
-    const k2 = TokenizeCache.keyFor(&m2, null, null, false, null).?;
-    const k3 = TokenizeCache.keyFor(&m3, null, null, false, null).?;
+    const k1 = TokenizeCache.keyFor(&m1, null, null, false, null, false).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, false, null, false).?;
+    const k3 = TokenizeCache.keyFor(&m3, null, null, false, null, false).?;
     try std.testing.expectEqual(k1, k2);
     try std.testing.expect(k1 != k3);
     _ = allocator;
@@ -185,8 +192,8 @@ test "TokenizeCache key distinguishes assistant reasoning_content" {
     const m2 = [_]chat_mod.Message{
         .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
     };
-    const k1 = TokenizeCache.keyFor(&m1, null, null, true, null).?;
-    const k2 = TokenizeCache.keyFor(&m2, null, null, true, null).?;
+    const k1 = TokenizeCache.keyFor(&m1, null, null, true, null, false).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, true, null, false).?;
     try std.testing.expect(k1 != k2);
 }
 
@@ -197,9 +204,9 @@ test "TokenizeCache key distinguishes reasoning_effort" {
     const m = [_]chat_mod.Message{
         .{ .role = "user", .content = "prove it rigorously" },
     };
-    const k_default = TokenizeCache.keyFor(&m, null, null, true, null).?;
-    const k_high = TokenizeCache.keyFor(&m, null, null, true, "high").?;
-    const k_max = TokenizeCache.keyFor(&m, null, null, true, "max").?;
+    const k_default = TokenizeCache.keyFor(&m, null, null, true, null, false).?;
+    const k_high = TokenizeCache.keyFor(&m, null, null, true, "high", false).?;
+    const k_max = TokenizeCache.keyFor(&m, null, null, true, "max", false).?;
     try std.testing.expect(k_default != k_high);
     try std.testing.expect(k_high != k_max);
 }
@@ -210,7 +217,20 @@ test "TokenizeCache images null key" {
             .{ .pixels = "", .width = 8, .height = 8 },
         } },
     };
-    try std.testing.expect(TokenizeCache.keyFor(&m_img, null, null, false, null) == null);
+    try std.testing.expect(TokenizeCache.keyFor(&m_img, null, null, false, null, false) == null);
+}
+
+test "keyFor: a continuation does not share a key with the same messages as history" {
+    // The trailing assistant renders as a PREFILL under continuation and as
+    // history without it — same messages, different prompt. Colliding here
+    // serves one request the other's tokens.
+    const m = [_]chat_mod.Message{
+        .{ .role = "user", .content = "count to three" },
+        .{ .role = "assistant", .content = "one, two," },
+    };
+    const plain = TokenizeCache.keyFor(&m, null, null, true, null, false).?;
+    const cont = TokenizeCache.keyFor(&m, null, null, true, null, true).?;
+    try std.testing.expect(plain != cont);
 }
 
 test "TokenizeCache get/put + LRU eviction" {

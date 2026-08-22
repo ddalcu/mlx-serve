@@ -2247,9 +2247,21 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     return sendBytes(conn, allocator, "audio/wav", out);
 }
 
+/// `instrumental: true` beside words to sing is contradictory. Letting either
+/// side quietly win is the failure mode — a sticky checkbox silently discards a
+/// verse the user typed, or the checkbox does nothing — so the pair is a NAMED
+/// 400 (the `/v1/images/edits` rule: everything we cannot honor is named).
+/// Whitespace-only lyrics count as ABSENT so an app that keeps a blank lyrics
+/// editor mounted beside the checkbox is fine. Both backends read this ONE
+/// predicate, so the rule cannot drift between them.
+pub fn instrumentalConflicts(instrumental: bool, lyrics: []const u8) bool {
+    return instrumental and std.mem.trim(u8, lyrics, " \t\r\n").len != 0;
+}
+
 /// `POST /v1/audio/music-generations` — ACE-Step text2music.
 /// `{"model", "prompt" (style/genre/mood, REQUIRED), "lyrics" ("" →
-/// "[Instrumental]"), "vocal_language" ("en"), "bpm", "keyscale",
+/// "[Instrumental]"), "instrumental" (bool, the explicit spelling of empty
+/// lyrics; a 400 if real lyrics ride along), "vocal_language" ("en"), "bpm", "keyscale",
 /// "timesignature", "duration_seconds" (default 60, valid 10–600), "seed",
 /// "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
 /// non-stream; SSE `progress` per stage/step + a base64 `complete` event when
@@ -2280,6 +2292,10 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
         allocator.free(language);
         language = try jsonUnescape(allocator, raw);
     }
+    const instrumental = sse.bodyWantsTrue(body, "instrumental");
+    if (instrumentalConflicts(instrumental, lyrics))
+        return sendError(conn, 400, "'instrumental' is true but 'lyrics' is non-empty — send one or the other");
+    const cond_lyrics = acestep.resolveLyrics(instrumental, lyrics);
     const keyscale = extractJsonString(body, "keyscale") orelse "";
     const timesignature = extractJsonString(body, "timesignature") orelse "";
     var bpm: ?u32 = null;
@@ -2293,14 +2309,14 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[music] generating {d}s seed={d} lyrics={d}ch stream={}\n", .{ duration, seed, lyrics.len, want_stream });
+    log.info("[music] generating {d}s seed={d} lyrics={d}ch instrumental={} stream={}\n", .{ duration, seed, cond_lyrics.len, instrumental, want_stream });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const req = acestep.MusicRequest{
         .caption = prompt,
-        .lyrics = lyrics,
+        .lyrics = cond_lyrics,
         .language = language,
         .bpm = bpm,
         .keyscale = keyscale,
@@ -2336,8 +2352,15 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
 
 /// `POST /v1/audio/music-generations` — MiniMax Music 3 text2music.
 /// `{"model", "prompt" (style/genre/mood caption, REQUIRED), "lyrics"
-/// (REQUIRED — the model is lyric-conditioned; structure tags like `[verse]`
-/// each on their own line), "duration_seconds" (default 60, valid 1-360, an
+/// (REQUIRED unless `instrumental` — the model is lyric-conditioned; structure
+/// tags like `[verse]` each on their own line), "instrumental" (bool; sends the
+/// `[Instrumental]` section tag from MiniMax's own model card as the whole
+/// lyric block — the open weights have no `is_instrumental` parameter, so text
+/// is the only lever, and the tag is the same one ACE-Step uses),
+/// "bpm" (30-300) and "keyscale" — no request field exists for these on this
+/// engine, so they are folded into the caption as MiniMax's own
+/// `BPM: 96. Key: C major.` (`music3.captionWithFacts`), skipped when the
+/// prompt already says them; "duration_seconds" (default 60, valid 1-360, an
 /// UPPER bound — the model may stop earlier), "steps" (flow-match steps,
 /// default 30, valid 4-100), "seed", "stream"}`. ACE-Step's
 /// bpm/keyscale/timesignature/vocal_language have NO equivalent here and are
@@ -2345,11 +2368,18 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
 /// handler: raw `audio/wav` non-stream, SSE progress + base64 complete when
 /// streaming.
 fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3: *music3.Engine) !void {
-    for ([_][]const u8{ "bpm", "keyscale", "timesignature", "vocal_language" }) |field| {
+    // `timesignature` and `vocal_language` stay named 400s: MiniMax's card
+    // documents neither, and inventing caption text for an undocumented knob is
+    // worse than saying we cannot honor it. `bpm` and `keyscale` USED to be
+    // refused here too — wrongly. Global Metadata on that same card lists BPM,
+    // key and scale, and its example caption reads
+    // "Genre: acoustic pop. BPM: 96. Key: C major.", so they are supported;
+    // they are just caption TEXT here rather than conditioning fields.
+    for ([_][]const u8{ "timesignature", "vocal_language" }) |field| {
         const present = extractJsonString(body, field) != null or extractJsonInt(body, field) != null;
         if (present) {
-            var msg: [128]u8 = undefined;
-            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step field; MiniMax Music 3 has no equivalent (put style facts in 'prompt')", .{field}) catch "unsupported field";
+            var msg: [160]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step field; MiniMax Music 3 has no documented equivalent (put it in 'prompt' yourself)", .{field}) catch "unsupported field";
             return sendError(conn, 400, m);
         }
     }
@@ -2357,10 +2387,40 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     const prompt = try jsonUnescape(allocator, raw_prompt);
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
-    const raw_lyrics = extractJsonString(body, "lyrics") orelse return sendError(conn, 400, "missing 'lyrics' (MiniMax Music 3 is lyric-conditioned; structure tags like [verse] go on their own lines)");
-    const lyrics = try jsonUnescape(allocator, raw_lyrics);
+    const instrumental = sse.bodyWantsTrue(body, "instrumental");
+    var lyrics: []u8 = try allocator.dupe(u8, "");
     defer allocator.free(lyrics);
-    if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'lyrics'");
+    if (extractJsonString(body, "lyrics")) |raw| {
+        allocator.free(lyrics);
+        lyrics = try jsonUnescape(allocator, raw);
+    }
+    if (instrumentalConflicts(instrumental, lyrics))
+        return sendError(conn, 400, "'instrumental' is true but 'lyrics' is non-empty — send one or the other");
+    if (!instrumental and std.mem.trim(u8, lyrics, " \t\r\n").len == 0)
+        return sendError(conn, 400, "missing 'lyrics' (MiniMax Music 3 is lyric-conditioned; structure tags like [verse] go on their own lines, or send \"instrumental\": true)");
+    const cond_lyrics = music3.resolveLyrics(instrumental, lyrics);
+
+    // Tempo and key ride the CAPTION on this engine (see captionWithFacts), as
+    // does the no-vocals intent — the lyric tag alone leaves vocal TEXTURE in
+    // (measured 2026-08-18), and MiniMax's api marks `prompt` required for an
+    // instrumental track while making `lyrics` optional. Built BEFORE the
+    // 5000-token pre-check below so every added clause is COUNTED, never
+    // smuggled past the cap.
+    var bpm: ?u32 = null;
+    if (extractJsonInt(body, "bpm")) |b| {
+        if (b < 30 or b > 300) return sendError(conn, 400, "'bpm' must be in [30,300]");
+        bpm = @intCast(b);
+    }
+    const keyscale = extractJsonString(body, "keyscale") orelse "";
+    const caption = try music3.captionWithFacts(
+        allocator,
+        prompt,
+        bpm,
+        keyscale,
+        instrumental and music3.instrumentalCaptionEnabled(),
+    );
+    defer allocator.free(caption);
+    const caption_grew = caption.len != prompt.len;
 
     const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
     if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
@@ -2372,7 +2432,7 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     // Pre-validate the prompt budget BEFORE any SSE bytes go out, so the cap
     // is a clean named 400 instead of a mid-stream error.
     {
-        const toks = m3.tokenizePrompt(allocator, prompt, lyrics) catch |err| switch (err) {
+        const toks = m3.tokenizePrompt(allocator, caption, cond_lyrics) catch |err| switch (err) {
             error.PromptTooLong => return sendError(conn, 400, "assembled prompt exceeds 5000 tokens"),
             else => return err,
         };
@@ -2381,14 +2441,14 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[music3] generating {d}s steps={d} seed={d} lyrics={d}ch stream={}\n", .{ duration, steps, seed, lyrics.len, want_stream });
+    log.info("[music3] generating {d}s steps={d} seed={d} lyrics={d}ch instrumental={} caption_facts={} stream={}\n", .{ duration, steps, seed, cond_lyrics.len, instrumental, caption_grew, want_stream });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const req = music3.MusicRequest{
-        .caption = prompt,
-        .lyrics = lyrics,
+        .caption = caption,
+        .lyrics = cond_lyrics,
         .duration_s = duration,
         .seed = seed,
         .steps = steps,
@@ -5223,4 +5283,28 @@ test "incompleteMediaDir: marker-missing media dir is refused, complete and non-
     // The refused dir is exactly the one detectModality declines.
     try testing.expect(detectModality(io, allocator, frag) == null);
     try testing.expectEqual(Modality.video, detectModality(io, allocator, comp).?);
+}
+
+test "instrumental is a request-level rule: the flag and real lyrics are a conflict, not a race" {
+    // `instrumental: true` beside words to sing is contradictory, and letting
+    // either side quietly win is the failure mode — a user who typed a verse
+    // and left a sticky checkbox set gets a wordless track with no explanation,
+    // or a checkbox that does nothing. Both backends read the ONE predicate, so
+    // the rule cannot drift between them.
+    try testing.expect(instrumentalConflicts(true, "[verse]\nhello"));
+    try testing.expect(instrumentalConflicts(true, "la la la"));
+    // Whitespace-only is ABSENT, not a conflict: an app that keeps a blank
+    // lyrics editor mounted beside the checkbox must not 400.
+    try testing.expect(!instrumentalConflicts(true, ""));
+    try testing.expect(!instrumentalConflicts(true, "  \n\t\r "));
+    // The flag off never conflicts, whatever the lyrics say.
+    try testing.expect(!instrumentalConflicts(false, "[verse]\nhello"));
+    try testing.expect(!instrumentalConflicts(false, ""));
+}
+
+test "instrumental is parsed off the body only when spelled true" {
+    try testing.expect(sse.bodyWantsTrue("{\"instrumental\":true}", "instrumental"));
+    try testing.expect(sse.bodyWantsTrue("{\"instrumental\": true}", "instrumental"));
+    try testing.expect(!sse.bodyWantsTrue("{\"instrumental\":false}", "instrumental"));
+    try testing.expect(!sse.bodyWantsTrue("{\"prompt\":\"x\"}", "instrumental"));
 }

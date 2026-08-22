@@ -41,6 +41,12 @@ class ServerManager: ObservableObject {
         allModels.filter { $0.lanAdvertises(capability) }
     }
     @Published var memoryInfo: MemoryInfo?
+    /// Live throughput, nil when the server runs without `--metrics`.
+    @Published var throughput: ThroughputSnapshot?
+    /// Live decode / prefill tok/s, derived from the gauge delta between the
+    /// last two polls.
+    @Published var decodeTPSNow: Double?
+    @Published var prefillTPSNow: Double?
     @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
     @Published var lastError: String = ""
@@ -279,6 +285,9 @@ class ServerManager: ObservableObject {
         status = .stopped
         modelInfo = nil
         memoryInfo = nil
+        throughput = nil
+        decodeTPSNow = nil
+        prefillTPSNow = nil
     }
 
     func toggle(modelPath: String, options: ServerOptions) {
@@ -589,6 +598,13 @@ class ServerManager: ObservableObject {
     private func refreshStatus() async {
         if let mem = try? await api.fetchProps(port: port) {
             memoryInfo = mem
+        }
+        if let snap = try? await api.fetchThroughput(port: port) {
+            if let prev = throughput {
+                decodeTPSNow = snap.decodeTPS(since: prev)
+                prefillTPSNow = snap.prefillTPS(since: prev)
+            }
+            throughput = snap
         }
         // Intentionally do NOT poll /v1/models here. The registry snapshot is
         // already populated once on `transitionToRunning` and again after every

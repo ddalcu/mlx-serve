@@ -12,9 +12,16 @@ enum ChatMetrics {
     /// transcript content, context monitor, composer row.
     static let gutter: CGFloat = 16
 
-    /// The reading measure — the width the transcript AND the composer are
-    /// capped at, centred in whatever the window gives them.
-    static let contentMaxWidth: CGFloat = 740
+    /// Fraction of the detail column's measured width the reading measure
+    /// takes — the transcript, composer, and empty-state greeting are all
+    /// capped at this fraction, centred in whatever the panel gives them.
+    /// 0.8, not 1.0: the window can be as wide as the user wants, but prose
+    /// still shouldn't run edge to edge. Pinned by `ChatColumnMetricsTests`.
+    static let contentWidthFraction: CGFloat = 0.8
+
+    /// Reading width used for the single frame before `ChatDetailView` has
+    /// measured its own column (`onGeometryChange` hasn't fired yet).
+    static let contentFallbackWidth: CGFloat = 740
 
     /// Between turns in the transcript. Wider than the old 12: with the column
     /// capped, vertical rhythm is what separates one turn from the next — the

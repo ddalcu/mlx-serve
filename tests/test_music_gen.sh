@@ -82,6 +82,16 @@ code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/jso
   -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"duration_seconds\":5}" -o /dev/null -w "%{http_code}")
 [ "$code" = "400" ] || { echo "FAIL: duration 5 returned $code (want 400)"; exit 1; }
 echo "PASS: out-of-range duration -> 400"
+# `instrumental` is the EXPLICIT spelling of what an empty lyric block already
+# meant on ACE-Step, so it must resolve to the same [Instrumental] marker — and
+# sending it beside real lyrics is a NAMED 400 on BOTH backends (one predicate).
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"instrumental\":true,\"lyrics\":\"la la\"}" \
+  -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: instrumental+lyrics returned $code (want 400)"; cat /tmp/test_music_err.txt; exit 1; }
+grep -q "instrumental" /tmp/test_music_err.txt \
+  || { echo "FAIL: conflict 400 does not NAME 'instrumental'"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: instrumental beside lyrics -> named 400"
 # The TTS endpoint against a music model is an explicit 400 (never a silent
 # misinterpretation) — the wrong-backend guard on the shared audio slot.
 code=$(api /v1/audio/speech -X POST -H 'Content-Type: application/json' \

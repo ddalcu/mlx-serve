@@ -32,9 +32,14 @@ if [ "$ZIG_DEBUG" = "1" ] && [ "$FAST_DEV" != "1" ]; then
     exit 1
 fi
 
-# Signing identity from env (set in ~/.zshrc or CI)
-IDENTITY="${APPLE_DEVELOPER_ID:?Set APPLE_DEVELOPER_ID in env (e.g. 'Developer ID Application: Name (TEAMID)')}"
-TEAM_ID="${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in env}"
+# Signing identity from env (set in ~/.zshrc or CI). Unset = ad-hoc ("-"), so
+# anyone can build without an Apple Developer account; a release sets the real
+# identity (release.yml does).
+IDENTITY="${APPLE_DEVELOPER_ID:--}"
+TEAM_ID="${APPLE_TEAM_ID:--}"
+if [ "$IDENTITY" = "-" ]; then
+    echo "→ APPLE_DEVELOPER_ID not set — building with ad-hoc signing (dev build, not distributable)"
+fi
 
 cd "$SCRIPT_DIR"
 
@@ -70,21 +75,43 @@ fi
 # against a CHANGELOG that said 26.7.12). Guarded by
 # tests/test_release_workflow_gates.sh.
 YM="$(TZ=America/New_York date +%y.%-m)"
-if [ "$FAST_DEV" = "1" ]; then
-    # A fast build cuts no release, so the `gh` round-trip buys nothing — and
-    # stamping the TRACKED plist would leave the tree dirty on every iteration
-    # (release.yml's Homebrew step rebases and cannot take a dirty tree). Reuse
-    # whatever version the plist already carries; it is only ever read back by
+# Only a build that could BECOME a release asks GitHub what has been published.
+# A fast build cuts nothing, and neither does an ad-hoc one: `gh` is release
+# tooling, not a build dependency, and someone who clones the repo to compile
+# the app must not need a GitHub login to do it. The signing identity is the
+# discriminator because it is already the flag deciding hardened runtime,
+# notarization and productbuild below — no identity, no release, no `gh`.
+# Nothing in CI reaches this: release.yml mirrors this script step by step and
+# runs its own `gh release list`.
+if [ "$FAST_DEV" = "1" ] || [ "$IDENTITY" = "-" ]; then
+    # Reuse whatever version the plist already carries. It is only read back by
     # UpdateChecker, which has nothing to compare against on a dev build.
     CALVER="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST_SRC" 2>/dev/null || echo "${YM}.0")"
 else
-    LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null || echo "0")
+    # `gh` is the only thing that knows what has already been published, so its
+    # failure is not defaultable. It used to end in `|| echo "0"`, which turns a
+    # missing login or an offline laptop into v<YY.M>.1 — BEHIND every release
+    # already cut that month, which is the same UpdateChecker dead end as an
+    # unstamped bundle from the other direction. An empty month still yields 0
+    # through the jq's own `// 0`; only the COMMAND failing stops the build.
+    if ! LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null); then
+        echo "ERROR: \`gh release list\` failed, so the next CalVer number is unknown."
+        echo "       Defaulting it would stamp v${YM}.1, behind what is already published."
+        echo "       Fix it (\`gh auth login\`), or build for yourself: FAST_DEV=1 bash app/build.sh"
+        exit 1
+    fi
     NEXT_N=$((LAST_N + 1))
     CALVER="${YM}.${NEXT_N}"
-    # Stamp the version into whichever Info.plist this build mode ships.
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" "$INFO_PLIST_SRC"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" "$INFO_PLIST_SRC"
 fi
+# The version is stamped into the BUNDLE below, never here. This block used to
+# PlistBuddy the TRACKED app/Info.plist, which dirties the working tree on every
+# build: release.yml's Homebrew step rebases and cannot take a dirty tree, and a
+# contributor who merely builds the app ends up with a modified file they never
+# touched. Not stamping at all is the other half of the same line and has
+# already shipped — v26.8.1's DMG contained an app reporting 26.7.12, so
+# UpdateChecker offered an update that installing could never satisfy, forever.
+# Stamping the bundle copy is what release.yml does; both sides are pinned by
+# tests/test_release_workflow_gates.sh.
 export MLX_SERVE_VERSION="$CALVER"
 
 if [ "$FAST_DEV" = "1" ]; then
@@ -95,13 +122,10 @@ fi
 
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
-# `-Xswiftc -swift-version -Xswiftc 5` forces Swift 5 language mode globally
-# across the build graph. The `swift-sdk` 0.10.x pin (kept for Swift 6.1 / macos-14
-# CI compat) declares `swift-tools-version:6.1`; under Swift 6.3 (current Xcode 26)
-# its NetworkTransport.swift hits `[#SendingRisksDataRace]` errors that didn't
-# exist in 6.1. Swift 5 mode downgrades those to warnings. Until the swift-sdk
-# pin can move past 0.11 (or CI moves to a Swift 6.3 runner), this flag keeps
-# the build green on both old and new toolchains.
+# SwiftPM owns each target's language mode. MLXCore's 5.9 manifest keeps the app
+# in Swift 5 mode, while modern dependencies (swift-sdk 0.12.x, SwaTex 0.5.x)
+# compile in the mode their own manifests declare. A global `-swift-version 5`
+# override reaches the whole graph and makes SwaTex's Swift 6.1 source invalid.
 #
 # The configuration is the single biggest lever in this script: `-c release`
 # turns on Whole Module Optimization, so touching one file recompiles the whole
@@ -114,11 +138,17 @@ if [ "$FAST_DEV" = "1" ]; then
 else
     SWIFT_CONFIG=release
 fi
-SWIFT_BUILD_FLAGS=(-c "$SWIFT_CONFIG" -Xswiftc -swift-version -Xswiftc 5 ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[@]}"})
+SWIFT_BUILD_FLAGS=(-c "$SWIFT_CONFIG" ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[@]}"})
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
-SWIFT_BIN="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)/MLXCore"
+SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
+SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"
+SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_DIR/SwaTex_SwaTexRender.bundle"
 if [ ! -f "$SWIFT_BIN" ]; then
     echo "ERROR: Swift build failed"
+    exit 1
+fi
+if [ ! -d "$SWATEX_RESOURCE_BUNDLE" ]; then
+    echo "ERROR: SwaTex font resource bundle missing"
     exit 1
 fi
 echo "  Swift binary: $(du -h "$SWIFT_BIN" | cut -f1)"
@@ -218,6 +248,10 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
 
+# SwiftPM does not embed resource bundles when we assemble the .app by hand.
+# SwaTex loads its KaTeX fonts from this bundle at runtime.
+cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"
+
 # License + third-party attributions. The bundled mlx-serve binary links
 # Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, jinja.cpp) whose section 4
 # wants the license text and NOTICE attributions to travel with the binary, not
@@ -227,8 +261,13 @@ cp "$PROJECT_ROOT/LICENSE" "$PROJECT_ROOT/LICENSE-APACHE-2.0" "$PROJECT_ROOT/NOT
 # mlx-serve Zig binary
 cp "$PROJECT_ROOT/$MLX_BIN" "$CONTENTS/MacOS/mlx-serve"
 
-# Info.plist (the build-mode variant, already version-stamped)
+# Info.plist (the build-mode variant), stamped HERE rather than at the source:
+# the tracked file stays clean, and the bundle can never ship the last release's
+# version. Must land after this cp (which would overwrite it) and before the
+# codesign below (a write after the seal invalidates it).
 cp "$INFO_PLIST_SRC" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" "$CONTENTS/Info.plist"
 
 # The vz-agent guest binary ships in EVERY build variant (issue #89: it was
 # MAS-only, so Developer ID / ad-hoc builds always booted the legacy console
@@ -500,6 +539,10 @@ fi
 # ── Phase 6: Notarize ──
 if [ "${SKIP_NOTARIZE:-}" = "1" ]; then
     echo "→ Skipping notarization (SKIP_NOTARIZE=1)"
+elif [ "$IDENTITY" = "-" ]; then
+    # An ad-hoc signed app can't be notarized (notarization requires a real
+    # Developer ID signature), so don't fail a no-account build at the finish line.
+    echo "→ Skipping notarization (ad-hoc signing)"
 else
     echo "→ Notarizing..."
     APPLE_ID="${APPLE_ID:?Set APPLE_ID in env for notarization}"

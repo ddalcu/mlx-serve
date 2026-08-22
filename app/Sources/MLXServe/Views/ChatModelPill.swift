@@ -60,15 +60,9 @@ struct ChatModelPill: View {
         Binding(
             get: { ChatModelSelection.tag(localPath: appState.selectedModelPath,
                                           lanChatModelId: server.lanChatModelId) },
-            set: { picked in
-                switch ChatModelSelection.action(for: picked) {
-                case .selectLan(let id):
-                    appState.selectLanModel(id)
-                case .selectLocal(let path):
-                    server.lanChatModelId = nil
-                    appState.selectedModelPath = path
-                }
-            }
+            // What a pick MEANS is `AppState.applyChatModelPick` — one method,
+            // shared with the tray and the ⌘L palette.
+            set: { picked in appState.applyChatModelPick(picked) }
         )
     }
 

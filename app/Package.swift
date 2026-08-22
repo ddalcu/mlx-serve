@@ -29,6 +29,10 @@ let package = Package(
         // EmbeddedTerminalView — so a libghostty-backed view can replace it
         // wholesale later. Pinned to the 1.14 line.
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", "1.14.0" ..< "2.0.0"),
+        // Native TeX parser/layout + bundled KaTeX fonts for assistant chat.
+        // Keeping this in Swift avoids a WebView/JavaScript renderer and the
+        // security, selection, and streaming seams that would come with one.
+        .package(url: "https://github.com/PhraseHQ/SwaTex", "0.5.0" ..< "0.6.0"),
     ],
     targets: [
         .executableTarget(
@@ -38,6 +42,7 @@ let package = Package(
                 .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "SwiftOGG", package: "swift-ogg"),
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
+                .product(name: "SwaTexRender", package: "SwaTex"),
             ],
             path: "Sources/MLXServe",
             exclude: ["Resources"]

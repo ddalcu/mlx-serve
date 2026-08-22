@@ -18,11 +18,16 @@ Every streaming surface buffers generated tokens while it might be looking at a 
 - Related but NOT the same bug: pi's `~/.pi/agent/models.json` declared `contextWindow: 32768` for a model whose server advertises `meta.context_length` ≈ 96k, so pi's own `max_tokens` budget collapsed late in the session and its `write` calls truncated mid-argument — surfacing as our (deliberate) truncation salvage: tool name recovered, `arguments: {}`, `finish_reason: "length"`. A client that validates args against the schema instead of honoring `finish_reason: "length"` reads that as a malformed call. Clients should read `context_length` off `/v1/models`.
 
 ### Shutdown race: drain connection threads before `Scheduler.deinit` (SIGSEGV in `complete`)
-Per-connection threads are spawned **detached** in `server.serve`'s accept loop (the `std.Thread.spawn` handle is discarded). On shutdown the accept loop breaks and `serve` returns, firing `defer scheduler.deinit()` — which frees the slot queues (`pending`/`decoding`/`cleanup_queue`) on the assumption that "all conn threads called `complete` properly". They hadn't: a detached conn thread still inside `Scheduler.complete` (touching those very lists) raced the free → use-after-free SIGSEGV (crash report `mlx-serve-2026-06-20-141700.ips`: thread 0 in `Scheduler.deinit`/`Thread.join`, thread 13 in `Scheduler.complete`; null-deref at +0x18). Triggered by a shutdown/model-switch while a stream was in flight. Fix (three parts):
+Per-connection threads are spawned in `server.serve`'s accept loop. On shutdown the accept loop breaks and `serve` returns, firing `defer scheduler.deinit()` — which frees the slot queues (`pending`/`decoding`/`cleanup_queue`) on the assumption that "all conn threads called `complete` properly". They hadn't: a conn thread still inside `Scheduler.complete` (touching those very lists) raced the free → use-after-free SIGSEGV (crash report `mlx-serve-2026-06-20-141700.ips`: thread 0 in `Scheduler.deinit`/`Thread.join`, thread 13 in `Scheduler.complete`; null-deref at +0x18). Triggered by a shutdown/model-switch while a stream was in flight. Fix (three parts):
 - `server.serve` tracks live conn threads in an atomic `active_conn_threads` (inc before spawn, dec in `handleConnectionThread`'s first-declared `defer`). After the accept loop it calls `scheduler.cancelAllInFlight()` then **waits for the counter to reach 0** (bounded ~30s) before returning — so `deinit` always runs after every `complete()` has finished.
 - `Scheduler.cancelAllInFlight()` sets `cancel()` on every pending+decoding slot so blocked readers wake.
 - `Slot.waitNext`/`waitNextTimeout` now return `.done` when `cancelled` is set — previously `cancel()` only broadcast, so a reader blocked in `waitNext` never woke on cancel and the drain could never complete. The inference thread is still alive during the drain (deinit joins it only after `serve` returns), so cancelled slots settle promptly.
-- Smoke test `tests/test_shutdown_midstream.sh` (SIGTERM during concurrent streams → clean exit, never rc=139). NOTE: the race is timing-sensitive and the plain-SIGTERM test does not deterministically reproduce it on the old binary (the live crash was a messier model-switch/relaunch) — the fix is correct by construction (deinit cannot run until conn threads drain), the test is a regression smoke guard, not a red-on-revert proof. **Rule: any teardown that frees state shared with detached worker threads must join/drain those threads first; a `defer deinit()` after a loop of `spawn(...)` whose handles are dropped is the classic shape of this bug.**
+- Smoke test `tests/test_shutdown_midstream.sh` (SIGTERM during concurrent streams → clean exit, never rc=139). NOTE: the race is timing-sensitive and the plain-SIGTERM test does not deterministically reproduce it on the old binary (the live crash was a messier model-switch/relaunch) — the fix is correct by construction (deinit cannot run until conn threads drain), the test is a regression smoke guard, not a red-on-revert proof. **Rule: every spawned thread handle must live until `join()` or `detach()`; detached workers touching shared state still need an explicit lifetime drain before teardown.**
+
+### Dropped connection-thread handles retain one stack mapping per request
+The shutdown counter fixed the lifetime race above but did not reap pthread resources. The accept loop discarded each successful `std.Thread.spawn` return value without calling `join()` or `detach()`. Returning from `handleConnectionThread` ends execution, but a joinable pthread retains its stack mapping and kernel bookkeeping until it is reaped. In a long-running Claude Code workload this looked like a model leak: E2B QAT-4bit stayed near 4–5 GB of MLX-active memory while process footprint climbed toward 10 GB and never fell. The decisive capture showed `/props` `cache_bytes` at only 2.9 MB, 155,786 stack regions using about 2.43 GB, and about 1.01 GB of page tables; 300 requests added 301 stack regions.
+
+The fix keeps the existing per-connection concurrency model and calls `conn_thread.detach()` immediately after a successful spawn. `active_conn_threads` still provides the shutdown lifetime barrier; detach only tells pthreads to reclaim resources automatically after return. Lowering `MLX_SERVE_CACHE_LIMIT`, changing the 8192-token KV growth cap, or calling `mlx_clear_cache()` more often cannot release pthread stacks. Guard: `each connection thread handle is detached after spawn` source-scans the accept-loop span so the handle cannot silently become discarded again.
 
 ### A text-gen request routed at a non-text model must 400 BEFORE prefill (one-request server kill)
 Live SIGSEGV 2026-07-06 (`mlx-serve run <flux dir>`): a chat request whose resolved model is a MEDIA entry has only the gen stub CPU state — the empty stub tokenizer yields `0 tokens`, prefill derefs `transformer == null`, and the WHOLE process dies. Any client (remote included) naming a media/encoder model on a chat surface could kill the server. The guard is `server.textGenRejectReason` (pure, hermetically tested) applied at ALL text-gen surfaces — `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses` (POST + WS upgrade), `/api/chat`, `/api/generate` — TWICE: a pre-`ensureLoaded` peek (so naming an unloaded 15 GB media stub doesn't cold-load just to earn its 400; detects via discovery `arch_hint`) and the post-load authoritative check (engine slots / `is_encoder_only` / ready-with-no-LM catch-all — `--model` primaries carry no hint, so the peek alone has gaps). Rules: (1) a new text-gen SURFACE must call the same guard (extend `isTextGenRoute` for the peek); (2) a new MODALITY is covered automatically via its engine slot + `modalityFromType(arch_hint)` — keep both in sync when adding one; (3) the same classification feeds `mlx-serve run`'s preflight (`model_discovery.classifyModelPath`/`ModelKind`) and the `list` TYPE column — one taxonomy, three surfaces. Guards: `textGenRejectReason`/`isTextGenRoute` unit tests (server.zig), `modelKindFromType`/`classifyModelPath` tests (model_discovery.zig), and the 4b case in `tests/test_unified_gen.sh` (chat + /v1/messages at a RESIDENT image model → 400s, server alive).
@@ -1355,3 +1360,36 @@ have been 0.62 GB of that. Layers past the 128-entry table keep the array's
   while `prefillTransientReserve` bills it for one chunk** (1.44x disagreement
   on Qwen3.5-4B at 4 bits). Absorbed by the sizer's 0.544 compound margin today;
   it belongs in `per_tok`. Still open.
+
+## opencode plan mode answered "What would you like to accomplish?" to every prompt: a content array's text parts were last-wins (2026-08-16, issue #195)
+
+A user in `mlx-serve launch opencode` put the session in plan mode and every
+first message was ignored — the model replied "I'll help you plan. What would
+you like to accomplish?" as if the prompt were empty, while the same model on
+LM Studio worked (issue #195; also reproduced locally — the SECOND plan-mode
+message worked, which was the tell).
+
+Opencode's `SessionReminders.apply` appends its "Plan Mode - System Reminder"
+block as a SECOND synthetic text part on the LAST user message when entering
+plan mode (and only then — later plan-mode turns get no reminder, which is why
+"asking again" worked). The AI SDK openai-compatible provider ships a
+multi-part user message as `content: [{type:"text",...},{type:"text",...}]`.
+Our `/v1/chat/completions` parser read that array with
+`if (text == .string) text_content = text.string;` — every text part
+OVERWROTE the previous one, so the model saw only the reminder and never the
+prompt. It then did exactly what the reminder asks with no task: offered to
+plan. Build mode sends ONE text part, so it never fired.
+
+Two more arms of the same class sat on `/v1/messages`: the top-level `system`
+array took only the FIRST text block (`break :blk text.string` on first hit
+— Claude Code sends identity + instructions as two blocks), and a
+`tool_result` content array took only its first text block. The Responses API
+parser already joined with `'\n'`, and the Anthropic user/assistant text
+blocks already accumulated — the bug was per-arm, which is what made it a
+class.
+
+Fix: ONE collector, `server.joinedTextParts` — every `{type:"text"}` part
+joined in order with `'\n'` (matching the Responses parser and the Anthropic
+user arm), single-part borrows the JSON's bytes / 2+ parts allocate
+(`{text, owned}`, the provenance rule), wired at all three sites. Guard:
+unit tests on the exact opencode two-part shape.

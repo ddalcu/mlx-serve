@@ -183,7 +183,8 @@
         'Compose a piece of music and give the user an audio player.',
         {
           prompt: { type: 'string', description: 'Style, genre, mood and instrumentation.' },
-          lyrics: { type: 'string', description: 'Lyrics to sing. Omit for an instrumental.' },
+          lyrics: { type: 'string', description: 'Lyrics to sing. Omit and set instrumental for a wordless track.' },
+          instrumental: { type: 'boolean', description: 'True for a wordless track. Never send lyrics with it.' },
           duration_seconds: { type: 'integer', description: 'Length in seconds, 10 to 600. Omit for 60.' },
           model: modelArg(music, 'music'),
         }, ['prompt']));
@@ -289,7 +290,8 @@
           kind: 'audio',
           path: '/v1/audio/music-generations',
           body: musicBody({
-            model: pm.id, prompt: args.prompt, lyrics: args.lyrics, duration: args.duration_seconds,
+            model: pm.id, prompt: args.prompt, lyrics: args.lyrics,
+            instrumental: args.instrumental === true, duration: args.duration_seconds,
           }),
         });
       }
@@ -634,7 +636,11 @@
 
   function musicBody(o) {
     var body = { model: o.model, prompt: o.prompt };
-    if (o.lyrics) body.lyrics = o.lyrics;
+    // `instrumental` and lyrics are a named 400 on both backends, so the flag
+    // WINS here rather than letting the pair reach the server: an omitted
+    // lyrics field is the only spelling of "no words" Music 3 accepts.
+    if (o.instrumental) body.instrumental = true;
+    else if (o.lyrics) body.lyrics = o.lyrics;
     if (isNum(o.duration)) body.duration_seconds = Number(o.duration);
     return body;
   }

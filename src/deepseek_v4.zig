@@ -9668,6 +9668,31 @@ test "dsv4: fused emission kernel matches the composed emission graph (GPU)" {
     }
 }
 
+/// Acquit a composed-vs-kernel fp4 mismatch ONLY when the pre-quant value
+/// sits at the rounding midpoint between the two returned grid points: the
+/// two arms sum the hadamard matmul in different orders, and a value a few
+/// ulps from the midpoint legitimately rounds to ADJACENT fp4 points on
+/// another machine (M5 measured composed -0.5 vs kernel -0.75, PR #223).
+/// Anything not at a midpoint is a real mismatch and still fails.
+fn fp4MidpointAcquits(composed: f32, kernel: f32, prequant: f32) bool {
+    const gap = @abs(composed - kernel);
+    if (gap == 0) return false;
+    const mid = (composed + kernel) * 0.5;
+    return @abs(prequant - mid) <= 0.05 * gap;
+}
+
+test "dsv4: fp4 midpoint acquittal accepts a rounding near-tie, rejects a real mismatch" {
+    // The M5 reading: adjacent grid points, pre-quant at the midpoint.
+    try testing.expect(fp4MidpointAcquits(-0.5, -0.75, -0.625));
+    // A few reduction-order ulps off the midpoint still acquits.
+    try testing.expect(fp4MidpointAcquits(-0.5, -0.75, -0.62501));
+    // A pre-quant value that rounds cleanly to one grid point is a bug.
+    try testing.expect(!fp4MidpointAcquits(-0.5, -0.75, -0.51));
+    try testing.expect(!fp4MidpointAcquits(-0.5, -0.75, -0.72));
+    // No gap: nothing to acquit.
+    try testing.expect(!fp4MidpointAcquits(1.0, 1.0, 1.0));
+}
+
 test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GPU)" {
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
@@ -9730,6 +9755,10 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
         defer _ = mlx.mlx_array_free(roped);
         var want_arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want_arr);
+        // Pre-quant hadamard product (post==2 only): the fp4 midpoint
+        // acquittal below needs it to tell a rounding near-tie from a bug.
+        var prequant: ?[]f32 = null;
+        defer if (prequant) |p| alloc.free(p);
         switch (tc.post) {
             0 => try mlx.check(mlx.mlx_array_set(&want_arr, roped)),
             1 => {
@@ -9746,6 +9775,7 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
             else => {
                 const had = try gpuOp2(mlx.mlx_matmul, roped, hada, s);
                 defer _ = mlx.mlx_array_free(had);
+                prequant = try toHostF32(alloc, had, tc.h * tc.d, s);
                 const simd = try gpuFp4Sim(had, s);
                 defer _ = mlx.mlx_array_free(simd);
                 try mlx.check(mlx.mlx_array_set(&want_arr, simd));
@@ -9771,6 +9801,9 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
         defer alloc.free(got);
         for (want, got, 0..) |wv, gv, i| {
             if (!(@abs(wv - gv) <= 2e-3)) {
+                if (prequant) |pq| {
+                    if (fp4MidpointAcquits(wv, gv, pq[i])) continue;
+                }
                 std.debug.print("dec-chain mismatch h={d} d={d} post={d} i={d}: composed={e} kernel={e}\n", .{ tc.h, tc.d, tc.post, i, wv, gv });
                 try testing.expect(false);
             }

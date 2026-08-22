@@ -20,7 +20,7 @@ Yes. mlx-serve embeds llama.cpp's inference library (`libllama`) inside the same
 
 ## Does mlx-serve work with Claude Code?
 
-Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you.
+Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you, and `mlx-serve launch claude` does the same from the terminal. Other agents too: pi, oh-my-pi, OpenCode, Codex, hermes, aider, plus editors like Zed. Setup for each is in [integrations.md](integrations.md).
 
 ## Can my Macs share models over the network?
 
@@ -57,6 +57,16 @@ Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. T
 ## Is the inference exact, or quantized output drift?
 
 For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with the long-tail divergence inherent to INT4 float-reduction order (documented in `CLAUDE.md`). For temp > 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by `tests/test_pld_equivalence.sh`, `test_drafter_equivalence.sh`, and `test_kv_quant_equivalence.sh`.
+
+## Can I get byte-identical greedy output across runs and settings?
+
+Yes, if you turn off the things that legitimately reorder float math. Speculative decoding verifies several tokens in one forward, and a wider forward picks different Metal kernels than a one-token forward, so near-tie argmaxes can flip. That's not corruption and not a seed issue (`seed` does nothing at temp 0); it's the same batch-width property every serving engine has. The byte-stable recipe:
+
+- disable speculation: `enable_mtp: false` in the request (or launch with `--no-mtp`), plus `--no-drafter` and no `--pld` if you enabled those
+- `--kv-quant off` or `8`
+- on hybrid architectures (Qwen 3.5/3.6/3.8, LFM2, Nemotron-H): `--prefix-cache-entries 0`, since a cache hit re-runs the recurrence in a different block size
+
+If your test gate needs exact-string matches, run it with this recipe. Making the speculative path itself byte-identical would mean forcing every kernel's reduction order to be independent of batch width, which is exactly what the fast verify kernels trade away.
 
 ## Where does my data go?
 
