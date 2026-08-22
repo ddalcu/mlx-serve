@@ -1537,6 +1537,76 @@ fn handleConnectionThread(args: *ConnThreadArgs) void {
     args.allocator.destroy(args);
 }
 
+/// Must a `model` id this registry does not hold be REFUSED, rather than
+/// answered by the default model?
+///
+/// Only on a server that was handed model ROOTS (`serve`, `run`, `--model-dir`,
+/// every headless launch the app makes). That registry publishes its ids on
+/// `/v1/models`, so a client naming one is ROUTING — and answering a typo from
+/// whatever else is resident echoes the unknown id back inside a 200 and hands
+/// over another model's reply. Same class as the unload that answered 200
+/// without unloading (#209): success-shaped, and no client can tell it from
+/// the real thing.
+///
+/// A `--model <dir>` launch keeps the fallback exactly as it was: it serves ONE
+/// model and the id is advisory, which is what makes it a drop-in for clients
+/// that hardcode `gpt-4o` (`registry.discovery` is null there — the launch
+/// shape, not a live count, so what a request resolves to cannot change under
+/// it when someone loads a second model). The empty id and the `"mlx-serve"`
+/// alias mean "the default" on every server and are never refused.
+fn unknownModelIdRefused(registry: *ModelRegistry, id: []const u8) bool {
+    if (registry.discovery == null) return false;
+    if (id.len == 0 or std.mem.eql(u8, id, "mlx-serve")) return false;
+    return registry.peek(id) == null;
+}
+
+/// The refusal for `unknownModelIdRefused`, in the shape the calling surface
+/// speaks. It NAMES the ids this server does serve: a refusal that quotes what
+/// it compared against is the difference between "fix the id" and "the server
+/// is broken", and the id list is exactly what the client got wrong. Bounded —
+/// a typo must not be answered with a 4 KB body — with `/v1/models` named for
+/// the tail.
+fn sendUnknownModelError(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    registry: *ModelRegistry,
+    path: []const u8,
+    id: []const u8,
+) !void {
+    var ids: std.Io.Writer.Allocating = .init(allocator);
+    defer ids.deinit();
+    {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        var n: usize = 0;
+        var it = registry.entries.valueIterator();
+        while (it.next()) |ep| {
+            if (n == 32) {
+                try ids.writer.writeAll(", ...");
+                break;
+            }
+            if (n > 0) try ids.writer.writeAll(", ");
+            try ids.writer.writeAll(ep.*.id);
+            n += 1;
+        }
+        if (n == 0) try ids.writer.writeAll("(none registered)");
+    }
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "Unknown model id \"{s}\". This server serves: {s} (GET /v1/models)",
+        .{ id, ids.written() },
+    );
+    defer allocator.free(msg);
+    log.warn("{s} -> 404 (unknown model id {s})\n", .{ path, id });
+    if (std.mem.eql(u8, path, "/v1/messages")) {
+        try sendAnthropicError(allocator, stream, "not_found_error", msg, 404);
+    } else if (std.mem.startsWith(u8, path, "/api/")) {
+        try sendOllamaError(allocator, stream, "404 Not Found", msg);
+    } else {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", msg, 404);
+    }
+}
+
 fn handleConnection(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -1828,10 +1898,15 @@ fn handleConnection(
             if (std.mem.startsWith(u8, path, "/api/")) {
                 resolved = ollamaResolveRegistryId(stream.io, registry, requested_model_id);
             }
-            // Unknown id — fall back to the default model rather than 404,
-            // so off-the-shelf SDK clients keep working. Multi-model
-            // clients that care about routing precision pass an exact id
-            // we registered (and `peek` will find it).
+            if (resolved == null and unknownModelIdRefused(registry, requested_model_id)) {
+                try sendUnknownModelError(allocator, stream, registry, path, requested_model_id);
+                return;
+            }
+            // Unknown id on a single-`--model` server — fall back to the
+            // default model rather than 404, so off-the-shelf SDK clients
+            // keep working. A server holding model ROOTS refuses instead
+            // (`unknownModelIdRefused`, above): it publishes its ids, so a
+            // request naming one is routing, not a marketing name.
             requested_model_id = resolved orelse "";
         }
     }
@@ -17542,4 +17617,52 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "an unknown model id is refused on a server holding model ROOTS, and served on a --model one" {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // `--model <dir>`: no roots, one model, and the id is advisory — this is
+    // the drop-in that answers a client hardcoding `gpt-4o`. Unchanged.
+    const single = try ModelRegistry.init(a, io, null, 8, 0, null);
+    defer single.deinit();
+    const only = try single.registerStub("gemma-4-e4b-it-4bit", "/m/g", 1);
+    single.default_id = only.id;
+    try std.testing.expect(!unknownModelIdRefused(single, "no-such-model-xyz"));
+    try std.testing.expect(!unknownModelIdRefused(single, "gpt-4o"));
+
+    // `serve` / `run` / `--model-dir`: the registry publishes its ids, so an
+    // id it does not hold is a routing error and answering it from the
+    // default model hands back another model's reply under a 200. Zero
+    // discovered models is enough to build the mode — the LAUNCH SHAPE is
+    // what differs, not how many models happened to be found.
+    const roots = try model_discovery.discoverModelsMany(io, a, &.{});
+    const multi = try ModelRegistry.init(a, io, roots, 8, 0, null);
+    defer multi.deinit();
+    const served = try multi.registerStub("gemma-4-e4b-it-4bit", "/m/g", 1);
+    multi.default_id = served.id;
+    try std.testing.expect(unknownModelIdRefused(multi, "no-such-model-xyz"));
+
+    // Controls, in the SAME registry: a predicate that refuses everything
+    // passes the line above just as well as one that reads the id.
+    try std.testing.expect(!unknownModelIdRefused(multi, "gemma-4-e4b-it-4bit"));
+    // The omitted field and the launcher alias mean "the default" on every
+    // server (`ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`) and are never refused.
+    try std.testing.expect(!unknownModelIdRefused(multi, ""));
+    try std.testing.expect(!unknownModelIdRefused(multi, "mlx-serve"));
+}
+
+test "the unknown-model 404 is answered BEFORE the model is resolved" {
+    // Same rule as the route-existence 404: a refusal must cost NOTHING. If
+    // this gate ever moved below `ensureLoaded`, a typo would cold-load the
+    // default model — the whole multi-GB, minutes-long cost — to earn its
+    // 404, which is the exact shape that cost 2m42s and 121 GB for a wrong
+    // URL.
+    const src = @embedFile("server.zig");
+    const gate = "unknownModelIdRefused(regis" ++ "try, requested_model_id)) {";
+    const resolve = "scheduler.ensureLoaded(" ++ "requested_model_id)";
+    const gate_at = std.mem.indexOf(u8, src, gate) orelse return error.GateMissing;
+    const resolve_at = std.mem.indexOf(u8, src, resolve) orelse return error.ResolveMissing;
+    try std.testing.expect(gate_at < resolve_at);
 }
