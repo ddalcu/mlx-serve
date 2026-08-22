@@ -1024,6 +1024,21 @@ private struct ServerSectionContent: View {
                 }
             }
         }
+        if let m = meta["idleEvictMinutes"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.idleEvictMinutes)
+            ) {
+                let minutes = appState.serverOptions.idleEvictMinutes
+                snappingSlider(
+                    presets: [0, 1, 5, 10, 15, 30, 60],
+                    current: minutes,
+                    set: { appState.serverOptions.idleEvictMinutes = $0 },
+                    label: minutes == 0 ? "Off" : "\(minutes) min"
+                )
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,

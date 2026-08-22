@@ -54,6 +54,7 @@ enum SettingsReset {
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
                 f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
                 f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
+                f("idleEvictMinutes") { $0.idleEvictMinutes = $1.idleEvictMinutes },
             ]
 
         case .lanSharing:
