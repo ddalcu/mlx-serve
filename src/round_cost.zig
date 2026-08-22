@@ -260,6 +260,11 @@ pub const Table = struct {
 /// and the measurement. The period is twice the regime gate's: a trial's
 /// cost is paid per request while its knowledge persists on the model.
 pub const EXPLORE_PERIOD: u32 = 16;
+/// Period while the trial's target is still untrusted: the table persists,
+/// so this is paid once per (chip, model, quant, OS) — measured M4 base 9B
+/// cap 6, w5 reached 1-2 samples per 66-round boot at period 16 and the
+/// +5% it buys stayed out of reach.
+pub const EXPLORE_PERIOD_COLD: u32 = 8;
 /// Half the regime gate's: a re-trial of a known cliff (M1 Pro 27B w5 is
 /// 34% dearer than w4) costs block * gap / period of throughput, and the
 /// measured per-request cost of one such block was 4.3% on a 22-round
@@ -310,8 +315,8 @@ pub const TrialSchedule = struct {
 /// run once in G/DRAG rounds, costs ~DRAG of throughput); the default while
 /// either is unmeasured.
 pub fn trialPeriod(a: ?f32, b: ?f32) u32 {
-    const x = a orelse return EXPLORE_PERIOD;
-    const y = b orelse return EXPLORE_PERIOD;
+    const x = a orelse return EXPLORE_PERIOD_COLD;
+    const y = b orelse return EXPLORE_PERIOD_COLD;
     if (!(x > 0) or !(y > 0)) return EXPLORE_PERIOD;
     const gap = @abs(x - y) / @min(x, y);
     const block: f32 = @floatFromInt(EXPLORE_BLOCK);
@@ -675,7 +680,7 @@ test "round_cost: formatBucket lists folded widths as ms/tok with sample counts"
 }
 
 test "round_cost: trialPeriod and TrialSchedule blocks" {
-    try testing.expectEqual(EXPLORE_PERIOD, trialPeriod(null, 10.0));
+    try testing.expectEqual(EXPLORE_PERIOD_COLD, trialPeriod(null, 10.0));
     try testing.expectEqual(@as(u32, 60), trialPeriod(10.0, 11.0));
     try testing.expectEqual(EXPLORE_PERIOD_MAX, trialPeriod(10.0, 30.0));
     var t = TrialSchedule{};

@@ -7174,7 +7174,7 @@ pub const Generator = struct {
     /// G/DRAG rounds, costs ~DRAG of throughput); the default period while
     /// either is unmeasured, so an unknown width is learned soon.
     pub fn mtpWidthTrialPeriod(t: *const round_cost.Table, kv_len: u32, m_lo: u32) u32 {
-        const b = t.bucketToRead(kv_len) orelse return MTP_REGIME_EXPLORE_PERIOD;
+        const b = t.bucketToRead(kv_len) orelse return round_cost.EXPLORE_PERIOD_COLD;
         return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.msPerTok(m_lo + 1, b));
     }
 
@@ -11489,7 +11489,7 @@ test "mtpWidthTrial: blocks per period, idempotent per round, period grows with 
     try testing.expect(wt.trials >= 17 and wt.trials <= 19);
     // Unmeasured next width: default period. 10% worse: 30. 36% worse: 110.
     var t = round_cost.Table{};
-    try testing.expectEqual(Generator.MTP_REGIME_EXPLORE_PERIOD, Generator.mtpWidthTrialPeriod(&t, 1000, 4));
+    try testing.expectEqual(round_cost.EXPLORE_PERIOD_COLD, Generator.mtpWidthTrialPeriod(&t, 1000, 4));
     for (0..round_cost.MIN_SAMPLES) |_| {
         _ = t.observe(4, 1000, 40.0, 4.0, true, false);
         _ = t.observe(5, 1000, 55.0, 5.0, true, false);
