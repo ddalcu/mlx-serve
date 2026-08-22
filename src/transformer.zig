@@ -14189,8 +14189,9 @@ pub const Transformer = struct {
         // slices (the engine widths become the sliced widths and the GPU
         // serves the complement).
         const mode = ane_offload.splitMode();
-        // Dual ANE (opt-in): two units pinned to the two dies of an Ultra
-        // part, each computing HALF the total channel share concurrently.
+        // Dual ANE (default on the M3 Ultra, MLX_SERVE_ANE_DUAL=0/1 overrides):
+        // two units pinned to the two dies, each computing HALF the total
+        // channel share concurrently.
         // A dual request that cannot be honored (single-ANE silicon, row
         // mode) self-disables by name — never a failed boot.
         const chip = ane_offload.chipBrand();

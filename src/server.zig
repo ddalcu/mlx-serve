@@ -9885,6 +9885,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
     };
 }
 
+var vision_pixel_clamp_logged: bool = false;
+/// One-shot: the checkpoint declared more pixels than the ViT can attend.
+fn logVisionPixelClamp(declared: u32) void {
+    if (vision_pixel_clamp_logged) return;
+    vision_pixel_clamp_logged = true;
+    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ qwen_vision.ENGINE_MAX_PIXELS, declared });
+}
+
 test "visionPreprocFromConfig threads each tower's processor bounds" {
     const qwen = visionPreprocFromConfig(&.{
         .qwen_vision = true,
@@ -10221,11 +10229,10 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         if (factor == 0 or vp.tps == 0) return null;
-        const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
-        const max_pixels = if (vp.max_pixels >= min_pixels)
-            vp.max_pixels
-        else
-            @max(qwen_vision.MAX_PIXELS, min_pixels);
+        const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+        const min_pixels = bounds.min;
+        const max_pixels = bounds.max;
+        if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
         const rs = switch (vp.mode) {
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
@@ -10329,8 +10336,10 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         };
     }
 
-    const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
-    const max_pixels = if (vp.max_pixels >= min_pixels) vp.max_pixels else @max(qwen_vision.MAX_PIXELS, min_pixels);
+    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+    const min_pixels = bounds.min;
+    const max_pixels = bounds.max;
+    if (bounds.clamped) logVisionPixelClamp(vp.max_pixels);
     const first = decoded.items[0];
     const rs = qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
     const rh = rs.h;

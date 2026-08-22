@@ -166,9 +166,24 @@ fn chipBrandString(buf: []u8) []const u8 {
 /// EXPECTED to sit higher (halving the ANE critical path is the whole
 /// point), which is a re-sweep, not an interpolation.
 pub fn defaultShare(mode: Mode, chip: []const u8) f32 {
+    return defaultShareFor(mode, chip, dualDefault(chip));
+}
+
+/// M3 Ultra: 0.35 on one ANE (PR #223 tester: 0.45 was nothing, 0.35
+/// +8.5%/+13.7% at 16k/32k); with BOTH ANEs 0.50 (2026-08-22 sweep, 16k
+/// prefill: single 0.35 465 tok/s, dual 0.35 471, 0.45 482-492, 0.50 498,
+/// 0.55 490, 0.65 466 — the rollover is one notch past 0.50).
+pub fn defaultShareFor(mode: Mode, chip: []const u8, dual: bool) f32 {
     if (mode == .row) return 0.40;
-    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return 0.35;
+    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return if (dual) 0.50 else 0.35;
     return 0.45;
+}
+
+/// Dual ANE is the default on the M3 Ultra: measured 2026-08-22 on a 512 GB
+/// box, both instances at equal eval counts, zero failures, both IOReport
+/// ANE0_ counters moving, +7.1% 16k prefill over the single-ANE best.
+pub fn dualDefault(chip: []const u8) bool {
+    return std.mem.indexOf(u8, chip, "M3 Ultra") != null;
 }
 
 /// The ANE's TOTAL share of each covered projection (channel mode: fraction
@@ -220,12 +235,20 @@ pub fn splitMode() Mode {
     return .channel;
 }
 
-/// Dual-ANE split (opt-in, default OFF): two pinned units computing
-/// disjoint channel slices concurrently. Unmeasurable on single-ANE
-/// silicon, and PRIVATE API on top of private API — hence opt-in.
+/// Dual-ANE split: two pinned units computing disjoint channel slices
+/// concurrently. Default ON where it was measured (M3 Ultra), off elsewhere
+/// (unmeasurable on single-ANE silicon; private API on top of private API).
 pub fn dualEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ANE_DUAL") orelse return false;
-    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    return dualEnabledFrom(if (std.c.getenv("MLX_SERVE_ANE_DUAL")) |p| std.mem.sliceTo(p, 0) else null, chipBrand());
+}
+
+/// MLX_SERVE_ANE_DUAL=1 forces it on, =0 off; unset = the chip default.
+pub fn dualEnabledFrom(raw: ?[]const u8, chip: []const u8) bool {
+    if (raw) |v| {
+        if (std.mem.eql(u8, v, "1")) return true;
+        if (std.mem.eql(u8, v, "0")) return false;
+    }
+    return dualDefault(chip);
 }
 
 /// Whether concurrent units share ONE input surface instead of getting a
@@ -1001,7 +1024,12 @@ test "defaultShare: per-silicon channel rows, row mode keeps its M4 optimum" {
     // M3 Ultra channel row (PR #223 tester): 0.45 measured ≈ nothing, 0.35
     // measured +8.5%/+13.7% at 16k/32k — the default must be the measured
     // optimum for the machine, never one machine's number everywhere.
-    try std.testing.expectEqual(@as(f32, 0.35), defaultShare(.channel, "Apple M3 Ultra"));
+    try std.testing.expectEqual(@as(f32, 0.50), defaultShare(.channel, "Apple M3 Ultra")); // dual by default
+    try std.testing.expectEqual(@as(f32, 0.35), defaultShareFor(.channel, "Apple M3 Ultra", false));
+    try std.testing.expect(dualEnabledFrom(null, "Apple M3 Ultra"));
+    try std.testing.expect(!dualEnabledFrom("0", "Apple M3 Ultra"));
+    try std.testing.expect(!dualEnabledFrom(null, "Apple M4 Max"));
+    try std.testing.expect(dualEnabledFrom("1", "Apple M4 Max"));
     try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M4 Max"));
     try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M3 Max"));
     try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, ""));
