@@ -5765,6 +5765,11 @@ pub const Transformer = struct {
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
+    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-depth, else
+    /// the adaptive default), set at load. The row-resolved cap travels as
+    /// `mtp_depth` through server -> slot -> Generator and reads there like
+    /// an explicit flag, so the row-less value needs its own carrier.
+    mtp_depth_free: u32 = 0,
     /// Certified lm_head prune (mlxfast notes/68 class): MXFP8 g32 coarse
     /// copy of a dense bf16 lm_head, built lazily on the first eligible
     /// argmax-only decode. `lm_head_prune_tried` marks the probe so a

@@ -2326,7 +2326,7 @@ pub const Generator = struct {
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
                 .mtp_depth = resolveMtpDepthCapForCurve(options.mtp_depth, mtp_cost_profile, xfm.spec_cost_curve),
-                .mtp_depth_free = mtpDepthCapFree(options.mtp_depth),
+                .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(options.mtp_depth),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile, xfm.spec_cost_curve),
                 // Start at depth 1 and climb with evidence: the cheap depth
                 // is the safe default (1.11x on cold/creative content), and

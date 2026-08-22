@@ -3603,6 +3603,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForCurve(params.mtp_depth, mtp_cost_profile, xfm_ptr.spec_cost_curve);
+    xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
