@@ -989,6 +989,9 @@ pub const Generator = struct {
     /// Drafts of the previous round (0 = serial), every round: a width
     /// change is a transition the table must not observe.
     spec_round_prev_width: ?u32 = null,
+    /// Shape of the previous MTP round: a shape change is a transition too
+    /// (the regime gate measured shape transitions 5-7% slow).
+    spec_round_prev_two_chunk: bool = false,
     /// Wall clock between round ends: the regime compares the quantity
     /// tok/s reports, so per-round work OUTSIDE the round stopwatch (token
     /// publish, stop checks, scheduler) must be in the denominator — fewer
@@ -3705,7 +3708,7 @@ pub const Generator = struct {
             const emitted = self.generated_ids.items.len - dflash_gen_before;
             const post_warmup = dflash_rounds_before >= MTP_EV_WARMUP_ROUNDS;
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
-            self.specObserveRound(dflash_table_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0);
+            self.specObserveRound(dflash_table_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
@@ -5889,7 +5892,15 @@ pub const Generator = struct {
         // A trial round was a single-chunk shape at another depth: not a
         // regime sample, but the shape its successor transitions from.
         if (width_trial) self.mtp_regime.last_two = false;
-        self.specObserveRound(m, wall, tok, post_warmup);
+        // The table is the cost of the SINGLE-CHUNK shape at each width — the
+        // quantity the m_lo loop compares. A two-chunk round chose its width
+        // by its own confidence gate (tokens biased high) and paid a sync
+        // (ms biased high); observed as width m_hi it read single-chunk 6
+        // as better than the 5 -> 6 two-chunk it was measured FROM (M4 Max
+        // 27B @16k, -4.5%). The shape question stays the regime gate's.
+        const shape_changed = self.spec_round_prev_two_chunk != two_chunk;
+        self.spec_round_prev_two_chunk = two_chunk;
+        self.specObserveRound(m, wall, tok, post_warmup and !two_chunk, shape_changed);
     }
 
     /// Feed the model's round-cost table (`Transformer.round_cost`, shared
@@ -5898,8 +5909,8 @@ pub const Generator = struct {
     /// first observed one is not a transition by accident; a rejected
     /// sample that is not an expected drop (contended, transition) logs its
     /// numbers — a silent reject is the probe's anti-pattern.
-    fn specObserveRound(self: *Generator, width: u32, wall_ms: f32, tokens: f32, observe: bool) void {
-        const transition = if (self.spec_round_prev_width) |p| p != width else true;
+    fn specObserveRound(self: *Generator, width: u32, wall_ms: f32, tokens: f32, observe: bool, shape_changed: bool) void {
+        const transition = shape_changed or (if (self.spec_round_prev_width) |p| p != width else true);
         self.spec_round_prev_width = width;
         if (!observe) return;
         const kv = self.mtpKvLen();
@@ -6142,10 +6153,33 @@ pub const Generator = struct {
             return self.scale > 0;
         }
 
+        /// Realized tokens per single-chunk round at a MEASURED width, else
+        /// null (the acceptance-EMA model fills in). The model's E(6) on the
+        /// M4 Max @16k said 6.85 while the measured single-6 round emitted
+        /// 6.0 — the 6th draft's rejections cost a rollback the model cannot
+        /// see, and the table can.
+        pub fn measuredTokens(self: MtpCostSource, m: u32) ?f32 {
+            if (self.scale <= 0) return null;
+            return self.table.?.measuredTok(m, self.bucket);
+        }
+
         pub fn roundCost(self: MtpCostSource, m: u32, with_sync: bool) f32 {
             if (self.scale > 0) {
-                if (self.table.?.roundMs(m, self.bucket)) |ms| {
-                    return ms * self.scale + (if (with_sync) self.costs.sync else 0.0);
+                const sync: f32 = if (with_sync) self.costs.sync else 0.0;
+                const t = self.table.?;
+                if (t.roundMs(m, self.bucket)) |ms| return ms * self.scale + sync;
+                // Past the widest measured width every extra position costs
+                // max(last measured slope, prior marginal): continuous with
+                // the table, never more optimistic than the prior (a shallow
+                // measured slope run upward let the plan race to 8 unmeasured).
+                if (t.widestMeasured(self.bucket)) |w| {
+                    if (m > w) {
+                        const slope = (t.lastSlope(self.bucket) orelse 0.0) * self.scale;
+                        var c = t.measuredMs(w, self.bucket).? * self.scale;
+                        var k: u32 = w + 1;
+                        while (k <= m) : (k += 1) c += @max(slope, mtpEvMarginalCostAt(self.costs, k, self.kv_len));
+                        return c + sync;
+                    }
                 }
             }
             return mtpEvRoundCostAt(self.costs, m, with_sync, self.kv_len);
@@ -6166,7 +6200,8 @@ pub const Generator = struct {
         var best_r: f32 = 0.0;
         var m: u32 = 1;
         while (m <= lo_cap) : (m += 1) {
-            const r = mtpEvExpectedTokens(a, m) / src.roundCost(m, false);
+            const tok = src.measuredTokens(m) orelse mtpEvExpectedTokens(a, m);
+            const r = tok / src.roundCost(m, false);
             if (r > best_r) {
                 best_r = r;
                 m_lo = m;
@@ -7008,14 +7043,23 @@ pub const Generator = struct {
 
     /// Which width a trial measures: the plan's own base when the bucket
     /// the plan reads has not measured it (the narrowest measured width
-    /// can be the cliff itself — the prior's extended rounds land there
-    /// first — and the prior below it cannot see that), else the next
-    /// width up on a single-chunk plan (a two-chunk plan measures m_lo+1
-    /// by extending). Null = nothing to try.
+    /// can be the cliff itself and the prior below it cannot see that),
+    /// then m_lo-1, then the next width up on a single-chunk plan. Null =
+    /// nothing to try.
     pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRoundPlan, cap: u32) ?u32 {
         const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
         if (t.measuredMs(plan.m_lo, b) == null) return plan.m_lo;
-        if (plan.m_hi == plan.m_lo and plan.m_lo < cap) return plan.m_lo + 1;
+        // The prior's climb passes m_lo-1 only in transition rounds, so the
+        // cliff BELOW the base (M1 Pro 27B: 4 -> 5 is +150 ms) is never
+        // measured unless asked for.
+        if (plan.m_lo > 1 and t.measuredMs(plan.m_lo - 1, b) == null) return plan.m_lo - 1;
+        if (plan.m_lo >= cap) return null;
+        // An unmeasured m_lo+1 is measured under ANY shape: a two-chunk
+        // plan extends there every round on echo, blind to its cost (the
+        // M1 Pro 27B's 4 -> 5 at +150 ms); the regime gate would catch it,
+        // the table should know it. A measured one is re-tried only where
+        // a single-chunk plan cannot otherwise reach it.
+        if (t.measuredMs(plan.m_lo + 1, b) == null or plan.m_hi == plan.m_lo) return plan.m_lo + 1;
         return null;
     }
 
@@ -11344,6 +11388,9 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     try testing.expectApproxEqAbs(Generator.mtpEvRoundCostAt(Generator.MTP_EV_DEFAULT_COSTS, 3, false, 10000), src.roundCost(3, false), 1e-4);
     try testing.expectApproxEqAbs(Generator.mtpEvRoundCostAt(Generator.MTP_EV_DEFAULT_COSTS, 2, false, 10000), src.roundCost(2, false), 1e-4);
     try testing.expect(src.marginal(5) > 5.0 * src.marginal(4));
+    // Past the widest measured width the cliff's slope continues (it is
+    // steeper than the prior's marginal here).
+    try testing.expectApproxEqAbs(src.roundCost(5, false) + (src.roundCost(5, false) - src.roundCost(4, false)), src.roundCost(6, false), 1e-3);
     const measured = Generator.mtpEvPlanSrc(&a, 8, src, 8);
     try testing.expectEqual(@as(u32, 4), measured.m_hi);
     try testing.expect(measured.m_lo <= 4);
@@ -11400,6 +11447,8 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     var t = round_cost.Table{};
     var wt = Generator.MtpWidthTrial{};
     var prev: ?u32 = null;
+    var prev_two = false;
+    var late_wide: u32 = 0;
     var picked: [round_cost.MAX_WIDTH + 1]u32 = @splat(0);
     var m_lo_prev: u32 = 1;
     var last_m: u32 = 0;
@@ -11412,13 +11461,17 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
             if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo))) plan = Generator.mtpWidthTrialPlan(target);
         }
         // Run it: a two-chunk plan extends (confidence is high), so the
-        // realized width is m_hi.
+        // realized width is m_hi — and, as in mtpRoundEndObserve, only a
+        // single-chunk round feeds the table.
         const m = plan.m_hi;
+        const two_chunk = plan.m_hi > plan.m_lo;
         picked[m] += 1;
+        if (i >= 60 and m >= 5) late_wide += 1;
         last_m = m;
         const tokens: f32 = Generator.mtpEvExpectedTokens(&a, m);
-        _ = t.observe(m, 1000, Machine.roundMs(m), tokens, true, if (prev) |p| p != m else true);
+        if (!two_chunk) _ = t.observe(m, 1000, Machine.roundMs(m), tokens, true, prev_two or (if (prev) |p| p != m else true));
         prev = m;
+        prev_two = two_chunk;
     }
     // Every width the chooser ran is in the table (transitions excepted,
     // and a width run only once can only ever be a transition).
@@ -11430,7 +11483,12 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     try testing.expect(t.measuredMs(4, 0) != null);
     try testing.expect(last_m == 4);
     try testing.expect(picked[4] > 250);
-    try testing.expect(picked[5] + picked[6] + picked[7] + picked[8] <= 16);
+    // Before the table activates the prior extends 4 -> 5 blind every round
+    // (live, the regime gate throttles that shape; the sim has no gate), so
+    // the bar is the settled tail: from round 60 on, width 5 appears only
+    // as scheduled 2-round re-trials (period capped at 128 -> one block).
+    try testing.expect(late_wide <= 2 * Generator.MTP_REGIME_EXPLORE_BLOCK);
+    try testing.expect(picked[6] + picked[7] + picked[8] <= 4); // the prior's first rounds only
     // Identity: forced rounds == 2 * trials (each block is 2 rounds).
     try testing.expect(wt.trials >= 2);
 }

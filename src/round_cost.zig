@@ -105,6 +105,13 @@ pub const Table = struct {
         return if (c.n == 0) null else c.ms;
     }
 
+    /// Measured tokens per round at exactly this width, or null.
+    pub fn measuredTok(self: *const Table, width: u32, bucket: usize) ?f32 {
+        if (width > MAX_WIDTH) return null;
+        const c = self.cells[width][bucket];
+        return if (c.n == 0) null else c.tok;
+    }
+
     pub fn msPerTok(self: *const Table, width: u32, bucket: usize) ?f32 {
         if (width > MAX_WIDTH) return null;
         return self.cells[width][bucket].msPerTok();
@@ -147,41 +154,53 @@ pub const Table = struct {
     }
 
     /// Round ms at `width`: measured, else linear between the two nearest
-    /// measured widths, else (past the widest) extrapolated with the last
-    /// slope — cost is near-linear between cliffs, a cliff is found by
-    /// measuring it, and the slope past one is the cliff's. BELOW the
-    /// narrowest measured width the answer is null and the caller's prior
-    /// fills in: the prior's extended rounds land on the cliff first, and
-    /// the cliff's slope run downward reads every narrower width as free.
+    /// measured widths. OUTSIDE the measured span the answer is null and
+    /// the caller's prior fills in — below, because the prior's extended
+    /// rounds land on the cliff first and the cliff's slope run downward
+    /// reads every narrower width as free; above, because a shallow slope
+    /// run upward (w3 -> w4 +6 ms) priced widths 5..8 as nearly free and the
+    /// plan raced there in consecutive transition rounds, measuring nothing
+    /// (the caller takes max(last slope, prior marginal) per extra width).
     /// Null while the bucket has fewer than MIN_WIDTHS measured widths.
     pub fn roundMs(self: *const Table, width: u32, bucket: usize) ?f32 {
         if (!self.active(bucket)) return null;
         if (self.measuredMs(width, bucket)) |m| return m;
         var lo: ?u32 = null;
-        var lo2: ?u32 = null;
         var hi: ?u32 = null;
         for (0..MAX_WIDTH + 1) |wi| {
             const w: u32 = @intCast(wi);
             if (self.cells[w][bucket].n == 0) continue;
             if (w < width) {
-                lo2 = lo;
                 lo = w;
             } else if (hi == null) {
                 hi = w;
             }
         }
-        const at = struct {
-            fn f(t: *const Table, w: u32, b: usize) f32 {
-                return t.cells[w][b].ms;
-            }
-        }.f;
         if (lo != null and hi != null) {
-            return lerp(lo.?, at(self, lo.?, bucket), hi.?, at(self, hi.?, bucket), width);
-        }
-        if (lo != null and lo2 != null) {
-            return lerp(lo2.?, at(self, lo2.?, bucket), lo.?, at(self, lo.?, bucket), width);
+            return lerp(lo.?, self.cells[lo.?][bucket].ms, hi.?, self.cells[hi.?][bucket].ms, width);
         }
         return null;
+    }
+
+    pub fn widestMeasured(self: *const Table, bucket: usize) ?u32 {
+        var i: usize = MAX_WIDTH + 1;
+        while (i > 0) {
+            i -= 1;
+            if (self.cells[i][bucket].n > 0) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// ms per width between the two widest measured widths (a cliff's slope
+    /// when one was measured), null with fewer than two.
+    pub fn lastSlope(self: *const Table, bucket: usize) ?f32 {
+        const hi = self.widestMeasured(bucket) orelse return null;
+        var lo: ?u32 = null;
+        for (0..hi) |wi| {
+            if (self.cells[wi][bucket].n > 0) lo = @intCast(wi);
+        }
+        const l = lo orelse return null;
+        return (self.cells[hi][bucket].ms - self.cells[l][bucket].ms) / @as(f32, @floatFromInt(hi - l));
     }
 
     fn lerp(w0: u32, m0: f32, w1: u32, m1: f32, w: u32) f32 {
@@ -256,13 +275,15 @@ test "round_cost: one width is not a table, two interpolate and extrapolate" {
     _ = t.observe(5, 1000, 50.0, 5.0, true, false);
     try testing.expect(t.active(0));
     try testing.expectApproxEqAbs(40.0, t.roundMs(4, 0).?, 1e-4); // between
-    try testing.expectApproxEqAbs(80.0, t.roundMs(8, 0).?, 1e-4); // last slope
+    try testing.expect(t.roundMs(8, 0) == null); // past the widest: the caller composes
     try testing.expect(t.roundMs(2, 0) == null); // below the anchor: the prior's job
     try testing.expectEqual(@as(u32, 3), t.narrowestMeasured(0).?);
+    try testing.expectEqual(@as(u32, 5), t.widestMeasured(0).?);
+    try testing.expectApproxEqAbs(10.0, t.lastSlope(0).?, 1e-4);
     // A measured cliff is read as measured, and the slope past it is the cliff's.
     _ = t.observe(6, 1000, 200.0, 6.0, true, false);
     try testing.expectApproxEqAbs(200.0, t.roundMs(6, 0).?, 1e-4);
-    try testing.expectApproxEqAbs(350.0, t.roundMs(7, 0).?, 1e-4);
+    try testing.expectApproxEqAbs(150.0, t.lastSlope(0).?, 1e-4);
 }
 
 test "round_cost: an unmeasured bucket reads the nearest active one, lower side first" {

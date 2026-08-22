@@ -3850,14 +3850,27 @@ by extending). Same 2-round block and drag-sized period as the regime gate,
 never inside a regime trial block, skipped by the regime observer (it
 compares shapes at ONE base depth), and `last_two` set to single after it.
 
-Measured M4 Max, Qwen3.8-27B 4bit, short echo (22 rounds, reps 2-3, two
-boot orders): table 105.5 vs Phase 1 97.0 vs --mtp-depth 4 97.5 (+8.7%) — the
-table read w5 10.9 / w6 9.9 ms/tok and the plan took m_lo 6 single-chunk
-(ext_rounds=0) where Phase 1 sat at a two-chunk 4/5 -> 6. 16k, ONE boot
-order: table 76.5 vs Phase 1 80.7 (-4.5%): single-chunk at 6 (80 ms, 6.0
-tok/round) lost to the two-chunk 5 -> 6 (77 ms, 5.84) — the plan models
-tokens from the acceptance EMAs while the table's own tok cells said w5 beat
-w6 per token. Unresolved at one boot; the bar is 3+ per side.
+Measured M4 Max, Qwen3.8-27B 4bit, v1 (9d3de7c), short echo (22 rounds,
+reps 2-3, two boot orders): table 105.5 vs Phase 1 97.0 vs --mtp-depth 4
+97.5 (+8.7%) — the table read w5 10.9 / w6 9.9 ms/tok and the plan took
+m_lo 6 single-chunk (ext_rounds=0) where Phase 1 sat at a two-chunk 4/5 ->
+6. 16k, ONE boot order: table 76.5 vs Phase 1 80.7 (-4.5%): single-chunk at
+6 (80 ms, 6.0 tok/round) lost to the two-chunk 5 -> 6 (77 ms, 5.84). Two
+design faults, both visible in that line: (1) extended two-chunk rounds fed
+the w6 cell — their width was chosen by the confidence gate (tokens biased
+high) and they paid a sync — so "single 6" was priced from rounds that were
+not single; (2) the m_lo loop used the acceptance-EMA E(6) = 6.85 while the
+cell's own tokens said 6.0 (the 6th draft's rejections cost a rollback the
+model cannot see). v2: the table is the cost of the SINGLE-CHUNK shape (only
+those rounds feed it; a shape change is a transition too), the m_lo loop
+reads measured tokens where a cell exists, and the shape question stays the
+regime gate's. The simulated loop then showed the remaining two: a shallow
+measured slope (w3 -> w4 +6 ms) extrapolated upward priced 5..8 as nearly
+free and the plan raced there in consecutive transition rounds (nothing
+measured) — past the widest measured width each position now costs
+max(last slope, prior marginal); and m_lo-1 / an extended m_lo+1 were never
+trialled, so the width trial targets an unmeasured m_lo, then m_lo-1, then
+m_lo+1 under any shape, then periodic m_lo+1 on single plans.
 
 Trap, caught by the simulated-loop test and nothing else: `plan = .{ .m_lo =
 plan.m_lo + 1, .m_hi = plan.m_lo + 1 }` writes m_lo first and reads it back
