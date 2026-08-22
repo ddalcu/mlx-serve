@@ -71,6 +71,20 @@ pub const Table = struct {
     dropped_bad: u32 = 0,
     /// One-shot: the first plan that read the table instead of the prior.
     first_use_logged: bool = false,
+    /// `folded` at the last store (persistence writes only when it moved).
+    stored_at: u32 = 0,
+    /// Cells restored from disk at load (diagnostics).
+    restored: u32 = 0,
+
+    pub fn foldedCells(self: *const Table) u32 {
+        var n: u32 = 0;
+        for (self.cells) |row| {
+            for (row) |c| {
+                if (c.n > 0) n += 1;
+            }
+        }
+        return n;
+    }
 
     /// Feed one realized round. `solo` = this was the only decoding stream
     /// (contention only ever ADDS time, so a busy server stops teaching the
@@ -453,6 +467,114 @@ pub const WidthChooser = struct {
     }
 };
 
+// ── Persistence ──────────────────────────────────────────────────────────
+//
+// Every fresh boot otherwise pays the exploration again (measured: 3-4% on
+// whichever request carries a trial block, 22-round requests), while the
+// knowledge is per (chip, model, quant, OS build) and does not change
+// between boots. Stored under ~/.mlx-serve/round-cost/<key>.txt, restored
+// at load, written at the end of any request that folded new samples.
+// Stale version or unreadable content is a QUIET miss (the kv_disk_cache
+// discipline). `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
+
+pub const STORE_VERSION: u32 = 1;
+
+pub fn persistEnabled() bool {
+    const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+/// Same identity rule as the spec-cost probe's key: every field the cost
+/// depends on, hashed, so one machine's cliff is never served to another.
+pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8) []const u8 {
+    var h = std.hash.Fnv1a_64.init();
+    for ([_][]const u8{ chip, model_dir, quant, os_build }) |part| {
+        h.update(part);
+        h.update("\x00");
+    }
+    return std.fmt.bufPrint(buf, "rc{d}-{x:0>16}", .{ STORE_VERSION, h.final() }) catch buf[0..0];
+}
+
+/// `rc1\n` then one `width bucket ms tok n` line per folded cell.
+pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try w.print("rc{d}\n", .{STORE_VERSION});
+    for (t.cells, 0..) |row, wi| {
+        for (row, 0..) |c, b| {
+            if (c.n == 0) continue;
+            try w.print("{d} {d} {d:.4} {d:.4} {d}\n", .{ wi, b, c.ms, c.tok, c.n });
+        }
+    }
+    return w.buffered();
+}
+
+/// Null on any version or shape mismatch. Restored cells keep their sample
+/// counts (trust) but are marked STALE, so the first live sample of each
+/// blends at RESEED_WEIGHT — another boot is another thermal/OS state.
+pub fn parse(text: []const u8) ?Table {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const head = lines.next() orelse return null;
+    var hb: [16]u8 = undefined;
+    const want = std.fmt.bufPrint(&hb, "rc{d}", .{STORE_VERSION}) catch return null;
+    if (!std.mem.eql(u8, std.mem.trim(u8, head, " \r"), want)) return null;
+    var t = Table{};
+    while (lines.next()) |line| {
+        const l = std.mem.trim(u8, line, " \r");
+        if (l.len == 0) continue;
+        var f = std.mem.splitScalar(u8, l, ' ');
+        const wi = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
+        const b = std.fmt.parseInt(usize, f.next() orelse return null, 10) catch return null;
+        const ms = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
+        const tok = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
+        const n = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
+        if (wi > MAX_WIDTH or b >= N_BUCKETS or n == 0) return null;
+        if (!std.math.isFinite(ms) or ms <= 0 or !(tok > 0)) return null;
+        t.cells[wi][b] = .{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
+    }
+    t.seq = RESEED_GAP + 1;
+    t.restored = t.foldedCells();
+    return t;
+}
+
+fn homeDir() []const u8 {
+    return std.mem.span(std.c.getenv("HOME") orelse return "/tmp");
+}
+
+fn cachePath(buf: []u8, key: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.mlx-serve/round-cost/{s}.txt", .{ homeDir(), key }) catch null;
+}
+
+pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8) ?Table {
+    if (!persistEnabled() or key.len == 0) return null;
+    var path_buf: [512]u8 = undefined;
+    const path = cachePath(&path_buf, key) orelse return null;
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const text = rs.interface.allocRemaining(allocator, .limited(16384)) catch return null;
+    defer allocator.free(text);
+    return parse(text);
+}
+
+/// Best-effort: a machine that cannot write re-explores next boot.
+pub fn storeCached(io: std.Io, key: []const u8, t: *const Table) void {
+    if (!persistEnabled() or key.len == 0) return;
+    var dir_buf: [512]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/.mlx-serve/round-cost", .{homeDir()}) catch return;
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return;
+    var path_buf: [512]u8 = undefined;
+    const path = cachePath(&path_buf, key) orelse return;
+    var text: [8192]u8 = undefined;
+    const body = serialize(&text, t) catch return;
+    const f = std.Io.Dir.createFileAbsolute(io, path, .{}) catch return;
+    defer f.close(io);
+    var wb: [8192]u8 = undefined;
+    var fw = f.writer(io, &wb);
+    fw.interface.writeAll(body) catch return;
+    fw.interface.flush() catch {};
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -622,4 +744,26 @@ test "round_cost: WidthChooser picks serial when the block loses, and comes back
     // sticky gate is the bootstrap that gets serial measured).
     const blind = simChooser(0.3, 10.0, 6.0, 8, 0.0, 4, 8, 300, false);
     try testing.expect(blind.current >= 1);
+}
+
+test "round_cost: persistence round-trips folded cells, marks them stale, rejects other versions" {
+    var t = Table{};
+    feed(&t, 4, 1000, 50.0, 4.5);
+    _ = t.observe(5, 20000, 80.0, 5.0, true, false);
+    var buf: [1024]u8 = undefined;
+    const text = try serialize(&buf, &t);
+    const back = parse(text) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 2), back.restored);
+    try testing.expectApproxEqAbs(50.0, back.measuredMs(4, 0).?, 1e-3);
+    try testing.expectApproxEqAbs(4.5, back.measuredTok(4, 0).?, 1e-3);
+    try testing.expectEqual(@as(u32, 1), back.cells[5][4].n);
+    // First live sample of a restored cell blends at RESEED_WEIGHT.
+    var live = back;
+    try testing.expectEqual(Verdict.reseeded, live.observe(4, 1000, 70.0, 4.5, true, false));
+    try testing.expectApproxEqAbs(60.0, live.measuredMs(4, 0).?, 1e-3);
+    try testing.expect(parse("rc0\n4 0 50 4 3\n") == null);
+    try testing.expect(parse("rc1\n99 0 50 4 3\n") == null);
+    try testing.expect(parse("") == null);
+    var kb: [64]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc1-"));
 }

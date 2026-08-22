@@ -68,6 +68,7 @@ const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const spec_cost_mod = @import("spec_cost.zig");
+const round_cost_mod = @import("round_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -1967,8 +1968,7 @@ pub const Scheduler = struct {
     /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
     /// INIT options does not bind DISPATCH".
     fn slotTicksRegular(slot: *const Slot) bool {
-        const gen = if (slot.legacy_gen) |*g| g else
-            return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
         // A runtime-disabled generator is already ticking regular, so batching it
         // dispatches what it was going to dispatch anyway.
         //
@@ -2800,8 +2800,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
         "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
-        "ane_chunk_resolver",
-        "ane_headroom_resolver",
+        "ane_chunk_resolver",      "ane_headroom_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3326,6 +3325,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             xfm_ptr,
             spec_cost_key,
         );
+        // The measured round-cost table rides the same identity: restored
+        // here, written at the end of any request that folded new samples.
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build);
+        xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
+        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key)) |t| {
+            xfm_ptr.round_cost = t;
+            log.info("[spec-cost] round-cost table restored ({d} cells)\n", .{t.restored});
+        }
     }
 
     // Assistant sidecar (optional). Loaded only when `drafter_dir` is
@@ -4436,7 +4443,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
-    if (slot.legacy_gen) |*g| g.logSpecStats();
+    if (slot.legacy_gen) |*g| {
+        g.logSpecStats();
+        g.persistRoundCost();
+    }
     commitSlotIfApplicable(sch, slot);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the

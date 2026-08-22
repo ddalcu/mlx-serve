@@ -3921,3 +3921,19 @@ width, serial, width-1, width+1 in that order, starting at once (a losing
 DFlash costs 15-20% per round, a serial trial costs one token); 5% switch
 hysteresis. `MLX_SERVE_DFLASH_CHOOSER=0` restores the fixed block + sticky
 gate. Unmeasured live as of this note.
+
+### Phase 5: persistence (measured, then built)
+
+The plan said "only if measured": the peers measured it — every request
+that carries a trial block loses 3-4% (M1 Pro 27B rep 2, 9B 16k rep 1; M4
+base 16k rep 1), and a fresh boot pays every trial again while the
+knowledge is per (chip, model, quant, OS build). `round_cost.storeCached`
+writes `~/.mlx-serve/round-cost/<key>.txt` (`rc1` header, one
+`width bucket ms tok n` line per folded cell) at the end of any request
+that folded new samples (`Generator.persistRoundCost`, inference thread);
+`loadCached` restores at model load beside the spec-cost probe with the
+same identity key. Restored cells keep their sample counts (trust) but are
+marked stale so the first live sample blends at 0.5 — another boot is
+another thermal/OS state. Any version or shape mismatch is a quiet miss.
+v3 on the M4 base 9B cap 4 (the -6.6% cell): -1.0%, every arm mechanically
+identical (single-4, no gate line, bare `w4:18.0/57` tables on both arms).

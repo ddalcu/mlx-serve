@@ -5995,6 +5995,15 @@ pub const Generator = struct {
         }
     }
 
+    /// Write the model's round-cost table to disk when this request folded
+    /// new samples (request end; inference thread, so no lock).
+    pub fn persistRoundCost(self: *Generator) void {
+        const t = &self.xfm.round_cost;
+        if (t.folded == t.stored_at) return;
+        round_cost.storeCached(self.timer.io, self.xfm.round_cost_key_buf[0..self.xfm.round_cost_key_len], t);
+        t.stored_at = t.folded;
+    }
+
     /// Round-cost table kill switch — MLX_SERVE_MTP_COST_TABLE=0 keeps the
     /// table OBSERVING (its `[spec-stats]` fields stay comparable across an
     /// A/B) but the plan reads only the fitted prior and no width trial runs.
