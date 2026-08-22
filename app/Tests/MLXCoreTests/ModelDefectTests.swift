@@ -60,6 +60,18 @@ final class ModelDefectTests: XCTestCase {
         XCTAssertTrue(m.isChatPickable)
     }
 
+    /// A FLUX.2 klein pack (mflux layout) keeps every weight under
+    /// `transformer/`, `text_encoder/`, `vae/` and nothing at the root. It is a
+    /// working image model, not an orphan.
+    func testAPackWithWeightsOnlyInSubdirsHasNoDefect() throws {
+        let dir = makeDir("klein")
+        try? #"{"model_type":"flux2"}"#.write(toFile: (dir as NSString).appendingPathComponent("config.json"),
+                                               atomically: true, encoding: .utf8)
+        write("klein/transformer/diffusion_pytorch_model.safetensors", bytes: 4_000_000)
+        let m = try XCTUnwrap(models(dir).first)
+        XCTAssertNil(m.defect, "weights in a subdir are still weights")
+    }
+
     /// `LFM2.5-8B-A1B-MXFP8`: config and tokenizer, no weights at all. Was
     /// dropped from the list entirely — you could not see it, so you could not
     /// delete it.

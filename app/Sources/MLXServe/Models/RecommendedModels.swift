@@ -113,6 +113,26 @@ struct RecommendedModelPick: Identifiable, Hashable {
 
     var sizeLabel: String { String(format: "~%.1f GB", sizeGB) }
 
+    /// The quant this pick downloads, read off the GGUF filename or the repo
+    /// name ("…-4bit", "…-oQ2e", "…-mixed-2-3-8bit", "…-NVFP4-…"). nil when the
+    /// name carries none.
+    var quantLabel: String? {
+        if let f = ggufFilename { return DownloadManager.quantLabel(forFilename: f) }
+        let name = (repoId as NSString).lastPathComponent
+        if let r = name.range(of: "mixed(-[0-9]+)+bit", options: .regularExpression) {
+            let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
+            return "mixed \(bits.joined(separator: "/"))-bit"
+        }
+        if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
+            return name[r].dropLast("bit".count) + "-bit"
+        }
+        if let r = name.range(of: "(?<![A-Za-z0-9])(oQ[0-9]+e?|NVFP[0-9]+|MXFP[0-9]+|Q[0-9]_[A-Z0-9_]+)(?![A-Za-z0-9])",
+                              options: .regularExpression) {
+            return String(name[r])
+        }
+        return nil
+    }
+
     // MARK: - Capability bars
     //
     // 0…1 track fills. No number is ever rendered next to them: the scores are

@@ -420,11 +420,18 @@ private struct RecommendedModelTableRow: View {
             MiniCapability(pick: pick)
                 .frame(width: RecTableMetrics.capability, alignment: .leading)
 
-            // Download size (on disk).
-            Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: RecTableMetrics.size, alignment: .trailing)
+            // Download size (on disk) and the quant it buys.
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if let quant = pick.quantLabel {
+                    Text(quant)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: RecTableMetrics.size, alignment: .trailing)
 
             // Memory needed + fit against this Mac's usable budget.
             memoryCell

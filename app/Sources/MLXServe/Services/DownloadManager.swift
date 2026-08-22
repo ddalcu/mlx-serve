@@ -1685,10 +1685,21 @@ class DownloadManager: ObservableObject {
         }
 
         // Inexact path: no index, so all we can say is whether the bytes on
-        // disk could possibly be a checkpoint.
-        let weights = entries.filter { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }
-        let bytes = weights.reduce(UInt64(0)) {
-            $0 + resolvedFileSize((dir as NSString).appendingPathComponent($1))
+        // disk could possibly be a checkpoint. Media packs (FLUX.2 klein's
+        // mflux layout) keep every weight one level down in `transformer/`,
+        // `vae/`, … with nothing at the root, so the sum reads one level deep.
+        let fm = FileManager.default
+        func safetensorsBytes(in d: String, names: [String]) -> UInt64 {
+            names.filter { $0.hasSuffix(".safetensors") }
+                .reduce(UInt64(0)) { $0 + resolvedFileSize((d as NSString).appendingPathComponent($1)) }
+        }
+        var bytes = safetensorsBytes(in: dir, names: entries)
+        for e in entries where bytes < minimumWeightBytes {
+            let sub = (dir as NSString).appendingPathComponent(e)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: sub, isDirectory: &isDir), isDir.boolValue,
+                  let names = try? fm.contentsOfDirectory(atPath: sub) else { continue }
+            bytes += safetensorsBytes(in: sub, names: names)
         }
         return bytes >= minimumWeightBytes ? nil : .missingWeights
     }

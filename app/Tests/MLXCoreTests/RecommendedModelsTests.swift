@@ -390,4 +390,29 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertTrue(repoIds.contains("mlx-community/Qwen3.5-9B-MLX-4bit"))
         XCTAssertFalse(repoIds.contains { $0.contains("0.8B") })
     }
+
+    /// The Recommended table names the quant beside the size so nobody finds
+    /// out what they downloaded from the folder name.
+    func testQuantLabelIsDerivedFromRepoIdOrGgufFile() {
+        func label(_ repoId: String, gguf: String? = nil) -> String? {
+            var p = RecommendedModelPick.gemmaCatalog[0]
+            p = RecommendedModelPick(id: p.id, name: p.name, tagline: p.tagline, blurb: p.blurb,
+                                     repoId: repoId, sizeGB: p.sizeGB, family: p.family,
+                                     intelligence: p.intelligence, intelligenceIsEstimated: p.intelligenceIsEstimated,
+                                     speed: p.speed, contextTokens: p.contextTokens, activeParamsB: p.activeParamsB,
+                                     ggufFilename: gguf)
+            return p.quantLabel
+        }
+        XCTAssertEqual(label("mlx-community/gemma-4-12b-it-4bit"), "4-bit")
+        XCTAssertEqual(label("mlx-community/gemma-4-31b-it-8bit"), "8-bit")
+        XCTAssertEqual(label("mlx-community/Hy3-oQ2e"), "oQ2e")
+        XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit"), "mixed 2/3/8-bit")
+        XCTAssertEqual(label("poolside/Laguna-S-2.1-NVFP4-mlx"), "NVFP4")
+        XCTAssertEqual(label("x/y", gguf: "model-Q4_K_M.gguf"), "Q4_K_M")
+        XCTAssertNil(label("x/plain-model"))
+        for pick in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog
+                + RecommendedModelPick.poolsideCatalog + RecommendedModelPick.largestCatalog {
+            XCTAssertNotNil(pick.quantLabel, pick.repoId)
+        }
+    }
 }
