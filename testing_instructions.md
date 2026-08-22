@@ -19,12 +19,13 @@ Run the tests marked for your chip and open a PR (or an issue) with the output.
 | **M2 / Pro / Max / Ultra** | both caps — no rows at all | 1, 2, 3 |
 | **M3 / Pro / Max** | depth cap; block only measured on M3 **Ultra** | 1, 2, 3 |
 | **M3 Ultra** | depth cap (block row exists: 8) | 1, 2 |
-| **M4 / Pro** | both (only M4 **Max** was measured) | 1, 2, 3 |
+| **M4 Pro** | both (M4 base and M4 Max are done) | 1, 2, 3 |
 | **M5 Pro / Max / Ultra** | depth cap (base M5 is 4; the dies are their own rows) | 1, 2 |
 | **anything newer** | everything | 1, 2, 3 |
 
 Already measured, no need to re-run unless you think a row is wrong:
-M4 Max (depth 6, block 5), M3 Ultra (block 8), M1 Pro (depth 4), M5 base (depth 4).
+M4 Max (depth 6, block 5), M3 Ultra (block 8), M1 Pro (depth 4),
+M5 base (depth 4), M4 base (depth 4).
 
 ---
 
@@ -66,27 +67,36 @@ cost ladder at boot; it costs ~1-2 s and is cached afterwards.
 
 ## Test 2 — MTP depth cap
 
-`--mtp-depth` is a **cap**, not a fixed depth: the adaptive controller picks a
-depth within `[1, cap]` every round, so sweeping it alone can give you the same
-effective depth at cap 6 and cap 8 and a flat, useless table. Pin the depth with
-`MLX_SERVE_MTP_ADAPTIVE=0` and then **check the depth actually held** — the
-`[spec-stats]` line printed after each arm is what makes the row trustworthy.
+`--mtp-depth` is a **cap**, not a fixed depth: the controller picks a depth
+within `[1, cap]` every round, and **no env pins it** — `MLX_SERVE_MTP_ADAPTIVE=0`
+only swaps one controller for another, which still moves. So the cap can only be
+measured on a prompt whose acceptance is high enough to push the controller
+against it. That means an **echo** prompt (ask the model to reproduce a passage
+verbatim). On ordinary prose the controller sits at depth ~2 whatever the cap is,
+every depth reads the same, and the table is worthless — one tester's first
+attempt produced byte-identical `[spec-stats]` at depths 3, 5, 6, 7 and 8.
+
+Confirm from the `[spec-stats]` line that `avg_per_round` actually reaches the
+depth you asked for. If it does not, the cap never bound and that row is not a
+measurement of that depth.
 
 ```bash
+# An ECHO prompt: acceptance is high, so the cap binds and the sweep means
+# something. Do NOT use ordinary prose here (see above).
 cat > prompt.json <<'JSON'
 {"model":"MODEL_ID","temperature":0,"max_tokens":300,"stream":false,
- "messages":[{"role":"user","content":"Write a detailed technical explanation of how a B-tree index works in a relational database, including insertion, splitting and range scans."}]}
+ "messages":[{"role":"user","content":"Repeat the following text back to me exactly, three times in a row:\n\nThe quick brown fox jumps over the lazy dog while the diligent engineer measures the throughput of a speculative decoder on a laptop that is plugged into the wall and not running on battery power."}]}
 JSON
 # replace MODEL_ID with the id from: curl -s localhost:11250/v1/models
 
 for d in 3 4 5 6 7 8; do
-  stop; MLX_SERVE_MTP_ADAPTIVE=0 serve --mtp-depth $d
+  stop; serve --mtp-depth $d
   for r in 1 2; do
     curl -s -X POST http://127.0.0.1:11250/v1/chat/completions \
       -H 'Content-Type: application/json' -d @prompt.json \
       | python3 -c "import json,sys;d=json.load(sys.stdin);print('depth $d rep $r: %.2f tok/s' % d['timings']['predicted_per_second'])"
   done
-  grep -a "spec-stats" srv.log | tail -1     # confirm depth=$d actually held
+  grep -a "spec-stats" srv.log | tail -1     # avg_per_round must reach $d
 done
 stop
 ```
@@ -139,9 +149,9 @@ Test 1 ladder:
   [spec-cost] measured draft step .. ms/position
   [mtp] adaptive depth cap ..
 
-Test 2 (decode tok/s, best of 2, MLX_SERVE_MTP_ADAPTIVE=0):
+Test 2 (decode tok/s, echo prompt, best of 2 or median of 5):
   depth 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..
-  spec-stats depth= confirmed for each: yes/no
+  avg_per_round per depth: ..      ext_rounds per depth: ..
 
 Test 3 (decode tok/s, best of 2, if you ran it):
   block 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..

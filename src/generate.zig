@@ -5923,6 +5923,15 @@ pub const Generator = struct {
         if (!adaptive) return mtp_mod.DEFAULT_DEPTH;
         return switch (profile) {
             .generic => blk: {
+                // A SWEPT row always beats the probe, for the reason the
+                // DFlash side documents: throughput is accepted-tokens OVER
+                // round-cost and a cost ladder measures only the denominator.
+                // Base M4 is the live counter-example — the ladder's cliff
+                // says 6, the sweep measured 4, because from depth 5 on the
+                // plan stops collapsing to one chunk and every round pays an
+                // extension sync the cost model prices at zero.
+                const row = mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP);
+                if (row.measured) break :blk row.cap;
                 if (curve) |c| {
                     const cap = spec_cost_mod.cliffCapFromCurve(
                         spec_cost_mod.depthCurveFromWidthCurve(c),
@@ -5930,7 +5939,7 @@ pub const Generator = struct {
                     );
                     if (cap >= 1) break :blk @min(mtp_mod.MAX_DEPTH, cap);
                 }
-                break :blk mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP).cap;
+                break :blk row.cap;
             },
             .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
         };
@@ -10485,11 +10494,13 @@ test "a measured ladder replaces the per-silicon depth cap, and an explicit dept
     c.add(4, 59.2);
     c.add(5, 68.2);
     c.add(7, 95.4);
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M4 Max", c));
-    // ... and it overrides a chip row that was measured on a DIFFERENT
-    // quant geometry: the cap is a property of the resident weights, which
-    // the chip key cannot express.
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M1 Pro", c));
+    // An UNSWEPT chip takes the ladder instead of the blunt default.
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M2 Pro", c));
+    // A SWEPT row outranks it — the ladder cannot see acceptance or the
+    // extension sync. Base M4 is the live counter-example: cliff says 6,
+    // sweep measured 4 (2026-08-22).
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M1 Pro", c));
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M4", c));
     // An explicit --mtp-depth is never fenced by a measurement.
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapResolved(8, true, .generic, "Apple M1 Pro", c));
     // No curve = the chip table, verbatim (MLX_SERVE_SPEC_COST_PROBE=0).
