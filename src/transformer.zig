@@ -7269,7 +7269,7 @@ pub const Transformer = struct {
                 return .{
                     .bits = cache.vals_bits[idx],
                     .group_size = @as(u32, cache.vals_gs_div8[idx]) * 8,
-                    .mode = @enumFromInt(@intCast(cache.vals_mode[idx])),
+                    .mode = @enumFromInt(cache.vals_mode[idx]),
                 };
             }
             if (entry == null) {
