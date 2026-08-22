@@ -31,8 +31,12 @@ pub const BETA: f32 = 0.10;
 /// otherwise lose trust on every trial, reopen the horizon, and cycle.
 pub const RESEED_GAP: u32 = 64;
 pub const RESEED_WEIGHT: f32 = 0.5;
-/// Measured widths a bucket needs before the table replaces the prior.
-pub const MIN_WIDTHS: u32 = 2;
+/// Measured widths a bucket needs before the table replaces the prior: ONE
+/// trusted width anchors the prior's shape (scale) and lets raw cells floor
+/// it — two were required first, and with w5 settled as clearly worse
+/// after one sample the bucket never reached two, so the prior kept
+/// planning the 4 -> 5 extension the table had already priced.
+pub const MIN_WIDTHS: u32 = 1;
 /// Samples a cell needs before it COUNTS as measured. A one-sample cell is
 /// the seed (a legacy-controller round at the warmup boundary seeded a w2
 /// cell on the M4 base 9B, activated the table on {w2, w4} and anchored it
@@ -477,6 +481,13 @@ pub const WidthChooser = struct {
         if (width <= MAX_WIDTH) self.hist[width] += 1;
     }
 
+    /// Drafts proposed across all rounds (sum of width x rounds at it).
+    pub fn draftsProposed(self: *const WidthChooser) u64 {
+        var sum: u64 = 0;
+        for (self.hist, 0..) |n, w| sum += @as(u64, n) * w;
+        return sum;
+    }
+
     pub fn avgWidth(self: *const WidthChooser) f32 {
         if (self.rounds == 0) return 0;
         var sum: u64 = 0;
@@ -662,12 +673,15 @@ test "round_cost: a contended, transition or bad sample never moves the estimate
     try testing.expectEqual(MIN_SAMPLES, t.folded);
 }
 
-test "round_cost: one width is not a table, two interpolate and extrapolate" {
+test "round_cost: one width anchors, two interpolate, nothing extrapolates" {
     var t = Table{};
-    feed(&t, 3, 1000, 30.0, 3.0);
-    try testing.expect(!t.active(0));
-    try testing.expect(t.roundMs(4, 0) == null);
+    _ = t.observe(3, 1000, 30.0, 3.0, true, false);
+    try testing.expect(!t.active(0)); // one untrusted sample is nothing
     try testing.expect(t.bucketToRead(1000) == null);
+    feed(&t, 3, 1000, 30.0, 3.0);
+    try testing.expect(t.active(0));
+    try testing.expect(t.roundMs(4, 0) == null); // one point: the prior's shape fills
+    try testing.expectEqual(@as(usize, 0), t.bucketToRead(1000).?);
     feed(&t, 5, 1000, 50.0, 5.0);
     try testing.expect(t.active(0));
     try testing.expectApproxEqAbs(40.0, t.roundMs(4, 0).?, 1e-4); // between

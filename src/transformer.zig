@@ -4705,7 +4705,7 @@ const QuantParamsCache = struct {
                 self.keys[idx] = key;
                 self.vals_bits[idx] = @intCast(qp.bits);
                 self.vals_gs_div8[idx] = @intCast(qp.group_size / 8);
-                self.vals_mode[idx] = @backingInt(qp.mode);
+                self.vals_mode[idx] = @intFromEnum(qp.mode);
                 return true;
             }
         }
@@ -7269,7 +7269,7 @@ pub const Transformer = struct {
                 return .{
                     .bits = cache.vals_bits[idx],
                     .group_size = @as(u32, cache.vals_gs_div8[idx]) * 8,
-                    .mode = @fromBackingInt(@intCast(cache.vals_mode[idx])),
+                    .mode = @enumFromInt(@intCast(cache.vals_mode[idx])),
                 };
             }
             if (entry == null) {
@@ -7464,23 +7464,23 @@ pub const Transformer = struct {
                 // (interleaved) or only once all three are issued (hoisted).
                 const post = struct {
                     fn q_chain(t: *Transformer, slot: *mlx.mlx_array, r: ProjRung, sh: []const c_int, nrm: mlx.mlx_array, pm: []const c_int, dims: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array) !void {
-                        if (@backingInt(r) < @backingInt(ProjRung.reshape)) return;
+                        if (@intFromEnum(r) < @intFromEnum(ProjRung.reshape)) return;
                         var o = mlx.mlx_array_new();
                         try mlx.check(mlx.mlx_reshape(&o, slot.*, sh.ptr, sh.len, t.s));
                         _ = mlx.mlx_array_free(slot.*);
                         slot.* = o;
-                        if (@backingInt(r) >= @backingInt(ProjRung.qk_norm) and nrm.ctx != null) {
+                        if (@intFromEnum(r) >= @intFromEnum(ProjRung.qk_norm) and nrm.ctx != null) {
                             const n = try t.rmsNorm(slot.*, nrm);
                             _ = mlx.mlx_array_free(slot.*);
                             slot.* = n;
                         }
-                        if (@backingInt(r) >= @backingInt(ProjRung.transpose)) {
+                        if (@intFromEnum(r) >= @intFromEnum(ProjRung.transpose)) {
                             var tr = mlx.mlx_array_new();
                             try mlx.check(mlx.mlx_transpose_axes(&tr, slot.*, pm.ptr, @intCast(pm.len), t.s));
                             _ = mlx.mlx_array_free(slot.*);
                             slot.* = tr;
                         }
-                        if (@backingInt(r) >= @backingInt(ProjRung.rope)) {
+                        if (@intFromEnum(r) >= @intFromEnum(ProjRung.rope)) {
                             var rp = mlx.mlx_array_new();
                             try mlx.check(mlx.mlx_fast_rope(&rp, slot.*, dims, false, base, 1.0, 0, freqs, t.s));
                             _ = mlx.mlx_array_free(slot.*);
@@ -7498,15 +7498,15 @@ pub const Transformer = struct {
                 // precomputed YaRN freqs ARRAY (and only the partial rotary
                 // width), sliding layers the local base frequency.
                 const l_full = cfg.isGlobalLayer(@intCast(li));
-                const l_yarn = @backingInt(rung) >= @backingInt(ProjRung.yarn_rope) and l_full and self.rope_freqs_yarn != null;
-                const l_dims: c_int = if (@backingInt(rung) < @backingInt(ProjRung.yarn_rope))
+                const l_yarn = @intFromEnum(rung) >= @intFromEnum(ProjRung.yarn_rope) and l_full and self.rope_freqs_yarn != null;
+                const l_dims: c_int = if (@intFromEnum(rung) < @intFromEnum(ProjRung.yarn_rope))
                     hd
                 else if (l_yarn)
                     @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor_global)
                 else
                     @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
                 const l_base = mlx.mlx_optional_float{
-                    .value = if (@backingInt(rung) < @backingInt(ProjRung.yarn_rope))
+                    .value = if (@intFromEnum(rung) < @intFromEnum(ProjRung.yarn_rope))
                         cfg.rope_theta
                     else if (l_full) cfg.rope_theta else cfg.rope_local_base_freq,
                     .has_value = !l_yarn,
@@ -7515,7 +7515,7 @@ pub const Transformer = struct {
 
                 var xin_l = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(xin_l);
-                if (@backingInt(rung) >= @backingInt(ProjRung.norms) and lw.input_norm.ctx != null) {
+                if (@intFromEnum(rung) >= @intFromEnum(ProjRung.norms) and lw.input_norm.ctx != null) {
                     const n = try self.rmsNorm(acc, lw.input_norm);
                     _ = mlx.mlx_array_free(xin_l);
                     xin_l = n;
@@ -7583,7 +7583,7 @@ pub const Transformer = struct {
                 // SDPA rung, K and V are folded in through a scalar sum so the
                 // rung still pays for their chains.
                 var head: mlx.mlx_array = undefined;
-                if (@backingInt(rung) >= @backingInt(ProjRung.sdpa)) {
+                if (@intFromEnum(rung) >= @intFromEnum(ProjRung.sdpa)) {
                     var att = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&att, q, k, v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
                     var back = mlx.mlx_array_new();
@@ -7607,7 +7607,7 @@ pub const Transformer = struct {
                 }
                 defer _ = mlx.mlx_array_free(head);
 
-                if (@backingInt(rung) >= @backingInt(ProjRung.gate) and fa.g_w.ctx != null) {
+                if (@intFromEnum(rung) >= @intFromEnum(ProjRung.gate) and fa.g_w.ctx != null) {
                     var gl = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(gl);
                     try mlx.check(mlx.mlx_matmul(&gl, xin_l, fa.g_w, self.s));
@@ -7649,12 +7649,12 @@ pub const Transformer = struct {
                 // Layer tail: post-attention norm, the real MLP, second
                 // residual. At the top rung this loop IS the forward's layer
                 // loop, so a jump here localizes to the op that caused it.
-                if (@backingInt(rung) >= @backingInt(ProjRung.norms) and lw.post_attn_norm.ctx != null) {
+                if (@intFromEnum(rung) >= @intFromEnum(ProjRung.norms) and lw.post_attn_norm.ctx != null) {
                     const ffn = try self.rmsNorm(acc, lw.post_attn_norm);
                     defer _ = mlx.mlx_array_free(ffn);
                     var mlp_out = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(mlp_out);
-                    if (@backingInt(rung) >= @backingInt(ProjRung.mlp)) {
+                    if (@intFromEnum(rung) >= @intFromEnum(ProjRung.mlp)) {
                         _ = mlx.mlx_array_free(mlp_out);
                         mlp_out = switch (lw.mlp) {
                             .moe => |*mw| try self.moeMLP(ffn, mw),
@@ -17850,7 +17850,7 @@ const ROUTER_NAMES = [3][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_
 var router_kernels: [3]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
-    const mi: usize = @backingInt(mode);
+    const mi: usize = @intFromEnum(mode);
     if (router_kernels[mi]) |k| return k;
     const softmax_inputs = [_][*:0]const u8{"logits"};
     const sigmoid_inputs = [_][*:0]const u8{ "logits", "bias", "scale" };
@@ -17990,7 +17990,7 @@ fn moeRouterTopK(
         .n_group = n_group,
         .topk_group = topk_group,
     };
-    const slot = &router_cfg_cache[@backingInt(mode)];
+    const slot = &router_cfg_cache[@intFromEnum(mode)];
     if (slot.cfg.ctx == null or !std.meta.eql(slot.key, key)) {
         if (slot.cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(slot.cfg);
         if (slot.scale_arr.ctx != null) _ = mlx.mlx_array_free(slot.scale_arr);
@@ -23357,7 +23357,7 @@ test "QuantParamsCache put/lookup round-trip" {
             if (cache.keys[j] == a.ctx) {
                 try testing.expectEqual(@as(u8, 4), cache.vals_bits[j]);
                 try testing.expectEqual(@as(u8, 32 / 8), cache.vals_gs_div8[j]);
-                try testing.expectEqual(@backingInt(QuantMode.affine), cache.vals_mode[j]);
+                try testing.expectEqual(@intFromEnum(QuantMode.affine), cache.vals_mode[j]);
                 found = true;
                 break;
             }
@@ -23372,7 +23372,7 @@ test "QuantParamsCache put/lookup round-trip" {
             if (cache.keys[j] == c.ctx) {
                 try testing.expectEqual(@as(u8, 8), cache.vals_bits[j]);
                 try testing.expectEqual(@as(u8, 128 / 8), cache.vals_gs_div8[j]);
-                try testing.expectEqual(@backingInt(QuantMode.affine), cache.vals_mode[j]);
+                try testing.expectEqual(@intFromEnum(QuantMode.affine), cache.vals_mode[j]);
                 found = true;
                 break;
             }
