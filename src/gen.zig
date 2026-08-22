@@ -1437,6 +1437,9 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     var prompt: ?[]const u8 = null;
     var model: ?[]const u8 = null;
     var size: ?[]const u8 = null;
+    var lora_paths: ?[]const u8 = null;
+    var lora_scales: ?[]const u8 = null;
+    var safety: ?bool = null;
 
     while (it.next()) |part| {
         // `image`, `image[]` and `image[0]` are all in the wild.
@@ -1453,6 +1456,18 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
             // "auto" means "you decide" — leave it out and let the edit path
             // resolve from the reference.
             if (!std.mem.eql(u8, part.data, "auto") and part.data.len != 0) size = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_paths")) {
+            lora_paths = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_scales")) {
+            lora_scales = part.data;
+        } else if (std.mem.eql(u8, part.name, "safety")) {
+            if (std.mem.eql(u8, part.data, "true")) {
+                safety = true;
+            } else if (std.mem.eql(u8, part.data, "false")) {
+                safety = false;
+            } else if (part.data.len != 0) {
+                return error.InvalidSafety;
+            }
         } else if (std.mem.eql(u8, part.name, "mask")) {
             if (part.data.len != 0) return error.MaskUnsupported;
         } else if (std.mem.eql(u8, part.name, "n")) {
@@ -1486,6 +1501,18 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     if (size) |sz| {
         try out.appendSlice(allocator, ",\"size\":");
         try chat_mod.appendJsonString(allocator, &out, sz);
+    }
+    if (lora_paths) |paths| {
+        try out.appendSlice(allocator, ",\"lora_paths\":");
+        try out.appendSlice(allocator, paths);
+    }
+    if (lora_scales) |scales| {
+        try out.appendSlice(allocator, ",\"lora_scales\":");
+        try out.appendSlice(allocator, scales);
+    }
+    if (safety) |enabled| {
+        try out.appendSlice(allocator, ",\"safety\":");
+        try out.appendSlice(allocator, if (enabled) "true" else "false");
     }
     try out.appendSlice(allocator, ",\"image\":\"");
     try appendBase64(allocator, &out, images[0]);
