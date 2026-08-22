@@ -4236,7 +4236,6 @@ fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
 fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
-    if (slot.was_pad_only) return;
     if (slot.error_code != null) return;
     if (slot.vision_embeddings != null) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
@@ -4244,10 +4243,20 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // client disconnected from mid-chunk-loop: initWithOptions threw
         // error.Cancelled before `slot.legacy_gen = gen` ever ran, but every
         // chunk that DID forward still lives in slot.cache. Commit that
-        // forwarded prefix instead of dropping it.
+        // forwarded prefix instead of dropping it. This arm sits ABOVE the
+        // pad-only guard: `was_pad_only` starts true and only flips on the
+        // first pushed token, so a slot that never pushed one is not
+        // pad-POISONED, it is merely empty.
         return commitCancelledPrefillSlot(slot, hc);
     };
-    if (gen_ptr.generated_ids.items.len == 0) return;
+    const n_gen = gen_ptr.generated_ids.items.len;
+    if (n_gen > 0 and slot.was_pad_only) return;
+    // Zero emitted tokens is worth committing only when the client cancelled
+    // between prefill completion and the first token: the KV holds exactly
+    // the prompt (cache.step == prompt_len) and the next identical request
+    // skips the whole prefill. A normally-finished empty generation is the
+    // old no-op.
+    if (n_gen == 0 and !slot.cancelled.load(.acquire)) return;
 
     // Construct the full token sequence: the original prompt + everything
     // generated this turn. The cache reflects exactly this state — Generator
@@ -5591,7 +5600,16 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") != null);
+    const route_pos = std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") orelse return error.MissingRoute;
+    // `was_pad_only` initializes TRUE and only flips on the first pushed
+    // token, so a guard on it ABOVE the Generator-less arm makes that arm
+    // unreachable (live 2026-08-22: "prefill aborted" logged, nothing
+    // committed, full re-prefill on retry).
+    const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
+    try testing.expect(route_pos < pad_pos);
+    // A cancel landing between prefill completion and the first token has a
+    // live Generator with zero emitted tokens and a KV holding the prompt.
+    try testing.expect(std.mem.indexOf(u8, body, "n_gen == 0 and !slot.cancelled") != null);
 
     const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
     const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;

@@ -64,7 +64,7 @@ done
 boot_server() {
     rm -f "$LOG"
     "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-        --ctx-size 8192 --kv-quant 4 --prefix-cache-entries 4 \
+        --ctx-size 16384 --prefill-chunk 1024 --kv-quant 4 --prefix-cache-entries 4 \
         > "$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
@@ -109,13 +109,13 @@ decode_cancel_section() {
     boot_server || return 1
     warmup_model
 
-    # Fire a long streaming generation and kill the client mid-decode.
-    # max_tokens 2000 guarantees decode is still running at the kill on any
-    # model speed (fast small models need >8s of decode, slow big ones far
-    # more).
+    # Fire a streaming generation and kill the client mid-decode. The short
+    # prompt prefills in well under a second on any model, and a thinking-off
+    # answer can hit EOS in a few seconds on a small one, so the kill lands
+    # early.
     local body
     body="$(body_chat "$SYSTEM_PROMPT" true 2000)"
-    curl -sN --max-time 8 -o /tmp/test_cancel_partial.sse \
+    curl -sN --max-time 3 -o /tmp/test_cancel_partial.sse \
         -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' -d "$body" 2>/dev/null
     local curl_rc=$?
@@ -169,9 +169,12 @@ prefill_cancel_section() {
     boot_server || return 1
     warmup_model
 
-    # ~6k-token prompt: still inside prefill at kill time on slow models; on
-    # very fast ones the kill may land in decode, which the captured stream
-    # tells us (see below) — that case is section [1]'s contract.
+    # ~8k-token prompt at --prefill-chunk 1024 (the boot flag): several
+    # chunks are still ahead at kill time on any model, and the chunk loop
+    # only polls the cancel flag at chunk boundaries — one 8k chunk would
+    # complete the whole prefill first. On very fast models the kill may
+    # still land in decode, which the captured stream tells us (see below);
+    # that case is section [1]'s contract.
     local body
     body="$(body_chat "$LONG_SYSTEM" true 2000)"
     curl -sN --max-time 2 -o /tmp/test_cancel_prefill.sse \
