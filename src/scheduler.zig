@@ -67,7 +67,6 @@ const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
-const spec_cost_mod = @import("spec_cost.zig");
 const round_cost_mod = @import("round_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
@@ -3291,19 +3290,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(v);
     };
 
-    // ── Measured spec-decode cost curve.
-    //
-    // Both speculative width knobs — the MTP depth cap and the DFlash block
-    // — were fenced by hand-typed per-silicon tables fitted on one machine,
-    // at one quant width, at one context length. The cost they encode is a
-    // property of the verify FORWARD SHAPE, so it is measured here instead:
-    // ~1-2 s of dummy forwards on this checkpoint, cached on disk per
-    // (chip, model, quant, OS build) so it is paid once ever. Runs BEFORE the
-    // sidecar/MTP loads so both resolve their width against it, and on this
-    // (the inference) thread — it forwards. `MLX_SERVE_SPEC_COST_PROBE=0`
-    // restores the tables verbatim.
-    var spec_cost_key_buf: [64]u8 = undefined;
-    var spec_cost_key: []const u8 = "";
+    // The measured round-cost table (`round_cost.zig`) is keyed per (chip,
+    // model, quant, OS build); restored here, written at request end.
     {
         var quant_buf: [32]u8 = undefined;
         const quant = std.fmt.bufPrint(&quant_buf, "q{d}g{d}", .{
@@ -3312,19 +3300,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }) catch "q?";
         var os_buf: [64]u8 = undefined;
         const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
-        spec_cost_key = spec_cost_mod.cacheKey(
-            &spec_cost_key_buf,
-            ane_mod.chipBrand(),
-            params.model_dir,
-            quant,
-            os_build,
-        );
-        xfm_ptr.spec_cost_curve = spec_cost_mod.resolve(
-            sch.io,
-            sch.allocator,
-            xfm_ptr,
-            spec_cost_key,
-        );
         // The measured round-cost table rides the same identity: restored
         // here, written at the end of any request that folded new samples.
         const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build);
@@ -3383,7 +3358,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            const block_cap = dflash_mod.resolveBlockCap(ane_mod.chipBrand(), xfm_ptr.spec_cost_curve);
+            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
@@ -3486,20 +3461,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     // hand-measured composite of 7.6). A cached curve already
                     // carries it, so this is paid once per (chip, model,
                     // quant, OS build) like the ladder itself.
-                    if (xfm_ptr.spec_cost_curve) |*c| {
-                        if (c.draft_ms == 0) {
-                            if (mtp_mod.probeStepMs(h, sch.io, sch.allocator, xfm_ptr, spec_cost_mod.DEFAULT_REPS)) |ms| {
-                                c.draft_ms = ms;
-                                spec_cost_mod.storeCached(sch.io, spec_cost_key, c.*);
-                                log.info("[spec-cost] measured draft step {d:.2} ms/position\n", .{ms});
-                            } else |err| {
-                                log.warn("[spec-cost] draft-step probe failed ({s}) — EV surface keeps its table\n", .{@errorName(err)});
-                                xfm_ptr.spec_cost_curve = null;
-                            }
-                        }
-                    }
                     log.info("MTP head ready (depth={d}, profile={s}).\n", .{
-                        generate_mod.Generator.resolveMtpDepthCapForCurve(params.mtp_depth, mtp_cost_profile, xfm_ptr.spec_cost_curve),
+                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
                         @tagName(mtp_cost_profile),
                     });
                 } else |bind_err| {
@@ -3602,7 +3565,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.mtp = if (mtp_ptr) |h| generate_mod.MtpHeadRef{ .qwen = h } else null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
-    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForCurve(params.mtp_depth, mtp_cost_profile, xfm_ptr.spec_cost_curve);
+    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
     xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`

@@ -53,17 +53,24 @@ a laptop before, which reads as a fake win.
 
 ---
 
-## Test 1 — your measured ladder (2 minutes, everyone)
+## Test 1 — your measured round-cost table (2 minutes, everyone)
 
 ```bash
 serve
-grep -a "spec-cost\|adaptive depth cap\|DFlash drafter ready" srv.log
-curl -s http://127.0.0.1:11250/props | python3 -m json.tool | grep -A12 spec_cost
+# run any two or three requests against it, then:
+grep -a "spec-stats\|cost table\|adaptive depth cap\|round-cost table\|DFlash drafter ready" srv.log
+cat ~/.mlx-serve/round-cost/*.txt
 stop
 ```
 
-Paste both outputs. This is the server measuring your machine's verify-forward
-cost ladder at boot; it costs ~1-2 s and is cached afterwards.
+Paste both outputs. The server measures the cost of every draft width it
+actually runs (ms per round and tokens per round, per KV bucket) and writes the
+table under `~/.mlx-serve/round-cost/` at the end of each request; the next
+boot restores it. The `[spec-stats]` line carries `table=<bucket>:wN:ms/tok/n`
+and `width_trials=`, and `[mtp] adaptive depth cap N (<row>, default 6)` names
+the per-silicon row that caps the FIRST boot (the table may plan above it once
+a width is measured). `MLX_SERVE_MTP_COST_TABLE=0` is the control arm (the
+old controller), `MLX_SERVE_ROUND_COST_PERSIST=0` disables the file.
 
 ## Test 2 — MTP depth cap
 
@@ -144,10 +151,10 @@ macOS:       26.2                  (sysctl -n kern.osproductversion)
 Model:       <repo/name>, <quant>
 Power:       AC
 
-Test 1 ladder:
-  [spec-cost] measured verify ladder (ms/forward) 1:.. 2:.. ...
-  [spec-cost] measured draft step .. ms/position
-  [mtp] adaptive depth cap ..
+Test 1 table:
+  [mtp] adaptive depth cap .. (<row>, default 6)
+  [spec-stats] ... width_trials=.. table=<2k:w4:../.., w5:../..
+  ~/.mlx-serve/round-cost/<key>.txt contents
 
 Test 2 (decode tok/s, echo prompt, best of 2 or median of 5):
   depth 3: ..   4: ..   5: ..   6: ..   7: ..   8: ..
@@ -163,20 +170,11 @@ chips, and we would rather have your six numbers than a guess.
 
 ---
 
-## Optional: the two opt-in levers
+## Optional: the control arms
 
-Both are off by default because they **measured a loss** on an M4 Max. If you
-want to check whether that holds on your chip, run Test 2 with the env set and
-compare against the same test without it:
-
-- `MLX_SERVE_SPEC_COST_KV=1` — scales the cost model with context length.
-  Measured -2.7% at a 21k prompt on M4 Max: it makes deep drafts look cheaper,
-  the controller extends further, and the extra positions do not get accepted.
-- `MLX_SERVE_SPEC_COST_EV=1` — replaces the hand-fitted cost surface with the
-  boot probe's own fit. The probe times a forward, but a round is a forward plus
-  the draft steps, so it under-prices depth.
-- `MLX_SERVE_SPEC_COST_PROBE=0` — turns the boot probe off entirely and restores
-  the hand-typed tables. Use it as the control arm for anything above.
-
-If either of the first two is a *win* on your machine, that is genuinely
-interesting — say so, with both arms' numbers.
+- `MLX_SERVE_MTP_COST_TABLE=0` — the MTP plan reads only the fitted prior (the
+  table still observes and persists). Same-boot A/B control for anything above.
+- `MLX_SERVE_ROUND_COST_PERSIST=0` — no table file: every boot starts cold.
+- `MLX_SERVE_DFLASH_CHOOSER=1` — opt-in: the DFlash/DSpark block is chosen per
+  round from the same table (serial is a candidate). Report its
+  `[dflash] width chooser:` lines and `block_hist=` with on/off numbers.

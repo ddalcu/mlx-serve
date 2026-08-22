@@ -29,7 +29,6 @@ const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const ane_mod = @import("ane.zig");
-const spec_cost_mod = @import("spec_cost.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -4125,28 +4124,6 @@ fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers:
     return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"units\":{d},\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d},\"unit_evals\":[{s}]}}", .{ mode_name, units.len, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures, rows_buf[0..used] });
 }
 
-/// The /props "spec_cost" object: the measured verify ladder this model
-/// resolved its spec widths from, plus the online kv term. A tester pastes
-/// this back instead of grepping a boot log — and a fence nobody can see is
-/// a fence nobody can debug. Empty fragment when the probe is off or
-/// declined (the per-silicon tables apply, exactly as before).
-fn specCostPropsJson(allocator: std.mem.Allocator, curve: spec_cost_mod.SpecCostCurve, depth_cap: u32) ![]u8 {
-    var widths_buf: [256]u8 = undefined;
-    var ms_buf: [256]u8 = undefined;
-    var wu: usize = 0;
-    var mu: usize = 0;
-    for (curve.widths[0..curve.n], curve.ms[0..curve.n], 0..) |w, m, i| {
-        const sep = if (i == 0) "" else ",";
-        wu += (try std.fmt.bufPrint(widths_buf[wu..], "{s}{d}", .{ sep, w })).len;
-        mu += (try std.fmt.bufPrint(ms_buf[mu..], "{s}{d:.3}", .{ sep, m })).len;
-    }
-    return std.fmt.allocPrint(
-        allocator,
-        ",\"spec_cost\":{{\"widths\":[{s}],\"ms\":[{s}],\"kv_ms_per_token\":{d:.6},\"mtp_depth_cap\":{d}}}",
-        .{ widths_buf[0..wu], ms_buf[0..mu], curve.kv_ms_per_token, depth_cap },
-    );
-}
-
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
     const config = lm.config.?;
     const ctx_len = getEffectiveContextLength(config);
@@ -4213,17 +4190,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     };
     defer allocator.free(ane_json);
 
-    const spec_json: []u8 = blk: {
-        if (lm.transformer) |x| {
-            if (x.spec_cost_curve) |c| break :blk try specCostPropsJson(allocator, c, lm.mtp_depth);
-        }
-        break :blk try allocator.dupe(u8, "");
-    };
-    defer allocator.free(spec_json);
-    const extras = try std.mem.concat(allocator, u8, &.{ ane_json, spec_json });
-    defer allocator.free(extras);
-
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extras);
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -10138,10 +10105,10 @@ fn appendLfm2Tiles(
         }
     }
     log.info("  Decoded {d}x{d} image → lfm2 {d}x{d} tiles{s} on a {d}x{d} canvas ({d} tokens)\n", .{
-        src.w,     src.h,
-        grid.rows, grid.cols,
+        src.w,      src.h,
+        grid.rows,  grid.cols,
         thumb_note, canvas_w,
-        canvas_h,  @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
+        canvas_h,   @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
     });
 }
 
@@ -15335,11 +15302,16 @@ test "lfm2ImageSegment labels every tile and closes on the thumbnail" {
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         125009,
-        124908, 124907,
-        124909, 124907,
-        124918, 124907,
-        124919, 124907,
-        125008, 124907,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
         125010,
     };
     try testing.expectEqualSlices(u32, &want, seg);
@@ -16169,8 +16141,7 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         try std.testing.expect(got.enable);
         try std.testing.expectEqual(case.want, got.budget);
         // The raw string rides along either way — the template still renders it.
-        try std.testing.expectEqualStrings(
-            parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
+        try std.testing.expectEqualStrings(parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
 }
 
@@ -16986,24 +16957,19 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // are the same class of parameter: derived from the CONFIG at the site, or
     // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
     // and a quantized checkpoint gets a dense one's.
-    try t.expect(std.mem.indexOf(u8, src,
-        "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
-    try t.expect(std.mem.indexOf(u8, src,
-        "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
+    try t.expect(std.mem.indexOf(u8, src, "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
+    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
 
     // Auto-context sizing reads the same helpers — the two must not drift.
     // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
     // `--kv-quant 4` server cannot size its context against fp16 while the
     // guard admits against 4-bit (that mismatch reported a third of what fits).
-    try t.expect(std.mem.indexOf(u8, src,
-        "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
-    try t.expect(std.mem.indexOf(u8, src,
-        "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src, "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src, "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
     // The prefill transient: the sizer RESERVES it once at the chunk width
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
-    try t.expect(std.mem.indexOf(u8, src,
-        "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -17039,8 +17005,7 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // scheduler sources it from `slot.model.config` — the same object the
     // guard bills against.
     const sched = @embedFile("scheduler.zig");
-    try t.expect(std.mem.indexOf(u8, sched,
-        ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
     try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
 
     // And the width has to be frozen BEFORE anything is computed from it:
@@ -17588,27 +17553,4 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
-}
-
-test "specCostPropsJson: the measured ladder is readable from /props" {
-    var c = spec_cost_mod.SpecCostCurve{};
-    c.add(1, 38.0);
-    c.add(2, 44.6);
-    c.add(4, 59.2);
-    c.kv_ms_per_token = 0.00125;
-    const frag = try specCostPropsJson(testing.allocator, c, 6);
-    defer testing.allocator.free(frag);
-    try testing.expect(std.mem.startsWith(u8, frag, ",\"spec_cost\":"));
-    try testing.expect(std.mem.indexOf(u8, frag, "\"widths\":[1,2,4]") != null);
-    try testing.expect(std.mem.indexOf(u8, frag, "44.600") != null);
-    try testing.expect(std.mem.indexOf(u8, frag, "\"kv_ms_per_token\":0.001250") != null);
-    // The RESOLVED width, not just the ladder: that is what a tester needs
-    // to say whether Automatic landed where they expected.
-    try testing.expect(std.mem.indexOf(u8, frag, "\"mtp_depth_cap\":6") != null);
-    // Splices into the props root as a fragment (same contract as "ane").
-    const doc = try std.fmt.allocPrint(testing.allocator, "{{\"x\":1{s}}}", .{frag});
-    defer testing.allocator.free(doc);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, doc, .{});
-    defer parsed.deinit();
-    try testing.expect(parsed.value.object.get("spec_cost") != null);
 }

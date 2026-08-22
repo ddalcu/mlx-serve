@@ -27,7 +27,6 @@ test {
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
-    _ = @import("spec_cost.zig");
     _ = @import("round_cost.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");

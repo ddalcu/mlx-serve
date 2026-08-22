@@ -2755,7 +2755,6 @@ pub fn splitCausalSdpa(
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
-const spec_cost_mod = @import("spec_cost.zig");
 const round_cost_mod = @import("round_cost.zig");
 // NB `ane_offload`, not `*_mod`: the `?*<x>_mod.<Y>` field convention marks
 // module-owned ARCH state (the dsv4 class — single-flight + spec-off); the
@@ -5750,12 +5749,6 @@ pub const Transformer = struct {
     /// samplers reference it non-owning via `SamplingParams.suppress_mask`.
     /// Null = suppression off (kill switch, no chat template, GGUF engines).
     suppress_mask: ?mlx.mlx_array = null,
-    /// Measured verify-forward cost ladder for THIS checkpoint on THIS
-    /// machine (`probeSpecCostCurve`, resolved once at load and cached on
-    /// disk). Drives the MTP EV cost surface and the spec width caps in
-    /// place of the hand-typed per-silicon tables; null means the probe was
-    /// disabled or declined, and every consumer falls back to its table.
-    spec_cost_curve: ?spec_cost_mod.SpecCostCurve = null,
     /// Measured spec round-cost table (`round_cost.Table`): per draft
     /// width, per KV bucket, fed by every MTP/DFlash round on this model and
     /// read by the EV plan in place of the fitted surface once a bucket has
@@ -8634,54 +8627,6 @@ pub const Transformer = struct {
         }
         _ = mlx.mlx_clear_cache();
         try self.resetCache();
-    }
-
-    /// Time the verify-forward ladder this machine actually serves.
-    ///
-    /// Both spec-decode width knobs (MTP depth, the DFlash block) were fenced
-    /// by hand-typed per-silicon tables, each fitted on one machine at one
-    /// quant width. The cost they encode is a property of the FORWARD SHAPE —
-    /// a width-`w` forward reads the weights once and the KV once whatever
-    /// `w` is, and only the GEMM tile cliff bends the curve — so it is
-    /// directly measurable here, at boot, on this checkpoint.
-    ///
-    /// Same shape as `warmup()`: dummy ids, cache reset around every pass, no
-    /// sampling and no acceptance. Rep 0 of each width is DISCARDED (it pays
-    /// the kernel JIT / lane selection this width would have paid on its
-    /// first real use anyway) and the remaining reps keep their MIN —
-    /// contention and thermal noise are strictly one-sided, so the minimum is
-    /// the robust estimator.
-    ///
-    /// MUST run on the inference thread (the sole MLX caller).
-    pub fn probeSpecCostCurve(self: *Transformer, io: std.Io, widths: []const u32, reps: u32) !spec_cost_mod.SpecCostCurve {
-        var curve = spec_cost_mod.SpecCostCurve{};
-        var ids: [spec_cost_mod.MAX_ENTRIES]i32 = std.mem.zeroes([spec_cost_mod.MAX_ENTRIES]i32);
-        for (widths) |w| {
-            if (w == 0 or w > spec_cost_mod.MAX_ENTRIES) continue;
-            var best_ns: u64 = std.math.maxInt(u64);
-            var rep: u32 = 0;
-            while (rep < reps + 1) : (rep += 1) {
-                try self.resetCache();
-                const shape = [_]c_int{ 1, @intCast(w) };
-                const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
-                defer _ = mlx.mlx_array_free(input);
-                const watch = io_util_mod.Stopwatch.init(io);
-                const logits = try self.forward(input);
-                mlx.check(mlx.mlx_array_eval(logits)) catch {
-                    _ = mlx.mlx_array_free(logits);
-                    return error.SpecCostProbeFailed;
-                };
-                const ns = watch.read();
-                _ = mlx.mlx_array_free(logits);
-                if (rep > 0) best_ns = @min(best_ns, ns);
-            }
-            _ = mlx.mlx_clear_cache();
-            if (best_ns == std.math.maxInt(u64)) continue;
-            curve.add(w, @as(f32, @floatFromInt(best_ns)) / @as(f32, std.time.ns_per_ms));
-        }
-        try self.resetCache();
-        _ = mlx.mlx_clear_cache();
-        return curve;
     }
 
     /// Run a forward pass and ALSO capture the post-final-norm hidden state

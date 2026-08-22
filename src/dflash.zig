@@ -31,7 +31,6 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
-const spec_cost_mod = @import("spec_cost.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
@@ -385,11 +384,6 @@ pub const BlockCap = struct {
     measured: bool = false,
 };
 
-/// Fraction by which a width's cost-per-position may exceed the running best
-/// before the measured ladder calls it past the cliff. Same bar as the MTP
-/// side (generate.MTP_CLIFF_TOLERANCE).
-pub const BLOCK_CLIFF_TOLERANCE: f32 = 0.05;
-
 /// Per-silicon cap table for machines WITHOUT the NAX m16 verify lane. The
 /// cap is a MACHINE measurement, so each row is one: the M4 row is
 /// NO_WIDE_LANE_BLOCK_CAP (see above); the M3 Ultra row is 8 on oMLX PR
@@ -407,73 +401,6 @@ pub fn blockCapForMachine(chip: []const u8) BlockCap {
     // outranks a probe.
     if (std.mem.indexOf(u8, chip, "M4") != null) return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "m4", .measured = true };
     return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
-}
-
-/// Chip name via sysctl ("Apple M3 Ultra"); empty on failure, which lands
-/// on the default cap row. Canonical copy lives in ane.zig (the ANE share
-/// table keys on the same string).
-/// The block cap for this load: a measured chip row when there is one, else
-/// this machine's own measured verify ladder, else the conservative default.
-///
-/// A SWEPT CHIP ROW ALWAYS WINS, and the reason is not deference — it is that
-/// the two measure different things. Throughput is accepted-tokens over
-/// round-cost; the probe's ladder is round-cost ALONE. Live on an M4 Max
-/// (2026-08-21) the ladder's cost-per-position bottoms at width 6 and is
-/// still within 5% at 7, so the cliff says cap 7 — while the hand sweep at
-/// the top of this file measured block 7 at 1.43x serial against block 5's
-/// 1.97x. The extra positions cost almost nothing and accept almost nothing,
-/// and a forward ladder cannot see the second half of that sentence.
-///
-/// MTP escapes this because its EV controller supplies acceptance separately
-/// (the cap only has to fence the cost cliff); the DFlash block is FIXED for
-/// a request with no acceptance-aware controller behind it, so the cliff
-/// alone is the wrong criterion and the probe only fills in chips nobody
-/// swept — where the alternative is a guess, not a measurement.
-pub fn resolveBlockCap(chip: []const u8, curve: ?spec_cost_mod.SpecCostCurve) BlockCap {
-    const row = blockCapForMachine(chip);
-    if (row.measured) return row;
-    const c = curve orelse return row;
-    const cap = spec_cost_mod.cliffCapFromCurve(c, BLOCK_CLIFF_TOLERANCE);
-    if (cap < 2) return row;
-    return .{ .cap = cap, .label = "measured ladder" };
-}
-
-/// Test seam (the repo's `mtp_kv_only_override` pattern).
-pub var per_request_block_override: ?bool = null;
-
-fn perRequestBlockEnabled() bool {
-    if (per_request_block_override) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_SPEC_COST_BLOCK") orelse return false;
-    return std.mem.eql(u8, std.mem.span(raw), "1");
-}
-
-/// Per-REQUEST block width. OPT-IN (`MLX_SERVE_SPEC_COST_BLOCK=1`).
-///
-/// The block is baked into the assistant forward for a request's duration,
-/// but nothing requires it to be fixed for the SERVER's lifetime — and a
-/// verify forward's cost approaches the serial step's as the KV read grows,
-/// so a 32k request can in principle afford a wider block than a 200-token
-/// one, where today they get the same. Never widens past the checkpoint's
-/// own trained block, never past `config_block`, floor 2.
-///
-/// It is opt-in for the reason spelled out on `resolveBlockCap`: this widens
-/// on a COST criterion, and the M4 sweep shows a cost-only criterion already
-/// misjudges this block by 2 at short context, because it cannot see
-/// acceptance. The long-context cost argument is sound — the KV read
-/// genuinely swamps the extra positions — but "cheap" is not "pays", and the
-/// positions that get added are the low-acceptance tail either way. Ship it
-/// on when a long-context sweep measures it, not before.
-pub fn requestBlockSize(
-    load_block: u32,
-    config_block: u32,
-    curve: ?spec_cost_mod.SpecCostCurve,
-    kv_len: u32,
-) u32 {
-    if (!perRequestBlockEnabled()) return load_block;
-    const c = curve orelse return load_block;
-    if (!(c.kv_ms_per_token > 0)) return load_block;
-    const wide = spec_cost_mod.cliffCapAtKv(c, BLOCK_CLIFF_TOLERANCE, c.kv_ms_per_token, kv_len);
-    return @max(2, @min(config_block, @max(load_block, wide)));
 }
 
 /// Resolve the effective block size: the config's value, capped by what the
@@ -3775,65 +3702,4 @@ test "dflash: every server-side drafter-loaded gate also consults lm.dflash (per
     }
     // Zero means the gates were renamed and this guard went vacuous.
     try testing.expect(checked >= 10);
-}
-
-test "resolveBlockCap: a measured chip row wins, otherwise the measured ladder does" {
-    var c = spec_cost_mod.SpecCostCurve{};
-    c.add(1, 38.0);
-    c.add(2, 44.6);
-    c.add(3, 51.0);
-    c.add(4, 59.2);
-    c.add(5, 68.2);
-    c.add(6, 82.0);
-    c.add(7, 130.0);
-    c.add(8, 190.0);
-    // The M3 Ultra row was measured as realized throughput (acceptance
-    // included), which a forward ladder cannot see — it keeps precedence.
-    const ultra = resolveBlockCap("Apple M3 Ultra", c);
-    try testing.expectEqual(@as(u32, 8), ultra.cap);
-    try testing.expectEqualStrings("m3-ultra", ultra.label);
-    // The M4 row is a SWEEP too (block 5 measured 1.97x serial against 7's
-    // 1.43x), so the probe must not raise it — live on an M4 Max the ladder's
-    // cliff says 7, which the sweep measured as a ~27% loss. A cost ladder
-    // cannot see acceptance.
-    const m4 = resolveBlockCap("Apple M4 Max", c);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, m4.cap);
-    try testing.expectEqualStrings("m4", m4.label);
-    // An UNSWEPT chip has only a guess, and a measured ladder beats a guess.
-    const unswept = resolveBlockCap("Apple M2 Pro", c);
-    try testing.expectEqual(@as(u32, 6), unswept.cap);
-    try testing.expectEqualStrings("measured ladder", unswept.label);
-    // No curve (MLX_SERVE_SPEC_COST_PROBE=0) = the table, verbatim.
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockCap("Apple M2 Pro", null).cap);
-}
-
-test "requestBlockSize: a long-context request earns a wider block than a short one" {
-    // Opt-in until a long-context sweep measures it (see the doc comment):
-    // this widens on cost alone, and cost alone already misjudges the M4
-    // block by 2 at short context.
-    per_request_block_override = false;
-    try testing.expectEqual(@as(u32, 5), requestBlockSize(5, 16, null, 32000));
-    per_request_block_override = true;
-    defer per_request_block_override = null;
-    var c = spec_cost_mod.SpecCostCurve{};
-    c.add(1, 38.0);
-    c.add(2, 44.6);
-    c.add(3, 51.0);
-    c.add(4, 59.2);
-    c.add(5, 68.2);
-    c.add(6, 82.0);
-    c.add(7, 110.0);
-    c.add(8, 150.0);
-    c.kv_ms_per_token = 0.002;
-    const short = requestBlockSize(5, 16, c, 200);
-    const long = requestBlockSize(5, 16, c, 32000);
-    try testing.expect(long > short);
-    // Never past the checkpoint's own trained block...
-    try testing.expectEqual(@as(u32, 4), requestBlockSize(4, 4, c, 32000));
-    // ...never below the load-resolved block, and an unlearned kv term (or
-    // no curve at all) leaves it exactly where the load put it.
-    try testing.expectEqual(@as(u32, 5), requestBlockSize(5, 16, null, 32000));
-    var blind = c;
-    blind.kv_ms_per_token = 0;
-    try testing.expectEqual(@as(u32, 5), requestBlockSize(5, 16, blind, 32000));
 }
