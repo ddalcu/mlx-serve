@@ -32,8 +32,13 @@ enum InlineLaTeXRenderer {
         latex: String,
         raw: String,
         theme: LaTeXTheme,
-        fontSize: CGFloat = ChatMetrics.transcriptFontSize
+        fontSize: CGFloat = ChatMetrics.transcriptFontSize,
+        fontsAvailable: Bool = LaTeXFonts.isAvailable
     ) -> NSAttributedString? {
+        // No KaTeX fonts means SwaTex would trap in its own resource-bundle
+        // accessor (issue #233); the caller falls back to the exact source.
+        guard fontsAvailable else { return nil }
+
         let list: DisplayList
         do {
             list = try SwaTexEngine.displayList(
@@ -94,8 +99,10 @@ enum DisplayLaTeXRenderer {
     static func canRender(
         _ latex: String,
         theme: LaTeXTheme,
-        fontSize: CGFloat
+        fontSize: CGFloat,
+        fontsAvailable: Bool = LaTeXFonts.isAvailable
     ) -> Bool {
+        guard fontsAvailable else { return false }
         guard let list = try? SwaTexEngine.displayList(
             for: latex,
             style: .display,

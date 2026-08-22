@@ -33,6 +33,7 @@ const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
+const io_util_mod = @import("io_util.zig");
 const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -69,6 +70,11 @@ pub const DepthCap = struct { cap: u32, label: []const u8 };
 
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro" };
+    // Base M5 only — the Pro/Max/Ultra dies are their own (unmeasured) rows.
+    if (std.mem.indexOf(u8, chip, "M5") != null and
+        std.mem.indexOf(u8, chip, "M5 Pro") == null and
+        std.mem.indexOf(u8, chip, "M5 Max") == null and
+        std.mem.indexOf(u8, chip, "M5 Ultra") == null) return .{ .cap = 4, .label = "m5" };
     return .{ .cap = default_cap, .label = "default" };
 }
 
@@ -2416,6 +2422,65 @@ pub fn appendHistoryWithMrope(
 
 /// One lazy draft step: `[1]`-shaped (possibly lazy) token id + `[1,1,H]`
 /// hidden → logits + next hidden. Appends one entry to `cache`.
+/// Time ONE sequential head step, so the spec cost model can price the DRAFT
+/// side of a round.
+///
+/// A verify-forward ladder measures the trunk forward and nothing else, but an
+/// m-deep MTP round is that forward PLUS `m` sequential head steps — and on a
+/// 27B those steps dominate the per-position marginal (measured 2026-08-21:
+/// the trunk forward's own marginal at low depth is ~0.8 ms/position while the
+/// hand-fitted composite is ~7.6). Fitting the EV surface from the forward
+/// alone under-prices depth by ~9x and drafts far too deep. This is what makes
+/// the fit reproduce `MTP_EV_DEFAULT_COSTS` instead of contradicting it.
+///
+/// Rep 0 is discarded (JIT) and the rest keep their MIN, same discipline as
+/// `Transformer.probeSpecCostCurve`. MUST run on the inference thread.
+pub fn probeStepMs(
+    self: *const MtpModel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    target: *Transformer,
+    reps: u32,
+) !f32 {
+    try target.resetCache();
+    var hidden: mlx.mlx_array = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden);
+    const dummy: i32 = 0;
+    const shape = [_]c_int{ 1, 1 };
+    const ids = mlx.mlx_array_new_data(&dummy, &shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    {
+        const logits = try target.forwardCaptureHidden(ids, &hidden);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(hidden));
+    }
+    // A family that does not honor the capture leaves a default array behind;
+    // there is nothing to feed the head, so decline rather than guess.
+    if (mlx.mlx_array_ndim(hidden) != 3) return error.MtpStepProbeUnavailable;
+
+    var cache = try self.makeCache(allocator);
+    defer cache.deinit();
+    var best_ns: u64 = std.math.maxInt(u64);
+    var rep: u32 = 0;
+    while (rep < reps + 1) : (rep += 1) {
+        const watch = io_util_mod.Stopwatch.init(io);
+        const out = try stepArr(self, target, &cache, ids, hidden, @intCast(rep));
+        mlx.check(mlx.mlx_array_eval(out.logits)) catch {
+            _ = mlx.mlx_array_free(out.logits);
+            _ = mlx.mlx_array_free(out.hidden_next);
+            return error.MtpStepProbeUnavailable;
+        };
+        const ns = watch.read();
+        _ = mlx.mlx_array_free(out.logits);
+        _ = mlx.mlx_array_free(out.hidden_next);
+        if (rep > 0) best_ns = @min(best_ns, ns);
+    }
+    _ = mlx.mlx_clear_cache();
+    try target.resetCache();
+    if (best_ns == std.math.maxInt(u64)) return error.MtpStepProbeUnavailable;
+    return @as(f32, @floatFromInt(best_ns)) / @as(f32, std.time.ns_per_ms);
+}
+
 pub fn stepArr(
     self: *const MtpModel,
     target: *Transformer,
@@ -4220,4 +4285,12 @@ test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the 
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6).cap);
+}
+
+test "adaptiveDepthCapForMachine: base M5 caps at 4, Pro/Max/Ultra keep the default" {
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M5", 6).cap);
+    try testing.expectEqualStrings("m5", adaptiveDepthCapForMachine("Apple M5", 6).label);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Ultra", 6).cap);
 }

@@ -12,6 +12,7 @@ const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const spec_cost_mod = @import("spec_cost.zig");
 const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -979,6 +980,15 @@ pub const Generator = struct {
     /// fraction of the round. Always-on; the trace is not required.
     mtp_ev_sync_ms: f32 = 0,
     mtp_ev_round_ms: f32 = 0,
+    /// True while this generator is the ONLY decoding stream. Contention is
+    /// strictly one-sided — it only ADDS time — so a busy server simply
+    /// stops feeding the kv-term learner rather than teaching it a lie.
+    /// Set per tick by the scheduler.
+    spec_cost_solo: bool = true,
+    /// The kv anchors live on the model's `spec_cost_curve` — a Generator is
+    /// per REQUEST and a request's kv spans only its own max_tokens, so
+    /// per-request anchors can never identify B (live 2026-08-21: a 21k
+    /// prompt at 256 max_tokens engaged the term zero times).
     /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
     mtp_trace: MtpTrace = .{},
     /// Trace-only: stopwatch running across the scheduler gap (round return
@@ -1094,6 +1104,11 @@ pub const Generator = struct {
     pub const DFLASH_GATE_WARMUP: u64 = 3;
     pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
     pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
+    /// Absolute floor for a SPARSE target, applied after the width scaling.
+    /// See `scheduler.dflashGateMinimum` for the measurement it comes from —
+    /// a MoE verify reads every expert its block's positions route to, so its
+    /// break-even acceptance is several times a dense trunk's.
+    pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
     pub fn dflashGateWarmup() u64 {
         const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
@@ -2223,18 +2238,23 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
-                .dflash_block_size = if (options.dflash_block_size > 0)
+                .dflash_block_size = if (dflash_active)
+                    dflash_mod.requestBlockSize(
+                        if (options.dflash_block_size > 0) options.dflash_block_size else options.dflash.?.config.block_size,
+                        options.dflash.?.config.block_size,
+                        xfm.spec_cost_curve,
+                        @intCast(prompt_ids.len),
+                    )
+                else if (options.dflash_block_size > 0)
                     options.dflash_block_size
-                else if (dflash_active)
-                    options.dflash.?.config.block_size
                 else
                     0,
                 .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
-                .mtp_depth = resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile),
-                .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
+                .mtp_depth = resolveMtpDepthCapForCurve(options.mtp_depth, mtp_cost_profile, xfm.spec_cost_curve),
+                .mtp_ev_costs = mtpEvCosts(mtp_cost_profile, xfm.spec_cost_curve),
                 // Start at depth 1 and climb with evidence: the cheap depth
                 // is the safe default (1.11x on cold/creative content), and
                 // hot workloads promote within ~8 rounds.
@@ -3109,7 +3129,7 @@ pub const Generator = struct {
                 try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
                 self.ctx.cache.step = step_keep;
                 for (self.ctx.ssm_entries.?) |*entry| {
-                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
                 }
                 self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
             } else {
@@ -3633,6 +3653,18 @@ pub const Generator = struct {
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        // The kv term is the same physics for either block decoder (one
+        // forward, one KV read, shared across the block's rows), so a DFlash
+        // round is an observation for it too — and on a DFlash-only server
+        // it is the ONLY source.
+        const dflash_kv_watch = io_util.Stopwatch.init(self.timer.io);
+        const dflash_kv_len = self.mtpKvLen();
+        const dflash_kv_width = self.dflash_block_size;
+        defer self.mtpObserveKvCost(
+            @min(dflash_kv_width, mtp_mod.MAX_DEPTH),
+            dflash_kv_len,
+            @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms),
+        );
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
         std.debug.assert(self.dflash_ctx != null);
@@ -3663,7 +3695,13 @@ pub const Generator = struct {
         // is a bookkeeping counter the model never reads there — same rule as
         // nextMtp); the standard path keeps cache.step as the anchor.
         const moe_path = self.xfm.moe_layers != null;
-        const anchor_pos: usize = if (moe_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
+        // A hybrid trunk (LFM2 DSpark) positions from moe_seq_offset too, but
+        // its cache.step IS genuine (every token passes the attention layers),
+        // so it keeps the truncate and only needs the offset + conv-state
+        // rollback. Deciding the two independently is what keeps a partial
+        // accept from either mis-positioning or double-counting.
+        const hybrid_path = self.xfm.hybrid_layers != null;
+        const anchor_pos: usize = if (moe_path or hybrid_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
         const kv_step_snap = self.ctx.cache.step;
         std.debug.assert(dctx.absLen() == anchor_pos);
 
@@ -3676,11 +3714,16 @@ pub const Generator = struct {
         }
 
         // ── Phase 1: one assistant forward drafts all m tokens ──
-        const noise_ids = try allocator.alloc(i32, bs);
+        // Row mapping is the export's convention (`anchor_row_drafts`):
+        // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
+        // ALL rows starting at the anchor — so DSpark needs only m noise rows
+        // for the same m drafts and the same verify width.
+        const noise_rows: u32 = if (model.config.anchor_row_drafts) m else bs;
+        const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
         for (noise_ids[1..]) |*v| v.* = @intCast(model.config.mask_token_id);
-        const noise_shape = [_]c_int{ 1, @intCast(bs) };
+        const noise_shape = [_]c_int{ 1, @intCast(noise_rows) };
         const noise_input = mlx.mlx_array_new_data(noise_ids.ptr, &noise_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(noise_input);
         // RAW table rows — no embed norm, no scale (the DFlash contract).
@@ -3697,13 +3740,15 @@ pub const Generator = struct {
         const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
         defer _ = mlx.mlx_array_free(draft_logits_all);
 
-        // Drop the anchor row: drafts = argmax(logits[:, 1:]), lazily.
+        // Slice the m draft rows: DFlash drops the anchor row (1..bs-1),
+        // DSpark reads every row (0..m) — the anchor row IS draft 0.
         const dl_shape = mlx.getShape(draft_logits_all);
         var draft_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_logits);
         {
-            const start = [_]c_int{ 0, 1, 0 };
-            const stop = [_]c_int{ 1, @intCast(bs), dl_shape[2] };
+            const row0: c_int = if (model.config.anchor_row_drafts) 0 else 1;
+            const start = [_]c_int{ 0, row0, 0 };
+            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m)), dl_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
         }
@@ -3724,7 +3769,13 @@ pub const Generator = struct {
         // exact by construction. `MLX_SERVE_DFLASH_SELECTOR=0` forces the v1
         // arms for A/Bs.
         const use_selector = model.selector != null and dflashSelectorEnabled();
-        const sample_drafts = stochastic and !use_selector and dflashSampledDraftsEnabled();
+        // DSpark: the block's base logits are position-parallel, but each
+        // position's draft is picked from logits CORRECTED by the token
+        // drafted at the previous one (the Markov bigram bias). Chaining it
+        // is what the head is for — dropping it drafts every position from
+        // an uncorrected distribution the sidecar was never trained to emit.
+        const use_markov = model.markov != null and dflashMarkovEnabled();
+        const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
         var sel_path: ?dflash_mod.SelectedPath = null;
         defer if (sel_path) |*sp| sp.deinit(allocator);
         var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
@@ -3733,7 +3784,76 @@ pub const Generator = struct {
         };
         var draft_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_ids);
-        if (use_selector) {
+        if (use_markov) {
+            const mh = &model.markov.?;
+            const ids_i32 = try allocator.alloc(i32, m);
+            defer allocator.free(ids_i32);
+            var q_rows: ?[]mlx.mlx_array = null;
+            defer if (q_rows) |rows| {
+                for (rows) |r| _ = mlx.mlx_array_free(r);
+                allocator.free(rows);
+            };
+            if (stochastic) {
+                const rows = try allocator.alloc(mlx.mlx_array, m);
+                for (rows) |*r| r.* = .{ .ctx = null };
+                q_rows = rows;
+            }
+            var prev: u32 = t1;
+            var step: u32 = 0;
+            while (step < m) : (step += 1) {
+                var base_row = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(base_row);
+                {
+                    const start = [_]c_int{ 0, @intCast(step), 0 };
+                    const stop = [_]c_int{ 1, @as(c_int, @intCast(step)) + 1, dl_shape[2] };
+                    const strides = [_]c_int{ 1, 1, 1 };
+                    try mlx.check(mlx.mlx_slice(&base_row, draft_logits, &start, 3, &stop, 3, &strides, 3, s));
+                }
+                const corrected = try mh.stepLogits(base_row, prev, s);
+                defer _ = mlx.mlx_array_free(corrected);
+                if (stochastic) {
+                    // Sample the step from the request's own filtered
+                    // distribution and keep the row as q — the accept ratio
+                    // and the reject residual both need the density the
+                    // draft was actually drawn from.
+                    const qrow = try filteredProbsBlock(corrected, self.sampling, s);
+                    var logq = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(logq);
+                    try mlx.check(mlx.mlx_log(&logq, qrow, s));
+                    const null_key = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(null_key);
+                    var sampled = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(sampled);
+                    try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
+                    try mlx.check(mlx.mlx_array_eval(sampled));
+                    const sd = mlx.mlx_array_data_int32(sampled) orelse return error.MlxArrayDataNull;
+                    prev = @intCast(sd[0]);
+                    q_rows.?[step] = qrow;
+                } else {
+                    var amax = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(amax);
+                    try mlx.check(mlx.mlx_argmax_axis(&amax, corrected, 2, false, s));
+                    var as_i32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(as_i32);
+                    try mlx.check(mlx.mlx_astype(&as_i32, amax, .int32, s));
+                    try mlx.check(mlx.mlx_array_eval(as_i32));
+                    const ad = mlx.mlx_array_data_int32(as_i32) orelse return error.MlxArrayDataNull;
+                    prev = @intCast(ad[0]);
+                }
+                ids_i32[step] = @intCast(prev);
+            }
+            if (q_rows) |rows| {
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (rows) |r| _ = mlx.mlx_vector_array_append_value(vec, r);
+                draft_q = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_concatenate_axis(&draft_q, vec, 0, s));
+            }
+            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
+            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(host_arr);
+            try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
+        } else if (use_selector) {
             const sel_temp: f32 = if (stochastic) self.sampling.temperature else 0.0;
             sel_path = try dflash_mod.selectPath(
                 allocator,
@@ -3961,7 +4081,25 @@ pub const Generator = struct {
                     const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
                     if (!gdn_captured) return error.SpecRollbackUnavailable;
                     for (entries) |*entry| {
-                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
+                    }
+                }
+                self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
+            } else if (hybrid_path) {
+                if (self.ctx.ssm_entries) |entries| {
+                    // On a hybrid trunk only the CONV layers hold state, so
+                    // entry 0 may legitimately be an attention layer with no
+                    // capture at all — ask whether ANY layer recorded one.
+                    var captured = false;
+                    for (entries) |*e| {
+                        if (e.spec_conv_input.ctx != null or e.spec_state_seq.ctx != null) {
+                            captured = true;
+                            break;
+                        }
+                    }
+                    if (!captured) return error.SpecRollbackUnavailable;
+                    for (entries) |*entry| {
+                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, bs, s);
                     }
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
@@ -5082,6 +5220,10 @@ pub const Generator = struct {
                 self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
             }
             self.mtpTraceRoundEnd(m, m, m_lo);
+            {
+                const round_ms = @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms);
+                self.mtpObserveKvCost(m, self.mtpKvLen(), round_ms);
+            }
             if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
             return DrafterStepResult{
                 .tokens = tokens,
@@ -5116,7 +5258,7 @@ pub const Generator = struct {
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
             self.ctx.cache.step = kv_step_snap;
             for (self.ctx.ssm_entries.?) |*entry| {
-                try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
             }
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
@@ -5175,6 +5317,10 @@ pub const Generator = struct {
             self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
         }
         self.mtpTraceRoundEnd(m, accepted, m_lo);
+        {
+            const round_ms = @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms);
+            self.mtpObserveKvCost(m, self.mtpKvLen(), round_ms);
+        }
         if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         return DrafterStepResult{
             .tokens = tokens,
@@ -5357,9 +5503,16 @@ pub const Generator = struct {
     /// it on chips whose verify-width cliff was measured (M1 Pro: 4).
     pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
     pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
+    /// Fraction by which a width's cost-per-position may exceed the running
+    /// best before the measured ladder calls it past the cliff. 5% is well
+    /// inside the gap the tile cliff opens (the M4 ladder turns up 12% at
+    /// width 8) and well outside probe rep-to-rep noise, which is bounded
+    /// below by keeping the MIN of the reps.
+    pub const MTP_CLIFF_TOLERANCE: f32 = 0.05;
     /// One-shot guard for the per-silicon cap log (the row is a property of
     /// the machine, so it is worth saying once per process, not per request).
     var mtp_depth_cap_logged: bool = false;
+    var mtp_kv_term_logged: bool = false;
     /// Rounds of legacy (fixed-depth windowed) behavior while the EMAs fill.
     /// Warmup, but converges in ROUNDS, not 43 s of offline calibration.
     pub const MTP_EV_WARMUP_ROUNDS: u32 = 10;
@@ -5421,6 +5574,28 @@ pub const Generator = struct {
         /// default NAX M=8 takeover starts at draft position 7.
         nax_from: u32 = 0,
         per_pos_nax: f32 = 0.0,
+        /// Serial-floor cost in ms at kv ~= 0 (the probe's width-1 rung).
+        /// Zero — every hand-typed table — makes the kv term below a no-op,
+        /// so the tables keep behaving exactly as they did.
+        floor_ms: f32 = 0,
+        /// Context length the marginals above were FITTED AT. The kv term
+        /// scales relative to THIS, not to zero: refit #4 was measured at 8K,
+        /// so its 0.20 already contains 8K of KV read and re-scaling it from
+        /// a kv~=0 floor would discount it twice. Zero = unknown, which
+        /// disables the kv term for that surface rather than guessing.
+        kv_ref_tokens: u32 = 0,
+        /// Learned per-KV-token round cost B (ms/token), the term that makes
+        /// wide speculation approach FREE at long context.
+        ///
+        /// A verify forward of width k reads the weights once and the KV
+        /// once, both SHARED across all k query rows; only arithmetic scales
+        /// with k. So T(k, L) ~= W + B*L + C(k) and T(k,L)/T(1,L) -> 1 as L
+        /// grows: the optimal width RISES with context, and every constant
+        /// this controller ever shipped was fitted at ONE context length.
+        /// Learned online rather than probed — a boot probe measures at
+        /// kv ~= 0, where B is invisible, and probing it would mean
+        /// allocating a 32k KV cache purely to time it.
+        kv_ms_per_token: f32 = 0,
     };
     /// 2026-08-15 refit #4, AFTER the hd-256 causal sdpa split
     /// (`splitCausalSdpa` — dense verify q 6..9 now rides the vector path,
@@ -5442,7 +5617,7 @@ pub const Generator = struct {
     /// T(1)=45.4, T(2)=53.3 → .10/.10/.24@3/.01 on a ~37.9 ms floor.
     /// Refit #2, 2026-07-13, post-verify-qmm: T(1)=44.6, T(3)=54.4,
     /// T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
-    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52 };
+    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52, .kv_ref_tokens = 8192 };
     /// M5 Max/G17 refit (2026-07-17), same-session saturated fixed-depth
     /// sweep after the NAX m16 verify lane landed: T(1..4) ~= 41.35 ms,
     /// T(6)=62.15 ms, T(8)=68.39 ms. In floor units this identifies
@@ -5542,7 +5717,136 @@ pub const Generator = struct {
         .per_pos_nax = 0.005,
     };
 
-    /// Marginal round cost of draft position k (1-based).
+    /// How much a marginal position costs RELATIVE to the floor at this kv
+    /// length. The floor grows with the KV read (W + B*L) while a position's
+    /// own arithmetic does not, so every marginal shrinks — which is exactly
+    /// the effect that makes wide speculation cheap at long context.
+    /// Unmeasured (either term zero) => 1.0, i.e. the kv-blind surface.
+    /// The kv term is OPT-IN (`MLX_SERVE_SPEC_COST_KV=1`) — MEASURED A LOSS.
+    ///
+    /// Its premise was that a width-k verify reads the weights once and the
+    /// KV once, both SHARED across all k query rows, so only arithmetic
+    /// scales with k and wide speculation approaches free at long context.
+    /// The weight read is genuinely amortized. The ATTENTION is not: each of
+    /// the k rows scores against all L keys, so that part of the per-position
+    /// cost is O(k*L) and GROWS with context. Scaling the marginals DOWN as
+    /// context grows is therefore backwards.
+    ///
+    /// Measured 2026-08-21, M4 Max, Qwen3.8-27B oQ4e, 21,273-token prompt,
+    /// alternated A,B,A,B, two pairs (decode tok/s):
+    ///     on:  41.01 / 44.03   (median 42.52)
+    ///     off: 43.55 / 43.88   (median 43.72)   => -2.7%, worst pair -5.8%
+    /// and the mechanism is in the server's own spec-stats, not in the noise:
+    /// the on-arm drafted 278 against 253 and accepted 1.59 per round against
+    /// 1.69 (13 extension rounds against 10). Cheaper-looking deep positions,
+    /// more extension, no more accepted tokens.
+    ///
+    /// The term is still LEARNED and published at `/props`, because the
+    /// number itself is worth having: it is the only per-machine measurement
+    /// of B we have, and a corrected model (one that lets the marginal grow
+    /// with L rather than shrink) would be fitted from exactly this.
+    fn specCostKvEnabled() bool {
+        const raw = std.c.getenv("MLX_SERVE_SPEC_COST_KV") orelse return false;
+        return std.mem.eql(u8, std.mem.span(raw), "1");
+    }
+
+    pub fn mtpEvKvScale(costs: MtpEvCosts, kv_len: u32) f32 {
+        if (!specCostKvEnabled()) return 1.0;
+        if (!(costs.floor_ms > 0) or !(costs.kv_ms_per_token > 0) or kv_len == 0) return 1.0;
+        const ref = costs.floor_ms + costs.kv_ms_per_token * @as(f32, @floatFromInt(costs.kv_ref_tokens));
+        const denom = costs.floor_ms + costs.kv_ms_per_token * @as(f32, @floatFromInt(kv_len));
+        if (!(denom > 0) or !(ref > 0)) return 1.0;
+        return ref / denom;
+    }
+
+    /// Minimum kv separation before two anchors can identify B. Below it the
+    /// difference is dominated by round-to-round noise, not by the KV read.
+    pub const MTP_KV_FIT_MIN_SPAN: u32 = 2048;
+
+    /// One realized round -> the kv-term anchors. Pure, so the policy is
+    /// testable without a GPU: `lo`/`hi` are (kv_len, min ms) anchors that
+    /// widen outward, and each is a MIN over its own kv point.
+    pub fn mtpKvObserve(lo_len: *u32, lo_ms: *f32, hi_len: *u32, hi_ms: *f32, kv_len: u32, ms: f32) void {
+        if (kv_len == 0 or !(ms > 0)) return;
+        if (lo_len.* == 0 or kv_len < lo_len.*) {
+            lo_len.* = kv_len;
+            lo_ms.* = ms;
+        } else if (kv_len == lo_len.*) {
+            lo_ms.* = @min(lo_ms.*, ms);
+        }
+        if (kv_len > hi_len.*) {
+            hi_len.* = kv_len;
+            hi_ms.* = ms;
+        } else if (kv_len == hi_len.*) {
+            hi_ms.* = @min(hi_ms.*, ms);
+        }
+    }
+
+    /// B from one width's anchor pair, or null while they are too close
+    /// together (or inverted — a wider KV is never cheaper, so an inversion
+    /// is noise, not evidence).
+    pub fn mtpKvFit(lo_len: u32, lo_ms: f32, hi_len: u32, hi_ms: f32) ?f32 {
+        if (lo_len == 0 or hi_len <= lo_len) return null;
+        const span = hi_len - lo_len;
+        if (span < MTP_KV_FIT_MIN_SPAN) return null;
+        if (!(hi_ms > lo_ms)) return null;
+        return (hi_ms - lo_ms) / @as(f32, @floatFromInt(span));
+    }
+
+    /// Fold this round into the kv-term estimate. Sampled only when this is
+    /// the sole decoding stream; the resulting B is the SMALLEST positive
+    /// per-width fit, because every source of error here inflates.
+    fn mtpObserveKvCost(self: *Generator, m: u32, kv_len: u32, ms: f32) void {
+        if (!self.spec_cost_solo) return;
+        if (m == 0 or m > mtp_mod.MAX_DEPTH) return;
+        const curve = if (self.xfm.spec_cost_curve) |*c| c else return;
+        mtpKvObserve(
+            &curve.kv_lo_len[m],
+            &curve.kv_lo_ms[m],
+            &curve.kv_hi_len[m],
+            &curve.kv_hi_ms[m],
+            kv_len,
+            ms,
+        );
+        var best: f32 = 0;
+        for (1..mtp_mod.MAX_DEPTH + 1) |w| {
+            const b = mtpKvFit(
+                curve.kv_lo_len[w],
+                curve.kv_lo_ms[w],
+                curve.kv_hi_len[w],
+                curve.kv_hi_ms[w],
+            ) orelse continue;
+            if (best == 0 or b < best) best = b;
+        }
+        if (best > 0) {
+            // One-shot: an A/B arm is proven by an ENGAGEMENT line in its own
+            // log, never by its launch env. Without this a kv-term arm that
+            // never learned B is indistinguishable from one that did and
+            // found nothing.
+            if (self.mtp_ev_costs.kv_ms_per_token == 0 and !mtp_kv_term_logged) {
+                mtp_kv_term_logged = true;
+                log.info("[spec-cost] kv term learned: {d:.5} ms/token ({s})\n", .{
+                    best,
+                    if (specCostKvEnabled()) "applied" else "not applied — measured a loss; MLX_SERVE_SPEC_COST_KV=1 to enable",
+                });
+            }
+            // The model's curve is the shared home (the DFlash per-request
+            // block reads the same term). Only ever moved DOWN — every source
+            // of error in a realized round time inflates it.
+            if (curve.kv_ms_per_token == 0 or best < curve.kv_ms_per_token) curve.kv_ms_per_token = best;
+            // The live surface is built at Generator init, so a term learned
+            // after that has to reach THIS generator's own copy too.
+            self.mtp_ev_costs.kv_ms_per_token = curve.kv_ms_per_token;
+        }
+    }
+
+    /// KV length the next verify forward reads.
+    fn mtpKvLen(self: *const Generator) u32 {
+        return @intCast(self.prompt_ids_owned.len + self.generated_ids.items.len);
+    }
+
+    /// Marginal round cost of draft position k (1-based), kv-blind. This is
+    /// the fitted SHAPE; `mtpEvMarginalCostAt` applies the kv term.
     pub fn mtpEvMarginalCost(costs: MtpEvCosts, k: u32) f32 {
         const verify_cost = if (costs.nax_from != 0 and k >= costs.nax_from)
             costs.per_pos_nax
@@ -5565,9 +5869,16 @@ pub const Generator = struct {
     /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and a calibrated G17
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
-    pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
+    pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile, curve: ?spec_cost_mod.SpecCostCurve) u32 {
         const chip = ane_mod.chipBrand();
-        const cap = mtpDepthCapForProfileChip(configured, adaptive, profile, chip);
+        const cap = mtpDepthCapResolved(configured, adaptive, profile, chip, curve);
+        // A measured cap is a fence too, and an unexplained one is just as
+        // hard to debug as an unexplained chip row.
+        if (configured == 0 and adaptive and curve != null and profile == .generic and !mtp_depth_cap_logged) {
+            mtp_depth_cap_logged = true;
+            log.info("[mtp] adaptive depth cap {d} (measured ladder, default {d})\n", .{ cap, MTP_ADAPTIVE_DEFAULT_CAP });
+            return cap;
+        }
         // Name the row ONCE when a per-silicon measurement is what fenced the
         // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
         // as the EV controller having chosen 4, or as `--mtp-depth 4` — and
@@ -5588,22 +5899,60 @@ pub const Generator = struct {
 
     /// Same, with the chip string injected (tests, and the one live caller).
     pub fn mtpDepthCapForProfileChip(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile, chip: []const u8) u32 {
+        return mtpDepthCapResolved(configured, adaptive, profile, chip, null);
+    }
+
+    /// Same, with the machine's MEASURED verify ladder when one exists.
+    ///
+    /// The per-silicon rows exist because the EV controller cannot see time:
+    /// it scores accepted-tokens-per-round, which on an M1 Pro IMPROVED
+    /// (3.65 -> 4.00) while realized tok/s fell 21%. A measured curve sees
+    /// exactly the cliff those rows encode, on whatever chip and whatever
+    /// quant geometry is actually resident — which the chip key cannot
+    /// express (the split-K lane is 4-bit/g64 only, so a 6-bit pack on the
+    /// same box is a different answer). The calibrated NAX profiles keep
+    /// their own cap until a probe on that silicon is validated against it.
+    pub fn mtpDepthCapResolved(
+        configured: u32,
+        adaptive: bool,
+        profile: mtp_mod.MtpCostProfile,
+        chip: []const u8,
+        curve: ?spec_cost_mod.SpecCostCurve,
+    ) u32 {
         if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
         if (!adaptive) return mtp_mod.DEFAULT_DEPTH;
         return switch (profile) {
-            .generic => mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP).cap,
+            .generic => blk: {
+                if (curve) |c| {
+                    const cap = spec_cost_mod.cliffCapFromCurve(
+                        spec_cost_mod.depthCurveFromWidthCurve(c),
+                        MTP_CLIFF_TOLERANCE,
+                    );
+                    if (cap >= 1) break :blk @min(mtp_mod.MAX_DEPTH, cap);
+                }
+                break :blk mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP).cap;
+            },
             .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
         };
     }
 
     pub fn resolveMtpDepthCapForProfile(configured: u32, profile: mtp_mod.MtpCostProfile) u32 {
-        return mtpDepthCapForProfile(configured, mtpAdaptiveEnabled(), profile);
+        return resolveMtpDepthCapForCurve(configured, profile, null);
+    }
+
+    /// The live resolve, with this load's measured verify ladder.
+    pub fn resolveMtpDepthCapForCurve(
+        configured: u32,
+        profile: mtp_mod.MtpCostProfile,
+        curve: ?spec_cost_mod.SpecCostCurve,
+    ) u32 {
+        return mtpDepthCapForProfile(configured, mtpAdaptiveEnabled(), profile, curve);
     }
 
     /// Legacy q8 boolean selector retained for source compatibility.
     pub fn mtpDepthCapFor(configured: u32, adaptive: bool, nax_profile: bool) u32 {
         const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-        return mtpDepthCapForProfile(configured, adaptive, profile);
+        return mtpDepthCapForProfile(configured, adaptive, profile, null);
     }
 
     /// Legacy q8 boolean selector retained for source compatibility.
@@ -5625,11 +5974,19 @@ pub const Generator = struct {
         return tok;
     }
 
+    pub fn mtpEvMarginalCostAt(costs: MtpEvCosts, k: u32, kv_len: u32) f32 {
+        return mtpEvMarginalCost(costs, k) * mtpEvKvScale(costs, kv_len);
+    }
+
     /// Round cost in verify-base units (piecewise per-position marginals).
     pub fn mtpEvRoundCost(costs: MtpEvCosts, m: u32, with_sync: bool) f32 {
+        return mtpEvRoundCostAt(costs, m, with_sync, 0);
+    }
+
+    pub fn mtpEvRoundCostAt(costs: MtpEvCosts, m: u32, with_sync: bool, kv_len: u32) f32 {
         var c: f32 = 1.0 + (if (with_sync) costs.sync else 0.0);
         var k: u32 = 1;
-        while (k <= m) : (k += 1) c += mtpEvMarginalCost(costs, k);
+        while (k <= m) : (k += 1) c += mtpEvMarginalCostAt(costs, k, kv_len);
         return c;
     }
 
@@ -5649,13 +6006,17 @@ pub const Generator = struct {
     /// their priors blocks the first trial forever (live: ext_rounds=0 on
     /// pure echo).
     pub fn mtpEvPlanFor(a: []const f32, cap_in: u32, costs: MtpEvCosts, m_lo_max: u32) MtpRoundPlan {
+        return mtpEvPlanForAt(a, cap_in, costs, m_lo_max, 0);
+    }
+
+    pub fn mtpEvPlanForAt(a: []const f32, cap_in: u32, costs: MtpEvCosts, m_lo_max: u32, kv_len: u32) MtpRoundPlan {
         const cap: u32 = @intCast(@min(@as(usize, @max(1, cap_in)), a.len));
         const lo_cap: u32 = @min(cap, @max(1, m_lo_max));
         var m_lo: u32 = 1;
         var best_r: f32 = 0.0;
         var m: u32 = 1;
         while (m <= lo_cap) : (m += 1) {
-            const r = mtpEvExpectedTokens(a, m) / mtpEvRoundCost(costs, m, false);
+            const r = mtpEvExpectedTokens(a, m) / mtpEvRoundCostAt(costs, m, false, kv_len);
             if (r > best_r) {
                 best_r = r;
                 m_lo = m;
@@ -5668,7 +6029,7 @@ pub const Generator = struct {
         var t_sum: f32 = 0.0; // extension marginal cost (piecewise)
         while (m_hi < cap) {
             cond *= a[m_hi];
-            const mc = mtpEvMarginalCost(costs, m_hi + 1);
+            const mc = mtpEvMarginalCostAt(costs, m_hi + 1, kv_len);
             if (cond <= best_r * mc) break;
             s_sum += cond;
             t_sum += mc;
@@ -5687,7 +6048,7 @@ pub const Generator = struct {
             // clamped tau; the dry-spell gate bounds the consideration tax
             // on workloads where confidence never clears it.
             if (best_r <= MTP_EV_EXPLORE_MIN_R) return .{ .m_lo = m_lo, .m_hi = m_lo, .tau_ln = 0.0 };
-            const mc = mtpEvMarginalCost(costs, m_lo + 1);
+            const mc = mtpEvMarginalCostAt(costs, m_lo + 1, kv_len);
             const s = @max(a[m_lo], 1e-6);
             const tau_x = std.math.clamp(best_r * mc / s, MTP_EV_TAU_MIN, MTP_EV_TAU_MAX);
             return .{ .m_lo = m_lo, .m_hi = m_lo + 1, .tau_ln = @log(tau_x) };
@@ -5841,6 +6202,14 @@ pub const Generator = struct {
     /// selector (DFlash2). "0" forces the v1 draft arms (argmax / block
     /// sampling) for A/Bs — the conv layers stay, they are the checkpoint.
     var dflash_selector_cache: ?bool = null;
+    /// `MLX_SERVE_DFLASH_MARKOV=0` drafts a DSpark sidecar's block from its
+    /// UNCORRECTED base logits (the v1 arm) — an A/B lever for measuring what
+    /// the Markov chain is worth, never a default.
+    fn dflashMarkovEnabled() bool {
+        const p = std.c.getenv("MLX_SERVE_DFLASH_MARKOV") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(p), "0");
+    }
+
     fn dflashSelectorEnabled() bool {
         if (dflash_selector_cache) |v| return v;
         var on = true;
@@ -5986,6 +6355,81 @@ pub const Generator = struct {
         return c;
     }
 
+    /// Adopt a MEASURED fit as the controller's cost surface. The fit is
+    /// already the same piecewise model in the same floor units, so nothing
+    /// downstream (`mtpEvMarginalCost`, `mtpEvRoundCost`, `mtpEvPlanFor`)
+    /// changes shape — only the numbers stop being a hand fit from one
+    /// machine at one quant width.
+    pub fn mtpEvCostsFromFit(fit: spec_cost_mod.EvCosts) MtpEvCosts {
+        return .{
+            .draft = fit.draft,
+            .per_pos_lo = fit.per_pos_lo,
+            .per_pos_hi = fit.per_pos_hi,
+            .flat_max = fit.flat_max,
+            .sync = fit.sync,
+            .nax_from = fit.nax_from,
+            .per_pos_nax = fit.per_pos_nax,
+        };
+    }
+
+    /// The cost surface for a load: a curve measured on THIS machine with
+    /// THIS checkpoint when one exists, else the profile's table.
+    ///
+    /// An explicit `MLX_SERVE_MTP_EV_COSTS` still wins over both — it is the
+    /// live-tuning lever, and a measurement must not silently outrank a
+    /// value the operator typed. The table's own `sync` is carried into the
+    /// fit: the chunk-A confidence read-back is a host sync, invisible in a
+    /// forward ladder.
+    pub fn mtpEvCostsResolved(
+        profile: mtp_mod.MtpCostProfile,
+        curve: ?spec_cost_mod.SpecCostCurve,
+        override: ?[]const u8,
+    ) MtpEvCosts {
+        const table = mtpEvCostsForProfile(profile, override);
+        if (override != null and parseMtpEvCostsOverride(override.?) != null) return table;
+        const c = curve orelse return table;
+        // The MEASURED FLOOR + kv term are adopted onto whatever surface
+        // applies; the fitted MARGINALS are opt-in, because a boot probe
+        // cannot reproduce them (below).
+        var out = table;
+        out.floor_ms = c.at(1) orelse 0;
+        out.kv_ms_per_token = c.kv_ms_per_token;
+        if (!mtpEvFittedMarginalsEnabled()) return out;
+        const fit = spec_cost_mod.fitEvCosts(
+            spec_cost_mod.depthCurveFromWidthCurve(c),
+            .{ .sync = table.sync },
+        ) orelse return out;
+        var fitted = mtpEvCostsFromFit(fit);
+        fitted.floor_ms = out.floor_ms;
+        fitted.kv_ms_per_token = out.kv_ms_per_token;
+        // A measured fit is valid at the kv the ladder was timed at: zero.
+        fitted.kv_ref_tokens = 0;
+        return fitted;
+    }
+
+    /// The fitted MARGINALS are OPT-IN (`MLX_SERVE_SPEC_COST_EV=1`); the
+    /// measured floor and kv term ship on.
+    ///
+    /// Measured 2026-08-21, M4 Max, Jundot Qwen3.8-27B oQ4e — the exact
+    /// checkpoint `MTP_EV_DEFAULT_COSTS` was hand-fitted from. The probe's
+    /// verify ladder (38.5 ms at width 1) reproduces the hand-fitted 38.2 ms
+    /// floor and its cost-per-position cliff reproduces the depth cap of 6
+    /// EXACTLY. Its per-position marginals do not: forward-only reads 0.020
+    /// against the hand fit's 0.20, and even with the head step measured
+    /// (`mtp.probeStepMs`, 2.34 ms/position here) it reads 0.088 — still
+    /// 2.3x under. A real round carries per-position cost that no isolated
+    /// forward + head step can see (draft readout, sampling, host syncs,
+    /// per-step graph build), and under-pricing depth makes the controller
+    /// draft too deep. So the probe supplies what it MEASURED WELL — the
+    /// cliff, the floor, and the reference the kv term scales against — and
+    /// the hand-fitted shape stays until a real ROUND ladder is measured.
+    /// That bar (`fitEvCosts` landing near the shipped constants) is the
+    /// whole reason it is in the plan; it failed, so this ships opt-in.
+    fn mtpEvFittedMarginalsEnabled() bool {
+        const raw = std.c.getenv("MLX_SERVE_SPEC_COST_EV") orelse return false;
+        return std.mem.eql(u8, std.mem.span(raw), "1");
+    }
+
     /// Pure profile/override selector. A valid explicit four-value override
     /// starts from DEFAULT (rather than silently inheriting the hardware
     /// profile), so a value copied from an M1-M4 tuning run means the same
@@ -6013,9 +6457,10 @@ pub const Generator = struct {
         return mtpEvCostsForProfile(profile, override);
     }
 
-    fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
-        return mtpEvCostsForProfile(
+    fn mtpEvCosts(profile: mtp_mod.MtpCostProfile, curve: ?spec_cost_mod.SpecCostCurve) MtpEvCosts {
+        return mtpEvCostsResolved(
             profile,
+            curve,
             if (std.c.getenv("MLX_SERVE_MTP_EV_COSTS")) |p| std.mem.span(p) else null,
         );
     }
@@ -6155,7 +6600,7 @@ pub const Generator = struct {
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
-        var plan = mtpEvPlanFor(self.mtp_ev_accept[0..cap], cap, self.mtp_ev_costs, self.mtp_ev_m_lo_prev + 1);
+        var plan = mtpEvPlanForAt(self.mtp_ev_accept[0..cap], cap, self.mtp_ev_costs, self.mtp_ev_m_lo_prev + 1, self.mtpKvLen());
         self.mtp_ev_m_lo_prev = plan.m_lo;
         // Live-cost lever: shorten dry exploration bursts when the MEASURED
         // chunk-A sync is an expensive fraction of the round (mtpExtDryThresholdFor).
@@ -9809,20 +10254,20 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfileChip(8, true, .generic, "Apple M1 Pro"));
     try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfileChip(0, false, .generic, "Apple M1 Pro"));
     for ([_]mtp_mod.MtpCostProfile{ .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
-        try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapForProfile(0, true, profile));
-        try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(0, true, profile));
+        try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapForProfile(0, true, profile, null));
+        try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(0, true, profile, null));
     }
     for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
-        try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfile(0, false, profile));
+        try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfile(0, false, profile, null));
     }
     // Explicit values ignore both controller mode and profile, and remain
     // clamped to [1, MAX_DEPTH].
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, true, .generic));
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, false, .g17_nax_q8_gs32));
-    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapForProfile(7, true, .generic));
-    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(8, true, .generic));
-    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapForProfile(2, true, .g17_nax_q4_gs32));
-    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapForProfile(12, true, .generic));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, true, .generic, null));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, false, .g17_nax_q8_gs32, null));
+    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapForProfile(7, true, .generic, null));
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(8, true, .generic, null));
+    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapForProfile(2, true, .g17_nax_q4_gs32, null));
+    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapForProfile(12, true, .generic, null));
 
     // The original boolean helpers remain source-compatible and map true to
     // the pre-existing q8 profile.
@@ -9949,6 +10394,140 @@ test "mtpEvExpectedTokens: 1 + sum of acceptance chain products" {
     // Zero acceptance: every round still commits exactly the t1 bonus token.
     const z = [_]f32{ 0.0, 0.0 };
     try testing.expectApproxEqAbs(@as(f32, 1.0), Generator.mtpEvExpectedTokens(&z, 2), 1e-5);
+}
+
+test "the kv term is opt-in, and OFF it changes nothing" {
+    // Measured a LOSS (see specCostKvEnabled): -2.7% median, -5.8% worst
+    // pair, at a 21k prompt on an M4 Max. Default OFF means every surface
+    // behaves exactly as it did before the cost model existed.
+    var costs = Generator.MTP_EV_DEFAULT_COSTS;
+    costs.floor_ms = 38.0;
+    costs.kv_ms_per_token = 0.002;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), Generator.mtpEvKvScale(costs, 32000), 1e-6);
+    try testing.expectEqual(
+        Generator.mtpEvMarginalCost(costs, 6),
+        Generator.mtpEvMarginalCostAt(costs, 6, 32000),
+    );
+    const a = [_]f32{ 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5 };
+    try testing.expectEqual(
+        Generator.mtpEvPlanFor(&a, 8, costs, 8),
+        Generator.mtpEvPlanForAt(&a, 8, costs, 8, 32000),
+    );
+}
+
+test "the kv term shape, for the day a corrected model wants it" {
+    // T(k, L) ~= W + B*L + C(k): the KV read is shared across all k rows, so
+    // as L grows every marginal shrinks against the floor and the optimal
+    // width RISES. Every constant this controller shipped was fitted at ONE
+    // context length; this is the term that stops that from being applied at
+    // all of them.
+    // Kept as documentation of what the term DOES when enabled, and of the
+    // reference-length correction that made it self-consistent: the tables
+    // were fitted at 8K, so a surface must scale against 8K, not against
+    // zero, or it discounts 8K of KV read twice.
+    var costs = Generator.MTP_EV_DEFAULT_COSTS;
+    costs.floor_ms = 38.0;
+    costs.kv_ms_per_token = 0.002;
+    try testing.expectEqual(@as(u32, 8192), costs.kv_ref_tokens);
+    const ref = costs.floor_ms + costs.kv_ms_per_token * 8192.0;
+    const at32k = costs.floor_ms + costs.kv_ms_per_token * 32000.0;
+    try testing.expect(ref / at32k < 1.0);
+    // An unmeasured surface (every hand-typed table) has no floor, so the
+    // term is inert on it whatever the env says.
+    var blind = Generator.MTP_EV_DEFAULT_COSTS;
+    blind.kv_ms_per_token = 0.002;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), Generator.mtpEvKvScale(blind, 32000), 1e-6);
+}
+
+test "the kv anchors live on the MODEL, not on a per-request Generator" {
+    // A Generator is per REQUEST and a request's kv spans only its own
+    // max_tokens, so per-request anchors can never reach MTP_KV_FIT_MIN_SPAN
+    // on ordinary traffic — measured live 2026-08-21, a 21k-token prompt
+    // generating 256 tokens engaged the term ZERO times. The variation that
+    // identifies B is ACROSS requests. This pins the home, since a term that
+    // never engages looks exactly like a term that engaged and found nothing.
+    // Needles are ++-split so this test's own source cannot satisfy them.
+    const src = @embedFile("generate.zig");
+    try testing.expect(std.mem.indexOf(u8, src, "mtp_kv_lo" ++ "_len:") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "curve.kv_lo" ++ "_len[m]") != null);
+}
+
+test "mtpKvObserve/mtpKvFit: anchors widen outward and keep the MIN, contention only inflates" {
+    var lo_len: u32 = 0;
+    var lo_ms: f32 = 0;
+    var hi_len: u32 = 0;
+    var hi_ms: f32 = 0;
+    Generator.mtpKvObserve(&lo_len, &lo_ms, &hi_len, &hi_ms, 1000, 50.0);
+    // Too close together to identify B.
+    Generator.mtpKvObserve(&lo_len, &lo_ms, &hi_len, &hi_ms, 1500, 51.0);
+    try testing.expect(Generator.mtpKvFit(lo_len, lo_ms, hi_len, hi_ms) == null);
+    // A far anchor identifies it.
+    Generator.mtpKvObserve(&lo_len, &lo_ms, &hi_len, &hi_ms, 33000, 114.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.002), Generator.mtpKvFit(lo_len, lo_ms, hi_len, hi_ms).?, 1e-5);
+    // A contended sample at the SAME kv is slower and must not move the fit.
+    Generator.mtpKvObserve(&lo_len, &lo_ms, &hi_len, &hi_ms, 33000, 400.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.002), Generator.mtpKvFit(lo_len, lo_ms, hi_len, hi_ms).?, 1e-5);
+    // A faster one at that kv does.
+    Generator.mtpKvObserve(&lo_len, &lo_ms, &hi_len, &hi_ms, 33000, 106.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.00175), Generator.mtpKvFit(lo_len, lo_ms, hi_len, hi_ms).?, 1e-5);
+    // An inverted pair is noise, not evidence.
+    try testing.expect(Generator.mtpKvFit(1000, 60.0, 33000, 50.0) == null);
+}
+
+test "a measured ladder replaces the per-silicon depth cap, and an explicit depth still wins" {
+    // Width curve: the refit-#4 round ladder shifted into verify rows
+    // (depth k verifies k+1), so the depth curve it converts back into is
+    // the one the M4 row was hand-fitted from — cap 6, the shipped default.
+    var c = spec_cost_mod.SpecCostCurve{};
+    c.add(1, 38.0);
+    c.add(2, 44.6);
+    c.add(3, 51.0);
+    c.add(4, 59.2);
+    c.add(5, 68.2);
+    c.add(7, 95.4);
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M4 Max", c));
+    // ... and it overrides a chip row that was measured on a DIFFERENT
+    // quant geometry: the cap is a property of the resident weights, which
+    // the chip key cannot express.
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M1 Pro", c));
+    // An explicit --mtp-depth is never fenced by a measurement.
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapResolved(8, true, .generic, "Apple M1 Pro", c));
+    // No curve = the chip table, verbatim (MLX_SERVE_SPEC_COST_PROBE=0).
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapResolved(0, true, .generic, "Apple M1 Pro", null));
+    // The calibrated NAX profiles keep their own cap until a probe on that
+    // silicon is validated against it.
+    try testing.expectEqual(
+        Generator.MTP_ADAPTIVE_NAX_CAP,
+        Generator.mtpDepthCapResolved(0, true, .g17_nax_q4_gs64, "Apple M5 Max", c),
+    );
+}
+
+test "mtpEvCostsResolved: measured beats the table, an explicit override beats both" {
+    var c = spec_cost_mod.SpecCostCurve{};
+    c.add(1, 38.0);
+    c.add(2, 44.6);
+    c.add(3, 51.0);
+    c.add(4, 59.2);
+    c.add(5, 68.2);
+    c.add(7, 95.4);
+    c.add(9, 142.3);
+    const table = Generator.mtpEvCostsResolved(.generic, null, null);
+    try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, table);
+    const measured = Generator.mtpEvCostsResolved(.generic, c, null);
+    // A boot probe measures a forward and a head step, not a ROUND: live on
+    // an M4 Max it read a per-position marginal 2.3x under the hand fit for
+    // the very checkpoint that fit came from. So the SHAPE stays the table's
+    // and only the measured floor (which the probe reproduced to within 1%)
+    // and the kv term are adopted. Fitted marginals are opt-in.
+    try testing.expectEqual(table.per_pos_lo, measured.per_pos_lo);
+    try testing.expectEqual(table.per_pos_hi, measured.per_pos_hi);
+    try testing.expectEqual(table.flat_max, measured.flat_max);
+    try testing.expectApproxEqAbs(@as(f32, 38.0), measured.floor_ms, 1e-4);
+    try testing.expectEqual(@as(u32, 8192), measured.kv_ref_tokens);
+    // A value the operator typed is the live-tuning lever and outranks a
+    // measurement.
+    const overridden = Generator.mtpEvCostsResolved(.generic, c, "0.2,0.3,0.4,0.05");
+    try testing.expectApproxEqAbs(@as(f32, 0.2), overridden.draft, 1e-6);
 }
 
 test "mtpEvRoundCost: piecewise marginals (flat verify region, then the GDN width ramp)" {

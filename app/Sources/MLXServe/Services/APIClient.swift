@@ -345,12 +345,19 @@ class APIClient {
         }
     }
 
-    func fetchProps(port: UInt16) async throws -> MemoryInfo? {
+    struct PropsSnapshot {
+        let memory: MemoryInfo
+        /// nil when the server published no measured curve (the per-silicon
+        /// tables applied), which the UI reads as "nothing to show".
+        let specCost: SpecCostInfo?
+    }
+
+    func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
         let url = URL(string: "http://127.0.0.1:\(port)/props")!
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
-        return MemoryInfo.parse(mem)
+        return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json))
     }
 
     /// Live throughput feed. 503s when the server was launched without

@@ -29,6 +29,7 @@ const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const ane_mod = @import("ane.zig");
+const spec_cost_mod = @import("spec_cost.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -4124,6 +4125,28 @@ fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers:
     return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"units\":{d},\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d},\"unit_evals\":[{s}]}}", .{ mode_name, units.len, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures, rows_buf[0..used] });
 }
 
+/// The /props "spec_cost" object: the measured verify ladder this model
+/// resolved its spec widths from, plus the online kv term. A tester pastes
+/// this back instead of grepping a boot log — and a fence nobody can see is
+/// a fence nobody can debug. Empty fragment when the probe is off or
+/// declined (the per-silicon tables apply, exactly as before).
+fn specCostPropsJson(allocator: std.mem.Allocator, curve: spec_cost_mod.SpecCostCurve, depth_cap: u32) ![]u8 {
+    var widths_buf: [256]u8 = undefined;
+    var ms_buf: [256]u8 = undefined;
+    var wu: usize = 0;
+    var mu: usize = 0;
+    for (curve.widths[0..curve.n], curve.ms[0..curve.n], 0..) |w, m, i| {
+        const sep = if (i == 0) "" else ",";
+        wu += (try std.fmt.bufPrint(widths_buf[wu..], "{s}{d}", .{ sep, w })).len;
+        mu += (try std.fmt.bufPrint(ms_buf[mu..], "{s}{d:.3}", .{ sep, m })).len;
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        ",\"spec_cost\":{{\"widths\":[{s}],\"ms\":[{s}],\"kv_ms_per_token\":{d:.6},\"mtp_depth_cap\":{d}}}",
+        .{ widths_buf[0..wu], ms_buf[0..mu], curve.kv_ms_per_token, depth_cap },
+    );
+}
+
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
     const config = lm.config.?;
     const ctx_len = getEffectiveContextLength(config);
@@ -4190,7 +4213,17 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     };
     defer allocator.free(ane_json);
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
+    const spec_json: []u8 = blk: {
+        if (lm.transformer) |x| {
+            if (x.spec_cost_curve) |c| break :blk try specCostPropsJson(allocator, c, lm.mtp_depth);
+        }
+        break :blk try allocator.dupe(u8, "");
+    };
+    defer allocator.free(spec_json);
+    const extras = try std.mem.concat(allocator, u8, &.{ ane_json, spec_json });
+    defer allocator.free(extras);
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extras);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -5332,7 +5365,7 @@ fn handleChatCompletions(
         log.info("  drafter=disabled (logprobs requested)\n", .{});
         enable_drafter = false;
     }
-    if (enable_drafter and config.has_hybrid_layers) {
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
         log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
@@ -5687,7 +5720,7 @@ fn handleCompletions(
     else
         (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -5893,7 +5926,7 @@ fn handleStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -6790,13 +6823,26 @@ const StreamingTokenStream = struct {
 /// logprobs, no grammar constraint, no hybrid SSM for drafter) apply at the
 /// request-entry parse site; `pickStreamMode` re-enforces them defensively
 /// here so a missed gate at the parse site doesn't crash the dispatch.
+/// Does this trunk's architecture rule the loaded assistant sidecar out?
+///
+/// The hybrid veto exists for the GEMMA cross-attention drafter, whose
+/// multi-token verify was never wired for a recurrent trunk. A DFlash/DSpark
+/// sidecar is a different mechanism — it reads the trunk's own layer captures
+/// and rolls the conv state back from the verify pass's per-position capture
+/// — so a hybrid target is exactly what LiquidAI ships DSpark FOR. ONE
+/// predicate, because this gate is re-derived on four request surfaces and a
+/// missed site decodes serial with everything else looking healthy.
+pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) bool {
+    return has_hybrid_layers and !dflash_loaded;
+}
+
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     drafter_loaded: bool,
     mtp_loaded: bool,
-    has_hybrid_layers: bool,
+    arch_blocks_sidecar: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
@@ -6804,7 +6850,7 @@ fn pickStreamMode(
     // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
     // it needs is the same one PLD uses.
     if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
-    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .drafter;
+    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !arch_blocks_sidecar) return .drafter;
     if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
     return .regular;
 }
@@ -6872,7 +6918,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -10982,7 +11028,7 @@ fn handleAnthropicMessages(
     else
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
@@ -11211,7 +11257,7 @@ fn handleAnthropicNonStreaming(
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
     const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
@@ -11448,7 +11494,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -12817,7 +12863,7 @@ fn handleResponses(
     else
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
+    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
@@ -12847,7 +12893,7 @@ fn handleResponses(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -13152,7 +13198,7 @@ fn handleResponses(
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
         const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
         const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
@@ -17542,4 +17588,27 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "specCostPropsJson: the measured ladder is readable from /props" {
+    var c = spec_cost_mod.SpecCostCurve{};
+    c.add(1, 38.0);
+    c.add(2, 44.6);
+    c.add(4, 59.2);
+    c.kv_ms_per_token = 0.00125;
+    const frag = try specCostPropsJson(testing.allocator, c, 6);
+    defer testing.allocator.free(frag);
+    try testing.expect(std.mem.startsWith(u8, frag, ",\"spec_cost\":"));
+    try testing.expect(std.mem.indexOf(u8, frag, "\"widths\":[1,2,4]") != null);
+    try testing.expect(std.mem.indexOf(u8, frag, "44.600") != null);
+    try testing.expect(std.mem.indexOf(u8, frag, "\"kv_ms_per_token\":0.001250") != null);
+    // The RESOLVED width, not just the ladder: that is what a tester needs
+    // to say whether Automatic landed where they expected.
+    try testing.expect(std.mem.indexOf(u8, frag, "\"mtp_depth_cap\":6") != null);
+    // Splices into the props root as a fragment (same contract as "ane").
+    const doc = try std.fmt.allocPrint(testing.allocator, "{{\"x\":1{s}}}", .{frag});
+    defer testing.allocator.free(doc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, doc, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("spec_cost") != null);
 }

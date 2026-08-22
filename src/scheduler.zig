@@ -67,6 +67,7 @@ const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
+const spec_cost_mod = @import("spec_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -3291,6 +3292,42 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(v);
     };
 
+    // ── Measured spec-decode cost curve.
+    //
+    // Both speculative width knobs — the MTP depth cap and the DFlash block
+    // — were fenced by hand-typed per-silicon tables fitted on one machine,
+    // at one quant width, at one context length. The cost they encode is a
+    // property of the verify FORWARD SHAPE, so it is measured here instead:
+    // ~1-2 s of dummy forwards on this checkpoint, cached on disk per
+    // (chip, model, quant, OS build) so it is paid once ever. Runs BEFORE the
+    // sidecar/MTP loads so both resolve their width against it, and on this
+    // (the inference) thread — it forwards. `MLX_SERVE_SPEC_COST_PROBE=0`
+    // restores the tables verbatim.
+    var spec_cost_key_buf: [64]u8 = undefined;
+    var spec_cost_key: []const u8 = "";
+    {
+        var quant_buf: [32]u8 = undefined;
+        const quant = std.fmt.bufPrint(&quant_buf, "q{d}g{d}", .{
+            params.config.quant_bits,
+            params.config.quant_group_size,
+        }) catch "q?";
+        var os_buf: [64]u8 = undefined;
+        const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
+        spec_cost_key = spec_cost_mod.cacheKey(
+            &spec_cost_key_buf,
+            ane_mod.chipBrand(),
+            params.model_dir,
+            quant,
+            os_build,
+        );
+        xfm_ptr.spec_cost_curve = spec_cost_mod.resolve(
+            sch.io,
+            sch.allocator,
+            xfm_ptr,
+            spec_cost_key,
+        );
+    }
+
     // Assistant sidecar (optional). Loaded only when `drafter_dir` is
     // non-empty. The sidecar KIND is decided by its config CONTRACT: a
     // config declaring block_size + mask_token_id + target_layer_ids is a
@@ -3339,7 +3376,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand());
+            const block_cap = dflash_mod.resolveBlockCap(ane_mod.chipBrand(), xfm_ptr.spec_cost_curve);
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
@@ -3433,8 +3470,29 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
                     mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
+                    // Price the DRAFT side. The verify ladder above measures
+                    // the trunk forward and nothing else, but an m-deep round
+                    // is that forward PLUS m sequential head steps — which on
+                    // a 27B dominate the per-position marginal. Fitting the
+                    // EV surface without this under-prices depth ~9x (live
+                    // 2026-08-21: forward marginal 0.8 ms/position against a
+                    // hand-measured composite of 7.6). A cached curve already
+                    // carries it, so this is paid once per (chip, model,
+                    // quant, OS build) like the ladder itself.
+                    if (xfm_ptr.spec_cost_curve) |*c| {
+                        if (c.draft_ms == 0) {
+                            if (mtp_mod.probeStepMs(h, sch.io, sch.allocator, xfm_ptr, spec_cost_mod.DEFAULT_REPS)) |ms| {
+                                c.draft_ms = ms;
+                                spec_cost_mod.storeCached(sch.io, spec_cost_key, c.*);
+                                log.info("[spec-cost] measured draft step {d:.2} ms/position\n", .{ms});
+                            } else |err| {
+                                log.warn("[spec-cost] draft-step probe failed ({s}) — EV surface keeps its table\n", .{@errorName(err)});
+                                xfm_ptr.spec_cost_curve = null;
+                            }
+                        }
+                    }
                     log.info("MTP head ready (depth={d}, profile={s}).\n", .{
-                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
+                        generate_mod.Generator.resolveMtpDepthCapForCurve(params.mtp_depth, mtp_cost_profile, xfm_ptr.spec_cost_curve),
                         @tagName(mtp_cost_profile),
                     });
                 } else |bind_err| {
@@ -3537,7 +3595,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.mtp = if (mtp_ptr) |h| generate_mod.MtpHeadRef{ .qwen = h } else null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
-    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForCurve(params.mtp_depth, mtp_cost_profile, xfm_ptr.spec_cost_curve);
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
@@ -4763,14 +4821,28 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
 /// draft positions. `block_size` includes the always-emitted anchor. Thinking
 /// is the actual resolved request mode; tools are neither necessary nor
 /// sufficient for a reasoning preamble.
-fn dflashGateMinimum(block_size: u32, enable_thinking: bool) f32 {
+fn dflashGateMinimum(block_size: u32, enable_thinking: bool, moe_target: bool) f32 {
     const drafts = block_size -| 1;
     if (drafts == 0) return 0;
     const calibrated_min = if (enable_thinking)
         generate_mod.Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND
     else
         generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
-    return calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+    const scaled = calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+    // The bar is really "round cost / serial step cost", and the whole
+    // calibration above was measured on DENSE trunks where one verify forward
+    // costs about one serial step. A sparse trunk breaks that: an A1B MoE
+    // decodes ~1B of weights per token but its verify reads every expert the
+    // block's positions route to, so a round costs far more than a step while
+    // the bar stayed at 0.53 and nothing ever disabled.
+    //
+    // Measured LFM2.5-8B-A1B + its DSpark sidecar, M4 Max, block 5, greedy:
+    // novel prose accepts 1.40/round and runs 171 tok/s against 199 serial
+    // (round cost = 1.40 x 199/171 = 1.63 steps), while an echo prompt accepts
+    // 4.00 and runs 273. A floor of 1.8 disables the losing class after its
+    // three warmup rounds and leaves the winning one untouched.
+    if (!moe_target) return scaled;
+    return @max(scaled, generate_mod.Generator.DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND);
 }
 
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
@@ -5044,6 +5116,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dflash_min_accepted_per_round = dflashGateMinimum(
                 slot.drafter_block_size,
                 slot.enable_thinking,
+                slot.model.config.?.isMoe(),
             ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
@@ -5124,6 +5197,13 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // and O(active), never per token. Finished slots are excluded, so the last
     // slot's completion drives this to 0 (live == total at rest).
     defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+
+    // Contention discipline for the spec cost model's kv term: it learns
+    // from realized round times, and contention only ever ADDS time. Rather
+    // than try to correct for it, a busy server simply stops sampling.
+    for (active) |s| {
+        if (s.legacy_gen) |*g| g.spec_cost_solo = active.len == 1;
+    }
 
     // Phase 3 gate: at len==1, route to legacy single-slot path. Bit-identical
     // to pre-Phase-2 behavior including PLD/drafter speculative decoding.
@@ -5527,11 +5607,21 @@ test "DFlash gate policy follows effective block width and resolved thinking" {
     // positions and block 7 has 6. The M5 calibration is normalized to that
     // actual draft width instead of being imposed as an absolute threshold on
     // machines without the wide verification lane.
-    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false), 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true), 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false), 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true), 0.0001);
-    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false));
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true, false), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, false));
+
+    // A SPARSE target's verify reads every expert its block routes to, so the
+    // dense width scaling under-bars it: at block 5 the scaled value is 0.53
+    // and LFM2.5-8B-A1B measured break-even at 1.63 accepted/round. The floor
+    // binds there and in the thinking arm, and never lowers a bar the width
+    // scaling already set higher.
+    try testing.expectApproxEqAbs(@as(f32, 1.8), dflashGateMinimum(5, false, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.8), dflashGateMinimum(5, true, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, true), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, true));
 }
 
 test "every server scheduler path forwards resolved thinking to the DFlash gate" {
