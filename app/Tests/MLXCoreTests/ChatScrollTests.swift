@@ -217,4 +217,24 @@ final class ChatScrollTests: XCTestCase {
         XCTAssertLessThanOrEqual(ChatScrollState.bottomTolerance, 48)
         XCTAssertLessThan(ChatScrollState.correctionSlack, ChatScrollState.bottomTolerance)
     }
+
+    // MARK: - Targeted jumps (search hit → message)
+
+    func testAMessageTargetedJumpReleasesFollowWithoutAutoScrolling() {
+        var state = ChatScrollState()
+        let action = state.handle(.messageTargeted)
+        XCTAssertEqual(action, .none, "the jump itself scrolls to the id; the core adds nothing")
+        XCTAssertFalse(state.isPinnedToBottom,
+                       "you asked to be HERE — streaming must not yank you back down")
+    }
+
+    func testLandingBackAtTheBottomReEngagesAfterATargetedJump() {
+        var state = ChatScrollState()
+        _ = state.handle(.messageTargeted)
+        let action = state.handle(.geometryChanged(distanceFromBottom: 0))
+        XCTAssertTrue(state.isPinnedToBottom,
+                      "the ordinary re-engage rule survives a targeted jump")
+        XCTAssertEqual(action, .none,
+                       "already at the end — following re-engaged, nothing to correct")
+    }
 }
