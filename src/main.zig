@@ -308,6 +308,13 @@ fn printUsage(io: std.Io) void {
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
         \\                        Basic (key = password), or ?api_key=. /health
         \\                        stays open. Unset = no auth (default).
+        \\  --api-key-strict    Require the key from loopback too (localhost is
+        \\                        exempt by default). For embedders that want
+        \\                        "only the key holder drives inference" on a
+        \\                        shared machine. No effect without --api-key.
+        \\  --api-key-env <VAR> Read the key from environment variable VAR
+        \\                        instead of argv (the process table is
+        \\                        world-readable). Unset/empty VAR = no auth.
         \\  --lan-share <all|id,...>
         \\                      Share models with the local network: advertise
         \\                        this server over Bonjour and let LAN clients
@@ -593,6 +600,26 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
             if (args[i].len > 0) server_mod.g_api_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--api-key-strict")) {
+            server_mod.g_api_key_strict = true;
+        } else if (std.mem.eql(u8, args[i], "--api-key-env") and i + 1 < args.len) {
+            i += 1;
+            // The key read from a named environment variable instead of argv:
+            // the process table is world-readable, argv with it. Same
+            // borrow-for-the-process lifetime as --api-key; empty/unset
+            // leaves the server open, exactly like an empty --api-key.
+            // args are plain slices; getenv needs a C string. A variable
+            // name past the buffer is not one this flag serves.
+            var name_buf: [128:0]u8 = undefined;
+            if (args[i].len < name_buf.len) {
+                @memcpy(name_buf[0..args[i].len], args[i]);
+                name_buf[args[i].len] = 0;
+                const name: [:0]const u8 = name_buf[0..args[i].len :0];
+                if (std.c.getenv(name.ptr)) |value| {
+                    const key = std.mem.span(value);
+                    if (key.len > 0) server_mod.g_api_key = key;
+                }
+            }
         } else if (std.mem.eql(u8, args[i], "--lan-share") and i + 1 < args.len) {
             i += 1;
             // Borrowed from argv, like --api-key. serve() starts the LAN

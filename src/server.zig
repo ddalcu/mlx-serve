@@ -59,6 +59,15 @@ pub var g_metrics: ?*instr.Metrics = null;
 /// an `?api_key=` / `?key=` query param. null ⇒ fully open (default, unchanged).
 pub var g_api_key: ?[]const u8 = null;
 
+/// `--api-key-strict`: drop the loopback exemption, so the key is required
+/// from 127.0.0.1 too (`/health` and CORS preflight stay open). For hosts
+/// where localhost is NOT one trust domain — an embedding application that
+/// generates a fresh key per start wants "only the process holding the key
+/// can drive inference", and loopback exemption made any local process (and
+/// any browser page via a simple no-preflight POST) a key holder. No effect
+/// unless `--api-key` is set.
+pub var g_api_key_strict: bool = false;
+
 /// Tool-call ARGUMENT auto-correct. When true (default), parsed tool-call
 /// arguments are coerced to the types the request's tool schema declares
 /// (`chat.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an
@@ -1622,8 +1631,7 @@ fn handleConnection(
     //    exposure. Browser-facing pages get a `WWW-Authenticate: Basic`
     //    challenge so the index + metrics panel prompt for the key; API clients
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
-    if (g_api_key != null and
-        !peerIsLoopback(stream) and
+    if (apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
         !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
         !apiKeyAuthorized(request[0..header_end_pos], raw_path))
@@ -8156,6 +8164,25 @@ fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
             break :blk false;
         },
     };
+}
+
+/// Whether the API-key auth gate covers this peer at all: a key must be set,
+/// and the peer must be non-loopback — unless `--api-key-strict` removed the
+/// loopback exemption. Pure so the truth table is hermetically testable.
+fn apiKeyGateApplies(key_set: bool, strict: bool, peer_loopback: bool) bool {
+    return key_set and (!peer_loopback or strict);
+}
+
+test "apiKeyGateApplies: strict removes exactly the loopback exemption" {
+    // No key: fully open regardless of strictness or peer.
+    try std.testing.expect(!apiKeyGateApplies(false, false, true));
+    try std.testing.expect(!apiKeyGateApplies(false, true, false));
+    // Key, default: loopback exempt, network gated.
+    try std.testing.expect(!apiKeyGateApplies(true, false, true));
+    try std.testing.expect(apiKeyGateApplies(true, false, false));
+    // Key, strict: everyone gated.
+    try std.testing.expect(apiKeyGateApplies(true, true, true));
+    try std.testing.expect(apiKeyGateApplies(true, true, false));
 }
 
 fn peerIsLoopback(conn: *const Conn) bool {
