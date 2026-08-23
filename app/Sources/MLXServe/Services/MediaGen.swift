@@ -516,6 +516,41 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// One sentence under the Steps slider. Per-backend for the same reason —
     /// LTX's "runs well from ~8" is wrong advice on any other engine.
     var stepsHelp: String = "More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default."
+    /// Lowest step count we have a QUALITY verdict on. Below it the model
+    /// still runs — the server has no such floor — but it needs a distilled
+    /// few-step adapter to look like anything. This is advice, not a gate:
+    /// `stepsRange` stays as wide as the server's own acceptance, because a
+    /// pane that refuses what the API takes makes its own LoRA slot useless
+    /// (#254). 0 = the whole range is tested, so nothing is ever said.
+    var testedStepsFloor: Int = 0
+    /// What to say below it. The wording is the PRESET's, not the helper's:
+    /// which adapter unlocks the low end, and what goes wrong without one, is
+    /// a fact about this checkpoint.
+    var testedStepsFloorNote: String = ""
+    /// Lowest frame count we have a verdict on, same contract as
+    /// `testedStepsFloor`. 0 = no advisory.
+    var testedFrameFloor: Int = 0
+    /// What to say below it, appended to the clip's own length.
+    var testedFrameFloorNote: String = ""
+
+    /// Advice under the Steps slider when the user has gone below the tested
+    /// floor. `distilled` = a few-step adapter is engaged (the engine-owned
+    /// Turbo toggle, or any attached Style LoRA) — that is what the low end is
+    /// FOR, so warning there would argue against the setup the user just made.
+    func stepsAdvisory(steps: Int, distilled: Bool) -> String? {
+        guard testedStepsFloor > 0, steps < testedStepsFloor, !distilled else { return nil }
+        return testedStepsFloorNote
+    }
+
+    /// Advice under the Frames slider for a clip shorter than the model's own
+    /// stated range. Short clips stay OFFERED: the engine generates them, and
+    /// a 1-second test is how you find a step count without paying for a
+    /// 20-minute render.
+    func framesAdvisory(_ frames: Int) -> String? {
+        guard testedFrameFloor > 0, frames < testedFrameFloor else { return nil }
+        let seconds = Double(frames) / Double(max(1, fps))
+        return String(format: "%.1f s — ", seconds) + testedFrameFloorNote
+    }
     /// Weights resident DURING sampling, in GB. Distinct from `approxRAMGB`,
     /// which is the staged LOAD peak (`max(TE, DiT) + VAEs`): by the time the
     /// DiT is stepping, the text encoder has been run and freed. Only the H3
@@ -860,8 +895,13 @@ struct VideoModelPreset: Identifiable, Hashable {
 
     /// H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1` (its VAE folds 17
     /// source frames into 5 latent tokens) — offering a count off it means the
-    /// server silently snaps it. Floor is 124, the reference node's own
-    /// trained-range start; shorter is off-distribution, not just "fast".
+    /// server silently snaps it. The floor is the ENGINE's (5, from
+    /// `temporalShape`'s `max(5, length)`), not the reference node's
+    /// trained-range start: 124 frames at 960x544 is a 20-minute job, so
+    /// "shorter is off-distribution" made the cheapest way to try a prompt or
+    /// a step count — a one-second clip — unreachable at any setting, and left
+    /// the server's OWN default length (56) off the slider. Below the stated
+    /// range the pane says so (`testedFrameFloor`).
     private static func h3FrameLadder(minFrames: Int, maxFrames: Int) -> [Int] {
         var out: [Int] = []
         var n = minFrames
@@ -880,8 +920,9 @@ struct VideoModelPreset: Identifiable, Hashable {
                                         supportsReferences: Bool = false) -> VideoModelPreset {
         // The model's own range: MiniMax states 4-15 s at 24 fps, and the
         // reference node's trained range is ~124-362 on the 17k+5 ladder. The
-        // floor stays 124 — below it the model is off-distribution, which is a
-        // quality cliff, not a fast option.
+        // SLIDER goes down to the engine's floor anyway and warns below the
+        // stated range; the quality tiers below still start at 124, so the
+        // short end is somewhere you steer to, never somewhere you land.
         //
         // The ceiling used to be 209 (the rap demo, the longest clip we had
         // shipped a verdict on) with a comment calling 362 "untested-by-us" —
@@ -889,8 +930,13 @@ struct VideoModelPreset: Identifiable, Hashable {
         // generation on an M5 Max at 139.6 s/step. Length is bounded by MEMORY
         // and TIME, and both are now modelled and shown (`H3Plan`,
         // `H3TimeEstimate`) instead of hidden behind a cap.
-        let minF = 124
+        let minF = 5
         let cap = 362
+        // Where the tiers and the stale-value clamp start: the reference
+        // node's trained-range start, and the lowest rung at or above
+        // MiniMax's stated 4 s (107 = 4.5 s; 90 = 3.75 s is under it).
+        let tierMin = 124
+        let statedMin = 107
         // What the quality TIERS pick. Deliberately not `cap`: the ladder going
         // to 362 is the slider's reach, but a preset is a default, and at
         // 1344x768 the top of the ladder is a five-hour job. Picking "Quality"
@@ -915,8 +961,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             // .good = the eyeballed capstone A/B; .quality = the rap demo's
             // longer 209-frame run.
             qualityProfiles: [
-                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
-                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
+                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
+                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
                 .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
                 .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
             ],
@@ -944,12 +990,21 @@ struct VideoModelPreset: Identifiable, Hashable {
             supportsChainedWindows: !supportsReferences,
             supportsLastFrame: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
-            // maximum — so this range is OURS. 16 is the lowest tier we have a
-            // verdict on, and below ~6 the fast recipe's warmup and tail windows
-            // cover the whole schedule, so those runs pay full price per step
-            // while looking like the cheap option.
-            stepsRange: 16...50,
-            stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render.",
+            // maximum — so this range is OURS. It used to START at 16, the
+            // lowest tier we had a verdict on, which locked out every distilled
+            // few-step adapter the pane's own LoRA slot can load — including
+            // REF2VA Turbo distillations, on the one pack whose Turbo toggle
+            // does not exist (#254). The floor is now the server's (4, turbo's
+            // own), and 16 survives as `testedStepsFloor` advice. Below ~6 the
+            // fast recipe's warmup and tail windows still cover the whole
+            // schedule, so an undistilled run there pays full price per step
+            // while looking like the cheap option — which is what the note says.
+            stepsRange: 4...50,
+            stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render. Fewer than 16 only works with a distilled few-step adapter.",
+            testedStepsFloor: 16,
+            testedStepsFloorNote: "Under 16 steps this model needs a distilled few-step adapter — the engine-owned Turbo LoRA, or a community one attached under Style LoRAs. Without one the picture is rough and the soundtrack usually comes out garbled, and the fast recipe means those steps are not much cheaper each.",
+            testedFrameFloor: statedMin,
+            testedFrameFloorNote: "below MiniMax's stated 4-second minimum. Good for trying a prompt or a step count cheaply; motion and the soundtrack degrade outside the trained range.",
             ditResidentGB: ditGB,
             stagedPeakGB: stagedGB
         )

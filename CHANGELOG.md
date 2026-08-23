@@ -71,7 +71,7 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 
 - **ACE-Step Cover**: drop in a track, describe a new style, and it re-sings the song. Melody and structure stay, the caption and lyrics decide the rest. Cover strength picks how much of the render follows the source; noise strength blends a fresh start in. Needs the new `fsq.safetensors` in the pack; the app fetches it into packs downloaded before this release.
 - **ACE-Step Vocal to BGM**: arrange around a vocal stem (or any single part). Pick the instruments to add, or leave them all off and let the model decide. The new track is exactly as long as the clip, 10 seconds to 10 minutes.
-- **Reference audio for music** (#259): a clip whose feel and timbre the track follows. Up to 30 seconds is used; it is a style hint, not a copy. Thanks @Fe2-O3.
+- **Reference audio for music** (#259): a clip whose feel and timbre the track follows. Up to 30 seconds is used; it is a style hint, not a copy. Thanks @Morac2.
 - **LTX first and last frame** (#260): `last_frame_image` pins the final frame the same way `first_frame_image` pins the first, on every LTX pipeline including two-stage. A request the model cannot honour (no VAE encoder, fewer than 9 frames) is a named 400 rather than a plausible video of something else.
 - `instrumental: true` beside non-empty lyrics is a named 400 instead of a silent choice.
 
@@ -82,6 +82,7 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 - Dropping a long audio file on the Music tab no longer freezes the window: the conversion runs in the background with a "Converting" indicator, and the WAV writer is a single pass instead of one append per sample.
 - The Music tab's Advanced controls line up in one grid, and the Voice / Music switch is larger with room above the pane.
 - The Video pane now exposes all five generation settings it used to hide. Thanks @Fe2-O3 (#244).
+- **MiniMax-H3 takes few-step LoRAs and short test clips** (#254): the Steps slider starts at 4 instead of 16, and the Frames slider reaches the engine's own floor of 5 rather than starting at 124. Both floors survive as a sentence under the control — under 16 steps needs a distilled adapter (the built-in Turbo LoRA, or a community one attached under Style LoRAs), and under 107 frames is below MiniMax's stated 4-second minimum. This is what the REF2VA pack needed most: it has no Turbo toggle, so a community 4-step distillation loaded through Style LoRAs was unusable without hand-writing the HTTP request. Quality presets, and the clips the chat model generates for you, are unchanged. Thanks @Morac2.
 
 - **Music mode gained an instrumental switch** plus tempo and key controls, and remembers your settings between generations. Instrumental is marked experimental on MiniMax Music 3, where the open weights have no real switch and the tag alone still leaves vocal texture in; ACE-Step's is documented and works. Closes #225. Thanks @Fe2-O3 (#226).
 - **Media checkpoints in My Models stopped reading as "Unsupported"** and gained a Use button. MiniMax Music 3, MageFlow and Kokoro were missing from the app's copy of the architecture list, so a model the app itself offers to download came back with a red badge. Thanks @Fe2-O3 (#229).

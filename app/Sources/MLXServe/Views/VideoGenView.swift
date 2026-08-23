@@ -419,6 +419,9 @@ struct VideoGenView: View {
             if let warn = frameRAMWarning {
                 Text(warn).font(.caption2).foregroundStyle(.orange)
             }
+            if let advice = model.framesAdvisory(numFrames) {
+                Text(advice).font(.caption2).foregroundStyle(.orange)
+            }
         }
     }
 
@@ -463,6 +466,12 @@ struct VideoGenView: View {
     private var effectiveStepsRange: ClosedRange<Int> {
         turboEngaged ? 4...16 : model.stepsRange
     }
+
+    /// Whether a few-step adapter is driving this render: the engine-owned
+    /// Turbo toggle, or any attached Style LoRA. The REF2VA pack has no Turbo
+    /// toggle at all — a community distillation loaded here is the ONLY way it
+    /// samples in 4 steps — so the LoRA list is load-bearing, not a nicety.
+    private var distilledSampling: Bool { turboEngaged || !loras.isEmpty }
 
     /// guess.
     private var frameRAMWarning: String? {
@@ -957,6 +966,11 @@ struct VideoGenView: View {
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
             Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
                 .font(.caption2).foregroundStyle(.secondary)
+            // The low end is REACHABLE and only advised against, so the pane
+            // can load a community few-step adapter the way the server can.
+            if let advice = model.stepsAdvisory(steps: steps, distilled: distilledSampling) {
+                Text(advice).font(.caption2).foregroundStyle(.orange)
+            }
 
             // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
             // backend has no guidance pass to scale — showing the slider there
