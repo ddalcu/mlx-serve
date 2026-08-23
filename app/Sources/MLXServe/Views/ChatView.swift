@@ -2637,6 +2637,11 @@ struct ChatDetailView: View {
             }
         }
         .onDisappear {
+            // The draft of the tab you are LOOKING AT only ever reached the
+            // store on a tab switch, so quitting or closing the window with a
+            // half-typed message threw it away — the one case the persistence
+            // was added for.
+            appState.stashDraft(inputText, for: sessionId)
             // Generation lives on the app-level engine now — closing the chat
             // window must NOT cancel an in-flight turn (the voice assistant may
             // be driving it with no window open). Only tear down this view's
@@ -2728,12 +2733,14 @@ struct ChatDetailView: View {
             // what the incoming one saved.
             appState.stashDraft(inputText, for: oldId)
             inputText = appState.draft(for: newId)
-            attemptSearchJump()
             // Scroll state is per-view, and the view is reused across tabs — so
             // without this, leaving one chat scrolled up opened the next one
             // unpinned at whatever offset the previous conversation's content
-            // happened to leave behind.
-            applyScroll(.transcriptShown)
+            // happened to leave behind. A consumed search jump has already
+            // aimed this view at a specific row, and re-pinning would undo it.
+            if !attemptSearchJump() {
+                applyScroll(.transcriptShown)
+            }
             // A history walk belongs to ONE conversation. Stale indexes are
             // harmless (ComposerHistory reads a mismatched draft as no walk),
             // but the first ↑ in the newly-visible tab has to mean "the last
@@ -2754,16 +2761,26 @@ struct ChatDetailView: View {
     /// Consume a pending search jump aimed at THIS conversation: release
     /// follow, then centre the matched message. Cleared exactly once — an
     /// aim at another session stays pending until that tab is showing.
-    private func attemptSearchJump() {
+    /// - Returns: true when a jump was CONSUMED, so the caller knows this view's
+    ///   scroll position is already spoken for. A same-session click works
+    ///   without it (only the `pendingSearchJump` observer fires), but a click
+    ///   into ANOTHER chat flips `sessionId` too — and that handler's
+    ///   `applyScroll(.transcriptShown)` re-pins to the bottom, so the async
+    ///   centered scroll lands and is then corrected straight back down. That
+    ///   is the normal case for searching: you search to reach a chat you are
+    ///   NOT looking at.
+    @discardableResult
+    private func attemptSearchJump() -> Bool {
         guard let jump = appState.pendingSearchJump,
               jump.sessionId == sessionId,
               session?.messages.contains(where: { $0.id == jump.messageId }) == true
-        else { return }
+        else { return false }
         appState.pendingSearchJump = nil
         applyScroll(.messageTargeted)
         DispatchQueue.main.async {
             scrollPosition.scrollTo(id: jump.messageId, anchor: .center)
         }
+        return true
     }
 
     /// The input field. No background or border of its own — the composer

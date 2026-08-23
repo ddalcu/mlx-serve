@@ -278,4 +278,39 @@ final class ChatBasicsSlimTests: XCTestCase {
         XCTAssertTrue(s.contains("Chats…"), "the N-chats export over the multi-selection")
         XCTAssertTrue(s.contains("jsonData("), "the JSON serializer is reachable")
     }
+
+    /// Both of these are WIRING bugs: the pure cores were right and the pure
+    /// tests passed, while the feature did not work. They are pinned by source
+    /// scan because that seam is the only place they exist.
+
+    /// A search hit in a chat you are NOT looking at flips `sessionId`, and
+    /// that handler re-pins the transcript to the bottom. The async centered
+    /// scroll lands first and is then corrected straight back down, so the
+    /// jump silently did nothing in its main case — you search precisely
+    /// because the chat is not in front of you.
+    func testAConsumedSearchJumpIsNotUndoneByTheTabSwitchRepin() throws {
+        let s = try Self.chatViewSource()
+        XCTAssertTrue(s.contains("if !attemptSearchJump() {"),
+                      "the tab-switch re-pin must yield to a jump that already aimed this view")
+        XCTAssertFalse(s.contains("attemptSearchJump()\n            applyScroll(.transcriptShown)"),
+                       "an unconditional transcriptShown after a jump re-pins to the bottom")
+    }
+
+    /// Drafts were stashed only on a tab SWITCH, so quitting or closing the
+    /// window with a half-typed message threw away the very thing persistence
+    /// was added for.
+    func testTheVisibleTabsDraftIsStashedOnTeardownNotOnlyOnSwitch() throws {
+        let s = try Self.chatViewSource()
+        let onDisappear = try XCTUnwrap(s.range(of: ".onDisappear {"))
+        let window = String(s[onDisappear.lowerBound...].prefix(600))
+        XCTAssertTrue(window.contains("stashDraft(inputText, for: sessionId)"),
+                      "closing the window must flush the visible tab's draft")
+    }
+
+    private static func chatViewSource() throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/ChatView.swift")
+        return try String(contentsOf: url, encoding: .utf8)
+    }
 }
