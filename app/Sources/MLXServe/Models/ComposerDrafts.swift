@@ -25,3 +25,21 @@ struct ComposerDrafts {
         storage.removeValue(forKey: id)
     }
 }
+
+/// Persists beside the chat history, so a half-typed message outlives a relaunch.
+/// UUID keys encode as their string forms; the whole store is one small file.
+extension ComposerDrafts: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case drafts
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        storage = try c.decodeIfPresent([UUID: String].self, forKey: .drafts) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(storage, forKey: .drafts)
+    }
+}
