@@ -943,6 +943,20 @@ struct ChatSidebar: View {
         }
     }
 
+    /// Search-hit context per session, computed OUTSIDE the view builder — a
+    /// loop inside one kept blowing the type-checker's time budget.
+    private static func computeSearchHits(_ sessions: [ChatSession],
+                                          query: String) -> [UUID: SidebarSearch.SearchHit] {
+        guard SidebarSearch.isFiltering(query) else { return [:] }
+        var hits: [UUID: SidebarSearch.SearchHit] = [:]
+        for session in sessions {
+            if let hit = SidebarSearch.firstContentMatch(in: session, query: query) {
+                hits[session.id] = hit
+            }
+        }
+        return hits
+    }
+
     private var conversationsSidebar: some View {
         // No `selection:` binding: a List draws its own selection tint UNDER
         // `listRowBackground`, which is the double highlight — two grays, the
@@ -970,16 +984,21 @@ struct ChatSidebar: View {
             // ranges across the Agents/Chats boundary, because the split is a
             // heading, not a wall.
             let ordered = groups.agents.map(\.id) + groups.chats.map(\.id)
+            // WHERE each visible session matched (row index + snippet), so the
+            // row can show the line and a click can jump to it. Computed once
+            // per body pass, not per row.
+            let searchHits = Self.computeSearchHits(groups.agents + groups.chats,
+                                                    query: sidebarQuery)
             LazyVStack(alignment: .leading, spacing: 2) {
                 if !groups.agents.isEmpty {
                     sectionHeader("Agents")
                     ForEach(groups.agents) { session in
-                        sessionRow(session, ordered: ordered)
+                        sessionRow(session, ordered: ordered, searchHit: searchHits[session.id])
                     }
                 }
                 sectionHeader("Chats")
                 ForEach(groups.chats) { session in
-                    sessionRow(session, ordered: ordered)
+                    sessionRow(session, ordered: ordered, searchHit: searchHits[session.id])
                 }
                 if SidebarSearch.isFiltering(sidebarQuery),
                    groups.agents.isEmpty, groups.chats.isEmpty {
@@ -1323,20 +1342,71 @@ struct ChatSidebar: View {
         )
     }
 
-    /// Write the conversation out as Markdown through a save panel. The panel's
-    /// own grant is what lets a sandboxed build write outside its container.
-    private func exportSession(_ session: ChatSession) {
+    /// Export format for the save panel.
+    private enum ExportFormat {
+        case markdown
+        case json
+
+        var fileExtension: String { self == .markdown ? "md" : "json" }
+        var contentType: UTType { self == .markdown ? .plainText : .json }
+    }
+
+    private func exportDateText() -> String {
+        Date.now.formatted(date: .long, time: .omitted)
+    }
+
+    /// Write one conversation out through a save panel. The panel's own grant
+    /// is what lets a sandboxed build write outside its container.
+    private func exportSession(_ session: ChatSession, as format: ExportFormat) {
+        let title = ChatSessionTitle.display(
+            title: session.title,
+            agentName: appState.agents.agent(id: session.agentId)?.name)
+        let data: Data?
+        switch format {
+        case .markdown:
+            data = ChatExport.markdown(title: title, messages: session.messages,
+                                       dateText: exportDateText())
+                .data(using: .utf8)
+        case .json:
+            data = ChatExport.jsonData(title: title, messages: session.messages,
+                                       dateText: exportDateText())
+        }
+        // suggestedFilename always answers a .md path; swap the extension for
+        // the chosen format rather than stacking two.
+        let stem = (ChatExport.suggestedFilename(title: title) as NSString).deletingPathExtension
+        runSavePanel(defaultName: stem + "." + format.fileExtension,
+                     contentType: format.contentType, data: data)
+    }
+
+    /// Every selected chat in one file — the multi-selection's export. Chats
+    /// appear in the sidebar's own order; each under its display title.
+    private func exportSelectedSessions() {
+        let byId = Dictionary(uniqueKeysWithValues: appState.chatSessions.map { ($0.id, $0) })
+        let chosen = appState.sidebarSelection.compactMap { byId[$0] }
+            // Sidebar order (newest first), not set order.
+            .sorted { a, b in
+                let ia = appState.visibleChatSessions.firstIndex(where: { $0.id == a.id }) ?? 0
+                let ib = appState.visibleChatSessions.firstIndex(where: { $0.id == b.id }) ?? 0
+                return ia < ib
+            }
+        let sections = chosen.map { session -> (title: String, messages: [ChatMessage]) in
+            (ChatSessionTitle.display(title: session.title,
+                                      agentName: appState.agents.agent(id: session.agentId)?.name),
+             session.messages)
+        }
+        let data = ChatExport.markdown(sessions: sections, dateText: exportDateText())
+            .data(using: .utf8)
+        runSavePanel(defaultName: "chats-export.md", contentType: .plainText, data: data)
+    }
+
+    private func runSavePanel(defaultName: String, contentType: UTType, data: Data?) {
+        guard let data else { return }
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = ChatExport.suggestedFilename(title: session.title)
-        let markdown = ChatExport.markdown(
-            title: ChatSessionTitle.display(title: session.title,
-                                            agentName: appState.agents.agent(id: session.agentId)?.name),
-            messages: session.messages,
-            dateText: Date.now.formatted(date: .long, time: .omitted))
+        panel.allowedContentTypes = [contentType]
+        panel.nameFieldStringValue = defaultName
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            try? markdown.data(using: .utf8)?.write(to: url, options: .atomic)
+            try? data.write(to: url, options: .atomic)
         }
     }
 
@@ -1355,7 +1425,8 @@ struct ChatSidebar: View {
     /// One conversation row, shared by both sections. `ordered` is the panel's
     /// flattened visual order, which shift-click ranges over.
     @ViewBuilder
-    private func sessionRow(_ session: ChatSession, ordered: [UUID]) -> some View {
+    private func sessionRow(_ session: ChatSession, ordered: [UUID],
+                            searchHit: SidebarSearch.SearchHit? = nil) -> some View {
         // Lit rows are the SELECTION, not just the active chat — otherwise a
         // cmd-clicked second row is selected (⌫ deletes it) while looking
         // exactly like an unselected one. A conversation is still only lit while
@@ -1370,6 +1441,13 @@ struct ChatSidebar: View {
         // along the top and bottom of the highlight.
         Button {
             selectRow(session.id, ordered: ordered)
+            // A search hit names WHERE to look; clicking the row goes THERE.
+            if let hit = searchHit,
+               session.messages.indices.contains(hit.messageIndex) {
+                appState.pendingSearchJump = AppState.SearchJump(
+                    sessionId: session.id,
+                    messageId: session.messages[hit.messageIndex].id)
+            }
         } label: {
             // An agent thread is named for its AGENT, with the agent's own
             // symbol beside it — the Agents section is a list of who you talk
@@ -1401,8 +1479,18 @@ struct ChatSidebar: View {
                 // from the first — without it the sidebar draws two identical
                 // rows. Absent until the thread has said something, so a new
                 // one is a single line exactly like a destination row.
-                if let subject = ChatSessionTitle.subject(title: session.title,
-                                                          agentName: agent?.name) {
+                // While searching, the row shows WHERE it matched — the line
+                // under the title is what makes the filter usable on long
+                // chats. It displaces the agent-subject caption, which is the
+                // same slot doing the same job (context under a title).
+                if let hit = searchHit {
+                    Text(hit.snippet)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(Color.accentColor.opacity(0.85))
+                } else if let subject = ChatSessionTitle.subject(title: session.title,
+                                                                 agentName: agent?.name) {
                     Text(subject)
                         .font(.caption2)
                         .lineLimit(1)
@@ -1505,13 +1593,19 @@ struct ChatSidebar: View {
                 renamingId = session.id
             }
             Button("Export as Markdown…") {
-                exportSession(session)
+                exportSession(session, as: .markdown)
+            }
+            Button("Export as JSON…") {
+                exportSession(session, as: .json)
             }
             Divider()
             // Right-clicking INSIDE a multi-selection acts on all of it, and
             // says how many; right-clicking outside one is a single delete.
             if appState.sidebarSelection.count > 1,
                appState.sidebarSelection.contains(session.id) {
+                Button("Export \(appState.sidebarSelection.count) Chats…") {
+                    exportSelectedSessions()
+                }
                 Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
                 }
@@ -1641,7 +1735,9 @@ struct ChatDetailView: View {
     // pinned flag is published. `scrollPosition` is the one handle that moves
     // the transcript, so no view needs a `ScrollViewProxy` passed around.
     @StateObject private var scrollModel = ChatScrollModel()
-    @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
+    // UUID-typed so a targeted jump can address ONE message (a sidebar search
+    // hit lands here); every other scroll still goes edge-to-bottom.
+    @State private var scrollPosition = ScrollPosition(idType: UUID.self, edge: .bottom)
     @State private var pasteMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
@@ -1680,11 +1776,11 @@ struct ChatDetailView: View {
     // id — the view is reused across tabs).
     @State private var pendingIntentPrompt: IntentPrompt?
     @State private var intentSuppress = SessionIntentSuppression()
-    // Per-tab composer drafts. This view is REUSED across tabs (no
-    // `.id(sessionId)`), so without a keyed store a half-typed message in one
-    // chat rode along when you switched to another — and sending it there was
-    // one Return key away.
-    @State private var drafts = ComposerDrafts()
+    // Per-tab composer drafts live ON AppState (`composerDrafts`, persisted to
+    // composer-drafts.json) — this view is REUSED across tabs (no
+    // `.id(sessionId)`), so the store is keyed by session id and read through
+    // appState.draft/stashDraft/clearDraft below. A half-typed message now
+    // both stays with its tab AND survives a relaunch.
 
 
     private var session: ChatSession? {
@@ -2273,6 +2369,10 @@ struct ChatDetailView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
+                    // Makes the rows' ids resolvable to `scrollTo(id:)` even
+                    // when the target row has not been laid out yet — a search
+                    // jump into a long conversation's middle needs this.
+                    .scrollTargetLayout()
                 }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
@@ -2519,7 +2619,7 @@ struct ChatDetailView: View {
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
             // A draft saved when you left this tab comes back with it.
-            inputText = drafts.restore(for: sessionId)
+            inputText = appState.draft(for: sessionId)
             applyScroll(.transcriptShown)
             // Cmd+V into the focused chat input: if the clipboard holds an image,
             // PDF, or folder, attach it (same as the attach button / drag-drop)
@@ -2619,8 +2719,9 @@ struct ChatDetailView: View {
             restoreAttachedFolderIfNeeded()
             // Drafts are per tab: stash what the outgoing field holds, restore
             // what the incoming one saved.
-            drafts.stash(inputText, for: oldId)
-            inputText = drafts.restore(for: newId)
+            appState.stashDraft(inputText, for: oldId)
+            inputText = appState.draft(for: newId)
+            attemptSearchJump()
             // Scroll state is per-view, and the view is reused across tabs — so
             // without this, leaving one chat scrolled up opened the next one
             // unpinned at whatever offset the previous conversation's content
@@ -2632,9 +2733,30 @@ struct ChatDetailView: View {
             // thing I said HERE".
             composerWalk = .idle
         }
+        // A search-hit click: the sidebar names WHERE (session + message); this
+        // view does the jumping once its own rows exist. Also re-checked on the
+        // sessionId change above, because a click into ANOTHER chat flips both.
+        .onChange(of: appState.pendingSearchJump) { _, _ in
+            attemptSearchJump()
+        }
         .onGeometryChange(for: CGFloat.self) { proxy in
             proxy.size.width
         } action: { columnWidth = $0 }
+    }
+
+    /// Consume a pending search jump aimed at THIS conversation: release
+    /// follow, then centre the matched message. Cleared exactly once — an
+    /// aim at another session stays pending until that tab is showing.
+    private func attemptSearchJump() {
+        guard let jump = appState.pendingSearchJump,
+              jump.sessionId == sessionId,
+              session?.messages.contains(where: { $0.id == jump.messageId }) == true
+        else { return }
+        appState.pendingSearchJump = nil
+        applyScroll(.messageTargeted)
+        DispatchQueue.main.async {
+            scrollPosition.scrollTo(id: jump.messageId, anchor: .center)
+        }
     }
 
     /// The input field. No background or border of its own — the composer
@@ -3316,7 +3438,7 @@ struct ChatDetailView: View {
               composerState != .generatingHere, server.status == .running else { return }
         inputText = ""
         // Sent: the draft is spent, and must not resurrect on return.
-        drafts.clear(for: sessionId)
+        appState.clearDraft(for: sessionId)
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
@@ -3664,6 +3786,11 @@ struct MessageBubble: View {
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
+    /// Hover state for the action tray. USER bubbles carry no footer, so the
+    /// tray is the only always-in-reach row of actions they have; assistant
+    /// rows keep their permanent footer (the hover-reveal-footer rule) and get
+    /// the tray's extra affordances there instead.
+    @State private var rowHovered = false
     @State private var editDraft = ""
     /// The edit field is the composer's field (`GrowingTextEditor`), so it
     /// needs the composer's two bindings: where the caret is, and how tall the
@@ -3838,9 +3965,23 @@ struct MessageBubble: View {
                 }
 
                 if showsFooter { footer }
+                // The user bubble's hover tray: copy / edit / branch / delete,
+                // the same set the context menu carries, one click deep.
+                if showsActionTray {
+                    MessageActionTray(
+                        copyText: message.content,
+                        onEdit: onEdit != nil ? { startEditing() } : nil,
+                        onFork: onFork,
+                        onDelete: onDelete)
+                }
             }
 
             if message.role == .assistant { Spacer(minLength: 60) }
+        }
+        .onHover { isHovered in
+            // The tray rides the pointer; streaming rows never show one, so a
+            // half-written reply can't grow buttons under the caret.
+            withAnimation(.easeInOut(duration: 0.12)) { rowHovered = isHovered }
         }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
@@ -3952,6 +4093,13 @@ struct MessageBubble: View {
             && !message.isAgentSummary && !message.content.isEmpty
     }
 
+    /// The hover tray exists for USER rows — assistant replies already keep
+    /// their always-visible footer. Shown only when there is something on it.
+    private var showsActionTray: Bool {
+        rowHovered && message.role == .user && !message.isStreaming
+            && (onEdit != nil || onFork != nil || onDelete != nil)
+    }
+
     /// Timestamp and token stats on the left, actions pinned to the right.
     private var footer: some View {
         HStack(spacing: 8) {
@@ -3999,6 +4147,13 @@ struct MessageBubble: View {
 
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                // Branch on the permanent footer, not just the context menu —
+                // the user bubble's hover tray carries it, and the assistant
+                // row's always-visible actions are this footer.
+                if let onFork {
+                    footerButton("arrow.triangle.branch",
+                                 help: "Branch Chat From Here", action: onFork)
+                }
                 // The model's replies are editable but have no double-click
                 // route into it (that gesture belongs to selecting a word), so
                 // without this the only way in is a context menu nobody thinks
@@ -4048,6 +4203,65 @@ struct MessageBubble: View {
     private func copyMessage() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(message.content, forType: .string)
+    }
+}
+
+/// The hover tray under a USER bubble: copy / edit / branch / delete, the same
+/// actions its context menu carries, one click deep. Copy carries the code
+/// block's "Copied" flip — a copy with no feedback reads as a dead button.
+private struct MessageActionTray: View {
+    let copyText: String
+    var onEdit: (() -> Void)?
+    var onFork: (() -> Void)?
+    var onDelete: (() -> Void)?
+    @State private var copied = false
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(copyText, forType: .string)
+                copied = true
+                Task {
+                    try? await Task.sleep(nanoseconds: 1_400_000_000)
+                    copied = false
+                }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10))
+                    .foregroundStyle(copied ? Color.green : Color.secondary)
+                    .frame(width: 22, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(copied ? "Copied" : "Copy message")
+            if let onEdit {
+                trayButton("pencil", help: "Edit & Resend", action: onEdit)
+            }
+            if let onFork {
+                trayButton("arrow.triangle.branch", help: "Branch Chat From Here",
+                           action: onFork)
+            }
+            if let onDelete {
+                trayButton("trash", help: "Delete message", action: onDelete)
+            }
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(.quaternary.opacity(0.6), in: Capsule())
+    }
+
+    private func trayButton(_ icon: String, help: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10))
+                .frame(width: 22, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 

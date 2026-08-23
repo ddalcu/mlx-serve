@@ -422,6 +422,55 @@ class AppState: ObservableObject {
         return (dir as NSString).appendingPathComponent("chat-history.json")
     }()
 
+    /// Per-tab composer drafts, persisted beside the chat history they belong
+    /// to — a half-typed message survives a relaunch like the conversations do.
+    @Published var composerDrafts = ComposerDrafts()
+    private var draftsLoaded = false
+
+    /// A search-hit click's destination: which conversation, which message.
+    /// The sidebar sets it; the chat detail view consumes (and CLEARS) it once
+    /// its rows exist. `requestId` is fresh per click, so clicking the SAME hit
+    /// twice still fires the detail view's `.onChange`.
+    struct SearchJump: Equatable {
+        let requestId = UUID()
+        let sessionId: UUID
+        let messageId: UUID
+    }
+    @Published var pendingSearchJump: SearchJump?
+
+    private var draftsPath: String {
+        let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
+        return (dir as NSString).appendingPathComponent("composer-drafts.json")
+    }
+
+    func stashDraft(_ text: String, for sessionId: UUID) {
+        composerDrafts.stash(text, for: sessionId)
+        saveComposerDrafts()
+    }
+
+    func draft(for sessionId: UUID) -> String {
+        composerDrafts.restore(for: sessionId)
+    }
+
+    func clearDraft(for sessionId: UUID) {
+        composerDrafts.clear(for: sessionId)
+        saveComposerDrafts()
+    }
+
+    private func saveComposerDrafts() {
+        guard draftsLoaded else { return }
+        guard let data = try? JSONEncoder().encode(composerDrafts) else { return }
+        try? data.write(to: URL(fileURLWithPath: draftsPath), options: .atomic)
+    }
+
+    private func loadComposerDrafts() {
+        defer { draftsLoaded = true }
+        guard FileManager.default.fileExists(atPath: draftsPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: draftsPath)),
+              let drafts = try? JSONDecoder().decode(ComposerDrafts.self, from: data) else { return }
+        composerDrafts = drafts
+    }
+
     init() {
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
         // read a never-set key as false, which is why a fresh install used to
@@ -471,6 +520,7 @@ class AppState: ObservableObject {
             }
         }
         loadChatHistory()
+        loadComposerDrafts()
         // Start background task scheduling (catch-up + timer arming). Notifications
         // route back here to resume paused runs / deep-link into the Tasks window.
         TaskNotifier.shared.appState = self
