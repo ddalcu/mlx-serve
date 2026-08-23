@@ -313,4 +313,103 @@ final class ChatBasicsSlimTests: XCTestCase {
             .appendingPathComponent("Sources/MLXServe/Views/ChatView.swift")
         return try String(contentsOf: url, encoding: .utf8)
     }
+
+    // MARK: - Review findings
+
+    /// An agent thread's SUMMARY rows (`**name**(args)` / `**name** → output`)
+    /// are folded into one tool-call row whose id is the CALL's. Indexing them
+    /// leaked raw tool output into a sidebar caption and produced a hit whose
+    /// id no row carries — the click released follow and scrolled nowhere.
+    func testSearchIgnoresAgentSummaryRows() {
+        var call = msg(.assistant, "**read_file**(path: secrets.env)")
+        call.isAgentSummary = true
+        var result = msg(.assistant, "**read_file** → DATABASE_PASSWORD=hunter2")
+        result.isAgentSummary = true
+        var session = ChatSession()
+        session.title = "Some thread"
+        session.messages = [msg(.user, "look at it"), call, result]
+
+        XCTAssertFalse(SidebarSearch.matches(session, query: "hunter2"),
+                       "raw tool output must not make a conversation a search hit")
+        XCTAssertNil(SidebarSearch.firstContentMatch(in: session, query: "read_file"),
+                     "a hit on a folded row names an id no row on screen carries")
+        XCTAssertNotNil(SidebarSearch.firstContentMatch(in: session, query: "look at it"),
+                        "ordinary rows still match")
+    }
+
+    /// An agent row DISPLAYS the agent's name, not `session.title`. Searching
+    /// the stored title made a row literally reading "Code Reviewer" vanish
+    /// when you typed "code reviewer".
+    func testSearchMatchesTheTitleTheSidebarActuallyDraws() {
+        var session = ChatSession()
+        session.title = "New agent"
+        session.messages = [msg(.user, "unrelated")]
+
+        XCTAssertFalse(SidebarSearch.matches(session, query: "code reviewer"))
+        XCTAssertTrue(SidebarSearch.matches(session, query: "code reviewer",
+                                            displayTitle: "Code Reviewer"),
+                      "search must read the string the row shows")
+        XCTAssertEqual(SidebarSearch.filter(sessions: [session], query: "review",
+                                            displayTitle: { _ in "Code Reviewer" }).count, 1)
+    }
+
+    /// The snippet is cut from the trimmed, whitespace-collapsed line, so the
+    /// offset has to be measured on that same string. Measured on the raw
+    /// content, a heavily indented line cut past the match and the tail cap
+    /// then removed it — a caption that does not contain what you searched for.
+    func testTheSnippetAlwaysContainsTheMatch() {
+        let padding = String(repeating: " ", count: 60)
+        let filler = String(repeating: "alpha ", count: 20)
+        var session = ChatSession()
+        session.messages = [msg(.user, padding + filler + "NEEDLE" + filler)]
+
+        let hit = SidebarSearch.firstContentMatch(in: session, query: "NEEDLE")
+        XCTAssertNotNil(hit)
+        XCTAssertTrue(hit?.snippet.localizedCaseInsensitiveContains("NEEDLE") == true,
+                      "snippet lost the match: \(hit?.snippet ?? "nil")")
+        XCTAssertLessThanOrEqual(hit?.snippet.count ?? 0, SidebarSearch.snippetMaxLength)
+    }
+
+    /// A draft belongs to a conversation. When the conversation goes, so does
+    /// it — otherwise composer-drafts.json only ever grows.
+    func testDraftsAreForgottenWithTheirConversation() {
+        var drafts = ComposerDrafts()
+        let gone = UUID(), kept = UUID()
+        drafts.stash("half a message", for: gone)
+        drafts.stash("keep me", for: kept)
+
+        drafts.clear(for: gone)
+        XCTAssertEqual(drafts.restore(for: gone), "")
+        XCTAssertEqual(drafts.restore(for: kept), "keep me")
+    }
+
+    /// Deleting the ACTIVE chat flips `activeChatId`, and the view then stashes
+    /// the outgoing field under the id just removed — resurrecting a dead
+    /// session's draft. Both the delete sweep and the stash guard are pinned.
+    func testDeletingAConversationDropsItsDraftAndCannotResurrectIt() throws {
+        let s = try Self.appStateSource()
+        XCTAssertTrue(s.contains("forgetDrafts(ids)"),
+                      "deleteSessions must drop the drafts of what it removed")
+        let stash = try XCTUnwrap(s.range(of: "func stashDraft("))
+        let window = String(s[stash.lowerBound...].prefix(700))
+        XCTAssertTrue(window.contains("chatSessions.contains(where:"),
+                      "a stash for a session that no longer exists must be dropped")
+    }
+
+    /// The save panel closes whether the write worked or not, so silence reads
+    /// as success. A full disk must not look like a saved file.
+    func testAFailedExportIsReported() throws {
+        let s = try Self.chatViewSource()
+        XCTAssertTrue(s.contains("func reportExportFailure("),
+                      "there is no way to tell the user an export failed")
+        XCTAssertFalse(s.contains("try? data.write("),
+                       "a swallowed write error is an export that silently did nothing")
+    }
+
+    private static func appStateSource() throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/AppState.swift")
+        return try String(contentsOf: url, encoding: .utf8)
+    }
 }

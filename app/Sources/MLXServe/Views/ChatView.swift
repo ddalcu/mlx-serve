@@ -945,6 +945,13 @@ struct ChatSidebar: View {
 
     /// Search-hit context per session, computed OUTSIDE the view builder — a
     /// loop inside one kept blowing the type-checker's time budget.
+    /// What the sidebar DRAWS for this row — the agent's name on an agent
+    /// thread. Search has to read the same string the row shows.
+    private func sessionDisplayTitle(_ session: ChatSession) -> String {
+        ChatSessionTitle.display(title: session.title,
+                                 agentName: appState.agents.agent(id: session.agentId)?.name)
+    }
+
     private static func computeSearchHits(_ sessions: [ChatSession],
                                           query: String) -> [UUID: SidebarSearch.SearchHit] {
         guard SidebarSearch.isFiltering(query) else { return [:] }
@@ -979,7 +986,9 @@ struct ChatSidebar: View {
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
             let groups = SidebarSessionGroups.split(
-                SidebarSearch.filter(sessions: appState.visibleChatSessions, query: sidebarQuery))
+                SidebarSearch.filter(sessions: appState.visibleChatSessions,
+                                     query: sidebarQuery,
+                                     displayTitle: { sessionDisplayTitle($0) }))
             // The panel's visual order, both sections flattened — a shift-click
             // ranges across the Agents/Chats boundary, because the split is a
             // heading, not a wall.
@@ -1399,14 +1408,37 @@ struct ChatSidebar: View {
         runSavePanel(defaultName: "chats-export.md", contentType: .plainText, data: data)
     }
 
+    /// An export that fails has to SAY so — the save panel closing is the only
+    /// feedback the action gives, and it closes either way.
+    private func reportExportFailure(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Export Failed"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     private func runSavePanel(defaultName: String, contentType: UTType, data: Data?) {
-        guard let data else { return }
+        guard let data else {
+            // Serialization failed. Silence here reads as "saved" — the click
+            // did something visible (a panel opened) and then nothing said
+            // otherwise.
+            reportExportFailure("The conversation could not be prepared for export.")
+            return
+        }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [contentType]
         panel.nameFieldStringValue = defaultName
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            try? data.write(to: url, options: .atomic)
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                // Full disk, a revoked sandbox grant, a read-only volume: the file
+                // is simply not there afterwards, and the user believes it is.
+                reportExportFailure(error.localizedDescription)
+            }
         }
     }
 

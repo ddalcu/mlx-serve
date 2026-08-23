@@ -444,8 +444,23 @@ class AppState: ObservableObject {
     }
 
     func stashDraft(_ text: String, for sessionId: UUID) {
+        // Deleting the ACTIVE conversation flips `activeChatId`, and the detail
+        // view's session-change handler then stashes the outgoing field under
+        // the id that was just removed — re-creating an entry for a session
+        // that no longer exists. A stash for an unknown session is dropped.
+        guard chatSessions.contains(where: { $0.id == sessionId }) else { return }
         composerDrafts.stash(text, for: sessionId)
         saveComposerDrafts()
+    }
+
+    /// Drop the drafts of conversations that are going away.
+    func forgetDrafts(_ ids: Set<UUID>) {
+        var removed = false
+        for id in ids where !composerDrafts.restore(for: id).isEmpty {
+            composerDrafts.clear(for: id)
+            removed = true
+        }
+        if removed { saveComposerDrafts() }
     }
 
     func draft(for sessionId: UUID) -> String {
@@ -863,6 +878,9 @@ class AppState: ObservableObject {
             SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
             SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
         }
+        // A deleted conversation's draft has nothing left to belong to. Left
+        // behind, composer-drafts.json only ever grows.
+        forgetDrafts(ids)
         chatSessions.removeAll { ids.contains($0.id) }
         // Stop the in-flight turns that belonged to these sessions — otherwise
         // they ghost-run invisibly with no Stop control anywhere, and no server
