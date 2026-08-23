@@ -608,14 +608,14 @@ pub fn main(init: std.process.Init) !void {
             // the process table is world-readable, argv with it. Same
             // borrow-for-the-process lifetime as --api-key; empty/unset
             // leaves the server open, exactly like an empty --api-key.
-            // args are plain slices; getenv needs a C string. A variable
-            // name past the buffer is not one this flag serves.
-            var name_buf: [128:0]u8 = undefined;
-            if (args[i].len < name_buf.len) {
-                @memcpy(name_buf[0..args[i].len], args[i]);
-                name_buf[args[i].len] = 0;
-                const name: [:0]const u8 = name_buf[0..args[i].len :0];
-                if (std.c.getenv(name.ptr)) |value| {
+            // getenv needs a null-terminated name; args[i] is a plain
+            // slice, so print a `:0` copy (process-lifetime, like the argv
+            // borrow --api-key uses). std.c.getenv is how every other env
+            // read in this codebase works. An unset var leaves the server
+            // open, exactly like an empty --api-key.
+            const name = std.fmt.allocPrintSentinel(allocator, "{s}", .{args[i]}, 0) catch null;
+            if (name) |name_z| {
+                if (std.c.getenv(name_z.ptr)) |value| {
                     const key = std.mem.span(value);
                     if (key.len > 0) server_mod.g_api_key = key;
                 }
