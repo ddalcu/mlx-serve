@@ -25,18 +25,19 @@ final class VideoGenUnreachableSettingsTests: XCTestCase {
 
     // MARK: - H3 last frame
 
-    func testLastFrameImageReachesTheRequestOnFl2vaOnly() {
+    func testLastFrameImageReachesTheRequestOnlyWhereDeclared() {
         // fl2va is first-LAST frame to video+audio. The server pins the last
         // keyframe as a center-COVER anchor; without the field we ship half
         // the partition the pack is named for. ref2va has no keyframe row to
-        // anchor, and LTX's handler has no `last_frame_image` at all, so both
-        // must stay absent even when the state is populated (a preset switch
-        // leaves the picked file behind — the `pipeline`-on-H3 class).
+        // anchor, so it must stay absent even when the state is populated (a
+        // preset switch leaves the picked file behind — the `pipeline`-on-H3
+        // class). LTX pins the last latent frame on both pipelines (#260).
         XCTAssertTrue(VideoModelPreset.minimaxH3.supportsLastFrame)
         XCTAssertTrue(VideoModelPreset.minimaxH3Q4.supportsLastFrame)
         XCTAssertFalse(VideoModelPreset.minimaxH3Ref2VA.supportsLastFrame)
-        XCTAssertFalse(VideoModelPreset.ltx25Q8.supportsLastFrame)
-        XCTAssertFalse(VideoModelPreset.ltx23Q4.supportsLastFrame)
+        XCTAssertTrue(VideoModelPreset.ltx25Q8.supportsLastFrame)
+        XCTAssertTrue(VideoModelPreset.ltx25Q4.supportsLastFrame)
+        XCTAssertTrue(VideoModelPreset.ltx23Q4.supportsLastFrame)
 
         for model in [VideoModelPreset.minimaxH3, .minimaxH3Ref2VA, .ltx25Q8] {
             let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req(model),

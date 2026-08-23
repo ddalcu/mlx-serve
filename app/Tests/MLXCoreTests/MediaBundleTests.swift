@@ -604,14 +604,6 @@ final class MediaBundleTests: XCTestCase {
         }
     }
 
-    func testNsfwClassifierProvisioningDefaults() {
-        // Shared content-filter classifier: the original public Apache-2.0 repo.
-        XCTAssertEqual(DownloadManager.nsfwClassifierRepo, "Falconsai/nsfw_image_detection")
-        // Safe mode is ON by default on a generation request.
-        let r = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 512, height: 512, steps: 8)
-        XCTAssertTrue(r.safeMode)
-    }
-
     // MARK: - 3D (Hunyuan3D) bundle + local-repo readiness
 
     func testModel3DBundleIsOneRecursiveHFRepoWithAllStages() {

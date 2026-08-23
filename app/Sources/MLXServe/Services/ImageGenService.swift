@@ -201,7 +201,6 @@ final class ImageGenService: ObservableObject {
         if request.width > 0 && request.height > 0 {
             json["size"] = "\(request.width)x\(request.height)"
         }
-        if !request.safeMode { json["safety"] = false }
         if let src = request.initImagePath,
            let data = FileManager.default.contents(atPath: src) {
             json["image"] = data.base64EncodedString()

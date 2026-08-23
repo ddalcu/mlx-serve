@@ -106,7 +106,7 @@ class DownloadManager: ObservableObject {
     /// Every folder to scan, download destination first. This is what the
     /// server is handed, one `--model-dir` per entry.
     func scanRoots() -> [String] {
-        ModelRoots().scanRoots(lmStudioRoot: lmStudioRoot)
+        ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
     }
 
     /// The folders the app owns for READS — where a repo the user already
@@ -127,7 +127,7 @@ class DownloadManager: ObservableObject {
     /// hermetic tests must never resolve into the developer's real library.
     var readRoots: [String] {
         guard pinnedRoot == nil else { return [modelsDir] }
-        return ModelRoots().readRoots(lmStudioRoot: lmStudioRoot)
+        return ModelRoots().readRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
     }
 
     // MARK: - Path resolution
@@ -459,36 +459,6 @@ class DownloadManager: ObservableObject {
         return nil
     }
 
-    /// Shared NSFW content-filter classifier (Apache-2.0). The server applies it
-    /// to ALL image generation (Krea license §4.2); auto-downloaded once into
-    /// `~/.mlx-serve/models` and shared across every image model. Original
-    /// public repo — no conversion/hosting; the Zig engine reads it directly.
-    static let nsfwClassifierRepo = "Falconsai/nsfw_image_detection"
-
-    func nsfwClassifierReady() -> Bool {
-        guard let dir = existingModelDir(for: Self.nsfwClassifierRepo) else { return false }
-        return FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("model.safetensors"))
-    }
-
-    /// Best-effort: provision the NSFW classifier in the background if missing.
-    /// Idempotent + quiet (tracked under its own repoId, so it doesn't disturb a
-    /// model's bundle progress); the server fails OPEN until it's present. Safe to
-    /// call on every Image-tab appearance.
-    func ensureNsfwClassifier() {
-        if nsfwClassifierReady() { return }
-        if activeTasks[Self.nsfwClassifierRepo] != nil { return } // already downloading
-        start(repoId: Self.nsfwClassifierRepo) {}
-    }
-
-    /// Repos the app auto-provisions for its own internal use (a "vit"
-    /// architecture the model picker already flags red as "Unsupported",
-    /// since it isn't a chat model) — never something the user chose to
-    /// download, so `discoverLocalModels` drops them before anything renders.
-    /// Matched by `LocalModel.name`, which for the standard nested layout
-    /// (`<root>/<org>/<repo>`) is exactly the `org/repo` string these repoIds
-    /// already are.
-    nonisolated static let internalHelperRepos: Set<String> = [nsfwClassifierRepo]
-
     /// User-configurable extra discovery root. Persisted in UserDefaults under
     /// `customModelPath` so it survives app restarts. The raw stored value is
     /// kept verbatim (we don't erase a broken path) so the user can see and
@@ -542,8 +512,12 @@ class DownloadManager: ObservableObject {
 
     /// The same resolution, reachable from `nonisolated` code — the launch-flag
     /// builder needs it and cannot touch this `@MainActor` instance.
-    nonisolated static func lmStudioRootPath() -> String? {
-        let settingsPath = NSString(string: "~/.lmstudio/settings.json").expandingTildeInPath
+    /// `home` is a parameter for the same reason `ToolModelRoots.detected` has
+    /// one: a resolver that reaches the real home directory cannot be tested
+    /// without depending on whether the machine running the tests happens to
+    /// have LM Studio installed.
+    nonisolated static func lmStudioRootPath(home: String = NSHomeDirectory()) -> String? {
+        let settingsPath = (home as NSString).appendingPathComponent(".lmstudio/settings.json")
         let configured: String? = {
             guard let data = FileManager.default.contents(atPath: settingsPath),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -551,7 +525,7 @@ class DownloadManager: ObservableObject {
                   !folder.isEmpty else { return nil }
             return (folder as NSString).expandingTildeInPath
         }()
-        let fallback = NSString(string: "~/.lmstudio/models").expandingTildeInPath
+        let fallback = (home as NSString).appendingPathComponent(".lmstudio/models")
         let candidate = configured ?? fallback
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else { return nil }
@@ -929,6 +903,15 @@ class DownloadManager: ObservableObject {
     /// once the mirrors actually carry the file — before then every tick
     /// alerted on a 404 nobody could fix.
     func startTurboLora(repoId: String, onFinish: @escaping @MainActor () -> Void = {}) {
+        startPackFile(repoId: repoId, fileName: TurboLoraFetch.fileName, onFinish: onFinish)
+    }
+
+    /// Fetch ONE file of a pack that is already on disk, beside its weights:
+    /// the Turbo adapter above, and the ACE-Step cover tokenizer
+    /// (`fsq.safetensors`) for packs downloaded before cover mode — that one
+    /// is TEMPORARY migration code (2026-08-22), to go once installs have
+    /// re-downloaded. Same contract as `startTurboLora`.
+    func startPackFile(repoId: String, fileName: String, onFinish: @escaping @MainActor () -> Void = {}) {
         if let running = activeTasks[repoId] {
             Task { @MainActor in
                 _ = await running.value
@@ -945,10 +928,10 @@ class DownloadManager: ObservableObject {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.download(repoId: repoId,
-                                selection: FileSelection(keepSafetensors: [TurboLoraFetch.fileName]),
+                                selection: FileSelection(keepSafetensors: [fileName]),
                                 alertOnFailure: true,
                                 destDirOverride: packDir)
-            self.finalizeCancelledTurboLora(repoId: repoId, packDir: packDir)
+            self.finalizeCancelledPackFile(repoId: repoId, fileName: fileName, packDir: packDir)
             self.turboLoraFetches.remove(repoId)
             self.activeTasks.removeValue(forKey: repoId)
             onFinish()
@@ -969,13 +952,13 @@ class DownloadManager: ObservableObject {
         activeTasks[repoId]?.cancel()
     }
 
-    /// Cancel cleanup for a Turbo-adapter fetch: drop the ONE file's partials,
-    /// never the directory — the destination is the pack itself.
-    private func finalizeCancelledTurboLora(repoId: String, packDir: String?) {
+    /// Cancel cleanup for a single-file pack fetch: drop the ONE file's
+    /// partials, never the directory — the destination is the pack itself.
+    private func finalizeCancelledPackFile(repoId: String, fileName: String, packDir: String?) {
         guard Task.isCancelled else { return }
         downloads.removeValue(forKey: repoId)
         let dir = packDir ?? newLayoutDir(for: repoId)
-        let base = (dir as NSString).appendingPathComponent(TurboLoraFetch.fileName)
+        let base = (dir as NSString).appendingPathComponent(fileName)
         try? FileManager.default.removeItem(atPath: base + ".partial")
         try? FileManager.default.removeItem(atPath: base + ".partial.parts")
     }
@@ -1610,7 +1593,11 @@ class DownloadManager: ObservableObject {
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configPath) else { return [] }
 
-        guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return [] }
+        // A defect does NOT drop the directory. Dropping it is how two junk
+        // folders stayed invisible in the app while the server registered them
+        // and would have died loading either one — you cannot delete what you
+        // cannot see. It is listed, unpickable, and deletable instead.
+        let defect = weightDefect(inDir: resolved, entries: entries)
 
         let meta = parseConfigMetadata(atPath: configPath)
         let modelType = meta.modelType
@@ -1635,8 +1622,78 @@ class DownloadManager: ObservableObject {
             quantBits: meta.quantBits,
             contextLength: meta.contextLength,
             numExperts: meta.numExperts,
-            activeExperts: meta.activeExperts
+            activeExperts: meta.activeExperts,
+            defect: defect
         )]
+    }
+
+    /// A `.partial` beside a moving progress bar is not an interrupted download,
+    /// so a dir that is the destination of a live transfer loses that defect.
+    nonisolated static func clearingInFlightDefects(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
+        guard !activeDirs.isEmpty else { return models }
+        return models.map { m in
+            guard m.defect == .interruptedDownload,
+                  activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
+            var fixed = m
+            fixed.defect = nil
+            return fixed
+        }
+    }
+
+    /// Smallest total weight payload that could be a real checkpoint.
+    ///
+    /// This is a "nothing loadable is this small" floor, NOT a guess about
+    /// model size: the smallest quantized checkpoint anyone serves is orders of
+    /// magnitude past a mebibyte. It exists because a file-EXISTS check let a
+    /// 48 KB stub `jangtq_runtime.safetensors` present its folder as a real,
+    /// selectable model. Where the checkpoint declares its own parts we do not
+    /// use the floor at all — a shard index is exact.
+    nonisolated static let minimumWeightBytes: UInt64 = 1024 * 1024
+
+    /// Classify a safetensors directory: nil when it holds a loadable
+    /// checkpoint, else why it does not.
+    ///
+    /// Order matters. An interrupted download is reported ahead of thin
+    /// weights because it EXPLAINS them — the transfer stopped, so "re-download
+    /// or delete" is the honest advice, where "this folder is junk" is not.
+    nonisolated static func weightDefect(inDir dir: String, entries: [String]) -> ModelDefect? {
+        if entries.contains(where: { $0.hasSuffix(".partial") || $0.hasSuffix(".incomplete") }) {
+            return .interruptedDownload
+        }
+
+        // Exact path: the index names every shard the checkpoint needs.
+        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
+        if let data = FileManager.default.contents(atPath: indexPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let map = obj["weight_map"] as? [String: String] {
+            let declared = Set(map.values)
+            if !declared.isEmpty {
+                let missing = declared.contains {
+                    !FileManager.default.fileExists(
+                        atPath: (dir as NSString).appendingPathComponent($0))
+                }
+                return missing ? .missingShards : nil
+            }
+        }
+
+        // Inexact path: no index, so all we can say is whether the bytes on
+        // disk could possibly be a checkpoint. Media packs (FLUX.2 klein's
+        // mflux layout) keep every weight one level down in `transformer/`,
+        // `vae/`, … with nothing at the root, so the sum reads one level deep.
+        let fm = FileManager.default
+        func safetensorsBytes(in d: String, names: [String]) -> UInt64 {
+            names.filter { $0.hasSuffix(".safetensors") }
+                .reduce(UInt64(0)) { $0 + resolvedFileSize((d as NSString).appendingPathComponent($1)) }
+        }
+        var bytes = safetensorsBytes(in: dir, names: entries)
+        for e in entries where bytes < minimumWeightBytes {
+            let sub = (dir as NSString).appendingPathComponent(e)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: sub, isDirectory: &isDir), isDir.boolValue,
+                  let names = try? fm.contentsOfDirectory(atPath: sub) else { continue }
+            bytes += safetensorsBytes(in: sub, names: names)
+        }
+        return bytes >= minimumWeightBytes ? nil : .missingWeights
     }
 
     /// Metadata read from a model's `config.json` — the authoritative source for
@@ -1707,6 +1764,18 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.discoverHuggingFaceModels(in: root))
         }
 
+        // Other local-inference tools' canonical folders, auto-detected. Both
+        // layouts they use are already read by `dualLayoutModels` — MTPLX
+        // writes flat `Org--Name` dirs, Osaurus writes `org/repo` — so this
+        // enumeration exists only because the picker walks folders separately
+        // from `ModelRoots.scanRoots`, and a root added to one and not the
+        // other is served but unselectable. Read-only: another tool's tree.
+        for tool in ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
+        where tool.path != lmStudioRoot {
+            out.append(contentsOf: Self.dualLayoutModels(
+                atRoot: tool.path, idPrefix: "tool:", source: tool.source))
+        }
+
         // User-configured custom root — same dual-layout scan as the owned
         // roots. resolvedCustomRoot() handles tilde expansion, existence check,
         // and dedup against the default roots so a user pointing it at
@@ -1715,8 +1784,9 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return out
-            .filter { !Self.internalHelperRepos.contains($0.name) }
+        let inFlight = Set(downloads.filter { $0.value.status == .downloading }
+            .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
+        return Self.clearingInFlightDefects(out, activeDirs: inFlight)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
@@ -1926,15 +1996,23 @@ class DownloadManager: ObservableObject {
     /// the repoId-based path resolver — and for LM Studio / custom-root models,
     /// which live outside `modelsDir` entirely. Scopes pruning to the known
     /// scan roots so it never climbs out of a model tree.
-    func deleteModel(_ model: LocalModel) {
+    /// `unlocked` is the row's explicit second click on a model outside our
+    /// own tree. It is a parameter rather than a mutation of `isDeletable`
+    /// because the DEFAULT must stay refusal: every other caller keeps the
+    /// old behaviour by not passing it.
+    func deleteModel(_ model: LocalModel, unlocked: Bool = false) {
         // Only ~/.mlx-serve/models is ours to delete. LM Studio, the Hugging Face
         // hub cache, and custom-root models are owned by another tool or the user
         // (deleting an HF snapshot orphans shared blobs and dangles refs/main; the
         // others simply aren't ours). The UI hides the trash for them; this is the
         // defensive backstop, and the roots are scoped to modelsDir so a stray call
         // can never prune into an external tree.
-        guard model.isDeletable else { return }
-        let roots = ownedRoots
+        guard model.isDeletable || unlocked else { return }
+        // A broken folder is deletable wherever it sits, so the ROOT LIST it is
+        // bounded by has to widen with it: `roots` is what `removeModelFiles`
+        // refuses to remove and stops pruning at, and a foreign root missing
+        // from that set is a root this call would happily delete.
+        let roots = (model.defect != nil || unlocked) ? readRoots : ownedRoots
         if model.quantFile != nil {
             // One quant of a GGUF repo — remove that file only. Its siblings are
             // separate models the user didn't ask to delete.

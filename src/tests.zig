@@ -52,7 +52,6 @@ test {
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
-    _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
     _ = @import("ltx_diffvae_kernel.zig");

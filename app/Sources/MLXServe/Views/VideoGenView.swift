@@ -523,9 +523,9 @@ struct VideoGenView: View {
                      help: "Select an image to use as the first frame of the video.")
     }
 
-    // fl2va's second anchor. Hidden rather than offered-and-ignored on a
-    // backend without it (the `pipeline`-on-H3 rule): LTX's handler has no
-    // `last_frame_image`, and ref2va has no keyframe row to land on.
+    // The second anchor (H3 fl2va, LTX both pipelines). Hidden rather than
+    // offered-and-ignored on a backend without it (the `pipeline`-on-H3
+    // rule): ref2va has no keyframe row to land on.
     @ViewBuilder
     private var lastFrameSection: some View {
         if model.supportsLastFrame {

@@ -32,11 +32,29 @@ struct MusicGenView: View {
     @State private var showSaveStyle = false
     @State private var showSaveLyrics = false
     @State private var saveTitle = ""
+    @State private var rewriteKind: MusicPromptRewriter.Kind? = nil
 
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: MusicGenRequest? = nil
     @StateObject private var clipPlayer = AudioClipPlayer()
+    // Kept across preset switches like the video pane's first frame; the
+    // SERVICE gates the field on `supportsReferenceAudio`.
+    @State private var refAudioURL: URL? = nil
+    @State private var refError: String? = nil
+    @State private var isRefDropTargeted: Bool = false
+    @State private var refBusy: Bool = false
+    // Source-audio tasks (ACE-Step only). The SERVICE gates every field on
+    // `supportsSourceAudio` + the task, so a clip left behind by a model
+    // switch never reaches a server that refuses it.
+    @State private var task: MusicTask = .text2music
+    @State private var srcAudioURL: URL? = nil
+    @State private var srcError: String? = nil
+    @State private var isSrcDropTargeted: Bool = false
+    @State private var srcBusy: Bool = false
+    @State private var coverStrength: Double = 1.0
+    @State private var coverNoiseStrength: Double = 0.0
+    @State private var trackClasses: [String] = []
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -63,18 +81,11 @@ struct MusicGenView: View {
             durationSeconds = min(max(durationSeconds, m.durationRange.lowerBound), m.durationRange.upperBound)
             persist()
         }
-        .onChange(of: durationSeconds) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: vocalLanguage) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
-        // Everything the pane shows is sticky now — these all used to reset on
-        // every navigation away from the Audio page, since the view unmounts.
-        .onChange(of: bpm) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: keyscale) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: timesignature) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: instrumental) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: showAdvanced) { _, _ in guard !hydrating else { return }; persist() }
+        // Everything the pane shows is sticky, the typed draft included — it
+        // all used to reset on every navigation away from the Audio page,
+        // since the view unmounts. ONE onChange on the snapshot: a chain of
+        // fourteen is where the type-checker gives up.
+        .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             // A new generation stops whatever is still playing.
             if case .running = phase { stopPlayback() }
@@ -96,6 +107,16 @@ struct MusicGenView: View {
         } message: {
             Text("Give these lyrics a name to reuse them from the Examples menu.")
         }
+        .sheet(item: $rewriteKind) { kind in
+            PromptRewriteSheet(
+                title: kind == .style ? "Rewrite style prompt" : "Rewrite lyrics",
+                request: MusicPromptRewriter.request(
+                    kind, text: kind == .style ? prompt : lyrics, family: model.family,
+                    other: kind == .style ? lyrics : prompt,
+                    instrumental: instrumental, language: vocalLanguage),
+                onApply: { if kind == .style { prompt = $0 } else { lyrics = $0 } })
+            .environmentObject(appState)
+        }
     }
 
     private func play(_ path: String) { clipPlayer.play(path) }
@@ -105,10 +126,13 @@ struct MusicGenView: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if model.supportsSourceAudio { modeSection }
+                    if sourceTask { sourceSection }
                     promptSection
                     lyricsSection
+                    if model.supportsReferenceAudio { referenceSection }
                     modelSection
-                    durationSection
+                    if sourceTask { sourceLengthNote } else { durationSection }
                     if showAdvanced { advancedSection } else { advancedToggle }
                     actionRow
                 }
@@ -138,7 +162,7 @@ struct MusicGenView: View {
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
             Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req, server: server) }
+                if let req = pendingRequest { service.generate(req, server: server, downloads: downloads) }
                 pendingRequest = nil
             }
         } message: {
@@ -153,6 +177,7 @@ struct MusicGenView: View {
             HStack(spacing: 8) {
                 Text("Style prompt").font(.subheadline.weight(.semibold))
                 Spacer()
+                rewriteButton(.style, text: prompt)
                 styleExamplesMenu
             }
             TextEditor(text: $prompt)
@@ -172,6 +197,7 @@ struct MusicGenView: View {
                 Text(model.requiresLyrics ? "Lyrics" : "Lyrics (optional)")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
+                rewriteButton(.lyrics, text: lyrics)
                 lyricsExamplesMenu
             }
             // The instrumental switch. Both engines can make a wordless track,
@@ -207,6 +233,236 @@ struct MusicGenView: View {
                     : "Leave empty, or tick Instrumental, for a track with no vocals. Section tags: \(MusicOptions.sectionTagHint)"))
                 .font(.caption2).foregroundStyle(.secondary)
         }
+    }
+
+    /// The task actually in force: the mode control only exists on models
+    /// with source-audio tasks, so elsewhere the sticky value is inert.
+    private var sourceTask: Bool { model.supportsSourceAudio && task.needsSource }
+
+    /// What the track is made from. Cover keeps the source's melody and
+    /// structure under a new caption; Vocal to BGM arranges around a vocal
+    /// stem. Both take their length from the clip, so Duration disappears.
+    private var modeSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("", selection: $task) {
+                ForEach(MusicTask.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+            .labelsHidden().pickerStyle(.segmented)
+            Text(task == .cover
+                 ? "Re-sings an existing track in the style you describe: melody and structure stay, the caption and lyrics decide the rest."
+                 : (task == .complete
+                    ? "Builds an arrangement around a vocal stem (or any part): pick the instruments to add, or leave them all off to let the model decide."
+                    : "A new track from the style prompt and lyrics."))
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    /// The source clip for Cover / Vocal to BGM: full length (up to 10 minutes),
+    /// because the track is made exactly as long as it. Same pick / drop /
+    /// preview / clear shape as the reference well below.
+    private var sourceSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(task == .cover ? "Source track" : "Source stem").font(.subheadline.weight(.semibold))
+                Spacer()
+            }
+            if let url = srcAudioURL {
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
+                    Text(url.lastPathComponent)
+                        .font(.caption).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    if clipPlayer.playingPath == url.path {
+                        Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                            .buttonStyle(.borderless).help("Stop preview")
+                    } else {
+                        Button { clipPlayer.play(url.path) } label: { Image(systemName: "play.circle") }
+                            .buttonStyle(.borderless).help("Preview source")
+                    }
+                    Button { clearSource() } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear source")
+                }
+            } else if srcBusy {
+                converting
+            } else {
+                Button { chooseSourceFile() } label: {
+                    Label("Choose file…", systemImage: "folder")
+                        .font(.caption).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            Text("10 seconds to 10 minutes. The new track is exactly as long as this clip.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let err = srcError {
+                Text(err).font(.caption2).foregroundStyle(.orange)
+            }
+            if task == .cover {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Cover strength").font(.caption)
+                        Spacer()
+                        Text(String(format: "%.2f", coverStrength)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Slider(value: $coverStrength, in: 0...1, step: 0.05)
+                    Text("How many of the steps follow the source. 1 keeps it all the way; lower lets the caption take over for the last steps.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Noise strength").font(.caption)
+                        Spacer()
+                        Text(String(format: "%.2f", coverNoiseStrength)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Slider(value: $coverNoiseStrength, in: 0...1, step: 0.05)
+                    Text("0 starts from pure noise (the default). Higher starts closer to the original audio, so more of it comes through.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if task == .complete {
+                Text("Add").font(.caption)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), alignment: .leading)], alignment: .leading, spacing: 4) {
+                    ForEach(MusicTask.trackClasses, id: \.self) { name in
+                        Toggle(name.replacingOccurrences(of: "_", with: " "),
+                               isOn: Binding(get: { trackClasses.contains(name) },
+                                             set: { on in
+                                                 if on { if !trackClasses.contains(name) { trackClasses.append(name) } }
+                                                 else { trackClasses.removeAll { $0 == name } }
+                                             }))
+                            .font(.caption)
+                    }
+                }
+            }
+        }
+        .mediaDrop(.audio, isTargeted: $isSrcDropTargeted) { urls in
+            if let url = urls.first { acceptSource(url) }
+        }
+    }
+
+    private var sourceLengthNote: some View {
+        Text("Length: same as the source clip.")
+            .font(.caption2).foregroundStyle(.secondary)
+    }
+
+    private func chooseSourceFile() {
+        srcError = nil
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        acceptSource(url)
+    }
+
+    private func acceptSource(_ url: URL) {
+        guard !srcBusy else { return }
+        srcError = nil
+        srcBusy = true
+        transcode(url, maxSeconds: 600) { result in
+            srcBusy = false
+            switch result {
+            case .success(let wav): srcAudioURL = wav
+            case .failure(let err): srcError = err.localizedDescription
+            }
+        }
+    }
+
+    /// Decode + resample + write off the main thread: a 10-minute clip took
+    /// seconds, and the drop animation sat frozen for all of them.
+    private func transcode(_ url: URL, maxSeconds: Double, done: @escaping @MainActor (Result<URL, Error>) -> Void) {
+        Task.detached(priority: .userInitiated) {
+            let result = Result { try AudioReference.referenceWav(fromFile: url, maxSeconds: maxSeconds) }
+            await done(result)
+        }
+    }
+
+    private func clearSource() {
+        if let url = srcAudioURL { try? FileManager.default.removeItem(at: url) }
+        srcAudioURL = nil
+    }
+
+    /// ACE-Step's timbre slot (#259): a clip whose style the track follows.
+    /// Same pick / drop / preview / clear shape as the Audio pane's voice
+    /// reference, minus recording — a mic clip is no style reference.
+    private var referenceSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Reference audio (optional)").font(.subheadline.weight(.semibold))
+                Spacer()
+            }
+            if let url = refAudioURL {
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform.circle.fill").foregroundStyle(.green)
+                    Text(url.lastPathComponent)
+                        .font(.caption).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    if clipPlayer.playingPath == url.path {
+                        Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                            .buttonStyle(.borderless).help("Stop preview")
+                    } else {
+                        Button { clipPlayer.play(url.path) } label: { Image(systemName: "play.circle") }
+                            .buttonStyle(.borderless).help("Preview reference")
+                    }
+                    Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
+                }
+            } else if refBusy {
+                converting
+            } else {
+                Button { chooseReferenceFile() } label: {
+                    Label("Choose file…", systemImage: "folder")
+                        .font(.caption).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            Text("A light touch: the model takes the overall feel and timbre from up to 30 seconds of the clip, it does not recreate the song.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let err = refError {
+                Text(err).font(.caption2).foregroundStyle(.orange)
+            }
+        }
+        .mediaDrop(.audio, isTargeted: $isRefDropTargeted) { urls in
+            if let url = urls.first { acceptReference(url) }
+        }
+    }
+
+    private var converting: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Converting…").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func chooseReferenceFile() {
+        refError = nil
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        acceptReference(url)
+    }
+
+    /// Picked or dropped, a file becomes the reference the same way: a 48 kHz
+    /// stereo transcode, or a visible reason instead of a clip that silently
+    /// doesn't attach.
+    private func acceptReference(_ url: URL) {
+        guard !refBusy else { return }
+        refError = nil
+        refBusy = true
+        transcode(url, maxSeconds: 30) { result in
+            refBusy = false
+            switch result {
+            case .success(let wav): refAudioURL = wav
+            case .failure(let err): refError = err.localizedDescription
+            }
+        }
+    }
+
+    private func clearReference() {
+        if let url = refAudioURL { try? FileManager.default.removeItem(at: url) }
+        refAudioURL = nil
     }
 
     /// Best-per-capability up front, everything else behind "Other Models", and
@@ -259,6 +515,18 @@ struct MusicGenView: View {
     /// because a menu that truncates its own options is worse than a bare one —
     /// `.frame(width:)` on a Picker clips, it does not wrap or shrink.
     private var menuWidth: CGFloat { 210 }
+    /// Label over control, pinned to the cell's leading edge: a picker is
+    /// intrinsic-width and was centring itself inside the column.
+    private func advancedCell<C: View>(_ label: String, @ViewBuilder control: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption)
+            control()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    /// Advanced rows lay out as many `menuWidth` cells as fit, then wrap —
+    /// never widening the pane (see the tempo row's comment).
+    private var advancedColumns: [GridItem] { [GridItem(.adaptive(minimum: menuWidth), spacing: 10, alignment: .bottomLeading)] }
 
     /// The model's server-valid duration bounds as integers, for the typed box.
     private var durationRangeInt: ClosedRange<Int> {
@@ -328,70 +596,65 @@ struct MusicGenView: View {
             // on ACE-Step, caption text on Music 3 — so they sit OUTSIDE the
             // acestep-only block. Hiding them on Music 3 read as "this model
             // cannot do tempo", which its own model card contradicts.
-            // Tempo, key and seed share one row — three short controls that
-            // each owned a full-width line, in a pane whose whole problem is
-            // that its options are hard to find.
-            if model.supportsTempoAndKey {
-            HStack(alignment: .bottom, spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Tempo (BPM)").font(.caption)
-                    // Typed, because the server takes 30–300 and the ten
-                    // anchors in the menu could not express 92. The menu stays
-                    // as a shortcut for people who think in genres, not numbers.
-                    HStack(spacing: 2) {
-                        OptionalNumberField(range: MusicOptions.bpmRange, value: $bpm,
-                                            placeholder: "Auto", width: 52,
-                                            help: "\(MusicOptions.bpmRange.lowerBound)–\(MusicOptions.bpmRange.upperBound), or leave empty to let the model decide.")
-                        Menu {
-                            Button("Auto") { bpm = nil }
-                            ForEach(MusicOptions.bpms, id: \.bpm) { opt in
-                                Button(opt.label) { bpm = opt.bpm }
-                            }
-                        } label: { Image(systemName: "chevron.down") }
-                        .menuStyle(.borderlessButton).fixedSize()
-                        .help("Common tempos")
-                    }
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Key").font(.caption)
-                    Picker("", selection: $keyscale) {
-                        Text("Auto").tag("")
-                        ForEach(MusicOptions.keyscales, id: \.self) { key in
-                            Text(MusicOptions.keyLabel(key)).tag(key)
+            // Tempo, key and seed share a row when the pane is wide enough and
+            // WRAP when it is not: a fixed-width HStack here set the left
+            // pane's minimum width (~540 pt) above what the default window
+            // gives it, and the HSplitView pushed the whole column under the
+            // sidebar (live 2026-08-22, Music tab clipped at default size).
+            LazyVGrid(columns: advancedColumns, alignment: .leading, spacing: 10) {
+                if model.supportsTempoAndKey {
+                    advancedCell("Tempo (BPM)") {
+                        // Typed, because the server takes 30–300 and the ten
+                        // anchors in the menu could not express 92. The menu stays
+                        // as a shortcut for people who think in genres, not numbers.
+                        HStack(spacing: 4) {
+                            OptionalNumberField(range: MusicOptions.bpmRange, value: $bpm,
+                                                placeholder: "Auto", width: 64,
+                                                help: "\(MusicOptions.bpmRange.lowerBound)–\(MusicOptions.bpmRange.upperBound), or leave empty to let the model decide.")
+                            Menu {
+                                Button("Auto") { bpm = nil }
+                                ForEach(MusicOptions.bpms, id: \.bpm) { opt in
+                                    Button(opt.label) { bpm = opt.bpm }
+                                }
+                            } label: { Image(systemName: "chevron.down") }
+                            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                            .help("Common tempos")
                         }
                     }
-                    .labelsHidden().pickerStyle(.menu).frame(width: menuWidth)
+                    advancedCell("Key") {
+                        Picker("", selection: $keyscale) {
+                            Text("Auto").tag("")
+                            ForEach(MusicOptions.keyscales, id: \.self) { key in
+                                Text(MusicOptions.keyLabel(key)).tag(key)
+                            }
+                        }
+                        .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
+                    }
                 }
-                seedControl
-                Spacer()
+                if model.supportsMusicalMeta {
+                    advancedCell("Vocal language") {
+                        Picker("", selection: $vocalLanguage) {
+                            ForEach(MusicOptions.languages, id: \.code) { opt in
+                                Text(opt.label).tag(opt.code)
+                            }
+                        }
+                        .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
+                    }
+                    advancedCell("Time signature") {
+                        Picker("", selection: $timesignature) {
+                            Text("Auto").tag("")
+                            ForEach(MusicOptions.timeSignatures, id: \.value) { opt in
+                                Text(opt.label).tag(opt.value)
+                            }
+                        }
+                        .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
+                    }
+                }
+                seedControl.frame(maxWidth: .infinity, alignment: .leading)
             }
-            if model.family == .minimaxMusic3 {
+            if model.supportsTempoAndKey && model.family == .minimaxMusic3 {
                 Text("Tempo and key are written into the style prompt for this model — it has no separate fields for them.")
                     .font(.caption2).foregroundStyle(.secondary)
-            }
-            }
-            if model.supportsMusicalMeta {
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Vocal language").font(.caption)
-                    Picker("", selection: $vocalLanguage) {
-                        ForEach(MusicOptions.languages, id: \.code) { opt in
-                            Text(opt.label).tag(opt.code)
-                        }
-                    }
-                    .labelsHidden().pickerStyle(.menu).frame(width: menuWidth)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Time signature").font(.caption)
-                    Picker("", selection: $timesignature) {
-                        Text("Auto").tag("")
-                        ForEach(MusicOptions.timeSignatures, id: \.value) { opt in
-                            Text(opt.label).tag(opt.value)
-                        }
-                    }
-                    .labelsHidden().pickerStyle(.menu).frame(width: menuWidth)
-                }
-            }
             }
             Text("Same seed + prompt reproduces the track.")
                 .font(.caption2).foregroundStyle(.secondary)
@@ -423,6 +686,7 @@ struct MusicGenView: View {
                     .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                               || !MusicGenRequest.lyricsSatisfied(model: model, lyrics: lyrics,
                                                                   instrumental: instrumental)
+                              || (sourceTask && srcAudioURL == nil)
                               || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
@@ -551,9 +815,19 @@ struct MusicGenView: View {
         steps = s.steps
         instrumental = s.instrumental
         showAdvanced = s.showAdvanced
+        prompt = s.prompt
+        lyrics = s.lyrics
+        refAudioURL = s.refAudioPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
+        task = s.task
+        srcAudioURL = s.srcAudioPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
+        coverStrength = s.coverStrength
+        coverNoiseStrength = s.coverNoiseStrength
+        trackClasses = s.trackClasses
     }
 
-    private func persist() {
+    /// Every sticky field, as the blob it would persist to — `Equatable`, so
+    /// one `onChange` covers all of them.
+    private var stickySnapshot: MusicGenSettings {
         var s = MusicGenSettings()
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.durationSeconds = Int(durationSeconds)
@@ -566,10 +840,33 @@ struct MusicGenView: View {
         s.steps = steps
         s.instrumental = instrumental
         s.showAdvanced = showAdvanced
-        s.save()
+        s.prompt = prompt
+        s.lyrics = lyrics
+        s.refAudioPath = refAudioURL?.path
+        s.task = task
+        s.srcAudioPath = srcAudioURL?.path
+        s.coverStrength = coverStrength
+        s.coverNoiseStrength = coverNoiseStrength
+        s.trackClasses = trackClasses
+        return s
     }
 
+    private func persist() { stickySnapshot.save() }
+
+
     // MARK: - Examples
+
+    /// The wand: asks the chat model to rewrite the field like the current
+    /// family's examples. Disabled until there is something to rewrite.
+    private func rewriteButton(_ kind: MusicPromptRewriter.Kind, text: String) -> some View {
+        Button { rewriteKind = kind } label: {
+            Image(systemName: "wand.and.stars")
+        }
+        .buttonStyle(.borderless)
+        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  || (kind == .lyrics && instrumental))
+        .help("Rewrite with the chat model")
+    }
 
     /// Style-prompt Examples menu: Save current + your saved styles (with a
     /// Delete submenu) + the built-in genre starters.
@@ -651,6 +948,12 @@ struct MusicGenView: View {
             seed: seed,
             steps: steps,
             keepResident: keepResident,
+            refAudioPath: refAudioURL?.path,
+            task: task,
+            srcAudioPath: srcAudioURL?.path,
+            coverStrength: coverStrength,
+            coverNoiseStrength: coverNoiseStrength,
+            trackClasses: trackClasses,
             lanModelId: lanModel
         )
         persist()
@@ -662,6 +965,78 @@ struct MusicGenView: View {
             showRAMWarning = true
             return
         }
-        service.generate(req, server: server)
+        service.generate(req, server: server, downloads: downloads)
+    }
+}
+
+// MARK: - Rewrite with LLM
+
+/// The wand sheet: streams the chat model's rewrite into an editable box;
+/// Apply hands the edited text back, Try again re-asks, Cancel keeps the
+/// original untouched.
+struct PromptRewriteSheet: View {
+    let title: String
+    let request: MusicPromptRewriter.Request
+    let onApply: (String) -> Void
+    @EnvironmentObject var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var text: String = ""
+    @State private var isWriting = false
+    @State private var error: String? = nil
+    @State private var job: Task<Void, Never>? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(title).font(.headline)
+                Spacer()
+                if isWriting { ProgressView().controlSize(.small) }
+            }
+            TextEditor(text: $text)
+                .font(.body)
+                .frame(minHeight: 220)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.red)
+            } else {
+                Text("Edit the result, then Apply to replace your text.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Try again") { start() }.disabled(isWriting)
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Apply") { onApply(text); dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 520)
+        .onAppear { start() }
+        .onDisappear { job?.cancel() }
+    }
+
+    private func start() {
+        job?.cancel()
+        text = ""
+        error = nil
+        isWriting = true
+        job = Task {
+            defer { isWriting = false }
+            do {
+                let stream = try await AgentComposer.stream(userText: request.user, systemPrompt: request.system,
+                                                            appState: appState, maxTokens: 1024)
+                for try await delta in stream {
+                    if Task.isCancelled { return }
+                    text += delta
+                }
+                text = MusicPromptRewriter.clean(text)
+            } catch is CancellationError {
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
     }
 }

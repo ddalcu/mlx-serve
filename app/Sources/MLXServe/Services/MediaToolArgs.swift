@@ -243,7 +243,7 @@ enum MediaToolArgs {
     }
 
     static func image(_ args: [String: String], model: ImageModelPreset,
-                      saved: ResolutionOption, seed: Int, safeMode: Bool,
+                      saved: ResolutionOption, seed: Int,
                       keepResident: Bool, lanId: String?) throws -> ImageGenRequest {
         let prompt = try required(args, "prompt", tool: "generate_image",
                                   example: #"{"prompt": "a red fox in the snow at golden hour"}"#)
@@ -255,7 +255,7 @@ enum MediaToolArgs {
         return ImageGenRequest(
             model: model, prompt: prompt, seed: seed,
             width: resolution.width, height: resolution.height, steps: steps,
-            keepResident: keepResident, lanModelId: lanId, safeMode: safeMode)
+            keepResident: keepResident, lanModelId: lanId)
     }
 
     // MARK: - Speech

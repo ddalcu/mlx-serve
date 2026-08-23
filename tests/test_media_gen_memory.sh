@@ -50,7 +50,7 @@ gen() { # WxH -> "" on success, "ERR <code>" otherwise
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 900 \
     -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"a lighthouse\",\"size\":\"$1\",\"steps\":4,\"seed\":1,\"safety\":false}")
+    -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"a lighthouse\",\"size\":\"$1\",\"steps\":4,\"seed\":1}")
   [ "$code" = "200" ] || echo "ERR $code"
 }
 unload() {

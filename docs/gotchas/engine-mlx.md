@@ -3970,3 +3970,56 @@ between reps (w6 11.9 -> 18.9) and the chooser walking down to w3: a MoE
 verify reads whatever experts the block's positions route to, so its
 per-width cost is content-dependent and the cells are far noisier than a
 dense trunk's. The chooser stays opt-in; MoE targets need their own bar.
+
+## The MTP sidecar loader was affine-only (2026-08-23, 26.8.10)
+
+Staging a cross-engine benchmark turned up something we had never had a reason
+to try: **Ollama's MLX tags are nvfp4 g16**, not affine. `qwen3.5:4b-mlx` and
+`qwen3.8:27b-mlx` both carry `{"quant_type": "nvfp4", "group_size": "16"}` in
+their tensor blob metadata, and Ollama publishes no affine MLX variant at all —
+only `-mlx` (nvfp4) and `-mlx-bf16`. So the only quantization scheme every
+engine in the comparison could share was nvfp4.
+
+We have read nvfp4 trunks since #24. The MTP head could not:
+
+```
+[mtp] missing tensor: mtp.fc.biases
+Failed to load MTP sidecar: MissingMtpWeight — disabled.
+```
+
+Two hardcoded affine assumptions, one behind the other:
+
+1. `mtp.loadLinear` returned `(weight, scales, biases)` whenever a `.scales`
+   key existed, through `ownWeight`, which errors on a missing key. Affine is
+   the only mode whose checkpoints carry per-group biases — every fp mode
+   stores an fp8-encoded `uint8` scales tensor and nothing else — so the whole
+   head failed at load on any fp checkpoint. `loadLinearRaw`, one function
+   over, had used the optional getter all along.
+2. `mtp.qLinearFwd` passed the literal `"affine"` to `mlx_quantized_matmul`
+   and solved geometry through `affineParamsFromGeometry`, which only accepts
+   group sizes 32/64/128 and so rejects nvfp4's 16 outright. Even with the
+   weights loaded, the first forward would have thrown inside MLX.
+
+The fix is `transformer.quantParamsFromGeometry(w, scales, biases_present,
+in_dim)`: a sidecar file carries weights and nothing else — no config to
+consult — so bits, group size and mode are solved from packed geometry alone,
+separated on exactly the evidence `computeQuantParams` already used (biases
+present, or non-`uint8` scales, means affine; otherwise the fp family, split by
+the (bits, group_size) table). `MtpModel.quant_mode` is resolved at load off
+`q_proj`, per-weight modes still resolve individually in the forward, and the
+verify lanes are gated to affine because those kernels unpack affine
+scales/biases.
+
+Measured on M4 Max, Qwen3.8-27B nvfp4, decode **29.2 → 61.7 tok/s** — a 2.1x
+that was unreachable on any nvfp4 pack before. `[spec-stats] mode=mtp
+attempts=112 accepts=188 avg_per_round=1.68 per_draft_pct=66.7%`.
+
+The guard runs the whole fp family (nvfp4 g16, mxfp4 g32, mxfp8 g32), not just
+the mode that shipped broken: all three are bias-less on identical grounds, so
+covering one and not the others would leave the same bug waiting behind two
+other checkpoint spellings.
+
+Worth noting what the symptom looked like from outside: nothing. The server
+booted, answered correctly, and logged one line about a disabled sidecar in the
+middle of a normal startup. A benchmark reading "26.8.9 and 26.8.10 are the
+same speed" would have been the only other evidence.

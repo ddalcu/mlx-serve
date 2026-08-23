@@ -3761,7 +3761,26 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 gen_req = sch.gen_queue.orderedRemove(0);
             }
         }
-        for (cleanup_batch[0..cleanup_n]) |s| s.deinit();
+        for (cleanup_batch[0..cleanup_n]) |s| {
+            // Decode-phase cancel: `complete()` pulled this slot straight
+            // into the cleanup queue, so it never went through finishSlot
+            // and its committed KV (prompt + every emitted token) would die
+            // right here with the slot. Commit it first — the same guards
+            // as a normal finish apply inside (pad-only / error / vision /
+            // empty all decline) — then flush what was committed to the
+            // SSD tier, since no finishSlot will. Normally-finished slots
+            // arrive here with `finished` already set (finishSlot committed
+            // them) and skip; errored slots decline via the error guard.
+            // Runs on the inference thread — the sole mlx caller — which is
+            // what makes the refcount-sharing snapshot legal here.
+            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+                commitSlotIfApplicable(sch, s);
+                if (s.model.prefix_cache) |*hc| {
+                    if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
+                }
+            }
+            s.deinit();
+        }
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
@@ -4284,11 +4303,27 @@ fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
 fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
-    if (slot.was_pad_only) return;
     if (slot.error_code != null) return;
     if (slot.vision_embeddings != null) return;
-    const gen_ptr = if (slot.legacy_gen) |*g| g else return;
-    if (gen_ptr.generated_ids.items.len == 0) return;
+    const gen_ptr = if (slot.legacy_gen) |*g| g else {
+        // A Generator-less slot whose cache is non-empty is a prefill the
+        // client disconnected from mid-chunk-loop: initWithOptions threw
+        // error.Cancelled before `slot.legacy_gen = gen` ever ran, but every
+        // chunk that DID forward still lives in slot.cache. Commit that
+        // forwarded prefix instead of dropping it. This arm sits ABOVE the
+        // pad-only guard: `was_pad_only` starts true and only flips on the
+        // first pushed token, so a slot that never pushed one is not
+        // pad-POISONED, it is merely empty.
+        return commitCancelledPrefillSlot(slot, hc);
+    };
+    const n_gen = gen_ptr.generated_ids.items.len;
+    if (n_gen > 0 and slot.was_pad_only) return;
+    // Zero emitted tokens is worth committing only when the client cancelled
+    // between prefill completion and the first token: the KV holds exactly
+    // the prompt (cache.step == prompt_len) and the next identical request
+    // skips the whole prefill. A normally-finished empty generation is the
+    // old no-op.
+    if (n_gen == 0 and !slot.cancelled.load(.acquire)) return;
 
     // Construct the full token sequence: the original prompt + everything
     // generated this turn. The cache reflects exactly this state — Generator
@@ -4348,6 +4383,41 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             a.free(cps);
         }
     };
+}
+
+/// Logical committed length for a cancelled-prefill commit: the tokens
+/// actually forwarded into the KV when the chunk loop aborted, clamped to
+/// the prompt and gated on the floor below which an entry is LRU pollution
+/// rather than saved work. Pure so the policy is unit-testable without a slot.
+fn cancelledPrefillCommitLen(step: usize, prompt_len: usize) ?usize {
+    const len = @min(step, prompt_len);
+    if (len < prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS) return null;
+    return len;
+}
+
+/// Commit the forwarded prefix of a prefill the client disconnected from
+/// (error.Cancelled out of `Generator.initWithOptions`; `legacy_gen` was
+/// never assigned). The partial KV in `slot.cache` is valid — every chunk
+/// that ran was a real forward — so the next request sharing this prefix
+/// skips exactly those chunks. The entry key is the forwarded prefix ONLY:
+/// `full_prompt` beyond `cache.step` was never forwarded and must not ride
+/// the key (a key longer than its KV is the alignment-error class).
+///
+/// Hybrids are excluded: their stride SSM checkpoints die with the failed
+/// Generator init, and a checkpoint-less hybrid entry restores as a cold
+/// miss ("hybrid miss") while still occupying an LRU slot — strictly worse
+/// than not committing. decode-phase cancels keep their checkpoints (the
+/// Generator is alive and `takeSsmCheckpoints` still works) and commit
+/// through the normal arm above.
+fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache) void {
+    if (slot.ssm_entries != null) return;
+    const step: usize = @intCast(slot.cache.step);
+    const len = cancelledPrefillCommitLen(step, slot.full_prompt.len) orelse return;
+    hc.commit(&slot.cache, slot.full_prompt[0..len], slot.has_tools) catch |err| {
+        log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ len, slot.full_prompt.len });
 }
 
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
@@ -5574,6 +5644,70 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "cancelled-prefill commit length: floor, clamp, and zero" {
+    // A cancelled prefill only pays its way into the LRU once the forwarded
+    // prefix is past the chat-template-prologue class (~dozens of tokens);
+    // below the floor the entry is pollution, not saved work.
+    try testing.expect(cancelledPrefillCommitLen(0, 1000) == null);
+    try testing.expect(cancelledPrefillCommitLen(1, 1000) == null);
+    try testing.expect(cancelledPrefillCommitLen(255, 1000) == null);
+    try testing.expectEqual(@as(?usize, 256), cancelledPrefillCommitLen(256, 1000));
+    try testing.expectEqual(@as(?usize, 300), cancelledPrefillCommitLen(300, 1000));
+    // cache.step can never exceed the prompt (restore clamps to matched and
+    // chunks stop at the tail); clamp defensively anyway so a bad step can
+    // never key tokens the KV does not hold.
+    try testing.expectEqual(@as(?usize, 1000), cancelledPrefillCommitLen(5000, 1000));
+    // A short prompt is not worth an entry at any step.
+    try testing.expect(cancelledPrefillCommitLen(50, 50) == null);
+}
+
+test "the cleanup drain commits a cancelled slot before deinit" {
+    // Class guard: a decode-phase cancel is pulled straight into the cleanup
+    // queue by `complete()` and NEVER passes through finishSlot — without a
+    // commit in the drain, its prompt+generated KV dies with the slot. The
+    // commit must run BEFORE deinit (the snapshot refcount-shares live
+    // buffers; after deinit they are freed).
+    const source = @embedFile("scheduler.zig");
+    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
+    const region = source[drain_start..@min(drain_start + 1600, source.len)];
+    const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
+    const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
+    try testing.expect(commit_pos < deinit_pos);
+    // The SSD tier has no finishSlot flush on this path — the drain must
+    // flush what it just committed itself.
+    try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
+    // Prefill abort: `Generator.initWithOptions` throws error.Cancelled from
+    // its chunk loop, so `slot.legacy_gen` is never assigned — the legacy
+    // `else return` silently dropped every chunk that DID forward. The
+    // cancelled-prefill arm must be reachable from commitSlotIfApplicable,
+    // and hybrids are excluded inside it (their stride checkpoints die with
+    // the failed Generator init; a checkpoint-less hybrid entry restores as
+    // a cold miss while still occupying an LRU slot).
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    const route_pos = std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") orelse return error.MissingRoute;
+    // `was_pad_only` initializes TRUE and only flips on the first pushed
+    // token, so a guard on it ABOVE the Generator-less arm makes that arm
+    // unreachable (live 2026-08-22: "prefill aborted" logged, nothing
+    // committed, full re-prefill on retry).
+    const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
+    try testing.expect(route_pos < pad_pos);
+    // A cancel landing between prefill completion and the first token has a
+    // live Generator with zero emitted tokens and a KV holding the prompt.
+    try testing.expect(std.mem.indexOf(u8, body, "n_gen == 0 and !slot.cancelled") != null);
+
+    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
+    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
+    const cp_body = source[cp_start..cp_end];
+    try testing.expect(std.mem.indexOf(u8, cp_body, "ssm_entries != null") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "cancelledPrefillCommitLen") != null);
 }
 
 test "DFlash gate policy follows effective block width and resolved thinking" {

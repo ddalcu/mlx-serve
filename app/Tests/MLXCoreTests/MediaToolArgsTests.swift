@@ -104,7 +104,7 @@ final class MediaToolArgsTests: XCTestCase {
         let req = try! MediaToolArgs.image(["prompt": "a fox"],
                                            model: .mageFlowTurbo8bit,
                                            saved: ImageModelPreset.mageFlowTurbo8bit.defaultResolution,
-                                           seed: -1, safeMode: true, keepResident: false, lanId: nil)
+                                           seed: -1, keepResident: false, lanId: nil)
         XCTAssertEqual(req.steps, ImageModelPreset.mageFlowTurbo8bit.fixedSteps)
     }
 
@@ -112,7 +112,7 @@ final class MediaToolArgsTests: XCTestCase {
         let m = ImageModelPreset.flux2Klein4B_Q4
         let req = try! MediaToolArgs.image(["prompt": "a fox"], model: m,
                                            saved: m.defaultResolution,
-                                           seed: -1, safeMode: true, keepResident: false, lanId: nil)
+                                           seed: -1, keepResident: false, lanId: nil)
         XCTAssertEqual(req.steps, m.settings(MediaChatDefaults.imageQuality).steps)
         XCTAssertEqual(req.prompt, "a fox")
     }
@@ -121,7 +121,7 @@ final class MediaToolArgsTests: XCTestCase {
         XCTAssertThrowsError(try MediaToolArgs.image(["size": "1024x1024"],
                                                      model: .flux2Klein4B_Q4,
                                                      saved: ImageModelPreset.flux2Klein4B_Q4.defaultResolution,
-                                                     seed: -1, safeMode: true, keepResident: false, lanId: nil)) { err in
+                                                     seed: -1, keepResident: false, lanId: nil)) { err in
             XCTAssertTrue("\(err)".contains("prompt"), "\(err)")
         }
     }

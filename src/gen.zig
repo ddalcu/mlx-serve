@@ -19,7 +19,6 @@ const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
-const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
@@ -698,77 +697,6 @@ pub fn clampFluxDim(v: u32) u32 {
 fn clampKreaDim(v: u32) u32 {
     const rounded = ((v + 15) / 16) * 16;
     return std.math.clamp(rounded, 256, 2048);
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// NSFW content filter (Krea 2 Community License §4.2). A single shared classifier
-// (Falconsai ViT, src/nsfw.zig) is lazy-loaded once from ~/.mlx-serve/models and
-// applied to EVERY generated image (FLUX + Krea). On by default; `--no-safety`
-// or per-request `"safety": false` disables it. FAILS OPEN: if the classifier
-// isn't downloaded/loadable, image gen proceeds unfiltered (with a warning).
-// Loaded + run on the inference thread (the sole mlx caller) — gen is serial
-// there, so the lazy-init singleton needs no lock.
-// ════════════════════════════════════════════════════════════════════════
-
-const NSFW_REPO_DIR = "Falconsai/nsfw_image_detection";
-var g_nsfw: ?nsfw.Classifier = null;
-var g_nsfw_tried: bool = false;
-
-/// Locate the auto-downloaded classifier dir under ~/.mlx-serve/models (must
-/// contain model.safetensors), or null (→ fail open).
-fn resolveNsfwDir(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return null);
-    const dir = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, NSFW_REPO_DIR }) catch return null;
-    const marker = std.fmt.allocPrint(allocator, "{s}/model.safetensors", .{dir}) catch {
-        allocator.free(dir);
-        return null;
-    };
-    defer allocator.free(marker);
-    if (std.Io.Dir.openFileAbsolute(io, marker, .{})) |f| {
-        f.close(io);
-        return dir; // caller owns
-    } else |_| {
-        allocator.free(dir);
-        return null;
-    }
-}
-
-/// Lazy-load the shared classifier (once). Returns null on the fail-open path
-/// (model missing or load error) — logged once.
-fn ensureNsfwClassifier(io: std.Io, allocator: std.mem.Allocator) ?*nsfw.Classifier {
-    if (g_nsfw_tried) return if (g_nsfw) |*c| c else null;
-    g_nsfw_tried = true;
-    const dir = resolveNsfwDir(allocator, io) orelse {
-        log.warn("[image] content filter ON but classifier not found at ~/.mlx-serve/models/{s} — failing OPEN (images NOT filtered). Download it to enable.\n", .{NSFW_REPO_DIR});
-        return null;
-    };
-    defer allocator.free(dir);
-    g_nsfw = nsfw.load(io, allocator, dir) catch |err| {
-        log.warn("[image] NSFW classifier load failed ({s}) — failing OPEN (images NOT filtered)\n", .{@errorName(err)});
-        g_nsfw = null;
-        return null;
-    };
-    log.info("[image] NSFW content filter ready (Falconsai ViT)\n", .{});
-    return if (g_nsfw) |*c| c else null;
-}
-
-/// P(nsfw) threshold above which a generated image is blocked. Default 0.5;
-/// operators can tune via `MLX_SERVE_NSFW_THRESHOLD` (stricter = lower).
-fn nsfwThreshold() f32 {
-    if (std.c.getenv("MLX_SERVE_NSFW_THRESHOLD")) |v| {
-        return std.fmt.parseFloat(f32, std.mem.span(v)) catch nsfw.NSFW_THRESHOLD;
-    }
-    return nsfw.NSFW_THRESHOLD;
-}
-
-/// True if the request explicitly opts out of the content filter via
-/// `"safety": false`.
-fn bodyDisablesSafety(body: []const u8) bool {
-    const pat = "\"safety\"";
-    const ki = std.mem.indexOf(u8, body, pat) orelse return false;
-    var i = ki + pat.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
-    return std.mem.startsWith(u8, body[i..], "false");
 }
 
 /// The audio modality hosts MULTIPLE architectures (the `ImageBackend`
@@ -1787,7 +1715,7 @@ fn ltxPadWithBos(allocator: std.mem.Allocator, enc: []const u32, bos: i32, pad_l
 // ════════════════════════════════════════════════════════════════════════
 
 /// POST /v1/images/generations — base64 PNG (or SSE progress + complete).
-pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
+pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
@@ -2034,26 +1962,6 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     };
     defer _ = mlx.mlx_array_free(img);
 
-    // Content filter (Krea license §4.2; on by default, `--no-safety` /
-    // `"safety":false` to disable). Run the NSFW classifier on the generated
-    // pixels; if flagged, refuse. Fail OPEN if the classifier is unavailable.
-    if (server_mod.image_safety_filter and !bodyDisablesSafety(body)) {
-        if (ensureNsfwClassifier(io, allocator)) |clf| {
-            const p_nsfw = clf.classify(img) catch |err| blk: {
-                log.warn("[image] classifier error ({s}) — failing OPEN\n", .{@errorName(err)});
-                break :blk @as(f32, 0);
-            };
-            if (p_nsfw > nsfwThreshold()) {
-                log.warn("[image] output blocked by content filter (P(nsfw)={d:.3})\n", .{p_nsfw});
-                if (want_stream) {
-                    sse.sendError(conn, "generated image blocked by the content filter");
-                    return;
-                }
-                return sendError(conn, 400, "generated image blocked by the content filter (set \"safety\":false or run with --no-safety to override)");
-            }
-        }
-    }
-
     const png_bytes = try engine.toPng(allocator, img);
     defer allocator.free(png_bytes);
 
@@ -2258,12 +2166,16 @@ pub fn instrumentalConflicts(instrumental: bool, lyrics: []const u8) bool {
     return instrumental and std.mem.trim(u8, lyrics, " \t\r\n").len != 0;
 }
 
-/// `POST /v1/audio/music-generations` — ACE-Step text2music.
+/// `POST /v1/audio/music-generations` — ACE-Step text2music / cover / complete.
 /// `{"model", "prompt" (style/genre/mood, REQUIRED), "lyrics" ("" →
 /// "[Instrumental]"), "instrumental" (bool, the explicit spelling of empty
 /// lyrics; a 400 if real lyrics ride along), "vocal_language" ("en"), "bpm", "keyscale",
 /// "timesignature", "duration_seconds" (default 60, valid 10–600), "seed",
-/// "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
+/// "ref_audio" (base64 WAV, style/timbre), "task" ("text2music" | "cover" |
+/// "complete"), "src_audio" (base64 WAV 10–600 s, the cover/complete source;
+/// its length becomes the track length), "cover_strength" (0–1, default 1),
+/// "cover_noise_strength" (0–1, default 0), "track_classes" (complete: array
+/// from the TRACK_NAMES vocabulary), "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
 /// non-stream; SSE `progress` per stage/step + a base64 `complete` event when
 /// streaming. Targeting a TTS voice model here is an explicit 400.
 pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
@@ -2308,8 +2220,98 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
         return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
+    // `task`: text2music (default) | cover | complete (vocal-to-BGM). The task
+    // is the DiT's context stream + the instruction line; cover/complete read
+    // a full-length `src_audio`, whose latent decides the track length.
+    var task: acestep.Task = .text2music;
+    if (extractJsonString(body, "task")) |raw| {
+        task = std.meta.stringToEnum(acestep.Task, raw) orelse return sendError(conn, 400, "'task' must be one of text2music, cover, complete");
+    }
+    const cover_strength: f32 = @floatCast(extractJsonFloat(body, "cover_strength") orelse 1.0);
+    const cover_noise_strength: f32 = @floatCast(extractJsonFloat(body, "cover_noise_strength") orelse 0.0);
+    if (cover_strength < 0.0 or cover_strength > 1.0 or cover_noise_strength < 0.0 or cover_noise_strength > 1.0)
+        return sendError(conn, 400, "'cover_strength' and 'cover_noise_strength' must be in [0,1]");
+    if (task != .cover and (extractJsonFloat(body, "cover_strength") != null or extractJsonFloat(body, "cover_noise_strength") != null))
+        return sendError(conn, 400, "'cover_strength' / 'cover_noise_strength' only apply to task \"cover\"");
+    var track_classes: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(track_classes);
+    if (iterJsonStringArray(body, "track_classes")) |it0| {
+        if (task != .complete) return sendError(conn, 400, "'track_classes' only applies to task \"complete\"");
+        var it = it0;
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(allocator);
+        while (it.next()) |n| try names.append(allocator, n);
+        if (it.bad) return sendError(conn, 400, "'track_classes' must be an array of strings");
+        allocator.free(track_classes);
+        track_classes = acestep.joinTrackClasses(allocator, names.items) catch
+            return sendError(conn, 400, "'track_classes' entries must be from: woodwinds, brass, fx, synth, strings, percussion, keyboard, guitar, bass, drums, backing_vocals, vocals");
+    }
+    if (task == .cover and !music.fsqAvailable())
+        return sendError(conn, 400, "task \"cover\" needs fsq.safetensors beside model.safetensors (this pack predates cover mode — re-download it, or fetch fsq.safetensors from the HF mirror into the model folder)");
+
+    // `src_audio`: the cover / complete SOURCE as a base64 WAV, full length
+    // (10–600 s, NOT windowed like ref_audio). Named 400s, never a silent
+    // text2music downgrade.
+    var src_audio: ?mlx.mlx_array = null;
+    defer if (src_audio) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    if (extractJsonString(body, "src_audio")) |raw_src| {
+        const b64 = try jsonUnescape(allocator, raw_src);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            if (task == .text2music) return sendError(conn, 400, "'src_audio' needs task \"cover\" or \"complete\" (text2music takes 'ref_audio' for style)");
+            const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "src_audio: invalid base64");
+            defer allocator.free(wav_bytes);
+            const dec = wav_mod.decode(allocator, wav_bytes) catch return sendError(conn, 400, "src_audio: expected a PCM16/PCM24/float32 WAV");
+            defer allocator.free(dec.pcm);
+            const secs = (dec.pcm.len / dec.channels) / dec.sample_rate;
+            if (secs < acestep.MIN_DURATION_S) return sendError(conn, 400, "src_audio: clip too short (needs at least 10 s)");
+            if (secs > acestep.MAX_DURATION_S) return sendError(conn, 400, "src_audio: clip longer than 600 s");
+            const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+            defer allocator.free(stereo);
+            const at48k = try wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, music.cfg.sample_rate);
+            defer allocator.free(at48k);
+            const n: c_int = @intCast(at48k.len / 2);
+            src_audio = mlx.mlx_array_new_data(at48k.ptr, &[_]c_int{ 1, n, 2 }, 3, .float32);
+            log.info("[music] source audio: {d}s {d} Hz {d}ch clip for task {s}\n", .{ secs, dec.sample_rate, dec.channels, @tagName(task) });
+        }
+    }
+    if (task != .text2music and src_audio == null)
+        return sendError(conn, 400, "task \"cover\" / \"complete\" needs 'src_audio' (base64 WAV of the source track)");
+
+    // `ref_audio` (#259): a base64 WAV whose style/timbre the track should
+    // follow. Fills the condition encoder's timbre slot (VAE latent mean of a
+    // 30 s window, `acestep.referenceWindow`) instead of the silence latent.
+    // NOT graceful (the a2vid rule): the user asked for THIS clip, so a silent
+    // text2music downgrade is a wrong result — named 400s instead.
+    var ref_audio: ?mlx.mlx_array = null;
+    defer if (ref_audio) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    if (extractJsonString(body, "ref_audio")) |raw_ref| {
+        const b64 = try jsonUnescape(allocator, raw_ref);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio: invalid base64");
+            defer allocator.free(wav_bytes);
+            const dec = wav_mod.decode(allocator, wav_bytes) catch return sendError(conn, 400, "ref_audio: expected a PCM16/PCM24/float32 WAV");
+            defer allocator.free(dec.pcm);
+            if (dec.pcm.len / dec.channels < dec.sample_rate) return sendError(conn, 400, "ref_audio: clip too short (needs at least 1 s)");
+            const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+            defer allocator.free(stereo);
+            const at48k = try wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, music.cfg.sample_rate);
+            defer allocator.free(at48k);
+            const window = try acestep.referenceWindow(allocator, at48k, music.cfg.sample_rate);
+            defer allocator.free(window);
+            const n: c_int = @intCast(window.len / 2);
+            ref_audio = mlx.mlx_array_new_data(window.ptr, &[_]c_int{ 1, n, 2 }, 3, .float32);
+            log.info("[music] reference audio: {d:.1}s {d} Hz {d}ch clip -> 30 s timbre window\n", .{ @as(f32, @floatFromInt(dec.pcm.len / dec.channels)) / @as(f32, @floatFromInt(dec.sample_rate)), dec.sample_rate, dec.channels });
+        }
+    }
+
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[music] generating {d}s seed={d} lyrics={d}ch instrumental={} stream={}\n", .{ duration, seed, cond_lyrics.len, instrumental, want_stream });
+    log.info("[music] generating {d}s task={s} seed={d} lyrics={d}ch instrumental={} ref_audio={} src_audio={} stream={}\n", .{ duration, @tagName(task), seed, cond_lyrics.len, instrumental, ref_audio != null, src_audio != null, want_stream });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -2323,6 +2325,12 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
         .timesignature = timesignature,
         .duration_s = duration,
         .seed = seed,
+        .ref_audio = ref_audio,
+        .task = task,
+        .src_audio = src_audio,
+        .cover_strength = cover_strength,
+        .cover_noise_strength = cover_noise_strength,
+        .track_classes = track_classes,
     };
     const wav = music.generateWav(allocator, req, prog) catch |err| {
         log.err("[music] generation failed: {}\n", .{err});
@@ -2396,6 +2404,12 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     }
     if (instrumentalConflicts(instrumental, lyrics))
         return sendError(conn, 400, "'instrumental' is true but 'lyrics' is non-empty — send one or the other");
+    if (extractJsonString(body, "ref_audio")) |raw| if (raw.len > 0)
+        return sendError(conn, 400, "'ref_audio' is not supported by this model (MiniMax Music 3 takes no reference audio) — it is an ACE-Step field");
+    if (extractJsonString(body, "src_audio")) |raw| if (raw.len > 0)
+        return sendError(conn, 400, "'src_audio' is not supported by this model (MiniMax Music 3 has no cover / complete mode) — it is an ACE-Step field");
+    if (extractJsonString(body, "task")) |raw| if (!std.mem.eql(u8, raw, "text2music"))
+        return sendError(conn, 400, "'task' is not supported by this model (MiniMax Music 3 is text2music only) — cover / complete are ACE-Step tasks");
     if (!instrumental and std.mem.trim(u8, lyrics, " \t\r\n").len == 0)
         return sendError(conn, 400, "missing 'lyrics' (MiniMax Music 3 is lyric-conditioned; structure tags like [verse] go on their own lines, or send \"instrumental\": true)");
     const cond_lyrics = music3.resolveLyrics(instrumental, lyrics);
@@ -3294,6 +3308,39 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         }
     }
 
+    // Last-frame anchor (#260): `last_frame_image` pins the LAST latent frame
+    // the same way. NOT graceful — the user asked for this ending, so a silent
+    // text-to-video downgrade is a wrong result: named 400s instead. The
+    // two-stage half-grid pair mirrors the first-frame one.
+    var last_img: ?mlx.mlx_array = null;
+    defer if (last_img) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    var last_img_half: ?mlx.mlx_array = null;
+    defer if (last_img_half) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    if (extractJsonString(body, "last_frame_image")) |raw_img| {
+        const b64 = try jsonUnescape(allocator, raw_img);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            const ve = if (engine.vae_encoder) |*e| e else return sendError(conn, 400, "last frame conditioning needs vae_encoder.safetensors — download it into the model dir");
+            const img_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "last_frame_image: invalid base64");
+            defer allocator.free(img_bytes);
+            if (num_frames < 9) return sendError(conn, 400, "last_frame_image needs at least 9 frames (one latent frame cannot hold an anchor and still generate)");
+            const enc_h = (height / 32) * 32;
+            const enc_w = (width / 32) * 32;
+            last_img = decodeImageToBCFHW(allocator, img_bytes, enc_h, enc_w, engine.s) orelse return sendError(conn, 400, "last_frame_image: expected a PNG/JPEG image");
+            if (pipeline != .one_stage) {
+                const half_h = ((height / 2) / 32) * 32;
+                const half_w = ((width / 2) / 32) * 32;
+                last_img_half = decodeImageToBCFHW(allocator, img_bytes, half_h, half_w, engine.s) orelse return sendError(conn, 400, "last_frame_image: expected a PNG/JPEG image");
+            }
+            enc_ptr = ve;
+            log.info("[video] last frame anchor {d}x{d}\n", .{ enc_h, enc_w });
+        }
+    }
+
     // `decoder`: which VAE turns the final latent into pixels. Default is the
     // conv `vae_decoder` we have always shipped; `diffusion` is LTX's own
     // DiffVAE, which their published clips are decoded with and which only the
@@ -3320,7 +3367,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             // Run the schedule the loaded variant was trained for; the request
             // never forces a swap here (dev-only bundles keep working).
             const distilled = engine.transformer_variant == .distilled;
-            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, enc_ptr, cond_img, last_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
         .two_stage, .two_stage_hq => blk: {
             engine.ensureTransformer(.dev) catch |err| break :blk err;
@@ -3333,7 +3380,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = Stage2Swap.swap,
             };
-            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, &engine.vae_encoder.?, cond_img_half, cond_img, last_img_half, last_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
         if (err == error.Cancelled) {
@@ -3341,6 +3388,13 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             // denoise loop aborted; nothing to write, the socket is dead.
             log.info("[video] generation cancelled — client disconnected\n", .{});
             return;
+        }
+        if (err == error.KeyframeCanvasTooShort) {
+            if (want_stream) {
+                conn.writeAll("data: {\"type\":\"error\",\"message\":\"keyframes need at least 9 frames\"}\n\n") catch {};
+                return;
+            }
+            return sendError(conn, 400, "keyframes need at least 9 frames (one latent frame cannot hold an anchor and still generate)");
         }
         log.err("[video] generation failed: {}\n", .{err});
         if (want_stream) {
@@ -4508,13 +4562,6 @@ test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR workin
     var empty = std.testing.tmpDir(.{ .iterate = true });
     defer empty.cleanup();
     try std.testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, empty.dir, "minimax_music3"));
-}
-
-test "bodyDisablesSafety detects per-request opt-out" {
-    try testing.expect(bodyDisablesSafety("{\"prompt\":\"x\",\"safety\":false}"));
-    try testing.expect(bodyDisablesSafety("{\"safety\": false }"));
-    try testing.expect(!bodyDisablesSafety("{\"prompt\":\"x\",\"safety\":true}"));
-    try testing.expect(!bodyDisablesSafety("{\"prompt\":\"x\"}"));
 }
 
 test "parseSize parses WxH and rejects garbage" {

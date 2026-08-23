@@ -168,7 +168,14 @@ enum ModelUseState: Equatable {
 struct LocalModelGroup: Identifiable {
     let source: LocalModelSource
     let models: [LocalModel]
-    var id: String { source.rawValue }
+    /// Broken folders are grouped by their DEFECT, not by which tool's folder
+    /// they happen to sit in — they are not that tool's models, and padding a
+    /// tool's section with junk misreports what you have.
+    var isDefectGroup: Bool = false
+    var id: String { isDefectGroup ? "defect" : source.rawValue }
+    var title: String {
+        isDefectGroup ? ModelBrowserUse.defectGroupTitle : ModelBrowserUse.groupTitle(source)
+    }
 }
 
 /// Pure helpers for the "what do I already have, and can I load it?" side of
@@ -210,13 +217,19 @@ enum ModelBrowserUse {
     /// sections (`StatusMenuView`), which is the point — the old "Downloaded"
     /// tab filtered to `.mlxServe` only and so never matched what you could
     /// actually select.
-    static let sourceOrder: [LocalModelSource] = [.mlxServe, .lmStudio, .huggingFace, .custom]
+    static let sourceOrder: [LocalModelSource] = [.mlxServe, .lmStudio, .huggingFace, .mtplx, .osaurus, .custom]
+
+    /// Heading for the broken-folder group. Names the two things it holds —
+    /// folders that cannot load, and downloads that never finished.
+    static let defectGroupTitle = "Incomplete & Orphaned"
 
     static func groupTitle(_ source: LocalModelSource) -> String {
         switch source {
         case .mlxServe:    return "Downloaded by MLX Core"
-        case .lmStudio:    return "Other Discovered Models"
+        case .lmStudio:    return "LM Studio Models"
         case .huggingFace: return "Hugging Face Cache"
+        case .mtplx:       return LocalModelSource.mtplx.sectionTitle
+        case .osaurus:     return LocalModelSource.osaurus.sectionTitle
         case .custom:      return "Custom Folder"
         }
     }
@@ -229,9 +242,16 @@ enum ModelBrowserUse {
             ? models
             : models.filter { $0.name.localizedCaseInsensitiveContains(needle) }
 
-        return sourceOrder.compactMap { source in
-            let bucket = matching.filter { $0.source == source }
+        var out = sourceOrder.compactMap { source -> LocalModelGroup? in
+            let bucket = matching.filter { $0.source == source && $0.defect == nil }
             return bucket.isEmpty ? nil : LocalModelGroup(source: source, models: bucket)
         }
+        // Last: these are not what you came to pick, but they ARE the reason a
+        // folder you do not recognise is sitting in your library.
+        let broken = matching.filter { $0.defect != nil }
+        if let first = broken.first {
+            out.append(LocalModelGroup(source: first.source, models: broken, isDefectGroup: true))
+        }
+        return out
     }
 }

@@ -62,7 +62,6 @@ struct ImageGenSettings: Codable, Equatable {
     var resolutionId: String = ImageModelPreset.flux2Klein4B_Q4.defaultResolution.id
     var steps: Int = 8
     var seed: Int = -1
-    var safeMode: Bool = true
     var keepResident: Bool = false
     /// img2img renoise strength (the source image path itself is transient —
     /// not persisted, like video's first-frame).
@@ -152,7 +151,6 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(String.self, forKey: .resolutionId) { resolutionId = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .steps) { steps = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .safeMode) { safeMode = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .strength) { strength = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .editMode) { editMode = v }
@@ -180,6 +178,12 @@ struct AudioGenSettings: Codable, Equatable {
     var speed: Double = 1.0
     var temperature: Double = 0.7
     var keepResident: Bool = false
+    /// The DRAFT, not just the knobs: the pane unmounts on every navigation,
+    /// so without these a trip to Chat for a copy-paste wiped the text and
+    /// the attached reference clip (live 2026-08-22).
+    var text: String = ""
+    var refAudioPath: String? = nil
+    var refText: String = ""
 
     private static let storageKey = "audioGenSettings"
 
@@ -213,6 +217,9 @@ extension AudioGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .speed) { speed = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .temperature) { temperature = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .text) { text = v }
+        refAudioPath = try c.decodeIfPresent(String.self, forKey: .refAudioPath)
+        if let v = try c.decodeIfPresent(String.self, forKey: .refText) { refText = v }
     }
 }
 
@@ -236,6 +243,16 @@ struct MusicGenSettings: Codable, Equatable {
     /// Advanced starts OPEN. Collapsed-by-default is why tempo, key, seed and
     /// steps read as missing features — they were one unlabeled chevron away.
     var showAdvanced: Bool = true
+    /// The draft (see `AudioGenSettings.text`).
+    var prompt: String = ""
+    var lyrics: String = ""
+    var refAudioPath: String? = nil
+    /// Source-audio task state (ACE-Step cover / complete), part of the draft.
+    var task: MusicTask = .text2music
+    var srcAudioPath: String? = nil
+    var coverStrength: Double = 1.0
+    var coverNoiseStrength: Double = 0.0
+    var trackClasses: [String] = []
 
     private static let storageKey = "musicGenSettings"
 
@@ -281,6 +298,14 @@ extension MusicGenSettings {
         steps = try c.decodeIfPresent(Int.self, forKey: .steps)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .instrumental) { instrumental = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lyrics) { lyrics = v }
+        refAudioPath = try c.decodeIfPresent(String.self, forKey: .refAudioPath)
+        if let v = try c.decodeIfPresent(MusicTask.self, forKey: .task) { task = v }
+        srcAudioPath = try c.decodeIfPresent(String.self, forKey: .srcAudioPath)
+        if let v = try c.decodeIfPresent(Double.self, forKey: .coverStrength) { coverStrength = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .coverNoiseStrength) { coverNoiseStrength = v }
+        if let v = try c.decodeIfPresent([String].self, forKey: .trackClasses) { trackClasses = v }
     }
 }
 

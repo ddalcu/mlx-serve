@@ -360,9 +360,10 @@ extension MediaBundle {
         )
     }
 
-    /// ACE-Step music (text2music): a flat converted dir — `config.json` +
+    /// ACE-Step music: a flat converted dir — `config.json` +
     /// `model.safetensors` (DiT + condition encoder) + `vae.safetensors`
-    /// (Oobleck) + the `text_encoder/` Qwen3-Embedding subdir. Single
+    /// (Oobleck) + `fsq.safetensors` (cover-mode tokenizer; fetched on demand
+    /// into packs that predate it) + the `text_encoder/` Qwen3-Embedding subdir. Single
     /// self-contained repo, no external-component dependencies (the simplest
     /// bundle yet). Local-convert repos share this factory with any future
     /// published one (readiness checks disk presence either way).
@@ -374,7 +375,7 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true, keepSafetensors: [
-                        "model.safetensors", "vae.safetensors",
+                        "model.safetensors", "vae.safetensors", "fsq.safetensors",
                     ]),
                     readyMarkers: [
                         "config.json", "model.safetensors", "vae.safetensors",

@@ -39,8 +39,8 @@ final class ModelRootsTests: XCTestCase {
         var roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         roots.customRoot = custom
-        let read = roots.readRoots(lmStudioRoot: lms)
-        XCTAssertEqual(read, roots.scanRoots(lmStudioRoot: lms))
+        let read = roots.readRoots(toolRoots: ToolModelRoots(lmStudio: lms))
+        XCTAssertEqual(read, roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: lms)))
         XCTAssertEqual(read.first, dest)
         XCTAssertTrue(read.contains(custom))
         XCTAssertTrue(read.contains(lms))
@@ -94,7 +94,7 @@ final class ModelRootsTests: XCTestCase {
         var roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         roots.customRoot = custom
-        let all = roots.scanRoots(lmStudioRoot: nil)
+        let all = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: nil))
         XCTAssertEqual(all.first, dest)
         XCTAssertTrue(all.contains(custom))
     }
@@ -120,7 +120,7 @@ final class ModelRootsTests: XCTestCase {
         let dest = tempDir("dest")
         var roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
-        let all = roots.scanRoots(lmStudioRoot: nil)
+        let all = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: nil))
         XCTAssertEqual(all.first, dest)
         XCTAssertTrue(all.contains(builtIn),
                       "models downloaded before the move must stay visible")
@@ -148,7 +148,7 @@ final class ModelRootsTests: XCTestCase {
         var roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         roots.customRoot = dest + "/"          // same folder, trailing slash
-        let all = roots.scanRoots(lmStudioRoot: dest)  // and again as LM Studio
+        let all = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: dest))  // and again as LM Studio
         XCTAssertEqual(all.filter { $0 == dest }.count, 1)
         XCTAssertFalse(all.contains("/Volumes/Gone/models"))
         for r in all {
@@ -163,7 +163,7 @@ final class ModelRootsTests: XCTestCase {
         var roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = tempDir("dest")
         roots.customRoot = tempDir("custom")
-        XCTAssertLessThanOrEqual(roots.scanRoots(lmStudioRoot: tempDir("lms")).count, ModelRoots.serverRootLimit)
+        XCTAssertLessThanOrEqual(roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: tempDir("lms"))).count, ModelRoots.serverRootLimit)
         XCTAssertEqual(ModelRoots.serverRootLimit, 8)
     }
 
@@ -327,6 +327,6 @@ final class ModelRootsTests: XCTestCase {
 
         let gated = ModelRoots(defaults: defaults, allowCustomFolders: false)
         XCTAssertEqual(gated.downloadRoot, NSString(string: "~/.mlx-serve/models").expandingTildeInPath)
-        XCTAssertFalse(gated.scanRoots(lmStudioRoot: nil).contains(dir))
+        XCTAssertFalse(gated.scanRoots(toolRoots: ToolModelRoots(lmStudio: nil)).contains(dir))
     }
 }

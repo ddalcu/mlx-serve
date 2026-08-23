@@ -16,16 +16,15 @@ final class MediaGenSettingsTests: XCTestCase {
         s.resolutionId = "1216x832"
         s.steps = 33
         s.seed = 7
-        s.safeMode = false
         s.keepResident = true
         let decoded = try JSONDecoder().decode(ImageGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
     }
 
-    /// Settings saved by an older build still carry `guidance` and
-    /// `negativePrompt` — both retired once it was clear no image backend ever
-    /// read them. The tolerant decoder must ignore the leftovers rather than
-    /// throwing, or every existing user's image settings reset on upgrade.
+    /// Settings saved by an older build still carry `guidance`, `negativePrompt`
+    /// and `safeMode` — all retired. The tolerant decoder must ignore the
+    /// leftovers rather than throwing, or every existing user's image settings
+    /// reset on upgrade.
     func testImageSettingsIgnoresRetiredKeysFromOlderBuilds() throws {
         let legacy = Data("""
         {"modelId":"mflux/flux2-klein-4b-q4","quality":"Quality","resolutionId":"1216x832",
@@ -36,7 +35,6 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(s.steps, 33)
         XCTAssertEqual(s.seed, 7)
         XCTAssertEqual(s.resolutionId, "1216x832")
-        XCTAssertFalse(s.safeMode)
         XCTAssertTrue(s.keepResident)
         XCTAssertEqual(s.strength, 0.4)
         XCTAssertFalse(s.editMode)
@@ -157,11 +155,9 @@ final class MediaGenSettingsTests: XCTestCase {
         var obj = try JSONSerialization.jsonObject(
             with: try JSONEncoder().encode(ImageGenSettings())) as! [String: Any]
         obj.removeValue(forKey: "steps")
-        obj.removeValue(forKey: "safeMode")
         let decoded = try JSONDecoder().decode(
             ImageGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
         XCTAssertEqual(decoded.steps, ImageGenSettings().steps)
-        XCTAssertEqual(decoded.safeMode, ImageGenSettings().safeMode)
     }
 
     func testAudioMigrationSafeDecodeDropsKey() throws {

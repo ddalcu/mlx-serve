@@ -357,6 +357,7 @@ private struct RecommendedModelTableRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+    @State private var card: ModelCardRequest?
 
     /// How this pick's memory requirement fits the Mac's usable budget.
     private var fit: MemoryFit { memory.fit(neededGB: pick.approxRAMNeededGB) }
@@ -395,36 +396,48 @@ private struct RecommendedModelTableRow: View {
     var body: some View {
         HStack(spacing: RecTableMetrics.spacing) {
             // Model — name + tagline; the full blurb is on hover.
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(pick.name)
-                        .font(.callout.weight(.medium))
-                    if isRecommended {
-                        Text("Recommended")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
-                            .foregroundStyle(.tint)
+            Button { card = ModelCardRequest(repoId: pick.repoId, title: pick.name) } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(pick.name)
+                            .font(.callout.weight(.medium))
+                        if isRecommended {
+                            Text("Recommended")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                                .foregroundStyle(.tint)
+                        }
                     }
+                    Text(pick.tagline)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(pick.tagline)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(pick.blurb)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .help(pick.blurb)
 
             // Capability — intelligence over speed.
             MiniCapability(pick: pick)
                 .frame(width: RecTableMetrics.capability, alignment: .leading)
 
-            // Download size (on disk).
-            Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: RecTableMetrics.size, alignment: .trailing)
+            // Download size (on disk) and the quant it buys.
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if let quant = pick.quantLabel {
+                    Text(quant)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: RecTableMetrics.size, alignment: .trailing)
 
             // Memory needed + fit against this Mac's usable budget.
             memoryCell
@@ -437,6 +450,7 @@ private struct RecommendedModelTableRow: View {
         .padding(.horizontal, RecTableMetrics.hPad)
         .padding(.vertical, 9)
         .background(isRecommended ? Color.accentColor.opacity(0.07) : Color.clear)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     /// The memory column: how much RAM the model needs, and a colored badge for
@@ -752,7 +766,7 @@ private struct MyModelsPane: View {
                                 Divider().padding(.horizontal, 12)
                             }
                         } header: {
-                            Text(ModelBrowserUse.groupTitle(group.source))
+                            Text(group.title)
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -925,6 +939,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @State private var confirmDelete = false
+    @State private var card: ModelCardRequest?
 
     private var bundle: MediaBundle { preset.bundle }
     private var isReady: Bool { downloads.bundleReady(bundle) }
@@ -940,6 +955,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
+            Button { card = ModelCardRequest(repoId: bundle.primaryRepo, title: preset.name) } label: {
             VStack(alignment: .leading, spacing: 3) {
                 Text(preset.name)
                     .font(.callout.weight(.medium))
@@ -971,6 +987,9 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                         .lineLimit(1)
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 4) {
@@ -982,6 +1001,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     @ViewBuilder
@@ -1246,10 +1266,12 @@ private struct ModelBrowserRow: View {
     private var isReady: Bool { downloads.isReady(model.id) }
     private var state: DownloadManager.DownloadState? { downloads.downloads[model.id] }
     private var disabled: Bool { !model.isCompatible }
+    @State private var card: ModelCardRequest?
 
     var body: some View {
         HStack(spacing: ModelBrowserMetrics.columnSpacing) {
-            // Model name — takes all remaining space
+            // Model name — takes all remaining space; click opens the card.
+            Button { card = ModelCardRequest(repoId: model.id, title: model.modelName) } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(model.modelName)
                     .font(.callout.weight(.medium))
@@ -1267,6 +1289,9 @@ private struct ModelBrowserRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // Quantization badge
@@ -1332,6 +1357,7 @@ private struct ModelBrowserRow: View {
         .padding(.horizontal, ModelBrowserMetrics.rowPaddingH)
         .padding(.vertical, 6)
         .opacity(disabled ? 0.4 : 1.0)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     private var fitnessColor: Color {
@@ -1735,6 +1761,18 @@ private struct LocalModelRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+    /// Per-row, per-session: clicking the lock arms the trash for THIS row
+    /// only, and a refresh re-locks it. The friction is worth one click; the
+    /// old dead badge was not worth anything.
+    @State private var unlocked = false
+    @State private var card: ModelCardRequest?
+
+    /// nil for a bare folder that maps to no Hugging Face repo.
+    private var cardRequest: ModelCardRequest? {
+        ModelCard.repoId(localName: model.name).map {
+            ModelCardRequest(repoId: $0, title: ModelDisplayName.pretty(model.displayLabel))
+        }
+    }
 
     private var useState: ModelUseState {
         ModelUseState.resolve(
@@ -1743,8 +1781,22 @@ private struct LocalModelRow: View {
         )
     }
 
+    /// Open Finder with the model selected. `path` is the directory for a
+    /// safetensors checkpoint and the FILE for one GGUF quant, and
+    /// `activateFileViewerSelecting` selects either — which is the behaviour
+    /// you want: a quant row reveals its own file, not its repo folder.
+    private func revealInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
+    }
+
+    private func performDelete() {
+        downloads.deleteModel(model, unlocked: unlocked)
+        appState.refreshModels()
+    }
+
     var body: some View {
         HStack(spacing: 8) {
+            Button { card = cardRequest } label: {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     // The READABLE name. `displayLabel` (the repo id, plus a
@@ -1757,6 +1809,17 @@ private struct LocalModelRow: View {
                     // just aren't loadable as a target on their own. Show a
                     // distinct badge instead of the red "unsupported" warning
                     // that the generic check would otherwise render.
+                    // A folder that cannot load says so on the row itself. The
+                    // alternative — hiding it — is how two junk folders sat in
+                    // this library unnoticed while the server registered both.
+                    if let defect = model.defect {
+                        Text(defect.label)
+                            .font(.system(size: 10).weight(.medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.15), in: Capsule())
+                            .help(defect.explanation)
+                    }
                     if model.kind == .drafter {
                         Text("Drafter")
                             .font(.system(size: 10).weight(.medium))
@@ -1777,7 +1840,9 @@ private struct LocalModelRow: View {
                 // the row actually tells the user what the model is — previously
                 // it was just a name and a delete button.
                 HStack(spacing: 6) {
-                    Text(model.metadataSummary)
+                    // For a broken folder the architecture summary is noise —
+                    // what it IS matters less than why it cannot load.
+                    Text(model.defect?.explanation ?? model.metadataSummary)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1807,6 +1872,10 @@ private struct LocalModelRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(cardRequest == nil)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(model.sizeFormatted)
@@ -1837,15 +1906,20 @@ private struct LocalModelRow: View {
                     // pane load it the way it always has.
                     UseMediaModelButton(modality: modality, name: model.name)
                 }
-                if let reason = model.externalReadOnlyReason {
-                    // Read-only: this model lives outside ~/.mlx-serve (LM Studio,
-                    // the HF hub cache, or a user-added custom folder). The app
-                    // loads it but never deletes into another tool's / the user's
-                    // tree, so we surface a badge instead of a trash.
-                    Image(systemName: "externaldrive.badge.icloud")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .help(reason)
+                if ModelRowActions.showsLock(model, unlocked: unlocked) {
+                    // Locked, not read-only. This slot used to hold an `Image`
+                    // of an external-drive/cloud glyph nobody could read, which
+                    // did nothing when clicked. It is a Button now, and clicking
+                    // it is how you get the trash. (The old symbol name is
+                    // deliberately not spelled here — a source scan in
+                    // `ModelRowActionsTests` asserts it is gone from this file.)
+                    Button { unlocked = true } label: {
+                        Image(systemName: "lock")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(ModelRowActions.lockHelp(model))
                 } else {
                     Button {
                         confirmDelete = true
@@ -1855,27 +1929,65 @@ private struct LocalModelRow: View {
                     }
                     .buttonStyle(.plain)
                     .font(.callout)
-                    .help(model.quantFile != nil ? "Delete this quant" : "Delete model")
-                    .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
-                        Button("Cancel", role: .cancel) {}
-                        Button("Delete", role: .destructive) {
-                            downloads.deleteModel(model)
-                            appState.refreshModels()
-                        }
-                        .keyboardShortcut(.defaultAction)
-                    } message: {
-                        // A GGUF row is ONE quant of a repo — deleting it must not
-                        // promise (or perform) the removal of its siblings.
-                        Text(model.quantFile != nil
-                             ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
-                             : "Delete \(model.name)? This will remove all downloaded files.")
-                    }
+                    .help(model.defect != nil
+                          ? "Delete this broken folder"
+                          : (model.quantFile != nil ? "Delete this quant" : "Delete model"))
                 }
+
+                // Reveal in Finder — rightmost, on EVERY row. Six other panes
+                // already had this control; the one pane that is entirely about
+                // files on disk did not, so a model you did not recognise could
+                // not be located from the app that listed it.
+                Button(action: revealInFinder) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .font(.callout)
+                .help(ModelRowActions.revealHelp(model))
             }
-            .frame(width: 120, alignment: .trailing)
+            .frame(width: 150, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        // The alert lives on the ROW so both the trash and the context menu
+        // raise the same confirmation — two delete paths with two dialogs is
+        // two chances to word the consequence differently.
+        .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { performDelete() }
+                .keyboardShortcut(.defaultAction)
+        } message: {
+            Text(ModelRowActions.deleteMessage(model))
+        }
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
+        .contextMenu {
+            if model.isChatPickable, useState == .idle {
+                Button("Use This Model") {
+                    appState.selectedModelPath = model.path
+                }
+            }
+            if cardRequest != nil {
+                Button("Model Details\u{2026}") { card = cardRequest }
+            }
+            Button("Show in Finder", action: revealInFinder)
+            Button("Copy Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.path, forType: .string)
+            }
+            Button("Copy Model ID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.displayLabel, forType: .string)
+            }
+            Divider()
+            if ModelRowActions.showsTrash(model, unlocked: unlocked) {
+                Button("Delete\u{2026}", role: .destructive) { confirmDelete = true }
+            } else {
+                // Same two-step as the lock button: the menu never deletes
+                // another app's model on one click.
+                Button("Unlock to Delete") { unlocked = true }
+            }
+        }
     }
 }
 

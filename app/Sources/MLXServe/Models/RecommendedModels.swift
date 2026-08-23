@@ -113,6 +113,30 @@ struct RecommendedModelPick: Identifiable, Hashable {
 
     var sizeLabel: String { String(format: "~%.1f GB", sizeGB) }
 
+    /// The quant this pick downloads, read off the GGUF filename or the repo
+    /// name ("…-4bit", "…-oQ2e", "…-mixed-2-3-8bit", "…-NVFP4-…"). nil when the
+    /// name carries none.
+    var quantLabel: String? {
+        if let f = ggufFilename { return DownloadManager.quantLabel(forFilename: f) }
+        let name = (repoId as NSString).lastPathComponent
+        if let r = name.range(of: "mixed(-[0-9]+)+bit", options: .regularExpression) {
+            let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
+            return "mixed \(bits.joined(separator: "/"))-bit"
+        }
+        if let r = name.range(of: "iQ-MLX-[0-9.]+bpw", options: .regularExpression) {
+            let bpw = name[r].dropFirst("iQ-MLX-".count).dropLast("bpw".count)
+            return "iQ-MLX \(bpw) bpw"
+        }
+        if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
+            return name[r].dropLast("bit".count) + "-bit"
+        }
+        if let r = name.range(of: "(?<![A-Za-z0-9])(oQ[0-9]+e?|NVFP[0-9]+|MXFP[0-9]+|Q[0-9]_[A-Z0-9_]+)(?![A-Za-z0-9])",
+                              options: .regularExpression) {
+            return String(name[r])
+        }
+        return nil
+    }
+
     // MARK: - Capability bars
     //
     // 0…1 track fills. No number is ever rendered next to them: the scores are
@@ -338,9 +362,9 @@ extension RecommendedModelPick {
         id: "deepseek-v4-flash",
         name: "DeepSeek-V4-Flash",
         tagline: "Frontier model, native MLX",
-        blurb: "A frontier-scale DeepSeek model that runs natively on Apple Silicon through MLX — no GGUF conversion, no llama.cpp — for top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and holds around a million words of context. This is our own mixed 2/3/8-bit conversion, about 118 GB on disk, so it wants a Mac with 128 GB of memory; it also ships DeepSeek's own DSpark draft stages, which Settings can switch on for a faster reply.",
-        repoId: "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit",
-        sizeGB: 117.8,
+        blurb: "A frontier-scale DeepSeek model that runs natively on Apple Silicon through MLX — no GGUF conversion, no llama.cpp — for top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and holds around a million words of context. This is our own iQ-MLX conversion at 3.3 bits per weight, about 130 GB on disk, so it wants a Mac with 128 GB of memory (raise the GPU wired limit and close other apps to fit a useful context); it also ships DeepSeek's own DSpark draft stages, which Settings can switch on for a faster reply on Macs with more than 128 GB.",
+        repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
+        sizeGB: 129.6,
         family: .largest,
         intelligence: 67,
         intelligenceIsEstimated: false,

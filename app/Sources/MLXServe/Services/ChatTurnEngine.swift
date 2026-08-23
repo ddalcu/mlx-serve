@@ -1444,7 +1444,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                             window: "Image", lanId: lanId) { return notice }
         let req = try MediaToolArgs.image(args, model: model,
                                           saved: s.concreteResolution(for: model),
-                                          seed: s.seed, safeMode: s.safeMode,
+                                          seed: s.seed,
                                           keepResident: s.keepResident, lanId: lanId)
         let path = try await appState.imageGen.generateForAgent(req, server: appState.server,
                                                                 onProgress: onProgress)

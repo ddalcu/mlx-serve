@@ -166,7 +166,7 @@ class ServerManager: ObservableObject {
         // `modelsDir` is the caller's primary root; the rest of the library's
         // folders ride along so a headless boot discovers everything the picker
         // shows, not just one folder (`launchModelDirs` de-dups).
-        var dirs = ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+        var dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
         if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
         let args = options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
         launch(args: args, options: options)
@@ -751,7 +751,7 @@ class ServerManager: ObservableObject {
     /// of them.
     nonisolated static func launchModelDirs(selectedModel: String,
                                             roots: [String]? = nil) -> [String] {
-        var dirs = roots ?? ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+        var dirs = roots ?? ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
         let model = (selectedModel as NSString).standardizingPath
         guard !model.isEmpty else { return dirs }
         let covered = dirs.contains { root in

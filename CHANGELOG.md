@@ -10,6 +10,10 @@
 - **LFM 2.5 gets DSpark speed.** Liquid's draft heads run on the 1.2B, 2.6B and the new 8B-A1B MoE — the 2.6B replies 1.4x faster.
 - **Several chats at once, no slowdown.** Concurrent requests on Qwen 3.5/3.6/3.8 decode together: 2.8x total throughput at 4 streams.
 - **Tables render as tables** in chat. Thanks @slava-kudzinau (#216).
+- **Cover a song, or build a track around a vocal.** ACE-Step gained Cover and Vocal to BGM modes plus reference audio for style, all in the Music tab.
+- **Videos that start and end where you say.** LTX takes a last frame next to the first one.
+- **Rewrite with LLM** in the Music tab: the chat model reshapes your style prompt or lyrics to match the loaded model's format, and you edit before applying.
+- **Image content filter removed.** The Safe mode toggle, the `--no-safety` flag and the classifier download are gone. Both are still accepted (`"safety"` in a request, `--no-safety` on the command line) and ignored.
 
 Same models, same Macs, 26.8.9 vs 26.8.10:
 
@@ -63,9 +67,20 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 
 - The release workflow gained a **Pre-release** checkbox: it tags `v<version>-pre-release.1`, `.2`, `.3` instead of `v<version>`, so a build can go out for testing without spending the version number that the real release will use. Still created as a draft, still kept out of Homebrew.
 
+### Media
+
+- **ACE-Step Cover**: drop in a track, describe a new style, and it re-sings the song. Melody and structure stay, the caption and lyrics decide the rest. Cover strength picks how much of the render follows the source; noise strength blends a fresh start in. Needs the new `fsq.safetensors` in the pack; the app fetches it into packs downloaded before this release.
+- **ACE-Step Vocal to BGM**: arrange around a vocal stem (or any single part). Pick the instruments to add, or leave them all off and let the model decide. The new track is exactly as long as the clip, 10 seconds to 10 minutes.
+- **Reference audio for music** (#259): a clip whose feel and timbre the track follows. Up to 30 seconds is used; it is a style hint, not a copy. Thanks @Fe2-O3.
+- **LTX first and last frame** (#260): `last_frame_image` pins the final frame the same way `first_frame_image` pins the first, on every LTX pipeline including two-stage. A request the model cannot honour (no VAE encoder, fewer than 9 frames) is a named 400 rather than a plausible video of something else.
+- `instrumental: true` beside non-empty lyrics is a named 400 instead of a silent choice.
+
 ### App
 
 - **Send a video to Qwen3-VL models** and chat about it. Thanks @justinluque (#246).
+- **Rewrite with LLM**: wand buttons next to the style prompt and lyrics. The chat model rewrites the text in the loaded music model's own format (one-line ACE-Step caption, three-block Music 3 caption, tagged lyrics) and streams it into a sheet you can edit before applying.
+- Dropping a long audio file on the Music tab no longer freezes the window: the conversion runs in the background with a "Converting" indicator, and the WAV writer is a single pass instead of one append per sample.
+- The Music tab's Advanced controls line up in one grid, and the Voice / Music switch is larger with room above the pane.
 - The Video pane now exposes all five generation settings it used to hide. Thanks @Fe2-O3 (#244).
 
 - **Music mode gained an instrumental switch** plus tempo and key controls, and remembers your settings between generations. Instrumental is marked experimental on MiniMax Music 3, where the open weights have no real switch and the tag alone still leaves vocal texture in; ACE-Step's is documented and works. Closes #225. Thanks @Fe2-O3 (#226).

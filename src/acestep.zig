@@ -14,7 +14,15 @@
 //! Weights arrive PRE-CONVERTED by tests/convert_acestep_weights.py:
 //!   model.safetensors  DiT + condition encoder + silence_latent (bf16 / 8-bit)
 //!   vae.safetensors    Oobleck VAE, weight-norm fused, MLX conv layouts
+//!   fsq.safetensors    FSQ audio tokenizer + detokenizer (cover mode; loaded
+//!                      on first use, absent on packs that predate it)
 //!   text_encoder/      Qwen3-Embedding-0.6B verbatim (bf16, standard qwen3)
+//!
+//! Tasks: text2music (context = [silence | ones]), complete (= vocal2bgm: the
+//! source clip's VAE latent as context, "Complete the input track…"), cover
+//! (the source latent round-tripped through pooler → FSQ → detokenizer, the
+//! "Generate audio semantic tokens…" instruction). Same DiT forward for all
+//! three — the task is the CONTEXT stream + the instruction line.
 //! The converter already drops the Sequential indices (proj_in.1 → proj_in) and
 //! swaps conv layouts — this engine does STANDARD reshapes only.
 //!
@@ -58,6 +66,10 @@ pub const Cfg = struct {
     timbre_fix_frame: u32 = 750,
     sample_rate: u32 = 48000,
     vae_hop: u32 = 1920, // 2*4*4*6*10 → latents at exactly 25 Hz
+    // FSQ audio tokenizer (cover mode): 5 latent frames pool to one token.
+    pool_window: u32 = 5,
+    pooler_layers: u32 = 2,
+    fsq_levels: [6]f32 = .{ 8, 8, 8, 5, 5, 5 },
 };
 
 // Qwen3-Embedding-0.6B (text_encoder/, standard qwen3 — keys are unprefixed:
@@ -91,6 +103,8 @@ fn vaeChunkFrames(low_mem: bool) usize {
 }
 const MAX_PROMPT_TOKENS: usize = 256; // reference truncation limits
 const MAX_LYRIC_TOKENS: usize = 2048;
+const VAE_ENC_CHUNK_FRAMES: usize = 750; // 30 s encode windows (f32 activations)
+pub const FSQ_FILE = "fsq.safetensors";
 
 // ════════════════════════════════════════════════════════════════════════
 // Pure helpers (schedule, prompt formatting, normalization) — hermetic tests.
@@ -117,6 +131,16 @@ pub fn timestepSchedule(buf: []f32, shift: f32) void {
     }
 }
 
+/// Index of the schedule entry nearest `t` (cover_noise_strength start point;
+/// ties resolve to the EARLIER step, like Python's `min` over the list).
+pub fn nearestStep(sched: []const f32, t: f32) usize {
+    var best: usize = 0;
+    for (sched, 0..) |v, i| {
+        if (@abs(v - t) < @abs(sched[best] - t)) best = i;
+    }
+    return best;
+}
+
 /// Latent frame count for a duration: exactly 25 frames/s (48000/1920).
 pub fn latentFrames(duration_s: u32) u32 {
     return duration_s * 25;
@@ -140,14 +164,55 @@ pub fn formatMetaString(a: std.mem.Allocator, bpm: ?u32, keyscale: []const u8, t
     return out.toOwnedSlice(a);
 }
 
-/// SFT_GEN_PROMPT with the fixed text2music instruction. The metas string
-/// already ends with '\n', so `<|endoftext|>` follows the duration line.
-pub fn formatPrompt(a: std.mem.Allocator, caption: []const u8, metas: []const u8) ![]u8 {
+/// SFT_GEN_PROMPT. The metas string already ends with '\n', so `<|endoftext|>`
+/// follows the duration line. `instruction` comes from `taskInstruction`.
+pub fn formatPrompt(a: std.mem.Allocator, instruction: []const u8, caption: []const u8, metas: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         a,
-        "# Instruction\nFill the audio semantic mask based on the given conditions:\n\n# Caption\n{s}\n\n# Metas\n{s}<|endoftext|>\n",
-        .{ caption, metas },
+        "# Instruction\n{s}\n\n# Caption\n{s}\n\n# Metas\n{s}<|endoftext|>\n",
+        .{ instruction, caption, metas },
     );
+}
+
+pub const Task = enum { text2music, cover, complete };
+
+pub const TEXT2MUSIC_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:";
+pub const COVER_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:";
+
+/// The instruction line is part of the TASK (constants.py TASK_INSTRUCTIONS via
+/// task_utils.generate_instruction). `track_classes` is the `A | B` list from
+/// `joinTrackClasses` for `complete`; empty = the default spelling.
+pub fn taskInstruction(a: std.mem.Allocator, task: Task, track_classes: []const u8) ![]u8 {
+    return switch (task) {
+        .text2music => a.dupe(u8, TEXT2MUSIC_INSTRUCTION),
+        .cover => a.dupe(u8, COVER_INSTRUCTION),
+        .complete => if (track_classes.len == 0)
+            a.dupe(u8, "Complete the input track:")
+        else
+            std.fmt.allocPrint(a, "Complete the input track with {s}:", .{track_classes}),
+    };
+}
+
+/// The instrument vocabulary the checkpoint was trained on (constants.py
+/// TRACK_NAMES). Anything else is a named 400, not an in-prompt typo.
+pub const TRACK_NAMES = [_][]const u8{ "woodwinds", "brass", "fx", "synth", "strings", "percussion", "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals" };
+
+/// `["bass","drums"]` → "BASS | DRUMS" (case-insensitive match, upper-cased,
+/// ` | `-joined, request order kept — task_utils.generate_instruction).
+pub fn joinTrackClasses(a: std.mem.Allocator, names: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (names, 0..) |raw, i| {
+        const name = std.mem.trim(u8, raw, " \t\r\n");
+        var known = false;
+        for (TRACK_NAMES) |t| {
+            if (std.ascii.eqlIgnoreCase(name, t)) known = true;
+        }
+        if (!known) return error.UnknownTrackClass;
+        if (i > 0) try out.appendSlice(a, " | ");
+        for (name) |c| try out.append(a, std.ascii.toUpper(c));
+    }
+    return out.toOwnedSlice(a);
 }
 
 /// The reference marker for a wordless track. ACE-Step has had this since day
@@ -459,8 +524,7 @@ fn qwenForward(w: *const Weights, allocator: std.mem.Allocator, ids: []const i32
 // server traffic carries no padding).
 // ════════════════════════════════════════════════════════════════════════
 
-fn encoderLayer(e: *const Engine, a: std.mem.Allocator, prefix: []const u8, h_in: mlx.mlx_array, sliding_mask: ?mlx.mlx_array, s: S) !mlx.mlx_array {
-    const w = &e.w;
+fn encoderLayer(e: *const Engine, a: std.mem.Allocator, w: *const Weights, prefix: []const u8, h_in: mlx.mlx_array, sliding_mask: ?mlx.mlx_array, s: S) !mlx.mlx_array {
     const cfg = e.cfg;
     const nh: c_int = @intCast(cfg.enc_heads);
     const nkv: c_int = @intCast(cfg.enc_kv_heads);
@@ -525,9 +589,12 @@ fn encoderLayer(e: *const Engine, a: std.mem.Allocator, prefix: []const u8, h_in
     return addA(h1, down, s);
 }
 
-/// Run an encoder stack (`encoder.lyric_encoder` / `encoder.timbre_encoder`)
-/// over pre-embedded input [1,T,2048]; returns the FINAL-NORMED sequence.
-fn encoderStack(e: *const Engine, allocator: std.mem.Allocator, base: []const u8, input: mlx.mlx_array, n_layers: u32, s: S) !mlx.mlx_array {
+/// Run an encoder stack (`encoder.lyric_encoder` / `encoder.timbre_encoder` /
+/// the FSQ pooler + detokenizer) over pre-embedded input [B,T,2048]; returns
+/// the FINAL-NORMED sequence. B>1 = independent windows: RoPE positions and
+/// the band mask restart per batch row, which is exactly what the pooler's
+/// `(b t) p c` regrouping wants.
+fn encoderStack(e: *const Engine, allocator: std.mem.Allocator, w: *const Weights, base: []const u8, input: mlx.mlx_array, n_layers: u32, s: S) !mlx.mlx_array {
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
     const a = arena_inst.allocator();
@@ -543,14 +610,14 @@ fn encoderStack(e: *const Engine, allocator: std.mem.Allocator, base: []const u8
         const pfx = try std.fmt.allocPrint(a, "{s}.layers.{d}", .{ base, li });
         // Even index = sliding_attention, odd = full_attention (config order).
         const mask: ?mlx.mlx_array = if (li % 2 == 0) band else null;
-        const nh = try encoderLayer(e, a, pfx, h, mask, s);
+        const nh = try encoderLayer(e, a, w, pfx, h, mask, s);
         _ = mlx.mlx_array_free(h);
         h = nh;
         _ = mlx.mlx_array_eval(h);
         _ = arena_inst.reset(.retain_capacity);
     }
     const norm_key = try std.fmt.allocPrint(a, "{s}.norm.weight", .{base});
-    const norm_w = try getW(&e.w, norm_key);
+    const norm_w = try getW(w, norm_key);
     const out = try rmsNorm(h, norm_w, e.cfg.eps, s);
     _ = mlx.mlx_array_free(h);
     return out;
@@ -570,7 +637,7 @@ fn buildConditioning(e: *const Engine, allocator: std.mem.Allocator, text_hidden
     // Lyrics: embed_tokens Linear → 8-layer stack.
     const lyr_in = try lin(&e.w, a, lyric_embeds, "encoder.lyric_encoder.embed_tokens", s);
     defer _ = mlx.mlx_array_free(lyr_in);
-    const lyr = try encoderStack(e, allocator, "encoder.lyric_encoder", lyr_in, e.cfg.lyric_layers, s);
+    const lyr = try encoderStack(e, allocator, &e.w, "encoder.lyric_encoder", lyr_in, e.cfg.lyric_layers, s);
     defer _ = mlx.mlx_array_free(lyr);
 
     // Timbre: embed → prepend CLS → 4-layer stack → CLS output.
@@ -579,7 +646,7 @@ fn buildConditioning(e: *const Engine, allocator: std.mem.Allocator, text_hidden
     const cls = try getW(&e.w, "encoder.timbre_encoder.special_token");
     const tim_seq = try concat2(cls, tim_in, 1, s);
     defer _ = mlx.mlx_array_free(tim_seq);
-    const tim_out = try encoderStack(e, allocator, "encoder.timbre_encoder", tim_seq, e.cfg.timbre_layers, s);
+    const tim_out = try encoderStack(e, allocator, &e.w, "encoder.timbre_encoder", tim_seq, e.cfg.timbre_layers, s);
     defer _ = mlx.mlx_array_free(tim_out);
     const enc_h: c_int = @intCast(e.cfg.enc_hidden);
     const tim_cls = try sliceA(tim_out, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, 1, enc_h }, &[_]c_int{ 1, 1, 1 }, s);
@@ -1223,6 +1290,272 @@ pub fn vaeEncodeMean(e: *const Engine, allocator: std.mem.Allocator, audio: mlx.
     return sliceA(out, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, osh[1], half }, &[_]c_int{ 1, 1, 1 }, s);
 }
 
+/// Full-length encode (the cover/complete SOURCE): `[1, frames*hop, 2]` f32 →
+/// latent mean `[1, frames, 64]` f32 in 30 s windows — one untiled pass at
+/// 600 s holds 128 ch × 28.8M samples f32 (15 GB) per activation. Windows
+/// start on latent boundaries so every strided conv lands where the untiled
+/// pass would; the 64-frame halo (≫ the encoder's ~12-frame receptive field)
+/// absorbs the zero-padded edges. The decode's overlap strategy, mirrored.
+pub fn vaeEncodeMeanChunked(e: *const Engine, allocator: std.mem.Allocator, audio: mlx.mlx_array, progress: ?sse.Progress, s: S) !mlx.mlx_array {
+    const hop: usize = @intCast(e.cfg.vae_hop);
+    const total: usize = @as(usize, @intCast(mlx.getShape(audio)[1])) / hop;
+    if (total <= VAE_ENC_CHUNK_FRAMES) return vaeEncodeMean(e, allocator, audio, s);
+    const n_chunks = std.math.divCeil(usize, total, VAE_ENC_CHUNK_FRAMES) catch unreachable;
+    var acc: ?mlx.mlx_array = null;
+    errdefer if (acc) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var ci: usize = 0;
+    while (ci < n_chunks) : (ci += 1) {
+        if (progress) |p| {
+            if (p.cancelled()) return error.Cancelled;
+            p.emit("encode", @intCast(ci), @intCast(n_chunks));
+        }
+        const core_start = ci * VAE_ENC_CHUNK_FRAMES;
+        const core_end = @min(core_start + VAE_ENC_CHUNK_FRAMES, total);
+        const win_start = core_start -| VAE_OVERLAP_FRAMES;
+        const win_end = @min(core_end + VAE_OVERLAP_FRAMES, total);
+        const win = try sliceA(audio, &[_]c_int{ 0, @intCast(win_start * hop), 0 }, &[_]c_int{ 1, @intCast(win_end * hop), 2 }, &[_]c_int{ 1, 1, 1 }, s);
+        defer _ = mlx.mlx_array_free(win);
+        const m = try vaeEncodeMean(e, allocator, win, s);
+        defer _ = mlx.mlx_array_free(m);
+        const core = try sliceA(m, &[_]c_int{ 0, @intCast(core_start - win_start), 0 }, &[_]c_int{ 1, @intCast(core_end - win_start), 64 }, &[_]c_int{ 1, 1, 1 }, s);
+        defer _ = mlx.mlx_array_free(core);
+        if (acc) |prev| {
+            const next = try concat2(prev, core, 1, s);
+            _ = mlx.mlx_array_free(prev);
+            acc = next;
+        } else {
+            var own = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&own, core));
+            acc = own;
+        }
+        _ = mlx.mlx_array_eval(acc.?);
+        if (e.low_mem) _ = mlx.mlx_clear_cache();
+    }
+    return acc.?;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FSQ audio tokenizer + detokenizer (cover mode). Reference: AceStepAudioTokenizer
+// (acoustic proj → AttentionPooler → ResidualFSQ, 1 quantizer so scale = 1) and
+// AudioTokenDetokenizer. vector-quantize-pytorch's ResidualFSQ SOFT-CLAMPS its
+// input, z' = c·tanh(z/c) with c = L/(L−1) per dim (`soft_clamp_input_value`,
+// defaulted from the levels), then builds its FSQ with preserve_symmetry +
+// bound_hard_clamp, so the grid is
+//   QL(z') = 2/(L−1) · ⌊(L−1)(clamp(z',−1,1)+1)/2 + 0.5⌋ − 1
+// — NOT the tanh `bound()` of a bare FSQ, and not the hard clamp alone either
+// (that reading flipped the reference's level at z=−0.787, L=5). Quantization
+// runs f32 (the reference forces it; a bf16 ulp at a cell edge flips a code).
+// ════════════════════════════════════════════════════════════════════════
+
+fn levelsArray(levels: []const f32) mlx.mlx_array {
+    const sh = [_]c_int{@intCast(levels.len)};
+    return mlx.mlx_array_new_data(levels.ptr, &sh, 1, .float32);
+}
+
+/// The ResidualFSQ input soft clamp, per dim: c·tanh(z/c), c = L/(L−1).
+fn fsqSoftClamp(z: f32, level: f32) f32 {
+    const c = level / (level - 1.0);
+    return c * std.math.tanh(z / c);
+}
+
+/// z [..., d] f32 → codes on the symmetric grid, same shape (values in [−1, 1]).
+fn fsqQuantize(z: mlx.mlx_array, levels: []const f32, s: S) !mlx.mlx_array {
+    const lv = levelsArray(levels);
+    defer _ = mlx.mlx_array_free(lv);
+    const neg1 = mlx.mlx_array_new_float(-1.0);
+    defer _ = mlx.mlx_array_free(neg1);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    const half = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(half);
+    const lm1 = try subA(lv, one, s);
+    defer _ = mlx.mlx_array_free(lm1);
+    // soft clamp: c·tanh(z/c)
+    var cl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cl);
+    try mlx.check(mlx.mlx_divide(&cl, lv, lm1, s));
+    var zdc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zdc);
+    try mlx.check(mlx.mlx_divide(&zdc, z, cl, s));
+    var th = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(th);
+    try mlx.check(mlx.mlx_tanh(&th, zdc, s));
+    const zs = try mulA(th, cl, s);
+    defer _ = mlx.mlx_array_free(zs);
+    var zc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zc);
+    try mlx.check(mlx.mlx_clip(&zc, zs, neg1, one, s));
+    const zp1 = try addA(zc, one, s);
+    defer _ = mlx.mlx_array_free(zp1);
+    const prod = try mulA(zp1, lm1, s);
+    defer _ = mlx.mlx_array_free(prod);
+    const halved = try mulScalar(prod, 0.5, s);
+    defer _ = mlx.mlx_array_free(halved);
+    const shifted = try addA(halved, half, s);
+    defer _ = mlx.mlx_array_free(shifted);
+    var fl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fl);
+    try mlx.check(mlx.mlx_floor(&fl, shifted, s));
+    var scale = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scale);
+    const two = mlx.mlx_array_new_float(2.0);
+    defer _ = mlx.mlx_array_free(two);
+    try mlx.check(mlx.mlx_divide(&scale, two, lm1, s));
+    const scaled = try mulA(fl, scale, s);
+    defer _ = mlx.mlx_array_free(scaled);
+    return subA(scaled, one, s);
+}
+
+/// codes [..., d] → codebook indices [...] int32 (FSQ.codes_to_indices:
+/// per-level index (code+1)(L−1)/2, mixed-radix with basis cumprod([1] ++ L[:-1])).
+fn fsqIndices(codes: mlx.mlx_array, levels: []const f32, s: S) !mlx.mlx_array {
+    var basis_buf: [16]f32 = undefined;
+    var b: f32 = 1.0;
+    for (levels, 0..) |l, i| {
+        basis_buf[i] = b;
+        b *= l;
+    }
+    const basis = levelsArray(basis_buf[0..levels.len]);
+    defer _ = mlx.mlx_array_free(basis);
+    const lv = levelsArray(levels);
+    defer _ = mlx.mlx_array_free(lv);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    const lm1 = try subA(lv, one, s);
+    defer _ = mlx.mlx_array_free(lm1);
+    const cp1 = try addA(codes, one, s);
+    defer _ = mlx.mlx_array_free(cp1);
+    const lvl = try mulA(cp1, lm1, s);
+    defer _ = mlx.mlx_array_free(lvl);
+    const lvl_h = try mulScalar(lvl, 0.5, s);
+    defer _ = mlx.mlx_array_free(lvl_h);
+    const weighted = try mulA(lvl_h, basis, s);
+    defer _ = mlx.mlx_array_free(weighted);
+    var summed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(summed);
+    try mlx.check(mlx.mlx_sum_axis(&summed, weighted, -1, false, s));
+    var rounded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rounded);
+    try mlx.check(mlx.mlx_round(&rounded, summed, 0, s));
+    return astype(rounded, .int32, s);
+}
+
+const AudioTokens = struct {
+    hints: mlx.mlx_array,
+    indices: mlx.mlx_array,
+    /// Pre-quantization values [1,T5,6] f32 (the parity oracle's per-dim probe).
+    z: mlx.mlx_array,
+    fn deinit(self: *const AudioTokens) void {
+        _ = mlx.mlx_array_free(self.hints);
+        _ = mlx.mlx_array_free(self.indices);
+        _ = mlx.mlx_array_free(self.z);
+    }
+};
+
+/// Source latents [1,T,64] → 5 Hz FSQ hints [1,⌈T/5⌉,2048] f32 + codebook
+/// indices [1,⌈T/5⌉] i32 (`AceStepConditionGenerationModel.tokenize`: pad T
+/// to ×5 with the silence latent, acoustic proj, CLS-prepended 6-token windows
+/// through the pooler, RMSNorm, CLS row → ResidualFSQ).
+fn audioTokenize(self: *Engine, allocator: std.mem.Allocator, latents: mlx.mlx_array, s: S) !AudioTokens {
+    const fw = try self.ensureFsq();
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const cfg = self.cfg;
+    const p: c_int = @intCast(cfg.pool_window);
+    const ad: c_int = @intCast(cfg.acoustic_dim);
+    const enc_h: c_int = @intCast(cfg.enc_hidden);
+
+    // f32 activations through the pooler: the grid below is a floor, and bf16
+    // attention moved a pre-quantization value 0.07 cells — enough to flip a
+    // code the fp32 reference did not (both 8-bit and dense-bf16 weights
+    // flipped the SAME dim). The stacks are tiny (T/5 windows of 6 tokens).
+    const lat_f = try astype(latents, .float32, s);
+    defer _ = mlx.mlx_array_free(lat_f);
+    const t_len: c_int = mlx.getShape(lat_f)[1];
+    var x = lat_f;
+    var x_owned = false;
+    defer if (x_owned) {
+        _ = mlx.mlx_array_free(x);
+    };
+    if (@mod(t_len, p) != 0) {
+        const pad_bf = try self.silenceSlice(@intCast(p - @mod(t_len, p)), s);
+        defer _ = mlx.mlx_array_free(pad_bf);
+        const pad = try astype(pad_bf, .float32, s);
+        defer _ = mlx.mlx_array_free(pad);
+        x = try concat2(lat_f, pad, 1, s);
+        x_owned = true;
+    }
+    const t5: c_int = @divExact(mlx.getShape(x)[1], p);
+    const windows = try reshape(x, &[_]c_int{ t5, p, ad }, s);
+    defer _ = mlx.mlx_array_free(windows);
+    const proj = try lin(fw, a, windows, "tokenizer.audio_acoustic_proj", s);
+    defer _ = mlx.mlx_array_free(proj);
+    const emb = try lin(fw, a, proj, "tokenizer.attention_pooler.embed_tokens", s);
+    defer _ = mlx.mlx_array_free(emb);
+    const cls_w = try getW(fw, "tokenizer.attention_pooler.special_token");
+    const cls = try astype(cls_w, .float32, s);
+    defer _ = mlx.mlx_array_free(cls);
+    var cls_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cls_b);
+    try mlx.check(mlx.mlx_broadcast_to(&cls_b, cls, &[_]c_int{ t5, 1, enc_h }, 3, s));
+    const seq = try concat2(cls_b, emb, 1, s);
+    defer _ = mlx.mlx_array_free(seq);
+    const pooled = try encoderStack(self, allocator, fw, "tokenizer.attention_pooler", seq, cfg.pooler_layers, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    const cls_out = try sliceA(pooled, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ t5, 1, enc_h }, &[_]c_int{ 1, 1, 1 }, s);
+    defer _ = mlx.mlx_array_free(cls_out);
+    const cls_f = try reshape(cls_out, &[_]c_int{ 1, t5, enc_h }, s);
+    defer _ = mlx.mlx_array_free(cls_f);
+    const z = try lin(fw, a, cls_f, "tokenizer.quantizer.project_in", s);
+    errdefer _ = mlx.mlx_array_free(z);
+    const codes = try fsqQuantize(z, &cfg.fsq_levels, s);
+    defer _ = mlx.mlx_array_free(codes);
+    const indices = try fsqIndices(codes, &cfg.fsq_levels, s);
+    errdefer _ = mlx.mlx_array_free(indices);
+    const hints = try lin(fw, a, codes, "tokenizer.quantizer.project_out", s); // f32
+    errdefer _ = mlx.mlx_array_free(hints);
+    _ = mlx.mlx_array_eval(hints);
+    _ = mlx.mlx_array_eval(indices);
+    _ = mlx.mlx_array_eval(z);
+    return .{ .hints = hints, .indices = indices, .z = z };
+}
+
+/// 5 Hz hints [1,T5,2048] → 25 Hz latents [1,T5·5,64] f32
+/// (AudioTokenDetokenizer: embed, ×5 + per-slot special tokens, 5-token
+/// windows through the detokenizer stack, RMSNorm, proj_out).
+fn audioDetokenize(self: *Engine, allocator: std.mem.Allocator, hints: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const fw = try self.ensureFsq();
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const cfg = self.cfg;
+    const p: c_int = @intCast(cfg.pool_window);
+    const enc_h: c_int = @intCast(cfg.enc_hidden);
+    const t5: c_int = mlx.getShape(hints)[1];
+
+    const hints_f = try astype(hints, .float32, s);
+    defer _ = mlx.mlx_array_free(hints_f);
+    const emb = try lin(fw, a, hints_f, "detokenizer.embed_tokens", s);
+    defer _ = mlx.mlx_array_free(emb);
+    const emb3 = try reshape(emb, &[_]c_int{ t5, 1, enc_h }, s);
+    defer _ = mlx.mlx_array_free(emb3);
+    const special_w = try getW(fw, "detokenizer.special_tokens"); // [1,5,2048]
+    const special = try astype(special_w, .float32, s);
+    defer _ = mlx.mlx_array_free(special);
+    const x = try addA(emb3, special, s); // broadcast → [t5,5,2048]
+    defer _ = mlx.mlx_array_free(x);
+    const out = try encoderStack(self, allocator, fw, "detokenizer", x, cfg.pooler_layers, s);
+    defer _ = mlx.mlx_array_free(out);
+    const po = try lin(fw, a, out, "detokenizer.proj_out", s); // [t5,5,64]
+    defer _ = mlx.mlx_array_free(po);
+    const flat = try reshape(po, &[_]c_int{ 1, t5 * p, @intCast(cfg.acoustic_dim) }, s);
+    defer _ = mlx.mlx_array_free(flat);
+    return astype(flat, .float32, s);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Engine
 // ════════════════════════════════════════════════════════════════════════
@@ -1236,7 +1569,79 @@ pub const MusicRequest = struct {
     timesignature: []const u8 = "",
     duration_s: u32 = 60,
     seed: u64 = 0,
+    /// Reference clip for style/timbre (#259): decoded samples `[1,N,2]` f32
+    /// channels-last at 48 kHz, already windowed by `referenceWindow`. Fills
+    /// the condition encoder's timbre slot INSTEAD of the silence latent —
+    /// never both. Borrowed; the caller frees it.
+    ref_audio: ?mlx.mlx_array = null,
+    task: Task = .text2music,
+    /// cover / complete source: decoded samples `[1,N,2]` f32 48 kHz, FULL
+    /// length — its VAE latent IS the context stream and decides the track
+    /// length (`duration_s` is ignored). Borrowed.
+    src_audio: ?mlx.mlx_array = null,
+    /// cover: fraction of the denoise steps that see the source codes (1 =
+    /// all); the remaining steps switch to plain text2music conditioning
+    /// (upstream `audio_cover_strength`).
+    cover_strength: f32 = 1.0,
+    /// cover: start from `t·noise + (1−t)·source latent` at the schedule step
+    /// nearest `1 − strength` instead of pure noise (upstream
+    /// `cover_noise_strength`; 0 = off). Blends the RAW latent, not the hints.
+    cover_noise_strength: f32 = 0.0,
+    /// complete: the `A | B` instrument list from `joinTrackClasses`.
+    track_classes: []const u8 = "",
 };
+
+/// Reference-clip window the timbre encoder sees: always 30 s of stereo 48 kHz
+/// (= `timbre_fix_frame` 750 latents). The reference (`process_reference_audio`)
+/// tiles a shorter clip up to 30 s and then takes one 10 s segment from each
+/// third at a RANDOM offset; ours takes the start of each third so the same
+/// request is reproducible. Input/output are interleaved stereo.
+pub const REF_WINDOW_S: usize = 30;
+pub const REF_SEGMENT_S: usize = 10;
+pub fn referenceWindow(allocator: std.mem.Allocator, stereo: []const f32, sample_rate: u32) ![]f32 {
+    const sr: usize = sample_rate;
+    const target = REF_WINDOW_S * sr * 2;
+    if (stereo.len == 0) return error.EmptyReference;
+    if (stereo.len < target) {
+        const out = try allocator.alloc(f32, target);
+        var i: usize = 0;
+        while (i < target) : (i += 1) out[i] = stereo[i % stereo.len];
+        return out;
+    }
+    const seg = REF_SEGMENT_S * sr * 2;
+    const frames = stereo.len / 2;
+    const third = (frames / 3) * 2; // interleaved samples per third (frame-aligned)
+    const out = try allocator.alloc(f32, target);
+    for (0..3) |k| {
+        const start = k * third;
+        @memcpy(out[k * seg .. (k + 1) * seg], stereo[start .. start + seg]);
+    }
+    return out;
+}
+
+test "acestep referenceWindow is always 30 s: tiles short clips, samples each third of long ones" {
+    const a = testing.allocator;
+    const sr: u32 = 100; // tiny rate keeps the test cheap; the math is rate-agnostic
+    // 40 s clip whose value encodes its second: each third contributes its first 10 s.
+    var long: [40 * 100 * 2]f32 = undefined;
+    for (&long, 0..) |*v, i| v.* = @floatFromInt(i / 200);
+    const w = try referenceWindow(a, &long, sr);
+    defer a.free(w);
+    try testing.expectEqual(@as(usize, 30 * 100 * 2), w.len);
+    try testing.expectEqual(@as(f32, 0), w[0]);
+    try testing.expectEqual(@as(f32, 9), w[10 * 200 - 1]);
+    try testing.expectEqual(@as(f32, 13), w[10 * 200]); // second third starts at 13.33 s
+    try testing.expectEqual(@as(f32, 26), w[20 * 200]); // last third starts at 26.66 s
+    // 4 s clip tiles.
+    var short: [4 * 100 * 2]f32 = undefined;
+    for (&short, 0..) |*v, i| v.* = @floatFromInt(i);
+    const t = try referenceWindow(a, &short, sr);
+    defer a.free(t);
+    try testing.expectEqual(@as(usize, 30 * 100 * 2), t.len);
+    try testing.expectEqual(@as(f32, 0), t[800]);
+    try testing.expectEqual(@as(f32, 399), t[t.len - 1]); // 6000 % 800
+    try testing.expectError(error.EmptyReference, referenceWindow(a, &[_]f32{}, sr));
+}
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -1245,6 +1650,8 @@ pub const Engine = struct {
     cfg: Cfg,
     w: Weights, // model.safetensors (DiT + condition encoder + silence_latent)
     vae_w: Weights, // vae.safetensors
+    fsq_w: ?Weights, // fsq.safetensors (cover mode), loaded on first use
+    model_dir: []u8,
     te_w: ?Weights, // text_encoder/ (Qwen3-Embedding-0.6B); null while phased out (low_mem)
     te_dir: []u8, // for per-request text-encoder reloads in low_mem
     tok: tok_mod.Tokenizer,
@@ -1268,6 +1675,9 @@ pub const Engine = struct {
         if (self.w.get("silence_latent") == null) return error.MissingAceStepWeight;
         self.vae_w = try loadFileWeights(allocator, model_dir, "vae.safetensors");
         errdefer self.vae_w.deinit();
+        self.fsq_w = null;
+        self.model_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(self.model_dir);
 
         self.te_dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
         errdefer allocator.free(self.te_dir);
@@ -1279,17 +1689,40 @@ pub const Engine = struct {
         }
         errdefer if (self.te_w) |*t| t.deinit();
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, self.te_dir);
-        log.info("[acestep] engine ready (model {d} + vae {d} + text_encoder {d} tensors)\n", .{ self.w.count(), self.vae_w.count(), if (self.te_w) |t| t.count() else 0 });
+        log.info("[acestep] engine ready (model {d} + vae {d} + text_encoder {d} tensors, fsq {s})\n", .{ self.w.count(), self.vae_w.count(), if (self.te_w) |t| t.count() else 0, if (self.fsqAvailable()) "present" else "absent" });
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
         self.w.deinit();
         self.vae_w.deinit();
+        if (self.fsq_w) |*f| f.deinit();
+        self.allocator.free(self.model_dir);
         if (self.te_w) |*t| t.deinit();
         self.allocator.free(self.te_dir);
         self.tok.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Whether the pack carries the cover-mode tokenizer (`fsq.safetensors`).
+    /// A stat, not a load: the app fetches the file into a pack that predates
+    /// it while the engine is resident, so the answer can change.
+    pub fn fsqAvailable(self: *const Engine) bool {
+        if (self.fsq_w != null) return true;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.model_dir, FSQ_FILE }) catch return false;
+        std.Io.Dir.accessAbsolute(self.io, path, .{}) catch return false;
+        return true;
+    }
+
+    /// FSQ weights, loaded on first cover request (`error.PackLacksFsq` when the
+    /// pack predates cover mode — the handler turns that into a named 400).
+    fn ensureFsq(self: *Engine) !*const Weights {
+        if (self.fsq_w == null) {
+            if (!self.fsqAvailable()) return error.PackLacksFsq;
+            self.fsq_w = try loadFileWeights(self.allocator, self.model_dir, FSQ_FILE);
+        }
+        return &self.fsq_w.?;
     }
 
     /// Text-encoder weights, loading them on demand in low_mem mode.
@@ -1336,6 +1769,39 @@ pub const Engine = struct {
         return acc;
     }
 
+    /// Reference audio `[1,N,2]` f32 → timbre latents `[1,≤timbre_fix_frame,64]`
+    /// bf16 (`refer_audio_acoustic_hidden_states_packed`): the VAE latent MEAN
+    /// (the reference samples the posterior; the mean keeps a seed reproducible),
+    /// cropped to the timbre window.
+    fn refTimbreLatents(self: *const Engine, allocator: std.mem.Allocator, audio: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const mean = try vaeEncodeMean(self, allocator, audio, s); // [1,T,64] f32
+        defer _ = mlx.mlx_array_free(mean);
+        const sh = mlx.getShape(mean);
+        const t: c_int = @min(sh[1], @as(c_int, @intCast(self.cfg.timbre_fix_frame)));
+        const crop = try sliceA(mean, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, t, sh[2] }, &[_]c_int{ 1, 1, 1 }, s);
+        defer _ = mlx.mlx_array_free(crop);
+        const out = try astype(crop, .bfloat16, s);
+        _ = mlx.mlx_array_eval(out);
+        const n_samp = mlx.getShape(audio)[1];
+        log.info("[acestep] reference audio: {d} latent frames ({d:.1}s)\n", .{ t, @as(f32, @floatFromInt(n_samp)) / @as(f32, @floatFromInt(self.cfg.sample_rate)) });
+        return out;
+    }
+
+    /// Source clip `[1,N,2]` f32 → VAE latent mean `[1,T,64]` f32 with
+    /// T = ⌊N/1920⌋ capped at 600 s (cropped, never tiled — the track IS the
+    /// source's length). Shorter than the 10 s floor is the handler's 400.
+    fn srcLatents(self: *const Engine, allocator: std.mem.Allocator, audio: mlx.mlx_array, progress: ?sse.Progress, s: S) !mlx.mlx_array {
+        const hop: c_int = @intCast(self.cfg.vae_hop);
+        const n: c_int = mlx.getShape(audio)[1];
+        const frames: c_int = @min(@divTrunc(n, hop), @as(c_int, @intCast(latentFrames(MAX_DURATION_S))));
+        if (frames < @as(c_int, @intCast(latentFrames(MIN_DURATION_S)))) return error.SourceTooShort;
+        const cropped = try sliceA(audio, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, frames * hop, 2 }, &[_]c_int{ 1, 1, 1 }, s);
+        defer _ = mlx.mlx_array_free(cropped);
+        const mean = try vaeEncodeMeanChunked(self, allocator, cropped, progress, s);
+        _ = mlx.mlx_array_eval(mean);
+        return mean;
+    }
+
     /// Tokenize with the reference truncation cap; returns owned i32 ids.
     /// The Qwen3-Embedding tokenizer.json carries a TemplateProcessing
     /// post-processor that appends `<|endoftext|>` after EVERY sequence (on
@@ -1354,90 +1820,197 @@ pub const Engine = struct {
         return ids;
     }
 
-    /// text2music: prompt/lyrics → 48 kHz stereo PCM16 WAV bytes (owned).
+    /// One condition set: packed encoder states → projected → per-layer cross K/V.
+    fn conditionSet(self: *Engine, allocator: std.mem.Allocator, cond2048: mlx.mlx_array, s: S) !CrossKv {
+        var arena_inst = std.heap.ArenaAllocator.init(allocator);
+        defer arena_inst.deinit();
+        const cond2560 = try lin(&self.w, arena_inst.allocator(), cond2048, "decoder.condition_embedder", s);
+        defer _ = mlx.mlx_array_free(cond2560);
+        return buildCrossKv(self, allocator, cond2560, s);
+    }
+
+    /// `[src | ones]` context stream [1,T,128] f32 from a [1,T,64] source.
+    fn contextLatents(self: *const Engine, src: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const sh = mlx.getShape(src);
+        const src_f = try astype(src, .float32, s);
+        defer _ = mlx.mlx_array_free(src_f);
+        const ones_sh = [_]c_int{ 1, sh[1], @intCast(self.cfg.acoustic_dim) };
+        var chunk_ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(chunk_ones);
+        try mlx.check(mlx.mlx_ones(&chunk_ones, &ones_sh, 3, .float32, s));
+        return concat2(src_f, chunk_ones, 2, s);
+    }
+
+    /// Text prompt → Qwen3-Embedding hidden states for one instruction.
+    fn encodeTextPrompt(self: *Engine, allocator: std.mem.Allocator, te: *const Weights, instruction: []const u8, req: MusicRequest, metas: []const u8, s: S) !mlx.mlx_array {
+        const prompt = try formatPrompt(allocator, instruction, req.caption, metas);
+        defer allocator.free(prompt);
+        const text_ids = try self.tokenize(allocator, prompt, MAX_PROMPT_TOKENS);
+        defer allocator.free(text_ids);
+        return qwenForward(te, allocator, text_ids, s);
+    }
+
+    /// prompt/lyrics (+ source clip for cover/complete) → 48 kHz stereo PCM16
+    /// WAV bytes (owned).
     pub fn generateWav(self: *Engine, allocator: std.mem.Allocator, req: MusicRequest, progress: ?sse.Progress) ![]u8 {
         const s = self.s;
-        const duration = std.math.clamp(req.duration_s, MIN_DURATION_S, MAX_DURATION_S);
-        const frames = latentFrames(duration);
-        log.info("[acestep] text2music: {d}s ({d} frames), seed={d}\n", .{ duration, frames, req.seed });
         if (progress) |p| p.emit("encode", 0, 1);
+
+        // ── source latents decide the length on cover/complete ──
+        var src_lat: ?mlx.mlx_array = null;
+        defer if (src_lat) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        var frames: u32 = undefined;
+        var duration: u32 = undefined;
+        if (req.src_audio) |audio| {
+            if (req.task == .text2music) return error.SourceWithoutTask;
+            src_lat = try self.srcLatents(allocator, audio, progress, s);
+            frames = @intCast(mlx.getShape(src_lat.?)[1]);
+            duration = frames / 25;
+            log.info("[acestep] {s}: source {d:.1}s -> {d} latent frames (duration_seconds ignored), seed={d}\n", .{ @tagName(req.task), @as(f32, @floatFromInt(mlx.getShape(audio)[1])) / @as(f32, @floatFromInt(self.cfg.sample_rate)), frames, req.seed });
+        } else {
+            if (req.task != .text2music) return error.MissingSourceAudio;
+            duration = std.math.clamp(req.duration_s, MIN_DURATION_S, MAX_DURATION_S);
+            frames = latentFrames(duration);
+            log.info("[acestep] text2music: {d}s ({d} frames), seed={d}\n", .{ duration, frames, req.seed });
+        }
 
         // ── conditioning strings → token ids ──
         const metas = try formatMetaString(allocator, req.bpm, req.keyscale, req.timesignature, duration);
         defer allocator.free(metas);
-        const prompt = try formatPrompt(allocator, req.caption, metas);
-        defer allocator.free(prompt);
+        const instruction = try taskInstruction(allocator, req.task, req.track_classes);
+        defer allocator.free(instruction);
         const lyric_text = try formatLyrics(allocator, req.language, req.lyrics);
         defer allocator.free(lyric_text);
-        const text_ids = try self.tokenize(allocator, prompt, MAX_PROMPT_TOKENS);
-        defer allocator.free(text_ids);
         const lyric_ids = try self.tokenize(allocator, lyric_text, MAX_LYRIC_TOKENS);
         defer allocator.free(lyric_ids);
 
         // ── text encoder (full forward) + lyric embeds (table lookup) ──
         const te = try self.ensureTextEncoder();
-        const text_hidden = try qwenForward(te, allocator, text_ids, s);
+        const text_hidden = try self.encodeTextPrompt(allocator, te, instruction, req, metas, s);
         defer _ = mlx.mlx_array_free(text_hidden);
         const lyric_embeds = try qwenEmbedLookup(te, lyric_ids, s);
         defer _ = mlx.mlx_array_free(lyric_embeds);
+        // cover_strength < 1: the tail of the schedule runs the text2music
+        // condition set (its instruction, silence context) — encode it NOW,
+        // while the text encoder is resident.
+        const two_sets = req.task == .cover and req.cover_strength < 1.0;
+        const text_hidden2: ?mlx.mlx_array = if (two_sets) try self.encodeTextPrompt(allocator, te, TEXT2MUSIC_INSTRUCTION, req, metas, s) else null;
+        defer if (text_hidden2) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
         if (progress) |p| {
             if (p.cancelled()) return error.Cancelled;
         }
 
-        // ── condition encoder (timbre = silence latent, the text2music path) ──
-        const timbre = try self.silenceSlice(self.cfg.timbre_fix_frame, s);
+        // ── condition encoder: timbre = the reference clip's VAE mean OR the
+        // silence latent (text2music) — one slot, never both ──
+        const timbre = if (req.ref_audio) |ref|
+            try self.refTimbreLatents(allocator, ref, s)
+        else
+            try self.silenceSlice(self.cfg.timbre_fix_frame, s);
         defer _ = mlx.mlx_array_free(timbre);
         const cond2048 = try buildConditioning(self, allocator, text_hidden, lyric_embeds, timbre, s);
         defer _ = mlx.mlx_array_free(cond2048);
+        const cond2048_2: ?mlx.mlx_array = if (text_hidden2) |th2| try buildConditioning(self, allocator, th2, lyric_embeds, timbre, s) else null;
+        defer if (cond2048_2) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
         // Phased text encoder (the FLUX low-mem pattern): materialize the
         // conditioning NOW — laziness would pin the TE weights through the
         // graph — then return its 1.2 GB before the denoise loop.
         if (self.low_mem) {
             _ = mlx.mlx_array_eval(cond2048);
+            if (cond2048_2) |c2| _ = mlx.mlx_array_eval(c2);
             self.releaseTextEncoder();
         }
-        // Project once, build the per-layer cross K/V once.
-        var arena_inst = std.heap.ArenaAllocator.init(allocator);
-        defer arena_inst.deinit();
-        const cond2560 = try lin(&self.w, arena_inst.allocator(), cond2048, "decoder.condition_embedder", s);
-        defer _ = mlx.mlx_array_free(cond2560);
-        var cross = try buildCrossKv(self, allocator, cond2560, s);
+        // Project once, build the per-layer cross K/V once (per set).
+        var cross = try self.conditionSet(allocator, cond2048, s);
         defer cross.deinit(allocator);
+        var cross2: ?CrossKv = if (cond2048_2) |c2| try self.conditionSet(allocator, c2, s) else null;
+        defer if (cross2) |*c| c.deinit(allocator);
         if (progress) |p| {
             if (p.cancelled()) return error.Cancelled;
             p.emit("encode", 1, 1);
         }
 
-        // ── context latents: [silence | ones] → [1,T,128] f32 ──
-        const src = try self.silenceSlice(frames, s);
-        defer _ = mlx.mlx_array_free(src);
-        const src_f = try astype(src, .float32, s);
-        defer _ = mlx.mlx_array_free(src_f);
-        const ones_sh = [_]c_int{ 1, @intCast(frames), @intCast(self.cfg.acoustic_dim) };
-        var chunk_ones = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(chunk_ones);
-        try mlx.check(mlx.mlx_ones(&chunk_ones, &ones_sh, 3, .float32, s));
-        const ctx = try concat2(src_f, chunk_ones, 2, s);
+        // ── context latents [1,T,128]: the task IS the context stream ──
+        const ctx = switch (req.task) {
+            .text2music => blk: {
+                const sil = try self.silenceSlice(frames, s);
+                defer _ = mlx.mlx_array_free(sil);
+                break :blk try self.contextLatents(sil, s);
+            },
+            .complete => blk: {
+                log.info("[acestep] complete: {d} source frames as context, classes={s}\n", .{ frames, if (req.track_classes.len == 0) "(default)" else req.track_classes });
+                break :blk try self.contextLatents(src_lat.?, s);
+            },
+            .cover => blk: {
+                const toks = try audioTokenize(self, allocator, src_lat.?, s);
+                defer toks.deinit();
+                const det = try audioDetokenize(self, allocator, toks.hints, s);
+                defer _ = mlx.mlx_array_free(det);
+                const crop = try sliceA(det, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, @intCast(frames), @intCast(self.cfg.acoustic_dim) }, &[_]c_int{ 1, 1, 1 }, s);
+                defer _ = mlx.mlx_array_free(crop);
+                log.info("[acestep] cover: source {d} frames -> {d} codes (strength={d:.2}, noise_strength={d:.2})\n", .{ frames, mlx.getShape(toks.hints)[1], req.cover_strength, req.cover_noise_strength });
+                break :blk try self.contextLatents(crop, s);
+            },
+        };
         defer _ = mlx.mlx_array_free(ctx);
+        const ctx2: ?mlx.mlx_array = if (two_sets) blk: {
+            const sil = try self.silenceSlice(frames, s);
+            defer _ = mlx.mlx_array_free(sil);
+            break :blk try self.contextLatents(sil, s);
+        } else null;
+        defer if (ctx2) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
 
         // ── seeded noise ──
+        const lat_sh = [_]c_int{ 1, @intCast(frames), @intCast(self.cfg.acoustic_dim) };
         var key = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(key);
         try mlx.check(mlx.mlx_random_key(&key, req.seed));
         var xt = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_random_normal(&xt, &ones_sh, 3, .float32, 0.0, 1.0, key, s));
+        try mlx.check(mlx.mlx_random_normal(&xt, &lat_sh, 3, .float32, 0.0, 1.0, key, s));
         defer _ = mlx.mlx_array_free(xt);
 
         // ── 8-step Euler flow-match + DCW ──
         var sched: [NUM_STEPS]f32 = undefined;
         timestepSchedule(&sched, SHIFT);
-        for (0..NUM_STEPS) |step| {
+        var start_step: usize = 0;
+        if (req.task == .cover and req.cover_noise_strength > 0.0) {
+            // Start part-way down the schedule from a noise/source blend.
+            start_step = nearestStep(&sched, 1.0 - req.cover_noise_strength);
+            const t0 = sched[start_step];
+            const noisy = try mulScalar(xt, t0, s);
+            defer _ = mlx.mlx_array_free(noisy);
+            const srcw = try mulScalar(src_lat.?, 1.0 - t0, s);
+            defer _ = mlx.mlx_array_free(srcw);
+            const blend = try addA(noisy, srcw, s);
+            _ = mlx.mlx_array_free(xt);
+            xt = blend;
+            log.info("[acestep] cover: noise_strength={d:.2} -> start at t={d:.3} ({d} steps remain)\n", .{ req.cover_noise_strength, t0, NUM_STEPS - start_step });
+        }
+        const remaining = NUM_STEPS - start_step;
+        const cover_steps: usize = if (req.task == .cover) @intFromFloat(@as(f32, @floatFromInt(remaining)) * req.cover_strength) else remaining;
+        var switched = false;
+        var cur_ctx = ctx;
+        var cur_cross: *const CrossKv = &cross;
+        for (start_step..NUM_STEPS) |step| {
             if (progress) |p| {
                 if (p.cancelled()) return error.Cancelled;
-                p.emit("diffuse", @intCast(step), NUM_STEPS);
+                p.emit("diffuse", @intCast(step - start_step), @intCast(remaining));
+            }
+            if (two_sets and !switched and step - start_step >= cover_steps) {
+                switched = true;
+                cur_ctx = ctx2.?;
+                cur_cross = &cross2.?;
+                log.info("[acestep] cover: switching to text2music conditioning at step {d}/{d}\n", .{ step - start_step, remaining });
             }
             const t_curr = sched[step];
-            const vt = try ditForward(self, allocator, xt, t_curr, ctx, &cross, s);
+            const vt = try ditForward(self, allocator, xt, t_curr, cur_ctx, cur_cross, s);
             defer _ = mlx.mlx_array_free(vt);
 
             const step_size = if (step == NUM_STEPS - 1) t_curr else t_curr - sched[step + 1];
@@ -1457,7 +2030,7 @@ pub const Engine = struct {
             xt = corrected;
             _ = mlx.mlx_array_eval(xt);
         }
-        if (progress) |p| p.emit("diffuse", NUM_STEPS, NUM_STEPS);
+        if (progress) |p| p.emit("diffuse", @intCast(remaining), @intCast(remaining));
 
         // ── VAE decode → normalize → WAV ──
         // Decode is the pipeline's memory peak; start it from a drained cache.
@@ -1536,7 +2109,7 @@ test "acestep prompt format matches the reference SFT_GEN_PROMPT byte-exactly" {
         "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n- duration: 10 seconds\n",
         metas,
     );
-    const prompt = try formatPrompt(a, "upbeat synthwave with driving bass, dreamy pads and a catchy lead melody", metas);
+    const prompt = try formatPrompt(a, TEXT2MUSIC_INSTRUCTION, "upbeat synthwave with driving bass, dreamy pads and a catchy lead melody", metas);
     defer a.free(prompt);
     try testing.expectEqualStrings(
         "# Instruction\nFill the audio semantic mask based on the given conditions:\n\n" ++
@@ -1544,6 +2117,77 @@ test "acestep prompt format matches the reference SFT_GEN_PROMPT byte-exactly" {
             "# Metas\n- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n- duration: 10 seconds\n<|endoftext|>\n",
         prompt,
     );
+}
+
+test "acestep task instruction: the instruction line is the task (constants.py TASK_INSTRUCTIONS)" {
+    const a = testing.allocator;
+    const t2m = try taskInstruction(a, .text2music, "");
+    defer a.free(t2m);
+    try testing.expectEqualStrings("Fill the audio semantic mask based on the given conditions:", t2m);
+    const cov = try taskInstruction(a, .cover, "");
+    defer a.free(cov);
+    try testing.expectEqualStrings("Generate audio semantic tokens based on the given conditions:", cov);
+    const dflt = try taskInstruction(a, .complete, "");
+    defer a.free(dflt);
+    try testing.expectEqualStrings("Complete the input track:", dflt);
+    const classes = try joinTrackClasses(a, &.{ "bass", " Drums", "backing_vocals" });
+    defer a.free(classes);
+    try testing.expectEqualStrings("BASS | DRUMS | BACKING_VOCALS", classes);
+    const comp = try taskInstruction(a, .complete, classes);
+    defer a.free(comp);
+    try testing.expectEqualStrings("Complete the input track with BASS | DRUMS | BACKING_VOCALS:", comp);
+    try testing.expectError(error.UnknownTrackClass, joinTrackClasses(a, &.{ "bass", "kazoo" }));
+    // The prompt carries it verbatim.
+    const p = try formatPrompt(a, comp, "lo-fi", "- duration: 10 seconds\n");
+    defer a.free(p);
+    try testing.expectEqualStrings("# Instruction\nComplete the input track with BASS | DRUMS | BACKING_VOCALS:\n\n# Caption\nlo-fi\n\n# Metas\n- duration: 10 seconds\n<|endoftext|>\n", p);
+}
+
+test "acestep nearestStep: cover_noise_strength picks the schedule entry nearest 1-strength" {
+    var sched: [NUM_STEPS]f32 = undefined;
+    timestepSchedule(&sched, SHIFT); // 1, .9545, .9, .8333, .75, .6429, .5, .3
+    try testing.expectEqual(@as(usize, 0), nearestStep(&sched, 1.0));
+    try testing.expectEqual(@as(usize, 7), nearestStep(&sched, 0.0));
+    try testing.expectEqual(@as(usize, 6), nearestStep(&sched, 0.45)); // |0.5-0.45| < |0.3-0.45|
+    try testing.expectEqual(@as(usize, 2), nearestStep(&sched, 0.9));
+}
+
+test "acestep FSQ grid: soft clamp + symmetry-preserving floor grid + mixed-radix indices" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    // levels [8,5], z' = c·tanh(z/c):
+    //   L=8 (c=8/7): z=0.3 → 0.2933 → ⌊7·1.2933/2+0.5⌋=5 → 5·2/7−1=0.428571; z=1.7 → 1.032 → clamp 1 → 1.0
+    //   L=5 (c=1.25): z=0.3 → 0.2944 → ⌊4·1.2944/2+0.5⌋=3 → 0.5; z=−1 → −0.830 → ⌊0.84⌋=0 → −1
+    //   L=5: z=−0.78662 → −0.6971 → ⌊1.106⌋=1 → −0.5 (the hard clamp ALONE floors 0.927 → −1: the
+    //   reference's code for this exact value is level 1 — oracle 8 caught it)
+    const levels = [_]f32{ 8, 5 };
+    const zv = [_]f32{ 0.3, 0.3, 1.7, -1.0, 0.0, -0.78662 };
+    const sh = [_]c_int{ 1, 3, 2 };
+    const z = mlx.mlx_array_new_data(&zv, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(z);
+    const codes = try fsqQuantize(z, &levels, s);
+    defer _ = mlx.mlx_array_free(codes);
+    var cc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cc);
+    try mlx.check(mlx.mlx_contiguous(&cc, codes, false, s));
+    _ = mlx.mlx_array_eval(cc);
+    const d = mlx.mlx_array_data_float32(cc) orelse return error.NoData;
+    try testing.expectApproxEqAbs(@as(f32, 5.0 * 2.0 / 7.0 - 1.0), d[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), d[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), d[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -1.0), d[3], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), d[5], 1e-6);
+    // indices: level idx (5,3) → 5 + 3·8 = 29; (7,0) → 7; (4,1) → 4 + 8 = 12 (z=0 at L=8 is level 4)
+    const idx = try fsqIndices(codes, &levels, s);
+    defer _ = mlx.mlx_array_free(idx);
+    var ic = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ic);
+    try mlx.check(mlx.mlx_contiguous(&ic, idx, false, s));
+    _ = mlx.mlx_array_eval(ic);
+    const di = mlx.mlx_array_data_int32(ic) orelse return error.NoData;
+    try testing.expectEqual(@as(i32, 29), di[0]);
+    try testing.expectEqual(@as(i32, 7), di[1]);
+    try testing.expectEqual(@as(i32, 12), di[2]);
 }
 
 test "acestep meta string with explicit bpm/keyscale/timesignature" {
@@ -1715,7 +2359,7 @@ test "acestep oracle: prompt tokenization matches reference ids" {
     defer e.deinit();
     const metas = try formatMetaString(a, null, "", "", 10);
     defer a.free(metas);
-    const prompt = try formatPrompt(a, "upbeat synthwave with driving bass, dreamy pads and a catchy lead melody", metas);
+    const prompt = try formatPrompt(a, TEXT2MUSIC_INSTRUCTION, "upbeat synthwave with driving bass, dreamy pads and a catchy lead melody", metas);
     defer a.free(prompt);
     const ids = try e.tokenize(a, prompt, MAX_PROMPT_TOKENS);
     defer a.free(ids);
@@ -1781,6 +2425,65 @@ test "acestep oracle: condition encoder matches reference" {
     const corr = try arrayCosine(cond, ref, s);
     std.debug.print("[acestep-cond] corr={d:.6}\n", .{corr});
     try testing.expect(corr > 0.999);
+}
+
+// Oracle 7: condition encoder with a REAL reference latent in the timbre slot
+// (the #259 path). Reuses the oracle-6 audio: VAE mean → timbre → packed states.
+test "acestep oracle: condition encoder with reference audio matches reference" {
+    _ = std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest;
+    const th_p = std.mem.span(std.c.getenv("ACESTEP_TEXT_HIDDEN") orelse return error.SkipZigTest);
+    const tl_s = std.mem.span(std.c.getenv("ACESTEP_TEXT_LEN") orelse return error.SkipZigTest);
+    const le_p = std.mem.span(std.c.getenv("ACESTEP_LYRIC_EMBEDS") orelse return error.SkipZigTest);
+    const ll_s = std.mem.span(std.c.getenv("ACESTEP_LYRIC_LEN") orelse return error.SkipZigTest);
+    const audio_p = std.mem.span(std.c.getenv("ACESTEP_VAEENC_AUDIO") orelse return error.SkipZigTest);
+    const cond_p = std.mem.span(std.c.getenv("ACESTEP_REFCOND") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const text_len = try std.fmt.parseInt(c_int, tl_s, 10);
+    const lyric_len = try std.fmt.parseInt(c_int, ll_s, 10);
+    const th = try readF32(io, a, th_p);
+    defer a.free(th);
+    const le = try readF32(io, a, le_p);
+    defer a.free(le);
+    const audio_d = try readF32(io, a, audio_p);
+    defer a.free(audio_d);
+    const ref = try readF32(io, a, cond_p);
+    defer a.free(ref);
+
+    var e = try testEngine(io, a);
+    defer e.deinit();
+    const s = e.s;
+    const th_f32 = mlx.mlx_array_new_data(th.ptr, &[_]c_int{ 1, text_len, 1024 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(th_f32);
+    const th_bf = try astype(th_f32, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(th_bf);
+    const le_f32 = mlx.mlx_array_new_data(le.ptr, &[_]c_int{ 1, lyric_len, 1024 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(le_f32);
+    const le_bf = try astype(le_f32, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(le_bf);
+    // audio fixture is [1,2,N] channels-first → [1,N,2]
+    const n_samp: c_int = @intCast(audio_d.len / 2);
+    const audio_cf = mlx.mlx_array_new_data(audio_d.ptr, &[_]c_int{ 1, 2, n_samp }, 3, .float32);
+    defer _ = mlx.mlx_array_free(audio_cf);
+    var audio_nlc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(audio_nlc);
+    try mlx.check(mlx.mlx_transpose_axes(&audio_nlc, audio_cf, &[_]c_int{ 0, 2, 1 }, 3, s));
+    const timbre = try e.refTimbreLatents(a, audio_nlc, s);
+    defer _ = mlx.mlx_array_free(timbre);
+    const cond = try buildConditioning(e, a, th_bf, le_bf, timbre, s);
+    defer _ = mlx.mlx_array_free(cond);
+    const corr = try arrayCosine(cond, ref, s);
+    // The timbre token is ONE row of the pack (index lyric_len), so the
+    // whole-tensor cosine is dominated by the 85 rows that never see the
+    // clip — the silence and reference fixtures differ ONLY on that row
+    // (row cos 0.075 between them). Pin the row itself.
+    const row_i: usize = @intCast(lyric_len);
+    const row = try sliceA(cond, &[_]c_int{ 0, lyric_len, 0 }, &[_]c_int{ 1, lyric_len + 1, 2048 }, &[_]c_int{ 1, 1, 1 }, s);
+    defer _ = mlx.mlx_array_free(row);
+    const row_corr = try arrayCosine(row, ref[row_i * 2048 .. (row_i + 1) * 2048], s);
+    std.debug.print("[acestep-refcond] corr={d:.6} timbre_row_corr={d:.6}\n", .{ corr, row_corr });
+    try testing.expect(corr > 0.999);
+    try testing.expect(row_corr > 0.999);
 }
 
 // Oracle 3: one DiT velocity at t=1.0 from injected noise + reference cond.
@@ -1970,6 +2673,311 @@ test "acestep oracle: VAE encode mean matches reference" {
     const corr = try arrayCosine(mean_cf, ref, s);
     std.debug.print("[acestep-vaeenc] corr={d:.6}\n", .{corr});
     try testing.expect(corr > 0.999);
+}
+
+/// FSQ boundary distance of a pre-quantization value, in cells: how far
+/// `(L−1)(clamp(z)+1)/2 + 0.5` sits from the nearest floor boundary (0 = on
+/// the edge, 0.5 = dead centre).
+fn fsqBoundaryDistance(z: f32, level: f32) f32 {
+    const u = (level - 1.0) * (std.math.clamp(fsqSoftClamp(z, level), -1.0, 1.0) + 1.0) / 2.0 + 0.5;
+    return @abs(u - @round(u));
+}
+
+/// Mixed-radix digit `d` of a codebook index (basis cumprod([1] ++ L[:-1])).
+fn fsqDigit(index: i32, levels: []const f32, d: usize) i32 {
+    var idx = index;
+    for (0..d) |i| idx = @divTrunc(idx, @as(i32, @intFromFloat(levels[i])));
+    return @mod(idx, @as(i32, @intFromFloat(levels[d])));
+}
+
+test "acestep FSQ boundary distance + digits" {
+    // L=8, z=0.3 → soft 0.29330 → u=5.0266 → 0.027 from the floor boundary;
+    // z=1.7 → soft 1.032 → clamps → u=7.5 → centre.
+    try testing.expectApproxEqAbs(@as(f32, 0.0266), fsqBoundaryDistance(0.3, 8), 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), fsqBoundaryDistance(1.7, 8), 1e-5);
+    const lv = [_]f32{ 8, 5 };
+    try testing.expectEqual(@as(i32, 5), fsqDigit(29, &lv, 0));
+    try testing.expectEqual(@as(i32, 3), fsqDigit(29, &lv, 1));
+}
+
+// Chunked encode == untiled encode. A cover source longer than one window
+// (30 s) is the ONLY path through `vaeEncodeMeanChunked`; every short test
+// clip fits one window and never exercises the halo/offset arithmetic.
+test "acestep chunked VAE encode matches the untiled pass on a multi-window clip" {
+    _ = std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var e = try testEngine(io, a);
+    defer e.deinit();
+    const s = e.s;
+    // 40 s stereo chirp + tone = 1000 frames → two windows with a halo seam at 750.
+    const n: usize = 1000 * 1920;
+    const buf = try a.alloc(f32, n * 2);
+    defer a.free(buf);
+    for (0..n) |i| {
+        const t = @as(f32, @floatFromInt(i)) / 48000.0;
+        buf[i * 2] = 0.5 * @sin(2.0 * std.math.pi * (110.0 + 20.0 * t) * t);
+        buf[i * 2 + 1] = 0.4 * @sin(2.0 * std.math.pi * 330.0 * t) * @sin(0.5 * t);
+    }
+    const audio = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, @intCast(n), 2 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(audio);
+    const whole = try vaeEncodeMean(e, a, audio, s);
+    defer _ = mlx.mlx_array_free(whole);
+    const chunked = try vaeEncodeMeanChunked(e, a, audio, null, s);
+    defer _ = mlx.mlx_array_free(chunked);
+    try testing.expectEqual(mlx.getShape(whole)[1], mlx.getShape(chunked)[1]);
+    var wc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wc);
+    try mlx.check(mlx.mlx_contiguous(&wc, whole, false, s));
+    _ = mlx.mlx_array_eval(wc);
+    const nw: usize = @intCast(mlx.mlx_array_size(wc));
+    const wd = mlx.mlx_array_data_float32(wc) orelse return error.NoData;
+    const corr = try arrayCosine(chunked, wd[0..nw], s);
+    std.debug.print("[acestep-chunked-enc] frames={d} corr={d:.6}\n", .{ mlx.getShape(whole)[1], corr });
+    try testing.expect(corr > 0.9999);
+}
+
+// Oracle 8: FSQ tokenizer. Reference: oracle-6 latent mean [1,64,50] → 5 Hz
+// hints [1,10,2048] + codebook indices [1,10]. The bar is NEAR-TIE acquittal
+// (the MTP rule): a code may differ from the fp32 reference ONLY on a grid
+// dimension whose reference pre-quantization value sits within 0.05 cells of
+// a floor boundary. Measured 2026-08-22: dense-bf16 FSQ weights + f32
+// activations are EXACT (0/10, max |Δz| 2e-5); the 8-bit pack moves z by up
+// to 0.039 and flips 3/10 codes, all at ≤ 0.012 cells. A wrong grid formula
+// (the hard clamp without the soft clamp) or a wrong RoPE/mask/window layout
+// flips dims sitting 0.07–0.5 cells deep, which is how the soft clamp was found.
+test "acestep oracle: FSQ tokenizer hints + indices match reference" {
+    _ = std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest;
+    const mean_p = std.mem.span(std.c.getenv("ACESTEP_VAEENC_MEAN") orelse return error.SkipZigTest);
+    const hints_p = std.mem.span(std.c.getenv("ACESTEP_TOK_HINTS") orelse return error.SkipZigTest);
+    const idx_p = std.mem.span(std.c.getenv("ACESTEP_TOK_INDICES") orelse return error.SkipZigTest);
+    const z_p = std.mem.span(std.c.getenv("ACESTEP_TOK_Z") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const mean_d = try readF32(io, a, mean_p); // [1,64,T] channel-first
+    defer a.free(mean_d);
+    const ref_h = try readF32(io, a, hints_p);
+    defer a.free(ref_h);
+    const ref_i = try readI32(io, a, idx_p);
+    defer a.free(ref_i);
+    const ref_z = try readF32(io, a, z_p); // [T5,6] reference pre-quantization values
+    defer a.free(ref_z);
+
+    var e = try testEngine(io, a);
+    defer e.deinit();
+    const s = e.s;
+    const frames: c_int = @intCast(mean_d.len / 64);
+    const mean_cf = mlx.mlx_array_new_data(mean_d.ptr, &[_]c_int{ 1, 64, frames }, 3, .float32);
+    defer _ = mlx.mlx_array_free(mean_cf);
+    const mean_nlc = try transpose(mean_cf, &[_]c_int{ 0, 2, 1 }, s);
+    defer _ = mlx.mlx_array_free(mean_nlc);
+    const toks = try audioTokenize(e, a, mean_nlc, s);
+    defer toks.deinit();
+    var zc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zc);
+    try mlx.check(mlx.mlx_contiguous(&zc, toks.z, false, s));
+    _ = mlx.mlx_array_eval(zc);
+    const dz = mlx.mlx_array_data_float32(zc) orelse return error.NoData;
+    var ic = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ic);
+    try mlx.check(mlx.mlx_contiguous(&ic, toks.indices, false, s));
+    _ = mlx.mlx_array_eval(ic);
+    const n_idx: usize = @intCast(mlx.mlx_array_size(ic));
+    const di = mlx.mlx_array_data_int32(ic) orelse return error.NoData;
+    const levels = &e.cfg.fsq_levels;
+    var mismatches: usize = 0;
+    var deep_flips: usize = 0;
+    var worst_dist: f32 = 0;
+    for (0..n_idx) |i| {
+        if (di[i] == ref_i[i]) continue;
+        mismatches += 1;
+        for (0..levels.len) |d| {
+            if (fsqDigit(di[i], levels, d) == fsqDigit(ref_i[i], levels, d)) continue;
+            const zr = ref_z[i * levels.len + d];
+            const dist = fsqBoundaryDistance(zr, levels[d]);
+            std.debug.print("[acestep-tok] flip tok {d} dim {d}: ref z={d:.5} ours z={d:.5} (L={d}, boundary dist {d:.4} cells)\n", .{ i, d, zr, dz[i * levels.len + d], levels[d], dist });
+            worst_dist = @max(worst_dist, dist);
+            if (dist >= 0.05) deep_flips += 1;
+        }
+    }
+    var max_dz: f32 = 0;
+    for (0..ref_z.len) |k| max_dz = @max(max_dz, @abs(dz[k] - ref_z[k]));
+    std.debug.print("[acestep-tok] max |z - z_ref| over all dims = {d:.5}\n", .{max_dz});
+    const corr = try arrayCosine(toks.hints, ref_h, s);
+    std.debug.print("[acestep-tok] corr={d:.6} codes={d} mismatched={d} deep_flips={d} worst_flip_dist={d:.4}\n", .{ corr, n_idx, mismatches, deep_flips, worst_dist });
+    try testing.expectEqual(ref_i.len, n_idx);
+    try testing.expectEqual(@as(usize, 0), deep_flips);
+    try testing.expect(corr > 0.99);
+}
+
+// Oracle 9: detokenizer. Hints → 25 Hz latents [1,50,64]. It is CONCATENATED
+// into the DiT's context stream, so the bar is cosine AND rms ratio (the
+// cosine-cannot-see-scale rule).
+test "acestep oracle: FSQ detokenizer matches reference (cos + scale)" {
+    _ = std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest;
+    const hints_p = std.mem.span(std.c.getenv("ACESTEP_TOK_HINTS") orelse return error.SkipZigTest);
+    const det_p = std.mem.span(std.c.getenv("ACESTEP_DETOK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const hints_d = try readF32(io, a, hints_p);
+    defer a.free(hints_d);
+    const ref = try readF32(io, a, det_p); // [1,T,64]
+    defer a.free(ref);
+
+    var e = try testEngine(io, a);
+    defer e.deinit();
+    const s = e.s;
+    const t5: c_int = @intCast(hints_d.len / 2048);
+    const h_f32 = mlx.mlx_array_new_data(hints_d.ptr, &[_]c_int{ 1, t5, 2048 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(h_f32);
+    const det = try audioDetokenize(e, a, h_f32, s);
+    defer _ = mlx.mlx_array_free(det);
+    const corr = try arrayCosine(det, ref, s);
+    var dc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dc);
+    try mlx.check(mlx.mlx_contiguous(&dc, det, false, s));
+    _ = mlx.mlx_array_eval(dc);
+    const d = mlx.mlx_array_data_float32(dc) orelse return error.NoData;
+    var ss_ours: f64 = 0;
+    var ss_ref: f64 = 0;
+    for (0..ref.len) |i| {
+        ss_ours += @as(f64, d[i]) * d[i];
+        ss_ref += @as(f64, ref[i]) * ref[i];
+    }
+    const rms_ratio = std.math.sqrt(ss_ours / ss_ref);
+    std.debug.print("[acestep-detok] corr={d:.6} rms_ratio={d:.4}\n", .{ corr, rms_ratio });
+    try testing.expect(corr > 0.999);
+    try testing.expect(rms_ratio > 0.97 and rms_ratio < 1.03);
+}
+
+// Oracle 10: the cover DiT velocity — context [detok | ones] + the COVER
+// instruction's conditioning, one forward at t=1.0 from injected noise.
+test "acestep oracle: cover DiT velocity matches reference" {
+    _ = std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest;
+    const cond_p = std.mem.span(std.c.getenv("ACESTEP_COVER_COND") orelse return error.SkipZigTest);
+    const det_p = std.mem.span(std.c.getenv("ACESTEP_DETOK") orelse return error.SkipZigTest);
+    const noise_p = std.mem.span(std.c.getenv("ACESTEP_COVER_NOISE") orelse return error.SkipZigTest);
+    const v1_p = std.mem.span(std.c.getenv("ACESTEP_COVER_V1") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cond_d = try readF32(io, a, cond_p);
+    defer a.free(cond_d);
+    const det_d = try readF32(io, a, det_p);
+    defer a.free(det_d);
+    const noise_d = try readF32(io, a, noise_p);
+    defer a.free(noise_d);
+    const ref = try readF32(io, a, v1_p);
+    defer a.free(ref);
+
+    var e = try testEngine(io, a);
+    defer e.deinit();
+    const s = e.s;
+    const frames: c_int = @intCast(noise_d.len / 64);
+    const cond_len: c_int = @intCast(cond_d.len / 2048);
+    const cond_f32 = mlx.mlx_array_new_data(cond_d.ptr, &[_]c_int{ 1, cond_len, 2048 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(cond_f32);
+    const cond_bf = try astype(cond_f32, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(cond_bf);
+    var cross = try e.conditionSet(a, cond_bf, s);
+    defer cross.deinit(a);
+    const noise = mlx.mlx_array_new_data(noise_d.ptr, &[_]c_int{ 1, frames, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(noise);
+    const det = mlx.mlx_array_new_data(det_d.ptr, &[_]c_int{ 1, frames, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(det);
+    const ctx = try e.contextLatents(det, s);
+    defer _ = mlx.mlx_array_free(ctx);
+    const v1 = try ditForward(e, a, noise, 1.0, ctx, &cross, s);
+    defer _ = mlx.mlx_array_free(v1);
+    const corr = try arrayCosine(v1, ref, s);
+    std.debug.print("[acestep-cover-dit] corr={d:.6}\n", .{corr});
+    try testing.expect(corr > 0.995);
+}
+
+// Oracle 11: the WHOLE cover pipeline on a real clip — reference source latent
+// → OUR tokenize → detokenize → context, OUR condition set from the reference
+// cover text hidden + the fixture lyrics → 8-step Euler + DCW from injected
+// noise, against the reference's final latents. Also reports how close each
+// cover sits to the SOURCE latent — the "does a cover follow the song" number.
+test "acestep oracle: cover e2e denoise matches reference" {
+    _ = std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest;
+    const src_p = std.mem.span(std.c.getenv("ACESTEP_COVER_SRC") orelse return error.SkipZigTest);
+    const th_p = std.mem.span(std.c.getenv("ACESTEP_COVER_E2E_TEXT_HIDDEN") orelse return error.SkipZigTest);
+    const le_p = std.mem.span(std.c.getenv("ACESTEP_LYRIC_EMBEDS") orelse return error.SkipZigTest);
+    const noise_p = std.mem.span(std.c.getenv("ACESTEP_COVER_E2E_NOISE") orelse return error.SkipZigTest);
+    const out_p = std.mem.span(std.c.getenv("ACESTEP_COVER_E2E_LATENTS") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const src_d = try readF32(io, a, src_p); // [1,T,64]
+    defer a.free(src_d);
+    const th = try readF32(io, a, th_p);
+    defer a.free(th);
+    const le = try readF32(io, a, le_p);
+    defer a.free(le);
+    const noise_d = try readF32(io, a, noise_p);
+    defer a.free(noise_d);
+    const ref = try readF32(io, a, out_p);
+    defer a.free(ref);
+
+    var e = try testEngine(io, a);
+    defer e.deinit();
+    const s = e.s;
+    const frames: c_int = @intCast(src_d.len / 64);
+    const text_len: c_int = @intCast(th.len / 1024);
+    const lyric_len: c_int = @intCast(le.len / 1024);
+    const th_f32 = mlx.mlx_array_new_data(th.ptr, &[_]c_int{ 1, text_len, 1024 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(th_f32);
+    const th_bf = try astype(th_f32, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(th_bf);
+    const le_f32 = mlx.mlx_array_new_data(le.ptr, &[_]c_int{ 1, lyric_len, 1024 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(le_f32);
+    const le_bf = try astype(le_f32, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(le_bf);
+    const timbre = try e.silenceSlice(e.cfg.timbre_fix_frame, s);
+    defer _ = mlx.mlx_array_free(timbre);
+    const cond = try buildConditioning(e, a, th_bf, le_bf, timbre, s);
+    defer _ = mlx.mlx_array_free(cond);
+    var cross = try e.conditionSet(a, cond, s);
+    defer cross.deinit(a);
+
+    const src = mlx.mlx_array_new_data(src_d.ptr, &[_]c_int{ 1, frames, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(src);
+    const toks = try audioTokenize(e, a, src, s);
+    defer toks.deinit();
+    const det = try audioDetokenize(e, a, toks.hints, s);
+    defer _ = mlx.mlx_array_free(det);
+    const crop = try sliceA(det, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, frames, 64 }, &[_]c_int{ 1, 1, 1 }, s);
+    defer _ = mlx.mlx_array_free(crop);
+    const ctx = try e.contextLatents(crop, s);
+    defer _ = mlx.mlx_array_free(ctx);
+
+    var xt = mlx.mlx_array_new_data(noise_d.ptr, &[_]c_int{ 1, frames, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(xt);
+    var sched: [NUM_STEPS]f32 = undefined;
+    timestepSchedule(&sched, SHIFT);
+    for (0..NUM_STEPS) |step| {
+        const t_curr = sched[step];
+        const vt = try ditForward(e, a, xt, t_curr, ctx, &cross, s);
+        defer _ = mlx.mlx_array_free(vt);
+        const step_size = if (step == NUM_STEPS - 1) t_curr else t_curr - sched[step + 1];
+        const dv = try mulScalar(vt, step_size, s);
+        defer _ = mlx.mlx_array_free(dv);
+        const x_next = try subA(xt, dv, s);
+        defer _ = mlx.mlx_array_free(x_next);
+        const vtt = try mulScalar(vt, t_curr, s);
+        defer _ = mlx.mlx_array_free(vtt);
+        const denoised = try subA(xt, vtt, s);
+        defer _ = mlx.mlx_array_free(denoised);
+        const corrected = try applyDcwDouble(x_next, denoised, t_curr, s);
+        _ = mlx.mlx_array_free(xt);
+        xt = corrected;
+        _ = mlx.mlx_array_eval(xt);
+    }
+    const corr = try arrayCosine(xt, ref, s);
+    const ours_vs_src = try arrayCosine(xt, src_d, s);
+    const ref_vs_src = cosine(ref, src_d);
+    const det_vs_src = try arrayCosine(crop, src_d, s);
+    std.debug.print("[acestep-cover-e2e] frames={d} corr(ours,ref)={d:.6} cos(ours,src)={d:.4} cos(ref,src)={d:.4} cos(detok,src)={d:.4}\n", .{ frames, corr, ours_vs_src, ref_vs_src, det_vs_src });
+    try testing.expect(corr > 0.95);
 }
 
 test "acestep instrumental flag reaches the same reference marker as empty lyrics" {

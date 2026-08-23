@@ -2687,9 +2687,10 @@ pub fn ditForward(
     // (`transformer_args.apply_keyframes_absolute_embedding`).
     //
     // `cond_mask[n] == 0` is exactly that set here: the only conditioning this
-    // engine builds is one first frame, VAE-encoded on its own, pinned clean by
-    // the denoise loop (`n < HW`). Riding the same mask is what keeps the two
-    // from ever disagreeing about which frames were handed in. A future
+    // engine builds is a first and/or last frame (`keyframeMask`), each
+    // VAE-encoded on its own as a standalone frame and pinned clean by the
+    // denoise loop. Riding the same mask is what keeps the two from ever
+    // disagreeing about which frames were handed in. A future
     // conditioning shape whose clean tokens come from a multi-frame CLIP would
     // need its own mask — those tokens are not standalone frames.
     //
@@ -4107,9 +4108,10 @@ pub fn oneStageSigmas(alloc: std.mem.Allocator, distilled: bool, num_steps: u32,
 /// text embeds → seed noise → guided Euler sampler → VAE decode → RGB uint8
 /// frames. `connector`/`transformer` are connector.safetensors / a transformer
 /// variant; `vae` is vae_decoder.safetensors. For I2V, pass `vae_encoder` (the
-/// encoder Component) and `cond_image` (`[1,3,1,height,width]` BCFHW, bf16,
-/// [-1,1]) — the image is VAE-encoded and pinned as the clean first latent
-/// frame; both null → pure t2v (byte-unchanged). The negative prompt is only
+/// encoder Component) and `cond_image` / `last_image` (`[1,3,1,height,width]`
+/// BCFHW, bf16, [-1,1]) — each image is VAE-encoded and pinned as the clean
+/// first / last latent frame (`buildKeyframeCond`); all null → pure t2v
+/// (byte-unchanged). The negative prompt is only
 /// encoded (a full Gemma-3-12B pass) when a guider actually needs the
 /// unconditional forward. Caller frees the result.
 pub fn generateVideoFrames(
@@ -4121,6 +4123,7 @@ pub fn generateVideoFrames(
     vae: VaeChoice,
     vae_encoder: ?*const Component,
     cond_image: ?mlx.mlx_array,
+    last_image: ?mlx.mlx_array,
     gemma_dir: []const u8,
     pos_ids: []const i32,
     neg_ids: []const i32,
@@ -4179,55 +4182,21 @@ pub fn generateVideoFrames(
     const noise_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
     defer _ = mlx.mlx_array_free(noise_a);
 
-    // ── I2V first-frame conditioning (optional) ──────────────────────────────
-    // Encode the reference image → clean tokens for latent frame 0. Replace the
-    // first H*W noise tokens with them, build the clean latent + denoise mask.
-    // Reference: combined_image_conditionings + VideoConditionByLatentIndex.
+    // ── keyframe conditioning (optional) ────────────────────────────────────
+    // Encode the anchor image(s) → clean tokens for latent frame 0 / F-1,
+    // spliced over the noise, plus the clean latent + denoise mask.
+    // Reference: VideoConditionByLatentIndex.
     const HW = H * W;
-    var init_owned: ?mlx.mlx_array = null;
-    defer if (init_owned) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    var clean_v: ?mlx.mlx_array = null;
-    defer if (clean_v) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    var cond_mask: ?[]f32 = null;
-    defer if (cond_mask) |b| alloc.free(b);
-    if (vae_encoder) |venc| if (cond_image) |img| if (HW < Nv) {
+    var kf: ?KeyframeCond = null;
+    defer if (kf) |*c| c.deinit(alloc);
+    if (vae_encoder) |venc| if (cond_image != null or last_image != null) {
         if (progress) |p| p.emit("Encoding image", 0, num_steps);
-        const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
-        defer _ = mlx.mlx_array_free(ref_lat);
-        // patchify: [1,128,1,H,W] → [1,1,H,W,128] → [1,H*W,128].
-        const tr = try transposeTo(ref_lat, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
-        defer _ = mlx.mlx_array_free(tr);
-        var trc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(trc);
-        try mlx.check(mlx.mlx_contiguous(&trc, tr, false, s));
-        var ref_tokens = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ref_tokens);
-        try mlx.check(mlx.mlx_reshape(&ref_tokens, trc, &[_]c_int{ 1, @intCast(HW), 128 }, 3, s));
-
-        // init latent = [ref_tokens, noise[HW:]].
-        const rest = try sliceTokens(noise_v, HW, Nv, s);
-        defer _ = mlx.mlx_array_free(rest);
-        init_owned = try concatTokens(ref_tokens, rest, s);
-
-        // clean latent = [ref_tokens, zeros] (the zero region is masked out anyway).
-        const zv = mlx.mlx_array_new_float(0.0);
-        defer _ = mlx.mlx_array_free(zv);
-        var zeros = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(zeros);
-        try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv - HW), 128 }, 3, zv, .bfloat16, s));
-        clean_v = try concatTokens(ref_tokens, zeros, s);
-
-        // denoise mask: 0 for the conditioned first frame, 1 for generated tokens.
-        const m = try alloc.alloc(f32, Nv);
-        for (0..Nv) |n| m[n] = if (n < HW) 0.0 else 1.0;
-        cond_mask = m;
-        log.info("[ltx] I2V: conditioned first frame ({d} tokens of {d})\n", .{ HW, Nv });
+        kf = try buildKeyframeCond(alloc, venc, cond_image, last_image, noise_v, HW, F, s);
+        log.info("[ltx] keyframe conditioning: first={} last={} ({d} of {d} tokens)\n", .{ cond_image != null, last_image != null, HW * (@as(u32, @intFromBool(cond_image != null)) + @intFromBool(last_image != null)), Nv });
     };
-    const sampler_v = init_owned orelse noise_v;
+    const clean_v: ?mlx.mlx_array = if (kf) |c| c.clean else null;
+    const cond_mask: ?[]const f32 = if (kf) |c| c.mask else null;
+    const sampler_v = if (kf) |c| c.init_latent else noise_v;
 
     // ── denoise ──
     const total_steps: u32 = @intCast(sigmas.len - 1);
@@ -4263,43 +4232,102 @@ pub fn generateVideoFrames(
 //            from stage 1 and renoised likewise.
 // ════════════════════════════════════════════════════════════════════════
 
-/// First-frame conditioning state for one stage (built from an encoded image).
-const I2VCond = struct {
-    init_latent: mlx.mlx_array, // [1,Nv,C]: [ref tokens, rest of `base`]
-    clean: mlx.mlx_array, // [1,Nv,C]: [ref tokens, zeros]
-    mask: []f32, // 0 for the first HW tokens, 1 elsewhere
+/// Keyframe conditioning state for one stage (built from the encoded anchor images).
+const KeyframeCond = struct {
+    init_latent: mlx.mlx_array, // [1,Nv,C]: `base` with the anchor ranges replaced
+    clean: mlx.mlx_array, // [1,Nv,C]: anchor tokens, zeros elsewhere
+    mask: []f32, // 0 on the anchor ranges, 1 elsewhere
 
-    fn deinit(self: *I2VCond, alloc: std.mem.Allocator) void {
+    fn deinit(self: *KeyframeCond, alloc: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.init_latent);
         _ = mlx.mlx_array_free(self.clean);
         alloc.free(self.mask);
     }
 };
 
-/// VAE-encode `img` and pin it as latent frame 0 over `base` (the noise / noisy
-/// tokens for the rest of the canvas). Mirrors VideoConditionByLatentIndex.
-fn buildI2VCond(alloc: std.mem.Allocator, venc: *const Component, img: mlx.mlx_array, base: mlx.mlx_array, HW: u32, Nv: u32, s: S) !I2VCond {
-    const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
-    defer _ = mlx.mlx_array_free(ref_lat);
-    const ref_tokens = try patchifyVideo(ref_lat, s); // [1,HW,128]
-    defer _ = mlx.mlx_array_free(ref_tokens);
+/// Denoise mask over `F_lat*HW` video tokens: 0 on every conditioned latent
+/// frame, 1 elsewhere. A first anchor is latent frame 0 (tokens `[0, HW)`),
+/// a last anchor is latent frame `F_lat-1` (the last pixel frame on the
+/// causal VAE, `num_frames = 8k+1`). This is the ONE place keyframe token
+/// ranges are computed; `VideoConditionByLatentIndex` at strength 1.
+pub fn keyframeMask(alloc: std.mem.Allocator, HW: u32, F_lat: u32, has_first: bool, has_last: bool) ![]f32 {
+    if (F_lat < 2 and (has_first or has_last)) return error.KeyframeCanvasTooShort;
+    const Nv = F_lat * HW;
+    const mask = try alloc.alloc(f32, Nv);
+    @memset(mask, 1.0);
+    if (has_first) @memset(mask[0..HW], 0.0);
+    if (has_last) @memset(mask[Nv - HW .. Nv], 0.0);
+    return mask;
+}
 
-    const rest = try sliceTokens(base, HW, Nv, s);
-    defer _ = mlx.mlx_array_free(rest);
-    const init_latent = try concatTokens(ref_tokens, rest, s);
-    errdefer _ = mlx.mlx_array_free(init_latent);
+/// VAE-encode the present anchors and pin them as clean latent frames over
+/// `base` (the noise / noisy tokens for the rest of the canvas).
+fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?mlx.mlx_array, last: ?mlx.mlx_array, base: mlx.mlx_array, HW: u32, F_lat: u32, s: S) !KeyframeCond {
+    const mask = try keyframeMask(alloc, HW, F_lat, first != null, last != null);
+    errdefer alloc.free(mask);
+    const Nv = F_lat * HW;
 
     const zv = mlx.mlx_array_new_float(0.0);
     defer _ = mlx.mlx_array_free(zv);
     var zeros = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(zeros);
-    try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv - HW), 128 }, 3, zv, .bfloat16, s));
-    const clean = try concatTokens(ref_tokens, zeros, s);
+    try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv), 128 }, 3, zv, .bfloat16, s));
+
+    var init_latent = try sliceTokens(base, 0, Nv, s);
+    errdefer _ = mlx.mlx_array_free(init_latent);
+    var clean = try sliceTokens(zeros, 0, Nv, s);
     errdefer _ = mlx.mlx_array_free(clean);
 
-    const mask = try alloc.alloc(f32, Nv);
-    for (0..Nv) |n| mask[n] = if (n < HW) 0.0 else 1.0;
+    const anchors = [_]struct { img: ?mlx.mlx_array, start: u32 }{
+        .{ .img = first, .start = 0 },
+        .{ .img = last, .start = Nv - HW },
+    };
+    for (anchors) |a| {
+        const img = a.img orelse continue;
+        const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
+        defer _ = mlx.mlx_array_free(ref_lat);
+        const tokens = try patchifyVideo(ref_lat, s); // [1,HW,128]
+        defer _ = mlx.mlx_array_free(tokens);
+        const ni = try spliceTokens(init_latent, tokens, a.start, Nv, s);
+        _ = mlx.mlx_array_free(init_latent);
+        init_latent = ni;
+        const nc = try spliceTokens(clean, tokens, a.start, Nv, s);
+        _ = mlx.mlx_array_free(clean);
+        clean = nc;
+    }
     return .{ .init_latent = init_latent, .clean = clean, .mask = mask };
+}
+
+/// `x` with tokens `[start, start+len(ins))` replaced by `ins`.
+fn spliceTokens(x: mlx.mlx_array, ins: mlx.mlx_array, start: u32, Nv: u32, s: S) !mlx.mlx_array {
+    const n: u32 = @intCast(mlx.getShape(ins)[1]);
+    const head_base = try sliceTokens(x, 0, start, s);
+    defer _ = mlx.mlx_array_free(head_base);
+    const head = try concatTokens(head_base, ins, s);
+    defer _ = mlx.mlx_array_free(head);
+    const tail = try sliceTokens(x, start + n, Nv, s);
+    defer _ = mlx.mlx_array_free(tail);
+    return concatTokens(head, tail, s);
+}
+
+test "ltx keyframeMask pins first and last latent frames only" {
+    const a = testing.allocator;
+    const HW: u32 = 4;
+    const m_first = try keyframeMask(a, HW, 3, true, false);
+    defer a.free(m_first);
+    try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, m_first);
+    const m_last = try keyframeMask(a, HW, 3, false, true);
+    defer a.free(m_last);
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_last);
+    const m_both = try keyframeMask(a, HW, 3, true, true);
+    defer a.free(m_both);
+    try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0 }, m_both);
+    const m_none = try keyframeMask(a, HW, 1, false, false);
+    defer a.free(m_none);
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1 }, m_none);
+    // One latent frame cannot hold two anchors (or even one and still generate).
+    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, true, true));
+    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, false, true));
 }
 
 /// `noise*sigma + clean*(1-sigma)` (flow-matching renoise), bf16 out.
@@ -4333,8 +4361,9 @@ pub const TwoStageOpts = struct {
 
 /// Two-stage text/image-to-video. `transformer` is the DEV variant (stage 1
 /// requires real CFG); `vae_encoder` is REQUIRED (latent statistics for the
-/// upsampler boundary, plus I2V). `cond_image_half`/`cond_image_full` are the
-/// first-frame pixels prepared at the stage-1 / stage-2 grids (both null → t2v).
+/// upsampler boundary, plus keyframes). `cond_image_half`/`cond_image_full` are
+/// the first-frame pixels prepared at the stage-1 / stage-2 grids, `last_image_*`
+/// the last-frame pair (all null → t2v).
 pub fn generateVideoFramesTwoStage(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -4345,6 +4374,8 @@ pub fn generateVideoFramesTwoStage(
     vae_encoder: *const Component,
     cond_image_half: ?mlx.mlx_array,
     cond_image_full: ?mlx.mlx_array,
+    last_image_half: ?mlx.mlx_array,
+    last_image_full: ?mlx.mlx_array,
     // a2vid: encoded clean audio tokens [1,Na,128] (encodeAudioCond). Stage 1
     // FREEZES them (audio timestep 0, x0 pinned) so the video is generated
     // against the real soundtrack; stage 2 renoises + jointly refines exactly
@@ -4420,13 +4451,13 @@ pub fn generateVideoFramesTwoStage(
     // defaults). Structural, not caller-optional.
     const ap1: GuiderParams = if (audio_cond != null) .{} else ap;
 
-    var cond1: ?I2VCond = null;
+    var cond1: ?KeyframeCond = null;
     defer if (cond1) |*c| c.deinit(alloc);
-    if (cond_image_half) |img| if (H1 * W1 < Nv1) {
+    if (cond_image_half != null or last_image_half != null) {
         if (progress) |p| p.emit("Encoding image", 0, total);
-        cond1 = try buildI2VCond(alloc, vae_encoder, img, noise_v1, H1 * W1, Nv1, s);
-        log.info("[ltx] two-stage I2V: conditioned first frame ({d} of {d} tokens)\n", .{ H1 * W1, Nv1 });
-    };
+        cond1 = try buildKeyframeCond(alloc, vae_encoder, cond_image_half, last_image_half, noise_v1, H1 * W1, F, s);
+        log.info("[ltx] keyframe conditioning (stage 1): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_half != null, last_image_half != null, H1 * W1 * (@as(u32, @intFromBool(cond_image_half != null)) + @intFromBool(last_image_half != null)), Nv1 });
+    }
 
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
     const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
@@ -4471,11 +4502,12 @@ pub fn generateVideoFramesTwoStage(
     const noisy_v2 = try lerpToSigma(video_tokens2, noise_v2, start_sigma, s);
     defer _ = mlx.mlx_array_free(noisy_v2);
 
-    var cond2: ?I2VCond = null;
+    var cond2: ?KeyframeCond = null;
     defer if (cond2) |*c| c.deinit(alloc);
-    if (cond_image_full) |img| if (H2 * W2 < Nv2) {
-        cond2 = try buildI2VCond(alloc, vae_encoder, img, noisy_v2, H2 * W2, Nv2, s);
-    };
+    if (cond_image_full != null or last_image_full != null) {
+        cond2 = try buildKeyframeCond(alloc, vae_encoder, cond_image_full, last_image_full, noisy_v2, H2 * W2, F, s);
+        log.info("[ltx] keyframe conditioning (stage 2): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_full != null, last_image_full != null, H2 * W2 * (@as(u32, @intFromBool(cond_image_full != null)) + @intFromBool(last_image_full != null)), Nv2 });
+    }
 
     // audio: carry stage-1 latent, renoised to the stage-2 start sigma.
     const noise_a2 = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed +% 2 +% 0x9E3779B97F4A7C15, s);

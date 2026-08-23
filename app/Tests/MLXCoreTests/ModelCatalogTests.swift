@@ -32,7 +32,7 @@ final class ModelCatalogTests: XCTestCase {
         guard let ds4 = gemmaModelOptions.first(where: { $0.id.contains("dsv4") }) else {
             return XCTFail("DeepSeek-V4-Flash must be in the curated catalog")
         }
-        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit")
+        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw")
         XCTAssertNil(ds4.ggufFilename, "the native MLX mirror fetches the whole safetensors repo")
         XCTAssertEqual(ds4.minHostRamBytes, 128 * (UInt64(1) << 30))
         XCTAssertTrue(gemmaModelOptionsTrayMenu.contains { $0.id == ds4.id },

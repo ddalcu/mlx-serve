@@ -27,6 +27,95 @@ final class MusicGenTests: XCTestCase {
                        "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit")
     }
 
+    func testReferenceAudioIsDeclaredPerFamilyAndSentOnlyThere() {
+        // ACE-Step has a timbre slot; Music 3 names `ref_audio` a 400. The
+        // preset flag gates the control AND the field, so a clip left behind
+        // by a model switch never reaches the server that refuses it.
+        XCTAssertTrue(MusicModelPreset.acestepXLTurbo8bit.supportsReferenceAudio)
+        XCTAssertFalse(MusicModelPreset.miniMaxMusic3_8bit.supportsReferenceAudio)
+        for p in MusicModelPreset.all {
+            XCTAssertEqual(p.supportsReferenceAudio, p.family == .acestep, p.id)
+        }
+        let ace = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "lo-fi", refAudioPath: "/tmp/ref.wav")
+        XCTAssertEqual(MusicGenService.requestBody(ace, modelName: "ace", refAudioB64: "UklGRg==")["ref_audio"] as? String, "UklGRg==")
+        XCTAssertNil(MusicGenService.requestBody(ace, modelName: "ace")["ref_audio"], "no clip, no field")
+        let m3 = MusicGenRequest(model: .miniMaxMusic3_8bit, prompt: "lo-fi", lyrics: "la", refAudioPath: "/tmp/ref.wav")
+        XCTAssertNil(MusicGenService.requestBody(m3, modelName: "m3", refAudioB64: "UklGRg==")["ref_audio"])
+        XCTAssertNil(MusicGenService.referenceB64(m3))
+        // The sidecar names the clip where it was used, so a track stays reproducible.
+        XCTAssertTrue(MusicGenService.settingsText(ace, resolvedSeed: 1, modelName: "ace").contains("ref_audio: ref.wav"))
+        XCTAssertFalse(MusicGenService.settingsText(m3, resolvedSeed: 1, modelName: "m3").contains("ref_audio"))
+    }
+
+    func testSourceAudioTasksGateTheirFieldsOnModelAndTask() throws {
+        XCTAssertTrue(MusicModelPreset.acestepXLTurbo8bit.supportsSourceAudio)
+        XCTAssertFalse(MusicModelPreset.miniMaxMusic3_8bit.supportsSourceAudio)
+        // Cover: task + source + its two strengths; never the instrument list.
+        var cover = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "orchestral", task: .cover,
+                                    srcAudioPath: "/tmp/src.wav", coverStrength: 0.7, coverNoiseStrength: 1.4,
+                                    trackClasses: ["bass"])
+        var body = MusicGenService.requestBody(cover, modelName: "ace", srcAudioB64: "UklGRg==")
+        XCTAssertEqual(body["task"] as? String, "cover")
+        XCTAssertEqual(body["src_audio"] as? String, "UklGRg==")
+        XCTAssertEqual(body["cover_strength"] as? Double, 0.7)
+        XCTAssertEqual(body["cover_noise_strength"] as? Double, 1.0, "clamped into the server's [0,1]")
+        XCTAssertNil(body["track_classes"])
+        // Complete: task + source + the (vocabulary-filtered) list; no cover knobs.
+        cover.task = .complete
+        cover.trackClasses = ["bass", "kazoo", "drums"]
+        body = MusicGenService.requestBody(cover, modelName: "ace", srcAudioB64: "UklGRg==")
+        XCTAssertEqual(body["task"] as? String, "complete")
+        XCTAssertEqual(body["track_classes"] as? [String], ["bass", "drums"])
+        XCTAssertNil(body["cover_strength"]); XCTAssertNil(body["cover_noise_strength"])
+        // No source clip → plain text2music, whatever the task says (the
+        // server would 400 a source-less cover).
+        body = MusicGenService.requestBody(cover, modelName: "ace")
+        XCTAssertNil(body["task"]); XCTAssertNil(body["src_audio"]); XCTAssertNil(body["track_classes"])
+        // text2music never carries a source even with one attached.
+        cover.task = .text2music
+        body = MusicGenService.requestBody(cover, modelName: "ace", srcAudioB64: "UklGRg==")
+        XCTAssertNil(body["task"]); XCTAssertNil(body["src_audio"])
+        XCTAssertNil(MusicGenService.sourceB64(cover))
+        // Music 3 names every one of these a 400 — the FIELDS are gated.
+        let m3 = MusicGenRequest(model: .miniMaxMusic3_8bit, prompt: "p", lyrics: "la", task: .cover,
+                                 srcAudioPath: "/tmp/src.wav")
+        body = MusicGenService.requestBody(m3, modelName: "m3", srcAudioB64: "UklGRg==")
+        XCTAssertNil(body["task"]); XCTAssertNil(body["src_audio"]); XCTAssertNil(body["cover_strength"])
+        XCTAssertNil(MusicGenService.sourceB64(m3))
+        // The sidecar documents the task, so a cover stays reproducible.
+        cover.task = .cover
+        let txt = MusicGenService.settingsText(cover, resolvedSeed: 1, modelName: "ace")
+        XCTAssertTrue(txt.contains("task: cover") && txt.contains("src_audio: src.wav") && txt.contains("cover_strength: 0.7"))
+        XCTAssertFalse(MusicGenService.settingsText(m3, resolvedSeed: 1, modelName: "m3").contains("task:"))
+    }
+
+    func testCoverWeightsMissingIsAStatOnThePack() throws {
+        // The migration fetch keys on this one file; a pack that has it must
+        // never trigger a download, a pack without it must.
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("mlx-serve-cover-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        XCTAssertTrue(MusicGenService.coverWeightsMissing(packDir: dir))
+        try Data("x".utf8).write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("fsq.safetensors")))
+        XCTAssertFalse(MusicGenService.coverWeightsMissing(packDir: dir))
+        XCTAssertEqual(MusicGenService.coverWeightsFile, "fsq.safetensors")
+    }
+
+    /// The unreachable-settings class (#243): every source-task field the
+    /// request carries has a control bound to it in the pane.
+    func testSourceTaskControlsExistInThePane() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/MusicGenView.swift")
+        let src = try String(contentsOf: url, encoding: .utf8)
+        for needle in ["selection: $task", "value: $coverStrength", "value: $coverNoiseStrength",
+                       "MusicTask.trackClasses", "acceptSource(", "maxSeconds: 600"] {
+            XCTAssertTrue(src.contains(needle), "MusicGenView has no control for \(needle)")
+        }
+        // The migration fetch is reachable from the pane (service gets the manager).
+        XCTAssertTrue(src.contains("service.generate(req, server: server, downloads: downloads)"))
+    }
+
     // MARK: - Request wire contract
 
     func testRequestBodyOmitsEmptyOptionalFields() {
@@ -101,9 +190,32 @@ final class MusicGenTests: XCTestCase {
         s.durationSeconds = 90
         s.vocalLanguage = "ja"
         s.keepResident = true
+        // The pane UNMOUNTS on every navigation, so what the user TYPED must
+        // ride the sticky blob too — or a trip to Chat for a copy-paste
+        // wipes the prompt, the lyrics and the attached reference clip.
+        s.prompt = "upbeat synthwave"
+        s.lyrics = "[verse]\nla la"
+        s.refAudioPath = "/tmp/ref.wav"
+        s.task = .cover
+        s.srcAudioPath = "/tmp/src.wav"
+        s.coverStrength = 0.8
+        s.coverNoiseStrength = 0.3
+        s.trackClasses = ["bass", "drums"]
         let data = try JSONEncoder().encode(s)
         let back = try JSONDecoder().decode(MusicGenSettings.self, from: data)
         XCTAssertEqual(back, s)
+        XCTAssertEqual(back.prompt, "upbeat synthwave")
+        XCTAssertEqual(back.refAudioPath, "/tmp/ref.wav")
+        XCTAssertEqual(back.task, .cover)
+        XCTAssertEqual(back.srcAudioPath, "/tmp/src.wav")
+        XCTAssertEqual(back.trackClasses, ["bass", "drums"])
+        var a = AudioGenSettings()
+        a.text = "hello there"
+        a.refAudioPath = "/tmp/voice.wav"
+        a.refText = "hello"
+        let aback = try JSONDecoder().decode(AudioGenSettings.self, from: JSONEncoder().encode(a))
+        XCTAssertEqual(aback, a)
+        XCTAssertEqual(try JSONDecoder().decode(AudioGenSettings.self, from: Data("{}".utf8)), AudioGenSettings())
         XCTAssertEqual(back.resolvedModel.id, MusicModelPreset.acestepXLTurbo8bit.id)
 
         // Migration-safe: an old/partial payload decodes to defaults.

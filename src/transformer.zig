@@ -17017,6 +17017,33 @@ fn fpParamsFromGeometry(config: *const ModelConfig, w_cols: u32, s_cols: u32, in
     return .{ .bits = bits, .group_size = group_size, .mode = mode };
 }
 
+/// Per-weight (bits, group_size, mode) solved from packed geometry ALONE, for
+/// callers that have no `ModelConfig` to consult — an MTP sidecar file carries
+/// weights and nothing else. The mode is separated on the same evidence
+/// `computeQuantParams` uses: affine is the only mode whose checkpoints ship
+/// per-group biases, and every fp mode stores fp8-encoded `uint8` scales, so
+/// bias-less + uint8 scales resolves through the (bits, group_size) table.
+pub fn quantParamsFromGeometry(
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    biases_present: bool,
+    in_dim: u32,
+) ?QuantParams {
+    if (sc.ctx == null or in_dim == 0) return null;
+    if (biases_present or mlx.mlx_array_dtype(sc) != .uint8) {
+        return affineParamsFromGeometry(w, sc, in_dim);
+    }
+    const w_shape = mlx.getShape(w);
+    const s_shape = mlx.getShape(sc);
+    if (w_shape.len < 2 or s_shape.len < 2) return null;
+    const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
+    const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
+    if (w_cols == 0 or s_cols == 0) return null;
+    if ((w_cols * 32) % in_dim != 0 or in_dim % s_cols != 0) return null;
+    const mode = fpQuantModeFor((w_cols * 32) / in_dim, in_dim / s_cols) orelse return null;
+    return .{ .bits = (w_cols * 32) / in_dim, .group_size = in_dim / s_cols, .mode = mode };
+}
+
 pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);

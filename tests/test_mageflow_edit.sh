@@ -61,12 +61,12 @@ b64() { python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"r
 SRC_B64=$(b64 "$SRC")
 
 # ── text-to-image still works on an edit checkpoint (same DiT) ──
-d=$(post "{\"prompt\":\"a red apple\",\"size\":\"512x512\",\"steps\":4,\"seed\":1,\"safety\":false}")
+d=$(post "{\"prompt\":\"a red apple\",\"size\":\"512x512\",\"steps\":4,\"seed\":1}")
 [ "$d" = "512x512" ] || { echo "FAIL: txt2img returned $d (want 512x512)"; exit 1; }
 echo "PASS: text-to-image on the edit checkpoint -> $d"
 
 # ── no size = the source's own resolution (max_size = source size) ──
-d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"steps\":4,\"seed\":3,\"safety\":false}")
+d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"steps\":4,\"seed\":3}")
 [ "$d" = "$SRC_DIMS" ] || { echo "FAIL: sizeless edit returned $d (want the source's $SRC_DIMS)"; exit 1; }
 grep -q "size matched to source" "$LOG" || { echo "FAIL: no match-to-source log line"; exit 1; }
 echo "PASS: edit without 'size' keeps the source resolution ($d)"
@@ -87,7 +87,7 @@ open(sys.argv[1], "wb").write(
     + chunk(b"IDAT", zlib.compress(row * H, 1)) + chunk(b"IEND", b""))
 PY
 BIG_B64=$(b64 "$BIG")
-d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$BIG_B64\",\"steps\":4,\"seed\":7,\"safety\":false}")
+d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$BIG_B64\",\"steps\":4,\"seed\":7}")
 case "$d" in ERR*) echo "FAIL: oversized-source edit -> $d"; exit 1;; esac
 python3 - "$d" <<'PY'
 import sys
@@ -99,7 +99,7 @@ PY
 echo "PASS: source above the cap scales instead of squashing ($d)"
 
 # ── an explicit size is a BUDGET; the source's aspect ratio still wins ──
-d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"size\":\"1024x1024\",\"steps\":4,\"seed\":3,\"safety\":false}")
+d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"size\":\"1024x1024\",\"steps\":4,\"seed\":3}")
 [ "$d" != "1024x1024" ] || { echo "FAIL: square request squashed a 3:2 reference"; exit 1; }
 python3 - "$d" "$SRC_DIMS" <<'PY'
 import sys
@@ -111,7 +111,7 @@ PY
 echo "PASS: explicit size = pixel budget at the source's aspect ($d)"
 
 # ── multi-reference composition engages the second reference ──
-d=$(post "{\"prompt\":\"put the object from image 2 into image 1\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"ref_images\":[\"$SRC_B64\"],\"steps\":4,\"seed\":5,\"safety\":false}")
+d=$(post "{\"prompt\":\"put the object from image 2 into image 1\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"ref_images\":[\"$SRC_B64\"],\"steps\":4,\"seed\":5}")
 case "$d" in ERR*) echo "FAIL: multi-reference edit -> $d"; exit 1;; esac
 grep -q "edit ref 2" "$LOG" || { echo "FAIL: second reference never reached the engine"; exit 1; }
 echo "PASS: multi-reference composition -> $d"
