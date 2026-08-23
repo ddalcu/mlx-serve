@@ -155,9 +155,127 @@ final class ChatBasicsSlimTests: XCTestCase {
 
     func testDraftsAreWiredIntoTabSwitching() throws {
         let s = try source("Sources/MLXServe/Views/ChatView.swift")
-        XCTAssertTrue(s.contains("@State private var drafts = ComposerDrafts()"),
-                      "the detail view holds the draft store")
-        XCTAssertTrue(s.contains("drafts.stash("), "switching tabs stashes the draft")
-        XCTAssertTrue(s.contains("drafts.restore(for:"), "returning to a tab restores it")
+        let appStateSrc = try source("Sources/MLXServe/AppState.swift")
+        // Drafts live ON AppState now, so they can survive relaunch beside the
+        // chat history they belong to.
+        XCTAssertTrue(s.contains("appState.stashDraft("), "switching tabs stashes the draft")
+        XCTAssertTrue(s.contains("appState.draft(for:"), "returning to a tab restores it")
+        XCTAssertTrue(appStateSrc.contains("composer-drafts.json"),
+                      "drafts persist to disk beside chat history")
+        XCTAssertTrue(appStateSrc.contains("func stashDraft("))
+    }
+
+    // MARK: - Handoff: search result context
+
+    func testFirstContentMatchFindsTheMessageAndASnippet() {
+        var s = ChatSession(title: "Rust")
+        s.messages = [msg(.user, "hello"),
+                      msg(.assistant, "\n\nuse borrow checker carefully\n")]
+        let hit = SidebarSearch.firstContentMatch(in: s, query: "borrow")
+        XCTAssertEqual(hit?.messageIndex, 1)
+        XCTAssertTrue(hit?.snippet.contains("borrow") ?? false, hit?.snippet ?? "no snippet")
+        XCTAssertFalse(hit?.snippet.contains("\n\n") ?? true, "snippet is one line")
+    }
+
+    func testFirstContentMatchNilWhenOnlyTitleMatched() {
+        var s = ChatSession(title: "Borrow checker")
+        s.messages = [msg(.user, "hi")]
+        XCTAssertNil(SidebarSearch.firstContentMatch(in: s, query: "borrow"),
+                     "a title-only hit has no transcript row to jump to")
+    }
+
+    func testFirstContentMatchSkipsHiddenRows() {
+        var hidden = msg(.system, "needle in tool output")
+        hidden.toolCallId = "c1"
+        var s = ChatSession(title: "t")
+        s.messages = [hidden, msg(.user, "visible needle")]
+        XCTAssertEqual(SidebarSearch.firstContentMatch(in: s, query: "needle")?.messageIndex, 1)
+        XCTAssertNil(SidebarSearch.firstContentMatch(in: s, query: ""),
+                     "an empty query names nothing")
+    }
+
+    // MARK: - Handoff: drafts survive relaunch
+
+    func testDraftsCodableRoundtrip() throws {
+        var drafts = ComposerDrafts()
+        let a = UUID(), b = UUID()
+        drafts.stash("survives", for: a)
+        drafts.stash("  ", for: b)
+        let data = try JSONEncoder().encode(drafts)
+        let back = try JSONDecoder().decode(ComposerDrafts.self, from: data)
+        XCTAssertEqual(back.restore(for: a), "survives")
+        XCTAssertEqual(back.restore(for: b), "")
+    }
+
+    // MARK: - Handoff: export formats
+
+    func testExportJSONCarriesRolesContentTimestampsAndSkipsMachineRows() throws {
+        var toolResult = msg(.system, "hidden")
+        toolResult.toolCallId = "t1"
+        var withReasoning = msg(.assistant, "answer")
+        withReasoning.reasoningContent = "scratchpad"
+        let data = try XCTUnwrap(ChatExport.jsonData(
+            title: "T",
+            messages: [msg(.user, "q"), withReasoning, toolResult],
+            dateText: "2026-08-22"))
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(obj["title"] as? String, "T")
+        XCTAssertEqual(obj["exportedAt"] as? String, "2026-08-22")
+        let messages = try XCTUnwrap(obj["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 2, "hidden tool rows stay out of the export")
+        XCTAssertEqual(messages[0]["role"] as? String, "user")
+        XCTAssertEqual(messages[0]["content"] as? String, "q")
+        XCTAssertNotNil(messages[0]["timestamp"], "re-import wants the when as well as the what")
+        XCTAssertEqual(messages[1]["reasoning"] as? String, "scratchpad")
+    }
+
+    func testExportMarkdownOfSeveralChatsJoinsThemUnderOneHeader() {
+        var one = ChatSession(title: "One")
+        one.messages = [msg(.user, "first chat")]
+        var two = ChatSession(title: "Two")
+        two.messages = [msg(.assistant, "second chat")]
+        let md = ChatExport.markdown(
+            sessions: [(title: "One", messages: one.messages),
+                       (title: "Two", messages: two.messages)],
+            dateText: "2026-08-22")
+        XCTAssertTrue(md.contains("# One"))
+        XCTAssertTrue(md.contains("# Two"))
+        XCTAssertTrue(md.components(separatedBy: "2026-08-22").count == 2,
+                      "exactly one exported-at line for the whole file")
+    }
+
+    // MARK: - Handoff affordance scans
+
+    func testUserBubbleCarriesAHoverActionTray() throws {
+        let s = try source("Sources/MLXServe/Views/ChatView.swift")
+        for (needle, what) in [
+            ("MessageActionTray", "the hover tray"),
+            ("arrow.triangle.branch", "the branch icon"),
+            ("pencil", "the edit icon"),
+            ("copied ? \"checkmark\"", "the Copied flip"),
+        ] {
+            XCTAssertTrue(s.contains(needle), "the tray lost \(what) (`\(needle)`)")
+        }
+    }
+
+    func testSearchJumpsToTheMatchingMessage() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+        let appStateSrc = try source("Sources/MLXServe/AppState.swift")
+        let scrollSrc = try source("Sources/MLXServe/Services/ChatScroll.swift")
+        XCTAssertTrue(appStateSrc.contains("pendingSearchJump"),
+                      "AppState carries the jump request between sidebar and detail view")
+        XCTAssertTrue(chat.contains("firstContentMatch"),
+                      "rows surface the matching snippet")
+        XCTAssertTrue(chat.contains("scrollTo(id:"),
+                      "the detail view scrolls to the matched message id")
+        XCTAssertTrue(scrollSrc.contains("case messageTargeted"),
+                      "the scroll core knows a targeted jump releases follow")
+    }
+
+    func testSidebarOffersJSONAndMultiChatExport() throws {
+        let s = try source("Sources/MLXServe/Views/ChatView.swift")
+        XCTAssertTrue(s.contains("Export as JSON…"), "the JSON sibling")
+        XCTAssertTrue(s.contains("Chats…"), "the N-chats export over the multi-selection")
+        XCTAssertTrue(s.contains("jsonData("), "the JSON serializer is reachable")
     }
 }
