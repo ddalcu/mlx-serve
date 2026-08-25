@@ -67,6 +67,10 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 
 - The release workflow gained a **Pre-release** checkbox: it tags `v<version>-pre-release.1`, `.2`, `.3` instead of `v<version>`, so a build can go out for testing without spending the version number that the real release will use. Still created as a draft, still kept out of Homebrew.
 
+### API
+
+- **`POST /v1/messages/count_tokens`**: how many prompt tokens a Messages request would cost, without generating anything. Same body as `/v1/messages` minus the sampling fields, answering `{"input_tokens": N}`. It goes through the same prompt build the real request does — same chat template, same tool serialization, same thinking resolution — so the number is the one `/v1/messages` bills, not an estimate that drifts.
+
 ### Media
 
 - **ACE-Step Cover**: drop in a track, describe a new style, and it re-sings the song. Melody and structure stay, the caption and lyrics decide the rest. Cover strength picks how much of the render follows the source; noise strength blends a fresh start in. Needs the new `fsq.safetensors` in the pack; the app fetches it into packs downloaded before this release.

@@ -655,6 +655,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/images/generations",
     "/v1/load-model",
     "/v1/messages",
+    "/v1/messages/count_tokens",
     "/v1/models",
     "/v1/models/rescan",
     "/v1/responses",
@@ -1387,6 +1388,7 @@ pub fn serve(
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
+    log.info("  POST /v1/messages/count_tokens\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
     log.info("  GET  /v1/responses/{{id}}\n", .{});
@@ -1971,6 +1973,14 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
+        if (text_gen_reject) |reason| {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            return;
+        }
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleAnthropicCountTokens(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -3358,6 +3368,7 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, method, "POST")) {
         const routes = [_][]const u8{
             "/v1/chat/completions", "/v1/completions", "/v1/messages",
+            "/v1/messages/count_tokens",
             "/v1/responses",        "/api/chat",       "/api/generate",
         };
         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
@@ -8718,6 +8729,58 @@ test "the index page documents every endpoint the server serves (drift guard)" {
     }
 }
 
+test "count_tokens is a route, and it counts the prompt /v1/messages would actually build" {
+    // The endpoint's whole value is that its number is the number the real
+    // request would report. A count computed by a second parse/render of the
+    // body is worthless the first time either path grows a field the other
+    // does not — so the guard is structural: exactly ONE prompt builder, and
+    // both handlers call it.
+    const src = @embedFile("server.zig");
+
+    // 1. The route exists at all (ROUTE_PATHS + routeExists).
+    try std.testing.expect(routeExists("/v1/messages/count_tokens"));
+
+    // 2. There is a shared builder, and both surfaces go through it.
+    const builder = "buildAnthropicPrompt" ++ "(";
+    const decl = "fn buildAnthropicPrompt" ++ "(";
+    try std.testing.expect(std.mem.indexOf(u8, src, decl) != null);
+    const msgs_at = std.mem.indexOf(u8, src, "fn handleAnthropicMessages" ++ "(") orelse
+        return error.MessagesHandlerMissing;
+    const count_at = std.mem.indexOf(u8, src, "fn handleAnthropicCountTokens" ++ "(") orelse
+        return error.CountTokensHandlerMissing;
+    for ([_]usize{ msgs_at, count_at }) |start| {
+        const rest = src[start + 4 ..];
+        const end = start + 4 + (std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len);
+        if (std.mem.indexOf(u8, src[start..end], builder) == null)
+            return error.HandlerDoesNotShareThePromptBuilder;
+    }
+
+    // 3. Counting must not reach generation: no scheduler submit, no
+    //    generator, inside the count handler.
+    const count_rest = src[count_at + 4 ..];
+    const count_end = count_at + 4 + (std.mem.indexOf(u8, count_rest, "\nfn ") orelse count_rest.len);
+    const count_body = src[count_at..count_end];
+    for ([_][]const u8{ "scheduler." ++ "submit", "generate_mod." ++ "Generator", "handleAnthropicNon" ++ "Streaming" }) |banned|
+        try std.testing.expect(std.mem.indexOf(u8, count_body, banned) == null);
+}
+
+test "countTokensResponseJson: exactly the field Anthropic returns" {
+    const a = std.testing.allocator;
+    const body = try countTokensResponseJson(a, 2095);
+    defer a.free(body);
+    try std.testing.expectEqualStrings("{\"input_tokens\":2095}", body);
+}
+
+test "count_tokens is LAN-shareable inference surface, not a host-local route" {
+    // Claude Code calls count_tokens before every turn; classing it `denied`
+    // would 403 the one client this whole surface exists for as soon as the
+    // request came from the LAN rather than loopback.
+    try std.testing.expectEqual(
+        lan_mod.RouteClass.model_gated,
+        lan_mod.routeClass("POST", "/v1/messages/count_tokens"),
+    );
+}
+
 test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {
     // `/v1/images/edits` is the ONE endpoint whose body is multipart, and model
     // resolution runs BEFORE the route translates that form to JSON. A JSON-only
@@ -10592,70 +10655,105 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
     return try buf.toOwnedSlice(allocator);
 }
 
-fn handleAnthropicMessages(
+/// The generation-only numbers the shared `/v1/messages` request log line
+/// prints. Null on `count_tokens`, which resolves none of them.
+const AnthropicGenLog = struct {
+    max_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    is_stream: bool,
+};
+
+/// Everything `POST /v1/messages` derives from a request body BEFORE any
+/// token is generated — the parsed message list, the tool serialization, the
+/// resolved thinking/effort decision, and the rendered, tokenized prompt.
+///
+/// It exists because `POST /v1/messages/count_tokens` must report the count of
+/// the prompt the real request would build. A counter with its own parse and
+/// its own render is correct exactly until either side grows a field the other
+/// does not — and the drift is silent, because both still answer 200. So there
+/// is ONE builder and both handlers call it; the guard is a source scan.
+const AnthropicPrompt = struct {
+    messages: std.ArrayList(chat_mod.Message) = .empty,
+    /// Serialized `tool_use.input` JSON strings referenced by `messages`.
+    arg_allocs: std.ArrayList([]const u8) = .empty,
+    tool_call_lists: std.ArrayList([]const chat_mod.ToolCall) = .empty,
+    /// Concatenated/duped content strings referenced by `messages`.
+    content_allocs: std.ArrayList([]const u8) = .empty,
+    /// The rendered prompt. THE number `count_tokens` reports is its length.
+    prompt_ids: []u32 = &.{},
+    /// Encoded image/video/audio features; ownership transfers to the caller.
+    vision_encoded: ?mlx.mlx_array = null,
+    tools_json: ?[]const u8 = null,
+    tools_json_allocated: bool = false,
+    tool_choice_instruction: ?[]const u8 = null,
+    tool_choice_allocated: bool = false,
+    has_tools: bool = false,
+    allow_parallel_tools: bool = true,
+    enable_thinking: bool = false,
+    reasoning_budget: i32 = 0,
+    effort_word: ?[]const u8 = null,
+    /// Borrowed from the caller's parsed body — valid while that lives.
+    output_schema: ?std.json.Value = null,
+    continue_final: bool = false,
+    tokenize_ns: u64 = 0,
+
+    fn deinit(self: *AnthropicPrompt, allocator: std.mem.Allocator) void {
+        if (self.vision_encoded) |arr| _ = mlx.mlx_array_free(arr);
+        if (self.prompt_ids.len > 0) allocator.free(self.prompt_ids);
+        if (self.tools_json_allocated) if (self.tools_json) |t| allocator.free(t);
+        if (self.tool_choice_allocated) if (self.tool_choice_instruction) |t| allocator.free(t);
+        for (self.arg_allocs.items) |a| allocator.free(a);
+        self.arg_allocs.deinit(allocator);
+        for (self.tool_call_lists.items) |tcs| allocator.free(tcs);
+        self.tool_call_lists.deinit(allocator);
+        for (self.content_allocs.items) |c| allocator.free(c);
+        self.content_allocs.deinit(allocator);
+        self.messages.deinit(allocator);
+    }
+};
+
+/// A named 400 the builder could not avoid. Kept as data rather than written
+/// to the socket so the builder stays free of the connection — each surface
+/// answers in its own error shape.
+const AnthropicPromptResult = union(enum) {
+    ok: AnthropicPrompt,
+    bad_request: []const u8,
+};
+
+fn badAnthropicRequest(message: []const u8) AnthropicPromptResult {
+    return .{ .bad_request = message };
+}
+
+fn buildAnthropicPrompt(
     allocator: std.mem.Allocator,
-    stream: *Conn,
-    body: []const u8,
+    io: std.Io,
     lm: *LoadedModel,
-) !void {
+    root: std.json.ObjectMap,
+    /// The path this build is serving, for the log line only.
+    route: []const u8,
+    gen_log: ?AnthropicGenLog,
+) !AnthropicPromptResult {
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
-    // transformer; the only gate below uses `config.has_hybrid_layers`.
+    // transformer, and `cachedFormatChat` renders through their own engines.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        log.warn("POST /v1/messages -> 400 (invalid JSON)\n", .{});
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "Invalid JSON in request body", 400);
-        return;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        log.warn("POST /v1/messages -> 400 (body is not a JSON object)\n", .{});
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
-        return;
-    }
-    const root = parsed.value.object;
 
-    // max_tokens is required in Anthropic API
-    const max_tokens: u32 = if (root.get("max_tokens")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => 0,
-    } else 0;
-    if (max_tokens == 0) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
-        return;
-    }
+    var result: AnthropicPrompt = .{};
+    errdefer result.deinit(allocator);
+    const messages = &result.messages;
+    const arg_allocs = &result.arg_allocs;
+    const tool_call_lists = &result.tool_call_lists;
+    const content_allocs = &result.content_allocs;
 
     // Parse messages array (required)
-    const messages_val = root.get("messages") orelse {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
-        return;
-    };
-    if (messages_val != .array) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' must be an array", 400);
-        return;
-    }
+    const messages_val = root.get("messages") orelse
+        return badAnthropicRequest("'messages' is required");
+    if (messages_val != .array)
+        return badAnthropicRequest("'messages' must be an array");
 
-    var messages = std.ArrayList(chat_mod.Message).empty;
-    defer messages.deinit(allocator);
-
-    // Track allocations for serialized tool arguments (need to outlive generation)
-    var arg_allocs = std.ArrayList([]const u8).empty;
-    defer {
-        for (arg_allocs.items) |a| allocator.free(a);
-        arg_allocs.deinit(allocator);
-    }
-    var tool_call_lists = std.ArrayList([]const chat_mod.ToolCall).empty;
-    defer {
-        for (tool_call_lists.items) |tcs| allocator.free(tcs);
-        tool_call_lists.deinit(allocator);
-    }
-    // Track allocated content strings (concatenated text)
-    var content_allocs = std.ArrayList([]const u8).empty;
-    defer {
-        for (content_allocs.items) |s| allocator.free(s);
-        content_allocs.deinit(allocator);
-    }
 
     // System prompt (Anthropic puts it at top level). Array form JOINS every
     // text block — Claude Code sends 2+ (identity + the instructions block),
@@ -10849,34 +10947,16 @@ fn handleAnthropicMessages(
         }
     }
 
-    if (messages.items.len == 0) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "No valid messages found in request", 400);
-        return;
-    }
-
-    // Sampling parameters. Omitted fields resolve through CLI flags and the
-    // model's generation_config.json — Claude Code omits ALL of them, and the
-    // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
-    // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    if (messages.items.len == 0)
+        return badAnthropicRequest("No valid messages found in request");
 
     // Tools
     var tools_json: ?[]const u8 = null;
     var tools_json_allocated = false;
-    defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
     var allow_parallel_tools = true;
     var tool_choice_instruction: ?[]const u8 = null;
     var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
 
     if (root.get("tools")) |tools_val| {
         if (tools_val == .array and tools_val.array.items.len > 0) {
@@ -10906,17 +10986,6 @@ fn handleAnthropicMessages(
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // Stop sequences
-    var stop_sequences = std.ArrayList([]const u8).empty;
-    defer stop_sequences.deinit(allocator);
-    if (root.get("stop_sequences")) |stop_val| {
-        if (stop_val == .array) {
-            for (stop_val.array.items) |item| {
-                if (item == .string) try stop_sequences.append(allocator, item.string);
             }
         }
     }
@@ -10973,37 +11042,6 @@ fn handleAnthropicMessages(
     // thinking stays whatever the request resolved.
     if (output_cfg.schema != null and !has_tools) enable_thinking = false;
 
-    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
-    const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
-
-    // Wave 1.A: per-request KV-quant override (Anthropic mirror).
-    const kv_quant_override = parseKvQuantOverride(root);
-    const kv_attn_explicit = parseKvAttnExplicit(root);
-
-    // Per-request PLD override (mirror chat-completions behavior: tools and
-    // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
-    // runtime acceptance gate handle the rest).
-    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
-
-    // Drafter: same disable rules as chat-completions parse site.
-    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
-    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
-        (v == .bool and v.bool)
-    else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
-
     // `output_config.format` json_schema — the same two-layer enforcement as
     // chat-completions' `response_format`: a schema instruction in the system
     // prompt (so the model aims at the shape) plus the grammar mask below (so
@@ -11040,9 +11078,15 @@ fn handleAnthropicMessages(
         if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
-    });
+    if (gen_log) |g| {
+        log.info("POST {s} ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+            route, messages.items.len, g.max_tokens, g.temperature, g.top_p, g.top_k, g.is_stream, enable_thinking, tools_len, tool_msg_count,
+        });
+    } else {
+        log.info("POST {s} ({d} msgs, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+            route, messages.items.len, enable_thinking, tools_len, tool_msg_count,
+        });
+    }
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template. Iteration 1 timing + Iteration 2 cache. The
@@ -11060,18 +11104,18 @@ fn handleAnthropicMessages(
     // endpoint has always given.
     const continue_final = chat_mod.continuationRequested(messages.items) and
         continuationRejectReason(lm.ds4_engine != null) == null;
-    var tokenize_sw = Stopwatch.init(stream.io);
+    var tokenize_sw = Stopwatch.init(io);
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
     const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
     // image tokens into the prompt at the model's configured image_token_id.
     // Phase A8: per-request ownership.
     var local_ve: ?mlx.mlx_array = null;
-    defer {
+    errdefer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
     if (lm.vision_encoder) |ve| {
@@ -11088,9 +11132,137 @@ fn handleAnthropicMessages(
             prompt_ids_raw = new_ids;
         }
     }
-    const prompt_ids = prompt_ids_raw;
-    defer allocator.free(prompt_ids);
 
+    result.prompt_ids = prompt_ids_raw;
+    result.vision_encoded = local_ve;
+    local_ve = null;
+    result.tools_json = tools_json;
+    result.tools_json_allocated = tools_json_allocated;
+    result.tool_choice_instruction = tool_choice_instruction;
+    result.tool_choice_allocated = tool_choice_allocated;
+    result.has_tools = has_tools;
+    result.allow_parallel_tools = allow_parallel_tools;
+    result.enable_thinking = enable_thinking;
+    result.reasoning_budget = reasoning_budget;
+    result.effort_word = effort_word;
+    result.output_schema = output_cfg.schema;
+    result.continue_final = continue_final;
+    result.tokenize_ns = tokenize_ns;
+    return .{ .ok = result };
+}
+
+fn handleAnthropicMessages(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+    lm: *LoadedModel,
+) !void {
+    // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
+    // transformer; the only gate below uses `config.has_hybrid_layers`.
+    // The chat template is `buildAnthropicPrompt`'s business now; the
+    // tokenizer is still handed to the sub-handlers for decode.
+    const tok = lm.tokenizer.?;
+    const config = lm.config.?;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.warn("POST /v1/messages -> 400 (invalid JSON)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Invalid JSON in request body", 400);
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("POST /v1/messages -> 400 (body is not a JSON object)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
+    const root = parsed.value.object;
+
+    // max_tokens is required in Anthropic API
+    const max_tokens: u32 = if (root.get("max_tokens")) |v| switch (v) {
+        .integer => |i| @intCast(i),
+        else => 0,
+    } else 0;
+    if (max_tokens == 0) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
+        return;
+    }
+
+    // Sampling parameters. Omitted fields resolve through CLI flags and the
+    // model's generation_config.json — Claude Code omits ALL of them, and the
+    // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
+    // intended envelope (model card wants top_k=20, top_p=0.95).
+    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
+    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
+        .integer => |i| @intCast(i),
+        else => null,
+    } else null;
+
+    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
+
+    // The ONE prompt build (see AnthropicPrompt): the same render, tool
+    // serialization and thinking resolution `count_tokens` reports on.
+    var built = switch (try buildAnthropicPrompt(allocator, stream.io, lm, root, "/v1/messages", .{
+        .max_tokens = max_tokens,
+        .temperature = temperature,
+        .top_p = top_p,
+        .top_k = top_k,
+        .is_stream = is_stream,
+    })) {
+        .bad_request => |msg| {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            return;
+        },
+        .ok => |p| p,
+    };
+    defer built.deinit(allocator);
+    const prompt_ids = built.prompt_ids;
+    const has_tools = built.has_tools;
+    const tools_json = built.tools_json;
+    const allow_parallel_tools = built.allow_parallel_tools;
+    const enable_thinking = built.enable_thinking;
+    const reasoning_budget = built.reasoning_budget;
+    const tokenize_ns = built.tokenize_ns;
+
+    // Stop sequences
+    var stop_sequences = std.ArrayList([]const u8).empty;
+    defer stop_sequences.deinit(allocator);
+    if (root.get("stop_sequences")) |stop_val| {
+        if (stop_val == .array) {
+            for (stop_val.array.items) |item| {
+                if (item == .string) try stop_sequences.append(allocator, item.string);
+            }
+        }
+    }
+
+    // Wave 1.A: per-request KV-quant override (Anthropic mirror).
+    const kv_quant_override = parseKvQuantOverride(root);
+    const kv_attn_explicit = parseKvAttnExplicit(root);
+
+    // Per-request PLD override (mirror chat-completions behavior: tools and
+    // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
+    // runtime acceptance gate handle the rest).
+    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
+    var enable_pld: bool = if (root.get("enable_pld")) |v|
+        (v == .bool and v.bool)
+    else
+        server_config.default_enable_pld;
+
+    // Drafter: same disable rules as chat-completions parse site.
+    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
+    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
+    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
+        (v == .bool and v.bool)
+    else
+        lm_default_enable_drafter;
+    if (enable_drafter and lm.drafter == null) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
     if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
         const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0;
@@ -11124,7 +11296,7 @@ fn handleAnthropicMessages(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(built.vision_encoded != null))) return;
 
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -11145,7 +11317,7 @@ fn handleAnthropicMessages(
     var sc: generate_mod.SchemaConstraint = undefined;
     var sc_init = false;
     defer if (sc_init) sc.deinit();
-    if (output_cfg.schema) |sv| {
+    if (built.output_schema) |sv| {
         if (has_tools) {
             log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
         } else {
@@ -11161,8 +11333,8 @@ fn handleAnthropicMessages(
     }
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
-    const sub_ve = local_ve;
-    local_ve = null;
+    const sub_ve = built.vision_encoded;
+    built.vision_encoded = null;
     if (is_stream) {
         handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
@@ -11178,6 +11350,70 @@ fn handleAnthropicMessages(
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
     }
+}
+
+/// `{"input_tokens": N}` — the entire body Anthropic's count_tokens returns.
+fn countTokensResponseJson(allocator: std.mem.Allocator, input_tokens: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"input_tokens\":{d}}}", .{input_tokens});
+}
+
+/// `POST /v1/messages/count_tokens` — how many prompt tokens the SAME body
+/// would cost on `POST /v1/messages`.
+///
+/// It is the same body minus the sampling/stream fields, so it goes through
+/// the same `buildAnthropicPrompt`: same template render, same tool
+/// serialization, same thinking resolution. Counting it any other way makes
+/// the number a guess that agrees with reality only until one surface changes.
+///
+/// No generation: nothing here reaches the scheduler or a Generator, and the
+/// context-length ceiling is deliberately NOT enforced — a client counts
+/// precisely to discover it is over, and answering that question with a 400
+/// would make the endpoint useless for the one job it has.
+fn handleAnthropicCountTokens(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+    lm: *LoadedModel,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.warn("POST /v1/messages/count_tokens -> 400 (invalid JSON)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Invalid JSON in request body", 400);
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("POST /v1/messages/count_tokens -> 400 (body is not a JSON object)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
+    const root = parsed.value.object;
+
+    // `model` is required by Anthropic's schema. Dispatch already resolved it
+    // (or fell back to the default), so this only reports a body that omitted
+    // it — same named 400 rather than a silent count against another model.
+    if (root.get("model")) |v| {
+        if (v != .string or v.string.len == 0) {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", "'model' must be a non-empty string", 400);
+            return;
+        }
+    } else {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'model' is required", 400);
+        return;
+    }
+
+    var built = switch (try buildAnthropicPrompt(allocator, stream.io, lm, root, "/v1/messages/count_tokens", null)) {
+        .bad_request => |msg| {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            return;
+        },
+        .ok => |b| b,
+    };
+    defer built.deinit(allocator);
+
+    const out = try countTokensResponseJson(allocator, built.prompt_ids.len);
+    defer allocator.free(out);
+    log.info("  -> input_tokens={d}\n", .{built.prompt_ids.len});
+    try sendResponse(stream, "200 OK", "application/json", out);
 }
 
 fn handleAnthropicNonStreaming(
@@ -17544,10 +17780,15 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
     // site passing the raw has-vision bool bills full width for a prefill
     // that chunks (over-refusal), and one passing false under the kill
     // switch under-bills straight into an uncatchable Metal OOM.
+    //
+    // Pinned on the PREDICATE, not on the name of the bool handed to it: the
+    // Anthropic site's encoded-vision handle moved onto `AnthropicPrompt` when
+    // the prompt build was shared with count_tokens, and a guard keyed on the
+    // old local name went quietly from three matches to two.
     const src = @embedFile("server.zig");
-    const raw = "lm, local_ve" ++ " != null))";
-    try std.testing.expect(std.mem.indexOf(u8, src, raw) == null);
-    const routed = "lm, generate_mod.visionPrefill" ++ "Unchunked(local_ve != null)))";
+    for ([_][]const u8{ "lm, local_ve" ++ " != null))", "lm, built.vision_encoded" ++ " != null))" }) |raw|
+        try std.testing.expect(std.mem.indexOf(u8, src, raw) == null);
+    const routed = "lm, generate_mod.visionPrefill" ++ "Unchunked(";
     var n: usize = 0;
     var at: usize = 0;
     while (std.mem.indexOfPos(u8, src, at, routed)) |i| {
