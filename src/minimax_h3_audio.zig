@@ -514,7 +514,7 @@ fn causalAttention(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, s:
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_sink = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, parts[0], parts[1], parts[2], scale, "array", mask, null_sink, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, parts[0], parts[1], parts[2], scale, "array", mask, null_sink, false, s));
 
     // mean over HEADS (axis 1) -> [B, T, D]
     var hm = mlx.mlx_array_new();

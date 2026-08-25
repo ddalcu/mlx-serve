@@ -1627,6 +1627,53 @@ fn computeNaxAvailable() bool {
     return naxAvailableFrom(force, arch, ver);
 }
 
+var nax_sdpa_avail_cache: ?bool = null;
+pub var nax_sdpa_override: ?bool = null; // test seam
+var nax_sdpa_env: ?bool = null;
+
+/// mlx >= 0.32.2 serves hd-256 attention on NAX with a fused full-attention
+/// kernel (`sdpa_full_self_attention_nax`), auto only at >= 1024 causal rows
+/// and reachable below that through `force_fused`. Default ON where NAX is
+/// available; MLX_SERVE_NAX_SDPA=0 restores msv_attn_p256 + the split/vector
+/// path, =1 forces the stock full kernel on a non-NAX GPU (A/B lever).
+pub fn naxSdpaPreferredFrom(nax_available: bool, raw: ?[]const u8) bool {
+    if (raw) |v| return !std.mem.eql(u8, v, "0");
+    return nax_available;
+}
+
+pub fn naxSdpaPreferred() bool {
+    if (nax_sdpa_override) |v| return v;
+    if (nax_sdpa_env) |v| return v;
+    if (nax_sdpa_avail_cache == null) nax_sdpa_avail_cache = computeNaxAvailable();
+    const raw = std.c.getenv("MLX_SERVE_NAX_SDPA");
+    const on = naxSdpaPreferredFrom(nax_sdpa_avail_cache.?, if (raw) |v| std.mem.sliceTo(v, 0) else null);
+    nax_sdpa_env = on;
+    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; msv_attn_p256 causal arm declined (MLX_SERVE_NAX_SDPA=0 restores)\n", .{});
+    return on;
+}
+
+/// force_fused is legal only where MLX has a fused kernel for the shape:
+/// hd 256 (<= 128 fuses on its own, 192 is not ours), more than 8 query
+/// rows (<= 8 is the vector kernel and its q*gqa <= 32 wall makes
+/// force_fused THROW), q <= k (the full kernel's causal precondition).
+pub fn sdpaForceFusedFor(preferred: bool, q_len: c_int, k_len: c_int, head_dim: c_int) bool {
+    return preferred and head_dim == 256 and q_len > 8 and q_len <= k_len;
+}
+
+pub fn sdpaForceFused(q: mlx.mlx_array, k: mlx.mlx_array) bool {
+    if (!naxSdpaPreferred()) return false;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4) return false;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const on = sdpaForceFusedFor(true, qs[2], ks[2], qs[3]);
+    if (on and !nax_sdpa_dispatch_logged) {
+        nax_sdpa_dispatch_logged = true;
+        log.info("[nax-sdpa] force_fused dispatch engaged: qL={d} kL={d} Hq={d} Hkv={d} hd={d}\n", .{ qs[2], ks[2], qs[1], ks[1], qs[3] });
+    }
+    return on;
+}
+var nax_sdpa_dispatch_logged = false;
+
 var vqmm_nax_env_cache: ?bool = null;
 /// Lane kill switch: MLX_SERVE_VERIFY_QMM_NAX=0 (the family-wide
 /// MLX_SERVE_VERIFY_QMM=0 also covers it via verifyQmm's entry gate).
@@ -2521,6 +2568,9 @@ pub fn fusedSdpa256Prefill(
         if (!fused256Enabled()) return null;
     } else {
         if (fused256CausalMode() == .off) return null;
+        // The band arm stays ours (mlx's NAX kernel takes no band); the
+        // causal arm yields to the stock fused kernel on NAX.
+        if (naxSdpaPreferred()) return null;
     }
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
@@ -2734,8 +2784,8 @@ pub fn splitCausalSdpa(
     defer _ = mlx.mlx_array_free(out_a);
     var out_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(out_b);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_a, q_a, k_a, v_a, scale, "causal", none_mask, .{ .ctx = null }, s));
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_b, q_b, k, v, scale, "causal", none_mask, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_a, q_a, k_a, v_a, scale, "causal", none_mask, .{ .ctx = null }, false, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_b, q_b, k, v, scale, "causal", none_mask, .{ .ctx = null }, false, s));
 
     const parts = [_]mlx.mlx_array{ out_a, out_b };
     const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
@@ -7583,7 +7633,7 @@ pub const Transformer = struct {
                 var head: mlx.mlx_array = undefined;
                 if (@intFromEnum(rung) >= @intFromEnum(ProjRung.sdpa)) {
                     var att = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&att, q, k, v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&att, q, k, v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
                     var back = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_transpose_axes(&back, att, &perm, 4, self.s));
                     _ = mlx.mlx_array_free(att);
@@ -8844,6 +8894,7 @@ pub const Transformer = struct {
                 if (pad_mask != null) "array" else "",
                 if (pad_mask) |m| m else mlx.mlx_array_new(),
                 mlx.mlx_array_new(),
+                false,
                 self.s,
             ));
 
@@ -9380,7 +9431,7 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = split_out;
                 } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_rope, full_k), self.s));
                 }
             } else if (std.mem.eql(u8, sel_mode, "array")) {
                 var fused_done = false;
@@ -9409,10 +9460,10 @@ pub const Transformer = struct {
                         local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding_kv_len, @intCast(cfg.sliding_window));
                         sel_mask = local_prefill_mask;
                     }
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", sel_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", sel_mask, .{ .ctx = null }, false, self.s));
                 }
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
             }
 
             // Reshape attention output
@@ -9816,7 +9867,7 @@ pub const Transformer = struct {
             // SDPA → [N, h_count, 1, cur_hd].
             var attn_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_out);
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
 
             // Output projection.
             var attn_t = mlx.mlx_array_new();
@@ -10871,7 +10922,7 @@ pub const Transformer = struct {
         // Bidirectional SDPA — no mask (scale 1.0; q/k norms absorb it).
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, 1.0, "", none_mask, .{ .ctx = null }, self.s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, 1.0, "", none_mask, .{ .ctx = null }, false, self.s));
 
         const perm_back = [_]c_int{ 0, 2, 1, 3 };
         var attn_t = mlx.mlx_array_new();
@@ -11588,10 +11639,10 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_t, k_t), self.s));
             }
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
         }
 
         // Transpose back: [B, n, S, hd] → [B, S, n, hd] → [B, S, n*hd]
@@ -11765,9 +11816,9 @@ pub const Transformer = struct {
             var attn_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_out);
             if (mask.ctx != null) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, k_rope, v_t, attn_scale, "array", mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, k_rope, v_t, attn_scale, "array", mask, .{ .ctx = null }, false, self.s));
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, k_rope, v_t, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, k_rope, v_t, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
             }
 
             var attn_t = mlx.mlx_array_new();
@@ -12137,7 +12188,7 @@ pub const Transformer = struct {
                 const stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max);
                 defer _ = mlx.mlx_array_free(stacked_mask);
 
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
             }
             return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer);
         }
@@ -12185,10 +12236,10 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = split_out;
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_rope, full_k), self.s));
             }
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
         }
 
         return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer);
@@ -12397,7 +12448,7 @@ pub const Transformer = struct {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
         const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, self.s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
 
         // [B,H,S,Dv] → [B,S,H,Dv]; the gate is per (token, head).
         var attn_t = mlx.mlx_array_new();
@@ -12764,9 +12815,9 @@ pub const Transformer = struct {
         if (!kv_fused_done) {
             if (is_full) {
                 if (is_prefill) {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_rope, full_k), self.s));
                 } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
                 }
             } else {
                 const sw: c_int = @intCast(cfg.sliding_window);
@@ -12774,16 +12825,16 @@ pub const Transformer = struct {
                 if (is_prefill and total_kv <= sw) {
                     // Window degenerates to plain causal — same kernel/reduction the
                     // reference picks for short prompts.
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_rope, full_k), self.s));
                 } else if (is_prefill) {
                     if (local_prefill_mask.ctx == null) {
                         local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                     }
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, false, self.s));
                 } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
                 } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, false, self.s));
                 }
             }
         }
@@ -12997,7 +13048,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_astype(&mask_cast, mask, mlx.mlx_array_dtype(q_final), self.s));
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_final, kv_view.k, kv_view.v, attn_scale, "", mask_cast, .{ .ctx = null }, self.s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_final, kv_view.k, kv_view.v, attn_scale, "", mask_cast, .{ .ctx = null }, false, self.s));
 
         // [B,H,S,D] → [B,S,H*D] → o_proj
         var attn_t = mlx.mlx_array_new();
@@ -13139,10 +13190,10 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_rope, full_k), self.s));
                 }
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
             }
         } else {
             const sw: c_int = @intCast(cfg.sliding_window);
@@ -13157,7 +13208,7 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, sdpaForceFused(q_rope, full_k), self.s));
                 }
             } else if (is_prefill) {
                 // Sliding-window prefill: band mask runs in-kernel when fused.
@@ -13170,14 +13221,14 @@ pub const Transformer = struct {
                         // call declined — build once, cache for later layers.
                         local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
                     }
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, false, self.s));
                 }
             } else if (is_global) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
             } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, false, self.s));
             }
         }
 
@@ -22193,6 +22244,7 @@ fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
         if (masked) "array" else "",
         if (masked) mask else none,
         .{ .ctx = null },
+        false,
         s,
     ));
 
@@ -22327,7 +22379,7 @@ fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
     var ref = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ref);
     const none = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, dv.k, dv.v, scale, "causal", none, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, dv.k, dv.v, scale, "causal", none, .{ .ctx = null }, false, s));
 
     const cand = (try qkvAttnVerifyKernel(s, q, &dv, scale, "causal")) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(cand);
@@ -22515,7 +22567,7 @@ fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize
 
     var ref = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ref);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, dv.k, dv.v, scale, mode, mask_used, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, dv.k, dv.v, scale, mode, mask_used, .{ .ctx = null }, false, s));
 
     const cand = try kv_quant.quantAttention(q, dv.kTriple(), dv.vTriple(), dv.bits, dv.group_size, scale, mode, mask_used, s);
     defer _ = mlx.mlx_array_free(cand);
@@ -22703,7 +22755,7 @@ test "qkv decode kernel µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
             defer _ = mlx.mlx_array_free(vdq);
             var out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vdq, scale, "", none, .{ .ctx = null }, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vdq, scale, "", none, .{ .ctx = null }, false, s));
             try evalOne(out);
         }
         const dense_ns: u64 = @intCast(mark.untilNow(io, .boot).nanoseconds);
@@ -22712,7 +22764,7 @@ test "qkv decode kernel µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
             if (i == warmup) mark = std.Io.Timestamp.now(io, .boot);
             var out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k_off, v_off, scale, "", none, .{ .ctx = null }, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k_off, v_off, scale, "", none, .{ .ctx = null }, false, s));
             try evalOne(out);
         }
         const off_ns: u64 = @intCast(mark.untilNow(io, .boot).nanoseconds);
@@ -30416,7 +30468,7 @@ fn attn256Reference(
 ) !mlx.mlx_array {
     var ref = mlx.mlx_array_new();
     const none = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k, v, scale, mode, if (mask.ctx != null) mask else none, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k, v, scale, mode, if (mask.ctx != null) mask else none, .{ .ctx = null }, false, s));
     return ref;
 }
 
@@ -30434,12 +30486,20 @@ fn attn256RandBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !ml
 }
 
 fn attn256MaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    // Raw data-pointer reads below: force row-major first. The fused sdpa
+    // kernels hand back a [B,L,H,D]-strided VIEW and astype keeps the strides.
+    var a_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_c);
+    var b_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b_c);
+    try mlx.check(mlx.mlx_contiguous(&a_c, a, false, s));
+    try mlx.check(mlx.mlx_contiguous(&b_c, b, false, s));
     var a32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a32);
     var b32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(b32);
-    try mlx.check(mlx.mlx_astype(&a32, a, .float32, s));
-    try mlx.check(mlx.mlx_astype(&b32, b, .float32, s));
+    try mlx.check(mlx.mlx_astype(&a32, a_c, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b32, b_c, .float32, s));
     try mlx.check(mlx.mlx_array_eval(a32));
     try mlx.check(mlx.mlx_array_eval(b32));
     const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
@@ -32773,4 +32833,56 @@ test "ane channel-split GPU complement: axis-0 slice VIEW of a packed weight thr
     std.debug.print("[ane-chan] qmm slice: copy_err={d} view_err={d}\n", .{ copy_err, view_err });
     try std.testing.expectEqual(@as(f32, 0), copy_err);
     try std.testing.expectEqual(@as(f32, 0), view_err);
+}
+
+test "naxSdpaPreferredFrom: default follows NAX availability, MLX_SERVE_NAX_SDPA overrides both ways" {
+    try testing.expect(naxSdpaPreferredFrom(true, null));
+    try testing.expect(!naxSdpaPreferredFrom(false, null));
+    try testing.expect(!naxSdpaPreferredFrom(true, "0"));
+    try testing.expect(naxSdpaPreferredFrom(false, "1"));
+}
+
+test "sdpaForceFusedFor: only shapes MLX has a fused kernel for (hd 256, > 8 rows, q <= k)" {
+    try testing.expect(sdpaForceFusedFor(true, 16, 4096, 256));
+    try testing.expect(sdpaForceFusedFor(true, 9, 9, 256));
+    // <= 8 rows is the vector kernel; its q*gqa <= 32 wall makes force_fused THROW.
+    try testing.expect(!sdpaForceFusedFor(true, 8, 4096, 256));
+    // hd <= 128 already fuses on its own; hd 192/exotic dims are not ours to force.
+    try testing.expect(!sdpaForceFusedFor(true, 16, 4096, 128));
+    try testing.expect(!sdpaForceFusedFor(true, 16, 4096, 192));
+    try testing.expect(!sdpaForceFusedFor(true, 16, 8, 256));
+    try testing.expect(!sdpaForceFusedFor(false, 16, 4096, 256));
+}
+
+test "sdpa force_fused: hd-256 causal blocks the gate admits match the unforced call (plumbing + shape gate)" {
+    // The shapes sdpaForceFusedFor admits (hd 256, > 8 rows, q <= k): the
+    // forced kernel (steel on M1-M4, the NAX variant on M5) must agree with
+    // the unforced dispatch (unfused at hd 256 on non-NAX) and never throw.
+    // <= 8 rows is NOT covered on purpose: that is the vector kernel, and
+    // force_fused on a gqa-8 block there throws (the gate's whole point).
+    const s = mlx.mlx_default_gpu_stream_new();
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const none = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none);
+    const cases = [_][3]c_int{ .{ 16, 4096, 8 }, .{ 9, 512, 8 }, .{ 64, 64, 2 } }; // q, k, gqa
+    for (cases) |c| {
+        const q_shape = [_]c_int{ 1, 2 * c[2], c[0], 256 };
+        const k_shape = [_]c_int{ 1, 2, c[1], 256 };
+        try std.testing.expect(sdpaForceFusedFor(true, c[0], c[1], 256));
+        const q = try attn256RandBf16(rnd, &q_shape, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try attn256RandBf16(rnd, &k_shape, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &k_shape, s);
+        defer _ = mlx.mlx_array_free(v);
+        var plain = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(plain);
+        var forced = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(forced);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&plain, q, k, v, 0.0625, "causal", none, .{ .ctx = null }, false, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&forced, q, k, v, 0.0625, "causal", none, .{ .ctx = null }, true, s));
+        const diff = try attn256MaxDiff(plain, forced, s);
+        try std.testing.expect(diff < 5e-3);
+    }
 }

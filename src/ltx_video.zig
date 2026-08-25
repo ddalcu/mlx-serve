@@ -1270,7 +1270,7 @@ pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, 
         defer _ = mlx.mlx_array_free(krp);
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qrp, krp, vh, scale, "", null_arr, null_arr, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qrp, krp, vh, scale, "", null_arr, null_arr, false, s));
         { // per-head gate: 2*sigmoid(to_gate_logits(normed)) [1,T,heads] → [1,heads,T,1]
             const gl = try linBias(comp, allocator, normed, "{s}.transformer_1d_blocks.{d}.attn1.to_gate_logits", .{ prefix, blk }, s);
             defer _ = mlx.mlx_array_free(gl);
@@ -1470,7 +1470,7 @@ fn gLayer(w: *const model_mod.Weights, a: std.mem.Allocator, idx: u32, h: mlx.ml
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_arr = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, cfg.qk_scale, "array", mask, null_arr, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, cfg.qk_scale, "array", mask, null_arr, false, s));
 
     const at = try gTranspose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
     defer _ = mlx.mlx_array_free(at);
@@ -2217,7 +2217,7 @@ fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_arr
     const null_arr = mlx.mlx_array{ .ctx = null };
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, false, s));
     if (skip_to_values) {
         // STG perturbation (full skip at B=1): replace the attention output with
         // the value projection — reference `out*mask + v*(1-mask)` with mask=0,

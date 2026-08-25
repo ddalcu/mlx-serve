@@ -575,7 +575,7 @@ pub const Decoder = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, t[0], t[1], t[2], scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, t[0], t[1], t[2], scale, "", null_a, null_a, false, s));
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
         const af = try reshape(at, &[_]c_int{ 1, n, heads * hd }, s);

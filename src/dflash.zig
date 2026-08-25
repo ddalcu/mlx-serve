@@ -1946,9 +1946,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, .{ .ctx = null }, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, .{ .ctx = null }, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, .{ .ctx = null }, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();

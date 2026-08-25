@@ -15,7 +15,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.0, `lib/mlxc-src` fba4470) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
 
 ## Layout (`src/`)
 
@@ -252,6 +252,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 
 - **The prefill-chunk cap reads the SCORE width** (`ModelConfig.prefillScoreHeadDim`) — the `<=128` fused-SDPA early-out otherwise exempts MLA; hd-256 policy branches key on 256 EXACTLY.
+- **On NAX the stock sdpa is the hd-256 kernel** (`naxSdpaPreferred`, default = NAX available, `MLX_SERVE_NAX_SDPA=0|1`): `msv_attn_p256`'s causal arm declines, stock fallthroughs pass `force_fused` ONLY where mlx has a fused kernel (`sdpaForceFusedFor`: hd 256, > 8 rows, q <= k — <= 8 rows is the vector kernel and force_fused THROWS on its gqa wall). Band arm stays ours; Gemma-4 global layers are hd 512 (declined). M5 A/B still owed.
 - **MLX sdpa has a WIDTH WALL at hd 256** (vector kernel serves `q_len*gqa <= 32`): dense causal q 6..9 ride `splitCausalSdpa` (split at row 5, byte-identical; `MLX_SERVE_SDPA_SPLIT=0`; +4..9%). The challenge tree's long-KV warmup does NOT transfer (AOT metallib). `--mtp-depth` is a CAP — force verify width via PLD draft-len in A/Bs.
 - **Fused decode QK-norm+RoPE** (`fusedQkNormRope`, laguna, default ON, `MLX_SERVE_QK_NORM_ROPE_FUSED=0`): bit-identical; cos/sin from probe rows (`ropeAngleRow`); live paired A/B is the bar.
 - **Decode-only dense-attention requant** (`--decode-attn-quant`, default ON, LOSSY): side copies at decode AND spec-verify (same weights); prefill dense; tail layers nvfp4-g16 (`attnDqFor`). A/B per newly-adopted dense arch.

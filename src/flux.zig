@@ -521,7 +521,7 @@ pub const TextEncoder = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_sink = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qf, kf, vf, scale, "array", mask, null_sink, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qf, kf, vf, scale, "array", mask, null_sink, false, s));
         const attn_bf = try astype(attn, .bfloat16, s);
         defer _ = mlx.mlx_array_free(attn_bf);
         const at = try transpose(attn_bf, &[_]c_int{ 0, 2, 1, 3 }, s);
@@ -860,7 +860,7 @@ pub const Dit = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, false, s));
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(at);
         return reshape(at, &[_]c_int{ 1, seq, heads * hd }, s);
     }
@@ -1256,7 +1256,7 @@ const VaeAttn = struct {
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(C)));
         var attn = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(attn);
         const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vr, scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vr, scale, "", null_a, null_a, false, s));
         const ar = try reshape(attn, &[_]c_int{ 1, H, Wd, C }, s); defer _ = mlx.mlx_array_free(ar);
         const ao = try self.o.forward(ar, s); defer _ = mlx.mlx_array_free(ao);
         return addA(x, ao, s);

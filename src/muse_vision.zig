@@ -660,7 +660,7 @@ pub const MuseVision = struct {
         const none = mlx.mlx_array{ .ctx = null };
         if (segs.len == 1) {
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, v, scale, "", none, none, self.s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, v, scale, "", none, none, false, self.s));
             return out;
         }
         var parts = try self.allocator.alloc(mlx.mlx_array, segs.len);
@@ -685,7 +685,7 @@ pub const MuseVision = struct {
                 _ = mlx.mlx_array_free(a);
             };
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, sq[0], sq[1], sq[2], scale, "", none, none, self.s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, sq[0], sq[1], sq[2], scale, "", none, none, false, self.s));
             parts[i] = out;
             made += 1;
             off = stop;

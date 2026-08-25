@@ -270,7 +270,7 @@ fn sliceAxis(x: mlx.mlx_array, axis: usize, start: c_int, stop: c_int, s: S) !ml
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     const null_a = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, false, s));
     return o;
 }
 /// [B,L,H*hd] → [B,H,L,hd]

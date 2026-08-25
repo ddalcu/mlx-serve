@@ -62,6 +62,7 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 - **Ling 3.0 flash-line checkpoints** that ship a direct query projection (`"q_lora_rank": null`) are no longer refused at load, and Ling 3.0 tiny loads under both converter layouts. Thanks @Fe2-O3 (#232). The published flash quants need a further layout change and still do not load.
 - **Alis (avlp12) Qwen packs are served**: their quantized draft-head projection binds, the vision tower's prefix and convolution layout are probed instead of assumed, and a false "broken norm" repair that was halving draft acceptance is fixed (33% → 70%).
 - Embedded DeepSeek and llama.cpp engines updated to their latest upstream versions.
+- **MLX 0.32.2.** Grouped-query decode attention reads each K/V byte once, quantized MoE matmuls skip idle work, and M5 Macs now run head-dim 256 attention (Qwen 3.5/3.6/3.8) on MLX's fused Neural Accelerator kernel for prompts and draft verification. `MLX_SERVE_NAX_SDPA=0` restores the previous kernels.
 
 ### Releases
 

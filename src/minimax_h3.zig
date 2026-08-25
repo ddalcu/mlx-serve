@@ -1366,7 +1366,7 @@ fn sparseAttend(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, spec: Spar
     defer _ = mlx.mlx_array_free(qg);
     var og = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(og);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&og, qg, k, v, scale, "", null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&og, qg, k, v, scale, "", null_a, null_a, false, s));
 
     // Video split + strip keys.
     const qv = try sliceAxis4(q, 2, g, seq, s);
@@ -1423,7 +1423,7 @@ fn sparseAttend(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, spec: Spar
 
     var ob = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ob);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ob, qb, kcat, vcat, scale, "", null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ob, qb, kcat, vcat, scale, "", null_a, null_a, false, s));
 
     // Unfold back to [1, H, Sv, hd] in packed row order.
     const inv_perm: [4]c_int = if (spec.mode == .spatial) .{ 1, 0, 2, 3 } else .{ 1, 2, 0, 3 };
@@ -1530,7 +1530,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
         var o = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(o);
         const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, t[0], t[1], t[2], scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, t[0], t[1], t[2], scale, "", null_a, null_a, false, s));
         attn = o;
     }
     defer _ = mlx.mlx_array_free(attn);
@@ -2971,7 +2971,7 @@ pub const TextEncoder = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_sink = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qkv[0], qkv[1], qkv[2], scale, "array", mask, null_sink, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qkv[0], qkv[1], qkv[2], scale, "array", mask, null_sink, false, s));
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
         const af = try reshape(at, &[_]c_int{ 1, seq, cfg.heads * cfg.head_dim }, s);
@@ -5931,7 +5931,7 @@ test "minimax h3 live: sdpa shape ubench" {
         var clock = LapClock.init(io);
         var o = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(o);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, false, s));
         try mlx.check(mlx.mlx_array_eval(o));
         const ms = clock.lapMs();
         const fl: f64 = 4.0 * 56.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(seq)) * 128.0;
@@ -5978,7 +5978,7 @@ test "minimax h3 live: sparse attention ubench" {
         for (0..3) |_| {
             var cl = LapClock.init(io);
             var o = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, false, s));
             try mlx.check(mlx.mlx_array_eval(o));
             _ = mlx.mlx_array_free(o);
             dense_ms = @min(dense_ms, cl.lapMs());

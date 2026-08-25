@@ -322,7 +322,7 @@ pub extern "c" fn mlx_fast_rope(res: *mlx_array, x: mlx_array, dims: c_int, trad
 // `mlx_fast_rope_dynamic` accepts a per-row offset array (shape [B], int32) so a single
 // kernel launch handles N requests at different KV positions during batched decode.
 pub extern "c" fn mlx_fast_rope_dynamic(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: mlx_array, freqs: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, force_fused: bool, s: mlx_stream) c_int;
 
 // ── Vector of strings (for custom metal kernels) ──
 pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
