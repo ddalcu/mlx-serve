@@ -1421,3 +1421,46 @@ into `dflash_pass`/`mtp_pass` and nulls the errdefer-guarded locals BEFORE the
 `try`, so on failure exactly one owner (the generator) frees them. Guard:
 `scheduler.zig` test "runPrefill clears restored spec-cache ownership BEFORE
 Generator.initWithOptions (issue #266)" pins the clear-before-call ordering.
+
+## `messages.deinit(allocator)` frees the Message array and NOTHING it points at
+
+Live 2026-08-25. `handleChatCompletions` and the Anthropic `/v1/messages`
+handler each decoded a request's `images[].pixels` (and, on the OpenAI surface,
+`videos[].pixels` and `audio[].samples`) into a local `std.ArrayList`, handed
+the buffer to `chat_mod.Message` with `toOwnedSlice`, and then only ever ran
+`defer messages.deinit(allocator)`. That defer frees the Message array. The
+decoded CHW buffers each Message points at had no owner at all, so EVERY
+request carrying an image leaked its full decoded pixel buffer on the SUCCESS
+path — and on every early return after the parse loop too (context-overflow
+400, the memory preflight's 503, a client disconnect mid-stream). Measured on
+the shipped binary: 40 chat requests each carrying a 3 MB `x-mlx-pixels`
+payload grew RSS by 121 MB, i.e. exactly the payload, retained forever.
+
+Only the Anthropic path had a partial guard: an `errdefer` covering the
+`try`s between the decode and the `messages.append`. It covered the ERROR path
+and not the success one, which is the inverse of the usual bug and is why the
+leak survived review — the file looked like it was already thinking about
+ownership.
+
+The Responses API was already correct: `responses.ParsedInput` carries an
+`owned_images` list and frees `pixels` in its `deinit`. That is the shape the
+fix generalizes.
+
+Fix: `server.RequestMedia`, one owner per request, installed beside the
+`messages` list in both handlers. Ownership is by PROVENANCE — a media list is
+only obtainable from `openImages`/`openVideos`/`openAudio` and is owned from
+its first append, so a `try` between the decode and the message append cannot
+leak either, and a new early return cannot leak by omission. `Message` borrows
+the slice (`imagesSlice` returns null for an empty slot, so a message with no
+media keeps a null field rather than an empty slice). Slots are INDICES, not
+pointers: opening another slot may move every `ArrayList` header in the bag,
+while the buffers those headers point at stay put. A fourth modality that
+spells its buffer something other than `pixels`/`samples` fails to COMPILE in
+`mediaBuffer` rather than leaking quietly.
+
+Guards: the source scan "a request handler never owns its own media list —
+RequestMedia does" (no `std.ArrayList(chat_mod.{Image,Video,Audio}Data).empty`
+anywhere in server.zig, and at least two `RequestMedia.init(allocator)` sites),
+plus the `std.testing.allocator` unit test "RequestMedia frees every decoded
+buffer it was handed" — gut the free in `MediaBag.deinit` and it reports 4
+leaked allocations.

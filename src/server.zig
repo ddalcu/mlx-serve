@@ -4892,6 +4892,11 @@ fn handleChatCompletions(
     var messages = std.ArrayList(chat_mod.Message).empty;
     defer messages.deinit(allocator);
 
+    // Decoded image/video/audio buffers for every message in this request.
+    // `Message` borrows them; this is the only thing that frees them.
+    var media = RequestMedia.init(allocator);
+    defer media.deinit();
+
     // Parse tool call structs for assistant messages (stored temporarily)
     var tool_call_lists = std.ArrayList([]const chat_mod.ToolCall).empty;
     defer {
@@ -4924,9 +4929,9 @@ fn handleChatCompletions(
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
-                var image_list = std.ArrayList(chat_mod.ImageData).empty;
-                var video_list = std.ArrayList(chat_mod.VideoData).empty;
-                var audio_list = std.ArrayList(chat_mod.AudioData).empty;
+                const img_slot = try media.openImages();
+                const vid_slot = try media.openVideos();
+                const aud_slot = try media.openAudio();
                 for (arr.items) |part| {
                     if (part != .object) continue;
                     const ptype = part.object.get("type") orelse continue;
@@ -4937,7 +4942,7 @@ fn handleChatCompletions(
                         if (img_obj != .object) continue;
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
-                        appendImageUrlContent(allocator, &image_list, url_val.string, visionPreprocFromConfig(config));
+                        appendImageUrlContent(allocator, media.images(img_slot), url_val.string, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
                         // A video is, on the wire, an ordered array of already-
                         // decoded frame images — no video codec exists anywhere
@@ -4952,7 +4957,7 @@ fn handleChatCompletions(
                         for (frames_val.array.items) |f| {
                             if (f == .string) frame_urls.append(allocator, f.string) catch continue;
                         }
-                        appendVideoUrlContent(allocator, &video_list, frame_urls.items, visionPreprocFromConfig(config));
+                        appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
@@ -4962,28 +4967,16 @@ fn handleChatCompletions(
                         const data_val = a_obj.object.get("data") orelse continue;
                         if (data_val != .string) continue;
                         if (parseAudioContent(allocator, data_val.string)) |aud| {
-                            audio_list.append(allocator, aud) catch {
+                            media.audio(aud_slot).append(allocator, aud) catch {
                                 allocator.free(aud.samples);
                                 continue;
                             };
                         }
                     }
                 }
-                if (image_list.items.len > 0) {
-                    msg_images = image_list.toOwnedSlice(allocator) catch null;
-                } else {
-                    image_list.deinit(allocator);
-                }
-                if (video_list.items.len > 0) {
-                    msg_videos = video_list.toOwnedSlice(allocator) catch null;
-                } else {
-                    video_list.deinit(allocator);
-                }
-                if (audio_list.items.len > 0) {
-                    msg_audio = audio_list.toOwnedSlice(allocator) catch null;
-                } else {
-                    audio_list.deinit(allocator);
-                }
+                msg_images = media.imagesSlice(img_slot);
+                msg_videos = media.videosSlice(vid_slot);
+                msg_audio = media.audioSlice(aud_slot);
                 const joined = try joinedTextParts(allocator, arr.items);
                 if (joined.owned) try content_allocs.append(allocator, joined.text);
                 break :blk joined.text;
@@ -9981,6 +9974,114 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
     return null;
 }
 
+/// The one heap buffer every decoded media entry carries. `ImageData` and
+/// `VideoData` spell it `pixels`, `AudioData` spells it `samples`; a fourth
+/// modality that spells it something else fails to COMPILE here rather than
+/// leaking quietly.
+inline fn mediaBuffer(item: anytype) []const u8 {
+    return if (@hasField(@TypeOf(item), "pixels")) item.pixels else item.samples;
+}
+
+/// One modality's decoded entries, grouped per message. Slots are INDICES, not
+/// pointers: opening another slot may grow the backing list and move every
+/// `ArrayList` header, while the buffers those headers point at stay put.
+fn MediaBag(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        lists: std.ArrayList(std.ArrayList(T)) = .empty,
+
+        fn open(self: *Self, allocator: std.mem.Allocator) !usize {
+            try self.lists.append(allocator, .empty);
+            return self.lists.items.len - 1;
+        }
+
+        fn at(self: *Self, slot: usize) *std.ArrayList(T) {
+            return &self.lists.items[slot];
+        }
+
+        /// Borrowed view for a `chat_mod.Message` field. Null when nothing
+        /// decoded, so a message with no media keeps a null field rather than
+        /// an empty slice (every downstream reader tests the optional).
+        fn slice(self: *Self, slot: usize) ?[]const T {
+            const l = self.lists.items[slot];
+            return if (l.items.len == 0) null else l.items;
+        }
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.lists.items) |*l| {
+                for (l.items) |item| allocator.free(mediaBuffer(item));
+                l.deinit(allocator);
+            }
+            self.lists.deinit(allocator);
+        }
+    };
+}
+
+/// Every image / video / audio buffer decoded out of ONE request body, owned in
+/// ONE place.
+///
+/// `chat_mod.Message.images/videos/audio` BORROW these slices — the handler
+/// hands the message a view and keeps ownership here — so the `defer
+/// messages.deinit(allocator)` every handler already has, which frees the
+/// Message array and nothing it points at, can never be the whole story. Both
+/// `handleChatCompletions` and the Anthropic `/v1/messages` handler used to
+/// hand-roll a local list per message and `toOwnedSlice` it into the Message,
+/// which leaked the full decoded CHW buffer of every image (megabytes each) on
+/// the SUCCESS path and on every return after the parse loop.
+///
+/// Ownership is by PROVENANCE: a list only ever comes from `openImages` /
+/// `openVideos` / `openAudio`, and is owned from its first append — so a `try`
+/// between the decode and the message append cannot leak either, and a new
+/// early return cannot leak by omission. That is the property the source scan
+/// "a request handler never owns its own media list" keeps: a handler may not
+/// declare a media list of its own.
+const RequestMedia = struct {
+    allocator: std.mem.Allocator,
+    image_bag: MediaBag(chat_mod.ImageData) = .{},
+    video_bag: MediaBag(chat_mod.VideoData) = .{},
+    audio_bag: MediaBag(chat_mod.AudioData) = .{},
+
+    fn init(allocator: std.mem.Allocator) RequestMedia {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *RequestMedia) void {
+        self.image_bag.deinit(self.allocator);
+        self.video_bag.deinit(self.allocator);
+        self.audio_bag.deinit(self.allocator);
+    }
+
+    fn openImages(self: *RequestMedia) !usize {
+        return self.image_bag.open(self.allocator);
+    }
+    fn images(self: *RequestMedia, slot: usize) *std.ArrayList(chat_mod.ImageData) {
+        return self.image_bag.at(slot);
+    }
+    fn imagesSlice(self: *RequestMedia, slot: usize) ?[]const chat_mod.ImageData {
+        return self.image_bag.slice(slot);
+    }
+
+    fn openVideos(self: *RequestMedia) !usize {
+        return self.video_bag.open(self.allocator);
+    }
+    fn videos(self: *RequestMedia, slot: usize) *std.ArrayList(chat_mod.VideoData) {
+        return self.video_bag.at(slot);
+    }
+    fn videosSlice(self: *RequestMedia, slot: usize) ?[]const chat_mod.VideoData {
+        return self.video_bag.slice(slot);
+    }
+
+    fn openAudio(self: *RequestMedia) !usize {
+        return self.audio_bag.open(self.allocator);
+    }
+    fn audio(self: *RequestMedia, slot: usize) *std.ArrayList(chat_mod.AudioData) {
+        return self.audio_bag.at(slot);
+    }
+    fn audioSlice(self: *RequestMedia, slot: usize) ?[]const chat_mod.AudioData {
+        return self.audio_bag.slice(slot);
+    }
+};
+
 /// Decode one `image_url` into as many entries as the model's processor makes
 /// of it — one per tower call. Only LFM2-VL ever yields more than one: past its
 /// single-tile token budget it splits the source into a tile grid plus a
@@ -10399,6 +10500,83 @@ pub fn appendVideoUrlContent(
     }
 }
 
+test "a request handler never owns its own media list — RequestMedia does" {
+    // Live leak: `handleChatCompletions` and the Anthropic `/v1/messages`
+    // handler each decoded `images[].pixels` (and videos/audio) into a local
+    // ArrayList, handed the slice to `chat_mod.Message` with `toOwnedSlice`,
+    // and then only ever `messages.deinit(allocator)`'d — which frees the
+    // Message array and NOTHING it points at. Every request carrying an image
+    // leaked the full decoded CHW buffer (megabytes per image) on the SUCCESS
+    // path, and on every early return after the parse loop as well.
+    //
+    // Scattering `defer allocator.free(...)` across the exit paths is how the
+    // next exit path gets added without one, so the buffers are owned by ONE
+    // struct with a `deinit` instead. This scan is what keeps a third handler
+    // (or a fourth media modality) from re-introducing a hand-rolled list whose
+    // contents nothing frees: a media list may only be obtained from the owner.
+    //
+    // Needles are split so this test's own source cannot satisfy them — it sits
+    // in the file it greps.
+    const src = @embedFile("server.zig");
+    const bare = [_][]const u8{
+        "std.ArrayList(chat_mod." ++ "ImageData).empty",
+        "std.ArrayList(chat_mod." ++ "VideoData).empty",
+        "std.ArrayList(chat_mod." ++ "AudioData).empty",
+    };
+    for (bare) |needle| {
+        if (std.mem.indexOf(u8, src, needle) != null) return error.HandlerOwnsItsOwnMediaList;
+    }
+    // The owner has to exist, and both handlers have to install it.
+    if (std.mem.indexOf(u8, src, "const RequestMedia " ++ "= struct") == null) return error.OwnerMissing;
+    var installs: usize = 0;
+    var i: usize = 0;
+    const install = "RequestMedia" ++ ".init(allocator)";
+    while (std.mem.indexOfPos(u8, src, i, install)) |at| : (i = at + install.len) installs += 1;
+    if (installs < 2) return error.AHandlerDoesNotInstallTheOwner;
+}
+
+test "RequestMedia frees every decoded buffer it was handed" {
+    // std.testing.allocator fails this test on a leak, which is the whole
+    // point: the owner is the only thing that frees `pixels`/`samples`, so a
+    // gutted `deinit` is caught here rather than in a week of RSS growth.
+    const a = std.testing.allocator;
+    var media = RequestMedia.init(a);
+
+    const img_slot = try media.openImages();
+    try media.images(img_slot).append(a, .{
+        .pixels = try a.alloc(u8, 4096),
+        .width = 32,
+        .height = 32,
+    });
+    try media.images(img_slot).append(a, .{
+        .pixels = try a.alloc(u8, 2048),
+        .width = 16,
+        .height = 32,
+    });
+
+    const vid_slot = try media.openVideos();
+    try media.videos(vid_slot).append(a, .{
+        .pixels = try a.alloc(u8, 1024),
+        .grid_t = 1,
+        .grid_h = 2,
+        .grid_w = 2,
+    });
+
+    const aud_slot = try media.openAudio();
+    try media.audio(aud_slot).append(a, .{ .samples = try a.alloc(u8, 512) });
+
+    // A borrowed slice for `Message.images`; empty slots read back as null so a
+    // message with no media keeps a null field rather than an empty slice.
+    try std.testing.expectEqual(@as(usize, 2), (media.imagesSlice(img_slot) orelse return error.NoImages).len);
+    try std.testing.expectEqual(@as(usize, 1), (media.videosSlice(vid_slot) orelse return error.NoVideos).len);
+    try std.testing.expectEqual(@as(usize, 1), (media.audioSlice(aud_slot) orelse return error.NoAudio).len);
+    const empty = try media.openImages();
+    try std.testing.expect(media.imagesSlice(empty) == null);
+
+    media.deinit();
+}
+
+
 // ── Anthropic Messages API ──
 
 fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
@@ -10639,6 +10817,11 @@ fn handleAnthropicMessages(
     var messages = std.ArrayList(chat_mod.Message).empty;
     defer messages.deinit(allocator);
 
+    // Decoded image buffers for every message in this request. `Message`
+    // borrows them; this is the only thing that frees them.
+    var media = RequestMedia.init(allocator);
+    defer media.deinit();
+
     // Track allocations for serialized tool arguments (need to outlive generation)
     var arg_allocs = std.ArrayList([]const u8).empty;
     defer {
@@ -10714,11 +10897,7 @@ fn handleAnthropicMessages(
                     // the vision encoder sees them attached to the right turn.
                     var msg_text = std.ArrayList(u8).empty;
                     defer msg_text.deinit(allocator);
-                    var image_list = std.ArrayList(chat_mod.ImageData).empty;
-                    errdefer {
-                        for (image_list.items) |img| allocator.free(img.pixels);
-                        image_list.deinit(allocator);
-                    }
+                    const img_slot = try media.openImages();
                     for (arr.items) |block| {
                         if (block != .object) continue;
                         const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
@@ -10736,10 +10915,10 @@ fn handleAnthropicMessages(
                             const stype = if (src_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
                             const data_url = blk: {
                                 if (std.mem.eql(u8, stype, "base64")) {
-                                    const media = if (src_val.object.get("media_type")) |v| (if (v == .string) v.string else "image/png") else "image/png";
+                                    const media_type = if (src_val.object.get("media_type")) |v| (if (v == .string) v.string else "image/png") else "image/png";
                                     const data = if (src_val.object.get("data")) |v| (if (v == .string) v.string else "") else "";
                                     if (data.len == 0) break :blk @as(?[]const u8, null);
-                                    break :blk @as(?[]const u8, try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media, data }));
+                                    break :blk @as(?[]const u8, try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media_type, data }));
                                 } else if (std.mem.eql(u8, stype, "url")) {
                                     const url = if (src_val.object.get("url")) |v| (if (v == .string) v.string else "") else "";
                                     if (url.len == 0) break :blk @as(?[]const u8, null);
@@ -10750,28 +10929,23 @@ fn handleAnthropicMessages(
                             };
                             if (data_url) |du| {
                                 defer allocator.free(du);
-                                appendImageUrlContent(allocator, &image_list, du, visionPreprocFromConfig(config));
+                                appendImageUrlContent(allocator, media.images(img_slot), du, visionPreprocFromConfig(config));
                             }
                         }
                     }
-                    if (msg_text.items.len > 0 or image_list.items.len > 0) {
+                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0) {
                         const owned_text = if (msg_text.items.len > 0) blk: {
                             const s = try allocator.dupe(u8, msg_text.items);
                             try content_allocs.append(allocator, s);
                             break :blk s;
                         } else "";
-                        const owned_images: ?[]const chat_mod.ImageData = if (image_list.items.len > 0) blk: {
-                            break :blk try image_list.toOwnedSlice(allocator);
-                        } else null;
                         try messages.append(allocator, .{
                             .role = "user",
                             .content = owned_text,
                             .tool_calls = null,
                             .tool_call_id = null,
-                            .images = owned_images,
+                            .images = media.imagesSlice(img_slot),
                         });
-                    } else {
-                        image_list.deinit(allocator);
                     }
                 },
                 else => {},
