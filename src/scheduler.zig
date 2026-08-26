@@ -507,6 +507,8 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
+                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
             }
             allocator.free(entries);
         };
@@ -639,6 +641,8 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
+                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
             }
             self.allocator.free(entries);
         }
@@ -3160,6 +3164,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.linear_num_key_heads > 0) {
             xfm_ptr.compileGdnGate();
         }
+        if (params.config.isQwen4()) {
+            xfm_ptr.compileQwen4Hc();
+        }
     }
 
     // Phase 2 experiment: opt-in full-forward Metal fusion via
@@ -3562,7 +3569,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter = drafter_ptr;
     entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = if (mtp_ptr) |h| generate_mod.MtpHeadRef{ .qwen = h } else null;
+    entry.mtp = if (mtp_ptr) |h|
+        generate_mod.MtpHeadRef{ .qwen = h }
+    else if (xfm_ptr.qwen4_mtp != null)
+        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
+    else
+        null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);

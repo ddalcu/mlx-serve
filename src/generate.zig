@@ -198,11 +198,37 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// and nothing else.
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
+    /// qwen4_exp: the head and its history live on the Transformer
+    /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
+    /// (pre-mixer stream at position r, token r+1), query position r+1.
+    qwen4: *Transformer,
 
     pub fn makeCache(self: MtpHeadRef, allocator: std.mem.Allocator) !MtpCacheRef {
         return switch (self) {
             .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
+            .qwen4 => |t| blk: {
+                try t.qwen4MtpReset();
+                break :blk .{ .qwen4 = t };
+            },
         };
+    }
+
+    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool) !mtp_mod.StepOut {
+        const s = t.s;
+        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1);
+        defer _ = mlx.mlx_array_free(out.logits);
+        const hs = mlx.getShape(out.stream);
+        if (!want_logits) return .{ .logits = .{ .ctx = null }, .hidden_next = out.stream };
+        defer _ = mlx.mlx_array_free(out.stream);
+        const last = hs[1] - 1;
+        const strides = [_]c_int{ 1, 1, 1 };
+        var h_last = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(h_last);
+        try mlx.check(mlx.mlx_slice(&h_last, out.stream, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ hs[0], hs[1], hs[2] }, 3, &strides, 3, s));
+        const ls = mlx.getShape(out.logits);
+        var l_last = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&l_last, out.logits, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ ls[0], ls[1], ls[2] }, 3, &strides, 3, s));
+        return .{ .logits = l_last, .hidden_next = h_last };
     }
 
     /// One head forward over L positions. `want_logits` returns the LAST row
@@ -219,6 +245,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mtp_mod.StepOut {
         return switch (self) {
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
+            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want_logits),
         };
     }
 
@@ -235,8 +262,17 @@ pub const MtpHeadRef = union(enum) {
     ) !void {
         switch (self) {
             .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
+            .qwen4 => |t| {
+                const ids_i32 = try allocator.alloc(i32, token_ids.len);
+                defer allocator.free(ids_i32);
+                for (token_ids, 0..) |tok, i| ids_i32[i] = @intCast(tok);
+                const shape = [_]c_int{@intCast(token_ids.len)};
+                const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
+                defer _ = mlx.mlx_array_free(id_arr);
+                const out = try qwen4Step(t, id_arr, hidden, rope_offset, false);
+                _ = mlx.mlx_array_free(out.hidden_next);
+            },
         }
-        _ = allocator;
     }
 
     /// Draft-rerank scheme (see mtp.zig): greedy drafts pick via a coarse
@@ -245,6 +281,7 @@ pub const MtpHeadRef = union(enum) {
     pub fn canRerankDrafts(self: MtpHeadRef) bool {
         return switch (self) {
             .qwen => |h| h.canRerankDrafts(),
+            .qwen4 => false,
         };
     }
 
@@ -256,6 +293,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mlx.mlx_array {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
+            .qwen4 => error.NoDraftRerank,
         };
     }
 
@@ -266,12 +304,14 @@ pub const MtpHeadRef = union(enum) {
     pub fn costProfile(self: MtpHeadRef, target: *const Transformer) mtp_mod.MtpCostProfile {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
+            .qwen4 => .generic,
         };
     }
 
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
+            .qwen4 => null,
         };
     }
 
@@ -281,6 +321,7 @@ pub const MtpHeadRef = union(enum) {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
+            .qwen4 => {},
         }
     }
 };
@@ -288,10 +329,12 @@ pub const MtpHeadRef = union(enum) {
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
+    qwen4: *Transformer,
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
             .qwen => |*c| c.step,
+            .qwen4 => |t| t.qwen4_mtp.?.seq_offset,
         };
     }
 
@@ -300,18 +343,21 @@ pub const MtpCacheRef = union(enum) {
     pub fn kv(self: *MtpCacheRef) *KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
+            .qwen4 => |t| &t.qwen4_mtp.?.cache,
         };
     }
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
+            .qwen4 => |t| try t.qwen4MtpTruncate(len),
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
             .qwen => |*c| c.deinit(),
+            .qwen4 => {},
         }
     }
 
@@ -321,6 +367,11 @@ pub const MtpCacheRef = union(enum) {
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
             .qwen => |*c| for (c.entries) |*entry| {
+                if (!entry.initialized) continue;
+                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
+                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+            },
+            .qwen4 => |t| for (t.qwen4_mtp.?.cache.entries) |*entry| {
                 if (!entry.initialized) continue;
                 _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
                 _ = mlx.mlx_vector_array_append_value(vec, entry.values);

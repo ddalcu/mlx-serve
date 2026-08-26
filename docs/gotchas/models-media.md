@@ -1464,3 +1464,77 @@ produce garbage rather than erroring.
 **The source clip is encoded in windows.** `vaeEncodeMean` on 600 s would hold 128 channels x 28.8M samples f32 (15 GB) per activation. `vaeEncodeMeanChunked` encodes 30 s windows with a 64-frame halo, cores starting on 1920-sample (one-latent) boundaries so every strided conv lands where the untiled pass would — the decode's own overlap strategy, mirrored; the encoder's receptive field is ~12 frames. And a 10 s WAV's base64 is past ARG_MAX: the integration script passes clips by FILE (`mkreq`), which the #259 `ref_audio` arm had silently been failing on.
 
 **Sampler extras.** `cover_strength < 1` builds a SECOND condition set (text2music instruction re-encoded while the text encoder is still resident — before the low-mem release —, same lyrics/timbre, silence context, its own cross K/V) and switches at `int(steps * strength)`, resetting nothing else (the reference rebuilds its cross KV cache; ours is per set). `cover_noise_strength` starts from `t*noise + (1-t)*RAW source latent` at the schedule entry nearest `1 - strength` (`nearestStep`, earlier step on ties like Python's `min`) and runs the remaining steps — the blend is the raw latent, never the hints. Both are integration-pinned by their log lines.
+
+
+## Qwen3.8-Flash-Next (`qwen4_exp`) port (2026-08-26)
+
+Qwen/Qwen3.8-Flash-Next arrived as `model_type: qwen4_exp` — the Qwen4 preview
+arch, not a qwen3_5 pack: 125B-A6B GDN+MoE trunk (48 layers, 3 GDN : 1
+attention) wrapped in FOUR hyper-connection residual streams, a 51B hashed
+n-gram embedding injected at layer 1 (PLE), Qwen Sparse Attention (QSA:
+indexer-selected 4-token blocks past 2048 tokens) on the attention layers, and a
+1-layer MTP head. HF transformers main (`models/qwen4_exp`) is the trunk oracle
+and ignores `mtp.*`; the MTP forward lives only in the vLLM (#53896) / SGLang
+(#36497) PR branches (see memory notes; not served yet).
+
+What the port reuses: the qwen3_5 split-projection GatedDeltaNet with the
+`kda_sigmoid_out_gate` output gate, the qwen3_5 MoE (softmax top-10 + sigmoid
+shared expert), `gatedFullAttnWith` (q-gate, QK norm, partial rotary 64/256,
+KV cache). What is new: `hcRead`/`hcWrite` (grouped `(1+w)` norm per stream,
+sigmoid mix, `2σ(inject/hc)` write gates), `pleForward` (host n-gram gather →
+key/value → gated → dilated depthwise conv), `qsaMask` (bool mask threaded
+through `ForwardCtx.qsa_mask`), and the final `hyper_connection_mixer` in place
+of `model.norm`.
+
+Traps that cost time:
+
+- **HF `output_hidden_states` records layer INPUTS**: `hidden_states[0]` is the
+  tiled embedding, `hidden_states[i]` the input of layer i. Comparing our layer
+  output with `stream_i` read as "layer 0 already broken" while every sub-module
+  matched at 0.9999.
+- **QSA tail is per query**: the reference concatenates each query's own
+  incomplete block (`visible[num_complete_blocks*ratio:]`), so token j is visible
+  iff selected-block OR `j >= ratio*floor((p+1)/ratio)`. A global `kv % ratio`
+  tail left rows 0..2 with NO visible tokens.
+- **Indexer scores in f32, ties to the lower index**: relu zeroes most blocks
+  early in a sequence; `torch.topk` keeps the lower index among equal scores and
+  `argpartition` does not. Bit-faithful selection needs f32 scores plus a tiny
+  index-descending bias.
+- **The n-gram eos is the text config's**: `_shift_right_ignore_eos` resets on
+  `config.eos_token_id[0]` (248044); the root config has none and
+  `generation_config.json` lists several. Read it into `ngram_eos`.
+- **A freed-but-not-nulled `aux_state`**: `resetCache` re-creates conv/ssm
+  handles; the new field must be nulled with them or the warmup's second forward
+  SIGBUSes on a dead handle.
+- **Toy geometry has to clear the kernels' floors**: the GDN Metal kernel refuses
+  dk 16 (`float state[n_per_t]` zero-length) — the tiny oracle uses dk/dv 64.
+
+Bring-up flow: `dump_qwen4_exp_fixtures.py build` (random tiny model in the
+real naming) → `convert_qwen38_flash_next.py --src` → `dump` (reference on OUR
+dequantized weights, so the fixture measures the engine, not the quantizer) →
+`QWEN4_TEST_MODEL=… QWEN4_FIXTURE=… zig build test -Dtest-filter="qwen4 fixture"`
+(prints a per-layer bisect ladder + layer-0/1/3 sub-module cosines). Final:
+full prefill cos 0.99996, 20/20 argmax; chunked prefill + stepwise decode past
+the budget 6/6.
+
+MTP (phase 2, same day): the head is one more hyper-connected QSA+MoE layer
+fed `fc_hidden(rms_10240(pre-mixer stream)) + fc_embedding(rms_2560(embed))`
+per stream, then its own mixer and the trunk lm_head — vLLM/SGLang agree, HF
+ignores `mtp.*`, so the oracle is a torch rendering of that math on a synthetic
+head (layer-3 tensors + random fc). Wired as `MtpHeadRef.qwen4` / `MtpCacheRef.qwen4`
+(state on `Transformer.qwen4_mtp`, single-flight), so the whole EV controller /
+acceptance / rollback loop is reused. Rollback extends `ssmRollbackFromCapture`:
+the PLE layer captures its conv input + token history during a capturing
+verify (`spec_ple_input/tokens`), attention layers truncate their positional
+QSA key history, the head truncates its own KV + keys. Two traps: draft ids
+arrive as lazy graphs of the sampler's dtype (cast + contiguous before the host
+n-gram read — `TokenIdsUnreadable` otherwise), and the head's key row 0 sits at
+position 1, so `qsaMask` takes a `pos_base` (explicit angle table for the pooled
+keys; a scaled `fast_rope` cannot express a non-multiple base). Bars: head
+parity cos 0.99998 vs the reference, verify→rollback(accept 1)→continue exact
+(cos 1.00000) vs a fresh forward, server MTP-on == MTP-off greedy at 0 accepts.
+
+Known v1 limits: serial + prefix cache off (module-owned); PLD/DFlash off; batch 1;
+QSA scores/mask are `[S, kv]`-sized transients per attention layer (long-context
+prefill wants a smaller `--prefill-chunk`); MTP head unserved; pooled block keys
+recomputed per step.

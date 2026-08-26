@@ -103,6 +103,7 @@ pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
 pub extern "c" fn mlx_array_new() mlx_array;
 pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
 pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
+pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
 pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
 pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
