@@ -4024,3 +4024,66 @@ Worth noting what the symptom looked like from outside: nothing. The server
 booted, answered correctly, and logged one line about a disabled sidecar in the
 middle of a normal startup. A benchmark reading "26.8.9 and 26.8.10 are the
 same speed" would have been the only other evidence.
+
+## qwen4_exp serial decode: the f32 scalar, the latency-bound kernel, the SSD fault (2026-08-26)
+
+Three separate findings from one afternoon on Qwen3.8-Flash-Next, all on the
+serial decode path (M4 Max 128 GB, 4bit-all pack, `MLX_SERVE_DECODE_FWD_UBENCH=30`).
+
+### 1. One f32 scalar widened the whole residual stream
+
+`scaleTriple` folded the reference's `/hc_count` into the dense inject weight
+with `mlx_multiply(w, mlx_array_new_float(0.25))`. In MLX C++ a float scalar
+array is a real float32 array, not a weak Python scalar, so the product is f32.
+The inject gate was then f32, `stream + out * inj` was f32, and from layer 0 on
+every hyper-connection read, every GDN in-projection and every MoE router ran
+on f32 activations. The PLE gate (`1/sqrt(hidden)`, the `1e-6` clamp floor) and
+the `2 * sigmoid` inject closure had the same scalar.
+
+The reference keeps everything in model dtype. The oracle fixture passed at
+0.99996 either way, so parity could not see it; `[dtype-trace] qwen4: residual
+widened at layer 0: bfloat16 -> float32` had been in every log. Fixed with
+`scalarOf(v, dtype)` at all three sites: 22.05 → 18.42 ms/forward, prefill
+560 → 750 tok/s, greedy text unchanged in substance.
+
+### 2. The fused hyper-connection read was slower than the chain — twice
+
+`hcRead` at decode width was 11 dispatches over 10240-wide tensors (grouped
+RMS norm, ×w, down qmv, silu, up qmv, sigmoid-mix + mean, inject matvec,
+2·sigmoid), ×2 per layer, ×48 layers. The first fused version (two kernels,
+normalized stream recomputed per row) cost 146 us per call in-situ, against
+~42 us for the whole chain. The second (normalize once into 20 KB of
+threadgroup memory) was still 63 us. The isolated microbench said 26–61 us for
+both — hot weights and 200 independent calls hide latency completely.
+
+What was actually wrong: one simdgroup per 10 KB row means one lane walks 40
+dependent load iterations; at ~400 ns each that is 16 us before any math, and
+the single-threadgroup normalize kernel paid the same for its own 40. The
+version that won (`hcReadFused`, kernels N/D/U): one threadgroup per stream
+with `H/256` compile-time-unrolled loads, the down matvec split-K across the 8
+simdgroups of a threadgroup (5 unrolled words per lane), the up matvec one
+simdgroup per column with the 4 streams unrolled. 3 dispatches per read,
+18.42 → 16.82 ms/forward, hc-free floor 14.4. Parity bar is per-element
+(one bf16 ulp at 1.0 plus 2%) — the accumulation order differs by design.
+
+The diagnostic that found it was in-situ bisection, not a microbench: a
+template flag that made kernel A return immediately (28.6 → 14.4 ms = the
+kernel's real cost), then sane stand-ins per kernel (zeros collapse the
+downstream graph and read as 4 ms forwards).
+
+### 3. The n-gram table gather was 5 ms of every token
+
+`ngram_table.bin` is a 32 GB private mmap; each token reads 16 rows × 3
+regions (weights, scales, biases) of ~100 bytes each, 48 random pages. With
+67 GB of weights resident the page cache never holds the table, so that is 48
+serial SSD faults ≈ 5 ms per decode step (measured with `QWEN4_PROFILE_FWD`,
+the `ple gather` line). `madvise(MADV_WILLNEED)` changed nothing on Darwin.
+`NgramTable.prefetch` spawns one thread per row to touch the three pages
+before the serial dequant: 5.5 → 1.1 ms, serial 36.3 → 39.0 tok/s at 8.5k
+context before the other two fixes. `QWEN4_PLE_PREFETCH=0` restores.
+
+Session totals (same box, same prompts): short answer 41.9 → 57.4 tok/s,
+8.5k-context decode 38.4 → 50–52 tok/s, prefill 560 → 750 tok/s. The MTP
+round cost (`MLX_SERVE_MTP_TRACE=1`, 120 ms/round at depth 1) is the S>1 MoE
+`_gather_sort` path: 1.46 ms/layer at S=2 vs 0.27 at S=1 — parked, serial
+first.

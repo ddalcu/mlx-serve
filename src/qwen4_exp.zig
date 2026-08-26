@@ -215,9 +215,47 @@ pub const NgramTable = struct {
     /// Gather + concatenate the `n_heads` rows of each token: `out` is
     /// `[ids.len / n_heads][n_heads * dim]` row-major.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32) void {
+        if (plePrefetchEnabled()) self.prefetch(row_ids);
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
     }
+
+    /// Fault every row's three regions in parallel before the serial reads:
+    /// the table is a cold 32 GB mmap and each region is one SSD fault
+    /// (~100 us), 48 per token — serial that was ~5 ms of every decode step.
+    fn prefetch(self: *const NgramTable, row_ids: []const i64) void {
+        var threads: [MAX_PREFETCH_THREADS]?std.Thread = @splat(null);
+        const n = @min(row_ids.len, MAX_PREFETCH_THREADS);
+        for (0..n) |t| {
+            threads[t] = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, touchRows, .{ self, row_ids, t, n }) catch null;
+        }
+        for (threads[0..n]) |th| if (th) |h| h.join();
+    }
+
+    fn touchRows(self: *const NgramTable, row_ids: []const i64, first: usize, stride: usize) void {
+        var acc: u8 = 0;
+        var i = first;
+        while (i < row_ids.len) : (i += stride) {
+            const r: u64 = @intCast(row_ids[i]);
+            acc +%= self.map[self.w_off + r * self.wcols * 4];
+            acc +%= self.map[self.s_off + r * self.scols * 2];
+            acc +%= self.map[self.b_off + r * self.scols * 2];
+        }
+        std.mem.doNotOptimizeAway(acc);
+    }
 };
+
+const MAX_PREFETCH_THREADS = 32;
+
+fn plePrefetchEnabled() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("QWEN4_PLE_PREFETCH");
+    const v = raw == null or raw.?[0] != '0';
+    S.v = v;
+    return v;
+}
 
 pub fn bf16ToF32(u: u16) f32 {
     return @bitCast(@as(u32, u) << 16);
