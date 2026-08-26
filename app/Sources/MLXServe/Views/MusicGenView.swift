@@ -245,7 +245,12 @@ struct MusicGenView: View {
     private var modeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Picker("", selection: $task) {
-                ForEach(MusicTask.allCases, id: \.self) { Text($0.label).tag($0) }
+                // The Cover segment declares a missing tokenizer in its OWN
+                // label, so the reason is readable before the mode is even
+                // selected — the whole point of #269.
+                ForEach(MusicTask.allCases, id: \.self) { t in
+                    Text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready)).tag(t)
+                }
             }
             .labelsHidden().pickerStyle(.segmented)
             Text(task == .cover
@@ -254,6 +259,63 @@ struct MusicGenView: View {
                     ? "Builds an arrangement around a vocal stem (or any part): pick the instruments to add, or leave them all off to let the model decide."
                     : "A new track from the style prompt and lyrics."))
                 .font(.caption2).foregroundStyle(.secondary)
+            coverWeightsNotice
+        }
+    }
+
+    /// Whether Cover can run against the pack on THIS Mac. Purely local — the
+    /// pack dir resolves across every served root, so an LM Studio or custom
+    /// folder answers too, and no generation has to be set up to find out.
+    private var coverWeights: CoverWeightsFetch.Decision {
+        CoverWeightsFetch.decide(
+            task: .cover,
+            modelSupportsSourceAudio: model.supportsSourceAudio,
+            isRemote: lanModel != nil,
+            packDir: lanModel == nil ? ServerManager.resolveModelDir(repo: model.repo) : nil,
+            fetching: downloads.isFetchingPackFile(repoId: model.repo))
+    }
+
+    /// Says what is missing, by name, and offers the ONE file — never the 5 GB
+    /// pack again. The engine stats for the tokenizer on every cover request
+    /// (`acestep.Engine.fsqAvailable`), so a resident model picks the file up
+    /// as soon as it lands: no reload, no app restart, nothing to warn about.
+    @ViewBuilder
+    private var coverWeightsNotice: some View {
+        if task == .cover, let text = CoverWeightsFetch.notice(coverWeights) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(text).font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                switch coverWeights {
+                case .fetch:
+                    Button {
+                        downloads.startPackFile(repoId: model.repo,
+                                                fileName: CoverWeightsFetch.fileName) {
+                            appState.refreshModels()
+                        }
+                    } label: {
+                        Label("Download \(CoverWeightsFetch.fileName) (\(CoverWeightsFetch.approxMB) MB)",
+                              systemImage: "arrow.down.circle")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                case .downloading:
+                    HStack(spacing: 8) {
+                        ProgressView(value: downloads.downloads[model.repo]?.progress ?? 0)
+                            .progressViewStyle(.linear)
+                        Text(downloads.downloads[model.repo]?.percentFormatted ?? "")
+                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        // Cancels ONLY this single-file fetch — a full pack
+                        // download for the same repo is never touched.
+                        Button("Cancel") { downloads.cancelPackFile(repoId: model.repo) }
+                            .buttonStyle(.borderless).font(.caption)
+                    }
+                default:
+                    EmptyView()
+                }
+            }
+            .padding(8)
+            .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
         }
     }
 

@@ -567,3 +567,164 @@ final class MusicGenTests: XCTestCase {
         }
     }
 }
+
+// MARK: - Cover weights (fsq.safetensors) declared at the point of use
+
+/// #269: a pack downloaded before cover mode lacks `fsq.safetensors`, and the
+/// only signal was a 400 after the user had already attached a source track.
+/// The Music tab must say so by name, offer the ONE file, and never offer a
+/// button that cannot work.
+final class CoverWeightsFetchTests: XCTestCase {
+
+    private func tempDir() throws -> String {
+        let dir = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("mlx-serve-fsq-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    func testFileNameIsTheOneConstant() {
+        // One spelling, or the app fetches a file the server never looks for.
+        XCTAssertEqual(CoverWeightsFetch.fileName, "fsq.safetensors")
+        XCTAssertEqual(MusicGenService.coverWeightsFile, CoverWeightsFetch.fileName)
+        // The size quoted in the UI is the real file (420,148,465 bytes).
+        XCTAssertEqual(CoverWeightsFetch.approxMB, 420)
+    }
+
+    func testDecisionOnlyAppliesToCoverOnASourceAudioModel() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        // Vocal to BGM does NOT read the FSQ tokenizer — the server only gates
+        // task "cover" on it, and `complete` builds its context straight from
+        // the source latents. It must never be disabled by this.
+        for task in [MusicTask.text2music, .complete] {
+            XCTAssertEqual(
+                CoverWeightsFetch.decide(task: task, modelSupportsSourceAudio: true,
+                                         isRemote: false, packDir: dir, fetching: false),
+                .notApplicable, "\(task) must not be gated on \(CoverWeightsFetch.fileName)")
+        }
+        // A model with no source-audio tasks has no cover mode at all.
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: false,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .notApplicable)
+    }
+
+    func testMissingWritablePackOffersTheFetchAndPresentSaysReady() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .fetch)
+        try Data("x".utf8).write(to: URL(fileURLWithPath:
+            (dir as NSString).appendingPathComponent(CoverWeightsFetch.fileName)))
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .ready)
+    }
+
+    func testInFlightFetchOutranksMissing() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: true),
+            .downloading)
+    }
+
+    func testUnwritablePackSaysWhereRatherThanOfferingADeadButton() throws {
+        let dir = try tempDir()
+        defer {
+            _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir)
+            try? FileManager.default.removeItem(atPath: dir)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir)
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .missingUnwritable(dir: dir))
+    }
+
+    func testRemoteModelIsNotOursToComplete() {
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: true, packDir: nil, fetching: false),
+            .unavailableRemotely)
+    }
+
+    func testAbsentPackDirIsNotAnOffer() {
+        // Not installed at all — the model row's own Download button covers it;
+        // offering one file into a pack that isn't there would fail.
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: nil, fetching: false),
+            .notApplicable)
+    }
+
+    func testEveryDeclaringStateNamesTheFileAndTheSize() {
+        // "The user must be able to read what is wrong without clicking."
+        for decision: CoverWeightsFetch.Decision in [.fetch, .missingUnwritable(dir: "/tmp/pack"),
+                                                     .unavailableRemotely] {
+            let text = CoverWeightsFetch.notice(decision)
+            XCTAssertNotNil(text, "\(decision) must say something")
+            XCTAssertTrue(text?.contains(CoverWeightsFetch.fileName) ?? false,
+                          "\(decision) must name the file: \(text ?? "nil")")
+        }
+        // The offer states the size AND that it is not the whole model again.
+        let offer = CoverWeightsFetch.notice(.fetch) ?? ""
+        XCTAssertTrue(offer.contains("420 MB"), offer)
+        XCTAssertTrue(offer.lowercased().contains("whole model"), offer)
+        // The unwritable state says WHERE to put it.
+        XCTAssertTrue(CoverWeightsFetch.notice(.missingUnwritable(dir: "/tmp/pack"))?
+            .contains("/tmp/pack") ?? false)
+        // Nothing to say when there is nothing wrong.
+        XCTAssertNil(CoverWeightsFetch.notice(.ready))
+        XCTAssertNil(CoverWeightsFetch.notice(.notApplicable))
+    }
+
+    func testTheModeLabelItselfDeclaresTheMissingFile() {
+        // Requirement 1: the Cover option declares it in its OWN label, so the
+        // reason is readable before the mode is even selected.
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(MusicTask.cover, decision: .ready), "Cover")
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(MusicTask.cover, decision: .notApplicable), "Cover")
+        for decision: CoverWeightsFetch.Decision in [.fetch, .downloading,
+                                                     .missingUnwritable(dir: "/d"), .unavailableRemotely] {
+            XCTAssertTrue(CoverWeightsFetch.modeLabel(.cover, decision: decision)
+                            .contains(CoverWeightsFetch.fileName),
+                          "\(decision) label: \(CoverWeightsFetch.modeLabel(.cover, decision: decision))")
+        }
+        // Never decorate the modes this has nothing to do with.
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(.complete, decision: .fetch), "Vocal to BGM")
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(.text2music, decision: .fetch), "Text to music")
+    }
+
+    /// The wiring a unit test cannot reach: the pane must actually render the
+    /// notice, offer the fetch, and allow cancel (the source-scan idiom).
+    func testMusicPaneWiresTheCoverWeightsNotice() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/MusicGenView.swift")
+        let src = try String(contentsOf: url, encoding: .utf8)
+        for needle in ["CoverWeightsFetch.decide(", "CoverWeightsFetch.notice(",
+                       "CoverWeightsFetch.modeLabel(",
+                       "downloads.startPackFile(", "downloads.cancelPackFile("] {
+            XCTAssertTrue(src.contains(needle), "MusicGenView does not wire \(needle)")
+        }
+    }
+
+    /// The server's own gate must keep spelling the file the app fetches, and
+    /// must keep gating ONLY cover on it.
+    func testServerGatesOnlyCoverOnTheSameFileName() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let gen = try String(contentsOf: root.appendingPathComponent("src/gen.zig"), encoding: .utf8)
+        XCTAssertTrue(gen.contains("task == .cover and !music.fsqAvailable()"),
+                      "src/gen.zig no longer gates cover on the FSQ tokenizer")
+        let ace = try String(contentsOf: root.appendingPathComponent("src/acestep.zig"), encoding: .utf8)
+        XCTAssertTrue(ace.contains("FSQ_FILE = \"\(CoverWeightsFetch.fileName)\""),
+                      "src/acestep.zig no longer reads \(CoverWeightsFetch.fileName)")
+    }
+}

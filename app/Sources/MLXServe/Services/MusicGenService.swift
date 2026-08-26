@@ -173,7 +173,9 @@ final class MusicGenService: ObservableObject {
 
     /// Cover mode reads the FSQ tokenizer, shipped as `fsq.safetensors` beside
     /// `model.safetensors`. Packs downloaded before it exist without the file.
-    nonisolated static let coverWeightsFile = "fsq.safetensors"
+    /// `CoverWeightsFetch` owns the name — one spelling, or the app fetches a
+    /// file the server never looks for.
+    nonisolated static let coverWeightsFile = CoverWeightsFetch.fileName
     nonisolated static func coverWeightsMissing(packDir: String) -> Bool {
         !FileManager.default.fileExists(atPath: (packDir as NSString).appendingPathComponent(coverWeightsFile))
     }

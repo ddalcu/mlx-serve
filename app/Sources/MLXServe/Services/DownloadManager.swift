@@ -924,7 +924,7 @@ class DownloadManager: ObservableObject {
         // destination (it shadows the real pack and the server dies loading it).
         let packDir = existingModelDir(for: repoId)
         mediaBundleRepos.insert(repoId)
-        turboLoraFetches.insert(repoId)
+        packFileFetches.insert(repoId)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.download(repoId: repoId,
@@ -932,24 +932,35 @@ class DownloadManager: ObservableObject {
                                 alertOnFailure: true,
                                 destDirOverride: packDir)
             self.finalizeCancelledPackFile(repoId: repoId, fileName: fileName, packDir: packDir)
-            self.turboLoraFetches.remove(repoId)
+            self.packFileFetches.remove(repoId)
             self.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
     }
 
-    /// Repo ids whose `activeTasks` entry is a Turbo-adapter fetch, not a full
-    /// pack download — `cancelTurboLora` must never cancel the latter.
-    private var turboLoraFetches: Set<String> = []
+    /// Repo ids whose `activeTasks` entry is a SINGLE-FILE fetch into a pack
+    /// already on disk (the Turbo adapter, the ACE-Step cover tokenizer), not a
+    /// full pack download — `cancelPackFile` must never cancel the latter.
+    private(set) var packFileFetches: Set<String> = []
 
-    /// Stop an in-flight Turbo-adapter fetch (the toggle's off-flip). With no
-    /// adapter fetch running this does NOTHING — the generic `cancel(_:)`
-    /// no-task fallback wipes the repo's whole download dir, which here is a
-    /// live pack.
-    func cancelTurboLora(repoId: String) {
-        guard turboLoraFetches.contains(repoId) else { return }
+    /// Whether a single-file fetch is in flight for this pack. Panes render
+    /// their own progress from it; a full pack download must NOT read as one.
+    func isFetchingPackFile(repoId: String) -> Bool {
+        packFileFetches.contains(repoId)
+    }
+
+    /// Stop an in-flight single-file pack fetch. With none running this does
+    /// NOTHING — the generic `cancel(_:)` no-task fallback wipes the repo's
+    /// whole download dir, which here is a live pack.
+    func cancelPackFile(repoId: String) {
+        guard packFileFetches.contains(repoId) else { return }
         activeTasks[repoId]?.cancel()
+    }
+
+    /// Stop an in-flight Turbo-adapter fetch (the toggle's off-flip).
+    func cancelTurboLora(repoId: String) {
+        cancelPackFile(repoId: repoId)
     }
 
     /// Cancel cleanup for a single-file pack fetch: drop the ONE file's
