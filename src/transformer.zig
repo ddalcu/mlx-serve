@@ -6038,6 +6038,10 @@ pub const Transformer = struct {
     // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
     // read that replaces model.norm.
     qwen4: ?*qwen4_mod.Qwen4State = null,
+    /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
+    /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
+    /// fixture is the tighter bar for the MATH.
+    qwen4_stream_f32: bool = false,
     qwen4_mixer: ?HcWeights = null,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
@@ -10700,6 +10704,57 @@ pub const Transformer = struct {
         }
     };
 
+    /// `hcRead` that first applies a deferred write (`*pending`, consumed):
+    /// fused when the N kernel takes it, else the chain's hcWrite. `h` is
+    /// replaced by the written stream either way.
+    fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pending: *?HcPending) !HcRead {
+        if (pending.*) |*pd| {
+            defer pending.* = null;
+            defer pd.deinit();
+            if (try self.hcReadFusedFor(h.*, w, batch, seq_len, pd.*)) |o| {
+                _ = mlx.mlx_array_free(h.*);
+                h.* = o.stream;
+                return .{ .mixed = o.mixed, .inj = o.inj };
+            }
+            h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+        }
+        return self.hcRead(h.*, w, batch, seq_len);
+    }
+
+    fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
+        const hc: c_int = @intCast(self.config.hc_count);
+        const hidden: c_int = @intCast(self.config.hidden_size);
+        if (batch * seq_len != 1 or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
+        const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
+        const uqp = self.quantParamsFor(w.up_w, w.up_s);
+        if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
+        return hcReadFused(self.s, stream, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size, pend);
+    }
+
+    /// Defer `stream += out * inj` to the next read when the fused read will
+    /// take it (decode width); otherwise write now.
+    fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
+        std.debug.assert(pending.* == null);
+        if (batch * seq_len == 1 and hcFusedEnabled() and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
+            var pd: HcPending = undefined;
+            pd.out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&pd.out, out));
+            pd.inj = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&pd.inj, inj));
+            pending.* = pd;
+            return;
+        }
+        h.* = try self.hcWrite(h.*, out, inj, batch, seq_len);
+    }
+
+    fn hcFlush(self: *Transformer, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
+        if (pending.*) |*pd| {
+            defer pending.* = null;
+            defer pd.deinit();
+            h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+        }
+    }
+
     /// Grouped RMS norm over the last `hidden` of each of the `hc` streams:
     /// `x [B,S,hc*hidden]` → `[B,S,hc,hidden]`, weight `[hc,hidden]` (already
     /// carrying the reference's +1). Caller frees.
@@ -10723,15 +10778,7 @@ pub const Transformer = struct {
     fn hcRead(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int) !HcRead {
         const hc: c_int = @intCast(self.config.hc_count);
         const hidden: c_int = @intCast(self.config.hidden_size);
-        if (batch * seq_len == 1 and w.down_s.ctx != null and w.up_s.ctx != null and (w.inject_w.ctx == null or w.inject_flat.ctx != null)) {
-            const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
-            const uqp = self.quantParamsFor(w.up_w, w.up_s);
-            if (dqp.bits == uqp.bits and dqp.group_size == uqp.group_size and dqp.mode == .affine and uqp.mode == .affine) {
-                if (try hcReadFused(self.s, stream, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size)) |o| {
-                    return .{ .mixed = o.mixed, .inj = o.inj };
-                }
-            }
-        }
+        if (try self.hcReadFusedFor(stream, w, batch, seq_len, null)) |o| return .{ .mixed = o.mixed, .inj = o.inj };
         const n4 = try self.hcGroupNorm(stream, w.norm_w, batch, seq_len);
         defer _ = mlx.mlx_array_free(n4);
         const flat_shape = [_]c_int{ batch, seq_len, hc * hidden };
@@ -11606,6 +11653,14 @@ pub const Transformer = struct {
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
+        // Text-only arch: the splice is a no-op, kept where every arm has it.
+        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
+        if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+            var h32 = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h32;
+        }
         var dt = mlx.DtypeTrace.begin("qwen4", h, switch (ml[0].attn) {
             .full => |f| f.q_w,
             .linear => |la| la.qkv_w,
@@ -11622,6 +11677,8 @@ pub const Transformer = struct {
         );
 
         var prof = try Qwen4FwdProf.init(seq_len, h);
+        var pending: ?HcPending = null;
+        defer if (pending) |*pd| pd.deinit();
 
         for (0..layerCap(cfg.num_hidden_layers)) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
@@ -11629,6 +11686,7 @@ pub const Transformer = struct {
             const entry = &entries[layer_idx];
 
             if (lw.ple) |*pw| {
+                try self.hcFlush(&h, batch, seq_len, &pending);
                 const add = try self.pleForward(h, token_ids, pw, entry, batch, seq_len);
                 defer _ = mlx.mlx_array_free(add);
                 var h_ple = mlx.mlx_array_new();
@@ -11638,7 +11696,7 @@ pub const Transformer = struct {
                 try prof.lap(h, .ple);
             }
 
-            var pre = try self.hcRead(h, &lw.hc_attn.?, batch, seq_len);
+            var pre = try self.hcReadPending(&h, &lw.hc_attn.?, batch, seq_len, &pending);
             defer pre.deinit();
             try prof.lap(pre.mixed, .hc_read);
             const attn_out = switch (lw.attn) {
@@ -11653,10 +11711,11 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_attn, pre.inj);
                 Qwen4Trace.set(&tr.attn_out, attn_out);
             };
-            h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len);
+            try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, &pending);
+            if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
 
-            var pre2 = try self.hcRead(h, &lw.hc_mlp.?, batch, seq_len);
+            var pre2 = try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
             defer pre2.deinit();
             try prof.lap(pre2.mixed, .hc_read);
             const mlp_out = switch (lw.mlp) {
@@ -11670,13 +11729,17 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
                 Qwen4Trace.set(&tr.mlp_out, mlp_out);
             };
-            h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
+            try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, &pending);
+            if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
 
             if (ctx.capture_layers) |cl| {
                 for (cl.ids, cl.out) |cid, *slot| {
-                    if (cid == li) _ = mlx.mlx_array_set(slot, h);
+                    if (cid == li) {
+                        try self.hcFlush(&h, batch, seq_len, &pending);
+                        _ = mlx.mlx_array_set(slot, h);
+                    }
                 }
             }
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % eval_cadence == 0) {
@@ -11685,6 +11748,7 @@ pub const Transformer = struct {
             dt.layer(h, layer_idx);
         }
 
+        if (ctx.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) try self.hcFlush(&h, batch, seq_len, &pending);
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);
         prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
@@ -11704,7 +11768,7 @@ pub const Transformer = struct {
         }
         if (ctx.capture_hidden_all) |target_all| _ = mlx.mlx_array_set(target_all, h);
 
-        const mix = try self.hcRead(h, &self.qwen4_mixer.?, batch, seq_len);
+        const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
         _ = mlx.mlx_array_free(h);
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
         const final = mix.mixed;
@@ -19689,6 +19753,8 @@ var decode_prof_enabled: ?bool = null;
 /// Forward-pass diagnostics for qwen4_exp. QWEN4_PROFILE_FWD=1 (S 2..16) or
 /// =all: per-block GPU ms with a sync per block, never on by default;
 /// QWEN4_OPCOUNT=1: FFI op attribution per block, no syncs.
+var qwen4_stream_f32_env: ?bool = null;
+
 const Qwen4FwdProf = struct {
     const Block = enum(u8) { ple, hc_read, gdn, attn, hc_write, mlp };
     timing: bool,
@@ -22134,7 +22200,18 @@ const HC_FUSED_N_SOURCE =
     \\const int base = int(h) * H;
     \\const int PER = H / 256;
     \\float xv[PER];
-    \\for (int i = 0; i < PER; ++i) xv[i] = float(x[base + int(tid) + 256 * i]);
+    \\if (WR) {
+    \\  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings.
+    \\  float g = float(wi[h]);
+    \\  for (int i = 0; i < PER; ++i) {
+    \\    int k = base + int(tid) + 256 * i;
+    \\    T v = T(float(x[k]) + float(T(float(wo[k - base]) * g)));
+    \\    xs[k] = v;
+    \\    xv[i] = float(v);
+    \\  }
+    \\} else {
+    \\  for (int i = 0; i < PER; ++i) xv[i] = float(x[base + int(tid) + 256 * i]);
+    \\}
     \\float a = 0.0f;
     \\for (int i = 0; i < PER; ++i) a += xv[i] * xv[i];
     \\a = simd_sum(a);
@@ -22259,7 +22336,7 @@ const HC_FUSED_U_SOURCE =
     \\if (lane == 0) mixed[j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
 ;
 
-const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
 var hc_fused_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
 var hc_fused_cfgs: [3]?mlx.mlx_fast_metal_kernel_config = .{ null, null, null };
 var hc_fused_key: HcFusedKey = std.mem.zeroes(HcFusedKey);
@@ -22280,8 +22357,8 @@ fn hcFusedEnabled() bool {
 
 fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     if (hc_fused_kernels[which]) |k| return k;
-    const n_inputs = [_][*:0]const u8{ "x", "nw", "iw", "eps" };
-    const n_outputs = [_][*:0]const u8{ "xn", "ipart" };
+    const n_inputs = [_][*:0]const u8{ "x", "nw", "iw", "eps", "wo", "wi" };
+    const n_outputs = [_][*:0]const u8{ "xn", "ipart", "xs" };
     const d_inputs = [_][*:0]const u8{ "xn", "dw_q", "dw_s", "dw_b", "ipart" };
     const d_outputs = [_][*:0]const u8{ "act", "inj" };
     const u_inputs = [_][*:0]const u8{ "xn", "act", "uw_q", "uw_s", "uw_b" };
@@ -22322,12 +22399,25 @@ fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array };
+pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
+
+/// A deferred `hcWrite`: the next read's N kernel applies `stream + out*inj`
+/// itself (one dispatch fewer per block). Handles are retained copies.
+pub const HcPending = struct {
+    out: mlx.mlx_array, // [1,1,hidden]
+    inj: mlx.mlx_array, // [1,1,hc,1]
+    fn deinit(self: *HcPending) void {
+        _ = mlx.mlx_array_free(self.out);
+        _ = mlx.mlx_array_free(self.inj);
+    }
+};
 
 /// Fused decode-width hyper-connection read. `x` holds exactly `hc*hidden`
 /// elements; `iw` is the row-major dense `[hc*hidden, hc]` inject weight or
-/// null-ctx (mixer). Returns `mixed [1,1,hidden]` + `inj [1,1,hc,1]`, or null
-/// when the geometry/quant is outside the kernel (caller keeps the chain).
+/// null-ctx (mixer). With `pend`, the read first applies that pending write
+/// and returns the written stream in `.stream` (null-ctx otherwise). Returns
+/// `mixed [1,1,hidden]` + `inj [1,1,hc,1]`, or null when the geometry/quant is
+/// outside the kernel (caller keeps the chain).
 pub fn hcReadFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -22344,6 +22434,7 @@ pub fn hcReadFused(
     hidden: c_int,
     bits: u32,
     group_size: u32,
+    pend: ?HcPending,
 ) !?HcFusedOut {
     if (!hcFusedEnabled()) return null;
     if (!mlx.streamIsGpu(s)) return null;
@@ -22368,13 +22459,18 @@ pub fn hcReadFused(
     // N: 256 threads per stream; D: 8 simdgroups × 32 lanes split each row's words.
     if (@rem(hidden, 256) != 0 or @rem(dsh[1], 256) != 0 or @rem(R, vpw) != 0) return null;
     const inj: c_int = @intFromBool(iw.ctx != null);
+    const wr: c_int = @intFromBool(pend != null);
+    if (pend) |pd| {
+        if (mlx.mlx_array_dtype(pd.out) != xd or mlx.mlx_array_dtype(pd.inj) != xd) return null;
+        if (mlx.mlx_array_size(pd.out) != @as(usize, @intCast(hidden)) or mlx.mlx_array_size(pd.inj) != @as(usize, @intCast(hc))) return null;
+    }
     if (inj == 1) {
         if (mlx.mlx_array_dtype(iw) != xd) return null;
         const ish = mlx.getShape(iw);
         if (ish.len != 2 or ish[0] != K or ish[1] != hc) return null;
     }
 
-    const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = group_size, .dtype = xd };
     if (hc_fused_cfgs[0] == null or !std.meta.eql(hc_fused_key, key)) {
         for (&hc_fused_cfgs) |*c| if (c.*) |cfg| {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -22386,12 +22482,15 @@ pub fn hcReadFused(
         const hchc_shape = [_]c_int{hc * hc};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cn, &k_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cn, &hchc_shape, 1, .float32));
+        const xs_shape = [_]c_int{if (wr == 1) K else 1};
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cn, &xs_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cn, 256 * hc, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cn, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cn, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "HC", hc));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "INJ", inj));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "WR", wr));
         hc_fused_cfgs[0] = cn;
         const cd = mlx.mlx_fast_metal_kernel_config_new();
         const act_shape = [_]c_int{R};
@@ -22443,12 +22542,28 @@ pub fn hcReadFused(
         }
     }.f;
 
-    var n_out: [2]mlx.mlx_array = undefined;
-    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.? }, 2, &n_out);
+    var n_out: [3]mlx.mlx_array = undefined;
+    const wo = if (pend) |pd| pd.out else nw;
+    const wi = if (pend) |pd| pd.inj else nw;
+    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
     const xn = n_out[0];
     defer _ = mlx.mlx_array_free(xn);
     const ipart = n_out[1];
     defer _ = mlx.mlx_array_free(ipart);
+    var stream_out = n_out[2];
+    if (wr == 0) {
+        _ = mlx.mlx_array_free(stream_out);
+        stream_out = .{ .ctx = null };
+    } else {
+        const xsh = mlx.getShape(x);
+        var shaped = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&shaped, stream_out, xsh.ptr, @intCast(xsh.len), s));
+        _ = mlx.mlx_array_free(stream_out);
+        stream_out = shaped;
+    }
+    errdefer if (stream_out.ctx != null) {
+        _ = mlx.mlx_array_free(stream_out);
+    };
     var d_out: [2]mlx.mlx_array = undefined;
     try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
     const act = d_out[0];
@@ -22474,7 +22589,7 @@ pub fn hcReadFused(
         hc_fused_engaged = true;
         log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_FUSED=0 restores the chain)\n", .{ hc, hidden, R, bits, group_size });
     }
-    return .{ .mixed = mixed, .inj = inj_out };
+    return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
 }
 
 const GateUpCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
@@ -26420,7 +26535,7 @@ test "fused hyper-connection read matches the op chain per element" {
     defer _ = mlx.mlx_array_free(ref_inj);
     try mlx.check(mlx.mlx_multiply(&ref_inj, isig, two, s));
 
-    const got = (try hcReadFused(s, x, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs)) orelse return error.HcFusedDeclined;
+    const got = (try hcReadFused(s, x, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
     defer {
         _ = mlx.mlx_array_free(got.mixed);
         _ = mlx.mlx_array_free(got.inj);
@@ -26461,6 +26576,41 @@ test "fused hyper-connection read matches the op chain per element" {
     }.f;
     try checkClose(allocator, s, ref_mixed, got.mixed, @intCast(H));
     try checkClose(allocator, s, ref_inj, got.inj, @intCast(HC));
+
+    // Pending-write arm: the read applies `x + out*inj` first and hands the
+    // written stream back; feeding that stream to the plain read must agree.
+    const wo = try bf16Random(allocator, rnd, s, &.{ 1, 1, H }, 2.0, 0.0);
+    defer _ = mlx.mlx_array_free(wo);
+    const wi = try bf16Random(allocator, rnd, s, &.{ 1, 1, HC, 1 }, 1.0, 1.0);
+    defer _ = mlx.mlx_array_free(wi);
+    var out4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out4);
+    const o4 = [_]c_int{ 1, 1, 1, H };
+    try mlx.check(mlx.mlx_reshape(&out4, wo, &o4, 4, s));
+    var prod4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prod4);
+    try mlx.check(mlx.mlx_multiply(&prod4, out4, wi, s));
+    var sum4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum4);
+    try mlx.check(mlx.mlx_add(&sum4, x4, prod4, s));
+    var ref_stream = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_stream);
+    try mlx.check(mlx.mlx_reshape(&ref_stream, sum4, &flat_shape, 3, s));
+    const plain = (try hcReadFused(s, ref_stream, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
+    defer {
+        _ = mlx.mlx_array_free(plain.mixed);
+        _ = mlx.mlx_array_free(plain.inj);
+    }
+    const pend = (try hcReadFused(s, x, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo, .inj = wi })) orelse return error.HcFusedDeclined;
+    defer {
+        _ = mlx.mlx_array_free(pend.mixed);
+        _ = mlx.mlx_array_free(pend.inj);
+        _ = mlx.mlx_array_free(pend.stream);
+    }
+    try testing.expect(pend.stream.ctx != null);
+    try checkClose(allocator, s, ref_stream, pend.stream, @intCast(K));
+    try checkClose(allocator, s, plain.mixed, pend.mixed, @intCast(H));
+    try checkClose(allocator, s, plain.inj, pend.inj, @intCast(HC));
 }
 
 test "fused gate+up+SwiGLU expert kernel is bit-identical to the split gatherQmv path" {
@@ -35046,6 +35196,72 @@ test "sdpa force_fused: hd-256 causal blocks the gate admits match the unforced 
 
 // ── qwen4_exp fixture parity (env-gated: QWEN4_TEST_MODEL + QWEN4_FIXTURE) ──
 
+test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE_BF16)" {
+    // `tests/dump_qwen4_exp_fixtures.py` with QWEN4_REF_DTYPE=bf16. The shipped
+    // checkpoint runs bf16 residual streams; against the f32 fixture that path
+    // reads 0.905 at the logits (bf16 rounding compounds through the tiny
+    // random model), against a bf16 reference the streams agree to 0.9998.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("QWEN4_FIXTURE_BF16") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    const ids_shape = mlx.getShape(ids_arr);
+    const T: usize = @intCast(ids_shape[ids_shape.len - 1]);
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    const tshape = [_]c_int{ 1, @intCast(T) };
+    try mlx.check(mlx.mlx_reshape(&ids, ids_arr, &tshape, 2, s));
+
+    var ctx = xfm.defaultCtx();
+    const n_layers: usize = config.num_hidden_layers;
+    const cap_ids = try allocator.alloc(u32, n_layers);
+    defer allocator.free(cap_ids);
+    const cap_out = try allocator.alloc(mlx.mlx_array, n_layers);
+    defer allocator.free(cap_out);
+    for (0..n_layers) |i| {
+        cap_ids[i] = @intCast(i);
+        cap_out[i] = mlx.mlx_array_new();
+    }
+    defer for (cap_out) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    var cap_layers: CaptureLayers = .{ .ids = cap_ids, .out = cap_out };
+    ctx.capture_layers = &cap_layers;
+    const logits = try xfm.forwardWith(&ctx, ids);
+    defer _ = mlx.mlx_array_free(logits);
+    var checked: usize = 0;
+    for (1..n_layers) |i| {
+        var nb: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&nb, "stream_{d}", .{i}) catch unreachable;
+        const ref = fx.get(key) orelse continue;
+        const ref_h = try qwen4ReadF32(allocator, ref, s);
+        defer allocator.free(ref_h);
+        const our_h = try qwen4ReadF32(allocator, cap_out[i - 1], s);
+        defer allocator.free(our_h);
+        if (our_h.len != ref_h.len) continue;
+        const rc = qwen4CompareRows(our_h, ref_h, T, ref_h.len / T);
+        std.debug.print("[qwen4 fixture bf16] after layer {d}: min row cos {d:.5}\n", .{ i - 1, rc.min_cos });
+        try testing.expect(rc.min_cos > 0.999);
+        checked += 1;
+    }
+    try testing.expect(checked >= n_layers - 2);
+}
+
 fn qwen4ReadF32(alloc: std.mem.Allocator, arr: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
@@ -35101,6 +35317,11 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
+    // The fixture renders the reference in f32; run our streams in f32 too so
+    // the bar measures the math. The shipped bf16 path is pinned by the
+    // `qwen4 fixture bf16` test below (streams vs a bf16 reference) — a tiny
+    // random model's final logits are chaotic between any two bf16 renderings.
+    xfm.qwen4_stream_f32 = true;
     xfm.compileQwen4Hc(); // the served path: fused hyper-connection tails
     xfm.compileGdnGate();
     xfm.compileMoeRouting();

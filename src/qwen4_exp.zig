@@ -135,6 +135,10 @@ pub const NgramTable = struct {
     b_off: usize,
     wcols: u32,
     scols: u32,
+    /// Kept open for the pool's `pread` gather (page faults on one mapping
+    /// serialize on the VM map lock; preads run in parallel).
+    fd: std.c.fd_t = -1,
+    pool: ?*PrefetchPool = null,
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -143,7 +147,7 @@ pub const NgramTable = struct {
         pbuf[path.len] = 0;
         const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
-        defer _ = std.c.close(fd);
+        errdefer _ = std.c.close(fd);
         var st: std.c.Stat = undefined;
         if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
         const size: usize = @intCast(st.size);
@@ -152,7 +156,10 @@ pub const NgramTable = struct {
         if (size < 8) return error.NgramTableTruncated;
         const hlen: usize = @intCast(std.mem.readInt(u64, map[0..8], .little));
         if (8 + hlen > size) return error.NgramTableTruncated;
-        return parse(map, map[8 .. 8 + hlen], 8 + hlen);
+        var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
+        t.fd = fd;
+        if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
+        return t;
     }
 
     fn parse(map: []align(std.heap.page_size_min) const u8, header: []const u8, data_off: usize) !NgramTable {
@@ -189,6 +196,10 @@ pub const NgramTable = struct {
     }
 
     pub fn close(self: *NgramTable) void {
+        if (self.pool) |p| p.destroy();
+        self.pool = null;
+        if (self.fd >= 0) _ = std.c.close(self.fd);
+        self.fd = -1;
         std.posix.munmap(self.map);
     }
 
@@ -199,6 +210,10 @@ pub const NgramTable = struct {
         const words = self.map[self.w_off + r * self.wcols * 4 ..][0 .. self.wcols * 4];
         const scales = self.map[self.s_off + r * self.scols * 2 ..][0 .. self.scols * 2];
         const biases = self.map[self.b_off + r * self.scols * 2 ..][0 .. self.scols * 2];
+        self.dequantRow(words, scales, biases, out);
+    }
+
+    fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
         const per_word: u32 = 32 / self.bits;
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         var i: u32 = 0;
@@ -215,36 +230,128 @@ pub const NgramTable = struct {
     /// Gather + concatenate the `n_heads` rows of each token: `out` is
     /// `[ids.len / n_heads][n_heads * dim]` row-major.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32) void {
-        if (plePrefetchEnabled()) self.prefetch(row_ids);
+        const need: usize = self.wcols * 4 + self.scols * 4;
+        // Decode/verify widths only: a 4096-row prefill chunk is 65k rows,
+        // mostly page-cache hits, and 1024 wake rounds cost more than they save.
+        if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and row_ids.len <= PrefetchPool.MAX_ROWS) {
+            const wl: usize = self.wcols * 4;
+            const sl: usize = self.scols * 2;
+            var start: usize = 0;
+            while (start < row_ids.len) : (start += PrefetchPool.MAX_ROWS) {
+                const end = @min(start + PrefetchPool.MAX_ROWS, row_ids.len);
+                if (!p.run(self, row_ids[start..end])) break;
+                for (start..end) |i| {
+                    const b = &p.bufs[i - start];
+                    self.dequantRow(b[0..wl], b[wl .. wl + sl], b[wl + sl .. wl + 2 * sl], out[i * self.dim ..][0..self.dim]);
+                }
+            }
+            if (start >= row_ids.len) return;
+        };
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
     }
 
-    /// Fault every row's three regions in parallel before the serial reads:
-    /// the table is a cold 32 GB mmap and each region is one SSD fault
-    /// (~100 us), 48 per token — serial that was ~5 ms of every decode step.
-    fn prefetch(self: *const NgramTable, row_ids: []const i64) void {
-        var threads: [MAX_PREFETCH_THREADS]?std.Thread = @splat(null);
-        const n = @min(row_ids.len, MAX_PREFETCH_THREADS);
-        for (0..n) |t| {
-            threads[t] = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, touchRows, .{ self, row_ids, t, n }) catch null;
-        }
-        for (threads[0..n]) |th| if (th) |h| h.join();
+    /// One (row, region) pread into the pool's row buffer. False on a short read.
+    fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * 2;
+        const off: usize, const dst: []u8 = switch (region) {
+            0 => .{ self.w_off + r * wl, buf[0..wl] },
+            1 => .{ self.s_off + r * sl, buf[wl .. wl + sl] },
+            else => .{ self.b_off + r * sl, buf[wl + sl .. wl + 2 * sl] },
+        };
+        return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 
-    fn touchRows(self: *const NgramTable, row_ids: []const i64, first: usize, stride: usize) void {
-        var acc: u8 = 0;
-        var i = first;
-        while (i < row_ids.len) : (i += stride) {
-            const r: u64 = @intCast(row_ids[i]);
-            acc +%= self.map[self.w_off + r * self.wcols * 4];
-            acc +%= self.map[self.s_off + r * self.scols * 2];
-            acc +%= self.map[self.b_off + r * self.scols * 2];
-        }
-        std.mem.doNotOptimizeAway(acc);
-    }
 };
 
-const MAX_PREFETCH_THREADS = 32;
+/// Persistent gather workers. Every row's three regions are one SSD read on
+/// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
+/// of every decode step, 16 fault threads ~0.7 ms, and more threads got SLOWER
+/// (faults on one mapping serialize on the VM map lock), so workers `pread`
+/// instead and dequantize their rows in place. Workers wake on a generation
+/// bump and count themselves down; the caller spins (the job is ~100 us).
+const PrefetchPool = struct {
+    const N = 48;
+    const MAX_ROWS = 64;
+    const ROW_BUF = 512;
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    gen: u64 = 0,
+    quit: bool = false,
+    table: ?*const NgramTable = null,
+    rows: []const i64 = &.{},
+    bufs: [MAX_ROWS][ROW_BUF]u8 = undefined,
+    pending: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(u32) = .init(0),
+    threads: [N]std.Thread = undefined,
+
+    fn create() !*PrefetchPool {
+        const a = std.heap.page_allocator;
+        const p = try a.create(PrefetchPool);
+        p.* = .{};
+        var started: usize = 0;
+        errdefer {
+            p.shutdown(started);
+            a.destroy(p);
+        }
+        for (0..N) |i| {
+            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{ p, i });
+            started += 1;
+        }
+        return p;
+    }
+
+    fn destroy(self: *PrefetchPool) void {
+        self.shutdown(N);
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn shutdown(self: *PrefetchPool, started: usize) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        self.quit = true;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+        for (self.threads[0..started]) |t| t.join();
+    }
+
+    /// Fan the `3 * rows.len` preads over the workers; rows land in `bufs`.
+    fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        self.table = table;
+        self.rows = rows;
+        self.failed.store(0, .release);
+        self.pending.store(N, .release);
+        self.gen += 1;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        return self.failed.load(.acquire) == 0;
+    }
+
+    fn worker(self: *PrefetchPool, idx: usize) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seen: u64 = 0;
+        while (true) {
+            self.mu.lockUncancelable(io);
+            while (self.gen == seen and !self.quit) self.cv.wait(io, &self.mu) catch {};
+            if (self.quit) {
+                self.mu.unlock(io);
+                return;
+            }
+            seen = self.gen;
+            const table = self.table.?;
+            const rows = self.rows;
+            self.mu.unlock(io);
+            var i = idx;
+            while (i < rows.len * 3) : (i += N) {
+                if (!table.preadSite(@intCast(rows[i / 3]), i % 3, &self.bufs[i / 3])) _ = self.failed.fetchAdd(1, .acq_rel);
+            }
+            _ = self.pending.fetchSub(1, .acq_rel);
+        }
+    }
+};
 
 fn plePrefetchEnabled() bool {
     const S = struct {

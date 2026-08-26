@@ -4087,3 +4087,28 @@ Session totals (same box, same prompts): short answer 41.9 → 57.4 tok/s,
 round cost (`MLX_SERVE_MTP_TRACE=1`, 120 ms/round at depth 1) is the S>1 MoE
 `_gather_sort` path: 1.46 ms/layer at S=2 vs 0.27 at S=1 — parked, serial
 first.
+
+### Addendum, same day: the deferred write, the pread pool, and the oracle's dtype
+
+- `hcWrite` is now deferred into the next read's N kernel (`HcPending`): the
+  stream update `x + out*inj` is computed where the stream is read anyway,
+  two compiled dispatches fewer per layer. 16.82 → 16.55 ms/forward; flushed
+  before PLE, capture_layers, the capture sites and under the profiler.
+- The n-gram gather: 16 spawned fault threads 0.7 ms, a parked 16-thread pool
+  0.85 (wake latency), 48 fault threads 1.0–1.4 ms — page faults on one
+  mapping serialize on the VM map lock. 48 parked workers doing one `pread`
+  each: 0.45 ms. Gated to decode widths (≤ 64 rows): a 4096-row prefill
+  chunk is 65k rows, mostly page-cache hits, and the 1024 wake rounds
+  measured −4% prefill.
+- The oracle was rendered in f32 (`.float()`), and the head+trunk only
+  matched at 0.99998 because the residual was accidentally f32 too. At bf16
+  the tiny random model's logits read 0.905 against the f32 reference and
+  0.89 against a bf16 torch reference — chaotic between any two bf16
+  renderings — while the residual streams agree with bf16 torch at 0.9998
+  through every layer. So the f32 fixture stays the MATH oracle with
+  `qwen4_stream_f32` set for that test, and `qwen4 fixture bf16` pins the
+  shipped dtype on the streams. The committed HEAD had this row failing;
+  it had been reported green from a run before the last scalar fix.
+- Where the remaining 14 ms go (sync'd profile minus floor): GDN ≈ 8 ms
+  (36 layers, ~220 us, ~11 dispatches each), MoE ≈ 6 ms (~130 us), attention
+  ≈ 1.2 ms. Weight bandwidth is ~7 ms of it.

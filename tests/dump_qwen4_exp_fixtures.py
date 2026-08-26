@@ -21,6 +21,7 @@ Two phases, run from the torch venv (transformers main carries the arch):
 """
 
 import argparse
+import os
 import json
 import os
 import sys
@@ -28,6 +29,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+# QWEN4_REF_DTYPE=bf16 renders the reference in the shipped dtype (bf16 residual
+# streams); f32 is the tighter oracle for the math but not what the checkpoint runs.
+REF_DTYPE = torch.bfloat16 if os.environ.get("QWEN4_REF_DTYPE", "f32") == "bf16" else torch.float32
 from safetensors.numpy import save_file
 from safetensors.torch import save_file as save_torch
 
@@ -97,7 +102,7 @@ def make_model():
     cfg = Qwen4ExpTextConfig(**TINY)
     cfg._attn_implementation = "eager"
     torch.manual_seed(7)
-    m = Qwen4ExpForCausalLM(cfg).float().eval()
+    m = Qwen4ExpForCausalLM(cfg).float().eval()  # built f32 for the random init; cast after loading
     with torch.no_grad():
         for n, p in m.named_parameters():
             if p.dim() >= 2:
@@ -260,7 +265,7 @@ def dump(hf, pack, out):
                 assert sd[k].shape == ng.shape, (sd[k].shape, ng.shape)
                 sd[k].copy_(ng)
     m.load_state_dict(sd)
-    m.eval()
+    m.to(REF_DTYPE).eval()
 
     torch.manual_seed(3)
     T = T_PREFILL + T_DECODE
@@ -338,7 +343,7 @@ def mtp_reference(m, ten, ids, T):
     c9.num_hidden_layers = 9
     c9.layer_types = list(cfg.layer_types) + ["qwen_sparse_attention"]
     layer = Qwen4ExpTextDecoderLayer(c9, 8).float().eval()
-    mixer = Qwen4ExpTextGatedResidual(c9, use_combine=False).float().eval()
+    mixer = Qwen4ExpTextGatedResidual(c9, use_combine=False).float().eval()  # cast to REF_DTYPE after loading
     H, hc = cfg.hidden_size, cfg.hc_count
     norm_e = Qwen4ExpTextRMSNorm(H, eps=cfg.rms_norm_eps)
     norm_h = Qwen4ExpTextRMSNorm(H * hc, eps=cfg.rms_norm_eps)
@@ -369,6 +374,8 @@ def mtp_reference(m, ten, ids, T):
         norm_h.weight.copy_(get("pre_fc_norm_hidden.weight"))
         fc_e.weight.copy_(get("fc_embedding.weight"))
         fc_h.weight.copy_(get("fc_hidden.weight"))
+        for mod in (layer, mixer, norm_e, norm_h, fc_e, fc_h):
+            mod.to(REF_DTYPE)
         cap = {}
         hk = m.model.hyper_connection_mixer.register_forward_hook(lambda mod, inp, out: cap.__setitem__("pre", inp[0]))
         m(input_ids=ids, use_cache=False)
@@ -380,7 +387,7 @@ def mtp_reference(m, ten, ids, T):
         x = (hh + e.unsqueeze(-2)).flatten(-2)
         pos = torch.arange(1, T, dtype=torch.long)[None]
         pe = m.model.rotary_emb(x, pos[None].expand(3, 1, -1))
-        mask = torch.full((T - 1, T - 1), torch.finfo(torch.float32).min).triu(1)[None, None]
+        mask = torch.full((T - 1, T - 1), torch.finfo(REF_DTYPE).min, dtype=REF_DTYPE).triu(1)[None, None]
         out = layer(x, position_embeddings=pe, attention_mask=mask, conv_mask=None, past_key_values=None)
         logits = m.lm_head(mixer(out))
     return logits[0].float().numpy().astype(np.float32)
