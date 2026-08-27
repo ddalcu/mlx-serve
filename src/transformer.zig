@@ -33447,6 +33447,11 @@ test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, c
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
+    // The causal arm yields to the stock fused kernel on NAX silicon, so on an
+    // M5-class Mac this parity check would DECLINE instead of running — the
+    // kernel under test would never be exercised. Pin the arm, not the host.
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x256256);
     const rnd = prng.random();
 
@@ -33656,16 +33661,16 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     try std.testing.expect((try fusedSdpa256Prefill(s, q, q, q, 1.0, 0)) == null);
 }
 
-test "fusedSdpa256Prefill: causal and band both default FUSED (budgeted-dispatch flip)" {
+test "fusedSdpa256Prefill: both arms FUSED off NAX, causal yields to stock ON NAX" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4A7E);
     const rnd = prng.random();
 
-    // No override, no env: BOTH arms engage. The causal arm's historical
-    // net-loss (every pre-budget ratio-gated variant lost same-boot on the
-    // 27B) was the IOGPU preemption class — with the kv-chunk dispatch
-    // budget it wins live (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6%
-    // at 8K/16K/32K on the 27B), so causal is default-on now.
+    // No master-switch override: the causal arm's historical net-loss (every
+    // pre-budget ratio-gated variant lost same-boot on the 27B) was the IOGPU
+    // preemption class — with the kv-chunk dispatch budget it wins live
+    // (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
+    // 27B), so causal is default-on now.
     // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal.
     std.debug.assert(fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
@@ -33675,9 +33680,27 @@ test "fusedSdpa256Prefill: causal and band both default FUSED (budgeted-dispatch
     const k = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(k);
 
-    const causal = try fusedSdpa256Prefill(s, q, k, k, 1.0, 0);
-    try std.testing.expect(causal != null);
-    if (causal) |f| _ = mlx.mlx_array_free(f);
+    // Off NAX both arms engage — the budgeted-dispatch flip this test was
+    // written for. The preference is PINNED rather than read off the host:
+    // `naxSdpaPreferred()` defaults to whether the machine has NAX, so leaving
+    // it to the silicon makes this assertion true on an M4 and false on an M5.
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
+    {
+        const causal = try fusedSdpa256Prefill(s, q, k, k, 1.0, 0);
+        try std.testing.expect(causal != null);
+        if (causal) |f| _ = mlx.mlx_array_free(f);
+    }
+
+    // On NAX the causal arm yields to the stock fused sdpa (mlx's own hd-256
+    // kernel) while the BAND arm stays ours — mlx's NAX kernel takes no band.
+    // Nothing pinned that asymmetry before; a decline is invisible from the
+    // outside, since the composed fallback is output-equivalent.
+    nax_sdpa_override = true;
+    {
+        const causal = try fusedSdpa256Prefill(s, q, k, k, 1.0, 0);
+        try std.testing.expect(causal == null);
+    }
 
     const banded = try fusedSdpa256Prefill(s, q, k, k, 1.0, 40);
     try std.testing.expect(banded != null);
@@ -33702,6 +33725,9 @@ test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single d
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
+    // Causal arm: declines on NAX silicon unless the preference is pinned.
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0xC4A2);
     const rnd = prng.random();
 
@@ -33802,6 +33828,9 @@ test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
+    // Causal arm: declines on NAX silicon unless the preference is pinned.
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x27B27B);
     const rnd = prng.random();
 
