@@ -13,8 +13,10 @@ import SwiftUI
 
 /// Industry-standard tier names. Each model defines its own concrete step
 /// count per tier, so a "Fast" on FLUX.2-klein doesn't mean the same as "Fast"
-/// on FLUX.2-dev. There is no CFG here: no image backend reads a guidance
-/// field, so carrying one only invited the UI to show a knob that does nothing.
+/// on FLUX.2-dev. CFG (`guidance_scale`/negative prompt) is a real knob only
+/// on the undistilled "base" klein checkpoint (`ImageModelPreset.supportsGuidance`)
+/// — the distilled presets have guidance baked into the weights, so the field
+/// stays hidden there rather than showing a control that does nothing.
 enum QualityPreset: String, CaseIterable, Identifiable, Codable {
     case fast = "Fast"
     case good = "Good"
@@ -131,6 +133,9 @@ enum CustomResolution: Equatable {
 enum FluxVariant: String, Hashable, Codable {
     case flux2Klein4B     // FLUX.2-klein 4B params — uses Flux2Klein, ModelConfig.flux2_klein_4b()
     case flux2Klein9B     // FLUX.2-klein 9B params — uses Flux2Klein, ModelConfig.flux2_klein_9b()
+    case flux2Klein9BBase // FLUX.2-klein-base 9B — same DiT geometry as flux2Klein9B, UNDISTILLED:
+                          // real CFG (guidance_scale + negative prompt) over 30-50 steps instead
+                          // of the 4-step guidance-baked-in distilled schedule.
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
@@ -235,6 +240,39 @@ struct ImageModelPreset: Identifiable, Hashable {
         ],
         defaultQuality: .good,
         description: "The bigger FLUX.2-klein — stronger prompt following and detail than the 4B, with the same fast schedule and the same instruction editing. Twice the download and memory."
+    )
+
+    /// FLUX.2-klein-base 9B 4-bit — the UNDISTILLED checkpoint distillation
+    /// started from. Same DiT geometry as `flux2Klein9B_Q4` (the engine reads
+    /// it off the checkpoint), so it shares that preset's resolution grid and
+    /// editing capability; the whole difference is the training regime: no
+    /// guidance baked into the weights, so it needs real classifier-free
+    /// guidance (`supportsGuidance`) and many more steps — 30-50 rather than
+    /// klein's 4-step schedule — but rewards it with more creative,
+    /// prompt-varied output than the distilled model's narrower distribution.
+    ///
+    /// No official MLX conversion exists yet; `AITRADER/FLUX2-klein-base-9B-mlx-4bit`
+    /// is the only one published (an mflux repack of
+    /// `black-forest-labs/FLUX.2-klein-base-9B`), same configless weight-subdir
+    /// layout as the distilled 9B.
+    static let flux2Klein9BBase_Q4 = ImageModelPreset(
+        id: "mflux/flux2-klein-9b-base-q4",
+        name: "FLUX.2-klein 9B Base 4-bit (~10 GB)",
+        variant: .flux2Klein9BBase,
+        configName: "flux2_klein_9b",
+        repo: "AITRADER/FLUX2-klein-base-9B-mlx-4bit",
+        approxDownloadGB: 10,
+        approxRAMGB: 16,
+        resolutions: fluxResolutions,
+        defaultResolution: fluxResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 30),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "The undistilled FLUX.2-klein 9B — more creative and varied than the fast distilled model, at the cost of many more steps (30+) and real guidance/negative-prompt control."
     )
 
     // Krea-2-Turbo accepts any multiple of 16 in [256, 2048]; offer a few
@@ -407,6 +445,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
+        .flux2Klein9BBase_Q4,                          // 10
         .krea2Turbo,                                   // 15
     ]
 }
@@ -1780,6 +1819,12 @@ struct ImageGenRequest {
     /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
     /// Empty = none. Rows with an empty `path` are dropped before sending.
     var loras: [LoraAdapter] = []
+    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
+    /// 1.0 = off, matching the server default.
+    var guidanceScale: Double = 1.0
+    /// What to steer AWAY from — only meaningful alongside `guidanceScale`
+    /// != 1.0. Empty = the server's own unconditioning (empty-string prompt).
+    var negativePrompt: String = ""
 }
 
 extension ImageModelPreset {
@@ -1806,7 +1851,7 @@ extension ImageModelPreset {
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
-        case .flux2Klein4B, .flux2Klein9B:
+        case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
         }
     }
@@ -1815,7 +1860,16 @@ extension ImageModelPreset {
     /// capability: FLUX.2-klein, and the Mage-Flow-Edit checkpoint. Krea and
     /// Mage-Flow Turbo (txt2img) can only do renoise variations.
     var supportsReferenceEdit: Bool {
-        variant == .flux2Klein4B || variant == .flux2Klein9B || variant == .mageFlowEditTurbo
+        variant == .flux2Klein4B || variant == .flux2Klein9B || variant == .flux2Klein9BBase || variant == .mageFlowEditTurbo
+    }
+
+    /// Real classifier-free guidance (`guidance_scale` + negative prompt) —
+    /// `gen.ImageEngine.supportsGuidance()` is FLUX-generic server-side (1.0
+    /// is a no-op there), but only the undistilled base checkpoint has an
+    /// unconditional pathway worth opposing a prompt against; distilled klein
+    /// collapsed it into the weights, so the field stays hidden for it.
+    var supportsGuidance: Bool {
+        variant == .flux2Klein9BBase
     }
 
     // ── Capability flags: what the Advanced panel is allowed to offer ──
