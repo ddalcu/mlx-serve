@@ -6,7 +6,7 @@
 # there is no CSV, no chart pipeline and no engine matrix here any more.
 #
 #   ./tests/bench.sh                                # every model
-#   ./tests/bench.sh --only qwen36-27b              # one row
+#   ./tests/bench.sh --only qwen38-27b              # one row
 #   ./tests/bench.sh --url 127.0.0.1:1234 -m <id>   # a server someone else started
 #   ./tests/bench.sh --full                         # median of 3 per rung, to 64k
 #
@@ -69,12 +69,16 @@ GD="/Volumes/G Drive SSD"
 # against the old qwen36-27b cells. ANE=1 adds --ane-prefill to every boot
 # (a named refusal on non-qwen3_5-dense models, so it is safe matrix-wide);
 # ane-on cells are their own column, never diffed against ane-off ones.
+# qwen38-27b prefers the oQ4e pack on the external drive; without it the local
+# ddalcu 4-bit pack (same trunk + head, our converter) stands in.
+QWEN38_27B="$GD/models-dl/Jundot/Qwen3.8-27B-oQ4e-mtp"
+[[ -e "$QWEN38_27B" ]] || QWEN38_27B="$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
 TARGETS=(
-    "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit"
+    "gemma4-e4b-4bit|$MD/mlx-community/gemma-4-e4b-it-4bit"
     "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit"
     "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit"
-    "qwen38-27b|$GD/models-dl/Jundot/Qwen3.8-27B-oQ4e-mtp"
-    "qwen36-35b-a3b|$MD/stamsam/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP"
+    "qwen38-27b|$QWEN38_27B"
+    "qwen38-flash-next|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at

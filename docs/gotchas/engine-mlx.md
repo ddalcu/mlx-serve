@@ -4215,6 +4215,23 @@ at 8.5k KV is what costs there). So: MTP stays opt-in (`--mtp` /
 with their measured ceiling; a prose-vs-code acceptance difference of this
 size is a property of the head, not of the engine.
 
+Re-measured 2026-08-27 after the QSA verify-row split (`splitMaskedSdpa256`),
+same boot MTP vs serial, 3 reps, `-4bit-all` pack, M4 Max:
+
+| depth | code | prose | 8.5k prompt |
+|---|---|---|---|
+| serial | 62.6 | 62.3 | 55.2 |
+| 1 | 70.6 (+13%) | 59.1 (−5%) | 56.1 (+2%) |
+| 2 | 79.6 (+27%) | 67.3 (+8%) | 55.5 (0%) |
+| 3 | 86.9 (+39%) | 57.5 (−8%) | 49.0 (−11%) |
+| auto (default) | 90.5 (+41%, rep 1 62.0) | 59.6 (−4%) | 52.7 (−4%) |
+
+The −28% at 8.5k is gone (depth 1 now +2%). The flip rule was "MTP >= serial
+on the 8.5k prose cell" and the best arm is a wash there while the adaptive
+controller loses 4% (it runs depth 3 where depth 2 wins), so MTP stays opt-in
+on `qwen4_exp`. The next lever is the controller, not the round cost: a fixed
+depth 2 beats auto on prose by 13% and at 8.5k by 5%.
+
 
 
 ## MLX has no fused kernel for an hd-256 array mask (qwen4 QSA, 2026-08-26)

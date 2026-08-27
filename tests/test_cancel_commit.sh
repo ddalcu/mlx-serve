@@ -190,7 +190,11 @@ prefill_cancel_section() {
         -d "$(body_chat "$LONG_SYSTEM" false 1)" \
         | jq -r '.usage.prompt_tokens_details.cached_tokens // 0' 2>/dev/null)"
 
-    if grep -qE '"(content|reasoning_content)":"[^"]' /tmp/test_cancel_prefill.sse 2>/dev/null; then
+    # A prefill that finishes inside the 5 s keepalive silence window is
+    # only seen as disconnected at the first token write: no content in the
+    # stream, yet the cache holds a FULL entry (e4b prefills 8k in ~3 s).
+    if grep -qE '"(content|reasoning_content)":"[^"]' /tmp/test_cancel_prefill.sse 2>/dev/null \
+       || grep -q "\[hot-cache\] full reuse" "$LOG"; then
         # Prefill completed before the kill landed — the cancel hit decode
         # phase; not this section's contract (and [1] covers it).
         echo "NOTE: kill landed in decode phase (prompt prefilled too fast) — cached_tokens=$cached reported for information"

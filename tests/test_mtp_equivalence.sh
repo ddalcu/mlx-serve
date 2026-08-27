@@ -24,7 +24,7 @@
 #      tails legitimately diverge — same as PLD/drafter, see CLAUDE.md.)
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
-# Default model: ~/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve. A standalone
+# Default model: ~/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit. A standalone
 # sidecar (every mtp.sidecar_rel_paths location) or a sharded/monolithic
 # checkpoint carrying one of mtp_marker_keys works.
 # Calibrated auto-depth surfaces can additionally pin their live dispatch arm:
@@ -36,7 +36,7 @@
 # acceptance-floor checks exercise the MoE-MLP sidecar arm.
 
 set -u
-MODEL="${MTP_TEST_MODEL:-$HOME/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve}"
+MODEL="${MTP_TEST_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
 PORT="${1:-11313}"
 BIN="./zig-out/bin/mlx-serve"
 # ~24 tokens of prefix. Mirrors the PLD/KV-quant first-N thresholds: INT4
