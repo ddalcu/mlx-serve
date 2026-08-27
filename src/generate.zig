@@ -339,11 +339,14 @@ pub const MtpCacheRef = union(enum) {
     }
 
     /// The underlying KVCache — what the prefix cache's spec-snap machinery
-    /// snapshots and restores (every current variant is KVCache-backed).
-    pub fn kv(self: *MtpCacheRef) *KVCache {
+    /// snapshots and restores. Null when the head's state is NOT KV-only:
+    /// the qwen4 head also owns QSA key history + pooled blocks + its own
+    /// row count, so a KV-only restore would leave stale rows under a fresh
+    /// aux state — it is neither committed nor restored.
+    pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
-            .qwen4 => |t| &t.qwen4_mtp.?.cache,
+            .qwen4 => null,
         };
     }
 
@@ -733,11 +736,12 @@ pub fn visionPrefillUnchunked(has_vision: bool) bool {
 
 /// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
 /// source rows a chunk's splice consumes. Host-side count, no GPU sync.
-pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32) usize {
+pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32, video_token_id: u32) usize {
     var n: usize = 0;
     for (ids) |id| {
         if (id == @as(i32, @intCast(image_token_id)) or
-            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id)))) n += 1;
+            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id))) or
+            (video_token_id > 0 and id == @as(i32, @intCast(video_token_id)))) n += 1;
     }
     return n;
 }
@@ -2078,6 +2082,7 @@ pub const Generator = struct {
                         ids_i32[pos..end],
                         xfm.config.image_token_id,
                         xfm.config.audio_token_id,
+                        xfm.config.video_token_id,
                     );
                 }
                 pos = end;
@@ -5011,6 +5016,15 @@ pub const Generator = struct {
         // sequential recurrence AND a full trunk weight read, and at depth > 1
         // MOST rounds are partial, so it dominated the round cost).
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+        // DIAGNOSTIC (MLX_SERVE_MTP_TRACE_SYNC=1): drain the GPU before the
+        // verify build so the `sync` lap shows the pending lazy work (draft
+        // chain, rollback, commit) and `verify` the forward alone.
+        if (tracing and std.c.getenv("MLX_SERVE_MTP_TRACE_SYNC") != null) {
+            var sync_watch = io_util.Stopwatch.init(self.timer.io);
+            try mlx.check(mlx.mlx_array_eval(verify_input));
+            self.mtp_trace.add(.sync, sync_watch.read());
+            ph.reset();
+        }
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
         const verify_logits = try xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all);
@@ -6290,9 +6304,12 @@ pub const Generator = struct {
         drafted: u64 = 0,
         accepted: u64 = 0,
         extended: u32 = 0,
+        /// Per draft index: rounds that drafted index i / accepted it.
+        drafted_idx: [mtp_mod.MAX_DEPTH]u32 = @splat(0),
+        accepted_idx: [mtp_mod.MAX_DEPTH]u32 = @splat(0),
 
         pub fn add(self: *MtpTrace, phase: Phase, dur_ns: u64) void {
-            self.ns[@intFromEnum(phase)] += dur_ns;
+            self.ns[@backingInt(phase)] += dur_ns;
         }
 
         /// Close one round; true when a summary line is due (caller logs,
@@ -6302,12 +6319,27 @@ pub const Generator = struct {
             self.drafted += drafted_n;
             self.accepted += accepted_n;
             if (was_extended) self.extended += 1;
+            var i: usize = 0;
+            while (i < drafted_n and i < mtp_mod.MAX_DEPTH) : (i += 1) {
+                self.drafted_idx[i] += 1;
+                if (i < accepted_n) self.accepted_idx[i] += 1;
+            }
             return self.rounds >= LOG_EVERY;
+        }
+
+        /// `a0/a1/...` acceptance per drafted index (only indices ever drafted).
+        pub fn accIdxStr(self: *const MtpTrace, buf: []u8) []const u8 {
+            var w: std.Io.Writer = .fixed(buf);
+            var i: usize = 0;
+            while (i < mtp_mod.MAX_DEPTH and self.drafted_idx[i] > 0) : (i += 1) {
+                w.print("{s}{d:.2}", .{ if (i == 0) "" else "/", @as(f64, @floatFromInt(self.accepted_idx[i])) / @as(f64, @floatFromInt(self.drafted_idx[i])) }) catch break;
+            }
+            return w.buffered();
         }
 
         pub fn avgMs(self: *const MtpTrace, phase: Phase) f64 {
             if (self.rounds == 0) return 0.0;
-            return @as(f64, @floatFromInt(self.ns[@intFromEnum(phase)])) /
+            return @as(f64, @floatFromInt(self.ns[@backingInt(phase)])) /
                 (@as(f64, @floatFromInt(self.rounds)) * 1e6);
         }
 
@@ -6336,7 +6368,7 @@ pub const Generator = struct {
         accepted: u64 = 0,
 
         pub fn add(self: *DflashTrace, phase: Phase, dur_ns: u64) void {
-            self.ns[@intFromEnum(phase)] += dur_ns;
+            self.ns[@backingInt(phase)] += dur_ns;
         }
 
         /// Close one round; true when a summary line is due (caller logs,
@@ -6349,7 +6381,7 @@ pub const Generator = struct {
 
         pub fn avgMs(self: *const DflashTrace, phase: Phase) f64 {
             if (self.rounds == 0) return 0.0;
-            return @as(f64, @floatFromInt(self.ns[@intFromEnum(phase)])) /
+            return @as(f64, @floatFromInt(self.ns[@backingInt(phase)])) /
                 (@as(f64, @floatFromInt(self.rounds)) * 1e6);
         }
 
@@ -6446,6 +6478,8 @@ pub const Generator = struct {
     /// Adaptive (EV) controller gate — DEFAULT ON. MLX_SERVE_MTP_ADAPTIVE=0
     /// reverts to the fixed-depth windowed controller for same-boot A/Bs.
     var mtp_adaptive_cache: ?bool = null;
+    var mtp_force_depth_cache: ??u32 = null;
+
     pub fn mtpAdaptiveEnabled() bool {
         if (mtp_adaptive_cache) |v| return v;
         var on = true;
@@ -6895,7 +6929,22 @@ pub const Generator = struct {
     /// Post-warmup EV mode: the pure plan over the acceptance EMAs, with the
     /// base-depth climb damped to one step per round and two-chunk plans
     /// gated by the extension dry-spell policy.
+    /// DIAGNOSTIC (MLX_SERVE_MTP_FORCE_DEPTH=n): every round drafts exactly
+    /// n, the EV/windowed controllers never demote or disable — the
+    /// per-index acceptance meter (`acc_idx=` on the trace line).
+    fn mtpForcedDepth() ?u32 {
+        if (mtp_force_depth_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_FORCE_DEPTH", 0);
+        const v: ?u32 = if (n == 0) null else @intCast(@min(n, mtp_mod.MAX_DEPTH));
+        mtp_force_depth_cache = v;
+        return v;
+    }
+
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        if (mtpForcedDepth()) |d| {
+            self.mtp_ev_m_lo_prev = d;
+            return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
+        }
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
         const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
         var cap: u32 = cap_row;
@@ -7065,6 +7114,7 @@ pub const Generator = struct {
     fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         mtpEvObserve(&self.mtp_ev_accept, drafted, accepted, MTP_EV_EMA_BETA);
         self.mtp_ev_rounds += 1;
+        if (mtpForcedDepth() != null) return;
         if (self.mtp_ev_rounds <= MTP_EV_WARMUP_ROUNDS) {
             self.updateMtpDepth(drafted, accepted);
             // Warmup may evaluate several depths. None of that mixed evidence
@@ -7096,8 +7146,9 @@ pub const Generator = struct {
         if (!mtpTraceEnabled()) return;
         if (!self.mtp_trace.endRound(m, accepted, m > m_lo)) return;
         const t = &self.mtp_trace;
+        var acc_buf: [64]u8 = undefined;
         log.info(
-            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2}\n",
+            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2} acc_idx={s}\n",
             .{
                 t.rounds,
                 t.avgMs(.draft),
@@ -7114,6 +7165,7 @@ pub const Generator = struct {
                 @as(f64, @floatFromInt(t.drafted)) / @as(f64, @floatFromInt(t.rounds)),
                 @as(f64, @floatFromInt(t.accepted)) / @as(f64, @floatFromInt(t.rounds)),
                 @as(f64, @floatFromInt(t.extended)) / @as(f64, @floatFromInt(t.rounds)),
+                t.accIdxStr(&acc_buf),
             },
         );
         t.reset();
@@ -12409,11 +12461,12 @@ test "prefill chunk loop yields to the interleave hook between chunks, never aft
     try std.testing.expect(call_at - guard_at < 200);
 }
 
-test "countSpliceRows counts image and audio placeholders, audio only when declared" {
-    const ids = [_]i32{ 7, 99, 99, 8, 88, 9 };
-    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
-    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88));
-    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88));
+test "countSpliceRows counts image, audio and video placeholders, extras only when declared" {
+    const ids = [_]i32{ 7, 99, 99, 8, 88, 9, 77 };
+    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0, 0));
+    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88, 0));
+    try testing.expectEqual(@as(usize, 4), countSpliceRows(&ids, 99, 88, 77));
+    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
 }
 
 test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
@@ -12427,4 +12480,15 @@ test "vision prefill chunks by default and the splice offset feeds every prefill
     const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
     try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
     try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
+}
+
+test "MtpTrace per-index acceptance: index i counts only rounds that drafted it" {
+    var t: Generator.MtpTrace = .{};
+    _ = t.endRound(3, 3, false); // all three accepted
+    _ = t.endRound(3, 1, false); // a0 accepted, a1 rejected, a2 never judged
+    _ = t.endRound(1, 0, false); // depth-1 round: only index 0 drafted
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("0.67/0.50/0.50", t.accIdxStr(&buf));
+    t.reset();
+    try std.testing.expectEqualStrings("", t.accIdxStr(&buf));
 }

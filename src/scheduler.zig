@@ -3200,11 +3200,45 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const io_u = @import("io_util.zig");
             const tio = std.Io.Threaded.global_single_threaded.io();
             var ctx = xfm_ptr.defaultCtx();
-            const tok: i32 = 1;
-            const tsh = [_]c_int{ 1, 1 };
+            // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards
+            // (per-position SSM capture on, as spec verify runs them).
+            // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
+            // tokens first so the meter runs at a real context length.
+            const rows: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_S") orelse break :blk 1;
+                break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
+            };
+            const kv_pre: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
+                break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
+            };
+            const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
+            defer sch.allocator.free(tok_slice);
+            for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
+            const tok = tok_slice.ptr;
+            const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
+            if (kv_pre > 0) {
+                var done_pre: usize = 0;
+                const pre_buf = try sch.allocator.alloc(i32, 2048);
+                defer sch.allocator.free(pre_buf);
+                for (pre_buf, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
+                while (done_pre < kv_pre) {
+                    const n_chunk = @min(2048, kv_pre - done_pre);
+                    const psh = [_]c_int{ 1, @intCast(n_chunk) };
+                    const ti = mlx.mlx_array_new_data(pre_buf.ptr, &psh, 2, .int32);
+                    defer _ = mlx.mlx_array_free(ti);
+                    const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                    _ = mlx.mlx_array_eval(lg);
+                    _ = mlx.mlx_array_free(lg);
+                    done_pre += n_chunk;
+                }
+                log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
+            }
+            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            log.info("[fwd-ubench] rows={d} capture={}\n", .{ tok_slice.len, ctx.capture_ssm_seq });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -3220,7 +3254,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const ops_before = mlx.op_count.load(.monotonic);
                 var swb = io_u.Stopwatch.init(tio);
@@ -3249,7 +3283,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // this the one sound ablation in the probe.
             ctx.skip_lm_head = true;
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -3258,7 +3292,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw_nolm = io_u.Stopwatch.init(tio);
             var done_nolm: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -4383,7 +4417,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
-        break :blk .{ .cache = mc.kv(), .base_pos = gen_ptr.mtp_position_base };
+        break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
     hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
@@ -5025,6 +5059,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.model.transformer.?.dsv4 != null;
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
+    const image_request = slot.mrope_pos != null;
+    if (owns_module_state and module_spec_rollback and image_request and slot.enable_mtp and slot.mtp != null and !mtp_image_decline_logged) {
+        mtp_image_decline_logged = true;
+        log.info("[mtp] declined: image request on qwen4 (the head's QSA/rope has no M-RoPE arm; serial decode)\n", .{});
+    }
     const wiring = specInitWiring(
         owns_module_state,
         module_spec_rollback,
@@ -5035,6 +5074,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.drafter != null,
         slot.dflash != null,
         slot.enable_pld,
+        image_request,
     );
     const use_mtp = wiring.use_mtp;
     const use_drafter = wiring.use_drafter;
@@ -5093,6 +5133,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null;
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
+            const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
             const lookup = hc.lookupAndRestore(
                 &slot.cache,
                 &slot.moe_seq_offset,
@@ -5101,7 +5142,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.full_prompt,
                 slot.has_tools,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
-                if (mtp_target) |*mc| .{ .cache = mc.kv(), .base_pos = &mtp_base } else null,
+                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -5375,6 +5416,8 @@ pub const SpecInitWiring = struct {
 /// module-owned arch arrived with the same `Model.state` shape and a 0-layer
 /// shell cache, got no conjunct, and `--pld` drove verify forwards straight
 /// through it. One predicate, one place to extend.
+var mtp_image_decline_logged: bool = false;
+
 pub fn specInitWiring(
     owns_module_state: bool,
     module_spec_rollback: bool,
@@ -5385,6 +5428,7 @@ pub fn specInitWiring(
     has_drafter: bool,
     has_dflash: bool,
     enable_pld: bool,
+    image_request: bool,
 ) SpecInitWiring {
     if (owns_module_state) return .{
         // A module-owned arch that CAN rewind its state across a verify runs
@@ -5393,8 +5437,10 @@ pub fn specInitWiring(
         // .bind refuses these archs anyway), and PLD's win case is
         // echo-shaped traffic the n-gram gate rarely opens on a
         // head this cheap — neither has been measured on this family, and an
-        // unmeasured spec mode is worse than none.
-        .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
+        // unmeasured spec mode is worse than none. An image request (M-RoPE
+        // table) decodes serially: the qwen4 head's own QSA/rope has no
+        // M-RoPE arm, so a draft there would be mis-roped.
+        .use_mtp = module_spec_rollback and enable_mtp and has_mtp and !image_request,
         .use_drafter = false,
         .use_dflash = false,
         .use_pld = false,
@@ -6505,74 +6551,80 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
 
     // Plain arch: today's precedence, unchanged.
     {
-        const w = specInitWiring(false, false, false, true, true, true, true, false, true);
+        const w = specInitWiring(false, false, false, true, true, true, true, false, true, false);
         try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     {
-        const w = specInitWiring(false, false, false, true, false, true, true, false, true);
+        const w = specInitWiring(false, false, false, true, false, true, true, false, true, false);
         try testing.expect(!w.use_mtp and w.use_drafter and !w.use_pld);
     }
     {
-        const w = specInitWiring(false, false, false, false, false, false, false, false, true);
+        const w = specInitWiring(false, false, false, false, false, false, false, false, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and w.use_pld and !w.native_intent);
     }
     // A flag with no loaded handle never arms.
     {
-        const w = specInitWiring(false, false, false, true, false, false, false, false, false);
+        const w = specInitWiring(false, false, false, true, false, false, false, false, false, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 
     // DFlash rides the enable_drafter switch: MTP > dflash > drafter > PLD.
     {
-        const w = specInitWiring(false, false, false, false, false, true, false, true, true);
+        const w = specInitWiring(false, false, false, false, false, true, false, true, true, false);
         try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
     }
     // A loaded MTP head still outranks it.
     {
-        const w = specInitWiring(false, false, false, true, true, true, false, true, true);
+        const w = specInitWiring(false, false, false, true, true, true, false, true, true, false);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // enable_drafter:false opts BOTH sidecar kinds out.
     {
-        const w = specInitWiring(false, false, false, false, false, false, false, true, true);
+        const w = specInitWiring(false, false, false, false, false, false, false, true, true, false);
         try testing.expect(!w.use_dflash and !w.use_drafter and w.use_pld);
     }
 
     // Module-owned with NO rollback and no native draft mode: everything off,
     // and no intent bit either — nothing downstream can arm a draft path.
     {
-        const w = specInitWiring(true, false, false, true, true, true, true, true, true);
+        const w = specInitWiring(true, false, false, true, true, true, true, true, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
 
     // Module-owned WITH rollback: its own MTP head arms; the shell
     // spec modes stay off because none has been measured on this family.
     {
-        const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        const w = specInitWiring(true, true, false, true, true, true, true, true, true, false);
         try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     // Rollback capability alone never arms a head that is not loaded.
     {
-        const w = specInitWiring(true, true, false, true, false, true, true, true, true);
+        const w = specInitWiring(true, true, false, true, false, true, true, true, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
     // ...nor one the request opted out of.
     {
-        const w = specInitWiring(true, true, false, false, true, true, true, false, true);
+        const w = specInitWiring(true, true, false, false, true, true, true, false, true, false);
         try testing.expect(!w.use_mtp);
+    }
+    // ...nor on an image request: the qwen4 head's QSA/rope has no M-RoPE
+    // arm, so a `--mtp` server answers image turns serially.
+    {
+        const w = specInitWiring(true, true, false, true, true, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 
     // Module-owned WITH a native draft mode (dsv4/DSpark) and no rollback: the
     // shell paths stay off, but the request's MTP intent still reaches the
     // Generator chokepoint.
     {
-        const w = specInitWiring(true, false, true, true, true, true, true, true, true);
+        const w = specInitWiring(true, false, true, true, true, true, true, true, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
         try testing.expect(w.native_intent);
     }
     // enable_mtp:false opts out of DSpark; PLD intent alone never arms it.
     {
-        const w = specInitWiring(true, false, true, false, false, false, false, false, true);
+        const w = specInitWiring(true, false, true, false, false, false, false, false, true, false);
         try testing.expect(!w.native_intent);
     }
 }

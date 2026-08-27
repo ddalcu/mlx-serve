@@ -296,6 +296,11 @@ pub const HotPrefixCache = struct {
             ssm.conv_state = mlx.mlx_array_new();
             ssm.ssm_state = mlx.mlx_array_new();
             ssm.initialized = false;
+            if (ssm.aux_state.ctx != null) _ = mlx.mlx_array_free(ssm.aux_state);
+            if (ssm.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(ssm.qsa_pooled);
+            ssm.aux_state = .{ .ctx = null };
+            ssm.qsa_pooled = .{ .ctx = null };
+            ssm.ple_prev_valid = false;
         }
     }
 
@@ -322,9 +327,6 @@ pub const HotPrefixCache = struct {
         // rebuilding that state. Off until dsv4 state rides the ssm-entry
         // machinery (needsSsmEntries class).
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return false;
-        // qwen4_exp keeps the n-gram PLE conv state and the QSA indexer key
-        // history in fields the snapshot machinery does not carry yet.
-        if (config.isQwen4()) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;

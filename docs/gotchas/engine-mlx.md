@@ -4112,3 +4112,106 @@ first.
 - Where the remaining 14 ms go (sync'd profile minus floor): GDN ≈ 8 ms
   (36 layers, ~220 us, ~11 dispatches each), MoE ≈ 6 ms (~130 us), attention
   ≈ 1.2 ms. Weight bandwidth is ~7 ms of it.
+
+### Round 3, same day: GDN fusion, three MoE nulls, and the profiler that was never off
+
+- **GDN decode fusion** (`gdnPreworkFused`, `gdnNormGateFused`,
+  `MLX_SERVE_GDN_DECODE_FUSED=0`). The prework kernel was generalized from
+  S=1 to S 1..9 (verify widths) and grew the old-state conv rows, the gate
+  chain (`computeGdnGate`) and the beta sigmoid; the recurrence's output now
+  runs through one epilogue kernel doing the per-head rms norm and the z
+  gate (swish arm for qwen3_5/qwen4, sigmoid arm for the `kda_sigmoid_out_gate`
+  archs). Hermetic tests pin bit-identity to the composed chain at every S,
+  and a third test (`gdn gate: compiled closure vs graph chain`) pins the
+  assumption underneath — that the `mlx_compile`d gate closure and the plain
+  graph agree exactly. In-situ `QWEN4_GDN_CHECK=1` on the real pack: 179/180
+  per-layer checks exact, one k element off by 1 bf16 ulp (a tie in the rms
+  reduction order). That single ulp flips greedy bytes a few hundred tokens
+  in — legit, the bar is the fixture, not byte equality. 15.45 → 14.84
+  ms/forward (−3.9%), serial 60.0 → 60.4 short, 52.7/53.4 → 53.5/54.2 at 8.5k.
+- **Three MoE fusions measured null or worse and were removed.** (a) Folding
+  the four GDN in-projections into one qmm: 59.96 vs 59.97 tok/s and not
+  byte-exact at the real N. (b) The shared expert as an 11th slot of the
+  gather kernels: −3%. The separate shared chain is routing-INDEPENDENT, so
+  the GPU had been running it in parallel with the router → gather chain;
+  fusing it put ~8 kernels onto the critical path. (c) The gated shared tail
+  inside the down+reduce epilogue: 14.875 vs 14.875. (d) Multi-row gather
+  kernels for verify widths: S=2 a wash, S=4 45.4 vs 32.9 ms for
+  `_gather_sort` — the per-slot simdgroup kernel is latency-bound and scales
+  linearly with rows. Rule: a chain the GPU already overlaps is not a
+  dispatch to fuse; the marginal is measured in-situ
+  (`MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>`, `_KV=<prefill tokens>`: S=1 16.7
+  ms, S=2 24.5 (MoE +3.4 via `_gather_sort`, attention +1.5, GDN +0.9), S=4
+  32.9).
+- **The 70 ms MTP verify was the profiler.** `run.sh` exported
+  `QWEN4_PROFILE_FWD=0` and the code tested `getenv != null`, so every earlier
+  MTP arm had a GPU sync after every block of every layer. With it off the
+  real round at 8.5k is verify build 5 ms + eval 25 ms + draft 0.6 ms ≈ 30.5
+  ms, first-draft acceptance 0.56–0.72, MTP 52 vs serial 54.7 tok/s; depths 2
+  and 3 never engage because the controller holds m=1. Diagnostic env reads
+  now go through `diagEnvOn` (absent or `0` = off). The tech report's Table 4
+  gives four-step MTP a mean accepted length of 3.4–4.3 (≳0.8 per position
+  for the bf16 head), so the 0.56–0.72 first-draft rate is the open question
+  — bookkeeping, head quantization (4-bit here) or prompt — and is audited
+  before any S=2 forward lever.
+- **Prefill profile** (4096-row chunk at kv 4096, 9.7 s): attention 4.3 s
+  (44%), GDN 2.3, MoE 2.3, QSA mask chain 0.65. The attention is MLX's
+  unfused hd-256 fallback under the bool QSA mask (~300 ms/layer, ~10× the
+  compute bound) — the next real lever is a mask-aware arm of the hd-256
+  prefill kernel, not started. The GPU time lands in the graph BUILD lap
+  because prefill evals every 4 layers; a stand-in that zeroes a block
+  (`QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa`) is
+  how the split was read. A pool-gate widening for the n-gram gather (256
+  rows) measured nothing (9.49 vs 9.29 s build) and was reverted.
+- Prefix cache on qwen4 shipped in this round (story in models-media.md).
+
+### Round 3b, same night: the MTP acceptance audit
+
+The question was whether the 0.56–0.72 first-draft acceptance (Table 4 of the
+tech report: mean accepted length 3.44–4.29 under four-step MTP, i.e. ≳0.8 per
+position) was bookkeeping, head quantization, or the prompt. Three probes:
+
+1. **Bookkeeping audit against the SGLang/vLLM MTP refs.** Row pairing is
+   (pre-mixer stream at r, token r+1) at query position r+1 everywhere:
+   prefill history `appendHistory(prompt_ids[pos+1..end+1], chunk_hidden_all)`,
+   the Phase 5a stash `[t1, drafts[0..acc]]` ↔ `[last_hidden, verify_hidden[0..acc]]`,
+   the merged chain forward at `st.off0`, the chain's own rows at
+   `off0 + i`. The head's next-step hidden is its OWN pre-mixer stream
+   (`hc_hidden_states` in the ref, `hidden_next = out.stream` here). The
+   `--mtp-history-window` / prefix-restore "relative positions" are a non-
+   issue on this arch: the head pools its QSA blocks relative to its own row
+   0 and only RoPE reads the absolute base — invariant under a shift. The
+   one real finding: the prefix cache committed the qwen4 head's KV through
+   `MtpCacheRef.kv()` and a restore put rows into `m.cache` with
+   `seq_offset` still 0 and no aux keys — stale rows under a fresh state.
+   `kv()` is now `?*KVCache`, null for qwen4: never committed, never restored.
+2. **Cross-round hermetic test** on the tiny pack (`qwen4 fixture` [4]):
+   prefill history, two rounds of draft → capturing verify → accept 1 then 0
+   → trunk rollback → stash → consume-time truncate, then the third round's
+   merged head forward vs a fresh head over every committed row: cos
+   1.00000, argmax 2/2, with the head past its QSA budget. Green — the
+   bookkeeping is acquitted (single-forward parity only proved the math).
+3. **Per-index acceptance on the real packs** (`MLX_SERVE_MTP_FORCE_DEPTH=n`,
+   `acc_idx=` on the trace line, temp 0):
+
+| pack (head width) | depth | 8.4k repetitive prompt | code (LRU cache) | prose (essay) |
+|---|---|---|---|---|
+| -4bit-all (4-bit) | 1 | 0.65 · 33.7 ms · 49.7 tok/s | 0.93 · 28.0 ms · 69.4 | 0.61 · 28.0 ms · 57.4 |
+| -4bit-all (4-bit) | 2 | 0.64/0.42 · 51.2 ms · 40.3 | 0.88/0.76 · 34.1 ms · 78.5 | 0.76/0.46 · 34.0 ms · 65.2 |
+| -4bit-all (4-bit) | 3 | 0.62/0.41/0.22 · 60.0 ms · 39.3 | 0.91/0.80/0.68 · 40.0 ms · 84.7 | 0.65/0.37/0.25 · 40.0 ms · 55.8 |
+| -4bit (8-bit head) | 1 | 0.62 · 37.7 ms · 44.1 | 0.94 · 31.8 ms · 61.3 | 0.74 · 31.9 ms · 54.8 |
+| -4bit (8-bit head) | 2 | 0.61/0.38 · 56.4 ms · 35.5 | 0.96/0.87 · 38.5 ms · 74.2 | 0.66/0.40 · 38.6 ms · 53.7 |
+| -4bit (8-bit head) | 3 | 0.66/0.34/0.15 · 63.1 ms · 36.2 | 0.91/0.83/0.79 · 43.0 ms · 83.7 | 0.68/0.38/0.25 · 43.2 ms · 53.2 |
+
+Cells: acceptance per draft index (`acc_idx`) · round ms · client tok/s. Serial: 60.4 short / 54.7 at 8.5k. M4 Max 128 GB, temp 0, `MLX_SERVE_MTP_FORCE_DEPTH=n`, 2026-08-26.
+
+The gap was the prompt. Code meets Table 4 (HumanEval 4.24 over four drafts;
+ours 2.39–2.53 over three) on both packs, so the 4-bit head is not the
+limiter. Prose sits at 0.65/0.37/0.25 — below MT-Bench's 3.44 — and the
+repetitive 8.4k prompt at 0.62/0.41/0.22 with 51–60 ms rounds (verify width
+at 8.5k KV is what costs there). So: MTP stays opt-in (`--mtp` /
+`enable_mtp`); on code it is +40% at depth 3. The S=2..4 forward levers (MoE
+`_gather_sort` +3.4 ms, attention +1.5, GDN +0.9 at S=2) go back on the list
+with their measured ceiling; a prose-vs-code acceptance difference of this
+size is a property of the head, not of the engine.
+

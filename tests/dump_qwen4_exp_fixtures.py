@@ -18,6 +18,13 @@ Two phases, run from the torch venv (transformers main carries the arch):
       --pack ~/claude-tmp/qwen4-tiny/pack --out ~/claude-tmp/qwen4-tiny/fixture.safetensors
   QWEN4_TEST_MODEL=~/claude-tmp/qwen4-tiny/pack QWEN4_FIXTURE=~/claude-tmp/qwen4-tiny/fixture.safetensors \
       zig build test -Dtest-filter="qwen4 fixture"
+
+`--vision` on both phases builds Qwen4ExpForConditionalGeneration with a tiny
+tower (the converter packs it via `--add-vision --src`) and dumps ONE image
+prompt: pixel_values + grid, the tower's pooler_output, the 3-D position ids
++ rope delta, full-prefill logits, prefill + stepwise decode, per-layer
+streams and the layer-3 QSA mask (the prompt crosses the tiny budget so the
+mask depends on the M-RoPE angles of the pooled block keys).
 """
 
 import argparse
@@ -61,7 +68,12 @@ TINY = dict(
     linear_value_head_dim=64,
     linear_conv_kernel_dim=4,
     num_experts=8,
-    num_experts_per_tok=2,
+    # Every expert active: a random tiny MoE routes near ties everywhere
+    # (8 experts x 8 layers x T rows), and our kernels' bf16-class noise flips
+    # one pick per prompt whatever the router scale or seed (the tie RATE is
+    # scale-invariant). With k = E the weighting + gather + expert mapping
+    # are still measured; top-k SELECTION is covered by the live pack.
+    num_experts_per_tok=8,
     moe_intermediate_size=64,
     shared_expert_intermediate_size=64,
     ple_layer_ids=[2],
@@ -95,17 +107,40 @@ TINY = dict(
 T_PREFILL = 14
 T_DECODE = 6
 
+TINY_VISION = dict(
+    depth=2, hidden_size=64, num_heads=4, intermediate_size=128, in_channels=3,
+    patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
+    num_position_embeddings=16, out_hidden_size=64, hidden_act="gelu_pytorch_tanh",
+)
+VISION_IDS = dict(image_token_id=122, video_token_id=123, vision_start_token_id=120, vision_end_token_id=121)
+IMAGE_GRID = (1, 6, 8)  # patches (t, h, w) -> 3x4 = 12 merged tokens
+V_PREFILL = 22  # 3 text + start + 12 image + end + 5 text, then T_DECODE steps
 
-def make_model():
+
+def lm(m):
+    return m.model.language_model if hasattr(m.model, "language_model") else m.model
+
+
+def make_model(vision=False):
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
     cfg = Qwen4ExpTextConfig(**TINY)
     cfg._attn_implementation = "eager"
     torch.manual_seed(7)
-    m = Qwen4ExpForCausalLM(cfg).float().eval()  # built f32 for the random init; cast after loading
+    if vision:
+        from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig, Qwen4ExpVisionConfig
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+        full = Qwen4ExpConfig(text_config=cfg, vision_config=Qwen4ExpVisionConfig(**TINY_VISION), **VISION_IDS)
+        full._attn_implementation = "eager"
+        full.vision_config._attn_implementation = "eager"
+        m = Qwen4ExpForConditionalGeneration(full).float().eval()
+    else:
+        m = Qwen4ExpForCausalLM(cfg).float().eval()  # built f32 for the random init; cast after loading
     with torch.no_grad():
         for n, p in m.named_parameters():
-            if p.dim() >= 2:
+            if n.endswith("mlp.gate.weight"):
+                p.normal_(0, 0.5)  # spread the softmax weights (k = E, see TINY)
+            elif p.dim() >= 2:
                 p.normal_(0, 0.05 if "experts" not in n else 0.08)
             elif n.endswith("A_log"):
                 p.uniform_(-2.0, 0.5)
@@ -119,14 +154,14 @@ def make_model():
 
 
 def hf_name(k):
-    if k == "lm_head.weight":
+    if k == "lm_head.weight" or k.startswith("model.language_model.") or k.startswith("model.visual."):
         return k
     assert k.startswith("model."), k
     return "model.language_model." + k[len("model."):]
 
 
-def build(out):
-    cfg, m = make_model()
+def build(out, vision=False):
+    cfg, m = make_model(vision)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     sd = {}
@@ -163,6 +198,9 @@ def build(out):
                                for i in range(TINY["num_hidden_layers"])]
     full = {"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp",
             "text_config": text_cfg, "tie_word_embeddings": False}
+    if vision:
+        full["vision_config"] = dict(TINY_VISION, model_type="qwen4_exp_vision")
+        full.update(VISION_IDS)
     (out / "config.json").write_text(json.dumps(full, indent=2))
     print(f"wrote {len(sd)} tensors to {out}")
 
@@ -216,24 +254,25 @@ def dequant_pack(pack):
     return out
 
 
-def pack_to_torch_key(k):
-    # language_model.model.X -> model.X ; language_model.lm_head -> lm_head
+def pack_to_torch_key(k, vision=False):
+    # language_model.model.X -> model.X (model.language_model.X under the
+    # conditional-generation wrapper); language_model.lm_head -> lm_head
     if k.startswith("language_model.model."):
-        return "model." + k[len("language_model.model."):]
+        return ("model.language_model." if vision else "model.") + k[len("language_model.model."):]
     if k == "language_model.lm_head.weight":
         return "lm_head.weight"
     return k
 
 
-def dump(hf, pack, out):
-    cfg, m = make_model()
+def dump(hf, pack, out, vision=False):
+    cfg, m = make_model(vision)
     ten = dequant_pack(pack)
     sd = m.state_dict()
     with torch.no_grad():
         for k, v in ten.items():
             if k == "__ngram__" or k.startswith("language_model.mtp."):
                 continue
-            tk = pack_to_torch_key(k)
+            tk = pack_to_torch_key(k, vision)
             if tk.endswith(".mlp.switch_mlp.gate_proj.weight"):
                 base = tk[:-len("switch_mlp.gate_proj.weight")]
                 gate = torch.from_numpy(v)
@@ -249,7 +288,8 @@ def dump(hf, pack, out):
             if tk.endswith("conv1d.weight") and t.dim() == 3:
                 t = t.transpose(1, 2).contiguous()  # back to HF [C,1,K]
             if tk not in sd:
-                print("skip", tk)
+                if not tk.startswith("model.visual."):
+                    print("skip", tk)
                 continue
             if t.shape != sd[tk].shape:
                 raise SystemExit(f"{tk}: {tuple(t.shape)} vs {tuple(sd[tk].shape)}")
@@ -265,12 +305,16 @@ def dump(hf, pack, out):
                 assert sd[k].shape == ng.shape, (sd[k].shape, ng.shape)
                 sd[k].copy_(ng)
     m.load_state_dict(sd)
-    m.to(REF_DTYPE).eval()
+    m.float().eval()
+
+    if vision:
+        return dump_vision(m, ids_out=out)
+    T = T_PREFILL + T_DECODE
 
     torch.manual_seed(3)
-    T = T_PREFILL + T_DECODE
     ids = torch.randint(2, TINY["vocab_size"], (1, T))
     ids[0, 5] = TINY["eos_token_id"]  # an eos inside the prompt: PLE shift reset
+    m.to(REF_DTYPE)
     l0 = m.model.layers[0]
     cap = {}
     def hook(name):
@@ -286,7 +330,9 @@ def dump(hf, pack, out):
              m.model.layers[1].ple.ple_embedding.ngram_embedding.register_forward_hook(
                  lambda mod, inp, out: cap.__setitem__("ngram_ids", inp[0])),
              m.model.layers[3].self_attn.indexer.register_forward_hook(hook("qsa_mask")),
-             m.model.layers[3].self_attn.register_forward_hook(hook("attn3"))]
+             m.model.layers[3].self_attn.register_forward_hook(hook("attn3")),
+             m.model.hyper_connection_mixer.register_forward_hook(lambda mod, inp, out: cap.__setitem__("pre_mixer", inp[0]))]
+    hooks += hook_indexers(lm(m), cap)
     with torch.no_grad():
         full = m(input_ids=ids, use_cache=False, output_hidden_states=True)
         for h in hooks:
@@ -304,6 +350,8 @@ def dump(hf, pack, out):
     fixture = {
         "mtp_logits": mtp_reference(m, ten, ids, T),
         "input_ids": ids[0].numpy().astype(np.int32),
+        "logit_margin": logit_margin(logits_full),
+        "qsa_gap": qsa_rel_gaps(lm(m), cap, T),
         "logits_full": logits_full.astype(np.float32),
         "logits_prefill_last": pre.logits[0, -1].float().numpy().astype(np.float32),
         "logits_decode": np.stack(dec).astype(np.float32),
@@ -326,10 +374,129 @@ def dump(hf, pack, out):
     qm = (qm == 0) if qm.is_floating_point() else qm  # eager float mask: 0 = visible
     fixture["l3_qsa_mask"] = qm.reshape(T, -1).float().numpy()
     fixture["l3_attn_out"] = flat(cap["attn3"][0])
+    fixture["stream_pre_mixer"] = flat(cap["pre_mixer"])
     save_file(fixture, os.path.expanduser(out))
     # sanity: stepwise == full at the decode positions (the reference's own consistency)
     ref_gap = np.abs(np.stack(dec) - logits_full[T_PREFILL:]).max()
     print(f"wrote {out}; reference stepwise-vs-full max|Δ| = {ref_gap:.2e}")
+
+
+def logit_margin(logits):
+    top2 = torch.from_numpy(logits).float().topk(2, dim=-1).values
+    return (top2[:, 0] - top2[:, 1]).numpy().astype(np.float32)
+
+
+def hook_indexers(text, cap):
+    """Pre-hooks capturing every QSA indexer's (hidden, position_embeddings)."""
+    def pre(l):
+        def f(mod, args):
+            cap[("qsa", l)] = (args[0], args[1])
+        return f
+    return [layer.self_attn.indexer.register_forward_pre_hook(pre(i))
+            for i, layer in enumerate(text.layers) if hasattr(getattr(layer, "self_attn", None), "indexer")]
+
+
+def qsa_rel_gaps(text, cap, T):
+    """Per query row, the smallest (over QSA layers) RELATIVE margin between
+    the last selected block score and the first rejected one — the reference's
+    own tie measure. relu leaves exact-zero scores, so a near-zero q·k that
+    flips sign under 1% kernel noise selects a different block; the Zig test
+    acquits such rows by this number. 1.0 where no selection happens."""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+    out = np.ones(T, dtype=np.float32)
+    for (tag, l), (h, (cos, sin)) in [(k, v) for k, v in cap.items() if isinstance(k, tuple) and k[0] == "qsa"]:
+        idx = text.layers[l].self_attn.indexer
+        with torch.no_grad():
+            qk = idx.index_qk_proj(h)
+            hd = idx.index_head_dim
+            q, k = torch.split(qk, [idx.index_n_heads * hd, idx.index_kv_heads * hd], -1)
+            q = apply_rotary_pos_emb(idx.q_layernorm(q.reshape(1, T, -1, hd)), cos=cos, sin=sin, unsqueeze_dim=2)[0]
+            raw = k.reshape(T, hd)
+            r = idx.compress_ratio
+            nb = T // r
+            pooled = idx.k_layernorm(raw[:nb * r].view(nb, r, -1).float().mean(1).to(raw.dtype))
+            starts = torch.arange(nb) * r
+            kb = apply_rotary_pos_emb(pooled.unsqueeze(1), cos=cos[0].index_select(0, starts), sin=sin[0].index_select(0, starts)).squeeze(1)
+            for row in range(T):
+                ncb = (row + 1) // r
+                if ncb <= idx.block_topk:
+                    continue
+                sc = torch.relu(q[row].float() @ kb[:ncb].float().T).sum(0)
+                srt = sc.sort(descending=True).values
+                gap = float(srt[idx.block_topk - 1] - srt[idx.block_topk]) / max(float(srt[0]), 1e-9)
+                out[row] = min(out[row], gap)
+    return out
+
+
+def dump_vision(m, ids_out):
+    """One image prompt through Qwen4ExpForConditionalGeneration."""
+    T = V_PREFILL + T_DECODE
+    gt, gh, gw = IMAGE_GRID
+    n_img = gt * gh * gw // (TINY_VISION["spatial_merge_size"] ** 2)
+    feat = TINY_VISION["in_channels"] * TINY_VISION["temporal_patch_size"] * TINY_VISION["patch_size"] ** 2
+    thw = torch.tensor([[gt, gh, gw]])
+    text = lm(m)
+    torch.manual_seed(5)
+    ids = torch.randint(2, VISION_IDS["vision_start_token_id"], (1, T))
+    ids[0, 2] = TINY["eos_token_id"]
+    ids[0, 3] = VISION_IDS["vision_start_token_id"]
+    ids[0, 4:4 + n_img] = VISION_IDS["image_token_id"]
+    ids[0, 4 + n_img] = VISION_IDS["vision_end_token_id"]
+    mm = (ids == VISION_IDS["image_token_id"]).int()
+    pv = torch.rand(gt * gh * gw, feat) * 2 - 1
+    cap = {}
+    def hook(name):
+        def f(mod, inp, out):
+            cap[name] = out
+        return f
+    m.to(REF_DTYPE)
+    hooks = [text.layers[3].self_attn.indexer.register_forward_hook(hook("qsa_mask")),
+             text.layers[3].self_attn.register_forward_hook(hook("attn3")),
+             text.hyper_connection_mixer.register_forward_hook(lambda mod, inp, out: cap.__setitem__("pre_mixer", inp[0]))]
+    hooks += hook_indexers(text, cap)
+    with torch.no_grad():
+        pos_ids, deltas = m.model.get_rope_index(ids, mm, image_grid_thw=thw)
+        cos, sin = text.rotary_emb(torch.zeros(1, T, 1, dtype=REF_DTYPE), pos_ids)
+        embeds = torch.cat(m.model.get_image_features(pv, thw, return_dict=True).pooler_output, dim=0)
+        full = m(input_ids=ids, pixel_values=pv, image_grid_thw=thw, mm_token_type_ids=mm,
+                 use_cache=False, output_hidden_states=True)
+        for h in hooks:
+            h.remove()
+        hs = [h[0].float().numpy() for h in full.hidden_states]
+        pre = m(input_ids=ids[:, :V_PREFILL], pixel_values=pv, image_grid_thw=thw,
+                mm_token_type_ids=mm[:, :V_PREFILL], use_cache=True)
+        pkv = pre.past_key_values
+        dec = []
+        for t in range(V_PREFILL, T):
+            step = m(input_ids=ids[:, t:t + 1], past_key_values=pkv, use_cache=True)
+            pkv = step.past_key_values
+            dec.append(step.logits[0, -1].float().numpy())
+    qm = cap["qsa_mask"]
+    qm = (qm == 0) if qm.is_floating_point() else qm
+    fixture = {
+        "input_ids": ids[0].numpy().astype(np.int32),
+        "logit_margin": logit_margin(full.logits[0].float().numpy()),
+        "qsa_gap": qsa_rel_gaps(text, cap, T),
+        "pixel_values": pv.numpy().astype(np.float32),
+        "image_grid_thw": thw[0].numpy().astype(np.int32),
+        "image_embeds": embeds.float().numpy().astype(np.float32),
+        "position_ids": pos_ids[:, 0].numpy().astype(np.int32),
+        "rope_delta": deltas.reshape(-1).numpy().astype(np.int32),
+        "logits_full": full.logits[0].float().numpy().astype(np.float32),
+        "logits_prefill_last": pre.logits[0, -1].float().numpy().astype(np.float32),
+        "logits_decode": np.stack(dec).astype(np.float32),
+        "l3_qsa_mask": qm.reshape(T, -1).float().numpy(),
+        "rope_cos": cos[0].float().numpy().astype(np.float32),
+        "rope_sin": sin[0].float().numpy().astype(np.float32),
+        "l3_attn_out": cap["attn3"][0].reshape(T, -1).float().numpy().astype(np.float32),
+        "stream_pre_mixer": cap["pre_mixer"].reshape(T, -1).float().numpy().astype(np.float32),
+    }
+    for i, h in enumerate(hs):
+        fixture[f"stream_{i}"] = h.astype(np.float32)
+    save_file(fixture, os.path.expanduser(ids_out))
+    ref_gap = np.abs(np.stack(dec) - fixture["logits_full"][V_PREFILL:]).max()
+    print(f"wrote {ids_out}; {n_img} image tokens, delta {int(deltas[0, 0])}, "
+          f"reference stepwise-vs-full max|Δ| = {ref_gap:.2e}")
 
 
 def mtp_reference(m, ten, ids, T):
@@ -398,15 +565,17 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
     b.add_argument("--out", required=True)
+    b.add_argument("--vision", action="store_true")
     d = sub.add_parser("dump")
     d.add_argument("--hf", required=True)
     d.add_argument("--pack", required=True)
     d.add_argument("--out", required=True)
+    d.add_argument("--vision", action="store_true")
     a = ap.parse_args()
     if a.cmd == "build":
-        build(os.path.expanduser(a.out))
+        build(os.path.expanduser(a.out), a.vision)
     else:
-        dump(os.path.expanduser(a.hf), os.path.expanduser(a.pack), a.out)
+        dump(os.path.expanduser(a.hf), os.path.expanduser(a.pack), a.out, a.vision)
 
 
 if __name__ == "__main__":

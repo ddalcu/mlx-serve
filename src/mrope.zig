@@ -227,6 +227,74 @@ pub fn computeInvFreq(out: []f64, rotary_dim: usize, theta: f64) void {
     }
 }
 
+/// Fill NeoX-layout cos/sin rows (`[n, rope_dims]`, both halves tiled) for the
+/// `n` absolute positions `start + stride*i`: the 3-D table inside the prompt,
+/// `abs + delta` past it. `stride 1` is a prefill chunk; the qwen4 QSA indexer
+/// ropes its pooled block keys at block-START positions (`stride = ratio`).
+pub fn fillCosSin(cos: []f32, sin: []f32, positions: PositionContext, start: usize, stride: usize, n: usize, inv_freq: []const f64, sel: []const u8, rope_dims: usize) void {
+    const half = rope_dims / 2;
+    std.debug.assert(inv_freq.len == half and sel.len == half);
+    std.debug.assert(cos.len == n * rope_dims and sin.len == n * rope_dims);
+    for (0..n) |i| {
+        const p = start + stride * i;
+        const o = i * rope_dims;
+        for (0..half) |d| {
+            const pid: f64 = @floatFromInt(positions.axisPosition(sel[d], p));
+            const angle = pid * inv_freq[d];
+            const c: f32 = @floatCast(@cos(angle));
+            const sn: f32 = @floatCast(@sin(angle));
+            cos[o + d] = c;
+            cos[o + half + d] = c;
+            sin[o + d] = sn;
+            sin[o + half + d] = sn;
+        }
+    }
+}
+
+test "mrope fillCosSin strided rows == every stride-th row of the contiguous fill" {
+    // 3-D table over 12 prompt positions (an image at 4..7 with h/w grids),
+    // then decode positions past the table at abs + delta.
+    const total: usize = 12;
+    var pos: [3 * total]i32 = undefined;
+    for (0..total) |i| {
+        const t: usize = if (i >= 4 and i < 8) 4 else if (i >= 8) i - 2 else i;
+        const h: usize = if (i >= 4 and i < 8) 4 + (i - 4) / 2 else t;
+        const w: usize = if (i >= 4 and i < 8) 4 + (i - 4) % 2 else t;
+        pos[i] = @intCast(t);
+        pos[total + i] = @intCast(h);
+        pos[2 * total + i] = @intCast(w);
+    }
+    const ctx = PositionContext{ .pos = &pos, .total = total, .delta = -2 };
+    const rope_dims: usize = 8;
+    var inv_freq: [4]f64 = undefined;
+    computeInvFreq(&inv_freq, rope_dims, 100.0);
+    var sel: [4]u8 = undefined;
+    interleavedSelector(&sel, .{ 2, 1, 1 });
+    const n_all: usize = 20; // 8 positions past the table
+    var cos_all: [n_all * rope_dims]f32 = undefined;
+    var sin_all: [n_all * rope_dims]f32 = undefined;
+    fillCosSin(&cos_all, &sin_all, ctx, 0, 1, n_all, &inv_freq, &sel, rope_dims);
+    const stride: usize = 4;
+    const n_s: usize = n_all / stride;
+    var cos_s: [n_s * rope_dims]f32 = undefined;
+    var sin_s: [n_s * rope_dims]f32 = undefined;
+    fillCosSin(&cos_s, &sin_s, ctx, 0, stride, n_s, &inv_freq, &sel, rope_dims);
+    for (0..n_s) |b| {
+        for (0..rope_dims) |d| {
+            try std.testing.expectEqual(cos_all[b * stride * rope_dims + d], cos_s[b * rope_dims + d]);
+            try std.testing.expectEqual(sin_all[b * stride * rope_dims + d], sin_s[b * rope_dims + d]);
+        }
+    }
+    // The image rows are 3-D (h ≠ w angle on the h/w frequencies) and the
+    // past-table rows follow abs + delta: row 12 == the angle of position 10.
+    try std.testing.expect(cos_all[5 * rope_dims + 1] != cos_all[6 * rope_dims + 1]);
+    var one_cos: [rope_dims]f32 = undefined;
+    var one_sin: [rope_dims]f32 = undefined;
+    const plain = PositionContext{ .pos = &pos, .total = 0, .delta = 0 }; // no table: scalar positions
+    fillCosSin(&one_cos, &one_sin, plain, 10, 1, 1, &inv_freq, &sel, rope_dims);
+    for (0..rope_dims) |d| try std.testing.expectEqual(one_cos[d], cos_all[12 * rope_dims + d]);
+}
+
 test "mrope interleaved selector matches reference [11,11,10] over 32 freqs" {
     var sel: [32]u8 = undefined;
     interleavedSelector(&sel, .{ 11, 11, 10 });

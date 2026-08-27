@@ -4,7 +4,8 @@
 # call + round-trip, streaming delta cleanliness, and a prompt past the QSA
 # budget (2048 tokens) — asserted through the server's own
 # `[qsa] sparse attention engaged` line, since a dense fallback answers
-# plausibly too. SKIPs without the pack.
+# plausibly too. [7] sends an image (tower + M-RoPE engagement lines) and
+# SKIPs when the pack ships no `model-vision.safetensors`. SKIPs without the pack.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_exp.sh [port]
 set -u
 MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
@@ -56,5 +57,23 @@ check "mtp == serial (first 60 chars)" "${mtp:0:60}" "${base:0:60}"
 apr=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1 | sed -E 's/.*avg_per_round=([0-9.]+).*/\1/')
 echo "  avg accepted per round: $apr"
 check "acceptance floor 0.5/round" "$(python3 -c "print(1 if float('${apr:-0}')>=0.5 else 0)")" "1"
+echo "[7] image turn (vision tower + M-RoPE)"
+IMAGE="$(dirname "$0")/fixtures/house.jpeg"
+if [ -f "$MODEL/model-vision.safetensors" ] && [ -f "$IMAGE" ]; then
+  B64=$(base64 -i "$IMAGE")
+  img=$(python3 -c "
+import json,sys
+print(json.dumps({'messages':[{'role':'user','content':[{'type':'text','text':'What is the main subject of this image? One word.'},{'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+sys.argv[1]}}]}],'max_tokens':48,'temperature':0,'enable_thinking':False}))" "$B64")
+  resp=$(echo "$img" | curl -s -m 600 -w '\n%{http_code}' "$U/v1/chat/completions" -H 'content-type: application/json' -d @-)
+  code=$(echo "$resp" | tail -1)
+  ians=$(echo "$resp" | sed '$d' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])" 2>/dev/null)
+  echo "  -> $(echo "$ians" | tr '\n' ' ' | cut -c1-80)"
+  check "image http 200" "$code" "200"
+  check "image answer names the house" "$(echo "$ians" | grep -ciE 'house|home|building|cottage' | sed 's/^[1-9][0-9]*$/1/')" "1"
+  check "vision encoder load line" "$(grep -c 'Vision encoder: Qwen3-VL ViT' "$LOG")" "1"
+  check "m-rope engaged" "$(grep -c 'M-RoPE: 1 images' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
+else
+  echo "  SKIP: pack has no model-vision.safetensors"
+fi
 echo "passed $pass failed $fail"
 [ "$fail" = 0 ]

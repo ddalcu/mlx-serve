@@ -1,5 +1,11 @@
 # Changelog
 
+## v26.8.11 — 3.8 Qwen Flash Next + MLX 0.32.2 - Next Release
+- Add 9 custom kernels for Qwen 3.8 Flash Next, decoding at about 60 tok/s in serial
+- Qwen 3.8 Flash Next takes images and video: the checkpoint's own vision tower (`--add-vision` on the pack) with M-RoPE through attention and the sparse-attention indexer
+- Fix: video input on Qwen 3.5/3.8 never reached the model (the frames were encoded but the video placeholder rows were not spliced into the prompt)
+- Upgrade to mlx 0.32.2, boosts performance by ~3% in some cases.
+- 
 ## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
 
 ### Highlights

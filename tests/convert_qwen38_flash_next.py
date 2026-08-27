@@ -9,7 +9,9 @@ Layout / renames:
     mtp.*                           -> language_model.mtp.*
     mlp.experts.gate_up_proj [E,2I,H] -> mlp.switch_mlp.{gate,up}_proj [E,I,H]
     mlp.experts.down_proj    [E,H,I]  -> mlp.switch_mlp.down_proj
-    model.visual.*                  -> DROPPED (text-only build)
+    model.visual.*                  -> skipped by the stream; `--add-vision`
+        appends them bf16 pass-through as `model-vision.safetensors` (one HF
+        shard holds the whole tower) and restores `vision_config`
     ple.ple_embedding.ngram_embedding.shard_N -> ONE merged table in
         `ngram_table.bin` (safetensors-format, NOT a *.safetensors name so the
         directory loader never mlx-loads it; the engine gathers rows from the
@@ -17,7 +19,7 @@ Layout / renames:
 
 Widths: routed experts `--bits` (default 4, gs 64); n-gram table
 `--ngram-bits` (default 4, gs 32 because the row width is 160); every other
-2-D projection 8-bit gs 64; embed_tokens 4-bit gs 64; 2-D weights with fewer
+2-D projection `--nonexpert-bits` (default 8, 4 = the -all pack) gs 64; embed_tokens 4-bit gs 64; 2-D weights with fewer
 than 32 rows (router `mlp.gate`, `shared_expert_gate`, `block_inject_weight`,
 GDN `in_proj_a/b`) and every 1-D tensor stay bf16.
 
@@ -29,6 +31,7 @@ reads [C, K, 1].
 
   python3 tests/convert_qwen38_flash_next.py --dst ~/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit \
       --stage ~/claude-tmp/qwen38-flash-next/stage
+  python3 tests/convert_qwen38_flash_next.py --add-vision --dst <pack> --stage <dir>   # or --src <hf dir>
 """
 
 import argparse
@@ -68,9 +71,10 @@ tags:
 
 # Qwen3.8-Flash-Next for mlx-serve (4-bit experts, 8-bit rest)
 
-Text-only mlx-serve pack of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
+mlx-serve pack of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
 the Qwen4 preview architecture (`model_type: qwen4_exp`). Runs on a 128 GB Mac
-with about 75 GB resident. Includes the MTP head.
+with about 75 GB resident. Includes the MTP head and the vision tower (image
+and video input).
 
 ```bash
 mlx-serve --model ddalcu/{repo_name} --serve
@@ -129,7 +133,8 @@ the page cache already is an LRU over exactly this access pattern.
 
 Every `(1 + w)` RMSNorm has the `+1` folded into the stored weight; depthwise
 convs are transposed to MLX's `[C, K, 1]`; `experts.gate_up_proj` is split into
-`switch_mlp.gate_proj` / `up_proj`. The vision tower is dropped.
+`switch_mlp.gate_proj` / `up_proj`. The vision tower ships dense bf16 in
+`model-vision.safetensors` (~0.9 GB).
 
 ## Serving notes
 
@@ -145,7 +150,8 @@ convs are transposed to MLX's `[C, K, 1]`; `experts.gate_up_proj` is split into
   `--prefill-chunk` because the sparse-attention selection is built per chunk.
 - **Thinking** is on by default (`"enable_thinking": false` turns it off).
   Tools use Qwen3.8's XML call format; mlx-serve parses and schema-coerces it.
-- **No images**: text only.
+- **Images and video** go through the Qwen3-VL-style tower (`model.visual.*`,
+  dense bf16). MTP is declined on image turns (serial decode).
 
 ## Conversion
 
@@ -157,6 +163,8 @@ before the full conversion.
 """
 
 SHARD_BYTES = 2 * 1024 ** 3
+VISION_FILE = "model-vision.safetensors"
+VISION_PREFIX = "model.visual."
 COPY_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
               "generation_config.json", "vocab.json", "merges.txt", "LICENSE")
 NORM_FOLD_SUFFIXES = (
@@ -182,13 +190,13 @@ def needs_norm_fold(name):
     return name.endswith(NORM_FOLD_SUFFIXES)
 
 
-def width_for(name, shape):
+def width_for(name, shape, nonexpert_bits=8):
     """(bits, group_size) or None for bf16 pass-through."""
     if len(shape) != 2 or shape[0] < 32 or shape[1] % 64 != 0:
         return None
     if name.endswith("embed_tokens.weight"):
         return 4, 64
-    return 8, 64
+    return nonexpert_bits, 64
 
 
 def read_header(path):
@@ -299,6 +307,67 @@ class Prefetcher:
             return self.done.pop(i)
 
 
+def add_vision(args):
+    """Append the bf16 vision tower to an existing pack: only the HF shard(s)
+    holding `model.visual.*` are fetched, every tensor passes through
+    unquantized into VISION_FILE, the index and config.json are merged.
+    Idempotent."""
+    dst = Path(os.path.expanduser(args.dst))
+    idx_path = dst / "model.safetensors.index.json"
+    cfg_path = dst / "config.json"
+    index = json.loads(idx_path.read_text())
+    cfg = json.loads(cfg_path.read_text())
+    if (dst / VISION_FILE).exists() and VISION_FILE in index["weight_map"].values() and "vision_config" in cfg:
+        print(f"{dst.name}: vision tower already present")
+        return 0
+    local = args.src is not None
+    if local:
+        stage = Path(os.path.expanduser(args.src))
+    else:
+        from huggingface_hub import hf_hub_download
+        stage = Path(os.path.expanduser(args.stage))
+        stage.mkdir(parents=True, exist_ok=True)
+        for f in ("config.json", "model.safetensors.index.json"):
+            hf_hub_download(REPO, f, local_dir=stage)
+    hf_cfg = json.loads((stage / "config.json").read_text())
+    if (dst / VISION_FILE).exists():
+        # A sibling pack's shard hard-linked in (same bytes): merge only.
+        header, _ = read_header(str(dst / VISION_FILE))
+        out = {k: (m["dtype"], m["shape"], b"\0" * (m["data_offsets"][1] - m["data_offsets"][0])) for k, m in header.items()}
+    else:
+        if (stage / "model.safetensors.index.json").exists():
+            wm = json.loads((stage / "model.safetensors.index.json").read_text())["weight_map"]
+            files = sorted({v for k, v in wm.items() if k.startswith(VISION_PREFIX)})
+        else:
+            files = ["model.safetensors"]
+        out = {}
+        for fname in files:
+            path = str(stage / fname) if local else hf_hub_download(REPO, fname, local_dir=str(stage))
+            header, data_off = read_header(path)
+            for name in sorted(header):
+                if not name.startswith(VISION_PREFIX):
+                    continue
+                meta = header[name]
+                out[name] = (meta["dtype"], meta["shape"], read_raw(path, data_off, meta).tobytes())
+            if not local:
+                os.remove(path)
+        if not out:
+            raise SystemExit(f"no {VISION_PREFIX}* tensors in {files}")
+        write_safetensors_raw(str(dst / VISION_FILE), out)
+    added = 0
+    for k, t in out.items():
+        if index["weight_map"].get(k) != VISION_FILE:
+            added += len(t[2])
+        index["weight_map"][k] = VISION_FILE
+    index["metadata"]["total_size"] = index["metadata"].get("total_size", 0) + added
+    idx_path.write_text(json.dumps(index, indent=2))
+    cfg["vision_config"] = hf_cfg["vision_config"]
+    cfg["language_model_only"] = False
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+    print(f"wrote {VISION_FILE}: {len(out)} tensors, {os.path.getsize(dst / VISION_FILE)/1e9:.2f} GB")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dst", required=True)
@@ -306,8 +375,12 @@ def main():
     ap.add_argument("--src", default=None, help="local HF checkpoint dir instead of the Hub")
     ap.add_argument("--bits", type=int, default=4)
     ap.add_argument("--ngram-bits", type=int, default=4)
+    ap.add_argument("--nonexpert-bits", type=int, default=8, help="width for every non-expert 2-D projection (4 = the -all pack)")
     ap.add_argument("--ahead", type=int, default=2)
+    ap.add_argument("--add-vision", action="store_true", help="append the bf16 vision tower to the pack at --dst (no re-stream)")
     args = ap.parse_args()
+    if args.add_vision:
+        return add_vision(args)
 
     dst = Path(os.path.expanduser(args.dst))
     dst.mkdir(parents=True, exist_ok=True)
@@ -405,7 +478,7 @@ def main():
             if nk.endswith(".mlp.experts.down_proj"):
                 emit_q(nk[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight", arr, args.bits, 64)
                 continue
-            w = width_for(nk, arr.shape) if meta["dtype"] == "BF16" else None
+            w = width_for(nk, arr.shape, args.nonexpert_bits) if meta["dtype"] == "BF16" else None
             if w:
                 emit_q(nk, arr, *w)
                 continue
@@ -435,7 +508,7 @@ def main():
     cfg["ngram_table"] = {"file": "ngram_table.bin", "bits": args.ngram_bits, "group_size": 32}
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
     (dst / "README.md").write_text(README.format(
-        repo_name=dst.name, ngram_gb=os.path.getsize(dst / "ngram_table.bin") / 1e9, nonexpert_bits=8))
+        repo_name=dst.name, ngram_gb=os.path.getsize(dst / "ngram_table.bin") / 1e9, nonexpert_bits=args.nonexpert_bits))
     state_path.unlink()
     print(f"done: {state['total']/1e9:.1f} GB trunk + ngram_table.bin "
           f"{os.path.getsize(dst / 'ngram_table.bin')/1e9:.1f} GB in {(time.time()-t0)/60:.0f} min")
