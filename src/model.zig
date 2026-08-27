@@ -144,6 +144,16 @@ pub const ModelConfig = struct {
     rope_scaling_factor: f32 = 1.0,
     rope_proportional: bool = false, // Gemma 4: full attention uses proportional RoPE
     rope_proportional_factor: f32 = 1.0,
+    // Llama-3.1/3.2 "llama3" rope_scaling: a piecewise wavelength blend
+    // (low/high freq factors around original_max_position_embeddings), NOT
+    // a uniform `rope_scaling_factor` division. Reuses the SAME
+    // `rope_freqs_global` custom-frequencies mechanism as Gemma 4's
+    // proportional RoPE (mutually exclusive with `rope_proportional`).
+    rope_llama3: bool = false,
+    rope_llama3_factor: f32 = 8.0,
+    rope_llama3_low_freq_factor: f32 = 1.0,
+    rope_llama3_high_freq_factor: f32 = 4.0,
+    rope_llama3_orig_max_pos: u32 = 8192,
 
     // Sliding window attention
     has_sliding_window: bool = true,
@@ -477,6 +487,20 @@ pub const ModelConfig = struct {
     image_token_id: u32 = 0, // 0 = no image token
     boi_token_id: u32 = 0, // beginning of image
     eoi_token_id: u32 = 0, // end of image
+
+    // JoyCaption / standard HF LLaVA (src/joycaption_vision.zig): a plain,
+    // fixed-resolution SigLIP tower (siglip_vision_model, NO CLS token,
+    // NO RoPE, NO gating — 2 layernorms + fc1/fc2 MLP, everything biased)
+    // bridged to the text trunk by a 2-layer MLP `multi_modal_projector`.
+    // Distinct from the Gemma fields above, which are a different SigLIP
+    // variant (2D RoPE, clipped linears, sandwich norms, gated MLP).
+    joycaption_vision: bool = false,
+    vision_image_size: u32 = 384, // fixed square resize target (image_size in vision_config)
+    vision_layer_norm_eps: f32 = 1e-6,
+    // HF `hidden_states` index (Python-negative allowed): which vision layer's
+    // OUTPUT to splice. -2 (JoyCaption's value) means "skip the LAST encoder
+    // layer and post_layernorm entirely" — see joycaption_vision.zig.
+    vision_feature_layer: i32 = -2,
 
     // Gemma 4 12B "unified" (encoder-free) multimodal. Instead of the SigLIP
     // transformer tower, vision is a single patch embedder
@@ -1720,6 +1744,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (vc.get("patch_size")) |v| {
                 if (v == .integer) config.vision_patch_size = @intCast(v.integer);
             }
+            if (vc.get("image_size")) |v| {
+                if (v == .integer) config.vision_image_size = @intCast(v.integer);
+            }
+            if (vc.get("layer_norm_eps")) |v| {
+                config.vision_layer_norm_eps = jsonFloat(v);
+            }
             if (vc.get("pooling_kernel_size")) |v| {
                 if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer);
             }
@@ -1792,6 +1822,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     }
     if (root.get("image_token_index")) |v| {
         if (v == .integer and config.image_token_id == 0) config.image_token_id = @intCast(v.integer);
+    }
+    // JoyCaption/LLaVA: a FIXED per-image token count (no dynamic resolution),
+    // same role as Gemma's `default_output_length`/`num_soft_tokens` above.
+    if (root.get("image_seq_length")) |v| {
+        if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+    }
+    if (root.get("vision_feature_layer")) |v| {
+        if (v == .integer) config.vision_feature_layer = @intCast(v.integer);
     }
     if (root.get("boi_token_id")) |v| {
         if (v == .integer) config.boi_token_id = @intCast(v.integer);
@@ -3120,6 +3158,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.model_type = "llama";
         } else if (std.mem.eql(u8, model_type, "mistral")) {
             config.model_type = "mistral";
+        } else if (std.mem.eql(u8, model_type, "llava")) {
+            // JoyCaption (fancyfeast/llama-joycaption-beta-one-hf-llava) and
+            // any standard HF LlavaForConditionalGeneration checkpoint: a
+            // plain Llama text backbone (`text_config`, already `cfg_obj`
+            // above) + a standard SigLIP vision tower (`vision_config`,
+            // parsed generically above) bridged by `multi_modal_projector`.
+            config.model_type = "llava";
+            config.weight_prefix = "language_model.model";
+            config.joycaption_vision = true;
         } else {
             config.model_type = "unknown";
         }
@@ -3155,6 +3202,31 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.has_qk_norm = true;
+        }
+
+        // Llama-3.1/3.2 "llama3" rope_scaling: a piecewise wavelength blend,
+        // NOT the uniform `rope_scaling_factor` division the generic reader
+        // above already applied (harmless once `rope_llama3` is set — the
+        // custom-freqs path in transformer.zig ignores `rope_scaling_factor`).
+        if (std.mem.eql(u8, model_type, "llava")) {
+            if (cfg_obj.get("rope_scaling")) |rs_val| {
+                if (rs_val == .object) {
+                    const rs = rs_val.object;
+                    const is_llama3 = if (rs.get("rope_type")) |v|
+                        (v == .string and std.mem.eql(u8, v.string, "llama3"))
+                    else
+                        false;
+                    if (is_llama3) {
+                        config.rope_llama3 = true;
+                        if (rs.get("factor")) |v| config.rope_llama3_factor = jsonFloat(v);
+                        if (rs.get("low_freq_factor")) |v| config.rope_llama3_low_freq_factor = jsonFloat(v);
+                        if (rs.get("high_freq_factor")) |v| config.rope_llama3_high_freq_factor = jsonFloat(v);
+                        if (rs.get("original_max_position_embeddings")) |v| {
+                            if (v == .integer) config.rope_llama3_orig_max_pos = @intCast(v.integer);
+                        }
+                    }
+                }
+            }
         }
     }
 

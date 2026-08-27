@@ -19,6 +19,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "gemma",      // gemma, gemma2, gemma3, gemma3n, gemma4
     "qwen",       // qwen2, qwen3, qwen3_5, qwen3.5, qwen3.6
     "llama",
+    "llava",      // JoyCaption / standard HF LlavaForConditionalGeneration
     "mistral",
     "nemotron",   // nemotron_h (Mamba2 SSM hybrid)
     "lfm",        // lfm2, lfm2_vl (Liquid state-space hybrid; VL serves images)
@@ -45,6 +46,7 @@ let supportedModelTypes: Set<String> = [
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
+    "llava", // JoyCaption / standard HF LlavaForConditionalGeneration (Llama-3 + SigLIP)
     "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)

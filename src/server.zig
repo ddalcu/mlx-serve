@@ -9978,6 +9978,9 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.joycaption_vision) {
+        return .{ .mode = .siglip, .fixed_size = config.vision_image_size };
+    }
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -10451,6 +10454,35 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
+
+    // JoyCaption SigLIP: FIXED square resize (no smart-resize — the tower's
+    // patch grid, and therefore `image_seq_length`, is constant), bilinear-
+    // family resample + proper (x/255−0.5)/0.5 normalization at preprocess
+    // time (unlike `.gemma`, whose (x−0.5)/0.5 happens inside the tower
+    // forward). `grid_h` stays 0 — this is CHW pixels, routed to
+    // `VisionEncoder.forward` like Gemma's, not `forwardPatches`.
+    if (vp.mode == .siglip) {
+        const siglip_target = if (vp.fixed_size > 0) vp.fixed_size else 384;
+        const out_size = 3 * siglip_target * siglip_target;
+        const out_buf = allocator.alloc(u8, out_size * 4) catch return null;
+        const chw: [*]f32 = @ptrCast(@alignCast(out_buf.ptr));
+        const source_len: usize = @as(usize, src_h) * src_w * 3;
+        qwen_vision.resizeRgbNormalizedChw(
+            allocator,
+            chw[0..out_size],
+            px[0..source_len],
+            src_h,
+            src_w,
+            siglip_target,
+            siglip_target,
+            resampleFilterFor(vp),
+        ) catch {
+            allocator.free(out_buf);
+            return null;
+        };
+        log.info("  Decoded {d}x{d} image → siglip {d}x{d} float32 CHW\n", .{ src_w, src_h, siglip_target, siglip_target });
+        return .{ .pixels = out_buf, .width = siglip_target, .height = siglip_target };
+    }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that

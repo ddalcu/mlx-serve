@@ -41,7 +41,13 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, siglip } = .gemma,
+    /// siglip (JoyCaption): the fixed square resize target in pixels (e.g.
+    /// 384). Distinct from `.gemma`'s hardcoded 768 — JoyCaption's SigLIP
+    /// also gets proper bilinear resize + mean/std normalization at
+    /// preprocess time (see `decodeImageToPixels`), not `.gemma`'s
+    /// nearest-neighbor + defer-to-tower-forward convention.
+    fixed_size: u32 = 0,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
