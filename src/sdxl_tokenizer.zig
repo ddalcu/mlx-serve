@@ -371,6 +371,58 @@ pub fn load(
     return t;
 }
 
+/// Build a tokenizer from vocab/merges BYTES rather than files, for a
+/// single-file checkpoint that ships no tokenizer at all. The CLIP BPE is
+/// standard and fixed, so `sdxl_single_file` embeds one copy and feeds it here
+/// with each tower's own `pad_id` (49407 for CLIP-L, 0 for bigG — see the file
+/// header). Parsing mirrors `load`'s vocab.json / merges.txt blocks exactly.
+pub fn initFromBytes(
+    allocator: std.mem.Allocator,
+    vocab_json: []const u8,
+    merges_txt: []const u8,
+    pad_id: u32,
+) !ClipTokenizer {
+    var t = ClipTokenizer{
+        .allocator = allocator,
+        .vocab = .empty,
+        .ranks = .empty,
+        .byte_map = lm_tok.buildBytesToUnicode(),
+        .pad_id = pad_id,
+    };
+    errdefer t.deinit();
+
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vocab_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.BadClipVocab;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |e| {
+            const key = try allocator.dupe(u8, e.key_ptr.*);
+            errdefer allocator.free(key);
+            try t.vocab.put(allocator, key, @intCast(e.value_ptr.*.integer));
+        }
+    }
+
+    {
+        var rank: u32 = 0;
+        var lines = std.mem.splitScalar(u8, merges_txt, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (std.mem.indexOfScalar(u8, line, ' ') == null) continue;
+            const key = try allocator.dupe(u8, line);
+            errdefer allocator.free(key);
+            try t.ranks.put(allocator, key, rank);
+            rank += 1;
+        }
+    }
+
+    log.info("[sdxl] loaded single-file tokenizer: vocab={d} merges={d} pad_id={d}\n", .{
+        t.vocab.count(), t.ranks.count(), t.pad_id,
+    });
+    return t;
+}
+
 fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return error.BadPath;
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});

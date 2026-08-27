@@ -36,6 +36,7 @@ test {
     _ = @import("sdxl_vae.zig");
     _ = @import("sdxl_tokenizer.zig");
     _ = @import("sdxl_pipeline.zig");
+    _ = @import("sdxl_single_file.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");

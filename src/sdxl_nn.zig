@@ -261,8 +261,20 @@ pub fn upsample2x(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, s: S)
 /// diffusers' attention projections (`to_q`/`to_k`/`to_v`) have none, while
 /// everything else here does.
 pub const Linear = struct {
+    /// DENSE: the weight PRE-TRANSPOSED to `[in, out]`. QUANTIZED (affine): the
+    /// PACKED weight `[out, in·bits/32]` as stored — not transposed, because
+    /// `mlx_quantized_matmul(transpose_w=true)` wants the `[out, in]` logical
+    /// orientation. Which one is decided by `scales != null`.
     w_t: mlx.mlx_array,
     b: ?mlx.mlx_array,
+    /// Affine-quantization operands. Non-null marks this a quantized linear
+    /// (the SceneWorks q4/q8 diffusers packs quantize every SDXL matmul —
+    /// attention, ff, proj_in/out, the time/add embeds, resnet `time_emb_proj`
+    /// — and keep convs + norms dense). `mlx_quantized_matmul` dequant-frees.
+    scales: ?mlx.mlx_array = null,
+    q_biases: ?mlx.mlx_array = null,
+    bits: u32 = 0,
+    group_size: u32 = 0,
     /// Attached adapters, summed at forward time and never merged into
     /// `w_t` — the base weight stays pristine so a second request with a
     /// different stack costs a re-attach rather than a reload. Non-owning:
@@ -273,13 +285,21 @@ pub const Linear = struct {
     pub fn deinit(self: *Linear) void {
         _ = mlx.mlx_array_free(self.w_t);
         if (self.b) |bb| _ = mlx.mlx_array_free(bb);
+        if (self.scales) |x| _ = mlx.mlx_array_free(x);
+        if (self.q_biases) |x| _ = mlx.mlx_array_free(x);
     }
 
     pub fn forward(self: *const Linear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        var y = try matmul(x, self.w_t, s);
+        var y = if (self.scales) |sc| blk: {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w_t, sc, self.q_biases.?, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
+            break :blk o;
+        } else try matmul(x, self.w_t, s);
         errdefer _ = mlx.mlx_array_free(y);
         // The delta rides on the PRE-bias product, matching mflux's
-        // `FusedLoRALinear`: bias is not part of the low-rank update.
+        // `FusedLoRALinear`: bias is not part of the low-rank update. A LoRA
+        // delta is low-rank DENSE and rides a quantized base unchanged (never
+        // merged — a quantized weight would requantize the delta away).
         if (self.lora_count > 0) {
             const d = try lora_mod.deltaSum(x, self.lora_refs[0..self.lora_count], s);
             defer _ = mlx.mlx_array_free(d);
@@ -342,6 +362,33 @@ pub fn loadConvWeight(w: *const Weights, key: []const u8, dt: mlx.mlx_dtype, s: 
 
 /// Load a linear weight, transposing PyTorch `[out, in]` to `[in, out]`.
 /// `bias_key` null means the layer genuinely has no bias.
+/// Infer affine (bits, group_size) from a packed weight + its scales. The
+/// packed weight's last axis is `in·bits/32`; scales' is `in/group_size`, so
+/// `w_cols·32/s_cols = bits·group_size`. The product alone is ambiguous
+/// ((3,64) vs (6,32)…), so group sizes are tried in convention order (64 is the
+/// mlx/mlx-community default). Local copy of flux.zig's helper — the sdxl port
+/// keeps its plumbing self-contained.
+pub const QuantGeom = struct { bits: u32, group_size: u32 };
+
+pub fn inferQuantGeometry(w: mlx.mlx_array, scales: mlx.mlx_array) QuantGeom {
+    const wsh = mlx.getShape(w);
+    const ssh = mlx.getShape(scales);
+    const fallback = QuantGeom{ .bits = 4, .group_size = 64 };
+    if (wsh.len == 0 or ssh.len == 0) return fallback;
+    const w_cols: usize = @intCast(wsh[wsh.len - 1]);
+    const s_cols: usize = @intCast(ssh[ssh.len - 1]);
+    if (s_cols == 0 or (w_cols * 32) % s_cols != 0) return fallback;
+    const product = w_cols * 32 / s_cols; // bits · group_size
+    for ([_]u32{ 64, 32, 128 }) |gs| {
+        if (product % gs != 0) continue;
+        const bits: u32 = @intCast(product / gs);
+        for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |vb| {
+            if (bits == vb) return .{ .bits = bits, .group_size = gs };
+        }
+    }
+    return fallback;
+}
+
 pub fn loadLinear(
     w: *const Weights,
     key_w: []const u8,
@@ -353,13 +400,42 @@ pub fn loadLinear(
         log.err("[sdxl] MISSING LINEAR WEIGHT: {s}\n", .{key_w});
         return error.MissingSdxlWeight;
     };
+    const b = if (key_b) |kb| try dupWeight(w, kb, dt, s) else null;
+    errdefer {
+        if (b) |bb| _ = mlx.mlx_array_free(bb);
+    }
+
+    // Affine-quantized when a sibling `.scales` is present (the q4/q8 packs).
+    // The packed weight (uint32) is kept AS-IS — never astyped — and forward
+    // routes through `mlx_quantized_matmul(transpose_w=true)`.
+    if (std.mem.endsWith(u8, key_w, ".weight")) {
+        const base = key_w[0 .. key_w.len - ".weight".len];
+        var sbuf: [256]u8 = undefined;
+        var bbuf: [256]u8 = undefined;
+        const sk = std.fmt.bufPrint(&sbuf, "{s}.scales", .{base}) catch return error.SdxlKeyTooLong;
+        if (w.get(sk)) |scales_src| {
+            const bk = std.fmt.bufPrint(&bbuf, "{s}.biases", .{base}) catch return error.SdxlKeyTooLong;
+            const qbiases_src = w.get(bk) orelse {
+                log.err("[sdxl] quantized {s} has scales but no biases\n", .{base});
+                return error.MissingSdxlWeight;
+            };
+            const packed_w = try astype(src, mlx.mlx_array_dtype(src), s); // own the uint32, unchanged
+            errdefer _ = mlx.mlx_array_free(packed_w);
+            const scales = try astype(scales_src, dt, s);
+            errdefer _ = mlx.mlx_array_free(scales);
+            const qbiases = try astype(qbiases_src, dt, s);
+            errdefer _ = mlx.mlx_array_free(qbiases);
+            const geo = inferQuantGeometry(packed_w, scales);
+            return .{ .w_t = packed_w, .b = b, .scales = scales, .q_biases = qbiases, .bits = geo.bits, .group_size = geo.group_size };
+        }
+    }
+
     const cast = try astype(src, dt, s);
     defer _ = mlx.mlx_array_free(cast);
     const t = try transpose(cast, &[_]c_int{ 1, 0 }, s);
     defer _ = mlx.mlx_array_free(t);
     const w_t = try contiguous(t, s);
     errdefer _ = mlx.mlx_array_free(w_t);
-    const b = if (key_b) |kb| try dupWeight(w, kb, dt, s) else null;
     return .{ .w_t = w_t, .b = b };
 }
 
@@ -577,6 +653,38 @@ test "sdxl nn: conv weight load permutes PyTorch OIHW to MLX OHWI" {
     defer a.free(got);
     // OHWI order: [o][kh][kw][in] -> (0,0,0,0)=1, (0,0,0,1)=4, (0,0,1,0)=2 ...
     try testing.expectEqualSlices(f32, &[_]f32{ 1, 4, 2, 5, 3, 6 }, got);
+}
+
+test "sdxl nn: loadLinear detects affine quantization and infers geometry" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    const a = testing.allocator;
+    var w = Weights.init(a);
+    defer w.deinit();
+
+    // A quantized linear at bits=4, group_size=64 over in=128, out=4:
+    //   packed w cols = in·bits/32 = 16 ; scales cols = in/gs = 2.
+    var wq: [64]f32 = undefined;
+    for (&wq, 0..) |*v, i| v.* = @floatFromInt(i);
+    var sc: [8]f32 = .{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    try w.put("blk.to_q.weight", constArray(&wq, &[_]c_int{ 4, 16 }));
+    try w.put("blk.to_q.scales", constArray(&sc, &[_]c_int{ 4, 2 }));
+    try w.put("blk.to_q.biases", constArray(&sc, &[_]c_int{ 4, 2 }));
+
+    var lin = try loadLinear(&w, "blk.to_q.weight", null, .float16, s);
+    defer lin.deinit();
+    try testing.expect(lin.scales != null);
+    try testing.expect(lin.q_biases != null);
+    try testing.expectEqual(@as(u32, 4), lin.bits);
+    try testing.expectEqual(@as(u32, 64), lin.group_size);
+
+    // A dense linear (no `.scales` sibling) stays dense.
+    var d = Weights.init(a);
+    defer d.deinit();
+    var dw: [8]f32 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try d.put("blk.to_k.weight", constArray(&dw, &[_]c_int{ 2, 4 }));
+    var dl = try loadLinear(&d, "blk.to_k.weight", null, .float16, s);
+    defer dl.deinit();
+    try testing.expect(dl.scales == null);
 }
 
 test "sdxl nn: silu and gelu are the exact forms diffusers uses" {

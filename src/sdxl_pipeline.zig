@@ -42,6 +42,7 @@ const nn = @import("sdxl_nn.zig");
 const krea = @import("krea.zig");
 const sse = @import("gen_sse.zig");
 const model_mod = @import("model.zig");
+const single_file = @import("sdxl_single_file.zig");
 
 const S = mlx.mlx_stream;
 
@@ -252,6 +253,76 @@ pub const Engine = struct {
         errdefer self.unet.deinit();
         self.vae = try vae_mod.load(io, allocator, s, model_dir, vae_mod.DEFAULT_DTYPE);
         return self;
+    }
+
+    /// Load a SINGLE-FILE SDXL checkpoint (the Civitai / A1111 distribution:
+    /// one `.safetensors` in LDM key naming, no configs, no tokenizer files —
+    /// how Illustrious XL and Pony Diffusion XL are shipped).
+    ///
+    /// The blob is loaded once, converted to the diffusers layout the folder
+    /// path already binds (`sdxl_single_file`), and fed through the same
+    /// `*FromWeights` binders. Configs are SDXL-standard constants: the geometry
+    /// is `unet_mod.BASE_CONFIG`, the schedule the base default (leading /
+    /// epsilon / guidance 5), the tokenizer the embedded CLIP BPE. A checkpoint
+    /// with a non-standard schedule (a Turbo/Lightning single-file) still runs
+    /// but at base defaults — the single-file format carries nothing that could
+    /// say otherwise.
+    pub fn loadSingleFile(allocator: std.mem.Allocator, abs_path: []const u8) !*Engine {
+        const s = mlx.mlx_default_gpu_stream_new();
+        const self = try allocator.create(Engine);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
+        self.s = s;
+        self.force_zeros_for_empty_prompt = true; // SDXL base default
+        self.sched_cfg = .{};
+
+        var ldm = try model_mod.loadWeightsSingleFile(allocator, abs_path);
+        defer ldm.deinit();
+        if (!single_file.isLdmSdxl(&ldm)) return error.NotAnSdxlCheckpoint;
+
+        var w = try single_file.convert(allocator, &ldm);
+        defer w.deinit();
+
+        self.tok_l = try clip_tok.initFromBytes(allocator, single_file.CLIP_VOCAB_JSON, single_file.CLIP_MERGES_TXT, single_file.CLIP_L_PAD_ID);
+        errdefer self.tok_l.deinit();
+        self.tok_g = try clip_tok.initFromBytes(allocator, single_file.CLIP_VOCAB_JSON, single_file.CLIP_MERGES_TXT, single_file.CLIP_BIGG_PAD_ID);
+        errdefer self.tok_g.deinit();
+
+        // The two towers read SEPARATE maps — identical `text_model.*` key names.
+        self.tower_l = try clip.loadTowerFromWeights(allocator, s, &w.clip_l, "text_encoder", sdxl.CLIP_L_CONFIG, clip.towerDtype());
+        errdefer self.tower_l.deinit();
+        self.tower_g = try clip.loadTowerFromWeights(allocator, s, &w.clip_g, "text_encoder_2", sdxl.CLIP_BIG_G_CONFIG, clip.towerDtype());
+        errdefer self.tower_g.deinit();
+
+        const unet_dtype: mlx.mlx_dtype = if (std.c.getenv("SDXL_UNET_F32") != null) .float32 else .float16;
+        // BASE_CONFIG's slices are comptime literals — never freed, so owns_cfg=false.
+        self.unet = try unet_mod.loadFromWeights(allocator, s, &w.main, unet_mod.BASE_CONFIG, unet_dtype, false);
+        errdefer self.unet.deinit();
+        self.vae = try vae_mod.loadFromWeights(allocator, s, &w.main, sdxl.VAE_SCALING_FACTOR, vae_mod.DEFAULT_DTYPE);
+
+        log.info("[sdxl] loaded single-file checkpoint: {s}\n", .{abs_path});
+        return self;
+    }
+
+    /// Load from a resolved model directory, choosing the layout: a diffusers
+    /// repo (has `model_index.json`) goes through `load`; a directory holding a
+    /// single LDM `.safetensors` and no configs goes through `loadSingleFile`.
+    /// This is the entry point the media registry calls.
+    pub fn loadAuto(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
+        // A diffusers repo is canonical when its index is present.
+        const idx = try std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir});
+        defer allocator.free(idx);
+        const has_index = if (std.Io.Dir.openFileAbsolute(io, idx, .{})) |f| blk: {
+            f.close(io);
+            break :blk true;
+        } else |_| false;
+        if (!has_index) {
+            if (try single_file.findLdmSdxlFile(io, allocator, model_dir)) |path| {
+                defer allocator.free(path);
+                return loadSingleFile(allocator, path);
+            }
+        }
+        return load(io, allocator, model_dir);
     }
 
     pub fn deinit(self: *Engine) void {

@@ -33,6 +33,8 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const sdxl = @import("sdxl.zig");
 
+const nn = @import("sdxl_nn.zig");
+
 const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
 
@@ -111,16 +113,29 @@ fn activate(x: mlx.mlx_array, kind: sdxl.ClipActivation, s: S) !mlx.mlx_array {
 /// A linear with a bias — every CLIP projection has one, unlike the flow
 /// backends where bias-less linears are the norm.
 const Linear = struct {
-    w_t: mlx.mlx_array, // pre-transposed [in, out]
+    /// DENSE: pre-transposed `[in, out]`. QUANTIZED: packed `[out, in·bits/32]`
+    /// as stored (forward uses `mlx_quantized_matmul(transpose_w=true)`). The
+    /// q4/q8 packs quantize every CLIP encoder linear (q/k/v/out_proj, fc1/fc2).
+    w_t: mlx.mlx_array,
     b: mlx.mlx_array,
+    scales: ?mlx.mlx_array = null,
+    q_biases: ?mlx.mlx_array = null,
+    bits: u32 = 0,
+    group_size: u32 = 0,
 
     fn deinit(self: *Linear) void {
         _ = mlx.mlx_array_free(self.w_t);
         _ = mlx.mlx_array_free(self.b);
+        if (self.scales) |x| _ = mlx.mlx_array_free(x);
+        if (self.q_biases) |x| _ = mlx.mlx_array_free(x);
     }
 
     fn forward(self: *const Linear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const y = try matmul(x, self.w_t, s);
+        const y = if (self.scales) |sc| blk: {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w_t, sc, self.q_biases.?, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
+            break :blk o;
+        } else try matmul(x, self.w_t, s);
         errdefer _ = mlx.mlx_array_free(y);
         const out = try addA(y, self.b, s);
         _ = mlx.mlx_array_free(y);
@@ -391,22 +406,50 @@ pub fn loadTower(
     defer allocator.free(dir);
     var w = try model_mod.loadWeights(io, allocator, dir);
     defer w.deinit();
+    return loadTowerFromWeights(allocator, s, &w, sub, cfg, dtype);
+}
 
+/// The weight-binding half, split out so a single-file checkpoint drives it
+/// from an in-memory `Weights` map — the diffusers CLIP keys the converter
+/// produces are exactly what a `text_encoder/` folder holds. `sub` is only a
+/// log label here.
+pub fn loadTowerFromWeights(
+    allocator: std.mem.Allocator,
+    s: S,
+    w: *Weights,
+    sub: []const u8,
+    cfg: sdxl.ClipTextConfig,
+    dtype: mlx.mlx_dtype,
+) !TextTower {
     var tower: TextTower = undefined;
     tower.cfg = cfg;
     tower.allocator = allocator;
     tower.s = s;
 
-    tower.token_embed = try dup(&w, "text_model.embeddings.token_embedding.weight", dtype, s);
-    tower.pos_embed = try dup(&w, "text_model.embeddings.position_embedding.weight", dtype, s);
-    tower.final_ln_w = try dup(&w, "text_model.final_layer_norm.weight", dtype, s);
-    tower.final_ln_b = try dup(&w, "text_model.final_layer_norm.bias", dtype, s);
+    tower.token_embed = try dup(w, "text_model.embeddings.token_embedding.weight", dtype, s);
+    tower.pos_embed = try dup(w, "text_model.embeddings.position_embedding.weight", dtype, s);
+    tower.final_ln_w = try dup(w, "text_model.final_layer_norm.weight", dtype, s);
+    tower.final_ln_b = try dup(w, "text_model.final_layer_norm.bias", dtype, s);
 
     // Present in bigG, absent in CLIP-L — an optional, never a required get.
+    // The pooled projection is a PLAIN matmul (`pooled @ text_projection`), so a
+    // quantized `text_projection.weight` (the q4/q8 packs quantize it) is
+    // DEQUANTIZED here to a dense `[proj, hidden]` before the transpose, rather
+    // than routed through a quantized_matmul like the encoder linears.
     tower.text_projection = if (w.get(sdxl.CLIP_PROJECTION_TENSOR)) |proj_src| blk: {
         var cast = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&cast, proj_src, dtype, s));
         defer _ = mlx.mlx_array_free(cast);
+        if (w.get("text_projection.scales")) |proj_scales| {
+            const proj_biases = w.get("text_projection.biases") orelse return error.MissingWeight;
+            const geo = nn.inferQuantGeometry(proj_src, proj_scales);
+            const empty = mlx.mlx_array{ .ctx = null };
+            var deq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deq);
+            try mlx.check(mlx.mlx_dequantize(&deq, proj_src, proj_scales, proj_biases, mlx.mlx_optional_int.some(@intCast(geo.group_size)), mlx.mlx_optional_int.some(@intCast(geo.bits)), "affine", empty, mlx.mlx_optional_dtype{}, s));
+            try mlx.check(mlx.mlx_astype(&cast, deq, dtype, s));
+        } else {
+            try mlx.check(mlx.mlx_astype(&cast, proj_src, dtype, s));
+        }
         var t = mlx.mlx_array_new();
         const axes = [_]c_int{ 1, 0 };
         try mlx.check(mlx.mlx_transpose_axes(&t, cast, &axes, 2, s));
@@ -416,16 +459,16 @@ pub fn loadTower(
     tower.layers = try allocator.alloc(Layer, cfg.layers);
     errdefer allocator.free(tower.layers);
     for (tower.layers, 0..) |*layer, i| {
-        layer.ln1_w = try dupIdx(&w, allocator, i, "layer_norm1.weight", dtype, s);
-        layer.ln1_b = try dupIdx(&w, allocator, i, "layer_norm1.bias", dtype, s);
-        layer.ln2_w = try dupIdx(&w, allocator, i, "layer_norm2.weight", dtype, s);
-        layer.ln2_b = try dupIdx(&w, allocator, i, "layer_norm2.bias", dtype, s);
-        layer.q = try linearIdx(&w, allocator, s, i, "self_attn.q_proj", dtype);
-        layer.k = try linearIdx(&w, allocator, s, i, "self_attn.k_proj", dtype);
-        layer.v = try linearIdx(&w, allocator, s, i, "self_attn.v_proj", dtype);
-        layer.o = try linearIdx(&w, allocator, s, i, "self_attn.out_proj", dtype);
-        layer.fc1 = try linearIdx(&w, allocator, s, i, "mlp.fc1", dtype);
-        layer.fc2 = try linearIdx(&w, allocator, s, i, "mlp.fc2", dtype);
+        layer.ln1_w = try dupIdx(w, allocator, i, "layer_norm1.weight", dtype, s);
+        layer.ln1_b = try dupIdx(w, allocator, i, "layer_norm1.bias", dtype, s);
+        layer.ln2_w = try dupIdx(w, allocator, i, "layer_norm2.weight", dtype, s);
+        layer.ln2_b = try dupIdx(w, allocator, i, "layer_norm2.bias", dtype, s);
+        layer.q = try linearIdx(w, allocator, s, i, "self_attn.q_proj", dtype);
+        layer.k = try linearIdx(w, allocator, s, i, "self_attn.k_proj", dtype);
+        layer.v = try linearIdx(w, allocator, s, i, "self_attn.v_proj", dtype);
+        layer.o = try linearIdx(w, allocator, s, i, "self_attn.out_proj", dtype);
+        layer.fc1 = try linearIdx(w, allocator, s, i, "mlp.fc1", dtype);
+        layer.fc2 = try linearIdx(w, allocator, s, i, "mlp.fc2", dtype);
     }
 
     log.info("[sdxl] loaded {s}: hidden={d} layers={d} heads={d} act={s} projection={}\n", .{
@@ -459,13 +502,37 @@ fn linearIdx(w: *Weights, a: std.mem.Allocator, s: S, i: usize, prefix: []const 
     defer a.free(bname);
 
     const src = w.get(wname) orelse return error.MissingWeight;
+    const b = try dup(w, bname, dt, s);
+    errdefer _ = mlx.mlx_array_free(b);
+
+    // Affine-quantized when a sibling `.scales` exists (q4/q8 packs). Keep the
+    // packed weight AS-IS; forward routes through `mlx_quantized_matmul`.
+    const sname = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}.scales", .{ i, prefix });
+    defer a.free(sname);
+    if (w.get(sname)) |scales_src| {
+        const qbname = try std.fmt.allocPrint(a, "text_model.encoder.layers.{d}.{s}.biases", .{ i, prefix });
+        defer a.free(qbname);
+        const qbiases_src = w.get(qbname) orelse return error.MissingWeight;
+        var packed_w = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&packed_w, src, mlx.mlx_array_dtype(src), s)); // own the uint32
+        errdefer _ = mlx.mlx_array_free(packed_w);
+        var scales = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&scales, scales_src, dt, s));
+        errdefer _ = mlx.mlx_array_free(scales);
+        var qbiases = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&qbiases, qbiases_src, dt, s));
+        errdefer _ = mlx.mlx_array_free(qbiases);
+        const geo = nn.inferQuantGeometry(packed_w, scales);
+        return .{ .w_t = packed_w, .b = b, .scales = scales, .q_biases = qbiases, .bits = geo.bits, .group_size = geo.group_size };
+    }
+
     var cast = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&cast, src, dt, s));
     defer _ = mlx.mlx_array_free(cast);
     var w_t = mlx.mlx_array_new();
     const axes = [_]c_int{ 1, 0 };
     try mlx.check(mlx.mlx_transpose_axes(&w_t, cast, &axes, 2, s));
-    return .{ .w_t = w_t, .b = try dup(w, bname, dt, s) };
+    return .{ .w_t = w_t, .b = b };
 }
 
 // ════════════════════════════════════════════════════════════════════════

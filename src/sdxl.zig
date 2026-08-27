@@ -353,6 +353,29 @@ pub fn indexDeclaresSdxl(allocator: std.mem.Allocator, index_json: []const u8) b
     return obj.get("text_encoder_2") != null;
 }
 
+/// Tensor names that, all present, mark a SINGLE-FILE LDM SDXL checkpoint (the
+/// Civitai / A1111 / SGM distribution — how Illustrious XL and Pony Diffusion
+/// XL ship). The LDM UNet trunk, the SDXL-only micro-conditioning embedding
+/// (`label_emb` — absent on SD 1.5), and the SECOND text encoder (bigG, what
+/// makes it XL). None is sufficient alone.
+pub const LDM_SDXL_MARKERS = [_][]const u8{
+    "model.diffusion_model.input_blocks.0.0.weight",
+    "model.diffusion_model.label_emb.0.0.weight",
+    "conditioner.embedders.1.",
+};
+
+/// True when a safetensors HEADER (its JSON name/dtype/offset map) carries all
+/// the LDM SDXL markers. Substring search over the raw header — no JSON parse,
+/// so a caller can feed a bounded prefix of a multi-GB file. Shared by
+/// `model_discovery` (classification) and `sdxl_single_file` (routing), the
+/// same one-predicate discipline `indexDeclaresSdxl` keeps.
+pub fn headerDeclaresLdmSdxl(header_bytes: []const u8) bool {
+    for (LDM_SDXL_MARKERS) |m| {
+        if (std.mem.indexOf(u8, header_bytes, m) == null) return false;
+    }
+    return true;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Tests — invariants and hand-computable values only. See ORACLE STATUS above:
 // none of this is yet pinned against an executed diffusers reference.

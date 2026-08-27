@@ -75,6 +75,16 @@ pub const Alias = struct {
     is_default: bool = false,
     /// Non-empty: restrict the download to this single .gguf artifact.
     gguf_file: []const u8 = "",
+    /// Non-empty: restrict the download to this SUBDIR of the repo, and strip
+    /// the prefix so it lands as a flat model dir. For repos that ship several
+    /// variants side by side (e.g. SceneWorks/illustrious-xl-v2-mlx holds
+    /// `bf16/`, `q4/`, `q8/`, each a full diffusers repo). Pair with `dest_name`
+    /// so the variants don't collide on disk.
+    subdir: []const u8 = "",
+    /// Non-empty: the on-disk `<org>/<name>` to store under, overriding the repo
+    /// id. Lets `illustrious:q4` and `illustrious:q8` (same repo, different
+    /// subdir) land in distinct dirs that discovery finds as separate models.
+    dest_name: []const u8 = "",
 };
 
 /// Mirrors the app catalog (`gemmaModelOptions` in ChatModels.swift).
@@ -107,11 +117,31 @@ pub const aliases = [_]Alias{
     .{ .name = "gpt-oss", .tag = "20b", .repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", .is_default = true },
     .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
+    // ── SDXL image models (media gen) ──
+    // Pony Diffusion V6 XL — a single-file LDM checkpoint (Civitai), served by
+    // `sdxl_single_file`. The repo also carries a standalone VAE + sample
+    // images; the loader picks the LDM checkpoint by its header markers.
+    .{ .name = "pony", .tag = "v6", .repo = "LyliaEngine/Pony_Diffusion_V6_XL", .is_default = true },
+    // Illustrious XL v2 — one repo, three diffusers variants in subfolders. Each
+    // `subdir` is pulled flat into its own dest so they coexist as separate
+    // models. q4/q8 need the SDXL affine-quant path (`sdxl_nn` QLinear); bf16 is
+    // dense. Bare `illustrious` = q4 (widest Mac fit), matching the 4-bit-default
+    // convention above.
+    .{ .name = "illustrious", .tag = "q4", .repo = "SceneWorks/illustrious-xl-v2-mlx", .is_default = true, .subdir = "q4", .dest_name = "SceneWorks/illustrious-xl-v2-q4" },
+    .{ .name = "illustrious", .tag = "q8", .repo = "SceneWorks/illustrious-xl-v2-mlx", .subdir = "q8", .dest_name = "SceneWorks/illustrious-xl-v2-q8" },
+    .{ .name = "illustrious", .tag = "bf16", .repo = "SceneWorks/illustrious-xl-v2-mlx", .subdir = "bf16", .dest_name = "SceneWorks/illustrious-xl-v2-bf16" },
 };
 
 pub const Resolved = struct {
     repo: []const u8,
     gguf_file: []const u8 = "",
+    subdir: []const u8 = "",
+    dest_name: []const u8 = "",
+
+    /// The `<org>/<name>` to store under — `dest_name` when set, else the repo.
+    pub fn destRepo(self: Resolved) []const u8 {
+        return if (self.dest_name.len > 0) self.dest_name else self.repo;
+    }
 };
 
 /// Short name / repo ref → HF repo id. Accepts:
@@ -145,9 +175,9 @@ pub fn resolveShortName(name: []const u8) ?Resolved {
     for (aliases) |a| {
         if (!std.ascii.eqlIgnoreCase(a.name, base)) continue;
         if (tag.len == 0) {
-            if (a.is_default) return .{ .repo = a.repo, .gguf_file = a.gguf_file };
+            if (a.is_default) return .{ .repo = a.repo, .gguf_file = a.gguf_file, .subdir = a.subdir, .dest_name = a.dest_name };
         } else if (std.ascii.eqlIgnoreCase(a.tag, tag)) {
-            return .{ .repo = a.repo, .gguf_file = a.gguf_file };
+            return .{ .repo = a.repo, .gguf_file = a.gguf_file, .subdir = a.subdir, .dest_name = a.dest_name };
         }
     }
     return null;
@@ -455,17 +485,21 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     for (files) |f| {
         if (!wantedFile(resolved, f.path)) continue;
         idx += 1;
-        const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
+        // A subdir alias strips its prefix so the variant lands as a flat model
+        // dir (`q4/unet/…` -> `unet/…`); the download URL still uses the full
+        // repo path.
+        const rel = subdirRelPath(resolved, f.path);
+        const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, rel });
         defer allocator.free(dest_path);
         if (f.size > 0) {
-            if (fileSizeAt(io, dest_dir, f.path)) |have| {
+            if (fileSizeAt(io, dest_dir, rel)) |have| {
                 if (have == f.size) {
-                    reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
+                    reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, rel });
                     continue;
                 }
             }
         }
-        reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
+        reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, rel, f.size / (1024 * 1024) });
         const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
         defer allocator.free(url);
         curlDownload(allocator, io, url, dest_path, show_progress) catch {
@@ -481,7 +515,46 @@ fn wantedFile(resolved: Resolved, path: []const u8) bool {
         // Single-artifact GGUF repos: just that file (plus nothing else).
         return std.mem.eql(u8, path, resolved.gguf_file);
     }
+    if (resolved.subdir.len > 0) {
+        // A diffusers variant is inherently nested (unet/, vae/, …), so the
+        // flat-repo `mtp/`-only rule in `shouldDownload` can't apply. Filter the
+        // STRIPPED path: keep nested model files, drop images/readme/dotfiles.
+        if (!pathInSubdir(resolved.subdir, path)) return false;
+        return wantedInVariant(subdirRelPath(resolved, path));
+    }
     return shouldDownload(path);
+}
+
+/// Keep a file inside a `subdir` variant: any nested model file, minus
+/// dotfiles, sample images and docs (the assets `shouldDownload` also skips).
+fn wantedInVariant(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '.') return false;
+    if (std.mem.indexOf(u8, rel, "/.") != null) return false; // dot-dir anywhere
+    const skip_ext = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".md" };
+    for (skip_ext) |ext| {
+        if (rel.len > ext.len and std.ascii.eqlIgnoreCase(rel[rel.len - ext.len ..], ext)) return false;
+    }
+    const base = std.fs.path.basename(rel);
+    for ([_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" }) |sk| {
+        if (std.ascii.eqlIgnoreCase(base, sk)) return false;
+    }
+    return true;
+}
+
+/// True when `path` lives under `subdir/` (a `subdir`-prefixed entry).
+fn pathInSubdir(subdir: []const u8, path: []const u8) bool {
+    return path.len > subdir.len and
+        std.mem.startsWith(u8, path, subdir) and
+        path[subdir.len] == '/';
+}
+
+/// `path` with the `subdir/` prefix removed when a subdir alias is in play,
+/// so the variant is written flat under the dest dir. Unchanged otherwise.
+fn subdirRelPath(resolved: Resolved, path: []const u8) []const u8 {
+    if (resolved.subdir.len > 0 and pathInSubdir(resolved.subdir, path)) {
+        return path[resolved.subdir.len + 1 ..];
+    }
+    return path;
 }
 
 // ── Commands ────────────────────────────────────────────────────────────
@@ -504,7 +577,7 @@ pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []co
         printKnownAliases(io);
         std.process.exit(1);
     };
-    const dest = try modelDestPath(allocator, homeDir(), resolved.repo);
+    const dest = try modelDestPath(allocator, homeDir(), resolved.destRepo());
     errdefer allocator.free(dest);
     if (modelPresent(io, dest)) return dest;
     try pullRepo(allocator, io, resolved, dest, stderr_reporter, true);
@@ -887,6 +960,37 @@ test "cli: modelDestPath layout" {
     const p = try modelDestPath(allocator, "/Users/x", "org/repo");
     defer allocator.free(p);
     try testing.expectEqualStrings("/Users/x/.mlx-serve/models/org/repo", p);
+}
+
+test "cli: SDXL bundles — pony single-file + illustrious subdir variants" {
+    // Pony: a flat single-file repo, no subdir.
+    const pony = resolveShortName("pony").?;
+    try testing.expectEqualStrings("LyliaEngine/Pony_Diffusion_V6_XL", pony.repo);
+    try testing.expectEqualStrings("", pony.subdir);
+    try testing.expectEqualStrings("LyliaEngine/Pony_Diffusion_V6_XL", pony.destRepo());
+
+    // Bare illustrious = q4 (default), stored under its own flat dest.
+    const ill = resolveShortName("illustrious").?;
+    try testing.expectEqualStrings("SceneWorks/illustrious-xl-v2-mlx", ill.repo);
+    try testing.expectEqualStrings("q4", ill.subdir);
+    try testing.expectEqualStrings("SceneWorks/illustrious-xl-v2-q4", ill.destRepo());
+    try testing.expectEqualStrings("q8", resolveShortName("illustrious:q8").?.subdir);
+    try testing.expectEqualStrings("bf16", resolveShortName("illustrious:bf16").?.subdir);
+
+    // Subdir filtering keeps the variant's nested files, strips the prefix, and
+    // rejects the OTHER variants + assets.
+    try testing.expect(wantedFile(ill, "q4/unet/diffusion_pytorch_model.safetensors"));
+    try testing.expect(wantedFile(ill, "q4/model_index.json"));
+    try testing.expect(!wantedFile(ill, "q8/unet/diffusion_pytorch_model.safetensors"));
+    try testing.expect(!wantedFile(ill, "bf16/vae/config.json"));
+    try testing.expect(!wantedFile(ill, "q4/images/sample.jpeg"));
+    try testing.expect(!wantedFile(ill, "README.md"));
+    try testing.expectEqualStrings("unet/diffusion_pytorch_model.safetensors", subdirRelPath(ill, "q4/unet/diffusion_pytorch_model.safetensors"));
+
+    // pathInSubdir is boundary-exact (q4 must not match q40).
+    try testing.expect(pathInSubdir("q4", "q4/x"));
+    try testing.expect(!pathInSubdir("q4", "q40/x"));
+    try testing.expect(!pathInSubdir("q4", "q4"));
 }
 
 test "cli: shouldDownload chat-default selection" {

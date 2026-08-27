@@ -234,9 +234,22 @@ pub fn load(
     var w = try model_mod.loadWeights(io, allocator, dir);
     defer w.deinit();
 
+    return loadFromWeights(allocator, s, &w, scaling, dtype);
+}
+
+/// The weight-binding half, split out so a single-file checkpoint can drive it
+/// from an in-memory `Weights` map (the diffusers keys are identical either
+/// way — the converter produces exactly what `load` would have read from disk).
+pub fn loadFromWeights(
+    allocator: std.mem.Allocator,
+    s: S,
+    w: *Weights,
+    scaling: f32,
+    dtype: mlx.mlx_dtype,
+) !Decoder {
     // Stage count comes from the checkpoint's own `up_blocks.N` numbering, so
     // a VAE with a different depth loads rather than being assumed to be 4.
-    const stages = countUpBlocks(&w, allocator);
+    const stages = countUpBlocks(w, allocator);
     if (stages == 0) return error.NoVaeUpBlocks;
 
     var d: Decoder = undefined;
@@ -245,14 +258,14 @@ pub fn load(
     d.dtype = dtype;
     d.scaling_factor = scaling;
 
-    d.pq_w = try nn.loadConvWeight(&w, "post_quant_conv.weight", dtype, s);
-    d.pq_b = try nn.dupWeight(&w, "post_quant_conv.bias", dtype, s);
-    d.conv_in_w = try nn.loadConvWeight(&w, "decoder.conv_in.weight", dtype, s);
-    d.conv_in_b = try nn.dupWeight(&w, "decoder.conv_in.bias", dtype, s);
+    d.pq_w = try nn.loadConvWeight(w, "post_quant_conv.weight", dtype, s);
+    d.pq_b = try nn.dupWeight(w, "post_quant_conv.bias", dtype, s);
+    d.conv_in_w = try nn.loadConvWeight(w, "decoder.conv_in.weight", dtype, s);
+    d.conv_in_b = try nn.dupWeight(w, "decoder.conv_in.bias", dtype, s);
 
-    d.mid_r0 = try nn.loadResnet(&w, allocator, "decoder.mid_block.resnets.0", false, VAE_EPS, dtype, s);
-    d.mid_r1 = try nn.loadResnet(&w, allocator, "decoder.mid_block.resnets.1", false, VAE_EPS, dtype, s);
-    d.mid_attn = try loadVaeAttn(&w, allocator, "decoder.mid_block.attentions.0", dtype, s);
+    d.mid_r0 = try nn.loadResnet(w, allocator, "decoder.mid_block.resnets.0", false, VAE_EPS, dtype, s);
+    d.mid_r1 = try nn.loadResnet(w, allocator, "decoder.mid_block.resnets.1", false, VAE_EPS, dtype, s);
+    d.mid_attn = try loadVaeAttn(w, allocator, "decoder.mid_block.attentions.0", dtype, s);
 
     d.up = try allocator.alloc(UpBlock, stages);
     errdefer allocator.free(d.up);
@@ -260,12 +273,12 @@ pub fn load(
         blk.allocator = allocator;
         blk.up_w = null;
         blk.up_b = null;
-        const n_res = countResnets(&w, allocator, bi);
+        const n_res = countResnets(w, allocator, bi);
         blk.resnets = try allocator.alloc(Resnet, n_res);
         for (blk.resnets, 0..) |*r, ri| {
             const pfx = try nn.fmtKey(allocator, "decoder.up_blocks.{d}.resnets.{d}", .{ bi, ri });
             defer allocator.free(pfx);
-            r.* = try nn.loadResnet(&w, allocator, pfx, false, VAE_EPS, dtype, s);
+            r.* = try nn.loadResnet(w, allocator, pfx, false, VAE_EPS, dtype, s);
         }
         // Every stage but the last carries an upsampler.
         const kw = try nn.fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.conv.weight", .{bi});
@@ -273,15 +286,15 @@ pub fn load(
         if (w.get(kw) != null) {
             const kb = try nn.fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.conv.bias", .{bi});
             defer allocator.free(kb);
-            blk.up_w = try nn.loadConvWeight(&w, kw, dtype, s);
-            blk.up_b = try nn.dupWeight(&w, kb, dtype, s);
+            blk.up_w = try nn.loadConvWeight(w, kw, dtype, s);
+            blk.up_b = try nn.dupWeight(w, kb, dtype, s);
         }
     }
 
-    d.norm_out_w = try nn.dupWeight(&w, "decoder.conv_norm_out.weight", dtype, s);
-    d.norm_out_b = try nn.dupWeight(&w, "decoder.conv_norm_out.bias", dtype, s);
-    d.conv_out_w = try nn.loadConvWeight(&w, "decoder.conv_out.weight", dtype, s);
-    d.conv_out_b = try nn.dupWeight(&w, "decoder.conv_out.bias", dtype, s);
+    d.norm_out_w = try nn.dupWeight(w, "decoder.conv_norm_out.weight", dtype, s);
+    d.norm_out_b = try nn.dupWeight(w, "decoder.conv_norm_out.bias", dtype, s);
+    d.conv_out_w = try nn.loadConvWeight(w, "decoder.conv_out.weight", dtype, s);
+    d.conv_out_b = try nn.dupWeight(w, "decoder.conv_out.bias", dtype, s);
 
     log.info("[sdxl] loaded vae decoder: stages={d} scaling={d:.5}\n", .{ stages, scaling });
     return d;

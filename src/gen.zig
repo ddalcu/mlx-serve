@@ -190,13 +190,20 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
 fn isSdxlRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
     defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
-    defer allocator.free(content);
-    return sdxl_mod.indexDeclaresSdxl(allocator, content);
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+        defer allocator.free(content);
+        if (sdxl_mod.indexDeclaresSdxl(allocator, content)) return true;
+    } else |_| {}
+    // No (or non-SDXL) model_index.json: a single-file LDM checkpoint. Same
+    // classification the discovery side uses (`peekSdxlSingleFile`), so `list`
+    // and the routing here agree on what "an SDXL model" is.
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekSdxlSingleFile(io, allocator, dir);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -561,7 +568,7 @@ pub const ImageEngine = struct {
                 return self;
             }
             if (std.mem.eql(u8, mt, "sdxl")) {
-                self.backend = .{ .sdxl = try sdxl_pipeline.Engine.load(io, allocator, model_dir) };
+                self.backend = .{ .sdxl = try sdxl_pipeline.Engine.loadAuto(io, allocator, model_dir) };
                 return self;
             }
         }

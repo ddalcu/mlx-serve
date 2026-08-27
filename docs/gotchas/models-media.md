@@ -1815,3 +1815,111 @@ key, so re-running a fixture-gated test with a different `*_FIXTURE` path report
 the PREVIOUS run's result and prints nothing. `touch` does not help either — Zig
 hashes content. `rm -rf .zig-cache/h` forces it. A parity test that prints
 nothing has not necessarily passed; check for its output line, not its silence.
+
+### Single-file SDXL checkpoints (Civitai / A1111 — Illustrious XL, Pony)
+
+Illustrious XL and Pony Diffusion XL are vanilla SDXL — same UNet geometry, the
+same CLIP-L + OpenCLIP-bigG pair, the same VAE, epsilon on a discrete beta
+schedule — so the only thing standing between them and `sdxl_pipeline` is
+PACKAGING. The folder loader reads a diffusers multi-folder repo (`unet/`,
+`vae/`, `text_encoder/`, `text_encoder_2/`, each with a `config.json` and
+diffusers-named weights). Civitai ships one `.safetensors` in LDM/SGM key
+naming, no configs, no tokenizer files. `sdxl_single_file.zig` bridges the two:
+it loads the blob once, converts its keys into the diffusers layout, and feeds
+the SAME `*FromWeights` binders the folder path uses (`unet.loadFromWeights`,
+`vae.loadFromWeights`, `clip.loadTowerFromWeights` — all split out for this).
+`Engine.loadAuto` picks the path: a `model_index.json` means the folder layout;
+otherwise a root `.safetensors` whose header carries the LDM markers
+(`sdxl.headerDeclaresLdmSdxl`) is a single-file checkpoint. Discovery classifies
+the same dir the same way (`model_discovery.peekSdxlSingleFile`), so `list` and
+the loader agree — the MageFlow "loadable but invisible" precedent.
+
+What the converter fills that the blob omits: geometry is `unet.BASE_CONFIG`
+(standard SDXL, correct for any base-geometry finetune); the schedule is the
+base default (leading / epsilon / guidance 5 — a Turbo/Lightning single-file
+still runs, just at base defaults, because the format carries nothing that could
+say otherwise); the tokenizer is the standard OpenAI CLIP BPE, embedded
+(`@embedFile`) so the checkpoint is self-contained, with each tower's own pad id
+(49407 for CLIP-L, 0 for bigG).
+
+Three conversions are more than a rename, and each fails SILENTLY (plausible
+image, wrong content) if wrong:
+
+  - **OpenCLIP bigG packs Q/K/V into one `in_proj_weight` `[3d, d]`.** diffusers
+    wants three `[d, d]` linears, so `attn.in_proj_{weight,bias}` splits 3-ways
+    on axis 0 → `self_attn.{q,k,v}_proj`.
+  - **`text_projection` transposes.** OpenCLIP applies `pooled @ P` with `P`
+    `[hidden, proj]`; HF `CLIPTextModelWithProjection` stores `[proj, hidden]`
+    and applies `pooled @ W.T`, so `W = P.T`. The tower loader transposes it back
+    at bind, landing on `P` — get the transpose wrong and the pooled vector (the
+    whole `add_embeds` conditioning) is subtly off with no shape error, since
+    bigG's projection is square 1280×1280.
+  - **LDM VAE attention stores Q/K/V/proj_out as 1×1 convs `[c, c, 1, 1]`.**
+    diffusers wants `[c, c]` linears, so those squeeze (rank-gated — SDXL's UNet
+    `proj_in`/`proj_out` are already linear under `use_linear_projection`, so the
+    squeeze no-ops there and a conv-style checkpoint still loads).
+
+The UNet body is diffusers' `convert_ldm_unet_checkpoint` index arithmetic:
+`input_blocks`/`output_blocks` are flat lists that group into
+`down_blocks`/`up_blocks` at `(i-1)/3` / `i/3` (stride `layers_per_block+1`), the
+`.op`/`.conv` sub-module at `j>=1` is the sampler; the VAE is
+`convert_ldm_vae_checkpoint`, whose `decoder.up.{n}` is REVERSED against
+`up_blocks` (`block_id = num_up - 1 - n`).
+
+The trap the design had to dodge: the two CLIP towers CANNOT share one converted
+map. Both encoders use byte-identical `text_model.encoder.layers.N.*` names — in
+the folder layout they live in separate dirs, so nothing collides, but a single
+flat converted map has bigG silently overwrite CLIP-L (or vice versa, iteration
+order). `convert` returns THREE maps (`main` = unet+vae, `clip_l`, `clip_g`); a
+unit test asserts bigG's layer-5 q_proj is present in `clip_g` and ABSENT from
+`clip_l`.
+
+ORACLE: SDXL has no executed-diffusers reference in this repo (its component
+tests are invariants + shape/bind checks). The conversion's ground truth is
+instead the FOLDER loader — for any model shipped both ways, the converter's
+output must equal `model.loadWeights(<repo>/<component>)` key-and-shape-for-
+key-and-shape. That is the env-gated `sdxl single-file folder parity` test
+(`SDXL_SINGLE_FILE` + `SDXL_DIFFUSERS_DIR`); the hermetic tests cover the
+block-index math, the collision guard, and detection. Because there is no
+numeric oracle, the `text_projection` transpose and the in_proj split ORDER are
+the two places a future bug is most likely — verify them against a real
+checkpoint pair before trusting output that merely "looks like an SDXL image."
+
+### Quantized SDXL packs (q4/q8 diffusers) and the nested-repo bundle trap
+
+Some SDXL diffusers repos ship MLX affine-quantized variants (SceneWorks
+illustrious-xl-v2 ships `bf16/`, `q4/`, `q8/` side by side). The SDXL engine was
+dense-only — the loaders `astype` weights and matmul, no `QLinear` — so a
+quantized pack loaded packed uint32 weights as fp16 and produced garbage, not an
+error. Support is now per-tensor and covers exactly the LINEARS the packs
+quantize: `sdxl_nn.Linear` gained an affine arm (packed weight kept as-is,
+`mlx_quantized_matmul(transpose_w=true)`), detected in `loadLinear` by a sibling
+`.scales`, geometry solved from packed shape. `sdxl_clip.Linear` has the same
+arm for the text encoders. Two things are NOT `mlx_quantized_matmul`:
+
+  - **`text_projection`** — the pooled projection is a plain `pooled @ W`, not a
+    layer forward, so a quantized `text_projection.weight` is DEQUANTIZED at load
+    (`mlx_dequantize`) to a dense matrix before the transpose.
+  - **convs, norms, the whole VAE** — the packs leave these dense (measured: the
+    q4 `vae/` is byte-identical to bf16). MLX quantization is matmul-only, so
+    there was never anything to do there; `loadConvWeight`/`dupWeight` are
+    untouched and the VAE path never sees a `.scales`.
+
+The dense path is unchanged (no `.scales` → the old transpose+matmul), so bf16
+packs bind bit-identically — that is the guard: the existing dense SDXL tests
+still pass, plus a hermetic `loadLinear detects affine quantization` test.
+
+The BUNDLE trap is unrelated to numerics: the CLI `pull` is built for FLAT LLM
+repos — `shouldDownload` rejects every nested path except `mtp/`. A diffusers
+repo is inherently nested (`unet/`, `vae/`, …), and the SceneWorks repo nests
+its variants one level deeper still (`q4/unet/…`). So `Alias` grew a `subdir`
+(download only that variant, strip the prefix so it lands as a flat model dir
+discovery finds) and a `dest_name` (so `q4` and `q8` of the SAME repo don't
+collide on disk). `wantedFile` filters nested files inside the subdir via
+`wantedInVariant` rather than the flat `mtp/`-only rule. Pony needs none of this
+— it is a single `.safetensors` at the repo ROOT, which `shouldDownload` already
+keeps. `pull pony` / `pull illustrious[:q4|q8|bf16]`.
+
+Not verified against real output — the quant path binds and runs, but like the
+rest of SDXL here it has no numeric oracle. Pull a q4 pack and eyeball a
+generation before trusting it.
