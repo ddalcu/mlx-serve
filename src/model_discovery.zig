@@ -79,6 +79,7 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
 
 pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
+        std.mem.startsWith(u8, model_type, "flux1") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
@@ -146,6 +147,8 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // …and an mflux FLUX.2 conversion may carry nothing at all (the only
         // MLX build of klein 9B ships no config.json). Same fallback, keyed on
         // the DiT's own weight names.
+        if (peekMfluxFlux1(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "flux1") catch return .missing_or_unparseable };
         if (peekMfluxFlux2(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "flux2-klein") catch return .missing_or_unparseable };
         return .missing_or_unparseable;
@@ -213,6 +216,34 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
 /// no other diffusers-shaped repo names a weight this — so it identifies an
 /// mflux FLUX.2 conversion without a config.json to read.
 const flux2_dit_marker = "double_stream_modulation_img";
+// FLUX.1's per-block AdaLayerNormZero context modulation — absent from FLUX.2
+// (shared `double_stream_modulation_*`), Krea, and MageFlow, so it cleanly
+// distinguishes a FLUX.1 MMDiT pack (which also ships no root config.json).
+const flux1_dit_marker = "norm1_context";
+
+/// True when `sub/transformer/` holds FLUX.1 (dev/schnell) MMDiT weights. Same
+/// no-config situation as FLUX.2 (`peekMfluxFlux2`), keyed on the FLUX.1 DiT's
+/// per-block context modulation. FLUX.1 additionally ships `text_encoder_2/`
+/// (T5) which FLUX.2 lacks, but the DiT marker alone is decisive.
+pub fn peekMfluxFlux1(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var tdir = sub.openDir(io, "transformer", .{ .iterate = true }) catch return false;
+    defer tdir.close(io);
+    const cap = 1024 * 1024;
+    const buf = allocator.alloc(u8, cap) catch return false;
+    defer allocator.free(buf);
+    if (readPrefix(io, tdir, "model.safetensors.index.json", buf)) |idx| {
+        return std.mem.indexOf(u8, idx, flux1_dit_marker) != null;
+    }
+    var it = tdir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        const head = readPrefix(io, tdir, entry.name, buf) orelse continue;
+        if (head.len <= 8) continue;
+        return std.mem.indexOf(u8, head[8..], flux1_dit_marker) != null;
+    }
+    return false;
+}
 
 /// True when `sub/transformer/` holds FLUX.2 DiT weights. The 4B mirror ships
 /// a root config.json and never reaches here; `mlx-community/flux2-klein-9b-4bit`
@@ -468,6 +499,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.eql(u8, model_type, "bert")) return .embed;
     if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
     if (std.mem.startsWith(u8, model_type, "flux2") or
+        std.mem.startsWith(u8, model_type, "flux1") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow")) return .image;

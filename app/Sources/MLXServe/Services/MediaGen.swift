@@ -131,6 +131,8 @@ enum CustomResolution: Equatable {
 enum FluxVariant: String, Hashable, Codable {
     case flux2Klein4B     // FLUX.2-klein 4B params — uses Flux2Klein, ModelConfig.flux2_klein_4b()
     case flux2Klein9B     // FLUX.2-klein 9B params — uses Flux2Klein, ModelConfig.flux2_klein_9b()
+    case flux1Dev         // FLUX.1-dev — T5-XXL + CLIP-L MMDiT, guidance-distilled; flux1 backend
+    case flux1Schnell     // FLUX.1-schnell — dev minus the guidance embed, 4-step distilled; flux1 backend
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
@@ -235,6 +237,55 @@ struct ImageModelPreset: Identifiable, Hashable {
         ],
         defaultQuality: .good,
         description: "The bigger FLUX.2-klein — stronger prompt following and detail than the 4B, with the same fast schedule and the same instruction editing. Twice the download and memory."
+    )
+
+    /// FLUX.1-dev 4-bit. The classic FLUX.1 MMDiT (T5-XXL + CLIP-L text
+    /// encoders, 16-channel VAE) — a different, larger architecture than
+    /// FLUX.2-klein, served by the dedicated `flux1` backend. The mflux mirror
+    /// ships NO root config.json (like klein 9B); the server fingerprints the
+    /// DiT to discover it. dev takes a real step schedule (guidance-distilled,
+    /// not step-distilled), so the quality tiers are live.
+    static let flux1Dev_Q4 = ImageModelPreset(
+        id: "mflux/flux1-dev-q4",
+        name: "FLUX.1-dev 4-bit (~10 GB)",
+        variant: .flux1Dev,
+        configName: "flux1_dev",
+        repo: "mflux-community/flux-1-dev-mflux-q4",
+        approxDownloadGB: 10,
+        approxRAMGB: 14,
+        resolutions: fluxResolutions,
+        defaultResolution: fluxResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 8),
+            .good:         .init(steps: 20),
+            .quality:      .init(steps: 28),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "The original FLUX.1 — exceptional detail and prompt following via a T5-XXL + CLIP-L text encoder. A larger, slower model than FLUX.2-klein, worth it when you want maximum image quality."
+    )
+
+    /// FLUX.1-schnell 4-bit. Architecturally FLUX.1-dev minus the guidance
+    /// embedding, step-distilled to ~4 steps — the server detects the absence
+    /// of the guidance embedder and runs the schnell recipe automatically.
+    static let flux1Schnell_Q4 = ImageModelPreset(
+        id: "mflux/flux1-schnell-q4",
+        name: "FLUX.1-schnell 4-bit (~10 GB)",
+        variant: .flux1Schnell,
+        configName: "flux1_schnell",
+        repo: "mflux-community/flux-1-schnell-mflux-q4",
+        approxDownloadGB: 10,
+        approxRAMGB: 14,
+        resolutions: fluxResolutions,
+        defaultResolution: fluxResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 4),
+        ],
+        defaultQuality: .good,
+        description: "The fast FLUX.1 — the same T5-XXL + CLIP-L quality as dev, distilled to just 4 steps. Much quicker per image; no guidance or step tiers to tune."
     )
 
     // Krea-2-Turbo accepts any multiple of 16 in [256, 2048]; offer a few
@@ -407,6 +458,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
+        .flux1Dev_Q4, .flux1Schnell_Q4,                // 10, 10
         .krea2Turbo,                                   // 15
     ]
 }
@@ -1790,7 +1842,9 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo: return 0
+        // Mage-Flow + FLUX.1 use a single text-encoder hidden state — no
+        // rebalance (gen.zig `condWeightCount` == 0, so the rebalance UI hides).
+        case .mageFlowTurbo, .mageFlowEditTurbo, .flux1Dev, .flux1Schnell: return 0
         default: return 3
         }
     }
@@ -1808,6 +1862,9 @@ extension ImageModelPreset {
         // widest preset edge.
         case .flux2Klein4B, .flux2Klein9B:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+        // `clampFlux1Dim` — FLUX.1's VAE ×8 + DiT patch ×2 = /16 alignment.
+        case .flux1Dev, .flux1Schnell:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 1536)
         }
     }
 
@@ -1828,7 +1885,9 @@ extension ImageModelPreset {
     /// all: sending a source without `mode:"edit"` is a 400.
     var supportsImg2Img: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        // Mage-Flow has no variation path; FLUX.1's VAE encoder / img2img is
+        // not wired yet (the server rejects a source image by name).
+        case .mageFlowTurbo, .mageFlowEditTurbo, .flux1Dev, .flux1Schnell: return false
         default: return true
         }
     }
@@ -1847,7 +1906,9 @@ extension ImageModelPreset {
     /// 8 steps costs 2× and 12 costs 4× for a DIFFERENT image, not a better one.
     var stepsAreFixed: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return true
+        // Mage-Flow Turbo and FLUX.1-schnell are step-distilled (~4 steps); dev
+        // and the klein/krea models take a real step schedule.
+        case .mageFlowTurbo, .mageFlowEditTurbo, .flux1Schnell: return true
         default: return false
         }
     }

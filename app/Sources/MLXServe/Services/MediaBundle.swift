@@ -113,8 +113,10 @@ extension MediaBundle {
     /// (the Kokoro-reusing-the-TTS-bundle bug: the pane offers Download
     /// forever). The server classifies that repo from the DiT's weight names
     /// instead, so nothing downstream needs the file either.
-    static func flux(repo: String, displayName: String, sizeGB: Double, hasRootConfig: Bool = true) -> MediaBundle {
-        let subdirs = ["transformer", "vae", "text_encoder", "tokenizer"]
+    static func flux(repo: String, displayName: String, sizeGB: Double, hasRootConfig: Bool = true, extraSubdirs: [String] = []) -> MediaBundle {
+        // FLUX.1 adds `text_encoder_2` (the ~2.7 GB T5-XXL — its biggest text
+        // component, so the ideal completeness marker) via `extraSubdirs`.
+        let subdirs = ["transformer", "vae", "text_encoder", "tokenizer"] + extraSubdirs
         return MediaBundle(
             id: "flux:\(repo)",
             displayName: displayName,
@@ -466,6 +468,10 @@ extension ImageModelPreset {
         case .flux2Klein9B:
             // The one MLX conversion of klein 9B ships no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
+        case .flux1Dev, .flux1Schnell:
+            // FLUX.1 mflux packs ship no root config.json, and add the T5-XXL
+            // `text_encoder_2/` beside the CLIP `text_encoder/`.
+            return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false, extraSubdirs: ["text_encoder_2"])
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }

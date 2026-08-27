@@ -122,7 +122,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
 // comment above for the taxonomy of naming schemes this covers.
 // ════════════════════════════════════════════════════════════════════════
 
-pub const Arch = enum { flux2, krea2, minimax_h3, generic };
+pub const Arch = enum { flux2, flux1, krea2, minimax_h3, generic };
 
 /// Which third of a fused up-projection a canonical target draws from, when
 /// the source tensor packs several linears together (BFL's fused QKV).
@@ -207,6 +207,56 @@ const flux2_table = [_]AliasRow{
     t("single_transformer_blocks.{}.attn.to_out", "single_blocks.{}.linear2"),
 };
 
+// FLUX.1 (dev/schnell): the classic MMDiT. Doubles use mlx-serve's own
+// diffusers names 1:1 (self rows) plus the BFL/ai-toolkit alternates
+// (`double_blocks.{}.img_attn.qkv` fused Q/K/V split into thirds, `img_mlp.0/2`
+// → `ff.linear1/2`, etc.). Singles differ from FLUX.2: FLUX.1 keeps the
+// attention projections SEPARATE (`attn.to_q/to_k/to_v` + `proj_mlp` +
+// `proj_out`), so they are plain self rows — a diffusers/kohya export maps 1:1.
+// KNOWN GAP: a BFL-native single-block LoRA packs qkv+mlp into one `linear1`
+// tensor (a 4-way split the thirds mechanism can't express), so those are not
+// mapped; every diffusers-format FLUX.1 LoRA (the common case) is.
+const flux1_table = [_]AliasRow{
+    // Globals
+    t("x_embedder", "x_embedder"),
+    t("x_embedder", "img_in"),
+    t("context_embedder", "context_embedder"),
+    t("context_embedder", "txt_in"),
+    t("proj_out", "proj_out"),
+    t("proj_out", "final_layer.linear"),
+    // Double-stream blocks — self rows + BFL alternates
+    t("transformer_blocks.{}.attn.to_q", "transformer_blocks.{}.attn.to_q"),
+    ts("transformer_blocks.{}.attn.to_q", "double_blocks.{}.img_attn.qkv", .third0),
+    t("transformer_blocks.{}.attn.to_k", "transformer_blocks.{}.attn.to_k"),
+    ts("transformer_blocks.{}.attn.to_k", "double_blocks.{}.img_attn.qkv", .third1),
+    t("transformer_blocks.{}.attn.to_v", "transformer_blocks.{}.attn.to_v"),
+    ts("transformer_blocks.{}.attn.to_v", "double_blocks.{}.img_attn.qkv", .third2),
+    t("transformer_blocks.{}.attn.to_out", "transformer_blocks.{}.attn.to_out"),
+    t("transformer_blocks.{}.attn.to_out", "double_blocks.{}.img_attn.proj"),
+    t("transformer_blocks.{}.attn.add_q_proj", "transformer_blocks.{}.attn.add_q_proj"),
+    ts("transformer_blocks.{}.attn.add_q_proj", "double_blocks.{}.txt_attn.qkv", .third0),
+    t("transformer_blocks.{}.attn.add_k_proj", "transformer_blocks.{}.attn.add_k_proj"),
+    ts("transformer_blocks.{}.attn.add_k_proj", "double_blocks.{}.txt_attn.qkv", .third1),
+    t("transformer_blocks.{}.attn.add_v_proj", "transformer_blocks.{}.attn.add_v_proj"),
+    ts("transformer_blocks.{}.attn.add_v_proj", "double_blocks.{}.txt_attn.qkv", .third2),
+    t("transformer_blocks.{}.attn.to_add_out", "transformer_blocks.{}.attn.to_add_out"),
+    t("transformer_blocks.{}.attn.to_add_out", "double_blocks.{}.txt_attn.proj"),
+    t("transformer_blocks.{}.ff.linear1", "transformer_blocks.{}.ff.linear1"),
+    t("transformer_blocks.{}.ff.linear1", "double_blocks.{}.img_mlp.0"),
+    t("transformer_blocks.{}.ff.linear2", "transformer_blocks.{}.ff.linear2"),
+    t("transformer_blocks.{}.ff.linear2", "double_blocks.{}.img_mlp.2"),
+    t("transformer_blocks.{}.ff_context.linear1", "transformer_blocks.{}.ff_context.linear1"),
+    t("transformer_blocks.{}.ff_context.linear1", "double_blocks.{}.txt_mlp.0"),
+    t("transformer_blocks.{}.ff_context.linear2", "transformer_blocks.{}.ff_context.linear2"),
+    t("transformer_blocks.{}.ff_context.linear2", "double_blocks.{}.txt_mlp.2"),
+    // Single-stream blocks — separate on our side; self rows only
+    t("single_transformer_blocks.{}.attn.to_q", "single_transformer_blocks.{}.attn.to_q"),
+    t("single_transformer_blocks.{}.attn.to_k", "single_transformer_blocks.{}.attn.to_k"),
+    t("single_transformer_blocks.{}.attn.to_v", "single_transformer_blocks.{}.attn.to_v"),
+    t("single_transformer_blocks.{}.proj_mlp", "single_transformer_blocks.{}.proj_mlp"),
+    t("single_transformer_blocks.{}.proj_out", "single_transformer_blocks.{}.proj_out"),
+};
+
 // Krea-2: the runtime uses its own module names throughout (`blocks.{}.attn.wq`,
 // `txtfusion.layerwise_blocks.{}...`, `first`, `tmlp.0`, …), never diffusers
 // naming — every diffusers/community spelling needs an explicit alias. No
@@ -287,6 +337,7 @@ const minimax_h3_table = [_]AliasRow{
 fn archTable(arch: Arch) []const AliasRow {
     return switch (arch) {
         .flux2 => &flux2_table,
+        .flux1 => &flux1_table,
         .krea2 => &krea2_table,
         .minimax_h3 => &minimax_h3_table,
         .generic => &.{},
@@ -1292,13 +1343,38 @@ test "canonicalize: a flat key naming our OWN module resolves ONCE, never a spli
     try testing.expectEqual(Split.third2, fused[2].split);
 }
 
+test "canonicalize: flux1 diffusers 1:1 + BFL double-block split + separate singles" {
+    var bufs: [MAX_FANOUT]CanonBuf = undefined;
+    var out: [MAX_FANOUT]CanonMatch = undefined;
+    // Diffusers name already ours → single self-row match.
+    const own = canonicalize("transformer_blocks.5.attn.to_q", false, .flux1, &bufs, &out);
+    try testing.expectEqual(@as(usize, 1), own.len);
+    try testing.expectEqualStrings("transformer_blocks.5.attn.to_q", own[0].canon);
+    // FLUX.1 FF is linear1/linear2 (NOT flux2's linear_in/out).
+    const ff = canonicalize("transformer_blocks.2.ff.linear1", false, .flux1, &bufs, &out);
+    try testing.expectEqual(@as(usize, 1), ff.len);
+    try testing.expectEqualStrings("transformer_blocks.2.ff.linear1", ff[0].canon);
+    // BFL fused img_attn.qkv → three split targets.
+    const fused = canonicalize("double_blocks.3.img_attn.qkv", false, .flux1, &bufs, &out);
+    try testing.expectEqual(@as(usize, 3), fused.len);
+    try testing.expectEqualStrings("transformer_blocks.3.attn.to_q", fused[0].canon);
+    try testing.expectEqual(Split.third0, fused[0].split);
+    try testing.expectEqual(Split.third2, fused[2].split);
+    // Single blocks are SEPARATE in FLUX.1 (unlike flux2's fused to_qkv_mlp_proj).
+    const sg = canonicalize("single_transformer_blocks.7.attn.to_v", false, .flux1, &bufs, &out);
+    try testing.expectEqual(@as(usize, 1), sg.len);
+    try testing.expectEqualStrings("single_transformer_blocks.7.attn.to_v", sg[0].canon);
+    const pm = canonicalize("single_transformer_blocks.7.proj_mlp", false, .flux1, &bufs, &out);
+    try testing.expectEqualStrings("single_transformer_blocks.7.proj_mlp", pm[0].canon);
+}
+
 test "arch tables: every canonical target has a SELF row" {
     // The invariant that makes flat-mode alias-only matching complete: a file
     // that already speaks mlx-serve's own naming (dotted OR flattened) is
     // recognized because the canonical name is also listed as an alias. A new
     // row added without its self row would silently stop resolving Kohya
     // exports for that module.
-    inline for (.{ Arch.flux2, Arch.krea2, Arch.minimax_h3 }) |arch| {
+    inline for (.{ Arch.flux2, Arch.flux1, Arch.krea2, Arch.minimax_h3 }) |arch| {
         const table = archTable(arch);
         for (table) |row| {
             var found = false;
