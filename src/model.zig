@@ -3949,6 +3949,9 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     // vision when load_vision is false.
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
     try testing.expect(!shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", false));
+    // qwen4_exp / Alis packs spell the Qwen3-VL tower `model.visual.` — --no-vision drops it too.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
 }

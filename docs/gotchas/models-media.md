@@ -1632,3 +1632,12 @@ take `video_token_id`; guard = `spliceVisionRows: video placeholders are
 scattered like image rows` (red on the old mask). Rule: an engagement line
 proves the PATH ran, only content the pixels alone could supply proves the
 rows reached the prompt.
+
+
+## A k < E tiny MoE fixture covers selection only through the MTP head (2026-08-26)
+
+`dump_qwen4_exp_fixtures.py build --topk 2` builds the tiny qwen4_exp with 2 of 8 experts. The reference is constructed from `TINY`, so `dump` now reads `num_experts_per_tok` back from the checkpoint (the first dump ran k = 8 against our k = 2 pack: MTP head cos 0.894 with ZERO acquittals — a config mismatch looks exactly like a kernel bug). With k honored, the head matched at cos 1.0000 on every decisive row except one at a 3.5% softmax margin, hence `QWEN4_TIE_REL_ROUTE` = 5% (the router reads a bf16 residual; the QSA scores are f32 and keep 3%). Margins come from forward hooks on every `Qwen4ExpTextTopKRouter` (`route_gap` = min over MoE layers of `(p[k-1] - p[k]) / p[0]`; `mtp_route_gap` from the head's own router).
+
+The trunk cannot be covered this way on a random model: 8 MoE layers x k = 2 leaves 18 of 20 prefill rows and all 6 decode rows under the bar, so the `decisive >= T/2` floor only applies when no routing table is present. The head is one MoE layer and keeps 12/19 decisive rows — that is where top-k selection is hermetically pinned. The k = E fixture remains the CI oracle; the k = 2 pack lives in `~/claude-tmp/qwen4-tiny-k2/`.
+
+Also from this round: the video e2e bar (`tests/test_qwen_video_input.sh`) now demands frame 3's sign text; the informational bf16 logits readout in `qwen4 fixture bf16` reads cos 0.9997 / argmax 20/20 on the k = E pack.

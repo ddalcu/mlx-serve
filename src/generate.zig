@@ -708,8 +708,10 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 /// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
 /// equal images) — so vision prefills skip checkpointing even now that they
 /// chunk (the splice scatter itself is chunk-safe via vision_splice_offset).
+/// A vision prompt checkpoints like text once it chunks like text (#197):
+/// without a checkpoint a hybrid's image turn is a guaranteed hot-cache miss.
 pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
-    return stride > 0 and has_ssm and !has_vision;
+    return stride > 0 and has_ssm and (!has_vision or visionChunkedPrefillEnabled());
 }
 
 /// Chunked vision prefill (issue #197). Default ON: the splice resumes its
@@ -1546,6 +1548,9 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// Placeholder rows inside a restored prefix (prefix-cache hit on an
+        /// image prompt): the vision splice starts here, not at row 0.
+        vision_rows_before: usize = 0,
         /// A DFlash assistant context restored from the prefix cache, whose
         /// `absLen()` already equals `ssm_checkpoint_pos_offset`. Ownership
         /// transfers to the Generator. Null = start the assistant blind at
@@ -1894,7 +1899,7 @@ pub const Generator = struct {
         // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
         // so that path is byte-identical to the old whole-prompt behavior.
         const vision_chunked = has_vision and visionChunkedPrefillEnabled();
-        var vision_rows_consumed: usize = 0;
+        var vision_rows_consumed: usize = options.vision_rows_before;
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
@@ -1929,7 +1934,7 @@ pub const Generator = struct {
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
                 const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
-                if (vision_chunked) ctx.vision_splice_offset = vision_rows_consumed;
+                if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -2142,9 +2147,9 @@ pub const Generator = struct {
         // where the chunk loop left it (an image ending in the final span
         // otherwise re-splices from row 0). One-shot engagement line — the
         // silent-no-op class; tests grep for it per arm.
-        if (vision_chunked) {
+        if (has_vision) {
             ctx.vision_splice_offset = vision_rows_consumed;
-            if (n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
+            if (vision_chunked and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
         }
 
         // Process the final span — the last token, plus (under SSM
@@ -10426,10 +10431,17 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
 }
 
-test "vision prefill is not split at SSM checkpoint boundaries" {
+test "vision prefill checkpoints SSM state only when it chunks like text" {
     const prefix_len: usize = 1587;
     const checkpoint_stride: u32 = 256;
 
+    // Chunked vision (the default) checkpoints like text — a hybrid's image
+    // turn is otherwise a guaranteed hot-cache miss (no checkpoint <= match).
+    vision_chunked_cached = true;
+    defer vision_chunked_cached = null;
+    try testing.expect(shouldCheckpointSsmPrefill(checkpoint_stride, true, true));
+    // The whole-prompt kill-switch arm has no chunk boundaries to snapshot at.
+    vision_chunked_cached = false;
     const vision_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, true);
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(

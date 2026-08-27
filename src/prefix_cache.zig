@@ -69,6 +69,10 @@ const Entry = struct {
     /// Whether the request had tools enabled (different chat template, can't
     /// share cache across).
     has_tools: bool,
+    /// Hash of the request's media pixels (0 = text only). Image placeholder
+    /// tokens are identical across images, so the KV under them is keyed on
+    /// the pixels. Non-zero entries stay in RAM (never spilled to the SSD tier).
+    vision_key: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
@@ -368,11 +372,12 @@ pub const HotPrefixCache = struct {
     /// covers BOTH 4-bit and 8-bit packings: filtering on `Scheme` alone
     /// would let a 4-bit entry alias to an 8-bit slot and crash SDPA on
     /// restore. See `tests/test_kv_quant_per_request.sh`.
-    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
+            if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             const max_shared = @min(e.tokens.len, prompt_ids.len);
             var shared: usize = 0;
@@ -402,16 +407,18 @@ pub const HotPrefixCache = struct {
         s: mlx.mlx_stream,
         prompt_ids: []const u32,
         has_tools: bool,
+        vision_key: u64,
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
     ) !LookupResult {
-        const match = self.findBestMatch(prompt_ids, has_tools, target_cache.config);
+        const match = self.findBestMatch(prompt_ids, has_tools, vision_key, target_cache.config);
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
         // (fresh boot, post-eviction). Phase 3 handles hybrid targets too —
         // the tier persists per-position SSM checkpoints beside the KV chunks
         // and restores both.
         if (self.disk) |*d| disk: {
+            if (vision_key != 0) break :disk;
             const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse break :disk;
 
             if (target_ssm_entries) |ssm_entries| {
@@ -589,7 +596,7 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !void {
-        return self.commitWithState(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
+        return self.commitWithState(source_cache, tokens, has_tools, 0, ssm_cps, dflash, mtp);
     }
 
     /// Commit with SSM checkpoints; ownership of the payload transfers to
@@ -599,6 +606,7 @@ pub const HotPrefixCache = struct {
         source_cache: *const KVCache,
         tokens: []const u32,
         has_tools: bool,
+        vision_key: u64,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
@@ -608,6 +616,7 @@ pub const HotPrefixCache = struct {
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
+            if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             if (e.tokens.len <= tokens.len) {
                 var shared: usize = 0;
@@ -747,6 +756,7 @@ pub const HotPrefixCache = struct {
             e.tokens = tokens_owned;
             e.snapshot = new_snap;
             e.has_tools = has_tools;
+            e.vision_key = vision_key;
             e.quant_config = quant_config;
             e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
             e.ssm_checkpoints = merged_cps;
@@ -774,6 +784,7 @@ pub const HotPrefixCache = struct {
         self.entries.append(self.allocator, .{
             .tokens = tokens_owned,
             .has_tools = has_tools,
+            .vision_key = vision_key,
             .snapshot = new_snap,
             .last_used = self.bumpCounter(),
             .quant_config = quant_config,
@@ -815,6 +826,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items[1..]) |*e| {
             if (e.last_used > newest.last_used) newest = e;
         }
+        if (newest.vision_key != 0) return;
         // Phase 3: hybrid entries persist their SSM checkpoints alongside the
         // KV chunks (immutable per-position s*.safetensors). The snapshot
         // arrays are refcount-shared with the RAM entry, so `appendCommit`
@@ -1003,21 +1015,29 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
 
     // Looking up [1,2,3,4,5,6] should match entry A (5 shared tokens).
     const lookup_ids = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    const m = cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.dense).?;
+    const m = cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(usize, 0), m.idx);
     try testing.expectEqual(@as(usize, 5), m.shared);
 
     // Looking up [1,2,3,9,9,9,7] should match entry B (6 shared).
     const lookup_ids2 = [_]u32{ 1, 2, 3, 9, 9, 9, 7 };
-    const m2 = cache.findBestMatch(&lookup_ids2, false, kv_quant.KVQuantConfig.dense).?;
+    const m2 = cache.findBestMatch(&lookup_ids2, false, 0, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(usize, 1), m2.idx);
     try testing.expectEqual(@as(usize, 6), m2.shared);
 
     // has_tools mismatch returns null.
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, kv_quant.KVQuantConfig.dense));
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, 0, kv_quant.KVQuantConfig.dense));
+    // vision_key mismatch returns null both ways: a text entry never serves an
+    // image request and an image entry only serves the same pixels.
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, 7, kv_quant.KVQuantConfig.dense));
+    cache.entries.items[0].vision_key = 7;
+    // Text lookup falls through to entry B (3 shared); the keyed lookup gets A.
+    try testing.expectEqual(@as(usize, 1), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense).?.idx);
+    try testing.expectEqual(@as(usize, 0), cache.findBestMatch(&lookup_ids, false, 7, kv_quant.KVQuantConfig.dense).?.idx);
+    cache.entries.items[0].vision_key = 0;
     // Scheme mismatch returns null — entries are dense, a query for affine
     // 4-bit cannot match (Wave 1.A: cross-scheme cache hits never happen).
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)));
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(4)));
 }
 
 test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (gemma mask crash)" {
@@ -1054,7 +1074,7 @@ test "HotPrefixCache: restore clamps an inflated snapshot to the matched length 
     var dst = try KVCache.init(testing.allocator, 2);
     defer dst.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false, null, null);
+    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false, 0, null, null);
 
     try testing.expect(!res.full_match);
     try testing.expectEqual(@as(usize, 64), res.matched);
@@ -1105,6 +1125,7 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
         s,
         toks[0..32],
         false,
+        0,
         .{ .cache = &dfl, .base_pos = &base },
         null,
     );
@@ -1133,6 +1154,7 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
         s,
         toks[0..32],
         false,
+        0,
         .{ .cache = &dfl2, .base_pos = &base2 },
         null,
     );
@@ -1176,7 +1198,7 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
     defer mtp_dst.deinit();
     var moe_off: usize = 0;
     var base: usize = 99;
-    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, toks[0..32], false, null, .{ .cache = &mtp_dst, .base_pos = &base });
+    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, toks[0..32], false, 0, null, .{ .cache = &mtp_dst, .base_pos = &base });
     try testing.expect(res.full_match);
     try testing.expectEqual(@as(usize, 31), res.matched);
     try testing.expectEqual(@as(?usize, 0), res.mtp_base);
@@ -1192,7 +1214,7 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
     defer mtp2.deinit();
     var moe2: usize = 0;
     var base2: usize = 7;
-    const res2 = try hc.lookupAndRestore(&dst2, &moe2, null, s, &toks, false, null, .{ .cache = &mtp2, .base_pos = &base2 });
+    const res2 = try hc.lookupAndRestore(&dst2, &moe2, null, s, &toks, false, 0, null, .{ .cache = &mtp2, .base_pos = &base2 });
     try testing.expectEqual(@as(usize, 63), res2.matched);
     try testing.expectEqual(@as(?usize, null), res2.mtp_base);
     try testing.expectEqual(@as(usize, 0), mtp2.step);
@@ -1262,7 +1284,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, null, null);
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
         // Full match: identical re-issue semantics — truncate to len-1 and
         // re-forward the last token, exactly like a RAM full-match hit.
         try testing.expect(res.full_match);
@@ -1281,7 +1303,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var cache3 = try KVCache.init(testing.allocator, 2);
         defer cache3.deinit();
         var moe_off3: usize = 0;
-        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, null, null);
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, 0, null, null);
         try testing.expect(!res3.full_match);
         try testing.expectEqual(@as(usize, 400), res3.matched);
         try testing.expectEqual(@as(usize, 400), cache3.step);
@@ -1359,6 +1381,7 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
             s,
             &tokens,
             false,
+            0,
             .{ .cache = &dfl, .base_pos = &dbase },
             .{ .cache = &mtp_dst, .base_pos = &mbase },
         );
@@ -1387,6 +1410,7 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
             s,
             &tokens,
             false,
+            0,
             .{ .cache = &dfl3, .base_pos = &dbase3 },
             null,
         );
@@ -1425,7 +1449,7 @@ test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
     var cache2 = try KVCache.init(testing.allocator, 1);
     defer cache2.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, null, null);
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
     try testing.expect(res.full_match);
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
 }
@@ -1484,14 +1508,14 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
 
     const lookup_ids = [_]u32{ 1, 2, 3, 4, 5, 6 };
     // Matching config (affine 4) hits the entry.
-    const hit = cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)).?;
+    const hit = cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(4)).?;
     try testing.expectEqual(@as(usize, 0), hit.idx);
     try testing.expectEqual(@as(usize, 5), hit.shared);
     // Same Scheme (.affine) but different bits MUST NOT hit — that's the
     // cross-scheme buffer-layout crash this filter guards against.
-    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(8)));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(8)));
     // Dense query against an affine entry: also null (existing guarantee).
-    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.dense));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense));
 }
 
 // ── Phase 3: two-tier hybrid restore (Qwen 3.5/3.6 GatedDeltaNet) ──
@@ -1595,7 +1619,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var ssm2 = pcEmptySsm();
         defer pcFreeHybrid(&ssm2);
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, null, null);
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
         // Highest checkpoint ≤ 600 is 512 — never a full match on hybrid.
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 512), res.matched);
@@ -1617,7 +1641,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var ssm3 = pcEmptySsm();
         defer pcFreeHybrid(&ssm3);
         var moe_off3: usize = 0;
-        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens_div, false, null, null);
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens_div, false, 0, null, null);
         try testing.expect(!res3.full_match);
         try testing.expectEqual(@as(usize, 256), res3.matched);
         try testing.expectEqual(@as(usize, 256), cache3.step);
@@ -1661,7 +1685,7 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
     var ssm2 = pcEmptySsm();
     defer pcFreeHybrid(&ssm2);
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, null, null);
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
     try testing.expectEqual(@as(usize, 512), res.matched);
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
     // RAM restore installed the SSM state just the same.

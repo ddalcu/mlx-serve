@@ -4215,3 +4215,17 @@ at 8.5k KV is what costs there). So: MTP stays opt-in (`--mtp` /
 with their measured ceiling; a prose-vs-code acceptance difference of this
 size is a property of the head, not of the engine.
 
+
+
+## MLX has no fused kernel for an hd-256 array mask (qwen4 QSA, 2026-08-26)
+
+`ScaledDotProductAttention::use_fallback` (lib/mlx-src/mlx/backend/metal/scaled_dot_product_attention.cpp): for `q > 8` the steel full-attention kernel is skipped at hd 192/256 ("unfused path is faster"), and for `q <= 8` the vector kernel refuses `q * gqa > 32`. On qwen4_exp (24 q heads / 2 kv heads, gqa 12) that meant every QSA-masked attention past the 2048-token budget ran the materialized scores path: prefill chunks (the 44% measured on a 4096-row chunk at kv 4096) AND every MTP verify width from S = 3 (S = 2 fits the vector kernel). The NAX branch does not help either: it requires `do_causal && !has_arr_mask`.
+
+Two arms, both kill-switched:
+
+- `fusedSdpa256Masked`: a `QSA` template arm of `msv_attn_p256` that reads the `[B,1,qL,kL]` bool mask per element and skips whole 32-key blocks via a per-(q-tile, key-block) any-visible table (`qsaSkipTable`, an `mlx_pad` + reshape + `mlx_any_axes`). Same envelope as the causal arm (q >= 16, hd 256, bf16, kv-chunked dispatch with the fp32 carry). The dummy mask for the causal template is 4-D so `mask_strides[3]` exists under `QSA=0` (a 0-d dummy crashed the causal tests). `MLX_SERVE_QSA_FUSED=0`.
+- `splitMaskedSdpa256`: verify widths 3..15 under an array mask are sliced into `floor(32/gqa)`-row groups and sent through the vector kernel one group at a time (rows are independent under a per-row mask, so this is exact). Shares `MLX_SERVE_SDPA_SPLIT=0` with the causal split.
+
+Hermetic bars: `fusedSdpa256Masked: QSA bool-mask parity`, `splitMaskedSdpa256: verify-width array-mask rows split` (transformer.zig), both vs the composed array-mask sdpa at 0.005. Live engagement lines in `tests/test_qwen4_exp.sh` [5]/[5b]. The tiny fixture is hd 32, so it never reaches either arm. The live prefill/verify A/B on the real pack is still owed (written with the GPU occupied); the expectation from the profile is up to ~1.8x on prefill past 2048 tokens and the S=3..4 verify rounds at 8.5k dropping toward the S=2 cost.
+
+Measured (2026-08-26, `tests/prefill_ab.sh <pack> MLX_SERVE_QSA_FUSED 1 0`, M4 Max, 4-bit pack): 8.1k tokens on 11.36/11.80/11.90 vs off 11.93/12.01/12.07 s; 24.9k tokens on 40.66/41.13/40.56/41.24 vs off 41.49/41.88/42.20/42.43 s — ~1% and ~2.7%. Far from the 1.8x the profile suggested: the per-tile skip table rarely skips (64 queries' top-512 blocks union to most of the KV), so the arm only buys the fused-vs-materialized difference, and MLX's unfused path is already matmul-bound at these shapes. A per-QUERY block-list kernel (gather the 512 selected blocks per row instead of masking) is the remaining lever; not started. Kept default-on (parity-tested, small positive both lengths).

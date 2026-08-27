@@ -1421,3 +1421,14 @@ into `dflash_pass`/`mtp_pass` and nulls the errdefer-guarded locals BEFORE the
 `try`, so on failure exactly one owner (the generator) frees them. Guard:
 `scheduler.zig` test "runPrefill clears restored spec-cache ownership BEFORE
 Generator.initWithOptions (issue #266)" pins the clear-before-call ordering.
+
+
+## Vision prefixes in the prefix cache are keyed on the pixels (2026-08-26)
+
+`commitSlotIfApplicable` and the lookup both returned early on `vision_embeddings != null`, so an image conversation re-prefilled everything on every turn. The KV under image placeholder tokens is a function of the pixels, and two different images produce IDENTICAL token sequences, so a plain token-prefix match would restore the wrong image's rows. The fix keys every RAM entry on `vision_key` beside `has_tools`: `server.mediaKey` hashes the request's image/video/audio bytes in `processVisionImages` (0 = text only), the key rides `SubmitParams` → `Slot` → `commitWithState` / `lookupAndRestore` / `findBestMatch`. A text entry never serves an image request and vice versa (no partial-prefix sharing across the two — deliberate, KISS). Vision entries stay in RAM: the SSD tier's manifest has no key column and is never consulted for `vision_key != 0`.
+
+The second half is the splice: a restored prefix already holds its image rows, so the Generator's placeholder-row counter starts at `countSpliceRows(full_prompt[0..hot_matched])` (`InitOptions.vision_rows_before`) and `vision_splice_offset` is set on BOTH the chunk loop and the final-span forward whenever the request has vision, not only under chunked-vision. M-RoPE positions/delta are re-derived per request from the same images, so nothing else needs to ride the entry.
+
+Guard: `tests/test_vision_prefix_cache.sh` (not yet run live as of 2026-08-26) + the `vision_key` arms of the `findBestMatch` unit test.
+
+First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 514)` — the tokens matched, but `shouldCheckpointSsmPrefill` still returned false for any vision prompt (from before #197, when vision prefilled in one un-chunked forward and had no boundary to snapshot at). It now follows `visionChunkedPrefillEnabled()`. After that: 483/514 reused, the warm answer moved by one token (the hybrid restore class, so the script asserts content, not bytes).

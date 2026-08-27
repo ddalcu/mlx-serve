@@ -267,6 +267,8 @@ pub const SubmitParams = struct {
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
+    /// Prefix-cache key for the media under the placeholder tokens (0 = none).
+    vision_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -325,6 +327,7 @@ pub const Slot = struct {
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -530,6 +533,7 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
+            .vision_key = params.vision_key,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -4350,7 +4354,6 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
-    if (slot.vision_embeddings != null) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
@@ -4419,7 +4422,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         };
         break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4459,7 +4462,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     if (slot.ssm_entries != null) return;
     const step: usize = @intCast(slot.cache.step);
     const len = cancelledPrefillCommitLen(step, slot.full_prompt.len) orelse return;
-    hc.commit(&slot.cache, slot.full_prompt[0..len], slot.has_tools) catch |err| {
+    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, null, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -5117,7 +5120,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
-        if (slot.vision_embeddings == null) {
+        {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
             // the next one that does.
@@ -5141,6 +5144,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
+                slot.vision_key,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
             ) catch |err| blk: {
@@ -5238,6 +5242,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            // A restored prefix already holds its image rows: the splice
+            // resumes at the placeholder count inside the matched prefix.
+            .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)
+                generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.audio_token_id, xfm_ptr.config.video_token_id)
+            else
+                0,
             // The prefill width the admission guard billed for THIS model.
             // Straight off `slot.model.config` — the same object
             // `server.pinPrefillChunk` writes and `checkAttentionMemory`

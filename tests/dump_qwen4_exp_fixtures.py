@@ -333,6 +333,7 @@ def dump(hf, pack, out, vision=False):
              m.model.layers[3].self_attn.register_forward_hook(hook("attn3")),
              m.model.hyper_connection_mixer.register_forward_hook(lambda mod, inp, out: cap.__setitem__("pre_mixer", inp[0]))]
     hooks += hook_indexers(lm(m), cap)
+    hooks += hook_routers(lm(m), cap)
     with torch.no_grad():
         full = m(input_ids=ids, use_cache=False, output_hidden_states=True)
         for h in hooks:
@@ -347,11 +348,14 @@ def dump(hf, pack, out, vision=False):
             step = m(input_ids=ids[:, t:t + 1], past_key_values=pkv, use_cache=True)
             pkv = step.past_key_values
             dec.append(step.logits[0, -1].float().numpy())
+    mtp_logits, mtp_route_gap = mtp_reference(m, ten, ids, T)
     fixture = {
-        "mtp_logits": mtp_reference(m, ten, ids, T),
+        "mtp_logits": mtp_logits,
+        "mtp_route_gap": mtp_route_gap,
         "input_ids": ids[0].numpy().astype(np.int32),
         "logit_margin": logit_margin(logits_full),
         "qsa_gap": qsa_rel_gaps(lm(m), cap, T),
+        "route_gap": route_gaps(lm(m), cap, T),
         "logits_full": logits_full.astype(np.float32),
         "logits_prefill_last": pre.logits[0, -1].float().numpy().astype(np.float32),
         "logits_decode": np.stack(dec).astype(np.float32),
@@ -379,6 +383,33 @@ def dump(hf, pack, out, vision=False):
     # sanity: stepwise == full at the decode positions (the reference's own consistency)
     ref_gap = np.abs(np.stack(dec) - logits_full[T_PREFILL:]).max()
     print(f"wrote {out}; reference stepwise-vs-full max|Δ| = {ref_gap:.2e}")
+
+
+def route_gap_from_logits(router_logits, top_k):
+    """Per row: relative softmax margin between the last selected expert and
+    the first rejected one (1.0 when every expert is selected)."""
+    p = torch.nn.functional.softmax(router_logits.float(), dim=-1)
+    if top_k >= p.shape[-1]:
+        return np.ones(p.shape[0], dtype=np.float32)
+    srt = p.sort(dim=-1, descending=True).values
+    return ((srt[:, top_k - 1] - srt[:, top_k]) / srt[:, 0].clamp_min(1e-9)).numpy().astype(np.float32)
+
+
+def hook_routers(text, cap):
+    """Forward hooks on every MoE router: the router's own logits per layer."""
+    def f(l):
+        return lambda mod, inp, out: cap.__setitem__(("route", l), out[0].detach())
+    return [layer.mlp.gate.register_forward_hook(f(i))
+            for i, layer in enumerate(text.layers) if hasattr(getattr(layer, "mlp", None), "gate")]
+
+
+def route_gaps(text, cap, T):
+    """Min over MoE layers of the per-row routing margin (see Qwen4Ties)."""
+    out = np.ones(T, dtype=np.float32)
+    for (tag, l), logits in [(k, v) for k, v in cap.items() if isinstance(k, tuple) and k[0] == "route"]:
+        g = route_gap_from_logits(logits.reshape(-1, logits.shape[-1])[:T], text.layers[l].mlp.gate.top_k)
+        out = np.minimum(out, g)
+    return out
 
 
 def logit_margin(logits):
@@ -555,9 +586,13 @@ def mtp_reference(m, ten, ids, T):
         pos = torch.arange(1, T, dtype=torch.long)[None]
         pe = m.model.rotary_emb(x, pos[None].expand(3, 1, -1))
         mask = torch.full((T - 1, T - 1), torch.finfo(REF_DTYPE).min, dtype=REF_DTYPE).triu(1)[None, None]
+        rcap = {}
+        rh = layer.mlp.gate.register_forward_hook(lambda mod, inp, out: rcap.__setitem__("r", out[0].detach()))
         out = layer(x, position_embeddings=pe, attention_mask=mask, conv_mask=None, past_key_values=None)
+        rh.remove()
         logits = m.lm_head(mixer(out))
-    return logits[0].float().numpy().astype(np.float32)
+    rg = route_gap_from_logits(rcap["r"].reshape(-1, rcap["r"].shape[-1]), layer.mlp.gate.top_k)
+    return logits[0].float().numpy().astype(np.float32), rg
 
 
 def main():
@@ -566,6 +601,8 @@ def main():
     b = sub.add_parser("build")
     b.add_argument("--out", required=True)
     b.add_argument("--vision", action="store_true")
+    b.add_argument("--topk", type=int, default=None,
+                   help="num_experts_per_tok (< num_experts covers top-k SELECTION; ties then acquit more rows)")
     d = sub.add_parser("dump")
     d.add_argument("--hf", required=True)
     d.add_argument("--pack", required=True)
@@ -573,8 +610,15 @@ def main():
     d.add_argument("--vision", action="store_true")
     a = ap.parse_args()
     if a.cmd == "build":
+        if a.topk is not None:
+            TINY["num_experts_per_tok"] = a.topk
         build(os.path.expanduser(a.out), a.vision)
     else:
+        # The reference is built from TINY, so a `build --topk` checkpoint
+        # must hand its k back (the pack's config carries it).
+        with open(os.path.join(os.path.expanduser(a.hf), "config.json")) as f:
+            hc = json.load(f)
+        TINY["num_experts_per_tok"] = hc.get("text_config", hc).get("num_experts_per_tok", TINY["num_experts_per_tok"])
         dump(os.path.expanduser(a.hf), os.path.expanduser(a.pack), a.out, a.vision)
 
 

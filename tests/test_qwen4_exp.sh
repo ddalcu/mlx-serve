@@ -17,7 +17,9 @@ mkdir -p "$(dirname "$LOG")"
 [ -f "$MODEL/ngram_table.bin" ] || { echo "SKIP: pack has no ngram_table.bin"; exit 0; }
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
+# MTP_FORCE_DEPTH=3: every MTP round verifies 4 rows, so [5b] exercises the
+# array-mask row split (S >= 3 at gqa 12 is MLX's unfused fallback).
+MLX_SERVE_MTP_FORCE_DEPTH=3 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
@@ -49,11 +51,30 @@ la=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json
 echo "  prompt_tokens|answer: $la"
 check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG")" "1"
 check "needle recovered" "$(echo "$la" | grep -c 'PELICAN-42')" "1"
+check "qsa prefill kernel engaged (mask arm of msv_attn_p256)" "$(grep -c '\[qsa-fused\] engaged' "$LOG")" "1"
+echo "[5b] MTP past the QSA budget (verify rows under the QSA mask)"
+longm=$(echo "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=True; print(json.dumps(d))")
+lm=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$longm" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])")
+check "needle recovered under MTP" "$(echo "$lm" | grep -c 'PELICAN-42')" "1"
+check "masked verify split engaged" "$(grep -c 'sdpa-split\] masked arm engaged' "$LOG")" "1"
 echo "[6] MTP head: engagement + greedy equivalence"
 base=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 mtp=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":true}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 check "mtp engaged" "$(grep -c 'spec-stats\] mode=mtp' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
-check "mtp == serial (first 60 chars)" "${mtp:0:60}" "${base:0:60}"
+if [ "${mtp:0:60}" = "${base:0:60}" ]; then check "mtp == serial (first 60 chars)" 1 1; else
+  # Tie-aware acquittal (test_mtp_equivalence.sh): a verify width moves ties, a
+  # plumbing bug diverges at a confident position. Serial top-2 gap at the first
+  # divergent token must be <= 0.15 nats.
+  gap=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false,"logprobs":true,"top_logprobs":2}' | python3 -c "
+import sys,json; d=json.load(sys.stdin); mtp=sys.argv[1]; acc=''
+for e in d['choices'][0]['logprobs']['content']:
+    if not mtp.startswith(acc+e['token']):
+        t=e['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],3) if len(t)>1 else 99); break
+    acc+=e['token']
+else: print(0)" "$mtp")
+  echo "  mtp diverged; serial top-2 gap at the first divergent token: $gap nats"
+  check "mtp == serial or near-tie divergence (gap <= 0.15)" "$(python3 -c "print(1 if float('${gap:-99}')<=0.15 else 0)")" "1"
+fi
 apr=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1 | sed -E 's/.*avg_per_round=([0-9.]+).*/\1/')
 echo "  avg accepted per round: $apr"
 check "acceptance floor 0.5/round" "$(python3 -c "print(1 if float('${apr:-0}')>=0.5 else 0)")" "1"
