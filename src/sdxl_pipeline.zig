@@ -121,6 +121,14 @@ pub const GenOpts = struct {
     /// legitimate difference between our pipeline and diffusers', so removing
     /// it is what makes the two comparable. Borrowed, never freed here.
     init_latent: ?mlx.mlx_array = null,
+    /// img2img: source pixels `[1,3,H,W]` f32 `[0,1]`, pre-resized to the
+    /// target size. VAE-encoded internally and mixed with fresh noise at
+    /// `sigmas[start_step]` — diffusers' `EulerDiscreteScheduler.add_noise`
+    /// convention (`sample + noise * sigma`), not flow-match's linear blend.
+    init_image: ?mlx.mlx_array = null,
+    /// First schedule index to run (img2img skip; 0 = full schedule, i.e. the
+    /// same fresh-noise start as no `init_image` at all).
+    start_step: u32 = 0,
     /// Conditioning injected in place of running our own text encoders — the
     /// `[1,77,2048]` stream and the `[1,1280]` pooled vector. PARITY
     /// ATTRIBUTION ONLY: with these set, an end-to-end comparison against
@@ -222,6 +230,11 @@ pub const Engine = struct {
     tower_g: clip.TextTower,
     unet: unet_mod.Unet,
     vae: vae_mod.Decoder,
+    /// Null when the pack's `vae/` has no `encoder.*` tensors — a single-file
+    /// checkpoint (`loadSingleFile`; `sdxl_single_file` deliberately converts
+    /// decode-only) or a folder repo whose encoder failed to load. img2img is
+    /// unavailable either way (`ImageEngine.supportsImg2Img`).
+    vae_enc: ?vae_mod.Encoder,
     /// From `model_index.json`; see the file header.
     force_zeros_for_empty_prompt: bool,
     /// From `scheduler/scheduler_config.json` — what makes this base, Turbo
@@ -260,6 +273,11 @@ pub const Engine = struct {
         self.unet = try unet_mod.load(io, allocator, s, model_dir, unet_dtype);
         errdefer self.unet.deinit();
         self.vae = try vae_mod.load(io, allocator, s, model_dir, vae_mod.DEFAULT_DTYPE);
+        errdefer self.vae.deinit();
+        self.vae_enc = vae_mod.loadEncoder(io, allocator, s, model_dir, vae_mod.DEFAULT_DTYPE) catch |e| blk: {
+            log.warn("[sdxl] VAE encoder load failed ({}) — image-to-image disabled\n", .{e});
+            break :blk null;
+        };
         return self;
     }
 
@@ -317,6 +335,11 @@ pub const Engine = struct {
         self.unet = try unet_mod.loadFromWeights(allocator, s, &w.main, unet_mod.BASE_CONFIG, unet_dtype, false);
         errdefer self.unet.deinit();
         self.vae = try vae_mod.loadFromWeights(allocator, s, &w.main, sdxl.VAE_SCALING_FACTOR, vae_mod.DEFAULT_DTYPE);
+        // `sdxl_single_file.convertVae` deliberately converts decode-only — the
+        // LDM checkpoint's encoder tensors are never carried into `w.main`, so
+        // there is nothing here to bind. img2img is unavailable on a
+        // single-file checkpoint until that converter grows an encoder arm.
+        self.vae_enc = null;
 
         log.info("[sdxl] loaded single-file checkpoint: {s}\n", .{abs_path});
         return self;
@@ -350,6 +373,7 @@ pub const Engine = struct {
         self.tower_g.deinit();
         self.unet.deinit();
         self.vae.deinit();
+        if (self.vae_enc) |*e| e.deinit();
         self.allocator.destroy(self);
     }
 
@@ -434,8 +458,30 @@ pub const Engine = struct {
         const ts = opts.target_size orelse [2]u32{ opts.height, opts.width };
         const time_ids = sdxl.addTimeIds(os[0], os[1], ct[0], ct[1], ts[0], ts[1]);
 
-        // ── Fresh latent, scaled into the Euler formulation's space.
-        var latent = blk: {
+        const start_step: u32 = @min(opts.start_step, @as(u32, @intCast(opts.steps)) - 1);
+
+        // ── Starting latent. img2img: VAE-encode the source and mix with
+        // fresh noise at `sigmas[start_step]` (`sample + noise * sigma` —
+        // diffusers' `EulerDiscreteScheduler.add_noise`). Otherwise a fresh
+        // draw scaled into the Euler formulation's space, which is the same
+        // formula with an all-zero source at `sigmas[0]`.
+        var latent = if (opts.init_image) |pix| blk: {
+            const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
+            const z0 = try ve.encode(pix);
+            defer _ = mlx.mlx_array_free(z0);
+            var key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(key);
+            try mlx.check(mlx.mlx_random_key(&key, opts.seed));
+            const shape = [_]c_int{ 1, @intCast(sdxl.LATENT_CHANNELS), @intCast(dims.h), @intCast(dims.w) };
+            var noise = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&noise, &shape, 4, .float32, 0.0, 1.0, key, s));
+            defer _ = mlx.mlx_array_free(noise);
+            const sigma0 = mlx.mlx_array_new_float(@floatCast(sched.sigmas[start_step]));
+            defer _ = mlx.mlx_array_free(sigma0);
+            const noise_scaled = try nn.mulA(noise, sigma0, s);
+            defer _ = mlx.mlx_array_free(noise_scaled);
+            break :blk try nn.addA(z0, noise_scaled, s);
+        } else blk: {
             const noise = if (opts.init_latent) |given| given else nz: {
                 var key = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(key);
@@ -467,7 +513,8 @@ pub const Engine = struct {
             });
         }
 
-        for (0..opts.steps) |i| {
+        const run_steps = opts.steps - start_step;
+        for (start_step..opts.steps) |i| {
             // Poll for a departed client BEFORE spending a step on it. A
             // guided SDXL step is two full UNet forwards, and without this a
             // cancelled request burns the GPU to completion with every other
@@ -573,7 +620,7 @@ pub const Engine = struct {
             // same shapes every step, but the pool still grows without this.
             _ = mlx.mlx_clear_cache();
 
-            if (progress) |p| p.emit("Generating", @intCast(i + 1), opts.steps);
+            if (progress) |p| p.emit("Generating", @intCast(i + 1 - start_step), run_steps);
         }
         if (progress) |p| p.emit("Decoding image", opts.steps, opts.steps);
 

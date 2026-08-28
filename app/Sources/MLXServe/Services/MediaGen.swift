@@ -529,6 +529,12 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// Pony Diffusion V6 XL — shipped the Civitai way, as ONE LDM-keyed
     /// `.safetensors`. The server converts it at load (`sdxl_single_file`),
     /// which is why no diffusers folder is needed on disk.
+    ///
+    /// NOT in `ImageModelPreset.all` — see the comment on `all` for why the
+    /// SDXL finetune shelf is deliberately curated down to one anime pick in
+    /// the app. The preset itself, and its download-selection behaviour,
+    /// stay real and tested (`SdxlFinetuneCatalogTests`): `mlx-serve pull
+    /// pony` reaches the identical bundle from the CLI.
     static let ponyDiffusionV6XL = ImageModelPreset(
         id: "lylia/pony-diffusion-v6-xl",
         name: "Pony Diffusion V6 XL (~7 GB)",
@@ -546,6 +552,10 @@ struct ImageModelPreset: Identifiable, Hashable {
     )
 
     /// NoobAI-XL v1.1 — epsilon-prediction, the conventional schedule.
+    ///
+    /// NOT in `ImageModelPreset.all` (see `all`'s comment) — `mlx-serve pull
+    /// noobai` reaches it from the CLI; `SdxlFinetuneCatalogTests` still
+    /// covers its single-file download selection.
     static let noobaiXLv11 = ImageModelPreset(
         id: "laxhar/noobai-xl-v1.1",
         name: "NoobAI-XL v1.1 (~7 GB)",
@@ -569,6 +579,9 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// `prediction_type: epsilon`, which is WRONG for this checkpoint and would
     /// silently wash out every image, while the single file carries the
     /// `v_pred` + `ztsnr` marker tensors the engine reads instead.
+    ///
+    /// NOT in `ImageModelPreset.all` (see `all`'s comment) — `mlx-serve pull
+    /// noobai:vpred` reaches it from the CLI.
     static let noobaiXLVPred10 = ImageModelPreset(
         id: "laxhar/noobai-xl-vpred-1.0",
         name: "NoobAI-XL V-Pred 1.0 (~7 GB)",
@@ -593,12 +606,21 @@ struct ImageModelPreset: Identifiable, Hashable {
     ///
     /// This was ordered by RAM alone once, which put SDXL (7 GB down / 10 RAM)
     /// after klein 9B (10 / 16) and broke the ascending-download invariant.
+    ///
+    /// The SDXL finetune shelf is deliberately CURATED, not exhaustive: base,
+    /// Turbo and one anime quant (Illustrious) cover the shapes worth a picker
+    /// row, while Pony/NoobAI-v1.1/NoobAI-VPred are near-duplicates of the same
+    /// "anime SDXL finetune, takes a negative prompt" slot — four rows saying
+    /// almost the same thing is clutter, not choice. Every SDXL checkpoint the
+    /// server can load is still one `mlx-serve pull` away (`src/cli.zig`'s
+    /// alias table is intentionally WIDER than this array); the presets
+    /// themselves stay defined and tested (`SdxlFinetuneCatalogTests`) so nothing
+    /// about their download/load behaviour goes uncovered just because the app
+    /// doesn't list them.
     static let all: [ImageModelPreset] = [
         .illustriousXLv2_Q4,                           // 4 / 6
         .flux2Klein4B_Q4,                              // 5 / 8
         .sdxlBase10, .sdxlTurbo,                       // 7 / 10
-        .ponyDiffusionV6XL,                            // 7 / 10
-        .noobaiXLv11, .noobaiXLVPred10,                // 7 / 10
         .mageFlowTurbo8bit,                            // 9 / 10
         .mageFlowEditTurbo8bit,                        // 10 / 11
         .flux2Klein9B_Q4,                              // 10 / 16

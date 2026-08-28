@@ -214,11 +214,247 @@ pub const Decoder = struct {
     }
 };
 
+/// One down-block stage: two resnets, then an optional asymmetric-pad
+/// stride-2 downsample. The last stage does not downsample.
+const DownBlock = struct {
+    resnets: []Resnet,
+    down_w: ?mlx.mlx_array,
+    down_b: ?mlx.mlx_array,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *DownBlock) void {
+        for (self.resnets) |*r| r.deinit();
+        self.allocator.free(self.resnets);
+        if (self.down_w) |x| _ = mlx.mlx_array_free(x);
+        if (self.down_b) |x| _ = mlx.mlx_array_free(x);
+    }
+};
+
+/// The encoder half of `AutoencoderKL` — pixels to latents, for img2img. A
+/// structural mirror of `Decoder`: same resnet/attn/norm topology, down
+/// instead of up. Unlike FLUX.2's encoder (`flux.VaeEncoder`), there is no
+/// `bn.*` normalization to invert — SDXL's own `scaling_factor` is the whole
+/// convention, matching what `Decoder.decodeLatent` divides back out.
+pub const Encoder = struct {
+    allocator: std.mem.Allocator,
+    s: S,
+    dtype: mlx.mlx_dtype,
+    scaling_factor: f32,
+
+    conv_in_w: mlx.mlx_array,
+    conv_in_b: mlx.mlx_array,
+    down: []DownBlock,
+    mid_r0: Resnet,
+    mid_attn: VaeAttn,
+    mid_r1: Resnet,
+    norm_out_w: mlx.mlx_array,
+    norm_out_b: mlx.mlx_array,
+    conv_out_w: mlx.mlx_array,
+    conv_out_b: mlx.mlx_array,
+    quant_w: mlx.mlx_array, // top-level quant_conv, 1x1: 2*latent -> 2*latent
+    quant_b: mlx.mlx_array,
+
+    pub fn deinit(self: *Encoder) void {
+        inline for (.{ "conv_in_w", "conv_in_b", "norm_out_w", "norm_out_b", "conv_out_w", "conv_out_b", "quant_w", "quant_b" }) |f| {
+            _ = mlx.mlx_array_free(@field(self, f));
+        }
+        self.mid_r0.deinit();
+        self.mid_attn.deinit();
+        self.mid_r1.deinit();
+        for (self.down) |*d| d.deinit();
+        self.allocator.free(self.down);
+    }
+
+    /// image `[1,3,H,W]` f32 `[0,1]` (NCHW) -> raw latent `[1,4,H/8,W/8]`
+    /// f32, scaled by `scaling_factor` — the SAME space `Decoder.decodeLatent`
+    /// expects and the diffusion loop's own `latent` lives in. Deterministic:
+    /// the distribution MEAN, never sampled (same convention as `flux.zig`'s
+    /// and `krea.zig`'s encoders).
+    pub fn encode(self: *const Encoder, img: mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
+        const two = mlx.mlx_array_new_float(2.0);
+        defer _ = mlx.mlx_array_free(two);
+        const one = mlx.mlx_array_new_float(1.0);
+        defer _ = mlx.mlx_array_free(one);
+        const x2 = try nn.mulA(img, two, s);
+        defer _ = mlx.mlx_array_free(x2);
+        const xm = try nn.subA(x2, one, s);
+        defer _ = mlx.mlx_array_free(xm);
+        const nhwc = try nn.nchwToNhwc(xm, s);
+        defer _ = mlx.mlx_array_free(nhwc);
+        const xc = try nn.astype(nhwc, self.dtype, s);
+        defer _ = mlx.mlx_array_free(xc);
+
+        var h = try nn.conv2d(xc, self.conv_in_w, self.conv_in_b, 1, s);
+        errdefer _ = mlx.mlx_array_free(h);
+
+        for (self.down) |*blk| {
+            for (blk.resnets) |*r| {
+                nn.replace(&h, try r.forward(h, null, s));
+            }
+            if (blk.down_w) |dw| {
+                nn.replace(&h, try conv2dDown(h, dw, blk.down_b.?, s));
+            }
+        }
+
+        nn.replace(&h, try self.mid_r0.forward(h, null, s));
+        nn.replace(&h, try self.mid_attn.forward(h, s));
+        nn.replace(&h, try self.mid_r1.forward(h, null, s));
+
+        {
+            const n = try nn.groupNorm(h, self.norm_out_w, self.norm_out_b, 32, VAE_EPS, s);
+            nn.replace(&h, n);
+        }
+        nn.replace(&h, try nn.silu(h, s));
+        nn.replace(&h, try nn.conv2d(h, self.conv_out_w, self.conv_out_b, 1, s)); // [1,H,W,8]
+        nn.replace(&h, try nn.conv2d(h, self.quant_w, self.quant_b, 0, s)); // [1,H,W,8]
+
+        // mean = first LATENT_CHANNELS of the last axis; logvar discarded —
+        // encode() is deterministic (the mode, never sampled).
+        const hsh = mlx.getShape(h);
+        const start = [_]c_int{ 0, 0, 0, 0 };
+        const stop = [_]c_int{ hsh[0], hsh[1], hsh[2], @intCast(sdxl.LATENT_CHANNELS) };
+        const strides = [_]c_int{ 1, 1, 1, 1 };
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_slice(&mean, h, &start, 4, &stop, 4, &strides, 4, s));
+        _ = mlx.mlx_array_free(h);
+        const meanc = try nn.contiguous(mean, s);
+        defer _ = mlx.mlx_array_free(meanc);
+        const nchw = try nn.nhwcToNchw(meanc, s);
+        defer _ = mlx.mlx_array_free(nchw);
+        const nf = try nn.astype(nchw, .float32, s);
+        defer _ = mlx.mlx_array_free(nf);
+
+        const scale = mlx.mlx_array_new_float(self.scaling_factor);
+        defer _ = mlx.mlx_array_free(scale);
+        return nn.mulA(nf, scale, s);
+    }
+};
+
+/// Asymmetric (0,1,0,1) zero-pad + 3x3 stride-2 valid conv on NHWC —
+/// diffusers `Downsample2D` as the VAE's encoder configures it (padding 0,
+/// not the UNet's symmetric-1 `nn.conv2dStride2`).
+fn conv2dDown(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const axes = [_]c_int{ 1, 2 };
+    const low = [_]c_int{ 0, 0 };
+    const high = [_]c_int{ 1, 1 };
+    const zero = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    var p = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p);
+    try mlx.check(mlx.mlx_pad(&p, x, &axes, 2, &low, 2, &high, 2, zero, "constant", s));
+    const pc = try nn.contiguous(p, s);
+    defer _ = mlx.mlx_array_free(pc);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_conv2d(&o, pc, w, 2, 2, 0, 0, 1, 1, 1, s));
+    const r = try nn.addA(o, bias, s);
+    _ = mlx.mlx_array_free(o);
+    return r;
+}
+
+/// Load the encoder half of `<model_dir>/vae` — img2img's source-image path.
+/// A pack whose `vae/` carries no `encoder.*` tensors (unusual, but nothing
+/// enforces they ship) fails cleanly; callers treat that as "no img2img".
+pub fn loadEncoder(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    s: S,
+    model_dir: []const u8,
+    dtype: mlx.mlx_dtype,
+) !Encoder {
+    const dir = try nn.fmtKey(allocator, "{s}/vae", .{model_dir});
+    defer allocator.free(dir);
+    const scaling = readScalingFactor(io, allocator, dir) orelse sdxl.VAE_SCALING_FACTOR;
+    var w = try model_mod.loadWeights(io, allocator, dir);
+    defer w.deinit();
+    return loadEncoderFromWeights(allocator, s, &w, scaling, dtype);
+}
+
+/// The weight-binding half, split out so a single-file checkpoint can drive
+/// it from an in-memory `Weights` map — same reason `loadFromWeights` exists
+/// beside `load` for the decoder.
+pub fn loadEncoderFromWeights(
+    allocator: std.mem.Allocator,
+    s: S,
+    w: *Weights,
+    scaling: f32,
+    dtype: mlx.mlx_dtype,
+) !Encoder {
+    const stages = countDownBlocks(w, allocator);
+    if (stages == 0) return error.NoVaeDownBlocks;
+
+    var e: Encoder = undefined;
+    e.allocator = allocator;
+    e.s = s;
+    e.dtype = dtype;
+    e.scaling_factor = scaling;
+
+    e.conv_in_w = try nn.loadConvWeight(w, "encoder.conv_in.weight", dtype, s);
+    e.conv_in_b = try nn.dupWeight(w, "encoder.conv_in.bias", dtype, s);
+
+    e.down = try allocator.alloc(DownBlock, stages);
+    errdefer allocator.free(e.down);
+    for (e.down, 0..) |*blk, bi| {
+        blk.allocator = allocator;
+        blk.down_w = null;
+        blk.down_b = null;
+        const n_res = countEncoderResnets(w, allocator, bi);
+        blk.resnets = try allocator.alloc(Resnet, n_res);
+        for (blk.resnets, 0..) |*r, ri| {
+            const pfx = try nn.fmtKey(allocator, "encoder.down_blocks.{d}.resnets.{d}", .{ bi, ri });
+            defer allocator.free(pfx);
+            r.* = try nn.loadResnet(w, allocator, pfx, false, VAE_EPS, dtype, s);
+        }
+        const kw = try nn.fmtKey(allocator, "encoder.down_blocks.{d}.downsamplers.0.conv.weight", .{bi});
+        defer allocator.free(kw);
+        if (w.get(kw) != null) {
+            const kb = try nn.fmtKey(allocator, "encoder.down_blocks.{d}.downsamplers.0.conv.bias", .{bi});
+            defer allocator.free(kb);
+            blk.down_w = try nn.loadConvWeight(w, kw, dtype, s);
+            blk.down_b = try nn.dupWeight(w, kb, dtype, s);
+        }
+    }
+
+    e.mid_r0 = try nn.loadResnet(w, allocator, "encoder.mid_block.resnets.0", false, VAE_EPS, dtype, s);
+    e.mid_r1 = try nn.loadResnet(w, allocator, "encoder.mid_block.resnets.1", false, VAE_EPS, dtype, s);
+    e.mid_attn = try loadVaeAttn(w, allocator, "encoder.mid_block.attentions.0", dtype, s);
+
+    e.norm_out_w = try nn.dupWeight(w, "encoder.conv_norm_out.weight", dtype, s);
+    e.norm_out_b = try nn.dupWeight(w, "encoder.conv_norm_out.bias", dtype, s);
+    e.conv_out_w = try nn.loadConvWeight(w, "encoder.conv_out.weight", dtype, s);
+    e.conv_out_b = try nn.dupWeight(w, "encoder.conv_out.bias", dtype, s);
+    e.quant_w = try nn.loadConvWeight(w, "quant_conv.weight", dtype, s);
+    e.quant_b = try nn.dupWeight(w, "quant_conv.bias", dtype, s);
+
+    log.info("[sdxl] loaded vae encoder: stages={d} scaling={d:.5}\n", .{ stages, scaling });
+    return e;
+}
+
+fn countDownBlocks(w: *const Weights, a: std.mem.Allocator) usize {
+    var n: usize = 0;
+    while (n < 16) : (n += 1) {
+        const k = nn.fmtKey(a, "encoder.down_blocks.{d}.resnets.0.conv1.weight", .{n}) catch return n;
+        defer a.free(k);
+        if (w.get(k) == null) return n;
+    }
+    return n;
+}
+
+fn countEncoderResnets(w: *const Weights, a: std.mem.Allocator, block: usize) usize {
+    var n: usize = 0;
+    while (n < 16) : (n += 1) {
+        const k = nn.fmtKey(a, "encoder.down_blocks.{d}.resnets.{d}.conv1.weight", .{ block, n }) catch return n;
+        defer a.free(k);
+        if (w.get(k) == null) return n;
+    }
+    return n;
+}
+
 /// Load the decoder half of `<model_dir>/vae`.
 ///
-/// Only the decoder is bound: the encoder's tensors are in the same file and
-/// are simply not read, because nothing in the txt2img path needs them. An
-/// img2img path would add `encoder.*` here.
+/// Only the decoder is bound by default; `loadEncoder`/`loadEncoderFromWeights`
+/// above bind the `encoder.*` tensors in the same file for img2img.
 pub fn load(
     io: std.Io,
     allocator: std.mem.Allocator,

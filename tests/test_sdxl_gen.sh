@@ -65,7 +65,7 @@ for _ in $(seq 1 40); do
   sleep 1
 done
 
-echo "[1/6] discovery + classification"
+echo "[1/7] discovery + classification"
 MODELS=$(curl -s "http://127.0.0.1:$PORT/v1/models")
 ID=$(echo "$MODELS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['data'][0]['id'] if d.get('data') else '')")
 check "the repo is discovered" "$ID" "stabilityai/sdxl-base-1.0"
@@ -82,13 +82,13 @@ check "advertises the image capability" "$CAPS" "image"
 BYTES=$(echo "$MODELS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['data'][0].get('bytes_on_disk',0) if d.get('data') else 0)")
 if [ "$BYTES" -gt 1000000000 ]; then ok "sized on disk ($BYTES bytes)"; else bad "bytes_on_disk not measured ($BYTES)"; fi
 
-echo "[2/6] a text request against an image model is refused, not prefilled"
+echo "[2/7] a text request against an image model is refused, not prefilled"
 CODE=$(curl -s -o /tmp/sdxl_chat_$PORT.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
 check "chat on an image model 400s" "$CODE" "400"
 
-echo "[3/6] generation (cold load on first request)"
+echo "[3/7] generation (cold load on first request)"
 CODE=$(curl -s -o /tmp/sdxl_img_$PORT.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"$ID\",\"prompt\":\"a photo of a cat sitting on a wooden table\",\"size\":\"512x512\",\"steps\":8,\"seed\":42}")
@@ -123,7 +123,7 @@ if grep -q "loaded unet: stages=" "$LOG"; then ok "the SDXL engine loaded (unet 
 if grep -q "loaded tokenizer_2: .*pad_id=0" "$LOG"; then ok "tokenizer_2 pads with 0"; else bad "tokenizer_2 pad_id not 0"; fi
 if grep -q "loaded tokenizer: .*pad_id=49407" "$LOG"; then ok "tokenizer pads with EOS"; else bad "tokenizer pad_id not 49407"; fi
 
-echo "[4/6] the render is an image, not static"
+echo "[4/7] the render is an image, not static"
 if "$PY_BIN" -c "import numpy, PIL" 2>/dev/null; then
   "$PY_BIN" - "$PORT" <<'PY'
 import sys
@@ -144,7 +144,7 @@ else
   echo "  SKIP: numpy/PIL unavailable"
 fi
 
-echo "[5/6] guidance-surface 400s, before any pixels are spent"
+echo "[5/7] guidance-surface 400s, before any pixels are spent"
 # `guidance`, `guidance_scale` and `timestep_spacing` are the three fields only
 # a guided backend reads, and all three can refuse. Each refusal is asserted
 # TWICE — once plain, once with "stream": true — because the streaming arm is
@@ -175,7 +175,7 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1
   -d "{\"model\":\"$ID\",\"prompt\":\"a red cube\",\"size\":\"512x512\",\"steps\":2,\"seed\":1,\"guidance\":7.5,\"timestep_spacing\":\"trailing\",\"negative_prompt\":\"blurry\"}")
 check "a fully-specified guided request generates" "$CODE" "200"
 
-echo "[6/6] size snapping and unload"
+echo "[6/7] size snapping and unload"
 # 500 is not a multiple of 64; SDXL is trained on /64 buckets, so it snaps up
 # rather than generating off-distribution.
 CODE=$(curl -s -o /tmp/sdxl_snap_$PORT.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
@@ -201,6 +201,82 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1
 check "unload-model returns 200" "$CODE" "200"
 STATE=$(curl -s "http://127.0.0.1:$PORT/v1/models" | "$PY_BIN" -c "import json,sys; d=json.load(sys.stdin); print(d['data'][0].get('state','') if d.get('data') else '')")
 check "the model is unloaded afterwards" "$STATE" "unloaded"
+
+echo "[7/7] image-to-image: a high-contrast half-dark/half-bright source at LOW"
+echo "      strength must retain its brightness split (the LTX I2V live-check pattern)"
+SRC=/tmp/sdxl_img2img_src_$PORT.png
+python3 - "$SRC" <<'PY'
+import sys, struct, zlib
+W = H = 1024
+rows = b""
+for y in range(H):
+    row = bytearray([0])
+    for x in range(W):
+        v = 235 if x >= W // 2 else 20
+        row += bytes([v, v, v])
+    rows += bytes(row)
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(rows))
+       + chunk(b"IEND", b""))
+open(sys.argv[1], "wb").write(png)
+PY
+REQ=/tmp/sdxl_img2img_req_$PORT.json
+python3 - "$SRC" "$REQ" <<'PY'
+import sys, json, base64
+b64 = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+json.dump({"prompt": "a photo", "size": "1024x1024", "steps": 8,
+           "strength": 0.2, "image": b64, "seed": 7}, open(sys.argv[2], "w"))
+PY
+OUT2=/tmp/sdxl_img2img_out_$PORT.json
+CODE=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d @"$REQ" -o "$OUT2" -w '%{http_code}')
+if [ "$CODE" = "400" ] && grep -q "isn't available for this model" "$OUT2"; then
+  echo "  SKIP: this checkpoint's VAE encoder didn't load (img2img unavailable) — a single-file checkpoint has no encoder.* tensors"
+else
+  check "img2img generation returns 200" "$CODE" "200"
+  if grep -q "\[image\] img2img:" "$LOG"; then ok "img2img engagement log line"; else bad "no img2img engagement log line"; fi
+  if "$PY_BIN" -c "import numpy" 2>/dev/null; then
+    "$PY_BIN" - "$OUT2" <<'PY'
+import sys, json, base64, zlib, struct
+d = json.load(open(sys.argv[1]))
+png = base64.b64decode(d["data"][0]["b64_json"])
+assert png[:8] == bytes([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]), "not a PNG"
+pos, idat, w, h = 8, b"", 0, 0
+while pos < len(png):
+    ln, typ = struct.unpack(">I4s", png[pos:pos+8]); data = png[pos+8:pos+8+ln]; pos += 12 + ln
+    if typ == b"IHDR": w, h, _, ct = struct.unpack(">IIBB", data[:10]); assert ct == 2
+    elif typ == b"IDAT": idat += data
+raw = zlib.decompress(idat)
+stride = w * 3
+prev = bytearray(stride)
+left_sum = right_sum = 0; n = 0
+for y in range(h):
+    f = raw[y * (stride + 1)]
+    line = bytearray(raw[y * (stride + 1) + 1 : (y + 1) * (stride + 1)])
+    for i in range(stride):
+        a = line[i - 3] if i >= 3 else 0
+        b = prev[i]
+        c = prev[i - 3] if i >= 3 else 0
+        if f == 1: line[i] = (line[i] + a) & 0xFF
+        elif f == 2: line[i] = (line[i] + b) & 0xFF
+        elif f == 3: line[i] = (line[i] + (a + b) // 2) & 0xFF
+        elif f == 4:
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[i] = (line[i] + pr) & 0xFF
+    prev = line
+    if y % 32 == 0:
+        for x in range(0, w // 2, 16): left_sum += line[x * 3]; n += 1
+        for x in range(w // 2, w, 16): right_sum += line[x * 3]
+left, right = left_sum / n, right_sum / n
+print(f"  {'PASS' if right - left > 60 else 'FAIL'}: img2img strength=0.2 kept the split (left mean {left:.0f}, right mean {right:.0f})")
+PY
+  fi
+fi
 
 echo
 echo "SDXL: $PASS passed, $FAIL failed"

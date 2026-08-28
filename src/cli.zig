@@ -87,9 +87,13 @@ pub const Alias = struct {
     dest_name: []const u8 = "",
 };
 
-/// Mirrors the app catalog (`gemmaModelOptions` in ChatModels.swift).
-/// Bare-name defaults pick the 4-bit build that fits the widest range of
-/// Macs for that family.
+/// Mirrors the app catalog (`gemmaModelOptions` in ChatModels.swift) for chat
+/// models. The SDXL image-model entries are deliberately WIDER than the
+/// app's own `ImageModelPreset.all` — the picker curates a short list (base,
+/// Turbo, one Illustrious quant) to keep the Image pane from turning into a
+/// checkpoint shelf, while every SDXL variant the app knows how to load stays
+/// one `pull` away here. Bare-name defaults pick the 4-bit build that fits
+/// the widest range of Macs for that family.
 pub const aliases = [_]Alias{
     .{ .name = "gemma4", .tag = "e2b", .repo = "mlx-community/gemma-4-e2b-it-4bit" },
     .{ .name = "gemma4", .tag = "e2b-8bit", .repo = "mlx-community/gemma-4-e2b-it-8bit" },
@@ -118,10 +122,20 @@ pub const aliases = [_]Alias{
     .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
     // ── SDXL image models (media gen) ──
+    // Stable Diffusion XL 1.0 — the full base model, real CFG. Same backend
+    // serves every entry below it.
+    .{ .name = "sdxl", .tag = "base", .repo = "stabilityai/stable-diffusion-xl-base-1.0", .is_default = true },
+    // SDXL Turbo — adversarially distilled, guidance-free, 1-4 steps.
+    .{ .name = "sdxl", .tag = "turbo", .repo = "stabilityai/sdxl-turbo" },
     // Pony Diffusion V6 XL — a single-file LDM checkpoint (Civitai), served by
     // `sdxl_single_file`. The repo also carries a standalone VAE + sample
     // images; the loader picks the LDM checkpoint by its header markers.
     .{ .name = "pony", .tag = "v6", .repo = "LyliaEngine/Pony_Diffusion_V6_XL", .is_default = true },
+    // NoobAI-XL — single-file LDM checkpoints, same `sdxl_single_file` path.
+    // `v1.1` is epsilon-prediction; `vpred` ships the v-prediction +
+    // zero-terminal-SNR marker tensors `sdxl_single_file` reads at load.
+    .{ .name = "noobai", .tag = "v1.1", .repo = "Laxhar/noobai-XL-1.1", .is_default = true },
+    .{ .name = "noobai", .tag = "vpred", .repo = "Laxhar/noobai-XL-Vpred-1.0" },
     // Illustrious XL v2 — one repo, three diffusers variants in subfolders. Each
     // `subdir` is pulled flat into its own dest so they coexist as separate
     // models. q4/q8 need the SDXL affine-quant path (`sdxl_nn` QLinear); bf16 is

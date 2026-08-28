@@ -7,13 +7,19 @@ import XCTest
 /// every one of them fails silently: a wrong bundle downloads the wrong bytes
 /// (or twice as many), and a wrong capability flag hides a control the
 /// checkpoint is actually steered with.
+///
+/// Only Illustrious ships in `ImageModelPreset.all` — Pony and both NoobAI
+/// presets are deliberately CLI-only (`ImageModelPreset.all`'s doc comment),
+/// so this suite reaches them directly rather than through the catalog. Their
+/// download/load behaviour is real and exercised the same way regardless of
+/// whether the app's picker lists them.
 final class SdxlFinetuneCatalogTests: XCTestCase {
 
     private var finetunes: [ImageModelPreset] {
-        ImageModelPreset.all.filter { $0.variant == .sdxlFinetune }
+        [.illustriousXLv2_Q4, .ponyDiffusionV6XL, .noobaiXLv11, .noobaiXLVPred10]
     }
 
-    func testTheFinetunesAreInTheCatalogAndReachTheSdxlBackend() {
+    func testTheFinetunesReachTheSdxlBackend() {
         let ids = Set(finetunes.map(\.id))
         XCTAssertTrue(ids.contains("sceneworks/illustrious-xl-v2-q4"))
         XCTAssertTrue(ids.contains("lylia/pony-diffusion-v6-xl"))
@@ -21,6 +27,14 @@ final class SdxlFinetuneCatalogTests: XCTestCase {
         XCTAssertTrue(ids.contains("laxhar/noobai-xl-vpred-1.0"))
         // All of them are served by the sdxl engine, not a family of their own.
         for p in finetunes { XCTAssertEqual(p.configName, "sdxl", p.id) }
+    }
+
+    func testOnlyIllustriousIsInTheAppsCuratedCatalog() {
+        let catalogIds = Set(ImageModelPreset.all.map(\.id))
+        XCTAssertTrue(catalogIds.contains("sceneworks/illustrious-xl-v2-q4"))
+        XCTAssertFalse(catalogIds.contains("lylia/pony-diffusion-v6-xl"))
+        XCTAssertFalse(catalogIds.contains("laxhar/noobai-xl-v1.1"))
+        XCTAssertFalse(catalogIds.contains("laxhar/noobai-xl-vpred-1.0"))
     }
 
     func testEveryFinetuneTakesANegativePromptAndSdxlsOwnGrid() {

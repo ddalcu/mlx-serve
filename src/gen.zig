@@ -612,9 +612,9 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
-            // Only the DECODER half of SDXL's VAE is bound; img2img needs the
-            // encoder, which is in the same file and simply not read yet.
-            .sdxl => false,
+            // False on a single-file checkpoint (Pony/NoobAI): the LDM
+            // converter is decode-only, so `x.vae_enc` is null there.
+            .sdxl => |x| x.vae_enc != null,
         };
     }
 
@@ -725,7 +725,7 @@ pub const ImageEngine = struct {
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
             .sdxl => |x| blk: {
                 if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
-                if (opts.init_image != null) break :blk error.Img2ImgUnsupported;
+                if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
                 break :blk x.generate(prompt, .{
                     .width = width,
                     .height = height,
@@ -734,6 +734,8 @@ pub const ImageEngine = struct {
                     .seed = seed,
                     .negative_prompt = opts.negative_prompt,
                     .spacing = opts.spacing,
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
                 }, progress);
             },
         };
