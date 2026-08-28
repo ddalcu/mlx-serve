@@ -5867,7 +5867,7 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
 
         const p_val_start = p_name_start + p_name_end + 1;
         const p_val_end = std.mem.indexOf(u8, fn_body[p_val_start..], "</parameter>") orelse break;
-        const p_val = std.mem.trim(u8, fn_body[p_val_start .. p_val_start + p_val_end], "\n");
+        const p_val = stripHermesValueFraming(fn_body[p_val_start .. p_val_start + p_val_end]);
 
         // Skip a duplicate name (first wins); still advance past its block.
         var dup = false;
@@ -5891,11 +5891,17 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         appendJsonString(allocator, &args_map, p_name) catch return null;
         args_map.append(allocator, ':') catch return null;
 
-        const trimmed_val = std.mem.trim(u8, p_val, " ");
-        if (isJsonLiteral(trimmed_val)) {
-            args_map.appendSlice(allocator, trimmed_val) catch return null;
+        // Whitespace around a NUMBER/BOOLEAN/null carries no meaning, so a
+        // padded scalar is still typed from its spelling. A STRING's own
+        // whitespace is PAYLOAD and ships verbatim: an `old_string` must match
+        // the file "exactly, including indentation", and trimming it either
+        // failed the edit or — worse — matched a different, un-indented
+        // occurrence mid-line. Only the template framing is removed.
+        const literal_val = std.mem.trim(u8, p_val, " \t\r\n");
+        if (isJsonLiteral(literal_val)) {
+            args_map.appendSlice(allocator, literal_val) catch return null;
         } else {
-            appendJsonString(allocator, &args_map, trimmed_val) catch return null;
+            appendJsonString(allocator, &args_map, p_val) catch return null;
         }
 
         param_search = p_val_start + p_val_end + "</parameter>".len;
@@ -5907,6 +5913,27 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         .name = allocator.dupe(u8, fn_name) catch return null,
         .arguments = allocator.dupe(u8, args_map.items) catch return null,
     };
+}
+
+/// The Hermes/Qwen XML tool-call template frames a parameter value with EXACTLY
+/// one newline on each side (`<parameter=NAME>\nVALUE\n</parameter>` — pinned by the
+/// Qwen3.8 render test in this file), so exactly that framing is what the parser
+/// may remove. Everything else between the tags is the value's own bytes: eating
+/// a run of newlines, or the spaces an `old_string` needs to match a file
+/// "exactly, including indentation", silently mis-edits.
+fn stripHermesValueFraming(raw: []const u8) []const u8 {
+    var v = raw;
+    if (std.mem.startsWith(u8, v, "\r\n")) {
+        v = v[2..];
+    } else if (std.mem.startsWith(u8, v, "\n")) {
+        v = v[1..];
+    }
+    if (std.mem.endsWith(u8, v, "\r\n")) {
+        v = v[0 .. v.len - 2];
+    } else if (std.mem.endsWith(u8, v, "\n")) {
+        v = v[0 .. v.len - 1];
+    }
+    return v;
 }
 
 /// A parameter name from a well-formed `<parameter=NAME>` tag is a short token
@@ -6713,6 +6740,100 @@ test "parseHermesToolCall dedups a repeated <parameter=> name (no duplicate JSON
     try testing.expectEqualStrings("./notes.md", parsed.value.object.get("path").?.string);
     // Exactly one `edits` key survives.
     try testing.expect(parsed.value.object.get("edits") != null);
+}
+
+test "parseHermesToolCall keeps leading/trailing whitespace inside a parameter value" {
+    // The Hermes/Qwen XML template frames a value with EXACTLY one newline on
+    // each side (`<parameter=NAME>\nVALUE\n</parameter>` — pinned by the
+    // Qwen3.8 render test above), so that framing is the only thing the parser
+    // may remove. It also did `std.mem.trim(u8, p_val, " ")`, which ate an
+    // `old_string`/`new_string`'s own indentation: an Edit whose needle must
+    // match the file "exactly, including indentation" then either failed, or —
+    // worse — matched a DIFFERENT, un-indented occurrence mid-line and wrote
+    // the replacement at the wrong nesting. Trailing whitespace is payload too
+    // (a `new_string` that must end in two spaces, a markdown hard line break).
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=Edit>\n<parameter=file_path>\n/tmp/app.py\n</parameter>\n" ++
+        "<parameter=old_string>\n        return None\n</parameter>\n" ++
+        "<parameter=new_string>\n        return self.value  \n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/app.py", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("        return None", parsed.value.object.get("old_string").?.string);
+    try testing.expectEqualStrings("        return self.value  ", parsed.value.object.get("new_string").?.string);
+}
+
+test "parseHermesToolCall strips only the ONE framing newline on each side" {
+    // A value that legitimately begins or ends with a blank line keeps it: the
+    // template adds one newline, not "any run of newlines". A multi-line
+    // `content` written into a file is byte-exact or the file is wrong.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=write>\n<parameter=path>\n./a.md\n</parameter>\n" ++
+        "<parameter=content>\n\n# Title\n\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("\n# Title\n", parsed.value.object.get("content").?.string);
+}
+
+test "parseHermesToolCall still types a space-padded scalar from its spelling" {
+    // The other half: whitespace around a NUMBER or BOOLEAN carries no meaning,
+    // so a one-line `<parameter=limit> 5 </parameter>` must still ship JSON 5,
+    // not the string " 5 " — fixing the string class must not break the literal
+    // class (`isJsonLiteral` never matches a padded token).
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=ls>\n<parameter=path>\n./src\n</parameter>\n" ++
+        "<parameter=limit> 5 </parameter>\n<parameter=recursive>\n true \n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 5), parsed.value.object.get("limit").?.integer);
+    try testing.expectEqual(true, parsed.value.object.get("recursive").?.bool);
+}
+
+test "parseHermesToolCall strips a CRLF framing pair as one unit" {
+    // A model that emits Windows line endings frames the value with
+    // `>\r\nVALUE\r\n</parameter>`. Dropping the "\n" half alone would leave a
+    // stray CR at both ends of every value — the framing is one unit.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\r\n<function=write>\r\n<parameter=content>\r\n" ++
+        "  hi\r\n</parameter>\r\n</function>\r\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("  hi", parsed.value.object.get("content").?.string);
 }
 
 test "parseToolCalls does NOT treat prose mentioning <function=> as a call" {
@@ -10142,6 +10263,20 @@ test "coerceToolArgsToSchema: Python-style False on a boolean param becomes JSON
     const v = parsed.value.object.get("replace_all").?;
     try testing.expect(v == .bool);
     try testing.expectEqual(false, v.bool);
+    // Same capture, the whitespace half of the class: `old_string` must match
+    // the file "exactly, including indentation", so the two leading spaces the
+    // model sent are payload. Trimming them either failed the edit or matched a
+    // DIFFERENT, un-indented occurrence mid-line and rewrote it at the wrong
+    // nesting; coercion leaves a declared string alone, so the parser is the
+    // only layer that can preserve them.
+    try testing.expectEqualStrings(
+        "  <script src=\"game.js\"></script>",
+        parsed.value.object.get("old_string").?.string,
+    );
+    try testing.expectEqualStrings(
+        "  <script src=\"game.js\" type=\"module\"></script>",
+        parsed.value.object.get("new_string").?.string,
+    );
 }
 
 test "coerceToolArgsToSchema: a STRING param spelled `false` stays a string" {
