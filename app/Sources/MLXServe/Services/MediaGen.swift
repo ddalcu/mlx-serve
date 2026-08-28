@@ -134,8 +134,9 @@ enum FluxVariant: String, Hashable, Codable {
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
-    case sdxlBase10          // Stable Diffusion XL base 1.0 — served by the sdxl backend
-    case sdxlTurbo         // Stable Diffusion XL Turbo
+    case sdxlBase10       // Stable Diffusion XL base 1.0 — served by the sdxl backend
+    case sdxlTurbo        // Stable Diffusion XL Turbo — same backend, distilled few-step
+    case sdxlFinetune     // A community SDXL finetune (Illustrious/Pony/NoobAI) — same backend, full guidance
 }
 
 struct ImageQualitySettings: Hashable {
@@ -163,6 +164,13 @@ struct ImageModelPreset: Identifiable, Hashable {
     let defaultQuality: QualityPreset
     /// Plain-English explanation shown under the model in the Media pane.
     let description: String
+    /// Non-nil: this preset is ONE variant subfolder of a multi-variant repo
+    /// (`q4/` of SceneWorks illustrious-xl-v2), pulled flat into its own dir.
+    var repoSubfolder: String? = nil
+    /// Non-nil: the repo ships a SINGLE-FILE LDM checkpoint and this is the
+    /// file — the Civitai shape the server converts at load. Only that one file
+    /// is pulled, never a diffusers folder the repo may also carry.
+    var singleFileCheckpoint: String? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -178,7 +186,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// so it has no unconditional branch for a negative prompt to steer — the
     /// field would be decoration, which is why the Advanced panel deliberately
     /// carried neither before SDXL arrived.
-    var supportsNegativePrompt: Bool { variant == .sdxlBase10 }
+    /// The community finetunes are NOT distilled — they run the same real
+    /// guidance base does, and the anime-SDXL ecosystem leans on negative
+    /// prompts harder than base ever did, so withholding the field would be
+    /// hiding the control those checkpoints are actually steered with.
+    var supportsNegativePrompt: Bool { variant == .sdxlBase10 || variant == .sdxlFinetune }
 
     /// SDXL is trained on a fixed list of ~1 MP buckets, every one a multiple
     /// of 64. It is the SAME bucket list FLUX uses (that list came from here),
@@ -484,14 +496,113 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Distilled few-step SDXL — a picture in 1-4 steps, no guidance. Takes the same LoRAs as the base model."
     )
 
-    /// Catalog ordered cheapest → heaviest (by `approxRAMGB`). Default
-    /// (`first`) is FLUX.2-klein 4B Q4 — smallest download.
+    /// Quality ladder shared by the full-guidance community finetunes. They are
+    /// base-SDXL descendants, not distills, so they want base's step counts.
+    private static let sdxlFinetuneQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 20),
+        .good:         .init(steps: 28),
+        .quality:      .init(steps: 36),
+        .superQuality: .init(steps: 48),
+    ]
+
+    /// Illustrious XL v2, 4-bit. An anime/illustration SDXL finetune, served by
+    /// the same backend as base — the affine MLX pack binds per-tensor through
+    /// the quantized `Linear` arm, so the only thing 4-bit changes is the size.
+    /// The repo holds three complete variants in subfolders; each preset pulls
+    /// exactly one (`MediaBundle.sdxlVariant`).
+    static let illustriousXLv2_Q4 = ImageModelPreset(
+        id: "sceneworks/illustrious-xl-v2-q4",
+        name: "Illustrious XL v2 4-bit (~4 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "SceneWorks/illustrious-xl-v2-mlx",
+        approxDownloadGB: 4,
+        approxRAMGB: 6,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "An anime and illustration model built on Stable Diffusion XL. Takes a negative prompt, and the smallest of the SDXL family here — a good first pick on an 8 GB Mac.",
+        repoSubfolder: "q4"
+    )
+
+    /// Pony Diffusion V6 XL — shipped the Civitai way, as ONE LDM-keyed
+    /// `.safetensors`. The server converts it at load (`sdxl_single_file`),
+    /// which is why no diffusers folder is needed on disk.
+    static let ponyDiffusionV6XL = ImageModelPreset(
+        id: "lylia/pony-diffusion-v6-xl",
+        name: "Pony Diffusion V6 XL (~7 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "LyliaEngine/Pony_Diffusion_V6_XL",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "A widely used stylized SDXL finetune with a large LoRA ecosystem. Responds strongly to its own tag-style prompts and to a negative prompt.",
+        singleFileCheckpoint: "ponyDiffusionV6XL_v6StartWithThisOne.safetensors"
+    )
+
+    /// NoobAI-XL v1.1 — epsilon-prediction, the conventional schedule.
+    static let noobaiXLv11 = ImageModelPreset(
+        id: "laxhar/noobai-xl-v1.1",
+        name: "NoobAI-XL v1.1 (~7 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "Laxhar/noobai-XL-1.1",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "An anime SDXL finetune trained on a very large tagged corpus. Takes a negative prompt; prompt it with comma-separated tags.",
+        singleFileCheckpoint: "NoobAI-XL-v1.1.safetensors"
+    )
+
+    /// NoobAI-XL V-Pred 1.0 — the v-prediction, zero-terminal-SNR build.
+    ///
+    /// Deliberately pulled as the SINGLE FILE, not the diffusers folder the same
+    /// repo also ships: the folder's `scheduler_config.json` declares
+    /// `prediction_type: epsilon`, which is WRONG for this checkpoint and would
+    /// silently wash out every image, while the single file carries the
+    /// `v_pred` + `ztsnr` marker tensors the engine reads instead.
+    static let noobaiXLVPred10 = ImageModelPreset(
+        id: "laxhar/noobai-xl-vpred-1.0",
+        name: "NoobAI-XL V-Pred 1.0 (~7 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "Laxhar/noobai-XL-Vpred-1.0",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "The v-prediction build of NoobAI-XL — deeper blacks and a wider tonal range than the standard model, at the same speed.",
+        singleFileCheckpoint: "NoobAI-XL-Vpred-v1.0.safetensors"
+    )
+
+    /// Catalog ordered cheapest → heaviest by DOWNLOAD size, which is the order
+    /// the picker shows and `testMageFlow8BitPresetsMatchTheirBf16Siblings`
+    /// enforces. It happens to be ascending in `approxRAMGB` too (comments
+    /// below: download / RAM) — where the two disagree, download wins, because
+    /// that is the number the user is committing to at the moment they choose.
+    ///
+    /// This was ordered by RAM alone once, which put SDXL (7 GB down / 10 RAM)
+    /// after klein 9B (10 / 16) and broke the ascending-download invariant.
     static let all: [ImageModelPreset] = [
-        .flux2Klein4B_Q4,                              // 5
-        .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
-        .flux2Klein9B_Q4,                              // 10
-        .sdxlBase10, .sdxlTurbo,                       // 10, 10
-        .krea2Turbo,                                   // 15
+        .illustriousXLv2_Q4,                           // 4 / 6
+        .flux2Klein4B_Q4,                              // 5 / 8
+        .sdxlBase10, .sdxlTurbo,                       // 7 / 10
+        .ponyDiffusionV6XL,                            // 7 / 10
+        .noobaiXLv11, .noobaiXLVPred10,                // 7 / 10
+        .mageFlowTurbo8bit,                            // 9 / 10
+        .mageFlowEditTurbo8bit,                        // 10 / 11
+        .flux2Klein9B_Q4,                              // 10 / 16
+        .krea2Turbo,                                   // 15 / 24
     ]
 }
 
@@ -1907,7 +2018,9 @@ extension ImageModelPreset {
         // drifts off-distribution between them, so 64 is the grid and 512 the
         // floor. Drift here shows up as the app accepting a size the server
         // then silently snaps somewhere else.
-        case .sdxlBase10, .sdxlTurbo:
+        // The community finetunes are the same architecture on the same bucket
+        // list — a finetune does not move the grid its base was trained on.
+        case .sdxlBase10, .sdxlTurbo, .sdxlFinetune:
             return ResolutionGrid(alignment: 64, minDim: 512, maxDim: 2048)
         }
     }

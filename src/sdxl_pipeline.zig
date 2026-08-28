@@ -64,6 +64,9 @@ pub const SchedulerConfig = struct {
     /// `EulerAncestralDiscreteScheduler` (SDXL-Turbo's declared sampler) adds
     /// fresh noise each step; plain Euler does not.
     ancestral: bool = false,
+    /// Zero-terminal-SNR training (diffusers `rescale_betas_zero_snr`). A
+    /// v-prediction anime finetune ships it; the stock schedule washes it out.
+    zero_snr: bool = false,
     /// Guidance the checkpoint expects when the request says nothing. Base
     /// wants ~5; the distills are trained guidance-free, and at <= 1 the
     /// pipeline skips the unconditional forward entirely — half the work.
@@ -153,6 +156,10 @@ pub fn buildSchedule(
     steps: usize,
     spacing: sdxl.TimestepSpacing,
     offset: usize,
+    /// Rescale the schedule so the terminal SNR is zero. A property of how the
+    /// checkpoint was TRAINED (NoobAI V-Pred ships a `ztsnr` marker tensor), not
+    /// a quality knob — see `sdxl.rescaleZeroTerminalSnr`.
+    zero_snr: bool,
 ) !Schedule {
     if (steps == 0) return error.ZeroSteps;
 
@@ -162,6 +169,7 @@ pub fn buildSchedule(
     const acp = try allocator.alloc(f64, sdxl.NUM_TRAIN_TIMESTEPS);
     defer allocator.free(acp);
     sdxl.alphasCumprod(betas, acp);
+    if (zero_snr) sdxl.rescaleZeroTerminalSnr(acp);
     const train = try allocator.alloc(f64, sdxl.NUM_TRAIN_TIMESTEPS);
     defer allocator.free(train);
     sdxl.trainSigmas(acp, train);
@@ -279,6 +287,16 @@ pub const Engine = struct {
         var ldm = try model_mod.loadWeightsSingleFile(allocator, abs_path);
         defer ldm.deinit();
         if (!single_file.isLdmSdxl(&ldm)) return error.NotAnSdxlCheckpoint;
+
+        // The checkpoint's own marker tensors outrank every default here: a
+        // v-prediction model sampled as epsilon produces a plausible, silently
+        // wrong image (see `single_file.TrainingMarkers`).
+        const markers = single_file.markersOf(&ldm);
+        if (markers.v_prediction) self.sched_cfg.prediction = .v_prediction;
+        if (markers.zero_snr) self.sched_cfg.zero_snr = true;
+        if (markers.any()) {
+            log.info("[sdxl] checkpoint markers: v_pred={} ztsnr={}\n", .{ markers.v_prediction, markers.zero_snr });
+        }
 
         var w = try single_file.convert(allocator, &ldm);
         defer w.deinit();
@@ -400,7 +418,7 @@ pub const Engine = struct {
             // which is guidance-free unless they also named a guidance.
             if (sp == .trailing) scfg.default_guidance = 1.0;
         }
-        var sched = try buildSchedule(a, opts.steps, scfg.spacing, scfg.effectiveOffset());
+        var sched = try buildSchedule(a, opts.steps, scfg.spacing, scfg.effectiveOffset(), scfg.zero_snr);
         defer sched.deinit();
 
         var cond = if (opts.cond_override) |ov| Conditioning{
@@ -660,6 +678,9 @@ pub fn parseSchedulerConfig(allocator: std.mem.Allocator, content: []const u8) S
     if (o.get("_class_name")) |v| {
         if (v == .string) cfg.ancestral = std.mem.indexOf(u8, v.string, "Ancestral") != null;
     }
+    if (o.get("rescale_betas_zero_snr")) |v| {
+        if (v == .bool) cfg.zero_snr = v.bool;
+    }
 
     // Guidance is NOT in this file — it is a property of how the checkpoint was
     // distilled, so it is inferred from the schedule. `trailing` at these step
@@ -710,7 +731,7 @@ const testing = std.testing;
 // accumulation error on purpose.
 test "sdxl schedule: timesteps and sigmas match diffusers EulerDiscreteScheduler" {
     const a = testing.allocator;
-    var sched = try buildSchedule(a, 8, .leading, STEPS_OFFSET);
+    var sched = try buildSchedule(a, 8, .leading, STEPS_OFFSET, false);
     defer sched.deinit();
 
     // The timesteps are integers and must match EXACTLY — there is no
@@ -740,9 +761,9 @@ test "sdxl schedule: timesteps and sigmas match diffusers EulerDiscreteScheduler
 
 test "sdxl schedule: steps_offset moves the sigma, not just the label" {
     const a = testing.allocator;
-    var with = try buildSchedule(a, 8, .leading, 1);
+    var with = try buildSchedule(a, 8, .leading, 1, false);
     defer with.deinit();
-    var without = try buildSchedule(a, 8, .leading, 0);
+    var without = try buildSchedule(a, 8, .leading, 0, false);
     defer without.deinit();
 
     // The offset shifts the reported timestep by exactly 1 ...
@@ -762,7 +783,7 @@ test "sdxl schedule: steps_offset moves the sigma, not just the label" {
 test "sdxl schedule: sigmas descend monotonically to zero at every step count" {
     const a = testing.allocator;
     for ([_]usize{ 1, 2, 4, 8, 20, 30, 50 }) |steps| {
-        var sched = try buildSchedule(a, steps, .leading, STEPS_OFFSET);
+        var sched = try buildSchedule(a, steps, .leading, STEPS_OFFSET, false);
         defer sched.deinit();
         try testing.expectEqual(steps, sched.timesteps.len);
         try testing.expectEqual(steps + 1, sched.sigmas.len);
@@ -774,7 +795,7 @@ test "sdxl schedule: sigmas descend monotonically to zero at every step count" {
         try testing.expectEqual(@as(f64, 0.0), sched.sigmas[steps]);
         try testing.expect(sched.init_noise_sigma > 1.0);
     }
-    try testing.expectError(error.ZeroSteps, buildSchedule(a, 0, .leading, STEPS_OFFSET));
+    try testing.expectError(error.ZeroSteps, buildSchedule(a, 0, .leading, STEPS_OFFSET, false));
 }
 
 // END-TO-END parity. The component fixtures pin each piece in isolation and
@@ -1060,11 +1081,11 @@ test "sdxl turbo: the schedule comes from the checkpoint, not from base's defaul
 test "sdxl turbo: a trailing schedule needs no offset and starts at the top" {
     const a = testing.allocator;
     // Turbo's real shape: 4 steps, trailing, no offset.
-    var sched = try buildSchedule(a, 4, .trailing, 0);
+    var sched = try buildSchedule(a, 4, .trailing, 0, false);
     defer sched.deinit();
     try testing.expectEqualSlices(f32, &[_]f32{ 999, 749, 499, 249 }, sched.timesteps);
     // 1 step is the headline case and must still reach the noisiest timestep.
-    var one = try buildSchedule(a, 1, .trailing, 0);
+    var one = try buildSchedule(a, 1, .trailing, 0, false);
     defer one.deinit();
     try testing.expectEqualSlices(f32, &[_]f32{999}, one.timesteps);
     try testing.expectEqual(@as(f64, 0.0), one.sigmas[1]);

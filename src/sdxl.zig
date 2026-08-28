@@ -99,6 +99,45 @@ pub fn trainSigmas(acp: []const f64, out: []f64) void {
     for (acp, 0..) |a, i| out[i] = @sqrt((1.0 - a) / a);
 }
 
+/// diffusers' floor for the terminal `alphas_cumprod` under zero-terminal-SNR.
+/// The rescale drives the last value to EXACTLY zero, and `trainSigmas` divides
+/// by it — sigma would be `inf` and every downstream coefficient NaN. diffusers
+/// picks fp16's smallest positive subnormal for the same reason: close enough to
+/// zero to be terminal, far enough to stay finite.
+const ZERO_SNR_TERMINAL_ACP: f64 = 1.0 / @as(f64, @floatFromInt(@as(u64, 1) << 24));
+
+/// Rescale `acp` in place so the terminal signal-to-noise ratio is zero
+/// (Lin et al., "Common Diffusion Noise Schedules and Sample Steps are Flawed";
+/// diffusers' `rescale_zero_terminal_snr`).
+///
+/// The stock scaled-linear schedule never reaches pure noise — `acp[last]` is
+/// ~0.0047, so the model is always shown a faint trace of the image and learns
+/// to rely on it. A model TRAINED that way is fine; one trained with zero
+/// terminal SNR (NoobAI V-Pred, which self-identifies with a `ztsnr` marker
+/// tensor) expects the last step to start from pure noise, and sampling it on
+/// the stock ladder washes out contrast — a plausible image, systematically
+/// wrong, which is why this is keyed on the checkpoint's own marker rather than
+/// offered as a knob.
+///
+/// Operates on sqrt(acp): shift so the last entry is 0, rescale so the first is
+/// unchanged, square back. The terminal entry is then floored (see above).
+pub fn rescaleZeroTerminalSnr(acp: []f64) void {
+    if (acp.len == 0) return;
+    var sqrt_acp_0 = @sqrt(acp[0]);
+    const sqrt_acp_t = @sqrt(acp[acp.len - 1]);
+    const denom = sqrt_acp_0 - sqrt_acp_t;
+    if (denom == 0.0) return; // degenerate table — leave it alone
+    const scale = sqrt_acp_0 / denom;
+    // `sqrt_acp_0` is read once more below through `scale`, so cache nothing else.
+    sqrt_acp_0 = undefined;
+    for (acp) |*a| {
+        const shifted = @sqrt(a.*) - sqrt_acp_t;
+        const s = shifted * scale;
+        a.* = s * s;
+    }
+    acp[acp.len - 1] = ZERO_SNR_TERMINAL_ACP;
+}
+
 /// The training timestep indices for `steps` inference steps.
 ///
 /// "leading" walks 0, ratio, 2*ratio, … with `ratio = num_train // steps`, then
@@ -419,6 +458,48 @@ test "train sigmas ascend with the timestep index" {
     // sigma_0 is small (barely any noise) and sigma_max is large.
     try testing.expect(sig[0] < 0.05);
     try testing.expect(sig[sig.len - 1] > 10.0);
+}
+
+test "zero-terminal-SNR rescale drives the last alphas_cumprod to ~0 and keeps sigma finite" {
+    var betas: [NUM_TRAIN_TIMESTEPS]f64 = undefined;
+    var acp: [NUM_TRAIN_TIMESTEPS]f64 = undefined;
+    scaledLinearBetas(&betas);
+    alphasCumprod(&betas, &acp);
+
+    // The stock schedule never reaches pure noise — that is the defect ZTSNR
+    // exists to fix, and the value it starts from.
+    try testing.expect(acp[acp.len - 1] > 0.004);
+    const first_before = acp[0];
+
+    rescaleZeroTerminalSnr(&acp);
+
+    // Terminal is the floor, not literally zero (a literal zero is an inf sigma).
+    try testing.expectEqual(ZERO_SNR_TERMINAL_ACP, acp[acp.len - 1]);
+    try testing.expect(acp[acp.len - 1] < 1e-6);
+    // The FIRST entry is preserved by construction (the rescale's whole point:
+    // move the tail to zero without moving the head).
+    try testing.expectApproxEqAbs(first_before, acp[0], 1e-9);
+    // Still a decaying schedule in (0, 1].
+    for (acp) |a| try testing.expect(a > 0.0 and a <= 1.0);
+    for (1..acp.len) |i| try testing.expect(acp[i] < acp[i - 1]);
+
+    // And the sigma ladder it feeds stays finite + ascending, with a terminal
+    // sigma far above the stock ~14.6 (that is what "pure noise" looks like).
+    var sig: [NUM_TRAIN_TIMESTEPS]f64 = undefined;
+    trainSigmas(&acp, &sig);
+    for (sig) |s| try testing.expect(std.math.isFinite(s));
+    for (1..sig.len) |i| try testing.expect(sig[i] > sig[i - 1]);
+    try testing.expect(sig[sig.len - 1] > 1000.0);
+}
+
+test "zero-terminal-SNR rescale leaves a degenerate table alone" {
+    // A constant table has no head-to-tail span to rescale against; dividing by
+    // that zero span would be inf/NaN across the whole ladder.
+    var flat = [_]f64{ 0.5, 0.5, 0.5 };
+    rescaleZeroTerminalSnr(&flat);
+    for (flat) |a| try testing.expectEqual(@as(f64, 0.5), a);
+    var empty = [_]f64{};
+    rescaleZeroTerminalSnr(&empty); // must not crash
 }
 
 test "leading spacing walks the training steps and runs high noise first" {

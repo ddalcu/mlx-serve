@@ -72,14 +72,26 @@ final class CustomMediaRepoTests: XCTestCase {
           "tags":["diffusers","safetensors","text-to-image","diffusion","mage-flow"],
           "config":{"diffusers":{"_class_name":"MageFlowPipeline"}}},
          {"id":"x/sdxl","pipeline_tag":"text-to-image","tags":["diffusers"],
-          "config":{"diffusers":{"_class_name":"StableDiffusionXLPipeline"}}}]
+          "config":{"diffusers":{"_class_name":"StableDiffusionXLPipeline"}}},
+         {"id":"x/sd15","pipeline_tag":"text-to-image","tags":["diffusers"],
+          "config":{"diffusers":{"_class_name":"StableDiffusionPipeline"}}}]
         """.utf8)
         let models = try JSONDecoder().decode([HFModel].self, from: json)
         XCTAssertEqual(models[0].mediaFamilyModelType, "mage_flow")
         XCTAssertTrue(models[0].isServedMediaRepo)
         XCTAssertFalse(models[0].isCompatible) // unverified until the tree check
-        XCTAssertFalse(models[1].isServedMediaRepo)
-        XCTAssertFalse(models[1].isCompatible)
+        // SDXL joined the served classes when the sdxl engine landed: it loads
+        // stability's own diffusers multi-folder layout, which is exactly the
+        // "our engine loads that repo's OWN layout" bar this list is for.
+        XCTAssertEqual(models[1].mediaFamilyModelType, "sdxl")
+        XCTAssertTrue(models[1].isServedMediaRepo)
+        XCTAssertFalse(models[1].isCompatible) // still unverified until the tree check
+        // SD 1.5 is the counter-example the SDXL row used to be: a diffusers
+        // pipeline we do NOT serve (one text encoder, not XL), so it stays
+        // incompatible on its class alone.
+        XCTAssertNil(models[2].mediaFamilyModelType)
+        XCTAssertFalse(models[2].isServedMediaRepo)
+        XCTAssertFalse(models[2].isCompatible)
 
         // The tree check runs the mage_flow family markers, and the Edit repo
         // adopts the edit family by its name — the server's dirIsEdit rule.

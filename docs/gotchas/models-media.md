@@ -1923,3 +1923,98 @@ keeps. `pull pony` / `pull illustrious[:q4|q8|bf16]`.
 Not verified against real output — the quant path binds and runs, but like the
 rest of SDXL here it has no numeric oracle. Pull a q4 pack and eyeball a
 generation before trusting it.
+
+### A v-prediction checkpoint whose own config says epsilon (NoobAI-XL V-Pred)
+
+NoobAI-XL ships two builds. v1.1 is ordinary epsilon-prediction. V-Pred 1.0 is
+v-prediction trained with zero terminal SNR — and the diffusers folder in its own
+repo declares:
+
+    "prediction_type": "epsilon",
+    "rescale_betas_zero_snr": false,
+
+Both wrong for that checkpoint. This is the "when an arch's reference IGNORES a
+config field, that field is not the truth" class, with the sharpest possible
+edge: read as epsilon, a v-prediction model does not error, does not produce
+noise, and does not look obviously broken. It produces a plausible image with
+systematically washed-out contrast — the failure a user reports as "this model
+isn't very good" rather than as a bug.
+
+The checkpoint itself is honest. Single-file SDXL checkpoints carry zero-size
+MARKER TENSORS in the A1111/ComfyUI convention, and NoobAI V-Pred's header holds
+both:
+
+    "v_pred": {"dtype":"F32","shape":[0],"data_offsets":[334615452,334615452]}
+    "ztsnr": {"dtype":"F32","shape":[0],"data_offsets":[334615452,334615452]}
+
+So `sdxl_single_file.TrainingMarkers` reads them and they OUTRANK every default
+at `loadSingleFile`. That in turn decides the app's bundle: `MediaBundle` pulls
+that repo's SINGLE FILE, not the diffusers folder sitting beside it, because the
+single file is the copy that describes itself correctly. The markers are matched
+QUOTED (`"v_pred"`) so a longer key containing the name cannot false-positive,
+and `convert` never carries them into the diffusers maps — they are sentinels,
+and a shapeless array handed to a binder is its own failure.
+
+Zero terminal SNR is the other half. The stock scaled-linear schedule ends at
+`alphas_cumprod ≈ 0.0047` — never pure noise — so the model is always shown a
+faint trace of the image. A model TRAINED that way is fine; one trained at zero
+terminal SNR expects the last step to start from pure noise, and sampling it on
+the stock ladder washes out contrast for the same reason the prediction type
+does. `sdxl.rescaleZeroTerminalSnr` is Lin et al.'s rescale (diffusers'
+`rescale_zero_terminal_snr`): operate on sqrt(acp), shift so the last entry is
+zero, rescale so the first is unchanged, square back. The terminal entry is then
+FLOORED at 2^-24 — the rescale drives it to exactly zero and `trainSigmas`
+divides by it, so a literal zero is an `inf` sigma and NaN through every
+downstream coefficient. diffusers floors it for the same reason and at the same
+value (fp16's smallest positive subnormal).
+
+There is no numeric oracle for any of this, so the tests assert the LADDER'S OWN
+properties rather than values: terminal alphas_cumprod at the floor, the head
+entry preserved to 1e-9, still monotonically decreasing, every sigma finite and
+ascending, terminal sigma far above the stock ~14.6. A degenerate (constant)
+table is left alone rather than divided by its zero span.
+
+Still unverified against real output — like the rest of SDXL here, this binds
+and runs and is reasoned from the reference, but nothing executes diffusers to
+check it. Generate with NoobAI V-Pred and look before trusting it.
+
+### Community SDXL finetunes in the app catalog, and the shapes they ship in
+
+Illustrious XL, Pony Diffusion V6 and NoobAI-XL are all vanilla SDXL, so they
+reach one backend — but they ship in three different repo shapes, and the preset
+DECLARES which rather than the bundle sniffing an id:
+
+  - **A nested quant variant.** SceneWorks illustrious-xl-v2 holds `bf16/`,
+    `q4/` and `q8/`, each a COMPLETE diffusers SDXL. `MediaBundle.sdxlVariant`
+    pulls one with `recursive` + `subfolder`. The existing `subfolder` support
+    kept only a subfolder's IMMEDIATE children (right for a flat MLX quant
+    folder like `4bit/config.json`), which rejects `q4/unet/…` and downloads a
+    variant with no weights — so `selectNeededFiles` now keeps depth under a
+    subfolder when `recursive` is also set. The prefix comes off on the way to
+    disk, so the result looks like a plain SDXL repo to the folder loader.
+  - **A root single-file checkpoint** (Pony, both NoobAI builds).
+    `MediaBundle.sdxlSingleFile` pulls exactly one `.safetensors`. Two things it
+    must exclude: the repo's other weights (Pony ships a standalone VAE; NoobAI
+    ships a whole diffusers folder — pulling both doubles a 7 GB download), and
+    `model_index.json` BY NAME, because its presence alone sends
+    `Engine.loadAuto` down the folder path into weights that were deliberately
+    not downloaded.
+  - **A plain diffusers repo** — stability's own, unchanged.
+
+Two catalog invariants came out of this. The finetunes are NOT distills, so they
+run real guidance and take a negative prompt (the anime-SDXL ecosystem steers
+with them harder than base does); `supportsNegativePrompt` is two variants now,
+and the guard that asserted "only sdxlBase10" had to grow rather than be
+deleted. And `ImageModelPreset.all` is ascending by DOWNLOAD size, which is the
+order the picker shows and what `testMageFlow8BitPresetsMatchTheirBf16Siblings`
+enforces — the SDXL presets had been inserted in RAM order, putting a 7 GB model
+after a 10 GB one and leaving that test red on the branch before any of this.
+
+The limit worth knowing: a download's destination is derived from its REPO, so
+two presets on one repo overwrite each other's files on disk — each reading as
+"downloaded" while holding the other's weights. That is why only ONE Illustrious
+variant (q4) ships. Shipping q8 as well needs a per-variant destination
+(`download(destRepoId:)` exists for MLX chat variants; the media bundle path
+keys `comp.repo` as source, destination AND progress key in ~7 places). Pinned
+by `testNoTwoCatalogPresetsShareADownloadDestination` so the collision cannot be
+introduced silently.

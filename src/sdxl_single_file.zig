@@ -83,6 +83,50 @@ pub fn isLdmSdxl(w: *const Weights) bool {
         hasPrefix(w, "conditioner.embedders.1.model.");
 }
 
+/// What a single-file checkpoint declares about how it was TRAINED, read from
+/// zero-size marker tensors rather than any config.
+///
+/// This is the A1111/ComfyUI convention and it is the ONLY trustworthy source
+/// for these two facts. NoobAI-XL V-Pred ships `v_pred` + `ztsnr` markers in the
+/// checkpoint — and its own diffusers export declares
+/// `"prediction_type": "epsilon"`, which is WRONG for it. A config that lies is
+/// worse than no config: read as epsilon, a v-prediction model still produces a
+/// plausible image, just systematically washed out, with nothing to error on.
+/// So the markers win wherever they are present.
+pub const TrainingMarkers = struct {
+    /// `v_pred` — v-prediction rather than epsilon.
+    v_prediction: bool = false,
+    /// `ztsnr` — trained with zero terminal SNR.
+    zero_snr: bool = false,
+
+    pub fn any(self: TrainingMarkers) bool {
+        return self.v_prediction or self.zero_snr;
+    }
+};
+
+/// Zero-size marker tensor names, in the spelling the ecosystem writes them.
+pub const V_PRED_MARKER = "v_pred";
+pub const ZTSNR_MARKER = "ztsnr";
+
+/// Read the training markers from a loaded LDM `Weights` map.
+pub fn markersOf(w: *const Weights) TrainingMarkers {
+    return .{
+        .v_prediction = w.get(V_PRED_MARKER) != null,
+        .zero_snr = w.get(ZTSNR_MARKER) != null,
+    };
+}
+
+/// Read the training markers from a safetensors HEADER (its JSON tensor map).
+/// Substring search over the raw header, so a caller can feed a bounded prefix
+/// of a multi-GB file — same discipline as `sdxl.headerDeclaresLdmSdxl`. The
+/// names are quoted so a `v_pred` inside some longer key cannot false-positive.
+pub fn markersFromHeader(header_bytes: []const u8) TrainingMarkers {
+    return .{
+        .v_prediction = std.mem.indexOf(u8, header_bytes, "\"" ++ V_PRED_MARKER ++ "\"") != null,
+        .zero_snr = std.mem.indexOf(u8, header_bytes, "\"" ++ ZTSNR_MARKER ++ "\"") != null,
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Array transforms
 // ════════════════════════════════════════════════════════════════════════
@@ -719,6 +763,57 @@ test "convert maps the block-index-sensitive keys to their diffusers targets" {
     try testing.expect(dst.clip_l.get("text_model.encoder.layers.5.self_attn.q_proj.weight") == null);
     // The mid attention 1x1 conv squeezed to a 2-D linear.
     try testing.expectEqual(@as(usize, 2), mlx.mlx_array_ndim(dst.main.get("decoder.mid_block.attentions.0.to_q.weight").?));
+}
+
+test "training markers are read from the checkpoint, not a config" {
+    const a = testing.allocator;
+    // A v-pred + ztsnr checkpoint (NoobAI-XL V-Pred's actual shape).
+    var w = Weights.init(a);
+    defer w.deinit();
+    try w.put("model.diffusion_model.input_blocks.0.0.weight", mlx.mlx_array_new());
+    try w.put(V_PRED_MARKER, mlx.mlx_array_new());
+    try w.put(ZTSNR_MARKER, mlx.mlx_array_new());
+    const m = markersOf(&w);
+    try testing.expect(m.v_prediction);
+    try testing.expect(m.zero_snr);
+    try testing.expect(m.any());
+
+    // A plain epsilon checkpoint carries neither.
+    var e = Weights.init(a);
+    defer e.deinit();
+    try e.put("model.diffusion_model.input_blocks.0.0.weight", mlx.mlx_array_new());
+    const me = markersOf(&e);
+    try testing.expect(!me.v_prediction);
+    try testing.expect(!me.zero_snr);
+    try testing.expect(!me.any());
+}
+
+test "markersFromHeader keys on the QUOTED name so a longer key cannot match" {
+    const vpred = "{\"v_pred\":{\"shape\":[0]},\"ztsnr\":{\"shape\":[0]}}";
+    const m = markersFromHeader(vpred);
+    try testing.expect(m.v_prediction and m.zero_snr);
+
+    // A key that merely CONTAINS the marker name is not the marker.
+    const decoy = "{\"model.diffusion_model.v_pred_thing.weight\":{}}";
+    const d = markersFromHeader(decoy);
+    try testing.expect(!d.v_prediction);
+    try testing.expect(!d.zero_snr);
+}
+
+test "the marker tensors are not converted into the diffusers maps" {
+    // They are zero-size sentinels, not weights — a converted map that carried
+    // one would hand a shapeless array to a binder.
+    const a = testing.allocator;
+    var src = Weights.init(a);
+    defer src.deinit();
+    try src.put(V_PRED_MARKER, mkArr(&[_]c_int{ 1, 1 }));
+    try src.put(ZTSNR_MARKER, mkArr(&[_]c_int{ 1, 1 }));
+    var dst = try convert(a, &src);
+    defer dst.deinit();
+    for ([_]*Weights{ &dst.main, &dst.clip_l, &dst.clip_g }) |m| {
+        try testing.expect(m.get(V_PRED_MARKER) == null);
+        try testing.expect(m.get(ZTSNR_MARKER) == null);
+    }
 }
 
 test "headerDeclaresLdmSdxl needs every marker" {

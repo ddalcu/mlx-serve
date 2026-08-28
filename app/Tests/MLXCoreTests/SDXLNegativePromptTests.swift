@@ -37,7 +37,17 @@ final class SDXLNegativePromptTests: XCTestCase {
         // Turbo is SDXL too, but adversarially distilled and guidance-free —
         // it has no unconditional branch, so it must NOT advertise the field.
         XCTAssertFalse(ImageModelPreset.sdxlTurbo.supportsNegativePrompt)
-        for p in ImageModelPreset.all where p.variant != .sdxlBase10 {
+        // The community finetunes (Illustrious / Pony / NoobAI) are base-SDXL
+        // descendants, NOT distills: they run the same real guidance, and the
+        // anime-SDXL ecosystem steers with negative prompts more than base does.
+        // So the guidance-capable set is two variants, not one.
+        let guidanceCapable: Set<FluxVariant> = [.sdxlBase10, .sdxlFinetune]
+        XCTAssertFalse(ImageModelPreset.all.filter { $0.variant == .sdxlFinetune }.isEmpty,
+                       "a finetune must be in the catalog or this assertion is vacuous")
+        for p in ImageModelPreset.all where p.variant == .sdxlFinetune {
+            XCTAssertTrue(p.supportsNegativePrompt, "\(p.id) runs real guidance and must offer the field")
+        }
+        for p in ImageModelPreset.all where !guidanceCapable.contains(p.variant) {
             XCTAssertFalse(p.supportsNegativePrompt, "\(p.id) does not read a negative prompt")
         }
     }

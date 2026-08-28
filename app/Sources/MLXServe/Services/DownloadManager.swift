@@ -264,7 +264,14 @@ class DownloadManager: ObservableObject {
             // speech_tokenizer).
             if let sub = selection.subfolder {
                 guard path.hasPrefix(sub + "/") else { return nil }
-                guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
+                // A flat quant variant holds its files directly (`4bit/config.json`),
+                // so the default keeps only the subfolder's own children. A variant
+                // that is itself a diffusers repo (`q4/unet/…` — SceneWorks ships
+                // one complete SDXL per quant folder) is nested, and asks for
+                // `recursive` to keep the depth below it.
+                if !selection.recursive {
+                    guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
+                }
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
             }

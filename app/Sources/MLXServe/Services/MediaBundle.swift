@@ -482,6 +482,69 @@ extension MediaBundle {
         )
     }
 
+    /// One quant variant of a multi-variant SDXL diffusers repo — SceneWorks
+    /// ships `bf16/`, `q4/` and `q8/`, each a COMPLETE diffusers SDXL. The
+    /// variant is pulled with its nested weight dirs (`recursive` + `subfolder`,
+    /// the combination `selectNeededFiles` keeps at any depth) and written at
+    /// the destination root, so on disk it looks exactly like a plain SDXL repo
+    /// and the server's ordinary folder loader binds it. `q4`/`q8` are affine
+    /// MLX packs — the engine reads them per-tensor through `sdxl_nn.Linear`'s
+    /// quantized arm; nothing here has to say which.
+    ///
+    /// No `keepSafetensors`: unlike stabilityai's repos these hold exactly one
+    /// weight file per component, with no fp32 sibling to filter out.
+    static func sdxlVariant(repo: String, subfolder: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sdxl:\(repo)#\(subfolder)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, subfolder: subfolder),
+                    readyMarkers: [
+                        "model_index.json", "unet", "vae",
+                        "text_encoder", "text_encoder_2",
+                        "tokenizer", "tokenizer_2", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// A SINGLE-FILE SDXL checkpoint (the Civitai / A1111 distribution): one
+    /// LDM-keyed `.safetensors` at the repo root, no configs and no tokenizer.
+    /// The server converts it in place (`sdxl_single_file`), reading the
+    /// checkpoint's own `v_pred`/`ztsnr` marker tensors for how it was trained.
+    ///
+    /// `checkpoint` is the ONE file to pull: these repos also ship a standalone
+    /// VAE, sample images, and — for NoobAI — a COMPLETE diffusers folder beside
+    /// the checkpoint, which would double the download. Non-recursive drops the
+    /// folder's weights; `model_index.json` is excluded BY NAME because its mere
+    /// presence would send `Engine.loadAuto` down the folder path, into a
+    /// directory whose weights were deliberately not downloaded. For NoobAI
+    /// V-Pred that exclusion is also a correctness fix: its folder export
+    /// declares `prediction_type: epsilon`, which is wrong for it, while the
+    /// single file self-identifies.
+    static func sdxlSingleFile(repo: String, checkpoint: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sdxl-single:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: false,
+                        excludeSubstrings: ["model_index.json"],
+                        keepSafetensors: [checkpoint]
+                    ),
+                    readyMarkers: [checkpoint]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -516,6 +579,18 @@ extension ImageModelPreset {
             // FLUX mirrors it isn't a bundle we control: it carries fp32
             // duplicates, single-file checkpoints, and onnx/openvino exports
             // the `.flux` default has no allowlist to skip.
+            return .sdxlDiffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .sdxlFinetune:
+            // Three repo shapes reach the same backend, and the preset declares
+            // which it is rather than the bundle sniffing the id.
+            if let checkpoint = singleFileCheckpoint {
+                return .sdxlSingleFile(repo: repo, checkpoint: checkpoint,
+                                       displayName: name, sizeGB: Double(approxDownloadGB))
+            }
+            if let sub = repoSubfolder {
+                return .sdxlVariant(repo: repo, subfolder: sub,
+                                    displayName: name, sizeGB: Double(approxDownloadGB))
+            }
             return .sdxlDiffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
