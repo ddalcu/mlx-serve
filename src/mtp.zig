@@ -107,6 +107,7 @@ pub const MtpCostProfile = enum {
     g17_nax_q6_gs64,
     g17_nax_q8_gs64,
     g17_nax_oq4e_q4_gs64,
+    g17_nax_qwen4_q4_gs64,
 };
 
 /// Target-side tensors that contribute materially to a complete MTP round.
@@ -153,6 +154,84 @@ pub fn m5NaxCostProfileForFingerprint(
             .generic,
         .none => .generic,
     };
+}
+
+/// Pure first-stage classifier for the qwen4_exp in-checkpoint head. The
+/// trunk is MoE, so the sidecar fingerprint path above can never match it;
+/// this is its own measured surface, not a widening of the sidecar ones.
+pub fn qwen4G17CostProfileForFingerprint(
+    trunk_affine: bool,
+    trunk_bits: u32,
+    trunk_group_size: u32,
+    head_packs_match: bool,
+    nax_lane_live: bool,
+) MtpCostProfile {
+    if (!trunk_affine or trunk_bits != 4 or trunk_group_size != 64) return .generic;
+    if (!head_packs_match) return .generic;
+    if (!nax_lane_live) return .generic;
+    return .g17_nax_qwen4_q4_gs64;
+}
+
+var qwen4_g17_profile_logged: bool = false;
+var qwen4_g17_env_cache: ?bool = null;
+
+/// Profile-only revocation (MLX_SERVE_MTP_QWEN4_PROFILE=0): planning falls
+/// back to `generic` while every compute lane stays exactly as shipped —
+/// the isolation arm for cost-surface A/Bs, where killing the vqmm NAX lane
+/// would change the very costs under test.
+fn qwen4G17EnvEnabled() bool {
+    if (qwen4_g17_env_cache) |v| return v;
+    var on = true;
+    if (std.c.getenv("MLX_SERVE_MTP_QWEN4_PROFILE")) |p| {
+        const val = std.mem.span(p);
+        if (val.len > 0 and val[0] == '0') on = false;
+    }
+    qwen4_g17_env_cache = on;
+    return on;
+}
+
+/// Live resolver for the qwen4_exp head: validates the runtime fingerprint
+/// the G17 surface was measured on — uniform affine-4/gs-64 config and both
+/// head fc packs at that width (K derived from the scales, so no input-dim
+/// formula is assumed). Revoked by MLX_SERVE_VERIFY_QMM_NAX=0 like the
+/// sidecar profiles: auto depth never assumes a lane the environment
+/// disabled.
+pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
+    if (!qwen4G17EnvEnabled()) return .generic;
+    const head = if (target.qwen4_mtp) |*h| h else return .generic;
+    const cfg = &target.config;
+    if (cfg.hidden_size == 0 or cfg.hidden_size > std.math.maxInt(c_int)) return .generic;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const packs = qwen4PackTripleMatches(head.fc_emb_w, head.fc_emb_s, head.fc_emb_b, hidden) and
+        qwen4PackTripleMatches(head.fc_hid_w, head.fc_hid_s, head.fc_hid_b, hidden);
+    const profile = qwen4G17CostProfileForFingerprint(
+        cfg.quant_mode == .affine,
+        cfg.quant_bits,
+        cfg.quant_group_size,
+        packs,
+        transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable(),
+    );
+    if (profile != .generic and !qwen4_g17_profile_logged) {
+        qwen4_g17_profile_logged = true;
+        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged (MLX_SERVE_VERIFY_QMM_NAX=0 restores generic)\n", .{});
+    }
+    return profile;
+}
+
+/// One packed projection of the qwen4 head: uint32 codes [N, K*4/32] with
+/// bf16 scales and biases [N, K/64], N == hidden. K comes from the scales.
+fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, hidden: c_int) bool {
+    if (w.ctx == null or s.ctx == null or b.ctx == null) return false;
+    if (mlx.mlx_array_dtype(w) != .uint32) return false;
+    if (mlx.mlx_array_dtype(s) != .bfloat16 or mlx.mlx_array_dtype(b) != .bfloat16) return false;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(s);
+    const bs = mlx.getShape(b);
+    if (ws.len != 2 or ss.len != 2 or bs.len != 2) return false;
+    if (ws[0] != hidden or ss[0] != hidden or bs[0] != hidden) return false;
+    if (ss[1] <= 0 or ss[1] != bs[1]) return false;
+    const k = @as(u64, @intCast(ss[1])) * 64;
+    return @as(u64, @intCast(ws[1])) * 32 == k * 4;
 }
 
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
@@ -432,12 +511,14 @@ pub const MtpModel = struct {
             .g17_nax_q8_gs32, .g17_nax_q8_gs64 => 8,
             .g17_nax_q6_gs64 => 6,
             .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64 => 4,
-            .generic => return .generic,
+            // The sidecar fingerprint classifier above never returns the
+            // qwen4 profile; keep the fallback honest anyway.
+            .generic, .g17_nax_qwen4_q4_gs64 => return .generic,
         };
         const sidecar_group_size: u32 = switch (profile) {
             .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
             .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => 64,
-            .generic => return .generic,
+            .generic, .g17_nax_qwen4_q4_gs64 => return .generic,
         };
 
         const cfg = &target.config;
@@ -3278,6 +3359,17 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForFingerprint(4, 64, .oqe_quantized_embedding));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(4, 64, .none));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(3, 32, .uniform_quantized_embedding));
+
+    // qwen4_exp in-checkpoint head: its own classifier — the MoE trunk can
+    // never reach the sidecar fingerprint path above. Only the measured
+    // uniform affine-4/gs-64 runtime with the NAX lane live is calibrated;
+    // every degraded condition falls back to generic, one at a time.
+    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_q4_gs64, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(false, 4, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 8, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 32, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, false, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, false));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
     defer sidecar.deinit();
