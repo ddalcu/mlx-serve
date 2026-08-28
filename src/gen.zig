@@ -1874,15 +1874,20 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             edit_imgs_n = 1;
             log.info("[image] edit: reference {d}x{d} -> {d}x{d} (in-context conditioning)\n", .{ nat.w, nat.h, rd.w, rd.h });
             // Output grid (independent of the reference's own conditioning grid
-            // above). NO size in the request = "Match source": the reference's
-            // own resolution IS the output target, same contract the byte-based
-            // backend already honors above. An explicit size keeps the
-            // reference's aspect ratio and treats the request as the pixel
-            // budget to fit it into. Without this, `width`/`height` stay at
-            // the 1024x1024 default from earlier and every edit comes back
-            // square regardless of what the client asked to match.
+            // above — the reference rides at its own `rd` grid in every attention
+            // step and is never resized onto the output canvas, unlike the
+            // byte-based backend above). NO size in the request = "Match
+            // source": the reference's own resolution IS the output target,
+            // same contract the byte-based backend already honors above. An
+            // EXPLICIT size is honored LITERALLY — the reference's aspect ratio
+            // has no architectural claim on the output grid here, so reshaping
+            // a requested 512x512 into the reference's aspect (as the
+            // byte-based backend must) just produced the wrong resolution.
+            // Without the no-size branch, `width`/`height` stay at the
+            // 1024x1024 default from earlier and every edit comes back square
+            // regardless of what the client asked to match.
             const fit = if (size_given)
-                resolveEditTargetSize(nat.w, nat.h, width, height, engine.maxDim())
+                fitWithinCap(width, height, engine.maxDim())
             else
                 resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
             const nz = engine.normalizeSize(fit.w, fit.h);
