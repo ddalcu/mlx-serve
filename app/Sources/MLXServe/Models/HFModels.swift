@@ -30,6 +30,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "muse",       // meta-models Muse-Glimmer-30B — repos tag "muse_glimmer" (and *_text)
     "bailing",    // inclusionAI Ling 3.0 — repos tag "bailing_moe_v3" and/or "bailing_hybrid"
     "ling",       // …and/or the family name
+    "gpt_oss",    // GPT-OSS family tags (e.g. mlx-community/gpt-oss-20b-MXFP4-Q8)
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -56,6 +57,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
+    "gpt_oss",
 ]
 
 /// model_type prefixes/exact values for native media-generation checkpoints

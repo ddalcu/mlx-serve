@@ -166,6 +166,20 @@ pub const ModelConfig = struct {
     scale_embeddings: bool = true,
     has_pre_ff_norm: bool = true,
     has_qk_norm: bool = true,
+    // Learned per-head attention sinks (gpt_oss `self_attn.sinks`, [n_heads]):
+    // one extra logit column that lands in the softmax DENOMINATOR only, so
+    // every head can attend to "nothing". mlx's fused SDPA takes them
+    // natively (`mlx_fast_scaled_dot_product_attention`'s `sinks` argument);
+    // this flag is what makes the loader fetch the weight and the forward
+    // pass it instead of the null array.
+    has_attn_sinks: bool = false,
+    // gpt_oss clamped SwiGLU. Non-zero limit selects
+    //   clip(gate, max=limit) * sigmoid(alpha*gate) * (clip(up, ±limit) + 1)
+    // over the standard silu(gate)*up. The `+ 1` on the linear branch and the
+    // asymmetric clip are both load-bearing; `hidden_act` in a gpt_oss
+    // config.json says "silu" and is never read by the reference.
+    swiglu_limit: f32 = 0.0,
+    swiglu_alpha: f32 = 1.702,
 
     // MoE
     num_experts: u32 = 0,
@@ -934,6 +948,22 @@ pub const ModelConfig = struct {
         if (!self.isEosToken(120025)) self.addEosToken(120025);
     }
 
+    /// gpt_oss / harmony terminators, merged ADDITIVELY onto whatever the
+    /// config declared. A harmony assistant turn can end two ways and the
+    /// config names only one of them:
+    ///   <|return|> (200002) — the declared eos, ends a normal answer.
+    ///   <|call|>   (200012) — ends a TOOL CALL. Never the eos, so a
+    ///                         tools request that stops only on eos runs to
+    ///                         max_tokens with the call already complete.
+    /// <|end|> (200007) is deliberately NOT here: it closes the analysis
+    /// channel MID-turn, immediately before `<|start|>assistant<|channel|>final`
+    /// opens. Terminating on it would truncate every thinking response to its
+    /// reasoning and never emit an answer.
+    pub fn ensureGptOssTerminators(self: *ModelConfig) void {
+        if (!self.isEosToken(200002)) self.addEosToken(200002);
+        if (!self.isEosToken(200012)) self.addEosToken(200012);
+    }
+
     /// The head width the PREFILL SCORE tensor is actually built at. Normally
     /// `head_dim`, but an arch can score at a different width than it stores
     /// values at (an MLA q.k can contract over nope+rope widths while
@@ -968,6 +998,16 @@ pub const ModelConfig = struct {
         // delivered rather than paid-and-dropped). A plain chat request
         // defaults to the prompt-committed to=user channel instead
         // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
+        // gpt_oss: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
+        // template's `Reasoning: low|medium|high` sets depth, not presence, and
+        // the model opens `<|channel|>analysis<|message|>` on every turn no
+        // matter what we ask. Defaulting a silent request to off did not stop
+        // the reasoning pass, it just routed the analysis channel down the
+        // flush-text streaming branch, which leaked `<|channel|>analysis` and
+        // the reasoning itself into visible content (live 2026-08-12).
+        // Thinking-off here would have to be enforced in the PROMPT, and
+        // harmony offers no way to do it.
+        if (std.mem.eql(u8, self.model_type, "gpt_oss")) return true;
         if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
         // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
         // checkpoint's own template normalizes an undefined `enable_thinking`
@@ -2129,6 +2169,79 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "gpt_oss")) {
+        // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B). A plain dense-attention MoE
+        // that rides the qwen3_moe forward arms — no linear/SSM layers, no
+        // module-owned decode state, so prefix cache, batched decode and spec
+        // decode all apply normally. Family-specific pieces:
+        //   1. Learned per-head attention SINKS (self_attn.sinks) — an extra
+        //      softmax-denominator column. mlx's fused SDPA takes them.
+        //   2. Clamped SwiGLU (swiglu_limit, alpha 1.702, +1 on the linear
+        //      branch) instead of silu(gate)*up.
+        //   3. Additive biases everywhere: q/k/v/o_proj.bias, mlp.router.bias
+        //      and per-expert gate/up/down bias — all living BESIDE the affine
+        //      quantizer's `.biases` tensors in the same checkpoint.
+        //   4. No QK norm.
+        // Router is softmax-over-top-k, which is algebraically identical to
+        // the existing softmax-all → top-k → renorm chain, so moe_route_norm
+        // stays true and moe_sigmoid_router stays false.
+        config.model_type = "gpt_oss";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+        // ONE theta for both layer types. The Gemma-flavored default of 10000
+        // would silently mis-base every sliding layer — the muse
+        // first-turn-repetition class (deterministic "coherent then loops").
+        config.rope_local_base_freq = config.rope_theta;
+        config.rope_scaling_factor = 1.0;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        // Expert count rides `num_local_experts`; the generic block only knows
+        // `num_experts`. Top-k has two spellings and both appear in shipped
+        // configs (`num_experts_per_tok` is generic, `experts_per_token` is not).
+        if (cfg_obj.get("num_local_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("experts_per_token")) |v| {
+            if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+        }
+        // There is no moe_intermediate_size key: the expert width IS
+        // intermediate_size (2880 on both sizes).
+        if (config.moe_intermediate_size == 0) {
+            config.moe_intermediate_size = config.intermediate_size;
+        }
+        if (cfg_obj.get("swiglu_limit")) |v| config.swiglu_limit = jsonFloat(v);
+        // Flat YaRN block. mscale is COMPUTED, never read: the config ships no
+        // "attention_factor" at all, and mlx-lm's YarnRoPE defaults
+        // (mscale 1 / mscale_all_dim 0) give 0.1*ln(factor) + 1. Laguna
+        // precedent — but note dsv4 is the same shape with the OPPOSITE
+        // answer, so this stays a per-arch decision.
+        if (cfg_obj.get("rope_scaling")) |rs| {
+            if (rs == .object) {
+                const is_yarn = if (rs.object.get("rope_type")) |rt|
+                    (rt == .string and std.mem.eql(u8, rt.string, "yarn"))
+                else
+                    false;
+                if (is_yarn) {
+                    config.rope_yarn = true;
+                    if (rs.object.get("factor")) |x| config.yarn_factor = jsonFloat(x);
+                    if (rs.object.get("beta_fast")) |x| config.yarn_beta_fast = jsonFloat(x);
+                    if (rs.object.get("beta_slow")) |x| config.yarn_beta_slow = jsonFloat(x);
+                    if (rs.object.get("original_max_position_embeddings")) |x| {
+                        if (x == .integer) config.yarn_orig_max_pos = @intCast(x.integer);
+                    }
+                    if (config.yarn_factor > 1.0) {
+                        config.yarn_attention_factor = 0.1 * @log(config.yarn_factor) + 1.0;
+                    }
+                }
+            }
+        }
+        config.ensureGptOssTerminators();
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -3726,6 +3839,15 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const ling = ModelConfig{ .model_type = "bailing_hybrid" };
     try testing.expect(ling.defaultEnableThinking(false));
     try testing.expect(ling.defaultEnableThinking(true));
+    // gpt_oss opts in with AND without tools. Unlike muse there is no
+    // thinking-off prompt to commit: harmony's `Reasoning: low|medium|high`
+    // sets depth, not presence, so the model opens an analysis channel on
+    // every turn. Defaulting a silent request off did not skip the reasoning
+    // pass — it sent the analysis channel down the flush-text streaming
+    // branch, leaking `<|channel|>analysis` and the reasoning into content.
+    const goss = ModelConfig{ .model_type = "gpt_oss" };
+    try testing.expect(goss.defaultEnableThinking(false));
+    try testing.expect(goss.defaultEnableThinking(true));
 }
 
 test "defaultEnableThinking: the checkpoint's own generation_config default outranks the arch allowlist" {
@@ -4246,6 +4368,106 @@ test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softpl
     try testing.expectEqual(@as(usize, 2), eos.len);
     try testing.expectEqual(@as(u32, 2), eos[0]);
     try testing.expectEqual(@as(u32, 24), eos[1]);
+}
+
+test "ModelConfig: gpt_oss (OpenAI gpt-oss-20b) config parse" {
+    // Trimmed from mlx-community/gpt-oss-20b-MXFP4-Q8/config.json. The 120B is
+    // the same shape (36 layers, 128 experts), so one block serves both.
+    const json =
+        \\{
+        \\  "architectures": ["GptOssForCausalLM"],
+        \\  "model_type": "gpt_oss",
+        \\  "attention_bias": true,
+        \\  "head_dim": 64,
+        \\  "hidden_act": "silu",
+        \\  "hidden_size": 2880,
+        \\  "initial_context_length": 4096,
+        \\  "intermediate_size": 2880,
+        \\  "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+        \\  "max_position_embeddings": 131072,
+        \\  "num_attention_heads": 64,
+        \\  "num_hidden_layers": 24,
+        \\  "num_key_value_heads": 8,
+        \\  "num_local_experts": 32,
+        \\  "num_experts_per_tok": 4,
+        \\  "experts_per_token": 4,
+        \\  "rms_norm_eps": 1e-05,
+        \\  "rope_scaling": {
+        \\    "beta_fast": 32.0, "beta_slow": 1.0, "factor": 32.0,
+        \\    "original_max_position_embeddings": 4096,
+        \\    "rope_type": "yarn", "truncate": false
+        \\  },
+        \\  "rope_theta": 150000,
+        \\  "sliding_window": 128,
+        \\  "swiglu_limit": 7.0,
+        \\  "tie_word_embeddings": false,
+        \\  "vocab_size": 201088,
+        \\  "eos_token_id": 200002,
+        \\  "quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("gpt_oss", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    // Qwen-style norm/embedding flags; gpt-oss has NO QK norm.
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(!config.has_pre_ff_norm);
+    try testing.expect(!config.has_qk_norm);
+    // MoE dims: num_local_experts is the spelling, and the expert width is
+    // plain intermediate_size (no moe_intermediate_size key).
+    try testing.expectEqual(@as(u32, 32), config.num_experts);
+    try testing.expectEqual(@as(u32, 4), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2880), config.moe_intermediate_size);
+    // Router is a plain softmax-over-top-k with an ADDITIVE bias, not hy3's
+    // sigmoid+selection-bias chain.
+    try testing.expect(!config.moe_sigmoid_router);
+    try testing.expect(config.moe_route_norm);
+    // Attention shape: hd 64, GQA 64/8, scale = head_dim^-0.5.
+    try testing.expectEqual(@as(u32, 64), config.head_dim);
+    try testing.expectEqual(@as(u32, 64), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 64), config.query_pre_attn_scalar);
+    // Learned per-head attention sinks (self_attn.sinks) — the softmax
+    // denominator gets an extra column; SDPA takes them natively.
+    try testing.expect(config.has_attn_sinks);
+    // Alternating layer types, sliding FIRST (layer 0 is local).
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(!config.isGlobalLayer(0));
+    try testing.expect(config.isGlobalLayer(1));
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 128), config.sliding_window);
+    // ONE theta for both layer types. Leaving rope_local_base_freq at the
+    // Gemma-flavored 10000 default would mis-base every sliding layer — the
+    // muse first-turn-repetition class (deterministic "coherent then loops").
+    try testing.expectApproxEqAbs(@as(f32, 150000.0), config.rope_theta, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 150000.0), config.rope_local_base_freq, 1.0);
+    // YaRN: mscale is COMPUTED (0.1*ln(32)+1), matching mlx-lm's YarnRoPE
+    // defaults (mscale 1 / mscale_all_dim 0) — the config ships no
+    // attention_factor at all. Laguna precedent.
+    try testing.expect(config.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_beta_fast, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.yarn_beta_slow, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 4096), config.yarn_orig_max_pos);
+    // Clamped SwiGLU: clip(gate, max=limit) * sigmoid(alpha*gate) * (clip(up, ±limit) + 1).
+    // `hidden_act: "silu"` in the config is a lie — the reference never uses it.
+    try testing.expectApproxEqAbs(@as(f32, 7.0), config.swiglu_limit, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.702), config.swiglu_alpha, 1e-6);
+    // Quant: mxfp4 gs32 for the expert banks (attention/embed/lm_head ride
+    // per-tensor affine-8 overrides resolved at weight-load time).
+    try testing.expectEqual(QuantMode.mxfp4, config.quant_mode);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 32), config.quant_group_size);
+    // Terminators merge ADDITIVELY: <|return|> (200002, the declared eos) and
+    // <|call|> (200012, which ends a tool call and is NEVER the eos).
+    // <|end|> (200007) is deliberately absent — it closes the analysis channel
+    // MID-generation, before the final channel opens.
+    const eos = config.eosTokenSlice();
+    try testing.expectEqual(@as(usize, 2), eos.len);
+    try testing.expectEqual(@as(u32, 200002), eos[0]);
+    try testing.expectEqual(@as(u32, 200012), eos[1]);
 }
 
 test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_factor (Laguna-XS ships 1.0)" {
