@@ -2072,6 +2072,297 @@ fn runVerifyQmmNax(
     return y;
 }
 
+// ── Grouped-expert NAX gate+up for MoE verify widths (M5 plan item 2) ──
+//
+// The sort path already argsorts (row, expert) pairs so consecutive pairs
+// share an expert; this kernel gives each RUN of equal experts one
+// threadgroup that streams the expert's gate and up banks ONCE through the
+// m16 tensor-ops tile (pad rows are ~free — weight streaming dominates, per
+// the vqmm ledger) and applies the table SwiGLU in-kernel, writing sorted
+// [N, inter] activations the unchanged down path consumes. Group discovery
+// is in-kernel from sorted_inds (a host readback mid-layer is a GPU
+// barrier); a threadgroup whose pair is not a run start exits before any
+// bank read. Two sequential accumulation passes (gate, then up) share one
+// partial buffer — two live partial sets would blow the 32 KB threadgroup
+// budget. OPT-IN: MLX_SERVE_MOE_VERIFY_NAX=1; anything else stays stock.
+var moe_vnax_env_cache: ?bool = null;
+pub var moe_vnax_override: ?bool = null; // test seam
+var moe_vnax_engaged = false;
+
+fn moeVerifyNaxEnvEnabled() bool {
+    if (moe_vnax_override) |v| return v;
+    if (moe_vnax_env_cache) |v| return v;
+    const on = blk: {
+        const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_NAX") orelse break :blk false;
+        const val = std.mem.sliceTo(raw, 0);
+        break :blk val.len > 0 and val[0] == '1';
+    };
+    moe_vnax_env_cache = on;
+    return on;
+}
+
+const MOE_VNAX_SOURCE: [:0]const u8 =
+    \\using namespace metal;
+    \\using namespace mpp::tensor_ops;
+    \\
+    \\constexpr int BM = 16;
+    \\constexpr int BN = 32;
+    \\constexpr int BK = 16;
+    \\constexpr int NSG = 4;
+    \\constexpr int K = KCONST;
+    \\constexpr int K_bytes = K * BITS / 8;
+    \\constexpr int K_by_gs = K / GS;
+    \\constexpr int K_chunk = K / NSG;
+    \\constexpr int NP = NPAIRS;
+    \\constexpr int NOUT = NOUTC;
+    \\static_assert(BITS == 4, "grouped MoE NAX v1 is 4-bit only");
+    \\
+    \\uint tid = thread_position_in_threadgroup.x;
+    \\uint sg_id = simdgroup_index_in_threadgroup;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint p = threadgroup_position_in_grid.y;
+    \\uint tg_n = threadgroup_position_in_grid.z;
+    \\int n0 = int(tg_n) * BN;
+    \\
+    \\// Group discovery: only the first pair of an equal-expert run owns it.
+    \\// p is threadgroup-uniform, so this early return is barrier-safe.
+    \\int eid = int(inds[p]);
+    \\if (p > 0 && int(inds[p - 1]) == eid) {
+    \\    return;
+    \\}
+    \\int run = 1;
+    \\while (p + run < NP && int(inds[p + run]) == eid && run < BM) {
+    \\    run++;
+    \\}
+    \\
+    \\// Single pass, dual accumulators: both banks stream per K step into
+    \\// their own tiles (24 KB total), one barrier pair per step.
+    \\threadgroup T Bg_tile[NSG][BK * BN];
+    \\threadgroup T Bu_tile[NSG][BK * BN];
+    \\threadgroup float partial_g[NSG][BM * BN];
+    \\threadgroup float partial_u[NSG][BM * BN];
+    \\
+    \\constexpr auto desc = matmul2d_descriptor(
+    \\    16,
+    \\    32,
+    \\    16,
+    \\    false,
+    \\    false,
+    \\    false,
+    \\    matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<desc, metal::execution_simdgroup> op;
+    \\
+    \\// A rows p..p+15 of the pair-sorted activations; the host pads x by 16
+    \\// zero rows so a tail group's tile stays in bounds. Extra rows only
+    \\// feed output rows >= run, which are never written.
+    \\tensor<device T, dextents<int, 2>, tensor_inline> A(
+    \\    (device T*)x + (size_t)p * (size_t)K,
+    \\    dextents<int, 2>{K, BM},
+    \\    array<int, 2>{1, K});
+    \\tensor<threadgroup T, dextents<int, 2>, tensor_inline> Bg(
+    \\    Bg_tile[sg_id],
+    \\    dextents<int, 2>{BN, BK},
+    \\    array<int, 2>{1, BN});
+    \\tensor<threadgroup T, dextents<int, 2>, tensor_inline> Bu(
+    \\    Bu_tile[sg_id],
+    \\    dextents<int, 2>{BN, BK},
+    \\    array<int, 2>{1, BN});
+    \\tensor<threadgroup float, dextents<int, 2>, tensor_inline> Cg(
+    \\    partial_g[sg_id],
+    \\    dextents<int, 2>{BN, BM},
+    \\    array<int, 2>{1, BN});
+    \\tensor<threadgroup float, dextents<int, 2>, tensor_inline> Cu(
+    \\    partial_u[sg_id],
+    \\    dextents<int, 2>{BN, BM},
+    \\    array<int, 2>{1, BN});
+    \\
+    \\int n_global = n0 + int(lane);
+    \\int k_begin = int(sg_id) * K_chunk;
+    \\size_t nrow = (size_t)eid * (size_t)NOUT + (size_t)n_global;
+    \\
+    \\auto ct_g = op.template get_destination_cooperative_tensor<
+    \\    tensor<device T, extents<int, 16, 16>, tensor_inline>,
+    \\    tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>,
+    \\    float>();
+    \\auto ct_u = op.template get_destination_cooperative_tensor<
+    \\    tensor<device T, extents<int, 16, 16>, tensor_inline>,
+    \\    tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>,
+    \\    float>();
+    \\_Pragma("unroll")
+    \\for (uint16_t i = 0; i < ct_g.get_capacity(); ++i) {
+    \\    ct_g[i] = 0.0f;
+    \\    ct_u[i] = 0.0f;
+    \\}
+    \\for (int k0 = k_begin; k0 < k_begin + K_chunk; k0 += BK) {
+    \\    const device uchar* wpg =
+    \\        ((const device uchar*)wg_q) + nrow * K_bytes + (k0 * BITS) / 8;
+    \\    const device uchar* wpu =
+    \\        ((const device uchar*)wu_q) + nrow * K_bytes + (k0 * BITS) / 8;
+    \\    float sg = float(g_scales[nrow * K_by_gs + (k0 / GS)]);
+    \\    float bg = float(g_biases[nrow * K_by_gs + (k0 / GS)]);
+    \\    float su = float(u_scales[nrow * K_by_gs + (k0 / GS)]);
+    \\    float bu = float(u_biases[nrow * K_by_gs + (k0 / GS)]);
+    \\    _Pragma("unroll")
+    \\    for (int pack = 0; pack < 2; ++pack) {
+    \\        uint32_t pg =
+    \\            uint32_t(wpg[pack * 4 + 0]) |
+    \\            (uint32_t(wpg[pack * 4 + 1]) << 8) |
+    \\            (uint32_t(wpg[pack * 4 + 2]) << 16) |
+    \\            (uint32_t(wpg[pack * 4 + 3]) << 24);
+    \\        uint32_t pu =
+    \\            uint32_t(wpu[pack * 4 + 0]) |
+    \\            (uint32_t(wpu[pack * 4 + 1]) << 8) |
+    \\            (uint32_t(wpu[pack * 4 + 2]) << 16) |
+    \\            (uint32_t(wpu[pack * 4 + 3]) << 24);
+    \\        _Pragma("unroll")
+    \\        for (int ki = 0; ki < 8; ++ki) {
+    \\            uint32_t qg = (pg >> (ki * 4)) & 0xFu;
+    \\            uint32_t qu = (pu >> (ki * 4)) & 0xFu;
+    \\            Bg_tile[sg_id][(pack * 8 + ki) * BN + int(lane)] =
+    \\                T(float(qg) * sg + bg);
+    \\            Bu_tile[sg_id][(pack * 8 + ki) * BN + int(lane)] =
+    \\                T(float(qu) * su + bu);
+    \\        }
+    \\    }
+    \\    simdgroup_barrier(mem_flags::mem_threadgroup);
+    \\    auto tA = A.template slice<16, 16>(k0, 0);
+    \\    auto tBg = Bg.template slice<32, 16>(0, 0);
+    \\    op.run(tA, tBg, ct_g);
+    \\    auto tBu = Bu.template slice<32, 16>(0, 0);
+    \\    op.run(tA, tBu, ct_u);
+    \\    simdgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\auto tCg = Cg.template slice<32, 16>(0, 0);
+    \\ct_g.store(tCg);
+    \\auto tCu = Cu.template slice<32, 16>(0, 0);
+    \\ct_u.store(tCu);
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\for (int off = int(tid); off < BM * BN; off += NSG * 32) {
+    \\    int row = off / BN;
+    \\    if (row < run) {
+    \\        float ag = (partial_g[0][off] + partial_g[1][off]) +
+    \\            (partial_g[2][off] + partial_g[3][off]);
+    \\        float au = (partial_u[0][off] + partial_u[1][off]) +
+    \\            (partial_u[2][off] + partial_u[3][off]);
+    \\        int col = off - row * BN;
+    \\        // Round exactly where the sort path's gather_qmm wrote T, then
+    \\        // the same table SwiGLU fusedSwiGLU applies.
+    \\        T gt = T(ag);
+    \\        T ut = T(au);
+    \\        T sig = sigtab[as_type<ushort>(gt)];
+    \\        y[(size_t)(p + (uint)row) * (size_t)NOUT + (size_t)(n0 + col)] =
+    \\            (gt * sig) * ut;
+    \\    }
+    \\}
+;
+
+var moe_vnax_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getMoeVerifyNaxKernel() !mlx.mlx_fast_metal_kernel {
+    if (moe_vnax_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "mlxserve_moe_vnax_gateup_m16",
+        in_vec,
+        out_vec,
+        MOE_VNAX_SOURCE,
+        VQMM_NAX_HEADER,
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    moe_vnax_kernel = kernel;
+    return kernel;
+}
+
+/// Grouped NAX gate+up over the pair-sorted verify activations. Returns the
+/// sorted [N, inter] SwiGLU activations, or null when any eligibility leg
+/// fails (the caller falls through to the stock path with no behaviour
+/// change). x_sorted is [N, D] in pair-sorted order (the sort path's x_rep
+/// squeezed); sorted_inds is the matching [N] expert per pair.
+pub fn runMoeVerifyNaxGateUp(
+    s: mlx.mlx_stream,
+    x_sorted: mlx.mlx_array,
+    sorted_inds: mlx.mlx_array,
+    gw: mlx.mlx_array,
+    gsc: mlx.mlx_array,
+    gbi: mlx.mlx_array,
+    uw: mlx.mlx_array,
+    usc: mlx.mlx_array,
+    ubi: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+) !?mlx.mlx_array {
+    if (!moeVerifyNaxEnvEnabled()) return null;
+    if (!naxLaneEnvEnabled() or !verifyQmmNaxAvailable()) return null;
+    if (bits != 4 or group_size != 64) return null;
+    if (gbi.ctx == null or ubi.ctx == null) return null; // affine only
+    const xd = mlx.mlx_array_dtype(x_sorted);
+    if (xd != .bfloat16 and xd != .float16) return null; // sigtab domain
+    const xsh = mlx.getShape(x_sorted);
+    if (xsh.len != 2) return null;
+    const np = xsh[0];
+    const K = xsh[1];
+    if (np < 2 or np > 16 * 16) return null;
+    if (@rem(K, 256) != 0) return null;
+    const gsh = mlx.getShape(gw);
+    if (gsh.len != 3) return null;
+    const inter = gsh[1];
+    if (@rem(inter, 32) != 0) return null;
+
+    if (!moe_vnax_engaged) {
+        moe_vnax_engaged = true;
+        log.info("[moe-vnax] grouped NAX gate+up engaged: pairs={d} K={d} inter={d} 4-bit gs64 (MLX_SERVE_MOE_VERIFY_NAX=0 restores stock)\n", .{ np, K, inter });
+    }
+
+    // Pad 16 zero rows so a tail group's fixed 16-row A tile stays in
+    // bounds; the pad rows feed only output rows >= run, never written.
+    var zero = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zero);
+    const zdims = [_]c_int{};
+    try mlx.check(mlx.mlx_zeros(&zero, &zdims, 0, xd, s));
+    const pad_axes = [_]c_int{0};
+    const pad_low = [_]c_int{0};
+    const pad_high = [_]c_int{16};
+    var x_pad = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_pad);
+    try mlx.check(mlx.mlx_pad(&x_pad, x_sorted, &pad_axes, 1, &pad_low, 1, &pad_high, 1, zero, "constant", s));
+
+    const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const y_shape = [_]c_int{ np, inter };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 128, np, @divExact(inter, 32)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KCONST", K));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NPAIRS", np));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NOUTC", inter));
+
+    const inputs_arr = [_]mlx.mlx_array{ x_pad, gw, gsc, gbi, uw, usc, ubi, sorted_inds, sigtab };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    const kernel = try getMoeVerifyNaxKernel();
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    return y;
+}
+
 // ── Fused head_dim-256 prefill attention (flash-style Metal kernel) ──
 //
 // MLX's fused SDPA (steel_attention) covers head_dim <= 128; every Gemma-4
@@ -17067,22 +17358,45 @@ pub const Transformer = struct {
 
             // gate / up gather_qmm: x_rep [N,1,D], rhs_indices=sorted_inds [N],
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
-            var gate_out_3d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(gate_out_3d);
-            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
-            var gate_out = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(gate_out);
-            try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
-
-            var up_out_3d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(up_out_3d);
-            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
-            var up_out = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(up_out);
-            try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
-
-            const expert_act = try self.computeGeglu(gate_out, up_out);
+            // Verify widths: grouped NAX gate+up — one threadgroup per
+            // equal-expert run streams the banks once through the m16 tile
+            // with the table SwiGLU in-kernel. A decline (null) falls
+            // through to the stock pair below with no behaviour change.
+            var expert_act = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(expert_act);
+            var vnax_act = false;
+            if (B * S <= 16 and gate_qp.mode == .affine and up_qp.mode == .affine and
+                gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
+            {
+                var x_sorted = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x_sorted);
+                const nd_shape = [_]c_int{ total_inds, D };
+                try mlx.check(mlx.mlx_reshape(&x_sorted, x_rep, &nd_shape, 2, self.s));
+                if (try runMoeVerifyNaxGateUp(self.s, x_sorted, sorted_inds, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, gate_qp.bits, gate_qp.group_size)) |act| {
+                    defer _ = mlx.mlx_array_free(act);
+                    try mlx.check(mlx.mlx_array_set(&expert_act, act));
+                    vnax_act = true;
+                }
+            }
+            if (!vnax_act) {
+                var gate_out_3d = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(gate_out_3d);
+                try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+                var gate_out = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(gate_out);
+                try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
+
+                var up_out_3d = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(up_out_3d);
+                try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+                var up_out = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(up_out);
+                try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
+
+                const act = try self.computeGeglu(gate_out, up_out);
+                defer _ = mlx.mlx_array_free(act);
+                try mlx.check(mlx.mlx_array_set(&expert_act, act));
+            }
 
             // down: expand inner singleton → [N,1,intermediate] → gather_qmm → [N,1,hidden]
             var act_exp = mlx.mlx_array_new();
@@ -34091,6 +34405,174 @@ test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged
 
     const max_diff = try attn256MaxDiff(fused, ref, s);
     try std.testing.expect(max_diff < 0.005);
+}
+
+fn moeVnaxBf16(v: f32) f32 {
+    const bits: u32 = @bitCast(v);
+    const rounded = bits + 0x7FFF + ((bits >> 16) & 1);
+    return @bitCast(rounded & 0xFFFF_0000);
+}
+
+test "moeVerifyNax: grouped gate+up parity vs mirrored fp32 truth (runs, widths, kill switch)" {
+    if (!verifyQmmNaxAvailable()) return; // NAX silicon only — scaffolding covered elsewhere
+    const s = mlx.gpuStream();
+    moe_vnax_override = true;
+    defer moe_vnax_override = null;
+
+    const E = 4;
+    const K = 256; // K % 256 == 0 floor
+    const INTER = 64; // % 32
+    const GS = 64;
+    var prng = std.Random.DefaultPrng.init(0x9e37);
+    const rnd = prng.random();
+    const alloc = std.testing.allocator;
+
+    // Host-built 4-bit affine banks: exact integer codes + bf16-rounded
+    // scales/biases so the fp32 reference dequantizes identically.
+    const codes_n = E * INTER * K;
+    const codes = try alloc.alloc(u8, codes_n);
+    defer alloc.free(codes);
+    for (codes) |*c| c.* = @intCast(rnd.uintLessThan(u8, 16));
+    const packed_n = codes_n / 8;
+    const packed_g = try alloc.alloc(u32, packed_n);
+    defer alloc.free(packed_g);
+    for (0..packed_n) |i| {
+        var w: u32 = 0;
+        for (0..8) |j| w |= @as(u32, codes[i * 8 + j]) << @intCast(j * 4);
+        packed_g[i] = w;
+    }
+    const groups_n = E * INTER * (K / GS);
+    const scales = try alloc.alloc(f32, groups_n);
+    defer alloc.free(scales);
+    const biases = try alloc.alloc(f32, groups_n);
+    defer alloc.free(biases);
+    for (scales) |*v| v.* = moeVnaxBf16(0.01 + rnd.float(f32) * 0.02);
+    for (biases) |*v| v.* = moeVnaxBf16((rnd.float(f32) - 0.5) * 0.02);
+
+    const mk = struct {
+        fn bank(st: mlx.mlx_stream, pk: []const u32, sc: []const f32, bi: []const f32) !struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array } {
+            const wsh = [_]c_int{ E, INTER, K / 8 };
+            const w = mlx.mlx_array_new_data(@constCast(@ptrCast(pk.ptr)), &wsh, 3, .uint32);
+            const gsh = [_]c_int{ E, INTER, K / GS };
+            const s32 = mlx.mlx_array_new_data(@constCast(@ptrCast(sc.ptr)), &gsh, 3, .float32);
+            defer _ = mlx.mlx_array_free(s32);
+            const b32 = mlx.mlx_array_new_data(@constCast(@ptrCast(bi.ptr)), &gsh, 3, .float32);
+            defer _ = mlx.mlx_array_free(b32);
+            var sb = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&sb, s32, .bfloat16, st));
+            var bb = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&bb, b32, .bfloat16, st));
+            return .{ .w = w, .s = sb, .b = bb };
+        }
+    };
+    // One code/scale pool reused for both banks with different base offsets
+    // via distinct slices would alias; simplest honest form: independent
+    // pools for gate and up.
+    const codes_u = try alloc.alloc(u8, codes_n);
+    defer alloc.free(codes_u);
+    for (codes_u) |*c| c.* = @intCast(rnd.uintLessThan(u8, 16));
+    const packed_u = try alloc.alloc(u32, packed_n);
+    defer alloc.free(packed_u);
+    for (0..packed_n) |i| {
+        var w: u32 = 0;
+        for (0..8) |j| w |= @as(u32, codes_u[i * 8 + j]) << @intCast(j * 4);
+        packed_u[i] = w;
+    }
+    const scales_u = try alloc.alloc(f32, groups_n);
+    defer alloc.free(scales_u);
+    const biases_u = try alloc.alloc(f32, groups_n);
+    defer alloc.free(biases_u);
+    for (scales_u) |*v| v.* = moeVnaxBf16(0.01 + rnd.float(f32) * 0.02);
+    for (biases_u) |*v| v.* = moeVnaxBf16((rnd.float(f32) - 0.5) * 0.02);
+
+    const g_bank = try mk.bank(s, packed_g, scales, biases);
+    defer {
+        _ = mlx.mlx_array_free(g_bank.w);
+        _ = mlx.mlx_array_free(g_bank.s);
+        _ = mlx.mlx_array_free(g_bank.b);
+    }
+    const u_bank = try mk.bank(s, packed_u, scales_u, biases_u);
+    defer {
+        _ = mlx.mlx_array_free(u_bank.w);
+        _ = mlx.mlx_array_free(u_bank.s);
+        _ = mlx.mlx_array_free(u_bank.b);
+    }
+
+    // Routings: duplicate-heavy runs, all-distinct, and one 16-row single
+    // group — every group-discovery edge.
+    const routings = [_][]const i32{
+        &[_]i32{ 0, 0, 1, 2, 2, 3 },
+        &[_]i32{ 0, 1, 2, 3 },
+        &[_]i32{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+        &[_]i32{ 0, 0, 0, 2, 2, 2, 2, 3, 3, 3, 3, 3 },
+    };
+    for (routings) |inds| {
+        const np: usize = inds.len;
+        const xs = try alloc.alloc(f32, np * K);
+        defer alloc.free(xs);
+        for (xs) |*v| v.* = moeVnaxBf16((rnd.float(f32) - 0.5) * 0.2);
+
+        const xsh = [_]c_int{ @intCast(np), K };
+        const x32 = mlx.mlx_array_new_data(@constCast(@ptrCast(xs.ptr)), &xsh, 2, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var xb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb);
+        try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, s));
+        const ish = [_]c_int{@intCast(np)};
+        const ia = mlx.mlx_array_new_data(@constCast(@ptrCast(inds.ptr)), &ish, 1, .int32);
+        defer _ = mlx.mlx_array_free(ia);
+
+        const y = (try runMoeVerifyNaxGateUp(s, xb, ia, g_bank.w, g_bank.s, g_bank.b, u_bank.w, u_bank.s, u_bank.b, 4, GS)) orelse return error.VnaxDeclined;
+        defer _ = mlx.mlx_array_free(y);
+        var y32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y32);
+        try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(y32));
+        const yd = mlx.mlx_array_data_float32(y32) orelse return error.InvalidDtype;
+
+        // Mirrored fp32 truth: dequant with the same bf16 scale/bias values,
+        // f32 dot, then the kernel's exact rounding chain — bf16 gate, exact
+        // sigmoid (the table is swept-exact per bf16 input), two bf16 mults.
+        var max_diff: f32 = 0;
+        for (0..np) |p| {
+            const e: usize = @intCast(inds[p]);
+            for (0..INTER) |j| {
+                var accg: f64 = 0;
+                var accu: f64 = 0;
+                for (0..K) |k| {
+                    const gidx = (e * INTER + j) * (K / GS) + k / GS;
+                    const wg = @as(f32, @floatFromInt(codes[(e * INTER + j) * K + k])) * scales[gidx] + biases[gidx];
+                    const wu = @as(f32, @floatFromInt(codes_u[(e * INTER + j) * K + k])) * scales_u[gidx] + biases_u[gidx];
+                    accg += @as(f64, xs[p * K + k]) * wg;
+                    accu += @as(f64, xs[p * K + k]) * wu;
+                }
+                const gt = moeVnaxBf16(@floatCast(accg));
+                const ut = moeVnaxBf16(@floatCast(accu));
+                const sig = moeVnaxBf16(1.0 / (1.0 + @exp(-gt)));
+                const m1 = moeVnaxBf16(gt * sig);
+                const ref = moeVnaxBf16(m1 * ut);
+                const d = @abs(yd[p * INTER + j] - ref);
+                if (d > max_diff) max_diff = d;
+            }
+        }
+        // f32-accumulation-order noise only: the dequant values, rounding
+        // sites and sigmoid are mirrored exactly.
+        try std.testing.expect(max_diff < 0.02);
+    }
+
+    // Kill-switch leg: the seam forced off must decline, not compute.
+    moe_vnax_override = false;
+    const xsh1 = [_]c_int{ 4, K };
+    var xz = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xz);
+    const zdims = [_]c_int{ 4, K };
+    try mlx.check(mlx.mlx_zeros(&xz, &zdims, 2, .bfloat16, s));
+    _ = xsh1;
+    const ish1 = [_]c_int{4};
+    const inds1 = [_]i32{ 0, 1, 2, 3 };
+    const ia1 = mlx.mlx_array_new_data(@constCast(@ptrCast(&inds1)), &ish1, 1, .int32);
+    defer _ = mlx.mlx_array_free(ia1);
+    try std.testing.expect((try runMoeVerifyNaxGateUp(s, xz, ia1, g_bank.w, g_bank.s, g_bank.b, u_bank.w, u_bank.s, u_bank.b, 4, GS)) == null);
 }
 
 /// Like attn256MaxDiff but errors on any non-finite element on either side —
