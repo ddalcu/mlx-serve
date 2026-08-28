@@ -321,6 +321,29 @@ extension MediaBundle {
         )
     }
 
+    /// Anima (`scripts/convert_anima_weights.py` output): a flat single-repo
+    /// layout — top-level `transformer.safetensors`/`text_encoder.safetensors`/
+    /// `vae.safetensors` + `tokenizer/`/`t5_tokenizer/` subdirs + `config.json`
+    /// (see `src/anima.zig`'s module doc for the exact list). Recursive
+    /// download; ready when every top-level marker is present. There is no
+    /// PUBLISHED mirror this points at today — this factory exists so a repo
+    /// matching the layout (a user's own conversion, uploaded or discovered
+    /// locally) resolves correctly if one ever reaches Discover search.
+    static func anima(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "anima:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "transformer.safetensors", "text_encoder.safetensors", "vae.safetensors", "tokenizer", "t5_tokenizer"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Hunyuan3D (shape stage): a flat model dir — `config.json` + the three
     /// engine safetensors (`dit`, `conditioner`, `vae`). Non-recursive with a
     /// safetensors allowlist so a future published HF repo pulls ONLY those
@@ -463,6 +486,8 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .anima:
+            return .anima(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B:
             // The one MLX conversion of klein 9B ships no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
