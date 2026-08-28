@@ -287,6 +287,13 @@ class ServerManager: ObservableObject {
         process = nil
         status = .stopped
         modelInfo = nil
+        // `residentChatModel` falls back to `allModels.first { loaded }` when
+        // `modelInfo` is nil — leaving this stale after a stop meant a picker
+        // switch made while stopped still reported the OLD model resident
+        // (nothing had reloaded `allModels` yet), so the pill kept naming the
+        // model that was resident before the stop instead of the one just
+        // picked, and Start looked like it might launch either one.
+        allModels = []
         memoryInfo = nil
         specCost = nil
         throughput = nil
