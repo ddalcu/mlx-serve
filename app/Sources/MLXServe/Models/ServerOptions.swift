@@ -184,6 +184,17 @@ struct ServerOptions: Codable, Equatable {
     /// text: `main.zig` exits on a `--max-resident-mem` it cannot parse, and a
     /// value that cannot be malformed needs no validator to drop it.
     var maxResidentMemGB: Int = 0
+    /// Registry residency cap (`--max-resident-models`): the count of `.ready`
+    /// models the server keeps loaded at once. A hot model switch (the
+    /// composer's picker) never explicitly unloads the model it's replacing —
+    /// it relies entirely on this server-side LRU gate, which evicts the
+    /// least-recently-used resident model before admitting a new load once the
+    /// count would exceed this cap (or refuses the load if nothing is
+    /// evictable). Mirrors the server's own default of 3, so switching models
+    /// a few times in a row can leave that many resident at once before the
+    /// oldest gets evicted. Set to 1 to keep exactly one model loaded at a
+    /// time — every switch unloads the previous model first.
+    var maxResidentModels: Int = 3
     /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
     /// free-RAM pre-flight that would otherwise refuse a model whose weights +
     /// warmup headroom look too big for current free memory. The check is
@@ -501,6 +512,7 @@ struct ServerOptions: Codable, Equatable {
         enablePrefixCacheDisk == other.enablePrefixCacheDisk &&
         prefixCacheDisk == other.prefixCacheDisk &&
         maxResidentMemGB == other.maxResidentMemGB &&
+        maxResidentModels == other.maxResidentModels &&
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
@@ -692,6 +704,9 @@ struct ServerOptions: Codable, Equatable {
         if maxResidentMemGB > 0 {
             args += ["--max-resident-mem", "\(maxResidentMemGB)GB"]
         }
+        if maxResidentModels != 3 {
+            args += ["--max-resident-models", "\(maxResidentModels)"]
+        }
         // GGUF-only performance knobs. Emitted unconditionally when not
         // the default — the server silently ignores them on the MLX path
         // (it never opens an llama session). Keeping them in argv for
@@ -841,6 +856,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
@@ -1068,6 +1084,10 @@ extension ServerOptions {
         "maxResidentMemGB": .init(
             title: "Model memory cap",
             explainer: "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem.",
+            needsRestart: true),
+        "maxResidentModels": .init(
+            title: "Max models loaded at once",
+            explainer: "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

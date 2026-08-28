@@ -1012,6 +1012,18 @@ private struct ServerSectionContent: View {
                 )
             }
         }
+        if let m = meta["maxResidentModels"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentModels)
+            ) {
+                Stepper(value: $appState.serverOptions.maxResidentModels, in: 1...8) {
+                    Text("\(appState.serverOptions.maxResidentModels)")
+                        .font(.body.monospacedDigit())
+                }
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,
