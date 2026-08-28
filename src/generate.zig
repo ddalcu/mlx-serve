@@ -5898,9 +5898,13 @@ pub const Generator = struct {
     /// filler, temp 0, `--prefix-cache-entries 0`, round-cost persist off),
     /// depths {1,2,3,4,6} x two reversed passes x 3 reps, medians of
     /// per-request round_ms: T(1)=25.41, T(2)=31.18, T(3)=35.70,
-    /// T(4)=41.33, T(6)=53.58 ms -> 20.34 ms floor, composite marginals
-    /// .257/.303 (SSE 0.28). Short-context fit for the record: T(1..4,6,8)=
-    /// 23.61/28.12/33.91/38.87/50.16/62.70 -> floor 18.24, .283/.310/.344.
+    /// T(4)=41.33, T(6)=53.58 ms -> 20.34 ms floor, composite
+    /// (draft + per-position) marginals .257/.303 (SSE 0.28), shipped
+    /// house-style below as `.draft = 0.02` plus per-position .237/.283 —
+    /// composite minus draft, the same split every calibrated surface
+    /// carries. Short-context fit for the record: T(1..4,6,8)=
+    /// 23.61/28.12/33.91/38.87/50.16/62.70 -> floor 18.24, composite
+    /// .283/.310/.344 (the .344 ships as per-position `.325`).
     /// A verify row on this arch is BYTES — a second row reads its own
     /// experts — so the marginals sit 3-5x above the dense-sidecar surfaces
     /// and there is NO NAX flattening: routed expert banks never ride the
