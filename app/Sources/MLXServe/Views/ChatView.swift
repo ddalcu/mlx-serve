@@ -3617,7 +3617,14 @@ struct MessageBubble: View {
                 thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
-                if let images = message.images, !images.isEmpty {
+                //
+                // A message carrying an image REF draws from its file instead
+                // (ChatMediaAttachmentView). Generated images stopped shipping
+                // bytes, but a history written before that still has both, and
+                // drawing both would show the same picture twice. The ref wins:
+                // it is the original the generator wrote, not a re-encode.
+                if let images = message.images, !images.isEmpty,
+                   message.media?.contains(where: { $0.kind == .image }) != true {
                     HStack(spacing: 4) {
                         ForEach(images) { img in
                             if let nsImage = NSImage(data: img.data) {

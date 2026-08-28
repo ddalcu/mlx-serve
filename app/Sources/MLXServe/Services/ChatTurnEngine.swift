@@ -1247,16 +1247,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 toolMsg.toolName = result.name
 
                 // Inline images. `browse` screenshots attach to the (hidden) tool
-                // message as VISION INPUT for the next turn. `generate_image`
-                // instead surfaces the rendered image to the USER as a separate
-                // visible assistant message (the tool message is hidden, and only
-                // a `.message` bubble renders images — ChatView ~1793); its
-                // model-facing content keeps just the caption/path, never the
-                // multi-KB base64 (which would blow up the context).
-                var pendingInlineImage: ChatImage? = nil
-                // A produced track or clip rides back as a PATH, not bytes — see
-                // ChatMediaRef. Same split-and-hide shape as the image marker:
-                // the model gets the caption, the user gets a player.
+                // message as VISION INPUT for the next turn: there is no file
+                // behind a screenshot, so its bytes are all there is.
+                //
+                // A GENERATED image keeps none. The generator already wrote the
+                // original to `~/.mlx-serve/generations`, and the ref below
+                // carries its path, so the transcript draws from that file. The
+                // history used to carry a second, re-encoded JPEG of a picture
+                // already on disk: 424 KB on a 1 MB history where the text was
+                // 29 KB.
+                //
+                // Produced tracks and clips ride a PATH, not bytes, for the same
+                // reason — see ChatMediaRef.
                 var pendingMediaRef: ChatMediaRef? = nil
                 if (result.name == "browse" || result.name == "generate_image")
                     && result.output.contains(AgentMediaInline.jpegDataURIMarker) {
@@ -1266,12 +1268,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         // A generated image ships BOTH markers, so the caption
                         // comes from the ref split (which stops before the ref
                         // line) rather than the image split (which would keep
-                        // it). The ref is what gives the picture the same
-                        // Reveal-in-Finder button as a track or a clip.
+                        // it). The ref is the whole attachment now: the picture,
+                        // its caption and its Reveal-in-Finder button all come
+                        // from the file it points at, so the inline bytes this
+                        // branch decoded are dropped on the floor.
                         let (caption, ref) = AgentMediaInline.splitMediaRef(
                             result.output, prompt: tc.arguments["prompt"] ?? "")
                         toolMsg.content = caption.isEmpty ? "[image generated]" : caption
-                        pendingInlineImage = chatImage
                         pendingMediaRef = ref
                     } else if let chatImage {
                         toolMsg.images = [chatImage]
@@ -1297,13 +1300,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
                 // Render the generated media inline AFTER the tool-call card, via
                 // a visible assistant `.message` (the only row that displays it).
-                // ONE message even when both are set — a generated image is its
-                // bytes AND its file, and splitting them would put the caption
-                // and its Reveal button in a separate row from the picture.
-                if pendingInlineImage != nil || pendingMediaRef != nil {
+                if let ref = pendingMediaRef {
                     var mediaMsg = ChatMessage(role: .assistant, content: "")
-                    mediaMsg.images = pendingInlineImage.map { [$0] }
-                    mediaMsg.media = pendingMediaRef.map { [$0] }
+                    mediaMsg.media = [ref]
                     appState.appendMessage(to: sessionId, message: mediaMsg)
                 }
             }

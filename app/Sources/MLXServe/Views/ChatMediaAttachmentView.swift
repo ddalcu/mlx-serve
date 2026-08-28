@@ -36,19 +36,16 @@ struct ChatMediaAttachmentView: View {
 
     var body: some View {
         if !ref.exists {
-            // An image's BYTES live in the transcript, so the picture is still
-            // on screen when its file is gone — a warning row under a perfectly
-            // visible image is noise, and the Reveal button would open nothing.
-            // A track or a clip has nothing left to show, so it says so.
-            if ref.kind != .image { missingRow }
+            // Every kind says so now. An image used to be the exception because
+            // its bytes rode the transcript, so the picture stayed on screen
+            // with the file gone; it is drawn FROM the file today, and a
+            // silently blank space is the one thing worse than a warning row.
+            missingRow
         } else {
             switch ref.kind {
             case .audio: ChatAudioAttachment(ref: ref)
             case .video: ChatVideoAttachment(ref: ref)
-            // The picture itself rides `ChatMessage.images`; this is the caption
-            // + Reveal-in-Finder row that sits under it, the same one a track
-            // and a clip get.
-            case .image: ChatMediaCaption(ref: ref).frame(maxWidth: 400)
+            case .image: ChatImageAttachment(ref: ref)
             }
         }
     }
@@ -64,8 +61,43 @@ struct ChatMediaAttachmentView: View {
     }
 }
 
-/// Prompt + Reveal-in-Finder, shared by the audio and video rows. The prompt is
-/// what makes a bare timestamped filename mean something months later.
+/// A generated picture in the transcript, drawn from its file.
+///
+/// The file in `~/.mlx-serve/generations` is what the generator wrote, so this
+/// shows the original rather than the re-encoded JPEG the history used to
+/// carry beside it. Double-click opens it, the same gesture an uploaded image
+/// has in the bubble above.
+private struct ChatImageAttachment: View {
+    let ref: ChatMediaRef
+
+    /// Read ONCE on appear. Reading it in `body` would re-open the file on
+    /// every render, and the transcript re-renders on every streamed token.
+    @State private var image: NSImage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 400, maxHeight: 300)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: ref.path))
+                    }
+                    .help("Double-click to open")
+            }
+            ChatMediaCaption(ref: ref)
+        }
+        .frame(maxWidth: 400)
+        .onAppear {
+            if image == nil { image = NSImage(contentsOfFile: ref.path) }
+        }
+    }
+}
+
+/// Prompt + Reveal-in-Finder, shared by the image, audio and video rows. The
+/// prompt is what makes a bare timestamped filename mean something months later.
 private struct ChatMediaCaption: View {
     let ref: ChatMediaRef
 
