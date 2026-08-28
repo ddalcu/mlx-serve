@@ -223,6 +223,16 @@ class DownloadManager: ObservableObject {
             .appendingPathComponent(name)
     }
 
+    /// A second copy of the same model in a format the server never reads
+    /// (`pytorch_model-0000N-of-0000M.bin`, `consolidated.pth`, flax/TF). Mirrors
+    /// `cli.isTorchShadowBin` + its skip-extension list.
+    nonisolated static func isTorchShadowWeight(_ path: String) -> Bool {
+        let base = (path as NSString).lastPathComponent.lowercased()
+        for ext in [".pth", ".h5", ".msgpack", ".ckpt"] where base.hasSuffix(ext) { return true }
+        guard base.hasSuffix(".bin") else { return false }
+        return ["pytorch_model", "rust_model", "tf_model"].contains { base.hasPrefix($0) }
+    }
+
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
     /// weight files, PLUS the MTP multi-token-prediction sidecar the server
@@ -236,7 +246,13 @@ class DownloadManager: ObservableObject {
     /// GB of unused weights. This allowlist mirrors `mtp.sidecar_rel_paths`; keep
     /// them in sync. Returns (path, size) pairs.
     nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault) -> [(String, Int64)] {
-        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt"]
+        // `.bin` is allowed because some packs ship an engine-READ binary
+        // sidecar (qwen4_exp's `ngram_table.bin`, mmapped at serve time); the
+        // extension allowlist used to drop it, so app-downloaded packs failed
+        // to load while `mlx-serve pull` (a denylist) got it. Torch/flax shadow
+        // weights stay out on both sides — same rule as `cli.shouldDownload`,
+        // keep them in sync.
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
@@ -254,6 +270,7 @@ class DownloadManager: ObservableObject {
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
+            if Self.isTorchShadowWeight(path) { return nil }
             // Per-bundle junk filter.
             if selection.excludeSubstrings.contains(where: { path.contains($0) }) { return nil }
             // Safetensors allowlist (LTX): keep only the engine's 3 files, skip

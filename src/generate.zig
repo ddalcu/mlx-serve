@@ -198,11 +198,37 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// and nothing else.
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
+    /// qwen4_exp: the head and its history live on the Transformer
+    /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
+    /// (pre-mixer stream at position r, token r+1), query position r+1.
+    qwen4: *Transformer,
 
     pub fn makeCache(self: MtpHeadRef, allocator: std.mem.Allocator) !MtpCacheRef {
         return switch (self) {
             .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
+            .qwen4 => |t| blk: {
+                try t.qwen4MtpReset();
+                break :blk .{ .qwen4 = t };
+            },
         };
+    }
+
+    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
+        const s = t.s;
+        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx);
+        defer _ = mlx.mlx_array_free(out.logits);
+        const hs = mlx.getShape(out.stream);
+        if (!want_logits) return .{ .logits = .{ .ctx = null }, .hidden_next = out.stream };
+        defer _ = mlx.mlx_array_free(out.stream);
+        const last = hs[1] - 1;
+        const strides = [_]c_int{ 1, 1, 1 };
+        var h_last = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(h_last);
+        try mlx.check(mlx.mlx_slice(&h_last, out.stream, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ hs[0], hs[1], hs[2] }, 3, &strides, 3, s));
+        const ls = mlx.getShape(out.logits);
+        var l_last = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&l_last, out.logits, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ ls[0], ls[1], ls[2] }, 3, &strides, 3, s));
+        return .{ .logits = l_last, .hidden_next = h_last };
     }
 
     /// One head forward over L positions. `want_logits` returns the LAST row
@@ -219,6 +245,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mtp_mod.StepOut {
         return switch (self) {
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
+            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
         };
     }
 
@@ -235,8 +262,17 @@ pub const MtpHeadRef = union(enum) {
     ) !void {
         switch (self) {
             .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
+            .qwen4 => |t| {
+                const ids_i32 = try allocator.alloc(i32, token_ids.len);
+                defer allocator.free(ids_i32);
+                for (token_ids, 0..) |tok, i| ids_i32[i] = @intCast(tok);
+                const shape = [_]c_int{@intCast(token_ids.len)};
+                const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
+                defer _ = mlx.mlx_array_free(id_arr);
+                const out = try qwen4Step(t, id_arr, hidden, rope_offset, false, mrope_ctx);
+                _ = mlx.mlx_array_free(out.hidden_next);
+            },
         }
-        _ = allocator;
     }
 
     /// Draft-rerank scheme (see mtp.zig): greedy drafts pick via a coarse
@@ -245,6 +281,7 @@ pub const MtpHeadRef = union(enum) {
     pub fn canRerankDrafts(self: MtpHeadRef) bool {
         return switch (self) {
             .qwen => |h| h.canRerankDrafts(),
+            .qwen4 => false,
         };
     }
 
@@ -256,6 +293,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mlx.mlx_array {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
+            .qwen4 => error.NoDraftRerank,
         };
     }
 
@@ -266,12 +304,14 @@ pub const MtpHeadRef = union(enum) {
     pub fn costProfile(self: MtpHeadRef, target: *const Transformer) mtp_mod.MtpCostProfile {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
+            .qwen4 => .generic,
         };
     }
 
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
+            .qwen4 => null,
         };
     }
 
@@ -281,6 +321,7 @@ pub const MtpHeadRef = union(enum) {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
+            .qwen4 => {},
         }
     }
 };
@@ -288,30 +329,38 @@ pub const MtpHeadRef = union(enum) {
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
+    qwen4: *Transformer,
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
             .qwen => |*c| c.step,
+            .qwen4 => |t| t.qwen4_mtp.?.seq_offset,
         };
     }
 
     /// The underlying KVCache — what the prefix cache's spec-snap machinery
-    /// snapshots and restores (every current variant is KVCache-backed).
-    pub fn kv(self: *MtpCacheRef) *KVCache {
+    /// snapshots and restores. Null when the head's state is NOT KV-only:
+    /// the qwen4 head also owns QSA key history + pooled blocks + its own
+    /// row count, so a KV-only restore would leave stale rows under a fresh
+    /// aux state — it is neither committed nor restored.
+    pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
+            .qwen4 => null,
         };
     }
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
+            .qwen4 => |t| try t.qwen4MtpTruncate(len),
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
             .qwen => |*c| c.deinit(),
+            .qwen4 => {},
         }
     }
 
@@ -321,6 +370,11 @@ pub const MtpCacheRef = union(enum) {
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
             .qwen => |*c| for (c.entries) |*entry| {
+                if (!entry.initialized) continue;
+                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
+                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+            },
+            .qwen4 => |t| for (t.qwen4_mtp.?.cache.entries) |*entry| {
                 if (!entry.initialized) continue;
                 _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
                 _ = mlx.mlx_vector_array_append_value(vec, entry.values);
@@ -654,8 +708,10 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 /// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
 /// equal images) — so vision prefills skip checkpointing even now that they
 /// chunk (the splice scatter itself is chunk-safe via vision_splice_offset).
+/// A vision prompt checkpoints like text once it chunks like text (#197):
+/// without a checkpoint a hybrid's image turn is a guaranteed hot-cache miss.
 pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
-    return stride > 0 and has_ssm and !has_vision;
+    return stride > 0 and has_ssm and (!has_vision or visionChunkedPrefillEnabled());
 }
 
 /// Chunked vision prefill (issue #197). Default ON: the splice resumes its
@@ -682,11 +738,12 @@ pub fn visionPrefillUnchunked(has_vision: bool) bool {
 
 /// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
 /// source rows a chunk's splice consumes. Host-side count, no GPU sync.
-pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32) usize {
+pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32, video_token_id: u32) usize {
     var n: usize = 0;
     for (ids) |id| {
         if (id == @as(i32, @intCast(image_token_id)) or
-            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id)))) n += 1;
+            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id))) or
+            (video_token_id > 0 and id == @as(i32, @intCast(video_token_id)))) n += 1;
     }
     return n;
 }
@@ -1491,6 +1548,9 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// Placeholder rows inside a restored prefix (prefix-cache hit on an
+        /// image prompt): the vision splice starts here, not at row 0.
+        vision_rows_before: usize = 0,
         /// A DFlash assistant context restored from the prefix cache, whose
         /// `absLen()` already equals `ssm_checkpoint_pos_offset`. Ownership
         /// transfers to the Generator. Null = start the assistant blind at
@@ -1839,7 +1899,7 @@ pub const Generator = struct {
         // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
         // so that path is byte-identical to the old whole-prompt behavior.
         const vision_chunked = has_vision and visionChunkedPrefillEnabled();
-        var vision_rows_consumed: usize = 0;
+        var vision_rows_consumed: usize = options.vision_rows_before;
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
@@ -1874,7 +1934,7 @@ pub const Generator = struct {
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
                 const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
-                if (vision_chunked) ctx.vision_splice_offset = vision_rows_consumed;
+                if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -2027,6 +2087,7 @@ pub const Generator = struct {
                         ids_i32[pos..end],
                         xfm.config.image_token_id,
                         xfm.config.audio_token_id,
+                        xfm.config.video_token_id,
                     );
                 }
                 pos = end;
@@ -2086,9 +2147,9 @@ pub const Generator = struct {
         // where the chunk loop left it (an image ending in the final span
         // otherwise re-splices from row 0). One-shot engagement line — the
         // silent-no-op class; tests grep for it per arm.
-        if (vision_chunked) {
+        if (has_vision) {
             ctx.vision_splice_offset = vision_rows_consumed;
-            if (n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
+            if (vision_chunked and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
         }
 
         // Process the final span — the last token, plus (under SSM
@@ -4960,6 +5021,15 @@ pub const Generator = struct {
         // sequential recurrence AND a full trunk weight read, and at depth > 1
         // MOST rounds are partial, so it dominated the round cost).
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+        // DIAGNOSTIC (MLX_SERVE_MTP_TRACE_SYNC=1): drain the GPU before the
+        // verify build so the `sync` lap shows the pending lazy work (draft
+        // chain, rollback, commit) and `verify` the forward alone.
+        if (tracing and std.c.getenv("MLX_SERVE_MTP_TRACE_SYNC") != null) {
+            var sync_watch = io_util.Stopwatch.init(self.timer.io);
+            try mlx.check(mlx.mlx_array_eval(verify_input));
+            self.mtp_trace.add(.sync, sync_watch.read());
+            ph.reset();
+        }
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
         const verify_logits = try xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all);
@@ -6239,9 +6309,12 @@ pub const Generator = struct {
         drafted: u64 = 0,
         accepted: u64 = 0,
         extended: u32 = 0,
+        /// Per draft index: rounds that drafted index i / accepted it.
+        drafted_idx: [mtp_mod.MAX_DEPTH]u32 = @splat(0),
+        accepted_idx: [mtp_mod.MAX_DEPTH]u32 = @splat(0),
 
         pub fn add(self: *MtpTrace, phase: Phase, dur_ns: u64) void {
-            self.ns[@intFromEnum(phase)] += dur_ns;
+            self.ns[@backingInt(phase)] += dur_ns;
         }
 
         /// Close one round; true when a summary line is due (caller logs,
@@ -6251,12 +6324,27 @@ pub const Generator = struct {
             self.drafted += drafted_n;
             self.accepted += accepted_n;
             if (was_extended) self.extended += 1;
+            var i: usize = 0;
+            while (i < drafted_n and i < mtp_mod.MAX_DEPTH) : (i += 1) {
+                self.drafted_idx[i] += 1;
+                if (i < accepted_n) self.accepted_idx[i] += 1;
+            }
             return self.rounds >= LOG_EVERY;
+        }
+
+        /// `a0/a1/...` acceptance per drafted index (only indices ever drafted).
+        pub fn accIdxStr(self: *const MtpTrace, buf: []u8) []const u8 {
+            var w: std.Io.Writer = .fixed(buf);
+            var i: usize = 0;
+            while (i < mtp_mod.MAX_DEPTH and self.drafted_idx[i] > 0) : (i += 1) {
+                w.print("{s}{d:.2}", .{ if (i == 0) "" else "/", @as(f64, @floatFromInt(self.accepted_idx[i])) / @as(f64, @floatFromInt(self.drafted_idx[i])) }) catch break;
+            }
+            return w.buffered();
         }
 
         pub fn avgMs(self: *const MtpTrace, phase: Phase) f64 {
             if (self.rounds == 0) return 0.0;
-            return @as(f64, @floatFromInt(self.ns[@intFromEnum(phase)])) /
+            return @as(f64, @floatFromInt(self.ns[@backingInt(phase)])) /
                 (@as(f64, @floatFromInt(self.rounds)) * 1e6);
         }
 
@@ -6285,7 +6373,7 @@ pub const Generator = struct {
         accepted: u64 = 0,
 
         pub fn add(self: *DflashTrace, phase: Phase, dur_ns: u64) void {
-            self.ns[@intFromEnum(phase)] += dur_ns;
+            self.ns[@backingInt(phase)] += dur_ns;
         }
 
         /// Close one round; true when a summary line is due (caller logs,
@@ -6298,7 +6386,7 @@ pub const Generator = struct {
 
         pub fn avgMs(self: *const DflashTrace, phase: Phase) f64 {
             if (self.rounds == 0) return 0.0;
-            return @as(f64, @floatFromInt(self.ns[@intFromEnum(phase)])) /
+            return @as(f64, @floatFromInt(self.ns[@backingInt(phase)])) /
                 (@as(f64, @floatFromInt(self.rounds)) * 1e6);
         }
 
@@ -6395,6 +6483,8 @@ pub const Generator = struct {
     /// Adaptive (EV) controller gate — DEFAULT ON. MLX_SERVE_MTP_ADAPTIVE=0
     /// reverts to the fixed-depth windowed controller for same-boot A/Bs.
     var mtp_adaptive_cache: ?bool = null;
+    var mtp_force_depth_cache: ??u32 = null;
+
     pub fn mtpAdaptiveEnabled() bool {
         if (mtp_adaptive_cache) |v| return v;
         var on = true;
@@ -6844,7 +6934,22 @@ pub const Generator = struct {
     /// Post-warmup EV mode: the pure plan over the acceptance EMAs, with the
     /// base-depth climb damped to one step per round and two-chunk plans
     /// gated by the extension dry-spell policy.
+    /// DIAGNOSTIC (MLX_SERVE_MTP_FORCE_DEPTH=n): every round drafts exactly
+    /// n, the EV/windowed controllers never demote or disable — the
+    /// per-index acceptance meter (`acc_idx=` on the trace line).
+    fn mtpForcedDepth() ?u32 {
+        if (mtp_force_depth_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_FORCE_DEPTH", 0);
+        const v: ?u32 = if (n == 0) null else @intCast(@min(n, mtp_mod.MAX_DEPTH));
+        mtp_force_depth_cache = v;
+        return v;
+    }
+
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        if (mtpForcedDepth()) |d| {
+            self.mtp_ev_m_lo_prev = d;
+            return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
+        }
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
         const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
         var cap: u32 = cap_row;
@@ -7014,6 +7119,7 @@ pub const Generator = struct {
     fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         mtpEvObserve(&self.mtp_ev_accept, drafted, accepted, MTP_EV_EMA_BETA);
         self.mtp_ev_rounds += 1;
+        if (mtpForcedDepth() != null) return;
         if (self.mtp_ev_rounds <= MTP_EV_WARMUP_ROUNDS) {
             self.updateMtpDepth(drafted, accepted);
             // Warmup may evaluate several depths. None of that mixed evidence
@@ -7045,8 +7151,9 @@ pub const Generator = struct {
         if (!mtpTraceEnabled()) return;
         if (!self.mtp_trace.endRound(m, accepted, m > m_lo)) return;
         const t = &self.mtp_trace;
+        var acc_buf: [64]u8 = undefined;
         log.info(
-            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2}\n",
+            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2} acc_idx={s}\n",
             .{
                 t.rounds,
                 t.avgMs(.draft),
@@ -7063,6 +7170,7 @@ pub const Generator = struct {
                 @as(f64, @floatFromInt(t.drafted)) / @as(f64, @floatFromInt(t.rounds)),
                 @as(f64, @floatFromInt(t.accepted)) / @as(f64, @floatFromInt(t.rounds)),
                 @as(f64, @floatFromInt(t.extended)) / @as(f64, @floatFromInt(t.rounds)),
+                t.accIdxStr(&acc_buf),
             },
         );
         t.reset();
@@ -10323,10 +10431,17 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
 }
 
-test "vision prefill is not split at SSM checkpoint boundaries" {
+test "vision prefill checkpoints SSM state only when it chunks like text" {
     const prefix_len: usize = 1587;
     const checkpoint_stride: u32 = 256;
 
+    // Chunked vision (the default) checkpoints like text — a hybrid's image
+    // turn is otherwise a guaranteed hot-cache miss (no checkpoint <= match).
+    vision_chunked_cached = true;
+    defer vision_chunked_cached = null;
+    try testing.expect(shouldCheckpointSsmPrefill(checkpoint_stride, true, true));
+    // The whole-prompt kill-switch arm has no chunk boundaries to snapshot at.
+    vision_chunked_cached = false;
     const vision_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, true);
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(
@@ -12358,11 +12473,12 @@ test "prefill chunk loop yields to the interleave hook between chunks, never aft
     try std.testing.expect(call_at - guard_at < 200);
 }
 
-test "countSpliceRows counts image and audio placeholders, audio only when declared" {
-    const ids = [_]i32{ 7, 99, 99, 8, 88, 9 };
-    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
-    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88));
-    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88));
+test "countSpliceRows counts image, audio and video placeholders, extras only when declared" {
+    const ids = [_]i32{ 7, 99, 99, 8, 88, 9, 77 };
+    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0, 0));
+    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88, 0));
+    try testing.expectEqual(@as(usize, 4), countSpliceRows(&ids, 99, 88, 77));
+    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
 }
 
 test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
@@ -12376,4 +12492,15 @@ test "vision prefill chunks by default and the splice offset feeds every prefill
     const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
     try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
     try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
+}
+
+test "MtpTrace per-index acceptance: index i counts only rounds that drafted it" {
+    var t: Generator.MtpTrace = .{};
+    _ = t.endRound(3, 3, false); // all three accepted
+    _ = t.endRound(3, 1, false); // a0 accepted, a1 rejected, a2 never judged
+    _ = t.endRound(1, 0, false); // depth-1 round: only index 0 drafted
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("0.67/0.50/0.50", t.accIdxStr(&buf));
+    t.reset();
+    try std.testing.expectEqualStrings("", t.accIdxStr(&buf));
 }

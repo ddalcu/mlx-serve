@@ -120,6 +120,28 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertEqual(sidecar?.1, 524_000_000)
     }
 
+    /// A `.bin` sidecar the engine READS is a needed file (qwen4_exp's
+    /// `ngram_table.bin`, mmapped at serve time): the extension allowlist used
+    /// to drop it, so app-downloaded packs crashed on a missing table while
+    /// `mlx-serve pull` (denylist) got it. Torch-format duplicates stay out on
+    /// both sides — same rule, so keep this in sync with `cli.shouldDownload`.
+    func testSelectNeededFilesIncludesBinSidecarSkipsTorchWeights() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 108_000],
+            ["path": "model-00001-of-00002.safetensors", "type": "file", "size": 5_300_000_000],
+            ["path": "ngram_table.bin", "type": "file", "size": 32_000_000_000],
+            ["path": "pytorch_model-00001-of-00002.bin", "type": "file", "size": 5_300_000_000],
+            ["path": "consolidated.pth", "type": "file", "size": 5_300_000_000],
+            ["path": "flax_model.msgpack", "type": "file", "size": 5_300_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+
+        XCTAssertTrue(paths.contains("ngram_table.bin"), "engine-read .bin sidecar must be downloaded")
+        XCTAssertFalse(paths.contains("pytorch_model-00001-of-00002.bin"), "torch shadow weights must not be pulled")
+        XCTAssertFalse(paths.contains("consolidated.pth"))
+        XCTAssertFalse(paths.contains("flax_model.msgpack"))
+    }
+
     /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
     /// of mlx-serve's `mtp/` layout) alongside `optiq/optiq_vision.safetensors`.
     /// The head must be pulled (server auto-loads it, delta-norms folded at load)

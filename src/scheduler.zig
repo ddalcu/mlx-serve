@@ -267,6 +267,8 @@ pub const SubmitParams = struct {
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
+    /// Prefix-cache key for the media under the placeholder tokens (0 = none).
+    vision_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -325,6 +327,7 @@ pub const Slot = struct {
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -507,6 +510,8 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
+                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
             }
             allocator.free(entries);
         };
@@ -528,6 +533,7 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
+            .vision_key = params.vision_key,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -639,6 +645,8 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
+                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
             }
             self.allocator.free(entries);
         }
@@ -2091,13 +2099,23 @@ fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     return t.ownsModuleDecodeState();
 }
 
+/// Per-SLOT exclusivity: the model's own bit, OR a slot that will drive a
+/// module-owned MTP head (qwen4: `Qwen4Mtp.cache` is one per model). Plain
+/// slots on the same model keep interleaving/batching beside it; two MTP
+/// slots serialize.
+fn slotExclusiveDecode(slot: *const Slot) bool {
+    if (modelExclusiveDecode(slot.model)) return true;
+    const head = slot.model.mtp orelse return false;
+    return slot.enable_mtp and head == .qwen4;
+}
+
 /// One pending-drain candidate (or live decoding slot), reduced to what
 /// admission needs: an opaque model identity + the exclusive-decode bit.
 pub const AdmitCand = struct { model: usize, exclusive: bool };
 
-/// FIFO admission for one drain tick. A candidate on an EXCLUSIVE model
-/// admits only if its model is neither among `active` (live decoding slots)
-/// nor already claimed by an earlier admitted exclusive candidate this tick
+/// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
+/// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
+/// admitted exclusive candidate claimed it this tick
 /// (a same-tick sibling is not in `decoding` yet — the claim covers the
 /// window). Non-exclusive candidates always admit — no head-of-line
 /// blocking behind a held exclusive request. Writes admitted candidate
@@ -2109,7 +2127,7 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
     outer: for (cands, 0..) |c, i| {
         if (n >= out.len) break;
         if (c.exclusive) {
-            for (active) |a| if (a.model == c.model) continue :outer;
+            for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
             for (out[0..n]) |j| {
                 if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
             }
@@ -3160,6 +3178,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.linear_num_key_heads > 0) {
             xfm_ptr.compileGdnGate();
         }
+        if (params.config.isQwen4()) {
+            xfm_ptr.compileQwen4Hc();
+        }
     }
 
     // Phase 2 experiment: opt-in full-forward Metal fusion via
@@ -3193,11 +3214,45 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const io_u = @import("io_util.zig");
             const tio = std.Io.Threaded.global_single_threaded.io();
             var ctx = xfm_ptr.defaultCtx();
-            const tok: i32 = 1;
-            const tsh = [_]c_int{ 1, 1 };
+            // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards
+            // (per-position SSM capture on, as spec verify runs them).
+            // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
+            // tokens first so the meter runs at a real context length.
+            const rows: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_S") orelse break :blk 1;
+                break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
+            };
+            const kv_pre: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
+                break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
+            };
+            const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
+            defer sch.allocator.free(tok_slice);
+            for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
+            const tok = tok_slice.ptr;
+            const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
+            if (kv_pre > 0) {
+                var done_pre: usize = 0;
+                const pre_buf = try sch.allocator.alloc(i32, 2048);
+                defer sch.allocator.free(pre_buf);
+                for (pre_buf, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
+                while (done_pre < kv_pre) {
+                    const n_chunk = @min(2048, kv_pre - done_pre);
+                    const psh = [_]c_int{ 1, @intCast(n_chunk) };
+                    const ti = mlx.mlx_array_new_data(pre_buf.ptr, &psh, 2, .int32);
+                    defer _ = mlx.mlx_array_free(ti);
+                    const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                    _ = mlx.mlx_array_eval(lg);
+                    _ = mlx.mlx_array_free(lg);
+                    done_pre += n_chunk;
+                }
+                log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
+            }
+            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            log.info("[fwd-ubench] rows={d} capture={}\n", .{ tok_slice.len, ctx.capture_ssm_seq });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -3213,7 +3268,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const ops_before = mlx.op_count.load(.monotonic);
                 var swb = io_u.Stopwatch.init(tio);
@@ -3242,7 +3297,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // this the one sound ablation in the probe.
             ctx.skip_lm_head = true;
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -3251,7 +3306,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw_nolm = io_u.Stopwatch.init(tio);
             var done_nolm: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -3562,7 +3617,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter = drafter_ptr;
     entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = if (mtp_ptr) |h| generate_mod.MtpHeadRef{ .qwen = h } else null;
+    entry.mtp = if (mtp_ptr) |h|
+        generate_mod.MtpHeadRef{ .qwen = h }
+    else if (params.mtp_enabled and xfm_ptr.qwen4_mtp != null)
+        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
+    else
+        null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
@@ -3817,7 +3877,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             var n_live: usize = 0;
             for (sch.decoding.items) |s| {
                 if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-                if (!modelExclusiveDecode(s.model)) continue;
+                if (!slotExclusiveDecode(s)) continue;
                 if (n_live >= live_buf.len) break;
                 live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
                 n_live += 1;
@@ -3825,7 +3885,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             var cand_buf: [32]AdmitCand = undefined;
             const n_cands = @min(sch.pending.items.len, cand_buf.len);
             for (sch.pending.items[0..n_cands], 0..) |s, i| {
-                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = modelExclusiveDecode(s.model) };
+                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
             }
             var admit_idx: [to_prefill.len]usize = undefined;
             const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
@@ -4304,7 +4364,6 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
-    if (slot.vision_embeddings != null) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
@@ -4371,9 +4430,9 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
-        break :blk .{ .cache = mc.kv(), .base_pos = gen_ptr.mtp_position_base };
+        break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4413,7 +4472,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     if (slot.ssm_entries != null) return;
     const step: usize = @intCast(slot.cache.step);
     const len = cancelledPrefillCommitLen(step, slot.full_prompt.len) orelse return;
-    hc.commit(&slot.cache, slot.full_prompt[0..len], slot.has_tools) catch |err| {
+    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, null, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -5007,8 +5066,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // "model's native head" semantics): the server defaults enable_mtp ON for a
     // stage-bearing dsv4, the n-gram prompt gate never touches it, and
     // enable_mtp:false opts out.
+    // Module CLASS (owned or shared-readonly), not ownership alone: qwen4
+    // batches its plain slots but its spec wiring stays the module one.
     const owns_module_state = slot.model.transformer != null and
-        slot.model.transformer.?.ownsModuleDecodeState();
+        slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
         slot.model.transformer.?.dsv4 != null;
     const module_spec_rollback = slot.model.transformer != null and
@@ -5065,7 +5126,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
-        if (slot.vision_embeddings == null) {
+        {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
             // the next one that does.
@@ -5081,6 +5142,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null;
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
+            const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
             const lookup = hc.lookupAndRestore(
                 &slot.cache,
                 &slot.moe_seq_offset,
@@ -5088,8 +5150,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
+                slot.vision_key,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
-                if (mtp_target) |*mc| .{ .cache = mc.kv(), .base_pos = &mtp_base } else null,
+                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -5185,6 +5248,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            // A restored prefix already holds its image rows: the splice
+            // resumes at the placeholder count inside the matched prefix.
+            .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)
+                generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.audio_token_id, xfm_ptr.config.video_token_id)
+            else
+                0,
             // The prefill width the admission guard billed for THIS model.
             // Straight off `slot.model.config` — the same object
             // `server.pinPrefillChunk` writes and `checkAttentionMemory`
@@ -5363,6 +5432,7 @@ pub const SpecInitWiring = struct {
 /// module-owned arch arrived with the same `Model.state` shape and a 0-layer
 /// shell cache, got no conjunct, and `--pld` drove verify forwards straight
 /// through it. One predicate, one place to extend.
+
 pub fn specInitWiring(
     owns_module_state: bool,
     module_spec_rollback: bool,
@@ -5381,7 +5451,8 @@ pub fn specInitWiring(
         // .bind refuses these archs anyway), and PLD's win case is
         // echo-shaped traffic the n-gram gate rarely opens on a
         // head this cheap — neither has been measured on this family, and an
-        // unmeasured spec mode is worse than none.
+        // unmeasured spec mode is worse than none. Image requests ride the
+        // head too: `qwen4MtpForward` takes the slot's M-RoPE table.
         .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
         .use_drafter = false,
         .use_dflash = false,
@@ -5871,7 +5942,6 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         const gen = &slot.legacy_gen.?;
         next_tokens[i] = gen.next_token_id;
         ctxs[i] = &gen.ctx;
-        rope_offsets[i] = @intCast(slot.cache.step);
     }
 
     // Two batched kernels: the standard one, and the GatedDeltaNet twin for
@@ -5879,6 +5949,11 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // the gate — a slot that has not prefilled yet carries no recurrent state
     // to merge, so that tick stays serial rather than merging a wrong width.
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
+    // Position source is per PATH: a GDN trunk positions from the slot's
+    // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
+    // linear layer there, so it reads 0 forever and every batched token was
+    // roped at position 0 (qwen3_5 batched diverged from serial at token 14).
+    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn) slot.moe_seq_offset else slot.cache.step);
     if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
         // A slot with no recurrent state yet cannot join the merge. Decode the
         // group serially this tick instead of skipping it — skipping advances
@@ -5894,6 +5969,10 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
     }
+    // The batched forward advances only its scratch offset; each slot's own
+    // position moves here so a slot leaving the batch resumes serial from
+    // the right place (qwen4's QSA reads it for kv length + tail rule).
+    for (batch) |slot| slot.moe_seq_offset += 1;
 
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
@@ -6183,6 +6262,38 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         dense.model_type = "qwen3";
         try testing.expect(!dense.supportsBatchedGdnDecode());
     }
+    {
+        // qwen4_exp: MoE, but every per-slot piece is on the SSMCacheEntry.
+        var q4 = std.mem.zeroes(model_mod.ModelConfig);
+        q4.model_type = "qwen4_exp";
+        q4.full_attention_interval = 4;
+        q4.num_experts = 256;
+        q4.num_experts_per_tok = 8;
+        try testing.expect(q4.supportsBatchedGdnDecode());
+    }
+}
+
+test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its own class" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    // An MTP candidate beside a live PLAIN slot on the same model admits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = false }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+    }
+    // An MTP candidate beside a live MTP slot holds.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+    }
+    // A plain candidate beside a live MTP slot admits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+    }
 }
 
 test "admitPendingTick: exclusive single-flight FIFO contract" {
@@ -6273,8 +6384,9 @@ test "inferenceLoop pending drain routes through admitPendingTick" {
     const src = @embedFile("scheduler.zig");
     const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
     try testing.expect(std.mem.indexOf(u8, src, call) != null);
-    // The candidates' exclusive bit must come from the model predicate.
-    const pred = ".exclusive = modelExclusiveDecode(" ++ "s.model)";
+    // The candidates' exclusive bit must come from the per-slot predicate
+    // (model bit OR a module-owned MTP head on this slot).
+    const pred = ".exclusive = slotExclusiveDecode(" ++ "s)";
     try testing.expect(std.mem.indexOf(u8, src, pred) != null);
     // The pre-gate unconditional drain shape must be GONE — its survival
     // would mean a path still admits without the gate.
@@ -6549,6 +6661,12 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         const w = specInitWiring(true, true, false, false, true, true, true, false, true);
         try testing.expect(!w.use_mtp);
     }
+    // An image request keeps the head (the qwen4 head takes the slot's
+    // M-RoPE table); the drafters stay off.
+    {
+        const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+    }
 
     // Module-owned WITH a native draft mode (dsv4/DSpark) and no rollback: the
     // shell paths stay off, but the request's MTP intent still reaches the
@@ -6575,7 +6693,7 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
     // The exclusion must come from the shared predicate, not a new arch list.
-    const from_predicate = "transformer.?.ownsModuleDecode" ++ "State()";
+    const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
     try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
     // The hand-written per-arch conjuncts must be GONE — their survival is how
     // a second module-owned arch gets missed.

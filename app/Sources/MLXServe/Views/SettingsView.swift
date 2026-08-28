@@ -1287,9 +1287,9 @@ private struct SpecDecodeSectionContent: View {
         // Native multi-token prediction — the model's OWN trained head, so it's
         // a different mechanism from PLD (which guesses by copying from the
         // prompt) and from the drafter (a separate small model). It needs no
-        // extra download and no compatible pairing: a Qwen 3.5/3.6 checkpoint
+        // extra download and no compatible pairing: a Qwen 3.5/3.8 checkpoint
         // either ships the head or it doesn't.
-        SettingsSubheader("Multi-Token Prediction — Qwen 3.5 / 3.6")
+        SettingsSubheader("Multi-Token Prediction — Qwen 3.5 / 3.8")
         if let m = meta["enableMTP"] {
             SettingsRow(
                 title: m.title,

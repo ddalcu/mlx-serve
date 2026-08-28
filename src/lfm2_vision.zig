@@ -528,7 +528,7 @@ pub const Lfm2Vision = struct {
         const none = mlx.mlx_array{ .ctx = null };
         var ctx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ctx);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ctx, bhnd[0], bhnd[1], bhnd[2], scale, "", none, none, self.s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ctx, bhnd[0], bhnd[1], bhnd[2], scale, "", none, none, false, self.s));
 
         const back = [_]c_int{ 0, 2, 1, 3 };
         var t = mlx.mlx_array_new();

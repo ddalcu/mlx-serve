@@ -1131,6 +1131,7 @@ test "quantAttention matches dense SDPA at 4-bit (decode, T_q=1)" {
         "",
         none_mask,
         .{ .ctx = null },
+        false,
         s,
     ));
 
@@ -1235,6 +1236,7 @@ fn gqaParityCaseD(
         mask_mode,
         mask_arr,
         .{ .ctx = null },
+        false,
         s,
     ));
 
@@ -1422,7 +1424,7 @@ test "kv-quant decode µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
                     defer _ = mlx.mlx_array_free(vd);
                     var out = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(out);
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vd, scale, "", none, .{ .ctx = null }, s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vd, scale, "", none, .{ .ctx = null }, false, s));
                     const ev = mlx.mlx_vector_array_new();
                     defer _ = mlx.mlx_vector_array_free(ev);
                     _ = mlx.mlx_vector_array_append_value(ev, out);
@@ -1436,7 +1438,7 @@ test "kv-quant decode µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
                     if (i == warmup) Lap.reset(&mark, io);
                     var out = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(out);
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k_dense, v_dense, scale, "", none, .{ .ctx = null }, s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k_dense, v_dense, scale, "", none, .{ .ctx = null }, false, s));
                     const ev = mlx.mlx_vector_array_new();
                     defer _ = mlx.mlx_vector_array_free(ev);
                     _ = mlx.mlx_vector_array_append_value(ev, out);
@@ -1494,6 +1496,7 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
         "causal",
         none_mask,
         .{ .ctx = null },
+        false,
         s,
     ));
 

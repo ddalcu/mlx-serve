@@ -330,7 +330,7 @@ fn ropeInPlace(x: mlx.mlx_array, hd: c_int, theta: f32, s: S) !mlx.mlx_array {
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: ?mlx.mlx_array, mode: [*:0]const u8, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     const null_a = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, mask orelse null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, mask orelse null_a, null_a, false, s));
     return o;
 }
 

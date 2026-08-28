@@ -24,19 +24,19 @@
 #      tails legitimately diverge — same as PLD/drafter, see CLAUDE.md.)
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
-# Default model: ~/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve. A standalone
+# Default model: ~/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit. A standalone
 # sidecar (every mtp.sidecar_rel_paths location) or a sharded/monolithic
 # checkpoint carrying one of mtp_marker_keys works.
 # Calibrated auto-depth surfaces can additionally pin their live dispatch arm:
 #   MTP_EXPECT_AUTO_PROFILE=g17_nax_q4_gs64 MTP_EXPECT_AUTO_DEPTH=8 \
 #     MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh
 #
-# MoE trunks (35B-A3B) keep MTP default-OFF per request; set MTP_FORCE_ENABLE=1
-# to inject "enable_mtp":true into every request body so engagement +
-# acceptance-floor checks exercise the MoE-MLP sidecar arm.
+# MoE trunks (35B-A3B, qwen4_exp) keep MTP default-OFF per request; set
+# MTP_FORCE_ENABLE=1 to inject "enable_mtp":true into every request body so
+# engagement + acceptance-floor checks exercise the MoE head arm.
 
 set -u
-MODEL="${MTP_TEST_MODEL:-$HOME/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve}"
+MODEL="${MTP_TEST_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
 PORT="${1:-11313}"
 BIN="./zig-out/bin/mlx-serve"
 # ~24 tokens of prefix. Mirrors the PLD/KV-quant first-N thresholds: INT4
@@ -74,6 +74,8 @@ markers = {
     "language_model.mtp.fc.weight",
     "mtp.eh_proj.weight",
     "language_model.mtp.eh_proj.weight",
+    "mtp.fc_hidden.weight",
+    "language_model.mtp.fc_hidden.weight",
 }
 
 try:
@@ -258,7 +260,8 @@ stop_server
 
 echo "── MTP server (default-on) ──"
 start_server ""
-if ! grep -q "MTP head ready" "$LOG"; then
+# The qwen4_exp head is the checkpoint's own layer and logs its own line.
+if ! grep -q "MTP head ready\|\[qwen4\] MTP head loaded" "$LOG"; then
     echo "FAIL: server did not auto-load the MTP sidecar"; tail -5 "$LOG"; FAIL=$((FAIL+1))
 else
     echo "PASS [mtp auto-load]"; PASS=$((PASS+1))

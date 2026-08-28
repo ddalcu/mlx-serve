@@ -1699,7 +1699,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_a = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q4, k4, v4, scale, "", null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q4, k4, v4, scale, "", null_a, null_a, false, s));
     const at3 = try squeezeDim1(attn, s); // [N,pp,C]
     defer _ = mlx.mlx_array_free(at3);
     const back = try fromPatches(at3, B, nph, npw, p, C, s); // [B,padH,padW,C]
@@ -2708,9 +2708,9 @@ fn jointAttn(aw: *const DitAttnW, img_in: mlx.mlx_array, txt_in: mlx.mlx_array, 
     defer _ = mlx.mlx_array_free(attn);
     const null_a = mlx.mlx_array{ .ctx = null };
     if (mask) |m| {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "array", m, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "array", m, null_a, false, s));
     } else {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, false, s));
     }
     // [B,H,seq,128] → [B,seq,3072]
     const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
@@ -3504,7 +3504,7 @@ fn visionSegAttn(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, cfg: VitC
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_a = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q4, k4, v4, scale, "", null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q4, k4, v4, scale, "", null_a, null_a, false, s));
     // [1,heads,seg,hd] → [seg,heads,hd]
     const a3 = try reshape(attn, &[_]c_int{ cfg.heads, seg, cfg.headDim() }, s);
     defer _ = mlx.mlx_array_free(a3);
@@ -3881,7 +3881,7 @@ fn teLayerForward(layer: *const TeLayerW, x: mlx.mlx_array, mask: mlx.mlx_array,
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_sink = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "array", mask, null_sink, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "array", mask, null_sink, false, s));
     const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
     defer _ = mlx.mlx_array_free(at);
     const af = try reshape(at, &[_]c_int{ 1, seq, TE_HEADS * TE_HEAD_DIM }, s);

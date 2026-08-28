@@ -239,6 +239,32 @@ pub const ModelConfig = struct {
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
+    // Qwen4-Exp (Qwen3.8-Flash-Next): gated residual streams ("hyper
+    // connections", hc_count x hidden wide), a hashed n-gram embedding
+    // injected at ONE layer (PLE), and Qwen Sparse Attention (indexer-selected
+    // 4-token blocks past `indexer_budget` tokens). hc_count 0 = none.
+    hc_count: u32 = 0,
+    hc_lowrank: u32 = 0,
+    ple_layer_idx: i32 = -1, // 0-based; the config lists 1-based ids
+    ple_embed_dim: u32 = 0,
+    ple_conv_kernel: u32 = 4,
+    ngram_size: u32 = 3,
+    heads_per_ngram: u32 = 8,
+    ngram_vocab_base: u64 = 20_000_000,
+    ngram_vocab_divisor: u32 = 128,
+    ngram_seed: u64 = 1234,
+    indexer_n_heads: u32 = 0, // 0 = dense attention
+    indexer_head_dim: u32 = 0,
+    indexer_budget: u32 = 0,
+    indexer_compress_ratio: u32 = 0,
+    /// The TEXT config's own eos (its first entry): the n-gram hash's segment
+    /// reset token, independent of the generation-time stop set.
+    ngram_eos: u32 = 0,
+    /// `<model_dir>/ngram_table.bin` for the PLE table (mmapped by the
+    /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
+    /// config does.
+    ngram_table_path: ?[]const u8 = null,
+
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
     // o_proj. Distinct from attn_output_gate (qwen3-next sigmoid + doubled
@@ -778,6 +804,12 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "inkling_mm_model");
     }
 
+    /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
+    /// in hyper-connection residual streams, with the n-gram PLE and QSA.
+    pub fn isQwen4(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "qwen4_exp");
+    }
+
     /// True when per-request SSM/conv cache entries must exist: hybrid
     /// recurrence (LFM2/Nemotron/GDN) or Inkling's four per-layer short
     /// convolutions. Shared by Transformer.init and the scheduler's per-slot
@@ -812,7 +844,7 @@ pub const ModelConfig = struct {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
-        if (self.isMoe()) return false; // routed experts: not modelled yet
+        if (self.isMoe() and !self.isQwen4()) return false; // routed experts: only qwen4_exp's per-slot state is modelled
         if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
@@ -957,6 +989,7 @@ pub const ModelConfig = struct {
         const is_qwen = std.mem.eql(u8, t, "qwen3") or
             std.mem.eql(u8, t, "qwen3_moe") or
             std.mem.eql(u8, t, "qwen3_5_moe") or
+            std.mem.eql(u8, t, "qwen4_exp") or
             std.mem.eql(u8, t, "qwen3_next");
         const is_gemma = std.mem.eql(u8, t, "gemma3") or
             std.mem.eql(u8, t, "gemma4") or
@@ -1098,6 +1131,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     defer allocator.free(content);
 
     var config = try parseConfigFromJson(allocator, content);
+    if (config.isQwen4()) {
+        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+    }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
     // any failure (missing file, bad JSON) leaves the fields null.
@@ -1299,6 +1335,75 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
 
 /// I/O-free variant for unit tests and for callers that already have the
 /// config.json bytes in memory. The full I/O-bound `parseConfig` delegates here.
+/// Qwen3-VL-family vision + M-RoPE fields, shared by the qwen3_5 and
+/// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
+/// vision token ids). The generic vision_config block already set
+/// `has_vision`; this reads Qwen's own keys into `qv_*`.
+fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) void {
+    if (root.get("vision_config")) |vc_val| {
+        if (vc_val == .object) {
+            const vc = vc_val.object;
+            config.qwen_vision = true;
+            if (vc.get("depth")) |v| {
+                if (v == .integer) config.qv_depth = @intCast(v.integer);
+            }
+            if (vc.get("hidden_size")) |v| {
+                if (v == .integer) config.qv_hidden = @intCast(v.integer);
+            }
+            if (vc.get("num_heads")) |v| {
+                if (v == .integer) config.qv_heads = @intCast(v.integer);
+            }
+            if (vc.get("intermediate_size")) |v| {
+                if (v == .integer) config.qv_intermediate = @intCast(v.integer);
+            }
+            if (vc.get("patch_size")) |v| {
+                if (v == .integer) config.qv_patch = @intCast(v.integer);
+            }
+            if (vc.get("temporal_patch_size")) |v| {
+                if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
+            }
+            if (vc.get("spatial_merge_size")) |v| {
+                if (v == .integer) config.qv_merge = @intCast(v.integer);
+            }
+            if (vc.get("num_position_embeddings")) |v| {
+                if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer);
+            }
+            if (vc.get("out_hidden_size")) |v| {
+                if (v == .integer) config.qv_out_hidden = @intCast(v.integer);
+            }
+            if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+            if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+        }
+    }
+    // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
+    // partial_rotary_factor already parsed in the generic rope block above.
+    if (cfg_obj.get("rope_parameters")) |rp| {
+        if (rp == .object) {
+            if (rp.object.get("mrope_interleaved")) |v| {
+                if (v == .bool) config.mrope_interleaved = v.bool;
+            }
+            if (rp.object.get("mrope_section")) |v| {
+                if (v == .array) {
+                    for (v.array.items, 0..) |item, i| {
+                        if (i >= 3) break;
+                        if (item == .integer) config.mrope_section[i] = @intCast(item.integer);
+                    }
+                }
+            }
+        }
+    }
+    // Qwen vision token ids (top-level).
+    if (root.get("video_token_id")) |v| {
+        if (v == .integer) config.video_token_id = @intCast(v.integer);
+    }
+    if (root.get("vision_start_token_id")) |v| {
+        if (v == .integer) config.vision_start_token_id = @intCast(v.integer);
+    }
+    if (root.get("vision_end_token_id")) |v| {
+        if (v == .integer) config.vision_end_token_id = @intCast(v.integer);
+    }
+}
+
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
     defer parsed.deinit();
@@ -1892,70 +1997,83 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
-        // Qwen3-VL vision tower (separate fields from the Gemma SigLIP block;
-        // see src/qwen_vision.zig). The generic vision_config block above already
-        // set has_vision; here we read Qwen's distinct keys into qv_*.
-        if (root.get("vision_config")) |vc_val| {
-            if (vc_val == .object) {
-                const vc = vc_val.object;
-                config.qwen_vision = true;
-                if (vc.get("depth")) |v| {
-                    if (v == .integer) config.qv_depth = @intCast(v.integer);
-                }
-                if (vc.get("hidden_size")) |v| {
-                    if (v == .integer) config.qv_hidden = @intCast(v.integer);
-                }
-                if (vc.get("num_heads")) |v| {
-                    if (v == .integer) config.qv_heads = @intCast(v.integer);
-                }
-                if (vc.get("intermediate_size")) |v| {
-                    if (v == .integer) config.qv_intermediate = @intCast(v.integer);
-                }
-                if (vc.get("patch_size")) |v| {
-                    if (v == .integer) config.qv_patch = @intCast(v.integer);
-                }
-                if (vc.get("temporal_patch_size")) |v| {
-                    if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
-                }
-                if (vc.get("spatial_merge_size")) |v| {
-                    if (v == .integer) config.qv_merge = @intCast(v.integer);
-                }
-                if (vc.get("num_position_embeddings")) |v| {
-                    if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer);
-                }
-                if (vc.get("out_hidden_size")) |v| {
-                    if (v == .integer) config.qv_out_hidden = @intCast(v.integer);
-                }
-                if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
-                if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+        parseQwenVisionFields(&config, root, cfg_obj);
+    } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
+        std.mem.eql(u8, model_type, "qwen4_exp_text"))
+    {
+        config.model_type = "qwen4_exp";
+        config.weight_prefix = "language_model.model";
+        config.norm_has_offset = false; // the converter folds every (1 + w) norm
+        config.has_final_norm = false; // hyper_connection_mixer replaces model.norm
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.attn_output_gate = true;
+        config.kda_sigmoid_out_gate = true; // output_gate_type "sigmoid"
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        config.hc_count = 4;
+        config.hc_lowrank = 320;
+        config.ple_embed_dim = config.hidden_size;
+        parseQwenVisionFields(&config, root, cfg_obj);
+        if (cfg_obj.get("hc_count")) |v| {
+            if (v == .integer) config.hc_count = @intCast(v.integer);
+        }
+        if (cfg_obj.get("hc_lowrank")) |v| {
+            if (v == .integer) config.hc_lowrank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("ple_layer_ids")) |v| {
+            if (v == .array and v.array.items.len > 0 and v.array.items[0] == .integer) {
+                config.ple_layer_idx = @intCast(v.array.items[0].integer - 1);
             }
         }
-        // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
-        // partial_rotary_factor already parsed in the generic rope block above.
-        if (cfg_obj.get("rope_parameters")) |rp| {
-            if (rp == .object) {
-                if (rp.object.get("mrope_interleaved")) |v| {
-                    if (v == .bool) config.mrope_interleaved = v.bool;
-                }
-                if (rp.object.get("mrope_section")) |v| {
-                    if (v == .array) {
-                        for (v.array.items, 0..) |item, i| {
-                            if (i >= 3) break;
-                            if (item == .integer) config.mrope_section[i] = @intCast(item.integer);
-                        }
-                    }
-                }
+        if (cfg_obj.get("ple_embed_dim")) |v| {
+            if (v == .integer) config.ple_embed_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("ple_conv_kernel_size")) |v| {
+            if (v == .integer) config.ple_conv_kernel = @intCast(v.integer);
+        }
+        if (cfg_obj.get("ngram_size")) |v| {
+            if (v == .integer) config.ngram_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("heads_per_ngram")) |v| {
+            if (v == .integer) config.heads_per_ngram = @intCast(v.integer);
+        }
+        if (cfg_obj.get("ngram_vocab_size_base")) |v| {
+            if (v == .integer) config.ngram_vocab_base = @intCast(v.integer);
+        }
+        if (cfg_obj.get("make_ngram_vocab_size_divisible_by")) |v| {
+            if (v == .integer) config.ngram_vocab_divisor = @intCast(v.integer);
+        }
+        if (cfg_obj.get("seed")) |v| {
+            if (v == .integer) config.ngram_seed = @intCast(v.integer);
+        }
+        if (cfg_obj.get("indexer_n_heads")) |v| {
+            if (v == .integer) config.indexer_n_heads = @intCast(v.integer);
+        }
+        if (cfg_obj.get("indexer_head_dim")) |v| {
+            if (v == .integer) config.indexer_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("indexer_budget")) |v| {
+            if (v == .integer) config.indexer_budget = @intCast(v.integer);
+        }
+        if (cfg_obj.get("indexer_compress_ratio")) |v| {
+            if (v == .integer) config.indexer_compress_ratio = @intCast(v.integer);
+        }
+        if (cfg_obj.get("eos_token_id")) |v| {
+            switch (v) {
+                .integer => |i| config.ngram_eos = @intCast(i),
+                .array => |arr| if (arr.items.len > 0 and arr.items[0] == .integer) {
+                    config.ngram_eos = @intCast(arr.items[0].integer);
+                },
+                else => {},
             }
-        }
-        // Qwen vision token ids (top-level).
-        if (root.get("video_token_id")) |v| {
-            if (v == .integer) config.video_token_id = @intCast(v.integer);
-        }
-        if (root.get("vision_start_token_id")) |v| {
-            if (v == .integer) config.vision_start_token_id = @intCast(v.integer);
-        }
-        if (root.get("vision_end_token_id")) |v| {
-            if (v == .integer) config.vision_end_token_id = @intCast(v.integer);
+            if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
         }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
@@ -2650,11 +2768,21 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         if (std.mem.eql(u8, model_type, "lfm2_moe")) {
             config.lfm2_moe = true;
-            if (cfg_obj.get("num_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-            if (cfg_obj.get("num_experts_per_tok")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
-            if (cfg_obj.get("moe_intermediate_size")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
-            if (cfg_obj.get("num_dense_layers")) |v| { if (v == .integer) config.num_dense_layers = @intCast(v.integer); }
-            if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+            if (cfg_obj.get("num_experts")) |v| {
+                if (v == .integer) config.num_experts = @intCast(v.integer);
+            }
+            if (cfg_obj.get("num_experts_per_tok")) |v| {
+                if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+            }
+            if (cfg_obj.get("moe_intermediate_size")) |v| {
+                if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+            }
+            if (cfg_obj.get("num_dense_layers")) |v| {
+                if (v == .integer) config.num_dense_layers = @intCast(v.integer);
+            }
+            if (cfg_obj.get("norm_topk_prob")) |v| {
+                if (v == .bool) config.moe_route_norm = v.bool;
+            }
             if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
             if (config.num_experts == 0 or config.num_experts_per_tok == 0 or config.moe_intermediate_size == 0) {
                 return error.IncompleteLfm2MoeConfig;
@@ -2695,17 +2823,37 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 if (vc.get("layer_norm_eps")) |v| config.lv_ln_eps = jsonFloat(v);
                 // The stored table is square: num_patches = pos_side².
                 var num_patches: u32 = 256;
-                if (vc.get("num_patches")) |v| { if (v == .integer) num_patches = @intCast(v.integer); }
+                if (vc.get("num_patches")) |v| {
+                    if (v == .integer) num_patches = @intCast(v.integer);
+                }
                 config.lv_pos_side = std.math.sqrt(num_patches);
-                if (root.get("downsample_factor")) |v| { if (v == .integer) config.lv_downsample = @intCast(v.integer); }
-                if (root.get("projector_hidden_size")) |v| { if (v == .integer) config.lv_projector_hidden = @intCast(v.integer); }
-                if (root.get("min_image_tokens")) |v| { if (v == .integer) config.lv_min_image_tokens = @intCast(v.integer); }
-                if (root.get("max_image_tokens")) |v| { if (v == .integer) config.lv_max_image_tokens = @intCast(v.integer); }
-                if (root.get("tile_size")) |v| { if (v == .integer) config.lv_tile_size = @intCast(v.integer); }
-                if (root.get("min_tiles")) |v| { if (v == .integer) config.lv_min_tiles = @intCast(v.integer); }
-                if (root.get("max_tiles")) |v| { if (v == .integer) config.lv_max_tiles = @intCast(v.integer); }
-                if (root.get("do_image_splitting")) |v| { if (v == .bool) config.lv_split_images = v.bool; }
-                if (root.get("use_thumbnail")) |v| { if (v == .bool) config.lv_use_thumbnail = v.bool; }
+                if (root.get("downsample_factor")) |v| {
+                    if (v == .integer) config.lv_downsample = @intCast(v.integer);
+                }
+                if (root.get("projector_hidden_size")) |v| {
+                    if (v == .integer) config.lv_projector_hidden = @intCast(v.integer);
+                }
+                if (root.get("min_image_tokens")) |v| {
+                    if (v == .integer) config.lv_min_image_tokens = @intCast(v.integer);
+                }
+                if (root.get("max_image_tokens")) |v| {
+                    if (v == .integer) config.lv_max_image_tokens = @intCast(v.integer);
+                }
+                if (root.get("tile_size")) |v| {
+                    if (v == .integer) config.lv_tile_size = @intCast(v.integer);
+                }
+                if (root.get("min_tiles")) |v| {
+                    if (v == .integer) config.lv_min_tiles = @intCast(v.integer);
+                }
+                if (root.get("max_tiles")) |v| {
+                    if (v == .integer) config.lv_max_tiles = @intCast(v.integer);
+                }
+                if (root.get("do_image_splitting")) |v| {
+                    if (v == .bool) config.lv_split_images = v.bool;
+                }
+                if (root.get("use_thumbnail")) |v| {
+                    if (v == .bool) config.lv_use_thumbnail = v.bool;
+                }
                 if (root.get("max_pixels_tolerance")) |v| config.lv_pixels_tolerance = jsonFloat(v);
                 if (config.lv_projector_hidden == 0) config.lv_projector_hidden = config.hidden_size;
             } else {
@@ -3801,6 +3949,9 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     // vision when load_vision is false.
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
     try testing.expect(!shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", false));
+    // qwen4_exp / Alis packs spell the Qwen3-VL tower `model.visual.` — --no-vision drops it too.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
 }
@@ -5846,4 +5997,73 @@ test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal
     const t = try parseConfigFromJson(testing.allocator, tiny);
     try testing.expect(t.mlaHasQLora());
     try testing.expectEqual(@as(u32, 256), t.mla_q_lora_rank);
+}
+
+test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connection, PLE, QSA and text-config eos fields" {
+    const json =
+        \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
+        \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
+        \\ "full_attention_interval":4,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,
+        \\ "hc_count":4,"hc_lowrank":320,"ple_layer_ids":[2],"ple_embed_dim":2560,"ple_conv_kernel_size":4,
+        \\ "ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,
+        \\ "indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
+        \\ "linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,
+        \\ "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,
+        \\ "eos_token_id":248044,"vocab_size":248320,"rms_norm_eps":1e-6,"output_gate_type":"sigmoid",
+        \\ "rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}},
+        \\ "quantization":{"group_size":64,"bits":4,"mode":"affine"}}
+    ;
+    const c = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(c.isQwen4());
+    try testing.expectEqualStrings("language_model.model", c.weight_prefix);
+    try testing.expectEqual(@as(u32, 4), c.hc_count);
+    try testing.expectEqual(@as(u32, 320), c.hc_lowrank);
+    try testing.expectEqual(@as(i32, 1), c.ple_layer_idx); // 1-based [2] → layer 1
+    try testing.expectEqual(@as(u32, 2560), c.ple_embed_dim);
+    try testing.expectEqual(@as(u32, 4), c.indexer_n_heads);
+    try testing.expectEqual(@as(u32, 2048), c.indexer_budget);
+    try testing.expectEqual(@as(u32, 4), c.indexer_compress_ratio);
+    try testing.expectEqual(@as(u32, 248044), c.ngram_eos);
+    try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
+    try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
+    try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
+    try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
+    try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
+    try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
+    try testing.expectEqual(@as(f32, 10000000.0), c.rope_theta);
+    try testing.expect(!c.qwen_vision and !c.has_vision);
+}
+
+test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower, M-RoPE and vision token ids" {
+    const json =
+        \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
+        \\ "image_token_id":248056,"video_token_id":248057,"vision_start_token_id":248053,"vision_end_token_id":248054,
+        \\ "vision_config":{"depth":27,"hidden_size":1152,"num_heads":16,"intermediate_size":4304,"patch_size":16,
+        \\   "temporal_patch_size":2,"spatial_merge_size":2,"num_position_embeddings":2304,"out_hidden_size":2560,"model_type":"qwen4_exp_vision"},
+        \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
+        \\ "full_attention_interval":4,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,
+        \\ "indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
+        \\ "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,
+        \\ "eos_token_id":248044,"vocab_size":248320,"rms_norm_eps":1e-6,
+        \\ "rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}},
+        \\ "quantization":{"group_size":64,"bits":4,"mode":"affine"}}
+    ;
+    const c = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(c.isQwen4() and c.has_vision and c.qwen_vision);
+    try testing.expectEqual(@as(u32, 27), c.qv_depth);
+    try testing.expectEqual(@as(u32, 1152), c.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), c.qv_heads);
+    try testing.expectEqual(@as(u32, 72), c.qv_head_dim);
+    try testing.expectEqual(@as(u32, 4304), c.qv_intermediate);
+    try testing.expectEqual(@as(u32, 16), c.qv_patch);
+    try testing.expectEqual(@as(u32, 2), c.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), c.qv_merge);
+    try testing.expectEqual(@as(u32, 2304), c.qv_num_pos_emb);
+    try testing.expectEqual(@as(u32, 2560), c.qv_out_hidden);
+    try testing.expect(c.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, c.mrope_section);
+    try testing.expectEqual(@as(u32, 248056), c.image_token_id);
+    try testing.expectEqual(@as(u32, 248057), c.video_token_id);
+    try testing.expectEqual(@as(u32, 248053), c.vision_start_token_id);
+    try testing.expectEqual(@as(u32, 248054), c.vision_end_token_id);
 }

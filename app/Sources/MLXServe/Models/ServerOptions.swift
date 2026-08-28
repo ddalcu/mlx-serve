@@ -999,7 +999,7 @@ extension ServerOptions {
             needsRestart: true),
         "enableMTP": .init(
             title: "Multi-Token Prediction (recommended)",
-            explainer: "Qwen 3.5 / 3.6 models that ship a trained MTP head guess several of the next tokens at once and check them all in a single pass — typically a big speed-up on replies, with output identical to normal decoding. It switches on by itself for models that have the head, and does nothing for models that don't, so there's rarely a reason to turn it off.",
+            explainer: "Qwen 3.5 / 3.8 models that ship a trained MTP head guess several of the next tokens at once and check them all in a single pass — typically a big speed-up on replies, with output identical to normal decoding. It switches on by itself for models that have the head, and does nothing for models that don't, so there's rarely a reason to turn it off.",
             needsRestart: true),
         "mtpDepth": .init(
             title: "Tokens guessed ahead",
@@ -1007,7 +1007,7 @@ extension ServerOptions {
             needsRestart: true),
         "forceMTPOnMoE": .init(
             title: "Also use MTP on mixture-of-experts models",
-            explainer: "Mixture-of-experts models (e.g. Qwen3.6 35B-A3B) leave their MTP head switched off by default, because checking several guessed tokens at once makes them re-route every expert and that can cost more than it saves. Some MoE heads are good enough to win anyway. Turn this on to use it — and measure: if replies get slower, turn it back off. Models without an MoE layout are unaffected.",
+            explainer: "Mixture-of-experts models (Qwen3.5 35B-A3B, Qwen3.8-Flash-Next) leave their MTP head switched off by default: every guessed token reads its own set of experts, so a multi-token check costs about two normal steps and only pays when most guesses land. On Qwen3.8-Flash-Next that is code (up to +40%); prose and long contexts are a wash. Turn this on to use it, and turn it back off if replies get slower. Dense models are unaffected.",
             needsRestart: true),
         "enableDSpark": .init(
             title: "DSpark draft stages (DeepSeek‑V4)",

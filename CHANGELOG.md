@@ -1,5 +1,17 @@
 # Changelog
 
+## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
+
+### Highlights
+
+- **Qwen 3.8 Flash Next runs natively.** Alibaba's 125B model with its huge n-gram memory, on Apple silicon. About 60 tok/s on an M4 Max, 78 with speculative decoding, ~70 GB of RAM for the 4-bit pack (`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit`).
+- **It sees images and video.** Follow-up questions about the same picture answer instantly instead of re-reading it.
+- **Long prompts stay fast.** Sparse attention past 2k tokens runs on custom kernels, so an 8k-token prompt with speculative decoding no longer loses to plain decoding.
+- **Several chats at once.** Concurrent requests on Flash Next share one pass: 2 streams give 1.3x total throughput, 4 streams 1.8x. A single chat is as fast as before.
+- **Speculative decoding on Flash Next is opt-in** (`--mtp` or the MoE toggle in Settings): +41% on code, a wash on prose, so you choose. It also works on image questions now.
+- **MLX 0.32.2.** Up to +3% faster on MoE models at long context.
+- **Fixes:** two concurrent chats on Qwen 3.5 drifted from the single-chat answer; video input on Qwen 3.5/3.8 never reached the model; `--no-vision` still answered image questions (now a clear error); `--no-mtp` was ignored on Flash Next; very long prompts on Flash Next could run out of GPU memory instead of being refused up front.
+
 ## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
 
 ### Highlights
@@ -62,6 +74,7 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 - **Ling 3.0 flash-line checkpoints** that ship a direct query projection (`"q_lora_rank": null`) are no longer refused at load, and Ling 3.0 tiny loads under both converter layouts. Thanks @Fe2-O3 (#232). The published flash quants need a further layout change and still do not load.
 - **Alis (avlp12) Qwen packs are served**: their quantized draft-head projection binds, the vision tower's prefix and convolution layout are probed instead of assumed, and a false "broken norm" repair that was halving draft acceptance is fixed (33% → 70%).
 - Embedded DeepSeek and llama.cpp engines updated to their latest upstream versions.
+- **MLX 0.32.2.** Grouped-query decode attention reads each K/V byte once, quantized MoE matmuls skip idle work, and M5 Macs now run head-dim 256 attention (Qwen 3.5/3.6/3.8) on MLX's fused Neural Accelerator kernel for prompts and draft verification. `MLX_SERVE_NAX_SDPA=0` restores the previous kernels.
 
 ### Releases
 

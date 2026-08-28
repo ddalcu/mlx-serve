@@ -629,7 +629,7 @@ fn qwenLayerForward(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, s: S
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_arr = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "causal", null_arr, null_arr, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "causal", null_arr, null_arr, false, s));
 
     const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
     defer _ = mlx.mlx_array_free(at);
@@ -791,9 +791,9 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
         // "causal" mode — the two differ in bf16 reduction order).
         const mask = try buildAdditiveCausalMask(L, s);
         defer _ = mlx.mlx_array_free(mask);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, full_k, full_v, scale, "array", mask, null_arr, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, full_k, full_v, scale, "array", mask, null_arr, false, s));
     } else {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, full_k, full_v, scale, "", null_arr, null_arr, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, full_k, full_v, scale, "", null_arr, null_arr, false, s));
     }
 
     const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
@@ -3023,7 +3023,7 @@ pub const CodecDecoder = struct {
         defer _ = mlx.mlx_array_free(attn);
         const null_arr = mlx.mlx_array{ .ctx = null };
         const mode: [*:0]const u8 = if (L > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, mode, null_arr, null_arr, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, mode, null_arr, null_arr, false, s));
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
         const af = try reshape(at, &[_]c_int{ 1, L, heads * hd }, s);

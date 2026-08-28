@@ -494,6 +494,38 @@ pub const DiskTier = struct {
             } else {
                 _ = mlx.mlx_array_free(ssm);
             }
+            const akey = try std.fmt.allocPrint(self.allocator, "l{d}.aux\x00", .{li});
+            defer self.allocator.free(akey);
+            var aux = mlx.mlx_array_new();
+            if (mlx.mlx_map_string_to_array_get(&aux, tensor_map, @ptrCast(akey.ptr)) == 0) {
+                l.aux_state = aux;
+            } else {
+                _ = mlx.mlx_array_free(aux);
+            }
+            const pkey = try std.fmt.allocPrint(self.allocator, "l{d}.pooled\x00", .{li});
+            defer self.allocator.free(pkey);
+            var pooled = mlx.mlx_array_new();
+            if (mlx.mlx_map_string_to_array_get(&pooled, tensor_map, @ptrCast(pkey.ptr)) == 0) {
+                l.qsa_pooled = pooled;
+            } else {
+                _ = mlx.mlx_array_free(pooled);
+            }
+            const lkey = try std.fmt.allocPrint(self.allocator, "l{d}.ple\x00", .{li});
+            defer self.allocator.free(lkey);
+            var ple = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ple);
+            if (mlx.mlx_map_string_to_array_get(&ple, tensor_map, @ptrCast(lkey.ptr)) == 0) {
+                if (mlx.mlx_array_dtype(ple) != .uint32 or mlx.mlx_array_size(ple) != 9) return error.DiskCacheCorruptSsm;
+                try mlx.check(mlx.mlx_array_eval(ple));
+                const d = mlx.mlx_array_data_uint32(ple) orelse return error.DiskCacheCorruptSsm;
+                l.ple_prev_valid = d[0] != 0;
+                for (0..8) |i| l.ple_prev[i] = d[1 + i];
+            }
+        }
+        var ratio_c: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&ratio_c, meta_map, "qsa_ratio") == 0) {
+            const ratio = std.fmt.parseInt(c_int, std.mem.span(ratio_c), 10) catch return error.DiskCacheCorruptSsm;
+            for (layers) |*l| l.qsa_ratio = ratio;
         }
 
         // `initialized=true` with both states null is a valid shape, so the
@@ -512,13 +544,11 @@ pub const DiskTier = struct {
             defer _ = mlx.mlx_vector_array_free(vec);
             var count: usize = 0;
             for (layers) |*l| {
-                if (l.conv_state.ctx != null) {
-                    _ = mlx.mlx_vector_array_append_value(vec, l.conv_state);
-                    count += 1;
-                }
-                if (l.ssm_state.ctx != null) {
-                    _ = mlx.mlx_vector_array_append_value(vec, l.ssm_state);
-                    count += 1;
+                inline for (.{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |arr| {
+                    if (arr.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(vec, arr);
+                        count += 1;
+                    }
                 }
             }
             if (count > 0) try mlx.check(mlx.mlx_eval(vec));
@@ -1259,16 +1289,35 @@ pub const DiskTier = struct {
         try init_buf.append(self.allocator, 0); // NUL-terminate for the C API
         try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "init", @ptrCast(init_buf.items.ptr)));
 
+        // qwen4_exp aux state rides the same file: `l{d}.aux` / `l{d}.pooled`
+        // tensors and `l{d}.ple` = uint32 [9] (valid flag, then the 8 token
+        // history slots); the compress ratio is one `qsa_ratio` metadata key.
+        var ratio_buf: [16]u8 = undefined;
+        var ratio_written = false;
         for (cp.layers, 0..) |l, li| {
-            if (l.conv_state.ctx != null) {
-                const key = try std.fmt.allocPrint(self.allocator, "l{d}.conv\x00", .{li});
-                defer self.allocator.free(key);
-                try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), l.conv_state));
+            const names = .{ "conv", "ssm", "aux", "pooled" };
+            const arrs = .{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled };
+            inline for (names, arrs) |name, arr| {
+                if (arr.ctx != null) {
+                    const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name ++ "\x00", .{li});
+                    defer self.allocator.free(key);
+                    try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), arr));
+                }
             }
-            if (l.ssm_state.ctx != null) {
-                const key = try std.fmt.allocPrint(self.allocator, "l{d}.ssm\x00", .{li});
+            if (l.ple_prev_valid) {
+                var ple: [9]u32 = undefined;
+                ple[0] = 1;
+                for (l.ple_prev, 0..) |t, i| ple[1 + i] = t;
+                const ple_arr = mlx.mlx_array_new_data(&ple, &[_]c_int{9}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(ple_arr);
+                const key = try std.fmt.allocPrint(self.allocator, "l{d}.ple\x00", .{li});
                 defer self.allocator.free(key);
-                try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), l.ssm_state));
+                try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), ple_arr));
+            }
+            if (!ratio_written and (l.aux_state.ctx != null or l.qsa_pooled.ctx != null)) {
+                const rs = try std.fmt.bufPrint(&ratio_buf, "{d}\x00", .{l.qsa_ratio});
+                try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "qsa_ratio", @ptrCast(rs.ptr)));
+                ratio_written = true;
             }
         }
 
@@ -2287,6 +2336,8 @@ fn freeHybridEntries(e: *[3]SSMCacheEntry) void {
     for (e) |*x| {
         _ = mlx.mlx_array_free(x.conv_state);
         _ = mlx.mlx_array_free(x.ssm_state);
+        if (x.aux_state.ctx != null) _ = mlx.mlx_array_free(x.aux_state);
+        if (x.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(x.qsa_pooled);
     }
 }
 
@@ -2317,6 +2368,15 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     defer freeHybridEntries(&src128);
     var src256 = buildHybridEntries(s, 200.0, 600.0);
     defer freeHybridEntries(&src256);
+    // Layer 2 at 256 also carries qwen4_exp aux state: a QSA key history +
+    // pooled block keys, and layer 1 the PLE token history.
+    const aux_shape = [_]c_int{ 1, 12, 4 };
+    const pooled_shape = [_]c_int{ 1, 3, 4 };
+    src256[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src256[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src256[2].qsa_ratio = 4;
+    src256[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
+    src256[1].ple_prev_valid = true;
     var cps = [_]transformer_mod.SSMCheckpoint{
         try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
         try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
@@ -2357,10 +2417,16 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expect(dst[1].initialized);
     try testing.expectEqual(@as(f32, 10_200.0), ssmArrVal(dst[1].conv_state, 0, s));
     try testing.expect(dst[1].ssm_state.ctx == null);
-    // Layer 2: uninitialized plain-attention layer — both null.
+    // Layer 2: uninitialized plain-attention layer — both null, but the
+    // qwen4_exp aux state round-trips (key history 700.., pooled 800..).
     try testing.expect(!dst[2].initialized);
     try testing.expect(dst[2].conv_state.ctx == null);
     try testing.expect(dst[2].ssm_state.ctx == null);
+    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
+    try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
+    try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
+    try testing.expect(!dst[0].ple_prev_valid and dst[0].aux_state.ctx == null);
 
     // KV rewound to 256 in lockstep, values byte-exact against the original.
     for (cache2.entries) |*ce| {

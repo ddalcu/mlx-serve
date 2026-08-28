@@ -178,9 +178,10 @@ mlx-c 0.6.0 added a `global_scale` param (may be null) to `mlx_dequantize` betwe
 
 ### The Homebrew mlx bottle ships with NAX silently disabled — we self-build from pinned submodules (silent-fallback class, 2026-07-19)
 MLX's M5 neural-accelerator (NAX) kernels are gated at CMake configure time: Metal 4 support AND macOS SDK ≥ 26.2 AND `CMAKE_OSX_DEPLOYMENT_TARGET` ≥ 26.2. When the gate fails, the kernels are skipped AND `MLX_METAL_NO_NAX` is compiled into the dylib, making `is_nax_available()` return **false unconditionally** — stock ops (quantized_matmul, gather_qmm, steel gemm, SDPA) never dispatch NAX variants, even on M5 hardware. The gate fails **silently**: upstream only added a configure-time *warning* after v0.32.0 (commit 4367c73). The brew bottle fails it because `Formula/m/mlx.rb` pins `MACOSX_DEPLOYMENT_TARGET` to the **build host's point release** and Homebrew's Tahoe builders run 26.0 — verified by `strings mlx.metallib | grep -c nax` → 0 and the AIR target `macosx26.0.0` in the shipping bottle (re-poured 2026-07-08). Flip side: the day brew's builders hit 26.2+, a rebottle would flip stock-op NAX ON with no formula change and no announcement — shifting the perf baseline under the M5 EV calibration (`MtpCostProfile.g17_nax_*`, verifyQmm lane margins, bench CSVs).
-- **Fix**: mlx (`lib/mlx-src` @ v0.32.0) + mlx-c (`lib/mlxc-src` @ fba4470) are pinned submodules built by `scripts/build-mlx.sh` with `-DCMAKE_OSX_DEPLOYMENT_TARGET=26.2` into `lib/mlx/{lib,include}` (gitignored stage, `.version` stamp = SHAs + target, idempotent). build.zig links the stage (`addMlxLib`, before `/opt/homebrew/lib` so a leftover brew mlx-c can never win the link; `use_pkg_config = .no`), `verifyMlxStage` errors with the fix when unstaged, `verifyBrewDeps` keeps only webp. Release/app bundling copies from `lib/mlx/lib` (all `*.dylib` — libjaccl is an @rpath sibling — plus the metallib); install names are now `@rpath/...` so the existing otool-discovery rewiring keeps working.
+- **Fix**: mlx (`lib/mlx-src` @ v0.32.2) + mlx-c (`lib/mlxc-src` @ 56b2d39, PR #127) are pinned submodules built by `scripts/build-mlx.sh` with `-DCMAKE_OSX_DEPLOYMENT_TARGET=26.2` into `lib/mlx/{lib,include}` (gitignored stage, `.version` stamp = SHAs + target, idempotent). build.zig links the stage (`addMlxLib`, before `/opt/homebrew/lib` so a leftover brew mlx-c can never win the link; `use_pkg_config = .no`), `verifyMlxStage` errors with the fix when unstaged, `verifyBrewDeps` keeps only webp. Release/app bundling copies from `lib/mlx/lib` (all `*.dylib` — libjaccl is an @rpath sibling — plus the metallib); install names are now `@rpath/...` so the existing otool-discovery rewiring keeps working.
 - **The assert IS the point**: every failure mode (wrong SDK, deployment-target regression, missing Metal Toolchain — Xcode 26 ships the Metal compiler as a separate `xcodebuild -downloadComponent MetalToolchain`) surfaces as a quietly NAX-less metallib. `build-mlx.sh` hard-fails when the built metallib lacks `*_nax` or minos < 26.2; `tests/test_mlx_staged_nax.sh` re-checks the stage + that the built binary links no brew mlx.
-- **mlx-c pin must be a brew-proven pair**: the v0.6.0 *tag* does not compile against mlx 0.32.0 (fft API: `FFTNorm` arg + `Shape` vs `std::vector<int>`); brew's 0.6.0_3 = v0.6.0 + exactly the 4 commits on mlx-c main (#110 #111 #112 #114), so the submodule pins `fba4470` — byte-identical source to what `src/mlx.zig` was validated against. When bumping mlx, bump mlx-c to whatever brew (or upstream CI) proves compatible, and re-diff the headers.
+- **NAX hd-256 attention via stock sdpa (mlx 0.32.2, 2026-08-25)**: 0.32.2 added `sdpa_full_self_attention_nax` (D 64/96/128/256) but auto-routes to it only at >= 1024 causal query rows with no array mask; below that hd 256 stays on the unfused (materialized-scores) path unless `force_fused=true`. Our `msv_attn_p256` took EVERY hd-256 prefill on every machine, so an M5 never reached the new kernel. Now `naxSdpaPreferred()` (NAX available, `MLX_SERVE_NAX_SDPA` overrides) makes the p256 causal arm decline and the stock fallthroughs pass `sdpaForceFused(q, k)`. The shape gate is load-bearing: `force_fused` on a shape without a fused kernel THROWS (`[scaled_dot_product_attention] force_fused=True but no fused kernel`), and for <= 8 rows mlx judges the VECTOR kernel, whose `q_len * gqa <= 32` wall fails every gqa-8 verify block of 5..8 rows — so the split/vector path keeps those. Gemma-4 12B's eight full-attention layers are hd **512** (only its sliding layers are 256), so mlx has no fused kernel for them at all and the gate declines — an unconditional `force_fused` would have killed the process on the first Gemma prompt; on M5 this lever reaches the Qwen 3.5/3.6/3.8 family, not Gemma 4. The band (sliding) arm stays on p256: the NAX kernel's auto gate excludes array masks and the band would need a materialized mask. Unmeasured on M5 as of writing; on M4 `MLX_SERVE_NAX_SDPA=1` runs the non-NAX steel kernel (mlx's own heuristic calls it slower for hd 256) — numerically fine (forced 4096-row Qwen prefill chunk, byte-identical text). Trap met while pinning it: the fused sdpa kernels return a `[B,L,H,D]`-STRIDED VIEW (so the caller's transpose is free) and `astype` keeps those strides, so a raw `mlx_array_data_float32` read of the result sees element [0,0,0,:] right and every later row permuted — it looked like a broken kernel (0.8 max diff at hd 128, `alternating rows`) and cost an hour of bisecting libmlx/metallib/mlx-c before a C++ program against our own libmlx was clean. `attn256MaxDiff` now materializes `mlx_contiguous` first; the CLAUDE.md raw-read rule already said so.
+- **mlx-c pin must be a pair that COMPILES against the pinned mlx and passes the suite** (brew is just one source of known-good combos; we build both from the submodules): the v0.6.0 *tag* does not compile against mlx 0.32.0 (fft API: `FFTNorm` arg + `Shape` vs `std::vector<int>`); brew's 0.6.0_3 = v0.6.0 + exactly the 4 commits on mlx-c main (#110 #111 #112 #114), so the submodule pins `fba4470` — byte-identical source to what `src/mlx.zig` was validated against. When bumping mlx, pick the mlx-c commit (main, a PR head, or brew's patch set) that builds against it, re-diff the headers, run the suite. mlx 0.32.2 (2026-08-25): brew's mlx-c 0.6.0_4 = fba4470 + the compile-cache half of PR #127 (enough for 0.32.1), but 0.32.2 also adds `bool force_fused` to `scaled_dot_product_attention` BEFORE the stream arg, so the pin moved to PR #127's head `56b2d39` (its regenerated `mlx_fast_scaled_dot_product_attention` grows a `force_fused` param; every Zig call site passes `false`). A PR-only commit is fetchable from GitHub by FULL SHA (`git submodule update` does exactly that); a short SHA is not.
 - **Consequences**: deployment target 26.2 is contagious — bundled dylibs refuse to load below macOS 26.2, so `LSMinimumSystemVersion`, `Package.swift` platforms, and the README floor all moved to 26.2 together. Compiling needs NO M5 (kernels compile to AIR; the runtime gen ≥ 17 probe gates dispatch), so M1–M4 behavior is unchanged and CI's virtualized M1/M2 runners can build it; only *measuring* NAX effects needs real M5 hardware (community M5 channel). Building from source also means new same-methodology bench baselines — pre-submodule CSVs were measured on the brew runtime.
 
 ### A non-absolute path to `openDirAbsolute` is `unreachable` → ReleaseFast UB that miscompiles the CALLER
@@ -4023,3 +4024,258 @@ Worth noting what the symptom looked like from outside: nothing. The server
 booted, answered correctly, and logged one line about a disabled sidecar in the
 middle of a normal startup. A benchmark reading "26.8.9 and 26.8.10 are the
 same speed" would have been the only other evidence.
+
+## qwen4_exp serial decode: the f32 scalar, the latency-bound kernel, the SSD fault (2026-08-26)
+
+Three separate findings from one afternoon on Qwen3.8-Flash-Next, all on the
+serial decode path (M4 Max 128 GB, 4bit pack (then named -4bit-all), `MLX_SERVE_DECODE_FWD_UBENCH=30`).
+
+### 1. One f32 scalar widened the whole residual stream
+
+`scaleTriple` folded the reference's `/hc_count` into the dense inject weight
+with `mlx_multiply(w, mlx_array_new_float(0.25))`. In MLX C++ a float scalar
+array is a real float32 array, not a weak Python scalar, so the product is f32.
+The inject gate was then f32, `stream + out * inj` was f32, and from layer 0 on
+every hyper-connection read, every GDN in-projection and every MoE router ran
+on f32 activations. The PLE gate (`1/sqrt(hidden)`, the `1e-6` clamp floor) and
+the `2 * sigmoid` inject closure had the same scalar.
+
+The reference keeps everything in model dtype. The oracle fixture passed at
+0.99996 either way, so parity could not see it; `[dtype-trace] qwen4: residual
+widened at layer 0: bfloat16 -> float32` had been in every log. Fixed with
+`scalarOf(v, dtype)` at all three sites: 22.05 → 18.42 ms/forward, prefill
+560 → 750 tok/s, greedy text unchanged in substance.
+
+### 2. The fused hyper-connection read was slower than the chain — twice
+
+`hcRead` at decode width was 11 dispatches over 10240-wide tensors (grouped
+RMS norm, ×w, down qmv, silu, up qmv, sigmoid-mix + mean, inject matvec,
+2·sigmoid), ×2 per layer, ×48 layers. The first fused version (two kernels,
+normalized stream recomputed per row) cost 146 us per call in-situ, against
+~42 us for the whole chain. The second (normalize once into 20 KB of
+threadgroup memory) was still 63 us. The isolated microbench said 26–61 us for
+both — hot weights and 200 independent calls hide latency completely.
+
+What was actually wrong: one simdgroup per 10 KB row means one lane walks 40
+dependent load iterations; at ~400 ns each that is 16 us before any math, and
+the single-threadgroup normalize kernel paid the same for its own 40. The
+version that won (`hcReadFused`, kernels N/D/U): one threadgroup per stream
+with `H/256` compile-time-unrolled loads, the down matvec split-K across the 8
+simdgroups of a threadgroup (5 unrolled words per lane), the up matvec one
+simdgroup per column with the 4 streams unrolled. 3 dispatches per read,
+18.42 → 16.82 ms/forward, hc-free floor 14.4. Parity bar is per-element
+(one bf16 ulp at 1.0 plus 2%) — the accumulation order differs by design.
+
+The diagnostic that found it was in-situ bisection, not a microbench: a
+template flag that made kernel A return immediately (28.6 → 14.4 ms = the
+kernel's real cost), then sane stand-ins per kernel (zeros collapse the
+downstream graph and read as 4 ms forwards).
+
+### 3. The n-gram table gather was 5 ms of every token
+
+`ngram_table.bin` is a 32 GB private mmap; each token reads 16 rows × 3
+regions (weights, scales, biases) of ~100 bytes each, 48 random pages. With
+67 GB of weights resident the page cache never holds the table, so that is 48
+serial SSD faults ≈ 5 ms per decode step (measured with `QWEN4_PROFILE_FWD`,
+the `ple gather` line). `madvise(MADV_WILLNEED)` changed nothing on Darwin.
+`NgramTable.prefetch` spawns one thread per row to touch the three pages
+before the serial dequant: 5.5 → 1.1 ms, serial 36.3 → 39.0 tok/s at 8.5k
+context before the other two fixes. `QWEN4_PLE_PREFETCH=0` restores.
+
+Session totals (same box, same prompts): short answer 41.9 → 57.4 tok/s,
+8.5k-context decode 38.4 → 50–52 tok/s, prefill 560 → 750 tok/s. The MTP
+round cost (`MLX_SERVE_MTP_TRACE=1`, 120 ms/round at depth 1) is the S>1 MoE
+`_gather_sort` path: 1.46 ms/layer at S=2 vs 0.27 at S=1 — parked, serial
+first.
+
+### Addendum, same day: the deferred write, the pread pool, and the oracle's dtype
+
+- `hcWrite` is now deferred into the next read's N kernel (`HcPending`): the
+  stream update `x + out*inj` is computed where the stream is read anyway,
+  two compiled dispatches fewer per layer. 16.82 → 16.55 ms/forward; flushed
+  before PLE, capture_layers, the capture sites and under the profiler.
+- The n-gram gather: 16 spawned fault threads 0.7 ms, a parked 16-thread pool
+  0.85 (wake latency), 48 fault threads 1.0–1.4 ms — page faults on one
+  mapping serialize on the VM map lock. 48 parked workers doing one `pread`
+  each: 0.45 ms. Gated to decode widths (≤ 64 rows): a 4096-row prefill
+  chunk is 65k rows, mostly page-cache hits, and the 1024 wake rounds
+  measured −4% prefill.
+- The oracle was rendered in f32 (`.float()`), and the head+trunk only
+  matched at 0.99998 because the residual was accidentally f32 too. At bf16
+  the tiny random model's logits read 0.905 against the f32 reference and
+  0.89 against a bf16 torch reference — chaotic between any two bf16
+  renderings — while the residual streams agree with bf16 torch at 0.9998
+  through every layer. So the f32 fixture stays the MATH oracle with
+  `qwen4_stream_f32` set for that test, and `qwen4 fixture bf16` pins the
+  shipped dtype on the streams. The committed HEAD had this row failing;
+  it had been reported green from a run before the last scalar fix.
+- Where the remaining 14 ms go (sync'd profile minus floor): GDN ≈ 8 ms
+  (36 layers, ~220 us, ~11 dispatches each), MoE ≈ 6 ms (~130 us), attention
+  ≈ 1.2 ms. Weight bandwidth is ~7 ms of it.
+
+### Round 3, same day: GDN fusion, three MoE nulls, and the profiler that was never off
+
+- **GDN decode fusion** (`gdnPreworkFused`, `gdnNormGateFused`,
+  `MLX_SERVE_GDN_DECODE_FUSED=0`). The prework kernel was generalized from
+  S=1 to S 1..9 (verify widths) and grew the old-state conv rows, the gate
+  chain (`computeGdnGate`) and the beta sigmoid; the recurrence's output now
+  runs through one epilogue kernel doing the per-head rms norm and the z
+  gate (swish arm for qwen3_5/qwen4, sigmoid arm for the `kda_sigmoid_out_gate`
+  archs). Hermetic tests pin bit-identity to the composed chain at every S,
+  and a third test (`gdn gate: compiled closure vs graph chain`) pins the
+  assumption underneath — that the `mlx_compile`d gate closure and the plain
+  graph agree exactly. In-situ `QWEN4_GDN_CHECK=1` on the real pack: 179/180
+  per-layer checks exact, one k element off by 1 bf16 ulp (a tie in the rms
+  reduction order). That single ulp flips greedy bytes a few hundred tokens
+  in — legit, the bar is the fixture, not byte equality. 15.45 → 14.84
+  ms/forward (−3.9%), serial 60.0 → 60.4 short, 52.7/53.4 → 53.5/54.2 at 8.5k.
+- **Three MoE fusions measured null or worse and were removed.** (a) Folding
+  the four GDN in-projections into one qmm: 59.96 vs 59.97 tok/s and not
+  byte-exact at the real N. (b) The shared expert as an 11th slot of the
+  gather kernels: −3%. The separate shared chain is routing-INDEPENDENT, so
+  the GPU had been running it in parallel with the router → gather chain;
+  fusing it put ~8 kernels onto the critical path. (c) The gated shared tail
+  inside the down+reduce epilogue: 14.875 vs 14.875. (d) Multi-row gather
+  kernels for verify widths: S=2 a wash, S=4 45.4 vs 32.9 ms for
+  `_gather_sort` — the per-slot simdgroup kernel is latency-bound and scales
+  linearly with rows. Rule: a chain the GPU already overlaps is not a
+  dispatch to fuse; the marginal is measured in-situ
+  (`MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>`, `_KV=<prefill tokens>`: S=1 16.7
+  ms, S=2 24.5 (MoE +3.4 via `_gather_sort`, attention +1.5, GDN +0.9), S=4
+  32.9).
+- **The 70 ms MTP verify was the profiler.** `run.sh` exported
+  `QWEN4_PROFILE_FWD=0` and the code tested `getenv != null`, so every earlier
+  MTP arm had a GPU sync after every block of every layer. With it off the
+  real round at 8.5k is verify build 5 ms + eval 25 ms + draft 0.6 ms ≈ 30.5
+  ms, first-draft acceptance 0.56–0.72, MTP 52 vs serial 54.7 tok/s; depths 2
+  and 3 never engage because the controller holds m=1. Diagnostic env reads
+  now go through `diagEnvOn` (absent or `0` = off). The tech report's Table 4
+  gives four-step MTP a mean accepted length of 3.4–4.3 (≳0.8 per position
+  for the bf16 head), so the 0.56–0.72 first-draft rate is the open question
+  — bookkeeping, head quantization (4-bit here) or prompt — and is audited
+  before any S=2 forward lever.
+- **Prefill profile** (4096-row chunk at kv 4096, 9.7 s): attention 4.3 s
+  (44%), GDN 2.3, MoE 2.3, QSA mask chain 0.65. The attention is MLX's
+  unfused hd-256 fallback under the bool QSA mask (~300 ms/layer, ~10× the
+  compute bound) — the next real lever is a mask-aware arm of the hd-256
+  prefill kernel, not started. The GPU time lands in the graph BUILD lap
+  because prefill evals every 4 layers; a stand-in that zeroes a block
+  (`QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa`) is
+  how the split was read. A pool-gate widening for the n-gram gather (256
+  rows) measured nothing (9.49 vs 9.29 s build) and was reverted.
+- Prefix cache on qwen4 shipped in this round (story in models-media.md).
+
+### Round 3b, same night: the MTP acceptance audit
+
+The question was whether the 0.56–0.72 first-draft acceptance (Table 4 of the
+tech report: mean accepted length 3.44–4.29 under four-step MTP, i.e. ≳0.8 per
+position) was bookkeeping, head quantization, or the prompt. Three probes:
+
+1. **Bookkeeping audit against the SGLang/vLLM MTP refs.** Row pairing is
+   (pre-mixer stream at r, token r+1) at query position r+1 everywhere:
+   prefill history `appendHistory(prompt_ids[pos+1..end+1], chunk_hidden_all)`,
+   the Phase 5a stash `[t1, drafts[0..acc]]` ↔ `[last_hidden, verify_hidden[0..acc]]`,
+   the merged chain forward at `st.off0`, the chain's own rows at
+   `off0 + i`. The head's next-step hidden is its OWN pre-mixer stream
+   (`hc_hidden_states` in the ref, `hidden_next = out.stream` here). The
+   `--mtp-history-window` / prefix-restore "relative positions" are a non-
+   issue on this arch: the head pools its QSA blocks relative to its own row
+   0 and only RoPE reads the absolute base — invariant under a shift. The
+   one real finding: the prefix cache committed the qwen4 head's KV through
+   `MtpCacheRef.kv()` and a restore put rows into `m.cache` with
+   `seq_offset` still 0 and no aux keys — stale rows under a fresh state.
+   `kv()` is now `?*KVCache`, null for qwen4: never committed, never restored.
+2. **Cross-round hermetic test** on the tiny pack (`qwen4 fixture` [4]):
+   prefill history, two rounds of draft → capturing verify → accept 1 then 0
+   → trunk rollback → stash → consume-time truncate, then the third round's
+   merged head forward vs a fresh head over every committed row: cos
+   1.00000, argmax 2/2, with the head past its QSA budget. Green — the
+   bookkeeping is acquitted (single-forward parity only proved the math).
+3. **Per-index acceptance on the real packs** (`MLX_SERVE_MTP_FORCE_DEPTH=n`,
+   `acc_idx=` on the trace line, temp 0):
+
+| pack (head width) | depth | 8.4k repetitive prompt | code (LRU cache) | prose (essay) |
+|---|---|---|---|---|
+| -4bit (4-bit) | 1 | 0.65 · 33.7 ms · 49.7 tok/s | 0.93 · 28.0 ms · 69.4 | 0.61 · 28.0 ms · 57.4 |
+| -4bit (4-bit) | 2 | 0.64/0.42 · 51.2 ms · 40.3 | 0.88/0.76 · 34.1 ms · 78.5 | 0.76/0.46 · 34.0 ms · 65.2 |
+| -4bit (4-bit) | 3 | 0.62/0.41/0.22 · 60.0 ms · 39.3 | 0.91/0.80/0.68 · 40.0 ms · 84.7 | 0.65/0.37/0.25 · 40.0 ms · 55.8 |
+| mixed-4-8bit (8-bit head) | 1 | 0.62 · 37.7 ms · 44.1 | 0.94 · 31.8 ms · 61.3 | 0.74 · 31.9 ms · 54.8 |
+| mixed-4-8bit (8-bit head) | 2 | 0.61/0.38 · 56.4 ms · 35.5 | 0.96/0.87 · 38.5 ms · 74.2 | 0.66/0.40 · 38.6 ms · 53.7 |
+| mixed-4-8bit (8-bit head) | 3 | 0.66/0.34/0.15 · 63.1 ms · 36.2 | 0.91/0.83/0.79 · 43.0 ms · 83.7 | 0.68/0.38/0.25 · 43.2 ms · 53.2 |
+
+Cells: acceptance per draft index (`acc_idx`) · round ms · client tok/s. Serial: 60.4 short / 54.7 at 8.5k. M4 Max 128 GB, temp 0, `MLX_SERVE_MTP_FORCE_DEPTH=n`, 2026-08-26.
+
+The gap was the prompt. Code meets Table 4 (HumanEval 4.24 over four drafts;
+ours 2.39–2.53 over three) on both packs, so the 4-bit head is not the
+limiter. Prose sits at 0.65/0.37/0.25 — below MT-Bench's 3.44 — and the
+repetitive 8.4k prompt at 0.62/0.41/0.22 with 51–60 ms rounds (verify width
+at 8.5k KV is what costs there). So: MTP stays opt-in (`--mtp` /
+`enable_mtp`); on code it is +40% at depth 3. The S=2..4 forward levers (MoE
+`_gather_sort` +3.4 ms, attention +1.5, GDN +0.9 at S=2) go back on the list
+with their measured ceiling; a prose-vs-code acceptance difference of this
+size is a property of the head, not of the engine.
+
+Re-measured 2026-08-27 after the QSA verify-row split (`splitMaskedSdpa256`),
+same boot MTP vs serial, 3 reps, `-4bit` pack (local dirs renamed to the HF names on 08-27; was `-4bit-all`), M4 Max:
+
+| depth | code | prose | 8.5k prompt |
+|---|---|---|---|
+| serial | 62.6 | 62.3 | 55.2 |
+| 1 | 70.6 (+13%) | 59.1 (−5%) | 56.1 (+2%) |
+| 2 | 79.6 (+27%) | 67.3 (+8%) | 55.5 (0%) |
+| 3 | 86.9 (+39%) | 57.5 (−8%) | 49.0 (−11%) |
+| auto (default) | 90.5 (+41%, rep 1 62.0) | 59.6 (−4%) | 52.7 (−4%) |
+
+The −28% at 8.5k is gone (depth 1 now +2%). The flip rule was "MTP >= serial
+on the 8.5k prose cell" and the best arm is a wash there while the adaptive
+controller loses 4% (it runs depth 3 where depth 2 wins), so MTP stays opt-in
+on `qwen4_exp`. The next lever is the controller, not the round cost: a fixed
+depth 2 beats auto on prose by 13% and at 8.5k by 5%.
+
+
+
+## MLX has no fused kernel for an hd-256 array mask (qwen4 QSA, 2026-08-26)
+
+`ScaledDotProductAttention::use_fallback` (lib/mlx-src/mlx/backend/metal/scaled_dot_product_attention.cpp): for `q > 8` the steel full-attention kernel is skipped at hd 192/256 ("unfused path is faster"), and for `q <= 8` the vector kernel refuses `q * gqa > 32`. On qwen4_exp (24 q heads / 2 kv heads, gqa 12) that meant every QSA-masked attention past the 2048-token budget ran the materialized scores path: prefill chunks (the 44% measured on a 4096-row chunk at kv 4096) AND every MTP verify width from S = 3 (S = 2 fits the vector kernel). The NAX branch does not help either: it requires `do_causal && !has_arr_mask`.
+
+Two arms, both kill-switched:
+
+- `fusedSdpa256Masked`: a `QSA` template arm of `msv_attn_p256` that reads the `[B,1,qL,kL]` bool mask per element and skips whole 32-key blocks via a per-(q-tile, key-block) any-visible table (`qsaSkipTable`, an `mlx_pad` + reshape + `mlx_any_axes`). Same envelope as the causal arm (q >= 16, hd 256, bf16, kv-chunked dispatch with the fp32 carry). The dummy mask for the causal template is 4-D so `mask_strides[3]` exists under `QSA=0` (a 0-d dummy crashed the causal tests). `MLX_SERVE_QSA_FUSED=0`.
+- `splitMaskedSdpa256`: verify widths 3..15 under an array mask are sliced into `floor(32/gqa)`-row groups and sent through the vector kernel one group at a time (rows are independent under a per-row mask, so this is exact). Shares `MLX_SERVE_SDPA_SPLIT=0` with the causal split.
+
+Hermetic bars: `fusedSdpa256Masked: QSA bool-mask parity`, `splitMaskedSdpa256: verify-width array-mask rows split` (transformer.zig), both vs the composed array-mask sdpa at 0.005. Live engagement lines in `tests/test_qwen4_exp.sh` [5]/[5b]. The tiny fixture is hd 32, so it never reaches either arm. The live prefill/verify A/B on the real pack is still owed (written with the GPU occupied); the expectation from the profile is up to ~1.8x on prefill past 2048 tokens and the S=3..4 verify rounds at 8.5k dropping toward the S=2 cost.
+
+Measured (2026-08-26, `tests/prefill_ab.sh <pack> MLX_SERVE_QSA_FUSED 1 0`, M4 Max, 4-bit pack): 8.1k tokens on 11.36/11.80/11.90 vs off 11.93/12.01/12.07 s; 24.9k tokens on 40.66/41.13/40.56/41.24 vs off 41.49/41.88/42.20/42.43 s — ~1% and ~2.7%. Far from the 1.8x the profile suggested: the per-tile skip table rarely skips (64 queries' top-512 blocks union to most of the KV), so the arm only buys the fused-vs-materialized difference, and MLX's unfused path is already matmul-bound at these shapes. A per-QUERY block-list kernel (gather the 512 selected blocks per row instead of masking) is the remaining lever; not started. Kept default-on (parity-tested, small positive both lengths).
+
+## "Module-owned" was a property of the pointer, not the state (qwen4 batched decode, 2026-08-27)
+
+qwen4_exp shipped serial: `Transformer.qwen4` sat in `module_owned_state_fields` beside dsv4, so admission was single-flight and `supportsBatchedGdnDecode` refused the MoE trunk. But the field only holds the n-gram hash and the mmapped table, both read-only. Every per-request thing was already on the slot's `SSMCacheEntry`: the GDN pair, the PLE conv window + token history, the QSA key history + pooled blocks. The one module-owned piece is the MTP head's cache, and only the slot driving it needs exclusivity.
+
+What it took to batch it:
+
+- Two lists: `module_owned_state_fields` (dsv4) and `module_shared_readonly_fields` (qwen4); the class scan accepts either. Admission exclusivity moved to the SLOT (`slotExclusiveDecode` = model bit OR `enable_mtp` on a model with a qwen4 head); `admitPendingTick` blocks an exclusive candidate only against exclusive active slots. Spec wiring keys on `moduleSpecWiring()` (both lists), otherwise the shared arch would fall onto the generic wiring and pick up PLD/drafters nobody measured.
+- `forwardMoeBatchedDecode` dispatches `forwardQwen4With`; the PLE layer's conv window merges/splits with the GDN pair (`mergeSsmAcrossSlots` reads the layer's shape). `pleEmbedding` hashes row i against slot i's history through `ctx.batch_slots` and gathers all N·heads rows in ONE table read. `qsaMask` projects once, then runs the serial per-slot body (`qsaMaskFromQk`) per row against that slot's keys/pooled blocks/offset, false-pads to kv_max and stacks; the batched attention branch ANDs it into the additive pad mask. A group where nobody is past the budget returns no mask at all.
+- `moeMLP` at `[N,1,·]` took the gather_qmm arm, whose `mlx_squeeze` drops EVERY singleton axis, so B=2 came out `[2,K,hidden]` and the residual write got `[2,2,64]`. Any `B*S > 1` now takes the sort path (serial unchanged).
+
+Two pre-existing GDN batching bugs surfaced on the way, on qwen3_5 too:
+
+- `KVCache.step` advances only on layer 0. On a GDN trunk layer 0 is linear, so `step` reads 0 forever, and the batched tick's `rope_offsets[i] = slot.cache.step` roped every batched decode token at position 0. Forced N=1 on Qwen3.5-0.8B diverged from serial at token 14, on HEAD. Offsets now come from the slot's `moe_seq_offset` on the GDN arm.
+- Nothing advanced `moe_seq_offset` for a batched slot (the forward moves only the driver's scratch), so a slot leaving a batch resumed serial from a stale position, and qwen4's QSA read the wrong kv length. The batched tick advances every slot by 1.
+
+Bars: hermetic `qwen4 batched decode` fixture test (two slots of different length, 10 ticks, cos 1.00000, 19/19 decisive argmax, PLE history / key rows / pooled blocks equal per slot); `test_batched_equivalence.sh` on the 4-bit pack 4/4 (forced N=1 byte-identical, two streams byte-identical); on Qwen3.5-0.8B forced N=1 byte-identical, the N=2 arm diverges at a 0.125-nat near-tie (prefix-cache restore + B=2 tiles) and is acquitted by the new ≤0.15 rule. `test_qwen4_exp.sh` [8]-[10] cover batched short, batched past the QSA budget, and an MTP slot beside a plain one.
+
+Measured (M4 Max, 4-bit pack, one boot per binary, 3 reps, `~/claude-tmp/qwen4-batched/ab.sh`): serial unchanged (code 63.7 vs 62.4, prose 61.8 vs 61.3, 8.5k 54.4 vs 54.3 tok/s, new vs HEAD). Aggregate prose: 2 streams 70.5 tok/s (HEAD queued: 59.6) = 1.18x; 4 streams 103.7 vs 60.0 = 1.73x. 2 streams at 8.5k: 28 + 28 = 56 vs 54 serial, ~1.03x (wall-clock 13.9 either way: two 8.5k prefills dominate). MTP serial unchanged (code 73-88 both binaries); an MTP request beside a plain one interleaves at 40 + 31 = 71 per-stream, wall aggregate 60 (same as HEAD's queue). Below the qwen3_5 ratio (2.8x at 4) because every fused decode kernel declines at batch > 1 (`hcReadFusedFor` / `hcWriteOrDefer` `batch*seq != 1`, `gdnPreworkFused` `qsh[0] != 1`, MoE `gatherQmv` `B*S == 1`), so the group runs the op chains it was fused away from; the per-slot QSA loop (12 layers x N small concats + top-k) is the 8.5k term. Both are kernel work for a later round, not a correctness question.
+
+## qwen4 leftovers: the verify row is bytes, and every decode kernel was keyed on ONE row (2026-08-27)
+
+Six items after batched decode landed; the numbers are one M4 Max, the 4-bit pack, one boot per binary, 3 reps, `tests/qwen4_ab.sh` (the `~/claude-tmp` harness copied into the tree with its three prompt fixtures).
+
+**Where a verify row's time goes.** `MLX_SERVE_DECODE_FWD_UBENCH=30` with `_S=<rows>` (verify widths, capture on): S=1 15.95 ms / 3940 ops, S=2 24.4 / 9616, S=4 32.1 / 9616. The op count more than doubles at S=2, so the first guess was dispatch-bound. It is not: `MLX_SERVE_VERIFY_QMM=0` drops S=2 to 5437 ops and the forward stays at 24.25 ms (the split-K lane is ~4200 view/scalar ops that cost nothing). The GPU eval is 14.6 → 22.2 ms. Per-block laps (`QWEN4_PROFILE_FWD=all`, sync per block, deltas only): hcRead +3.9, hcWrite +1.9, mlp +3.7, gdn/attn flat. So about a third was the hyper-connection chain (fused kernels declined at `batch*seq != 1`) and the rest is the MoE at two rows: a second token picks its own 8 experts, and their bytes are the cost the sort path pays on top of its argsorts.
+
+**Row-batched kernels.** The three hc kernels (`mlxserve_hc_read_n/d/u`) take a row axis on the grid (`HC_FUSED_MAX_ROWS` 16): every per-row buffer is offset once at the top of the kernel, weights are read per row, the D/U tiles are unchanged. `wi_in` (hc elements) lands in `constant` address space, so it is indexed, not rebound to a `device` pointer — the first cut compiled for WR=0 and crashed on the pending-write instantiation. `gdnPreworkFused` folds B into its row axis (`row = b*S + r`; conv taps and the next conv state index per batch, q/k/v/g/beta flat) and `gdnNormGateFused` takes `batch*seq` rows. Bars: the 3-row hc read is BIT-identical to three 1-row reads stacked (plain and pending arms); the B=2 prework is bit-identical per batch to the B=1 kernel; `test_batched_equivalence.sh` 4/4 on the pack (forced N=1 byte-identical). Meter after: S=1 16.0 (unchanged), S=2 22.35 (−8.4%), S=4 30.6 (−4.7%). Live, new vs HEAD, serial flat (62.0/61.7/54.8 vs 61.9/61.4/54.4): prose 2 streams 36.8 → 41.3 per stream (aggregate 70.3 → 78.4, 1.14x → 1.28x), 4 streams 27.5 → 29.7 (103.4 → 111.2, 1.69x → 1.81x), 8.5k 2 streams 28.4 → 30.6 per stream. MTP rounds barely move (new vs HEAD, `qwen4_ab.sh mtp`: code 81.8 vs 78.0, prose 61.1 vs 60.7, 8.5k 58.4 vs 58.5 median tok/s) — the hc chain was ~1.5 ms of a 34 ms round. Below the plan's 1.5x/2.3x bar; the remaining gap is the MoE at N rows, and two cheap attempts on it were losses: a per-row `gatherQmv` loop (each row through the in-place gather + fused down-reduce, concatenated) was flat at S=2 (24.6 vs 24.4) and −11% at S=4 (35.8 vs 32.1); the multi-row gather kernel had already measured +38% at S=4. The sort path stays; a grouped expert kernel is the M5 plan's item 2.
+
+**The MTP controller was not the lever.** Yesterday's "auto picks depth 3 where fixed 2 wins" (prose 59.6 vs 67.3) did not reproduce: today, same script, fixed-2 prose 58.5/58.5/61.7 vs auto 60.1/57.8/58.2 vs serial 61, and 8.5k fixed-2 53.8 vs auto 54.4 vs serial 54.5 — auto ≈ fixed-2 within noise, code auto 88.6 vs fixed-2 82.7. `MLX_SERVE_MTP_TRACE=1` shows the plan already at `m_avg=2.00` on prose with round `total≈34 ms` (eval 26.5 + verify 6.3), i.e. a depth-2 round is 2.05 serial forwards (S=1 16.0 vs S=3 ~24 in the meter, plus draft + sync), so break-even needs >1.05 accepted per round and prose sits at 1.0–1.06. A fresh table (`MLX_SERVE_ROUND_COST_PERSIST=0`) changed nothing, so stale persisted cells were not it either — though the persisted `w2` cell (24.97 ms/tok at n=435, never re-sampled across three runs while `w1` grew to 2120) is a real smell: the table key is (chip, model, quant, OS build), not the engine build, and a cell measured before a verify-path change keeps its number until a trial happens to land on it. No controller change; the round cost is the lever, and MTP stays opt-in on this arch.
+
+**Three bugs the bars found.** (1) `--no-mtp` did nothing on qwen4: the in-checkpoint head is loaded with the trunk and `entry.mtp` bound it regardless of `params.mtp_enabled`, so the `--no-mtp` baseline of `test_mtp_equivalence.sh` ran MTP rounds (`MTP_FORCE_ENABLE=1` injects `enable_mtp:true`). Gated on `params.mtp_enabled`; `slotExclusiveDecode` now keys on the ENTRY's head, not the transformer field. The script also needed the head's own load line (`[qwen4] MTP head loaded`) beside `MTP head ready`, and the marker `language_model.mtp.fc_hidden.weight`; 11/11 on the pack. (2) `--no-vision` answered image turns: the parts were parsed, the tower was absent, the image was dropped and the model said "Sky" for a house with a 200 (prompt 24 tokens). `server.mediaRejectReason` refuses media by name on all three surfaces when `lm.vision_encoder == null`; `test_qwen4_exp.sh` [11] reboots `--no-vision` (tower line absent, capabilities drop `vision`, active_bytes 73.48 → 71.11 GB, text answers, image 400 naming the tower). (3) The QSA prefill mask (`[S, kv]` per layer, 4096 × 25k = 410 MB) was in no bill: `server.qsaMaskBytes` (4 B per query-key for one live layer) rides `prefillTransientReserve` at kv = chunk and the admission guard at the prompt length; a qwen4 twin now steps a rung the qwen3_5 twin keeps at the same ceiling.
+
+**MTP on image turns.** The head's `ForwardCtx` had no M-RoPE fields, so `specInitWiring` declined MTP on any `mrope_pos` slot. Its rows sit at absolute positions `pos_base + seq_offset ..` and its history spans the prompt (image rows included), so the head needs the trunk's two arms, not just the delta: `qwen4MtpForward` takes the slot's `PositionContext`, `beginMropeChunk` builds the per-chunk tables at the head's absolute offset for multi-row forwards (history append, verify), and decode rows past the table take the scalar `offset + delta` that `qwen4AttnWith`/`qsaMaskFromQk` already read. The decline is gone; `test_qwen4_exp.sh` [7b] asserts engagement + tie-aware equality with the serial image answer. The vision fixture has no MTP reference yet (`dump_qwen4_exp_fixtures.py --vision` dumps the trunk only) — the live bar is what pins it.

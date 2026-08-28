@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":"Write a Python class implementing an LRU cache with O(1) get and put using a doubly linked list and a dict. Include docstrings and a small pytest test."}],"max_tokens":400,"temperature":0,"enable_thinking":false,"enable_mtp":true}

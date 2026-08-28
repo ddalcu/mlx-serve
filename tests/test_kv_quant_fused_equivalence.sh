@@ -307,6 +307,32 @@ if [ "${ENGAGED_VERIFY:-0}" = "0" ]; then
     exit 1
 fi
 echo "  engagement: spec=$ENGAGED_SPEC verify=$ENGAGED_VERIFY"
-compare_first_n_tokens "verify-kernel fused vs dense" "$VER_DENSE_TOK" "$VER_FUSED_TOK" "$FIRST_N" || FAIL=1
+# Verify widths move near-tie argmaxes (the mtp-equivalence rule): on a
+# mismatch replay the dense serial arm with logprobs and acquit only when
+# the top-2 gap at the first divergent token is <= 0.15 nats.
+if ! compare_first_n_tokens "verify-kernel fused vs dense" "$VER_DENSE_TOK" "$VER_FUSED_TOK" "$FIRST_N"; then
+    IDX=$(python3 -c "
+a='$VER_DENSE_TOK'.split(','); b='$VER_FUSED_TOK'.split(',')
+print(next(i for i,(x,y) in enumerate(zip(a,b)) if x!=y))")
+    MODEL="$VERIFY_MODEL"
+    LP_PAYLOAD=$(echo "$SPEC_PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); d.update(max_tokens=$IDX+1, logprobs=True, top_logprobs=2); print(json.dumps(d))")
+    echo "  starting server (verify tie probe)..." >&2
+    MLX_SERVE_KV_ATTN_MIN_TK=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 --kv-attn-mode dense --no-pld > /dev/null 2>&1 &
+    TP_PID=$!
+    for i in $(seq 1 60); do curl -s -f "$BASE/health" > /dev/null 2>&1 && break; sleep 1; done
+    GAP=$(echo "$LP_PAYLOAD" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" | python3 -c "
+import sys,json
+try:
+    t=json.load(sys.stdin)['choices'][0]['logprobs']['content'][$IDX]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],3))
+except Exception: print('none')")
+    kill $TP_PID 2>/dev/null; wait $TP_PID 2>/dev/null
+    MODEL="$SAVED_MODEL"
+    if python3 -c "import sys; g='$GAP'; sys.exit(0 if g!='none' and float(g) <= 0.15 else 1)"; then
+        echo -e "${GREEN}PASS${NC} verify-kernel fused vs dense: argmax flip at a near-tie (index $IDX, top-2 gap=$GAP nats)"
+    else
+        echo -e "${RED}FAIL${NC} verify-kernel fused vs dense: top-2 gap at index $IDX = $GAP — NOT a near-tie"
+        FAIL=1
+    fi
+fi
 
 exit $FAIL

@@ -2391,7 +2391,7 @@ pub fn forwardWithMrope(
     }
     if (!fused_done) {
         const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, seq_len > 1 and transformer_mod.sdpaForceFused(q_rope, kv_view.k), s));
     }
 
     const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);

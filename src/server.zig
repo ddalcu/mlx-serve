@@ -2758,7 +2758,22 @@ pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u6
         config.prefillAttnKeys(chunk),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-    );
+    ) + qsaMaskBytes(config, chunk, chunk);
+}
+
+/// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
+/// indexer budget: the `[S, kv]` bool mask, its additive copy for the sdpa
+/// arm, and the f32 indexer scores over kv/4 blocks (4 bytes/block = 1/key).
+const QSA_MASK_BYTES_PER_KEY: u64 = 4;
+
+/// qwen4_exp sparse attention materializes a `[S, kv]` mask per layer that
+/// no envelope term models: 4096 x 25k keys = 410 MB, and a tight box met it
+/// as a Metal OOM at 25k+. Zero for every arch without an indexer. The sizer
+/// bills it at kv = chunk (no prompt yet); the admission guard at the real
+/// prompt length.
+pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64 {
+    if (config.indexer_budget == 0) return 0;
+    return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
 /// The ANE admission gate's headroom for THIS model at THIS chunk: the KV
@@ -3140,7 +3155,8 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const needed: u64 = if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
-        prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));
+        prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
+        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -3319,6 +3335,28 @@ const TextGenTarget = struct {
 /// detected BOTH pre-load (discovery arch_hint) and post-load (engine
 /// slots) — either alone has gaps: `--model` primaries carry no hint,
 /// engines exist only while resident.
+/// A request carrying images/video/audio on a model serving WITHOUT its tower
+/// (`--no-vision`, or a checkpoint with no vision weights) is refused by name.
+/// Before this the media parts were parsed and then silently dropped — the
+/// model answered the text alone (a 200 with a hallucinated "Sky" for a house).
+fn mediaRejectReason(messages: []const chat_mod.Message) ?[]const u8 {
+    for (messages) |m| {
+        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision or no vision weights); image/video content is not supported";
+        if (m.audio != null) return "This model is serving without its audio embedder; input_audio content is not supported";
+    }
+    return null;
+}
+
+test "mediaRejectReason: media on a tower-less model is refused by name, text passes" {
+    const t = std.testing;
+    const text = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
+    try t.expect(mediaRejectReason(&text) == null);
+    const img = [_]chat_mod.Message{ .{ .role = "user", .content = "hi" }, .{ .role = "user", .content = "look", .images = &[_]chat_mod.ImageData{} } };
+    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&img).?, "vision tower") != null);
+    const aud = [_]chat_mod.Message{.{ .role = "user", .content = "listen", .audio = &[_]chat_mod.AudioData{} }};
+    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&aud).?, "audio") != null);
+}
+
 fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
     if (t.is_encoder_only) return "Encoder-only models do not support text generation. Use /v1/embeddings instead.";
     const modality: ?media_mod.Modality = blk: {
@@ -5396,6 +5434,7 @@ fn handleChatCompletions(
     // request owns its embedding locally; we hand it off to the slot at
     // submit time. Defer frees if we don't transfer ownership.
     var local_ve: ?mlx.mlx_array = null;
+    var vis_key: u64 = 0;
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -5403,7 +5442,7 @@ fn handleChatCompletions(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
@@ -5412,6 +5451,11 @@ fn handleChatCompletions(
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
+    } else if (mediaRejectReason(messages.items)) |reason| {
+        allocator.free(prompt_ids_raw);
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{reason});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
@@ -5527,7 +5571,7 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -5538,7 +5582,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -5792,7 +5836,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -6105,6 +6149,7 @@ fn nonStreamingViaScheduler(
     enable_mtp: bool,
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     mrope: MropeData,
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -6138,6 +6183,7 @@ fn nonStreamingViaScheduler(
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
+        .vision_key = vision_key,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -6236,6 +6282,7 @@ fn handleNonStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -6270,7 +6317,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -6834,6 +6881,7 @@ fn handleStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -6911,6 +6959,7 @@ fn handleStreamingGeneration(
         .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
+        .vision_key = vision_key,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -9391,6 +9440,23 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
 /// under `--max-concurrent ≥ 2`: two concurrent vision requests would
 /// clobber each other's array. Returning the value lets each conn thread
 /// hold its own local — no global state involved.
+/// Prefix-cache key for a request's media: the pixel/PCM bytes hashed in
+/// order (never 0 when media is present).
+fn mediaKey(images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, audio: []const chat_mod.AudioData) u64 {
+    var h = std.hash.Wyhash.init(0x5ec0de);
+    for (images) |im| {
+        h.update(std.mem.asBytes(&im.width));
+        h.update(std.mem.asBytes(&im.height));
+        h.update(im.pixels);
+    }
+    for (videos) |vd| {
+        h.update(std.mem.asBytes(&vd.grid_t));
+        h.update(vd.pixels);
+    }
+    for (audio) |au| h.update(au.samples);
+    return h.final() | 1;
+}
+
 fn processVisionImages(
     allocator: std.mem.Allocator,
     lm: *LoadedModel,
@@ -9399,10 +9465,12 @@ fn processVisionImages(
     out_n_vision: *usize,
     out_n_video: *usize,
     out_n_audio: *usize,
+    out_vision_key: *u64,
 ) !?mlx.mlx_array {
     out_n_vision.* = 0;
     out_n_video.* = 0;
     out_n_audio.* = 0;
+    out_vision_key.* = 0;
     // Only process media from the LAST user message. Previous turns' images /
     // videos / audio were already processed in their original request;
     // re-processing wastes context and causes stale feature confusion.
@@ -9424,6 +9492,7 @@ fn processVisionImages(
     const videos: []const chat_mod.VideoData = last_user_videos orelse &.{};
     const audio: []const chat_mod.AudioData = last_user_audio orelse &.{};
     if (images.len == 0 and videos.len == 0 and audio.len == 0) return null;
+    out_vision_key.* = mediaKey(images, videos, audio);
 
     log.info("Multimodal: processing {d} image(s), {d} video(s), {d} audio clip(s)\n", .{ images.len, videos.len, audio.len });
 
@@ -11245,6 +11314,7 @@ fn handleAnthropicMessages(
     // image tokens into the prompt at the model's configured image_token_id.
     // Phase A8: per-request ownership.
     var local_ve: ?mlx.mlx_array = null;
+    var vis_key: u64 = 0;
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -11252,7 +11322,7 @@ fn handleAnthropicMessages(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
@@ -11261,6 +11331,11 @@ fn handleAnthropicMessages(
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
+    } else if (mediaRejectReason(messages.items)) |reason| {
+        allocator.free(prompt_ids_raw);
+        log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+        return;
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
@@ -11338,7 +11413,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -11347,7 +11422,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -11379,6 +11454,7 @@ fn handleAnthropicNonStreaming(
     enable_drafter: bool,
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -11414,7 +11490,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -11616,6 +11692,7 @@ fn handleAnthropicStreaming(
     enable_drafter: bool,
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -11673,6 +11750,7 @@ fn handleAnthropicStreaming(
         .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
+        .vision_key = vision_key,
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -12817,6 +12895,7 @@ fn handleResponses(
     // Phase A8: per-request ownership. Defer frees if we don't end up
     // transferring the array to a scheduler slot.
     var local_ve: ?mlx.mlx_array = null;
+    var vis_key: u64 = 0;
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -12824,7 +12903,7 @@ fn handleResponses(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
@@ -12833,6 +12912,11 @@ fn handleResponses(
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
+    } else if (mediaRejectReason(pi.messages.items)) |reason| {
+        allocator.free(prompt_ids_raw);
+        log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
@@ -13068,6 +13152,7 @@ fn handleResponses(
             .mtp = if (stream_mode == .mtp) lm.mtp else null,
             .mtp_depth = lm.mtp_depth,
             .vision_embeddings = slot_ve_resp,
+            .vision_key = vis_key,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
             .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
@@ -13349,7 +13434,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -16832,6 +16917,32 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
         try t.expect(c >= generate_mod.PREFILL_CHUNK_FLOOR);
         prev = c;
     }
+}
+
+test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwen3_5 twin keeps" {
+    const t = std.testing;
+    var twin = model_mod.ModelConfig{};
+    twin.num_hidden_layers = 40;
+    twin.num_attention_heads = 24;
+    twin.num_key_value_heads = 2;
+    twin.head_dim = 256;
+    twin.hidden_size = 2560;
+    twin.intermediate_size = 9216;
+    twin.intermediate_size_declared = true;
+    twin.quant_bits = 4;
+    twin.max_position_embeddings = 262144;
+    var q4 = twin;
+    q4.indexer_budget = 2048;
+    try t.expectEqual(@as(u64, 0), qsaMaskBytes(&twin, 4096, 25000));
+    try t.expectEqual(@as(u64, 4 * 4096 * 25000 * 5 / 4), qsaMaskBytes(&q4, 4096, 25000));
+    const twin_bill = prefillTransientReserve(&twin, 16, 8192);
+    const q4_bill = prefillTransientReserve(&q4, 16, 8192);
+    try t.expectEqual(twin_bill + qsaMaskBytes(&q4, 8192, 8192), q4_bill);
+    // A ceiling whose quarter-share sits between the two bills at 8192.
+    const weights: u64 = 70_000_000_000;
+    const ceiling = weights + (twin_bill + q4_bill) / 2 * 4;
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0));
+    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0));
 }
 
 test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinned" {

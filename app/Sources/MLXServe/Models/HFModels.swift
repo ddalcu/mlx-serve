@@ -41,6 +41,7 @@ let supportedModelTypes: Set<String> = [
     "diffusion_gemma", // DiffusionGemma block diffusion (text-only; vision tower not wired)
     "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen3_moe", "qwen3_moe_text",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
     "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower

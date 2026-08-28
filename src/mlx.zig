@@ -103,6 +103,7 @@ pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
 pub extern "c" fn mlx_array_new() mlx_array;
 pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
 pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
+pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
 pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
 pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
@@ -322,7 +323,7 @@ pub extern "c" fn mlx_fast_rope(res: *mlx_array, x: mlx_array, dims: c_int, trad
 // `mlx_fast_rope_dynamic` accepts a per-row offset array (shape [B], int32) so a single
 // kernel launch handles N requests at different KV positions during batched decode.
 pub extern "c" fn mlx_fast_rope_dynamic(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: mlx_array, freqs: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, force_fused: bool, s: mlx_stream) c_int;
 
 // ── Vector of strings (for custom metal kernels) ──
 pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
@@ -338,6 +339,7 @@ pub extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_meta
 pub extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 

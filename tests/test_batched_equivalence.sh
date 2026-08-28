@@ -347,15 +347,31 @@ else:
 PYEOF
 )
         if [ "$verdict" != "OK" ]; then
-            echo -e "${RED}FAIL${NC} N=2 concurrent stream diverged from serial: $verdict"
-            CONC_FAIL=1; break
+            # A batch of >= 2 is not bit-identical to serial (B=2 matmul /
+            # recurrence tiles accumulate in a different order; a hybrid's
+            # prefix-cache restore adds its own class). Acquit a divergence
+            # whose serial top-2 gap is a near-tie (<= 0.15 nats, the MTP
+            # equivalence bar); anything wider is a real bug.
+            idx=$(echo "$verdict" | sed -n 's/DIFF at index \([0-9]*\):.*/\1/p')
+            gap=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=True; d['top_logprobs']=2; print(json.dumps(d))" "$LONG_JSON_PAYLOAD" |
+                curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" |
+                python3 -c "
+import sys,json
+c=json.load(sys.stdin)['choices'][0]['logprobs']['content']; i=int(sys.argv[1])
+t=c[i]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],4))" "$idx" 2>/dev/null || echo 99)
+            if python3 -c "import sys; sys.exit(0 if float('$gap') <= 0.15 else 1)"; then
+                echo -e "  ${YELLOW}near-tie${NC} $verdict acquitted: serial top-2 gap at index $idx = $gap nats"
+            else
+                echo -e "${RED}FAIL${NC} N=2 concurrent stream diverged from serial: $verdict (serial top-2 gap $gap nats)"
+                CONC_FAIL=1; break
+            fi
         fi
     done
     if [ "$CONC_FAIL" != "0" ]; then
         tail -20 "$CONC_LOG"
         kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"; exit 1
     fi
-    echo -e "${GREEN}PASS${NC} both concurrent streams byte-identical to serial for ${FIRST_N_TOKENS} tokens (batch >= 2)"
+    echo -e "${GREEN}PASS${NC} both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
 fi
 kill $CONC_PID 2>/dev/null || true
 wait $CONC_PID 2>/dev/null || true

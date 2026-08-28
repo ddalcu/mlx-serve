@@ -73,7 +73,7 @@ filler = " ".join(f"item{i} shelf {i % 7}." for i in range(120))
 body = {
     "model": "mlx-serve",
     "temperature": 0.0,
-    "max_tokens": 48,
+    "max_tokens": 96,
     "messages": [
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
