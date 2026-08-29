@@ -129,6 +129,14 @@ model-written document keeps is why the margins are added back. Swift clamps the
 result, because a page with `height: 1e9` or a NaN measurement does not break one
 block — a NaN frame breaks the whole chat column.
 
+The Settings toggle that picks which half opens (Settings ▸ Chat) reads through
+a SwiftUI environment key, not `@EnvironmentObject var appState`. `MarkdownText`
+renders inside `ModelDetailSheet` as well as the transcript, and a sheet does not
+inherit the environment of the view it hangs on — an object read there traps at
+first render, which is the crash `SheetEnvironmentAuditTests` exists for. An
+environment key has a default, so a surface that publishes nothing gets previews
+and no surface can crash for staying quiet.
+
 `Package.swift` says SwaTex was chosen to avoid "a WebView/JavaScript renderer
 and the security, selection, and streaming seams that would come with one". That
 is still true and still the right call for math. Streaming and security are

@@ -130,6 +130,23 @@ enum HTMLArtifact {
     prepared. Switch to Code to read the source.</p>
     """ + Self.scaffoldClose
 
+    // MARK: - Which half opens
+
+    /// Which half of the block is showing.
+    enum ViewMode: Equatable {
+        case preview
+        case source
+    }
+
+    /// The half a block OPENS on, from Settings ▸ Chat.
+    ///
+    /// A default, not a gate: the header's Preview/Code switch works the same
+    /// either way, so turning previews off makes the source the first thing you
+    /// see rather than making the rendered page unreachable.
+    static func defaultMode(previewsEnabled: Bool) -> ViewMode {
+        previewsEnabled ? .preview : .source
+    }
+
     // MARK: - Height
 
     /// Height before the page has reported its own — a plausible one, because a

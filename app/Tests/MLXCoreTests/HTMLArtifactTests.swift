@@ -185,6 +185,52 @@ final class HTMLArtifactTests: XCTestCase {
                         + String(describing: failure))
     }
 
+    // MARK: - The default-view setting
+    //
+    // Settings ▸ Chat ▸ "Render HTML blocks as live previews". It chooses which
+    // half of the block OPENS; the header's Preview/Code switch is unaffected
+    // either way, so nothing is ever unreachable because of it.
+
+    func testAFreshInstallOpensOnThePreview() {
+        XCTAssertTrue(ServerOptions().htmlPreviewsByDefault)
+    }
+
+    func testTheSettingOnlyChoosesTheOpeningView() {
+        XCTAssertEqual(HTMLArtifact.defaultMode(previewsEnabled: true), .preview)
+        XCTAssertEqual(HTMLArtifact.defaultMode(previewsEnabled: false), .source)
+    }
+
+    func testAConfigWrittenBeforeTheSettingExistedKeepsPreviews() throws {
+        // Changing a persisted DEFAULT does nothing for existing users — the
+        // tolerant decoder answers for a key that is not there, and the answer
+        // has to be the shipped behaviour rather than `false`, or everyone who
+        // upgrades silently loses the feature.
+        let old = Data(#"{"host":"127.0.0.1","port":8080}"#.utf8)
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: old)
+        XCTAssertTrue(decoded.htmlPreviewsByDefault)
+    }
+
+    func testTheSettingRoundTripsThroughTheStoredConfig() throws {
+        for value in [true, false] {
+            var options = ServerOptions()
+            options.htmlPreviewsByDefault = value
+            let data = try JSONEncoder().encode(options)
+            let back = try JSONDecoder().decode(ServerOptions.self, from: data)
+            XCTAssertEqual(back.htmlPreviewsByDefault, value)
+        }
+    }
+
+    func testFlippingTheSettingNeverPromptsAServerRestart() {
+        // A transcript rendering preference is app-side: it is not a launch
+        // flag, so — like `toolsOnlyWhenAsked` and `voiceClonePath` — it stays
+        // out of `serverLaunchEquals` and `toCLIArgs`. Otherwise toggling how a
+        // code block LOOKS puts the restart banner up over a running server.
+        var flipped = ServerOptions()
+        flipped.htmlPreviewsByDefault = false
+        XCTAssertTrue(ServerOptions().serverLaunchEquals(flipped))
+        XCTAssertEqual(ServerOptions().toCLIArgs(), flipped.toCLIArgs())
+    }
+
     // MARK: - Height
 
     func testHeightBeforeMeasurementIsThePlaceholder() {

@@ -282,6 +282,22 @@ struct ServerOptions: Codable, Equatable {
     /// server restart.
     var toolsOnlyWhenAsked: Bool = false
 
+    // MARK: Chat rendering (app-level — NOT a server-launch flag)
+    /// Whether a closed ```html / ```svg block in an assistant reply OPENS on
+    /// its rendered preview (`HTMLArtifactView`) or on its source.
+    ///
+    /// ON (default, the shipped behaviour) is what makes a model able to answer
+    /// with a chart instead of describing one. OFF suits someone who mostly
+    /// asks models ABOUT html and wants to read the code — it changes only
+    /// which half opens, never what is reachable: the header's Preview/Code
+    /// switch works the same either way.
+    ///
+    /// Purely a rendering preference, so — like `toolsOnlyWhenAsked` and
+    /// `voiceClonePath` — it is deliberately excluded from `serverLaunchEquals`
+    /// and `toCLIArgs`: changing how a block LOOKS must never put the restart
+    /// banner up over a running server.
+    var htmlPreviewsByDefault: Bool = true
+
     // MARK: Voice clone (app-level — NOT a server-launch flag, NOT per-request)
     /// Absolute path to the normalized voice-clone reference clip (24 kHz mono
     /// WAV) that hands-free voice mode speaks with, via Qwen3-TTS zero-shot
@@ -875,6 +891,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
         if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .toolsOnlyWhenAsked) { toolsOnlyWhenAsked = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .htmlPreviewsByDefault) { htmlPreviewsByDefault = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }

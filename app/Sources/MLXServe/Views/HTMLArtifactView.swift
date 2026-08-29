@@ -18,10 +18,31 @@ struct HTMLArtifactView: View {
     let language: String
     let code: String
 
-    @State private var showsSource = false
+    /// Settings ▸ Chat, reaching the block through the ENVIRONMENT rather than
+    /// `@EnvironmentObject var appState`.
+    ///
+    /// `MarkdownText` renders inside `ModelDetailSheet` as well as the
+    /// transcript, and a sheet does NOT inherit the environment of the view it
+    /// hangs on — reading an `@EnvironmentObject` here would trap at first
+    /// render on a surface that never injected one (the live crash
+    /// `SheetEnvironmentAuditTests` was written for). An environment KEY has a
+    /// default, so a surface that says nothing gets previews and no surface can
+    /// crash for staying quiet.
+    @Environment(\.htmlPreviewsEnabled) private var previewsEnabled
+
+    /// The half the reader CHOSE, if they chose one. `nil` means "whatever the
+    /// setting says" — so flipping the setting moves every block nobody has
+    /// touched, and leaves alone the ones somebody did.
+    @State private var chosenMode: HTMLArtifact.ViewMode?
     @State private var expanded = false
     /// What the page reported its own height as; nil until it has laid out.
     @State private var measured: CGFloat?
+
+    private var mode: HTMLArtifact.ViewMode {
+        chosenMode ?? HTMLArtifact.defaultMode(previewsEnabled: previewsEnabled)
+    }
+
+    private var showsSource: Bool { mode == .source }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -36,7 +57,9 @@ struct HTMLArtifactView: View {
         }
         .modifier(CodeBlockChrome())
         .contextMenu {
-            Button(showsSource ? "Show Preview" : "Show Source") { showsSource.toggle() }
+            Button(showsSource ? "Show Preview" : "Show Source") {
+                chosenMode = showsSource ? .preview : .source
+            }
             Button("Copy Source") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(code, forType: .string)
@@ -50,8 +73,8 @@ struct HTMLArtifactView: View {
                 chip(expanded ? "Collapse" : "Expand", active: false) { expanded.toggle() }
             }
             HStack(spacing: 2) {
-                chip("Preview", active: !showsSource) { showsSource = false }
-                chip("Code", active: showsSource) { showsSource = true }
+                chip("Preview", active: !showsSource) { chosenMode = .preview }
+                chip("Code", active: showsSource) { chosenMode = .source }
             }
             CodeBlockCopyButton(code: code, help: "Copy this block's source")
         }
@@ -388,5 +411,24 @@ final class ArtifactWebEnvironment {
         let pending = waiting ?? []
         waiting = nil
         pending.forEach { $0(list) }
+    }
+}
+
+
+/// Whether a `.html` block opens on its preview — `ServerOptions
+/// .htmlPreviewsByDefault`, handed to the transcript by `ChatDetailView`.
+///
+/// An environment key rather than an `@EnvironmentObject` read, and the default
+/// is the shipped behaviour: `MarkdownText` also renders in `ModelDetailSheet`,
+/// and a sheet presents in its own hosting context, so a view that DEMANDED an
+/// object there would trap at first render rather than fall back.
+private struct HTMLPreviewsEnabledKey: EnvironmentKey {
+    static let defaultValue: Bool = true
+}
+
+extension EnvironmentValues {
+    var htmlPreviewsEnabled: Bool {
+        get { self[HTMLPreviewsEnabledKey.self] }
+        set { self[HTMLPreviewsEnabledKey.self] = newValue }
     }
 }

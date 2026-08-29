@@ -122,12 +122,18 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
+                        category: .chat,
+                        subtitle: "How replies are RENDERED in the transcript — applies to what's already on screen, no restart needed."
+                    ) {
+                        ChatRenderingSectionContent()
+                    }
+
+                    SettingsSection(
                         category: .voice,
                         subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
                     ) {
                         WakePhraseSectionContent()
-                        VoiceCloneSectionContent()
-                    }
+                    }      }
 
                     SettingsSection(
                         category: .sandbox,
@@ -185,8 +191,8 @@ struct SettingsView: View {
                 .padding(.vertical, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-        }
     }
+    
 }
 
 // MARK: - Sidebar
@@ -1905,6 +1911,23 @@ extension InterfaceSectionContent {
                                                           UInt8((c.greenComponent * 255).rounded()),
                                                           UInt8((c.blueComponent * 255).rounded())).hex
             })
+    }
+}
+
+/// Settings ▸ Chat. How a reply is DRAWN, as opposed to what is sent to the
+/// model — which is the section next door.
+private struct ChatRenderingSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        SettingsRow(
+            title: "Render HTML blocks as live previews",
+            explainer: "ON = a finished ```html or ```svg block in a reply shows the page it describes, so a model can answer with a chart or a small interactive widget instead of describing one. OFF = those blocks open as source, like every other code block. Either way the block's own Preview/Code switch is there, and a block you've already switched by hand keeps what you chose. Pages run offline: no network access, no navigation, nothing saved."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.htmlPreviewsByDefault)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
     }
 }
 

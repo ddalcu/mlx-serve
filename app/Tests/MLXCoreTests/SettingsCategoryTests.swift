@@ -69,9 +69,12 @@ final class SettingsCategoryTests: XCTestCase {
     /// Sidebar order must match the order the sections render in, or clicking
     /// down the list scrolls the form around at random.
     func testSidebarOrderMatchesRenderOrder() {
+        // `.chat` sits next to `.requestDefaults` because the two are the pair
+        // a reader confuses: what is SENT to the model, then how the reply is
+        // DRAWN.
         XCTAssertEqual(SettingsCategory.visible(engine: .mlx, selfUpdate: true), [
             .modelFolders, .server, .lanSharing, .specDecode, .performance,
-            .requestDefaults, .interface, .voice, .sandbox, .messaging, .updates, .about,
+            .requestDefaults, .interface, .chat, .voice, .sandbox, .messaging, .updates, .about,
         ])
     }
 
