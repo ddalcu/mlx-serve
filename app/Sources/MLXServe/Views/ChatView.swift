@@ -4615,6 +4615,12 @@ struct MarkdownText: View {
                     }
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
+                case .html(let language, let code):
+                    // A closed html/svg fence renders as a live page, with its
+                    // source one click away. Only CLOSED ones reach here — see
+                    // `MarkdownSegmenter.Segment.html` for why a streaming
+                    // block must stay a code block.
+                    HTMLArtifactView(language: language, code: code)
                 }
             }
         }

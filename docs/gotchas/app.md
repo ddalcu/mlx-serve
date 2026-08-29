@@ -69,6 +69,74 @@ Voice mode's turn endpointing is a hand-rolled energy VAD: a turn finalizes afte
 ### WebSearch + Browse
 `webSearch` navigates DuckDuckGo HTML, extracts results via JS. `browse.readText` navigates first then extracts — ensures correct page (not previous).
 
+### Inline HTML artifacts: the content rule list is the whole security story, and it does not take a regex
+
+A closed ```html/```svg fence in an assistant reply renders as a live page
+(`HTMLArtifactView`), the way Gemini renders one. Three things bit, in order.
+
+**A half-streamed document must not run.** The first shape mounted the web view
+from the segmenter's ordinary `.code` fence, which meant every html reply
+executed a `<script>` whose function bodies were still arriving and reloaded the
+page on every token after that. `MarkdownSegmenter` now emits `.html` ONLY for a
+fence the model closed; until then the block is a code block, exactly as before.
+Nothing about that is visible from the view, which is why the rule lives in the
+segmenter and is pinned by `testUnterminatedHtmlFenceStaysCode`.
+
+**`WKContentRuleList`'s `url-filter` is not full regex.** The shipped-first rule
+was `^(https?|wss?|ftp|file)://`, and WebKit answers
+`Disjunctions are not supported yet` — the engine has no alternation. That
+failure is completely silent from the app's side: compilation is asynchronous,
+the error goes to a callback nobody was reading, `withNetworkBlocker` hands back
+nil, and every artifact in the app quietly renders the refusal page instead of
+the model's work. Found by a throwaway `swift` script that stood a real
+`WKWebView` up around the same scaffold and script, not by a unit test — no
+type checker can see inside a JSON string literal. The guard that exists now
+(`HTMLArtifactTests.testTheNetworkBlockerCompiles`) compiles the real constant
+into a temp store and is red-on-revert against the disjunction.
+
+**`.*` compiles, and over-blocks.** The obvious fix — block every URL — was
+measured in the same probe: it blocks remote subresources and `fetch` as
+intended, but ALSO `blob:` URLs and Web Workers, so a chart that exports its
+canvas or any worker-backed library silently breaks. Filtering per scheme
+(`^https?://`, `^wss?://`, `^ftp://`, `^file://`, plus a generic
+`^[a-z][a-z0-9+.-]*://`) was measured to block remote loads and `fetch` while
+leaving `data:` (how a model embeds an image), `blob:`, workers and `srcdoc`
+frames working. A nil base URL is NOT a substitute for any of it: it stops
+relative URLs and cross-origin `fetch`, but a `<script src="https://…">` is a
+subresource load and no navigation delegate is ever asked about one.
+
+Two consequences shaped the code. Compilation being async means the LOAD has to
+happen inside the callback — a rule list added after a load does not apply to
+it — which is why `load` is callback-shaped rather than a straight
+`loadHTMLString`. And a blocker that cannot be compiled must refuse: the payload
+decision is `HTMLArtifact.payload(for:networkBlocked:)`, so "render the model's
+HTML with no blocker installed" is not reachable by forgetting a branch at a
+call site.
+
+The rest of the containment is ordinary but worth listing because each item is a
+thing a model's page tried or could try: navigation is cancelled except the
+initial about:blank (a clicked link opens in the user's own browser instead),
+`window.open` returns nil, alert/confirm/prompt and `<input type=file>` all
+complete unshown, autoplay needs a user action, and the data store is
+non-persistent — shared across artifacts so a long transcript shares content
+processes rather than spawning one per block.
+
+Height is the page's own answer, posted back over a script message handler. It
+is measured from `body` (`scrollHeight` plus computed margins), never
+`documentElement`, which never reports less than the viewport and so gives a
+block that can grow and never shrink; the default 8px body margin a
+model-written document keeps is why the margins are added back. Swift clamps the
+result, because a page with `height: 1e9` or a NaN measurement does not break one
+block — a NaN frame breaks the whole chat column.
+
+`Package.swift` says SwaTex was chosen to avoid "a WebView/JavaScript renderer
+and the security, selection, and streaming seams that would come with one". That
+is still true and still the right call for math. Streaming and security are
+answered above; selection is the seam genuinely given up — text inside an
+artifact selects within the page, not as part of a drag across the whole reply —
+which is why the block keeps a Code toggle showing the same `CodeBlockBody`
+every other fence renders.
+
 ### WKWebView main thread
 `BrowserManager` is `@MainActor`. All WKWebView ops (navigate, readText, evaluateJS) on main thread. Created eagerly at app launch so tools work without Browser window open.
 

@@ -91,12 +91,15 @@ final class MarkdownSegmenterTests: XCTestCase {
             "no fences at all",
             "```js\nconst a = 1\n```\n\ntail\n\n```\nx\n```",
             "```\nunterminated",
+            "intro\n```html\n<b>hi</b>\n```\ntail",
+            "```html\n<b>half",
         ]
         for src in sources {
             let joined = segs(src).map { seg -> String in
                 switch seg {
                 case .prose(let t): return t
                 case .code(_, let c): return c
+                case .html(_, let c): return c
                 }
             }.joined(separator: "\n")
             for line in src.components(separatedBy: "\n")
@@ -126,6 +129,78 @@ final class MarkdownSegmenterTests: XCTestCase {
             .prose("| a | b |\n|---|---|\n| 1 | 2 |"),
             .code(language: "", code: "x"),
         ])
+    }
+
+
+    // MARK: - HTML artifact fences
+    //
+    // A closed fence whose language renders — html/svg — becomes its own
+    // segment so the transcript can mount a live document for it instead of a
+    // code block. Everything about WHEN that is safe lives here, because the
+    // view must not be the thing deciding whether a half-streamed document is
+    // ready to execute.
+
+    func testClosedHtmlFenceIsItsOwnSegment() {
+        XCTAssertEqual(segs("```html\n<b>hi</b>\n```"),
+                       [.html(language: "html", code: "<b>hi</b>")])
+    }
+
+    func testHtmlSegmentSitsBetweenProseRuns() {
+        XCTAssertEqual(segs("before\n```html\n<b>hi</b>\n```\nafter"), [
+            .prose("before"),
+            .html(language: "html", code: "<b>hi</b>"),
+            .prose("after"),
+        ])
+    }
+
+    func testUnterminatedHtmlFenceStaysCode() {
+        // THE streaming rule. Every html reply passes through a half-written
+        // document on its way to a closed fence; mounting a web view for one
+        // executes a script whose function bodies are still arriving, and
+        // reloads it on every token after that. Code until the fence closes.
+        XCTAssertEqual(segs("```html\n<script>for (;;"),
+                       [.code(language: "html", code: "<script>for (;;")])
+    }
+
+    func testSvgFenceRendersToo() {
+        let svg = "<svg viewBox=\"0 0 2 2\"><rect width=\"2\" height=\"2\"/></svg>"
+        XCTAssertEqual(segs("```svg\n" + svg + "\n```"),
+                       [.html(language: "svg", code: svg)])
+    }
+
+    func testFenceLabelCaseAndSpacingDoNotMatter() {
+        // Models write ``` HTML and ```Html as readily as ```html.
+        XCTAssertEqual(segs("```HTML\n<i>x</i>\n```"),
+                       [.html(language: "HTML", code: "<i>x</i>")])
+        XCTAssertEqual(segs("``` Html \n<i>x</i>\n```"),
+                       [.html(language: "Html", code: "<i>x</i>")])
+    }
+
+    func testHtmlLanguageIsPreservedVerbatim() {
+        // The header shows what the model wrote, and the code arm picks its
+        // lexer from it — same contract as `.code`.
+        guard case .html(let language, _)? = segs("```htm\n<b>x</b>\n```").first else {
+            return XCTFail("expected an html segment")
+        }
+        XCTAssertEqual(language, "htm")
+    }
+
+    func testOtherLanguagesAreUnaffected() {
+        for fence in ["swift", "js", "python", "json", "xml", "", "markdown"] {
+            let out = segs("```\(fence)\n<b>x</b>\n```")
+            XCTAssertEqual(out, [.code(language: fence, code: "<b>x</b>")],
+                           "fence \(fence.debugDescription) must stay a code block")
+        }
+    }
+
+    func testHtmlFenceWithoutMarkupStaysCode() {
+        // A model explaining HTML in prose inside an html fence has nothing to
+        // render; a blank web view where the answer should be is worse than the
+        // text.
+        XCTAssertEqual(segs("```html\njust a sentence\n```"),
+                       [.code(language: "html", code: "just a sentence")])
+        XCTAssertEqual(segs("```html\n```"),
+                       [.code(language: "html", code: "")])
     }
 
 }
