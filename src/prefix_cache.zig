@@ -155,6 +155,13 @@ pub const HotPrefixCache = struct {
     /// Enforced on `commit`: evict LRU entries (in addition to the count
     /// cap) until `current_kv_bytes + new_entry_bytes <= max_kv_bytes`.
     max_kv_bytes: u64,
+    /// Cap on SSM checkpoints kept per entry, mirroring `generate.zig`'s
+    /// `ssm_checkpoint_max`. That one bounds a SINGLE prefill; this one bounds
+    /// the replace path's merge, which concatenates the previous entry's
+    /// checkpoints with this turn's. Without it an entry extended in place —
+    /// every turn of an agent conversation — gains one checkpoint per turn for
+    /// the life of the session. 0 = unlimited.
+    ssm_checkpoint_max: u32 = 0,
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
@@ -731,6 +738,17 @@ pub const HotPrefixCache = struct {
                 }
                 self.allocator.free(old);
                 self.allocator.free(new);
+                // The merged list spans BOTH turns, so the per-prefill cap in
+                // generate.zig no longer bounds it. Re-apply it here, dropping
+                // oldest-first exactly as the capture path does: the newest
+                // positions sit closest to end-of-prompt, which is where warm
+                // multi-turn requests match.
+                while (self.ssm_checkpoint_max > 0 and
+                    merged.items.len > self.ssm_checkpoint_max)
+                {
+                    var oldest = merged.orderedRemove(0);
+                    oldest.deinit(self.allocator);
+                }
                 break :blk try merged.toOwnedSlice(self.allocator);
             };
 
@@ -767,6 +785,18 @@ pub const HotPrefixCache = struct {
             e.mtp_bytes = new_mtp_bytes;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
+            // The insert path below enforces the byte budget; this path used to
+            // return without it, so an entry that only ever grows could hold the
+            // cache above `max_kv_bytes` indefinitely. `e` was just bumped to the
+            // newest `last_used`, so `evictOneLru` cannot pick it while another
+            // entry exists.
+            if (self.max_kv_bytes > 0) {
+                while (self.current_kv_bytes > self.max_kv_bytes and
+                    self.entries.items.len > 1)
+                {
+                    self.evictOneLru("byte budget");
+                }
+            }
             if (self.disk != null) self.disk_dirty = true;
             self.logResident();
             return;
@@ -1690,4 +1720,59 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
     // RAM restore installed the SSM state just the same.
     try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm2[0].conv_state, 0, s));
+}
+
+// Regression: an entry that is EXTENDED in place must not accumulate SSM
+// checkpoints without bound. `generate.zig` caps what a single prefill
+// captures, but the replace path merges the previous entry's checkpoints with
+// this turn's, and nothing re-applied the cap to the merged list — so an agent
+// conversation gained one checkpoint per turn forever. Observed on
+// Qwen3.8-Flash-Next (36 GDN layers): 31237 MB of SSM state in ONE entry under
+// `--ssm-checkpoint-max 8`, which starved the prompt-admission check.
+test "HotPrefixCache: replace path re-applies ssm_checkpoint_max across turns" {
+    const s = mlx.gpuStream();
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 3);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssm_checkpoint_max = 2;
+    defer hc.deinit();
+
+    // Turn 1: a 300-token entry carrying two checkpoints.
+    var c1 = try KVCache.init(testing.allocator, 3);
+    defer c1.deinit();
+    try testFillCache(&c1, s, 3, 300);
+    var a = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&a);
+    var b = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&b);
+    const cps1 = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps1[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &a, 100, s);
+    cps1[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &b, 200, s);
+    try hc.commitWithSsm(&c1, tokens[0..300], false, cps1, null, null);
+    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ssm_checkpoints.?.len);
+
+    // Turn 2 extends that exact prefix — the replace path — and brings two more.
+    // Merged that is four; the cap must bring it back to two.
+    var c2 = try KVCache.init(testing.allocator, 3);
+    defer c2.deinit();
+    try testFillCache(&c2, s, 3, 600);
+    var c = pcBuildHybrid(s, 500.0, 900.0);
+    defer pcFreeHybrid(&c);
+    var d = pcBuildHybrid(s, 700.0, 1100.0);
+    defer pcFreeHybrid(&d);
+    const cps2 = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &c, 400, s);
+    cps2[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &d, 500, s);
+    try hc.commitWithSsm(&c2, tokens[0..600], false, cps2, null, null);
+
+    // Extended, not appended: still one entry.
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    const kept = hc.entries.items[0].ssm_checkpoints.?;
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    // Oldest-first drop, matching the capture path: the newest positions win,
+    // because they sit closest to end-of-prompt where warm requests match.
+    try testing.expectEqual(@as(usize, 400), kept[0].pos);
+    try testing.expectEqual(@as(usize, 500), kept[1].pos);
 }

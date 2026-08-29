@@ -3724,6 +3724,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
+        // The cache re-applies the cap after a replace-path merge; without this
+        // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
+        entry.prefix_cache.?.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
     // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
     // chat-template renders. Applies to MLX, ds4, and llama engines —
