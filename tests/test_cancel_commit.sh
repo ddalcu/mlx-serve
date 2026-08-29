@@ -8,18 +8,20 @@
 #       queue, so without the drain-hook commit its KV dies with the slot.
 #       Proven by an identical re-issue reporting `cached_tokens` ≈ the full
 #       prompt (full-match reuse) where it previously reported ~0.
-#   [2] prefill-phase cancel (non-hybrid models only): a long prompt killed
-#       while still prefilling must commit the FORWARDED PREFIX (chunk-
-#       aligned). Hybrids are excluded by design — their stride SSM
-#       checkpoints die with the failed Generator init, and a checkpoint-less
-#       hybrid entry restores as a cold miss while occupying an LRU slot —
-#       so the section self-detects hybrid configs (GDN / layer_types) and
-#       SKIPs with an explanation.
-#       The killed stream's captured body tells us which phase we were in:
-#       no `data:` content chunks ⇒ still prefilling (the strict
-#       "committed N/M prompt tokens from a cancelled prefill" log line is
-#       then REQUIRED); content chunks ⇒ prefill had finished and the
-#       decode-cancel contract of [1] covers it (section skipped, not failed).
+# [2] prefill-phase cancel: a long prompt killed while still prefilling must
+#     commit the FORWARDED PREFIX (chunk-aligned). Hybrids ride the
+#     Cancelled-checkpoint salvage: `initWithOptions` hands its captured
+#     SSM stride checkpoints to the slot on abort, so the commit carries
+#     them and the re-issue restores at the last checkpoint ≤ matched (the
+#     boot pins --prefill-chunk/--ssm-checkpoint-stride at 512 so the
+#     cancelled window always spans checkpoint boundaries — the effective
+#     stride otherwise coarsens to the prefill chunk and a short window may
+#     salvage nothing).
+#     The killed stream's captured body tells us which phase we were in:
+#     no content/reasoning chunks ⇒ still prefilling (the strict
+#     "committed N/M prompt tokens from a cancelled prefill" log line is
+#     then REQUIRED); content chunks ⇒ prefill had finished and the
+#     decode-cancel contract of [1] covers it (section skipped, not failed).
 #
 # Usage: ./tests/test_cancel_commit.sh [model_dir] [port]
 #   Starts its own server. Default model: Gemma 4 E4B 4-bit.
@@ -64,7 +66,8 @@ done
 boot_server() {
     rm -f "$LOG"
     "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-        --ctx-size 16384 --prefill-chunk 1024 --kv-quant 4 --prefix-cache-entries 4 \
+        --ctx-size 16384 --prefill-chunk 512 --ssm-checkpoint-stride 512 \
+        --kv-quant 4 --prefix-cache-entries 4 \
         > "$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
@@ -151,38 +154,31 @@ decode_cancel_section() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────
-# [2] prefill-phase cancel (non-hybrid only)
+# [2] prefill-phase cancel (hybrid + plain-attention)
 # ─────────────────────────────────────────────────────────────────────────
 prefill_cancel_section() {
     echo "== [2] prefill-phase cancel =="
 
-    # Hybrid detection: GDN / linear layer_types / mamba ⇒ the cancelled
-    # prefill commit is intentionally OFF (checkpoints die with the failed
-    # Generator init; a checkpoint-less hybrid entry restores as a cold miss
-    # while polluting the LRU).
-    local cfg="$MODEL/config.json"
-    if [ -f "$cfg" ] && grep -qE 'gated_deltanet|"linear"|mamba|full_attention_interval' "$cfg"; then
-        echo "SKIP: hybrid architecture detected — cancelled-prefill commit is excluded by design"
-        return 0
-    fi
-
     boot_server || return 1
     warmup_model
 
-    # ~8k-token prompt at --prefill-chunk 1024 (the boot flag): several
-    # chunks are still ahead at kill time on any model, and the chunk loop
-    # only polls the cancel flag at chunk boundaries — one 8k chunk would
-    # complete the whole prefill first. On very fast models the kill may
-    # still land in decode, which the captured stream tells us (see below);
-    # that case is section [1]'s contract.
+    # ~8k-token prompt. Kill at 8s: the conn thread only notices the dead
+    # socket at its next keepalive probe (5s of stream silence), so an 8s
+    # kill is detected at the ~10s probe — by then ~2 chunks (≥1024 tokens
+    # at even a slow 115 tok/s) are forwarded and checkpointed, comfortably
+    # past the 256-token floor and the first 512-stride boundary. A 2s kill
+    # races the first chunk on slow models (step=0, salvage empty); the
+    # chunk loop only polls the cancel flag at chunk boundaries, so the
+    # chunk must also be small enough to complete inside the window
+    # (--prefill-chunk 512, the boot flag — 1024 needs 8.9s at 115 tok/s).
     local body
     body="$(body_chat "$LONG_SYSTEM" true 2000)"
-    curl -sN --max-time 2 -o /tmp/test_cancel_prefill.sse \
+    curl -sN --max-time 8 -o /tmp/test_cancel_prefill.sse \
         -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' -d "$body" 2>/dev/null
     local curl_rc=$?
 
-    sleep 8  # keepalive-detection window + cleanup drain
+    sleep 8  # keepalive-detection window + chunk-loop abort + cleanup drain
 
     local cached
     cached="$(curl -sf --max-time 180 -X POST "$BASE/v1/chat/completions" \

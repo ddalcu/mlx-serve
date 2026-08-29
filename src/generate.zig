@@ -1440,6 +1440,33 @@ pub const Generator = struct {
         return initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{});
     }
 
+    /// Receiver for SSM checkpoints salvaged out of a cancelled prefill.
+    /// `initWithOptions` captures stride checkpoints into a local list that
+    /// its errdefer frees — on `error.Cancelled` it instead moves them here
+    /// so the scheduler can commit a partial-prefix cache entry. Ownership
+    /// transfers either to the hot-cache entry (`commitWithSsm`) or back to
+    /// the sink's `deinit`.
+    pub const CancelledCheckpointSink = struct {
+        /// Absolute prompt-token count forwarded into the KV when the chunk
+        /// loop aborted (`ssm_checkpoint_pos_offset + pos`). This — NOT
+        /// `cache.step`, which only advances when init completes — is the
+        /// authoritative length for a cancelled-prefill commit.
+        forwarded: usize = 0,
+        checkpoints: []SSMCheckpoint = &.{},
+        /// The allocator the checkpoints (and the slice itself) were
+        /// allocated with — the same `sch.allocator` family the hot-cache
+        /// entry later frees them with.
+        alloc: ?std.mem.Allocator = null,
+
+        pub fn deinit(self: *CancelledCheckpointSink) void {
+            const a = self.alloc orelse return;
+            for (self.checkpoints) |*cp| cp.deinit(a);
+            if (self.checkpoints.len > 0) a.free(self.checkpoints);
+            self.checkpoints = &.{};
+            self.alloc = null;
+        }
+    };
+
     pub const InitOptions = struct {
         /// Skip the lazy pre-forward of the first sampled token. When set,
         /// init samples t1 synchronously and leaves `pending_logits/pending_token`
@@ -1570,6 +1597,12 @@ pub const Generator = struct {
         /// `initWithOptions` returns `error.Cancelled` instead of grinding
         /// out the rest of a multi-minute ghost prefill.
         cancel_flag: ?*const std.atomic.Value(bool) = null,
+        /// When the chunk loop aborts on `cancel_flag`, the SSM checkpoints
+        /// captured so far move into this sink instead of dying with the
+        /// failed construction — the scheduler salvages a partial-prefix
+        /// cache commit from them. Null keeps the old drop-everything
+        /// behaviour.
+        cancelled_checkpoint_sink: ?*CancelledCheckpointSink = null,
         /// Per-token logprobs count for this request (0 = disabled). Callers
         /// that set `Generator.logprobs_n` after init must ALSO pass it here:
         /// init's split-prefill final-token forward is a single-row dispatch,
@@ -1922,7 +1955,27 @@ pub const Generator = struct {
                 // conn thread flagged the slot. Bail before the next chunk —
                 // the KV built so far is freed with the slot.
                 if (options.cancel_flag) |cf| {
-                    if (cf.load(.acquire)) return error.Cancelled;
+                    if (cf.load(.acquire)) {
+                        // Salvage the chunk loop's progress: `forwarded` is
+                        // the authoritative length (cache.step only advances
+                        // when init completes), the stride checkpoints ride
+                        // for hybrid restore (they die with the failed
+                        // construction otherwise). toOwnedSlice empties the
+                        // local list so the errdefer frees nothing (on OOM
+                        // the items stay and the errdefer cleans up — the
+                        // sink keeps the length, the commit declines the
+                        // checkpoints only).
+                        if (options.cancelled_checkpoint_sink) |sink| {
+                            sink.forwarded = ssm_cp_offset + pos;
+                            if (ssm_checkpoints.items.len > 0) {
+                                if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
+                                    sink.checkpoints = owned;
+                                    sink.alloc = allocator;
+                                } else |_| {}
+                            }
+                        }
+                        return error.Cancelled;
+                    }
                 }
                 // Pick this chunk's end. Normal path: hit the configured chunk
                 // size. Phase 1 path: if a checkpoint stride boundary lands
