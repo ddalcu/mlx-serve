@@ -7,6 +7,8 @@ import UniformTypeIdentifiers
 /// auto-routes to the right image backend by the model's `model_type`.
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
+    /// The enlarge side. Two services, one pane — see `ImagePanePreview`.
+    @EnvironmentObject var restore: RestoreService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
     /// For "Send to Chat" — the hand-off opens a new conversation and switches
@@ -29,6 +31,9 @@ struct ImageGenView: View {
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: ImageGenRequest? = nil
+    /// The enlarge waiting on the same RAM alert. Only one of this and
+    /// `pendingRequest` is ever set — the alert's confirm button reads which.
+    @State private var pendingEnlarge: String? = nil
     /// Keep the model resident after generating (default off → unload to free
     /// GPU memory). On → the next generation reuses it instantly.
     @State private var keepResident: Bool = false
@@ -43,9 +48,11 @@ struct ImageGenView: View {
     @State private var refImageURLs: [URL] = []
     /// img2img renoise strength: low = stay close to the source, high = mostly prompt.
     @State private var strength: Double = 0.6
-    /// Source-image mode: true = instruction edit (FLUX.2 in-context reference,
-    /// keeps the subject), false = variation (renoise remix).
-    @State private var editMode: Bool = true
+    /// What the attached source image is FOR: an instruction edit (FLUX.2
+    /// in-context reference, keeps the subject), a renoise variation, or a
+    /// SeedVR2 enlargement. Only meaningful while a source IS attached —
+    /// `effectiveVerb` is nil otherwise and the pane is text-to-image.
+    @State private var sourceVerb: ImageSourceVerb = .edit
     /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
@@ -63,32 +70,39 @@ struct ImageGenView: View {
     /// True while a drag carrying a file is hovering the source-image section
     /// — drives that section's dashed-border highlight and the well's fill.
     @State private var isDropTargeted: Bool = false
-    /// Create (text-to-image) vs Enhance (restore/upscale an existing photo,
-    /// SeedVR2). Two different pipelines behind one window — not persisted,
-    /// so the window always opens on Create.
-    @State private var paneMode: ImagePaneMode = .create
-    /// The photo the upscale controls act on. It lives HERE rather than in
-    /// `RestoreUpscaleView` because that view is destroyed every time the mode
-    /// flips back to Create — a picked photo would not survive a glance at the
-    /// prompt. Hoisting it is also what lets a finished generation be handed
-    /// straight over (`enlarge`) instead of re-found through a file panel.
-    @State private var upscaleSource: URL? = nil
     /// Set when a handoff can't proceed (the result file is gone). Shown as an
     /// alert rather than silently doing nothing, which is what a dead button
     /// looks like from the outside.
     @State private var handoffError: String? = nil
 
+    // ── Enlarge (SeedVR2) ───────────────────────────────────────────────
+    // A different model family behind the same source image, so it carries its
+    // own model pick and scale. Seed and Keep-loaded are deliberately NOT
+    // duplicated here: the pane has one Advanced section now.
+
+    @State private var restoreModel: RestoreModelPreset = .seedvr2_3b
+    /// Selected network restore model's routing id; nil = local.
+    @State private var restoreLanModel: String? = nil
+    /// 1 = restore only (same resolution, sharper/cleaner). SeedVR2 has no
+    /// upscaling of its own — a factor above 1x is a bicubic resize to that
+    /// target canvas BEFORE restoration, so the model fills in real detail at
+    /// the larger size instead of the resize just looking soft. Continuous, so
+    /// "1.5x" is a drag rather than a compromise between two menu items.
+    @State private var scale: Double = 2
+    /// Which service the single preview is following. Set when either one
+    /// finishes; `ImagePanePreview` turns it plus the two phases into what is
+    /// drawn. Never derived from the verb — that is what used to blank a
+    /// perfectly good picture the moment the controls changed.
+    @State private var previewFocus: ImagePanePreview.Origin? = nil
+
     var body: some View {
         // No window-sized floor: this is a PAGE of the chat window now, and a
         // root minimum wider than the detail column overflows it and clips
         // both edges. Small windows shrink the preview side instead.
-        switch paneMode {
-        case .create: createContent
-        case .upscale: RestoreUpscaleView(mode: $paneMode, source: $upscaleSource)
-        }
-    }
-
-    private var createContent: some View {
+        //
+        // ONE pane. There is no Create/Upscale switch: enlarging is a verb you
+        // apply to a source image, beside Edit and Variation, not a place you
+        // travel to and come back from.
         readyView
         .onAppear {
             if !didHydrate {
@@ -113,18 +127,43 @@ struct ImageGenView: View {
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: scale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: restoreModel) { _, _ in guard !hydrating else { return }; persist() }
+        // A model switch can take a verb away (Mage-Flow has no variation
+        // path). Re-point it here rather than at request time, so the picker
+        // never shows a selection the backend would 400 on.
+        .onChange(of: model) { _, m in
+            let resolved = ImageSourceVerb.resolve(sourceVerb, for: m)
+            if resolved != sourceVerb { sourceVerb = resolved }
+        }
+        // The preview follows whatever finished LAST, across both services.
+        .onChange(of: service.phase) { _, phase in
+            if case .completed = phase { previewFocus = .generated }
+        }
+        .onChange(of: restore.phase) { _, phase in
+            if case .completed = phase { previewFocus = .enlarged }
+        }
     }
 
     private var readyView: some View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    ImagePaneModeSwitcher(mode: $paneMode)
-                    promptSection
+                    // With no source attached this is text-to-image and reads
+                    // exactly as it always did: the prompt first. Attaching a
+                    // photo and choosing Enlarge is what drops the prompt and
+                    // brings the scale up — the source section becomes the
+                    // first thing on the page by consequence, not by a mode.
+                    if effectiveVerb != .enlarge { promptSection }
                     sourceImageSection
-                    modelSection
-                    qualitySection
-                    resolutionSection
+                    if effectiveVerb == .enlarge {
+                        scaleSection
+                        enlargeModelSection
+                    } else {
+                        modelSection
+                        qualitySection
+                        resolutionSection
+                    }
                     if showAdvanced { advancedSection } else { advancedToggle }
                     actionRow
                 }
@@ -142,10 +181,12 @@ struct ImageGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req, server: server) }
+            Button("Cancel", role: .cancel) { pendingRequest = nil; pendingEnlarge = nil }
+            Button(pendingEnlarge != nil ? "Enlarge Anyway" : "Generate Anyway", role: .destructive) {
+                if let path = pendingEnlarge { startEnlarge(sourcePath: path) }
+                else if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
+                pendingEnlarge = nil
             }
         } message: {
             Text(ramWarningMessage)
@@ -206,16 +247,22 @@ struct ImageGenView: View {
                 // variation path (Mage-Flow-Edit) would otherwise offer
                 // "Variation" and get a 400 back — and only once there is a
                 // source for it to apply to.
-                if initImageURL != nil && model.supportsReferenceEdit && model.supportsImg2Img {
-                    Picker("", selection: $editMode) {
-                        Text("Edit").tag(true)
-                        Text("Variation").tag(false)
+                // Three verbs now, not two: Enlarge joins Edit and Variation
+                // instead of living behind a top-level mode switch. Shown
+                // whenever the model offers more than one — on a txt2img-only
+                // preset the list is [.enlarge] alone, and a picker with one
+                // item is a label, so the hint below says it in words instead.
+                if initImageURL != nil, availableVerbs.count > 1 {
+                    Picker("", selection: $sourceVerb) {
+                        ForEach(availableVerbs) { v in
+                            Text(v.label).tag(v)
+                        }
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .controlSize(.small)
                     .fixedSize()
-                    .onChange(of: editMode) { _, _ in guard !hydrating else { return }; persist() }
+                    .onChange(of: sourceVerb) { _, _ in guard !hydrating else { return }; persist() }
                 }
             }
             if let url = initImageURL {
@@ -227,7 +274,13 @@ struct ImageGenView: View {
                     initImageURL = nil
                     refImageURLs = []
                 }
-                if effectiveEditMode {
+                if effectiveVerb == .enlarge {
+                    if let note = cropNote {
+                        Text(note).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Text("Enlarges the photo and restores real detail at the new size — not just a blurry resize. Runs SeedVR2, a different model from the one above.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else if effectiveEditMode {
                     ForEach(Array(refImageURLs.enumerated()), id: \.element) { i, ref in
                         imageRow(ref, number: numberedImageRows ? i + 2 : nil,
                                  help: "Remove this reference image") {
@@ -333,20 +386,22 @@ struct ImageGenView: View {
         effectiveEditMode && !refImageURLs.isEmpty
     }
 
-    /// What a source image is FOR on this model — instruction editing, a
-    /// renoise variation, or both. Never offers a mode the backend 400s on.
-    private var sourceImageButtonLabel: String {
-        model.supportsImg2Img ? "Choose image…" : "Choose image to edit…"
-    }
+    /// What a source image is FOR on this model. Derived from the same verb
+    /// list the picker draws, so the sentence and the control can never
+    /// disagree about what the backend will accept.
+    private var sourceImageButtonLabel: String { "Choose image…" }
 
     private var sourceImageHint: String {
-        switch (model.supportsReferenceEdit, model.supportsImg2Img) {
-        case (true, true):
-            return "Edit an existing image with an instruction, or generate a variation of it."
-        case (true, false):
-            return "Edit an existing image with an instruction — say what to change and the rest stays put."
+        switch availableVerbs {
+        case [.edit, .variation, .enlarge]:
+            return "Edit it with an instruction, remix it as a variation, or enlarge it."
+        case [.edit, .enlarge]:
+            return "Edit it with an instruction — say what to change and the rest stays put — or enlarge it."
+        case [.variation, .enlarge]:
+            return "Generate a variation of it guided by the prompt, or enlarge it."
         default:
-            return "Generate a variation of an existing image, guided by the prompt (image-to-image)."
+            // One verb: a picker would be a label, so the sentence carries it.
+            return "This model can't edit or remix a photo, so a source image here means one thing: enlarge it and restore detail."
         }
     }
 
@@ -483,6 +538,77 @@ struct ImageGenView: View {
         return customResolutionVerdict.size ?? (resolution.width, resolution.height)
     }
 
+    // MARK: - Enlarge (SeedVR2)
+
+    /// The source photo's pixel dimensions, or nil while nothing's picked /
+    /// the file can't be decoded.
+    private var sourcePixelSize: (width: Int, height: Int)? {
+        guard let url = initImageURL, let img = NSImage(contentsOf: url),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        return (cg.width, cg.height)
+    }
+
+    /// SeedVR2 needs both pixel dimensions divisible by 16 (`RestoreGeometry`)
+    /// — told UP FRONT rather than only discovered from the run log. nil when
+    /// the photo's already on-grid, or when scaling up (a resize hits the
+    /// target canvas exactly, so no crop is needed).
+    private var cropNote: String? {
+        guard scale <= 1, let (w, h) = sourcePixelSize else { return nil }
+        guard let crop = RestoreGeometry.centeredCrop(width: w, height: h) else { return nil }
+        return "Will be center-cropped to \(crop.width) × \(crop.height) — SeedVR2 needs both dimensions divisible by 16."
+    }
+
+    private var scaleSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Scale").font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(scale <= 1 ? "1× (restore only)" : RestoreGeometry.formatFactor(scale))
+                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+            Slider(value: $scale, in: 1...4, step: 0.1) {
+                Text("Scale")
+            } minimumValueLabel: {
+                Text("1×").font(.caption2).foregroundStyle(.secondary)
+            } maximumValueLabel: {
+                Text("4×").font(.caption2).foregroundStyle(.secondary)
+            }
+            .labelsHidden()
+            if let (w, h) = sourcePixelSize {
+                let t = scale > 1
+                    ? RestoreGeometry.upscaledTarget(width: w, height: h, factor: scale)
+                    : (width: RestoreGeometry.snap(w), height: RestoreGeometry.snap(h))
+                Text("\(w) × \(h) → \(t.width) × \(t.height)")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            // At 1x the model only cleans up what is there, which is the least
+            // obvious thing it does — so it is said in words, not left to a
+            // slider readout that disappears the moment you drag.
+            if scale <= 1 {
+                Text("Same size, cleaned up: sharpens detail and removes compression artifacts.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var enlargeModelSection: some View {
+        MediaModelChooser.pane(
+            all: RestoreModelPreset.all,
+            onThisMac: CustomMediaModels.restorePresets(from: server.allModels),
+            capability: "restore",
+            selected: $restoreModel, lanModel: $restoreLanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.restorePreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+    }
+
+    // MARK: - Advanced
+
     private var advancedToggle: some View {
         Button {
             withAnimation { showAdvanced = true }
@@ -513,21 +639,29 @@ struct ImageGenView: View {
             // the distilled ones. Steps stay overridable even where the schedule
             // is fixed — it's the Advanced panel, and the hint says the cost.
             HStack {
-                numberField("Steps", value: $steps, step: 1)
+                // Steps belong to the image schedule; an enlarge is one step
+                // by construction, so the field would be a lie there.
+                if effectiveVerb != .enlarge { numberField("Steps", value: $steps, step: 1) }
                 // -1 is the random sentinel and renders as an EMPTY box, so the
                 // placeholder explains it instead of a literal -1 that reads as
-                // a broken value.
+                // a broken value. ONE seed for the pane — a seed is a seed, and
+                // two of them was the duplicated shell in miniature.
                 SeedField(label: "Seed", placeholder: "random", range: -1...Int.max, value: $seed,
-                          help: "Same seed + same settings reproduces the image. Paste one to rerun someone else's; leave it empty for a new one each time.")
+                          help: "Same seed + same settings reproduces the result. Paste one to rerun someone else's; leave it empty for a new one each time.")
             }
-            if model.stepsAreFixed {
+            if effectiveVerb != .enlarge, model.stepsAreFixed {
                 Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            Toggle("Keep model loaded after generating", isOn: $keepResident)
+            Toggle("Keep model loaded afterwards", isOn: $keepResident)
                 .font(.caption)
-                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+                .help("On: the model stays resident so the next run is instant. Off (default): it's unloaded to free GPU memory.")
+            // Everything below is a property of the IMAGE model — safety
+            // filter, text-encoder rebalance, DiT LoRAs. None of it reaches
+            // SeedVR2, and a control the backend ignores is worse than one
+            // that isn't there.
+            if effectiveVerb == .enlarge { EmptyView() } else {
             Toggle("Safe mode (NSFW content filter)", isOn: $safeMode)
                 .font(.caption)
                 .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
@@ -624,18 +758,27 @@ struct ImageGenView: View {
                 }
             }
             } // model.supportsLoRA
+            } // image-model-only controls
         }
     }
 
-    /// Edit mode only applies where the model was trained for it; on models
-    /// without that training a source image always means variation. And where
-    /// editing is the ONLY thing a source image can do (no img2img path), a
-    /// source image means edit regardless of the toggle — the mode picker is
-    /// hidden in that case, so a stale `false` would otherwise send a variation
-    /// request the backend rejects.
-    private var effectiveEditMode: Bool {
-        model.supportsReferenceEdit && (editMode || !model.supportsImg2Img)
+    /// The verbs this model can serve, in picker order. `enlarge` is always
+    /// among them — it runs a different model family, so it is not a
+    /// capability of the image preset at all.
+    private var availableVerbs: [ImageSourceVerb] { ImageSourceVerb.available(for: model) }
+
+    /// What the pane is set up to do, or nil when there is no source image and
+    /// the pane is plain text-to-image. Resolved against the model so a verb it
+    /// cannot serve never reaches a request — the old `effectiveEditMode`
+    /// rule, generalised to three verbs.
+    private var effectiveVerb: ImageSourceVerb? {
+        guard initImageURL != nil else { return nil }
+        return ImageSourceVerb.resolve(sourceVerb, for: model)
     }
+
+    /// Kept as its own name because the request field and several sections
+    /// still ask exactly this question.
+    private var effectiveEditMode: Bool { effectiveVerb == .edit }
 
     /// True when the pane is set up to edit a real source image — the only
     /// situation where "Match source" is a meaningful output size.
@@ -656,14 +799,22 @@ struct ImageGenView: View {
         return ImageGenRequest.parseCondWeights(t)?.count == model.condWeightCount
     }
 
-    private func chooseSourceImage() {
+    /// `verb` is the one the picked photo should arrive on — the empty
+    /// preview's "Enlarge a photo…" is a verb and a file panel in one gesture,
+    /// not "attach something and then go find the mode".
+    private func chooseSourceImage(verb: ImageSourceVerb? = nil) {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
+        // Through AppActivation, never a raw `panel.runModal()`: this is an
+        // accessory app, so a picker opened without bringing it forward first
+        // comes up unfocused and swallows the click.
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
             initImageURL = url
+            if let verb { sourceVerb = verb }
+            persist()
         }
     }
 
@@ -720,23 +871,54 @@ struct ImageGenView: View {
         }
     }
 
+    /// The model the current verb actually runs. Enlarge is SeedVR2, not the
+    /// image preset — so the download bar, the ready check and the RAM gate
+    /// all have to ask the verb, not the pane.
+    private var activeBundleReady: Bool {
+        effectiveVerb == .enlarge
+            ? (restoreLanModel != nil || downloads.bundleReady(restoreModel.bundle))
+            : (lanModel != nil || downloads.bundleReady(model.bundle))
+    }
+
+    private var isRunning: Bool {
+        effectiveVerb == .enlarge ? restore.isRunning : service.isRunning
+    }
+
     private var actionRow: some View {
         VStack(spacing: 8) {
             // Progress only — the Download BUTTON lives on the model row above
             // (`MediaModelChooser`). Two buttons stacked here, one to fetch and
             // one to run, was the pane's most confusing moment.
-            if lanModel == nil && !downloads.bundleReady(model.bundle) {
+            //
+            // It follows the VERB, because picking Enlarge on a Mac that only
+            // has FLUX means a model it hasn't got — and that has to read as an
+            // answer to the choice just made, right under it.
+            if effectiveVerb == .enlarge {
+                if restoreLanModel == nil && !downloads.bundleReady(restoreModel.bundle) {
+                    BundleDownloadBar(bundle: restoreModel.bundle, showsStartButton: false)
+                }
+            } else if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
-                if service.isRunning {
+                if isRunning {
                     Button(role: .destructive) {
-                        service.cancel()
+                        if effectiveVerb == .enlarge { restore.cancel() } else { service.cancel() }
                     } label: {
                         Label("Cancel", systemImage: "stop.circle")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                } else if effectiveVerb == .enlarge {
+                    Button {
+                        tryEnlarge()
+                    } label: {
+                        Label("Enlarge", systemImage: "arrow.up.left.and.arrow.down.right")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(!activeBundleReady)
                 } else {
                     Button {
                         tryGenerate()
@@ -746,41 +928,55 @@ struct ImageGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid || !customSizeValid)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !activeBundleReady || !condWeightsValid || !customSizeValid)
                 }
             }
         }
     }
 
+    /// One preview, two services. `ImagePanePreview` decides what it shows
+    /// from the two phases plus the focus — never from the current verb, which
+    /// is what used to blank a perfectly good picture the moment the controls
+    /// changed.
     private var previewArea: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.black.opacity(0.15))
             Group {
-                switch service.phase {
-                case .idle:
+                switch ImagePanePreview.resolve(generate: generateRun,
+                                                enlarge: enlargeRun,
+                                                focus: previewFocus) {
+                case .empty:
                     ContentUnavailableView {
-                        Label("No generation yet", systemImage: "photo")
+                        Label("Nothing made yet", systemImage: "photo")
                     } description: {
-                        Text("Enter a prompt and press Generate.")
+                        Text("Write a prompt and press Generate — or bring in a photo you already have.")
                     } actions: {
-                        // The other way in. A photo from the camera roll has
-                        // no result to press Enlarge on, and the mode picker
-                        // is not where anyone looks for "I already have one".
-                        Button("Upscale a photo instead") { paneMode = .upscale }
+                        // The other door. A photo from the camera roll has no
+                        // result to press Enlarge on, and nobody looks for
+                        // "I already have one" in a model picker.
+                        Button("Enlarge a photo…") { chooseSourceImage(verb: .enlarge) }
                     }
-                case .running(let step, let total, let message):
+                case .running(.generated, let message):
                     VStack(spacing: 12) {
-                        ProgressView(value: Double(step), total: max(1, Double(total)))
+                        ProgressView(value: Double(generateStep.step), total: max(1, Double(generateStep.total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)
                         Text(message).font(.footnote).foregroundStyle(.secondary)
                     }
-                case .completed(let path):
-                    completedPreview(path: path)
-                case .failed(let msg):
+                case .running(.enlarged, let message):
+                    // No step events on this endpoint — one request, minutes of
+                    // GPU — so an indeterminate spinner is the honest shape.
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                    }
+                case .result(let origin, let path):
+                    completedPreview(path: path, origin: origin)
+                case .failed(let origin, let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label(origin == .enlarged ? "Enlarge failed" : "Generation failed",
+                              systemImage: "exclamationmark.triangle")
                     } description: {
                         Text(msg)
                     } actions: {
@@ -792,7 +988,35 @@ struct ImageGenView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func completedPreview(path: String) -> some View {
+    /// The two services' phases flattened for `ImagePanePreview`.
+    private var generateRun: ImagePanePreview.Run {
+        switch service.phase {
+        case .idle: return .idle
+        case .running(_, _, let message): return .running(message)
+        case .completed(let path): return .done(path)
+        case .failed(let msg): return .failed(msg)
+        }
+    }
+
+    private var enlargeRun: ImagePanePreview.Run {
+        switch restore.phase {
+        case .idle: return .idle
+        case .running(let message): return .running(message)
+        case .completed(let path): return .done(path)
+        case .failed(let msg): return .failed(msg)
+        }
+    }
+
+    /// The determinate bar's numbers, which only the generate side has.
+    private var generateStep: (step: Int, total: Int) {
+        if case .running(let step, let total, _) = service.phase { return (step, total) }
+        return (0, 1)
+    }
+
+    /// One result, one action set — whichever service produced it. The Upscale
+    /// pane used to offer Reveal alone, so the same picture got different
+    /// options depending on how it was made.
+    private func completedPreview(path: String, origin: ImagePanePreview.Origin) -> some View {
         VStack(spacing: 8) {
             if let img = NSImage(contentsOfFile: path) {
                 Image(nsImage: img)
@@ -825,16 +1049,25 @@ struct ImageGenView: View {
                 // or an NSOpenPanel aimed at the app's own output folder.
                 Button { enlarge(path) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                 .buttonStyle(.borderless)
-                .help("Enlarge — upscale and restore detail with SeedVR2")
+                .help(origin == .enlarged
+                      ? "Enlarge again — run this result through SeedVR2 once more"
+                      : "Enlarge — upscale and restore detail with SeedVR2")
             }
         }
         .padding(8)
     }
 
+    /// SeedVR2 output always lands in `upscales/`, whatever it came from — one
+    /// rule, so a result's folder never depends on how you got to it. The link
+    /// follows the verb so it opens the folder the next run will write to.
+    private var outputRoot: String {
+        effectiveVerb == .enlarge ? MediaStorage.upscalesRoot : MediaStorage.imagesRoot
+    }
+
     private var outputFolderLink: some View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting(
-                [URL(fileURLWithPath: MediaStorage.imagesRoot)]
+                [URL(fileURLWithPath: outputRoot)]
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
@@ -842,7 +1075,7 @@ struct ImageGenView: View {
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(MediaStorage.imagesRoot)
+        .help(outputRoot)
     }
 
     // MARK: - Sticky settings
@@ -862,7 +1095,7 @@ struct ImageGenView: View {
         safeMode = s.safeMode
         keepResident = s.keepResident
         strength = s.strength
-        editMode = s.editMode
+        sourceVerb = s.sourceVerb
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         loras = s.loras
@@ -870,6 +1103,12 @@ struct ImageGenView: View {
         customHeightText = String(s.customHeight)
         // A LoRA file may have moved since last session — drop stale entries.
         loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
+        // The enlarge side keeps its own model and scale; seed and
+        // keep-resident are the pane's, above.
+        let r = RestoreGenSettings.load()
+        restoreModel = r.resolvedModel(models: server.allModels)
+        restoreLanModel = LanPick.lanId(r.modelId)
+        scale = r.scale
     }
 
     /// Capture the current controls as the new last-used settings.
@@ -888,11 +1127,13 @@ struct ImageGenView: View {
         s.safeMode = safeMode
         s.keepResident = keepResident
         s.strength = strength
-        s.editMode = editMode
+        s.sourceVerb = sourceVerb
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loras = loras
         s.save()
+        RestoreGenSettings(modelId: LanPick.persisted(lanModel: restoreLanModel, presetId: restoreModel.id),
+                           scale: scale).save()
     }
 
     // MARK: - Actions
@@ -953,13 +1194,52 @@ struct ImageGenView: View {
     private func enlarge(_ path: String) {
         switch ImageSourceHandoff.resolve(path: path, isRunning: appState.restoreGen.isRunning) {
         case .accepted(let url):
-            upscaleSource = url
-            paneMode = .upscale
+            initImageURL = url
+            refImageURLs = []
+            sourceVerb = .enlarge
+            persist()
         case .missing(let name):
             handoffError = "\(name) is no longer in the output folder, so there is nothing to enlarge."
         case .busy:
-            handoffError = "An upscale is already running. Cancel it first, or wait for it to finish."
+            handoffError = "An enlarge is already running. Cancel it first, or wait for it to finish."
         }
+    }
+
+    /// Soft gate — same shape as `tryGenerate`, plus the one gate generation
+    /// does not need: the TARGET canvas, not the model, is what makes a
+    /// restore run out of memory, and the server only discovers that after
+    /// the checkpoint has loaded, which is minutes. Say it here, while it is
+    /// still one drag of the slider to fix.
+    private func tryEnlarge() {
+        guard let source = initImageURL else { return }
+        persist()
+
+        let total = RAMChecker.totalGB
+        let needed = restoreModel.approxRAMGB
+        if total < needed {
+            ramWarningMessage = "This model needs about \(needed) GB of RAM, but your Mac has \(total) GB total. It may run very slowly or fail. Continue?"
+            pendingEnlarge = source.path
+            showRAMWarning = true
+            return
+        }
+        if let (w, h) = sourcePixelSize {
+            let t = scale > 1
+                ? RestoreGeometry.upscaledTarget(width: w, height: h, factor: scale)
+                : (width: RestoreGeometry.snap(w), height: RestoreGeometry.snap(h))
+            if let msg = RestoreGeometry.memoryWarning(targetWidth: t.width, targetHeight: t.height,
+                                                      modelGB: needed, totalRAMGB: total) {
+                ramWarningMessage = msg
+                pendingEnlarge = source.path
+                showRAMWarning = true
+                return
+            }
+        }
+        startEnlarge(sourcePath: source.path)
+    }
+
+    private func startEnlarge(sourcePath: String) {
+        restore.restore(sourcePath: sourcePath, model: restoreModel, lanModelId: restoreLanModel,
+                        scale: scale, seed: seed, keepResident: keepResident, server: server)
     }
 
     private func showLogWindow() {

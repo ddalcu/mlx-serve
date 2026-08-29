@@ -124,23 +124,6 @@ enum CustomResolution: Equatable {
     }
 }
 
-// MARK: - Image window mode
-
-/// The Image Generation window's top-level switch: Create (text-to-image)
-/// vs Upscale (restore/upscale an existing photo). Two different pipelines
-/// — generation vs restoration — sharing one window because both start from
-/// "I want a better picture." Internal identifiers stay "restore"
-/// (`RestoreModelPreset`, `RestoreService`) to match the server's own
-/// capability name; "Upscale" is what the user reads, since that's what
-/// they're actually asking for — a bigger, cleaner image.
-enum ImagePaneMode: String, CaseIterable, Identifiable {
-    case create = "Create"
-    case upscale = "Upscale"
-
-    var id: String { rawValue }
-    var label: String { rawValue }
-}
-
 // MARK: - Image presets
 
 /// mflux variant — picks the model class and `ModelConfig` factory the

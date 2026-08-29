@@ -22,6 +22,8 @@ struct LoraAdapter: Codable, Equatable, Identifiable {
 /// UserDefaults blob into the new `loras` array. Not tied to any stored
 /// property, so it can't be part of either struct's synthesized CodingKeys.
 private enum LegacyLoraCodingKeys: String, CodingKey { case loraPath, loraScale }
+/// Pre-verb image settings: `editMode` retired into `ImageSourceVerb`.
+private enum LegacyImageCodingKeys: String, CodingKey { case editMode }
 
 /// Bounds for a drag-resizable prompt editor. The height is persisted, so a
 /// value dragged on a taller window — or a garbage one — must never come back
@@ -67,8 +69,10 @@ struct ImageGenSettings: Codable, Equatable {
     /// img2img renoise strength (the source image path itself is transient —
     /// not persisted, like video's first-frame).
     var strength: Double = 0.6
-    /// Source-image mode: instruction edit (FLUX.2) vs renoise variation.
-    var editMode: Bool = true
+    /// What an attached source image is FOR: instruction edit, renoise
+    /// variation, or SeedVR2 enlargement. Replaces the old `editMode: Bool`,
+    /// which could only say two of the three (migrated in `init(from:)`).
+    var sourceVerb: ImageSourceVerb = .edit
     /// Conditioning rebalance (Advanced): global gain + weights text.
     var condGain: Double = 1.0
     var condWeightsText: String = ""
@@ -155,7 +159,17 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .safeMode) { safeMode = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .strength) { strength = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .editMode) { editMode = v }
+        if let v = try c.decodeIfPresent(ImageSourceVerb.self, forKey: .sourceVerb) {
+            sourceVerb = v
+        } else {
+            // Pre-verb blob: a two-valued `editMode` flag, no longer a stored
+            // property, so it cannot ride the synthesized CodingKeys and needs
+            // its own container — the multi-LoRA migration's shape.
+            let legacy = try decoder.container(keyedBy: LegacyImageCodingKeys.self)
+            if let e = try legacy.decodeIfPresent(Bool.self, forKey: .editMode) {
+                sourceVerb = e ? .edit : .variation
+            }
+        }
         if let v = try c.decodeIfPresent(Double.self, forKey: .condGain) { condGain = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .condWeightsText) { condWeightsText = v }
         if let v = try c.decodeIfPresent([LoraAdapter].self, forKey: .loras), !v.isEmpty {
@@ -462,8 +476,6 @@ struct RestoreGenSettings: Codable, Equatable {
     /// larger canvas rather than the resize just looking soft. Continuous
     /// (slider-driven, 0.1 steps from 1 to 4) rather than fixed 1/2/4 stops.
     var scale: Double = 2
-    var seed: Int = -1
-    var keepResident: Bool = false
 
     private static let storageKey = "restoreGenSettings"
 
@@ -497,8 +509,10 @@ extension RestoreGenSettings {
         // A build before this change persisted an Int (1/2/4); JSON has no
         // type tag, so decoding straight to Double reads those the same way.
         if let v = try c.decodeIfPresent(Double.self, forKey: .scale) { scale = v }
-        if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        // `seed` and `keepResident` used to live here too. The unified pane has
+        // ONE Advanced section, so they are read from `ImageGenSettings`
+        // whichever verb is running — a seed is a seed. Older blobs keep the
+        // retired keys; nothing asks for them.
     }
 }
 
