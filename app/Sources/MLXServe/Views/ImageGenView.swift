@@ -89,11 +89,15 @@ struct ImageGenView: View {
     /// the larger size instead of the resize just looking soft. Continuous, so
     /// "1.5x" is a drag rather than a compromise between two menu items.
     @State private var scale: Double = 2
-    /// Which service the single preview is following. Set when either one
-    /// finishes; `ImagePanePreview` turns it plus the two phases into what is
-    /// drawn. Never derived from the verb — that is what used to blank a
-    /// perfectly good picture the moment the controls changed.
-    @State private var previewFocus: ImagePanePreview.Origin? = nil
+    /// The strip row the preview is showing, by path. Set when either service
+    /// finishes and when a row is clicked; `ImagePanePreview` turns it plus the
+    /// two phases into what is drawn. Never derived from the verb — that is
+    /// what used to blank a perfectly good picture the moment the controls
+    /// changed.
+    @State private var selectedPath: String? = nil
+    /// Set when a delete can't go through, so a failed Move to Trash says so
+    /// instead of looking like a dead menu item.
+    @State private var deleteError: String? = nil
 
     var body: some View {
         // No window-sized floor: this is a PAGE of the chat window now, and a
@@ -136,12 +140,13 @@ struct ImageGenView: View {
             let resolved = ImageSourceVerb.resolve(sourceVerb, for: m)
             if resolved != sourceVerb { sourceVerb = resolved }
         }
-        // The preview follows whatever finished LAST, across both services.
+        // A finished run selects itself, so it lands in the preview AND is
+        // highlighted in the strip — one notion of "what you're looking at".
         .onChange(of: service.phase) { _, phase in
-            if case .completed = phase { previewFocus = .generated }
+            if case .completed(let path) = phase { selectedPath = path }
         }
         .onChange(of: restore.phase) { _, phase in
-            if case .completed = phase { previewFocus = .enlarged }
+            if case .completed(let path) = phase { selectedPath = path }
         }
     }
 
@@ -173,6 +178,7 @@ struct ImageGenView: View {
 
             VStack(spacing: 12) {
                 previewArea
+                sessionStrip
                 outputFolderLink
             }
             .padding(16)
@@ -190,6 +196,13 @@ struct ImageGenView: View {
             }
         } message: {
             Text(ramWarningMessage)
+        }
+        .alert("Couldn't delete", isPresented: Binding(
+            get: { deleteError != nil },
+            set: { if !$0 { deleteError = nil } })) {
+            Button("OK", role: .cancel) { deleteError = nil }
+        } message: {
+            Text(deleteError ?? "")
         }
         .alert("Can't enlarge this", isPresented: Binding(
             get: { handoffError != nil },
@@ -945,7 +958,7 @@ struct ImageGenView: View {
             Group {
                 switch ImagePanePreview.resolve(generate: generateRun,
                                                 enlarge: enlargeRun,
-                                                focus: previewFocus) {
+                                                selected: selectedItem) {
                 case .empty:
                     ContentUnavailableView {
                         Label("Nothing made yet", systemImage: "photo")
@@ -986,6 +999,21 @@ struct ImageGenView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Everything this pane has made, newest first — both services' outputs on
+    /// one timeline. Rebuilt from the two `recent` lists, which each survive a
+    /// relaunch by scanning the output folders.
+    private var sessionItems: [MediaSessionItem] {
+        MediaSessionStrip.items(generated: service.recent, enlarged: restore.recent)
+    }
+
+    /// The selected row, or nil. A path that has left the strip (deleted
+    /// elsewhere, folder cleared) selects nothing rather than drawing a
+    /// preview of a file that is gone.
+    private var selectedItem: MediaSessionItem? {
+        guard let selectedPath else { return nil }
+        return sessionItems.first { $0.path == selectedPath }
     }
 
     /// The two services' phases flattened for `ImagePanePreview`.
@@ -1055,6 +1083,124 @@ struct ImageGenView: View {
             }
         }
         .padding(8)
+    }
+
+    // MARK: - Session strip
+
+    /// Everything made here, as a film strip under the preview. A generated
+    /// image used to exist on screen for exactly as long as the next one took
+    /// to arrive; this is the pane's memory of its own session.
+    @ViewBuilder
+    private var sessionStrip: some View {
+        let items = sessionItems
+        if !items.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                // Lazy: a plain HStack builds all 60 rows on every body pass,
+                // and each row reads a file.
+                LazyHStack(spacing: 6) {
+                    ForEach(items) { item in
+                        stripTile(item)
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 2)
+            }
+            .frame(height: 66)
+        }
+    }
+
+    private func stripTile(_ item: MediaSessionItem) -> some View {
+        let selected = item.path == selectedPath
+        return Button {
+            selectedPath = item.path
+        } label: {
+            ZStack(alignment: .bottomTrailing) {
+                if let img = MediaThumbnails.cached(path: item.path) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 56, height: 56)
+                        .clipped()
+                } else {
+                    // The file went away under us — the tile stays so the row
+                    // can still be selected and deleted rather than becoming
+                    // an invisible gap.
+                    RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.15))
+                        .frame(width: 56, height: 56)
+                        .overlay(Image(systemName: "questionmark").foregroundStyle(.secondary))
+                }
+                // An enlarged picture is marked, because at thumbnail size it
+                // looks exactly like the one it came from.
+                if item.origin == .enlarged {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .padding(3)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 4))
+                        .padding(3)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(selected ? Color.accentColor : Color.secondary.opacity(0.25),
+                            lineWidth: selected ? 2 : 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(item.filename)
+        .contextMenu {
+            Button("Use as Source") { useAsSource(item) }
+            Button("Enlarge") { enlarge(item.path) }
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+            }
+            Divider()
+            // Trash, never unlink: this is the user's own picture, and the
+            // recoverable verb is the only one an app should offer for it.
+            Button("Move to Trash", role: .destructive) { moveToTrash(item) }
+        }
+    }
+
+    /// Put a strip row back into the controls as the source image, on whatever
+    /// verb is currently selected — the strip's other job is being the input
+    /// tray, not just the output shelf.
+    private func useAsSource(_ item: MediaSessionItem) {
+        switch ImageSourceHandoff.resolve(path: item.path, isRunning: isRunning) {
+        case .accepted(let url):
+            initImageURL = url
+            refImageURLs = []
+            persist()
+        case .missing(let name):
+            handoffError = "\(name) is no longer in the output folder."
+        case .busy:
+            handoffError = "A run is already going. Cancel it first, or wait for it to finish."
+        }
+    }
+
+    /// Move a result to the Trash and drop it from the strip. The selection
+    /// lands on the neighbour rather than nothing — clearing out a run of bad
+    /// results is the reason this exists, and blanking the preview after every
+    /// one makes the pane feel like it lost its place.
+    private func moveToTrash(_ item: MediaSessionItem) {
+        let next = MediaSessionStrip.selectionAfterDelete(sessionItems,
+                                                          removing: item.path,
+                                                          selected: selectedPath)
+        do {
+            try FileManager.default.trashItem(at: URL(fileURLWithPath: item.path),
+                                              resultingItemURL: nil)
+        } catch {
+            deleteError = "Could not move \(item.filename) to the Trash: \(error.localizedDescription)"
+            return
+        }
+        // The services own their own lists, and each also holds the path in a
+        // `.completed` phase — both have to let go or the strip redraws the
+        // row from memory and the preview keeps pointing at a trashed file.
+        switch item.origin {
+        case .generated: service.forget(path: item.path)
+        case .enlarged: restore.forget(path: item.path)
+        }
+        MediaThumbnails.forget(path: item.path)
+        selectedPath = next
     }
 
     /// SeedVR2 output always lands in `upscales/`, whatever it came from — one

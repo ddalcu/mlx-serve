@@ -263,6 +263,14 @@ final class ImageGenService: ObservableObject {
         if log.count > 400 { log.removeFirst(log.count - 400) }
     }
 
+    /// Drop a path the user has deleted. The list AND a `.completed` phase can
+    /// each hold it, and a phase left pointing at a trashed file redraws it in
+    /// the preview from `NSImage`'s own cache — so both let go together.
+    func forget(path: String) {
+        recent.removeAll { $0 == path }
+        if case .completed(let p) = phase, p == path { phase = .idle }
+    }
+
     private func insertRecent(_ path: String) {
         recent.removeAll { $0 == path }
         recent.insert(path, at: 0)

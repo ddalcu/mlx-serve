@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import ImageIO
 
 /// Pure flow logic for the Image pane — the decisions that have to hold
 /// whether or not a view is on screen, kept out of the view so they can be
@@ -97,10 +99,10 @@ extension ImageSourceVerb {
 /// Generation and enlargement are separate services with separate phases, and
 /// the preview used to belong to whichever PANE was mounted — so setting up an
 /// enlarge threw away the generated image you were looking at. Deciding this
-/// from the two phases plus a focus (set when a run finishes) instead of from
-/// the current verb is what makes that impossible: `resolve` deliberately
-/// takes no verb, because what is on screen is a property of what has
-/// FINISHED, not of what the controls are set to.
+/// from the two phases plus the selected strip row instead of from the current
+/// verb is what makes that impossible: `resolve` deliberately takes no verb,
+/// because what is on screen is a property of what has been MADE and what the
+/// user picked out of it, not of what the controls are set to.
 enum ImagePanePreview {
 
     /// Which service produced what is being shown. Kept through to the view
@@ -125,14 +127,16 @@ enum ImagePanePreview {
         case failed(Origin, String)
     }
 
-    static func resolve(generate: Run, enlarge: Run, focus: Origin?) -> State {
+    /// - Parameter selected: the strip row the user is looking at. Set on
+    ///   every completion too, so a finished run selects itself.
+    static func resolve(generate: Run, enlarge: Run, selected: MediaSessionItem?) -> State {
         // A run in flight always wins: it is the only thing on screen that is
-        // still changing. With both somehow in flight the focus breaks the
+        // still changing. With both somehow in flight the selection breaks the
         // tie, so the answer is stable rather than order-dependent.
         let running: [(Origin, Run)] = [(.generated, generate), (.enlarged, enlarge)]
             .filter { if case .running = $0.1 { return true } else { return false } }
-        if running.count == 2, let focus,
-           let pick = running.first(where: { $0.0 == focus }),
+        if running.count == 2, let origin = selected?.origin,
+           let pick = running.first(where: { $0.0 == origin }),
            case .running(let msg) = pick.1 {
             return .running(pick.0, msg)
         }
@@ -140,18 +144,150 @@ enum ImagePanePreview {
             return .running(origin, msg)
         }
 
-        // Otherwise the focus names which finished run to show, and a focus
-        // whose side has nothing to say falls through to the other rather than
-        // blanking a picture that is still perfectly good.
-        let order: [(Origin, Run)] = focus == .enlarged
-            ? [(.enlarged, enlarge), (.generated, generate)]
-            : [(.generated, generate), (.enlarged, enlarge)]
-        for (origin, run) in order {
-            if case .done(let path) = run { return .result(origin, path) }
-        }
-        for (origin, run) in order {
+        // Then whatever is selected — which is how picking an older picture out
+        // of the strip brings it back, and how a just-finished run takes over.
+        if let selected { return .result(selected.origin, selected.path) }
+
+        // A failure has no row to select and is news, so it takes the preview.
+        for (origin, run) in [(Origin.generated, generate), (.enlarged, enlarge)] {
             if case .failed(let msg) = run { return .failed(origin, msg) }
         }
+        // Last resort: the pane can be remounted while a service still holds a
+        // finished run from an earlier visit, before anything has selected it.
+        for (origin, run) in [(Origin.generated, generate), (.enlarged, enlarge)] {
+            if case .done(let path) = run { return .result(origin, path) }
+        }
         return .empty
+    }
+}
+
+// MARK: - The session strip
+
+/// One picture this pane has made.
+struct MediaSessionItem: Identifiable, Equatable {
+    let path: String
+    let origin: ImagePanePreview.Origin
+
+    var id: String { path }
+    var filename: String { (path as NSString).lastPathComponent }
+}
+
+/// Everything the Image pane has produced, as one timeline.
+///
+/// Generation and enlargement write to different folders and are tracked by
+/// different services, but "what have I made" is one question — so the strip
+/// interleaves them. Grouping by which service produced a picture is a
+/// distinction nobody is looking for.
+enum MediaSessionStrip {
+
+    /// How many rows the strip holds. Each service already caps its own
+    /// `recent` at 60; this is the cap on the merged view of them.
+    static let limit = 60
+
+    /// The `yyyy-MM-dd_HH-mm-ss` stamp both writers put at the head of every
+    /// output filename, or nil for a file that arrived some other way (the
+    /// output folders are ordinary folders and `recent` scans whatever is in
+    /// them). Reading the name is what lets the merge order 120 files without
+    /// stat-ing any of them on every redraw.
+    static func timestampKey(_ path: String) -> String? {
+        let name = (path as NSString).lastPathComponent
+        guard name.count >= 19 else { return nil }
+        let stamp = String(name.prefix(19))
+        // yyyy-MM-dd_HH-mm-ss — check the shape, not just the length, so a
+        // file called "2026 summer holiday.png" isn't read as a date.
+        let separators: [(Int, Character)] = [(4, "-"), (7, "-"), (10, "_"), (13, "-"), (16, "-")]
+        let chars = Array(stamp)
+        for (i, c) in separators where chars[i] != c { return nil }
+        for (i, c) in chars.enumerated() where !separators.contains(where: { $0.0 == i }) {
+            guard c.isNumber else { return nil }
+        }
+        return stamp
+    }
+
+    /// Newest first. A file with no readable stamp keeps its place in the list
+    /// but sorts last — dropping it would make the strip disagree with the
+    /// folder the "Open output folder" link opens.
+    static func items(generated: [String], enlarged: [String], limit: Int = limit) -> [MediaSessionItem] {
+        let all = generated.map { MediaSessionItem(path: $0, origin: .generated) }
+            + enlarged.map { MediaSessionItem(path: $0, origin: .enlarged) }
+        return all
+            .enumerated()
+            .sorted { a, b in
+                let ka = timestampKey(a.element.path) ?? ""
+                let kb = timestampKey(b.element.path) ?? ""
+                // Descending by stamp; the original index breaks ties so the
+                // order is stable rather than dependent on the sort's internals.
+                if ka != kb { return ka > kb }
+                return a.offset < b.offset
+            }
+            .prefix(limit)
+            .map(\.element)
+    }
+
+    /// What stays selected once `path` is gone.
+    ///
+    /// Clearing out a run of bad results is the reason delete exists, and a
+    /// strip that blanks the preview after every one makes the app feel like it
+    /// lost its place. The next picture is right there, so it takes over; at
+    /// the end of the list the previous one does. Only an emptied strip
+    /// legitimately clears the selection.
+    static func selectionAfterDelete(_ items: [MediaSessionItem],
+                                     removing path: String,
+                                     selected: String?) -> String? {
+        guard selected == path, let i = items.firstIndex(where: { $0.path == path }) else {
+            return selected
+        }
+        if i + 1 < items.count { return items[i + 1].path }
+        if i > 0 { return items[i - 1].path }
+        return nil
+    }
+}
+/// Strip thumbnails.
+///
+/// A strip row is 56pt and the pane's own output runs to 4096 square, with 60
+/// rows in the list — `NSImage(contentsOfFile:)` on every SwiftUI body pass
+/// decodes all of that at full size. `CGImageSource` reads a REDUCED image
+/// straight from the file instead (using an embedded thumbnail where the
+/// encoder wrote one), and the results are cached by path so a redraw costs
+/// nothing.
+enum MediaThumbnails {
+
+    /// Longest edge, in pixels, of a cached thumbnail. 2x the 56pt tile, so it
+    /// stays sharp on Retina without holding full frames in memory.
+    static let maxPixel = 128
+
+    private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 200
+        return c
+    }()
+
+    /// nil when the file is unreadable — the strip keeps the row anyway, so it
+    /// can still be selected and moved to the Trash.
+    static func load(path: String, maxPixel: Int = maxPixel) -> NSImage? {
+        let url = URL(fileURLWithPath: path)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else {
+            return nil
+        }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    /// Cached by path. Deleting a picture drops its entry, so a path reused by
+    /// a later run never draws the old picture.
+    static func cached(path: String) -> NSImage? {
+        if let hit = cache.object(forKey: path as NSString) { return hit }
+        guard let img = load(path: path) else { return nil }
+        cache.setObject(img, forKey: path as NSString)
+        return img
+    }
+
+    static func forget(path: String) {
+        cache.removeObject(forKey: path as NSString)
     }
 }
