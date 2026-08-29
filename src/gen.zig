@@ -21,6 +21,7 @@ const mage_flow_mod = @import("mage_flow.zig");
 const sdxl_mod = @import("sdxl.zig");
 const sdxl_pipeline = @import("sdxl_pipeline.zig");
 const sdxl_unet = @import("sdxl_unet.zig");
+const sd1_pipeline = @import("sd1_pipeline.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -97,6 +98,7 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "sdxl",
+    "sd1",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -104,6 +106,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "sdxl")) return .image;
+    if (std.mem.eql(u8, model_type, "sd1")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -176,6 +179,10 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // model_index.json. Same predicate discovery uses (`sdxl.indexDeclaresSdxl`),
     // so `list` and the loader cannot disagree about whether a dir is a model.
     if (isSdxlRepo(io, allocator, model_dir)) return allocator.dupe(u8, "sdxl") catch null;
+    // SD 1.x is the same shape one level down: a diffusers repo whose
+    // identity lives only in model_index.json, and the SDXL check above
+    // already ruled out the second tower that would make it SDXL.
+    if (isSd1Repo(io, allocator, model_dir)) return allocator.dupe(u8, "sd1") catch null;
     // Same for an mflux FLUX.2 conversion with no config.json at all (the only
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
@@ -204,6 +211,24 @@ fn isSdxlRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) b
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
     return discovery.peekSdxlSingleFile(io, allocator, dir);
+}
+
+/// True when `model_dir/model_index.json` declares an SD 1.x pipeline. Same
+/// shape as `isSdxlRepo`, minus the single-file fallback: `sdxl_single_file`
+/// converts decode-only and has no SD 1.x key map, so a Civitai/A1111 SD 1.x
+/// checkpoint is not yet a model this server can load.
+fn isSd1Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+        defer allocator.free(content);
+        return sdxl_mod.indexDeclaresSd1(allocator, content);
+    } else |_| {}
+    return false;
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -474,6 +499,7 @@ const ImageBackend = union(enum) {
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
     sdxl: *sdxl_pipeline.Engine,
+    sd1: *sd1_pipeline.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -571,6 +597,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .sdxl = try sdxl_pipeline.Engine.loadAuto(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "sd1")) {
+                self.backend = .{ .sd1 = try sd1_pipeline.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -583,6 +613,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
             .sdxl => |x| x.deinit(),
+            .sd1 => |x| x.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -593,6 +624,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
             .sdxl => |x| x.s,
+            .sd1 => |x| x.s,
         };
     }
 
@@ -603,6 +635,7 @@ pub const ImageEngine = struct {
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
             .sdxl => 0, // SDXL taps no intermediate encoder layers
+            .sd1 => 0, // same reason — no intermediate-layer taps
         };
     }
 
@@ -615,6 +648,7 @@ pub const ImageEngine = struct {
             // False on a single-file checkpoint (Pony/NoobAI): the LDM
             // converter is decode-only, so `x.vae_enc` is null there.
             .sdxl => |x| x.vae_enc != null,
+            .sd1 => |x| x.vae_enc != null,
         };
     }
 
@@ -626,6 +660,7 @@ pub const ImageEngine = struct {
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
             .sdxl => false, // base SDXL has no instruction-edit training
+            .sd1 => false, // base SD 1.x has no instruction-edit training either
         };
     }
 
@@ -662,6 +697,12 @@ pub const ImageEngine = struct {
                 .krea => .krea2,
                 .mage_flow => .generic,
                 .sdxl => .sdxl,
+                // SD 1.x's UNet is an `sdxl_unet.Unet` too (same module tree,
+                // same kohya/diffusers LDM key convention, just fewer/narrower
+                // stages) — `lora.canonicalizeSdxl`'s index substitution is
+                // stage-count-agnostic, so it binds an SD 1.x adapter the same
+                // way it binds an SDXL one.
+                .sd1 => .sd1,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -674,6 +715,7 @@ pub const ImageEngine = struct {
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             .sdxl => |x| sdxl_unet.attachLora(&x.unet, &stack),
+            .sd1 => |x| sdxl_unet.attachLora(&x.unet, &stack),
         };
         if (matched == 0) {
             stack.deinit();
@@ -690,6 +732,7 @@ pub const ImageEngine = struct {
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
             .sdxl => |x| sdxl_unet.detachLora(&x.unet),
+            .sd1 => |x| sdxl_unet.detachLora(&x.unet),
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -738,6 +781,20 @@ pub const ImageEngine = struct {
                     .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
                 }, progress);
             },
+            .sd1 => |x| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
+                break :blk x.generate(prompt, .{
+                    .width = width,
+                    .height = height,
+                    .steps = steps,
+                    .guidance = opts.guidance,
+                    .seed = seed,
+                    .negative_prompt = opts.negative_prompt,
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                }, progress);
+            },
         };
     }
 
@@ -761,6 +818,7 @@ pub const ImageEngine = struct {
             // bucket list and drifts off-distribution between them, so the snap
             // is to 64 rather than to the 8 the latent arithmetic would allow.
             .sdxl => .{ .w = clampSdxlDim(req_w), .h = clampSdxlDim(req_h) },
+            .sd1 => .{ .w = clampSd1Dim(req_w), .h = clampSd1Dim(req_h) },
         };
     }
 
@@ -773,6 +831,7 @@ pub const ImageEngine = struct {
             .flux => 1536,
             .krea, .mage_flow => 2048,
             .sdxl => 2048,
+            .sd1 => 1536,
         };
     }
 
@@ -802,6 +861,17 @@ pub fn clampSdxlDim(v: u32) u32 {
     if (v == 0) return 1024;
     const rounded = ((v + 63) / 64) * 64;
     return std.math.clamp(rounded, 512, 2048);
+}
+
+/// Round a requested dimension to a multiple of 64 in [256, 1536], defaulting
+/// to SD 1.x's native 512. Same /64 training-bucket reasoning as SDXL's
+/// clamp, at SD 1.x's own trained scale — its VAE downsamples by 8 too, but
+/// the checkpoint was trained at 512 (occasionally 768), and drifts further
+/// off-distribution past 1024 than a wider ceiling would suggest.
+pub fn clampSd1Dim(v: u32) u32 {
+    if (v == 0) return 512;
+    const rounded = ((v + 63) / 64) * 64;
+    return std.math.clamp(rounded, 256, 1536);
 }
 
 /// Round a requested dimension to a multiple of 16 in [256, 2048] (Krea's

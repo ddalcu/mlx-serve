@@ -391,9 +391,9 @@ pub const Engine = struct {
         var ids_g = try self.tok_g.encode(a, text);
         defer ids_g.deinit();
 
-        var enc_l = try self.tower_l.encode(ids_l.ids, ids_l.eos_index);
+        var enc_l = try self.tower_l.encode(ids_l.ids, ids_l.eos_index, false);
         defer enc_l.deinit();
-        var enc_g = try self.tower_g.encode(ids_g.ids, ids_g.eos_index);
+        var enc_g = try self.tower_g.encode(ids_g.ids, ids_g.eos_index, false);
         defer enc_g.deinit();
 
         const pooled = enc_g.pooled orelse return error.MissingPooledEmbedding;

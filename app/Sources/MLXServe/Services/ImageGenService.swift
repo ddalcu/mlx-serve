@@ -223,6 +223,10 @@ final class ImageGenService: ObservableObject {
         // never touched the box means absent.
         let neg = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !neg.isEmpty { json["negative_prompt"] = neg }
+        // Omitted on a model that can't read it, so the server's own
+        // checkpoint default (`SchedulerConfig.default_guidance`) applies —
+        // sending a bare number to a guidance-free distill would earn a 400.
+        if request.model.supportsGuidance { json["guidance"] = request.guidance }
         if request.condGain != 1.0 { json["cond_gain"] = request.condGain }
         if !request.condWeightsText.trimmingCharacters(in: .whitespaces).isEmpty,
            let weights = ImageGenRequest.parseCondWeights(request.condWeightsText),

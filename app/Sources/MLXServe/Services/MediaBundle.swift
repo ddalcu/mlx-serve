@@ -482,6 +482,36 @@ extension MediaBundle {
         )
     }
 
+    /// Same diffusers-multifolder layout as `sdxlDiffusers`, MINUS the second
+    /// tower: SD 1.x ships one `text_encoder`/`tokenizer`, never a `_2` pair —
+    /// requiring `text_encoder_2` in the ready markers here would make a
+    /// complete SD 1.x download read as permanently incomplete (the same
+    /// configless-repo class as `flux2-klein-9b`'s missing root json).
+    static func sd1Diffusers(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sd1:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: ["onnx/", "openvino/"],
+                        keepSafetensors: [
+                            "diffusion_pytorch_model.fp16.safetensors",
+                            "model.fp16.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "model_index.json", "unet", "vae",
+                        "text_encoder", "tokenizer", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// One quant variant of a multi-variant SDXL diffusers repo — SceneWorks
     /// ships `bf16/`, `q4/` and `q8/`, each a COMPLETE diffusers SDXL. The
     /// variant is pulled with its nested weight dirs (`recursive` + `subfolder`,
@@ -592,6 +622,11 @@ extension ImageModelPreset {
                                     displayName: name, sizeGB: Double(approxDownloadGB))
             }
             return .sdxlDiffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .sd1, .sdTurbo:
+            // NOT `.sdxlDiffusers` — its ready markers require `text_encoder_2`,
+            // which neither SD 1.x nor SD-Turbo ships (one tower each), so a
+            // complete download would read as permanently incomplete.
+            return .sd1Diffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }

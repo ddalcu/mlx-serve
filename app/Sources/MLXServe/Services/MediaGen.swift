@@ -137,6 +137,8 @@ enum FluxVariant: String, Hashable, Codable {
     case sdxlBase10       // Stable Diffusion XL base 1.0 — served by the sdxl backend
     case sdxlTurbo        // Stable Diffusion XL Turbo — same backend, distilled few-step
     case sdxlFinetune     // A community SDXL finetune (Illustrious/Pony/NoobAI) — same backend, full guidance
+    case sd1              // Stable Diffusion 1.5 — served by the sd1 backend (sdxl_unet/sdxl_vae/sdxl_clip reused at SD 1.x's own config)
+    case sdTurbo          // SD-Turbo — an SD 2.1 distill, same sd1 backend + StableDiffusionPipeline shape, different (OpenCLIP-H) tower
 }
 
 struct ImageQualitySettings: Hashable {
@@ -190,7 +192,18 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// guidance base does, and the anime-SDXL ecosystem leans on negative
     /// prompts harder than base ever did, so withholding the field would be
     /// hiding the control those checkpoints are actually steered with.
-    var supportsNegativePrompt: Bool { variant == .sdxlBase10 || variant == .sdxlFinetune }
+    var supportsNegativePrompt: Bool { variant == .sdxlBase10 || variant == .sdxlFinetune || variant == .sd1 }
+
+    /// Whether this model reads a `guidance` (CFG scale) override.
+    ///
+    /// Same condition as `supportsNegativePrompt` — a real-guidance backend
+    /// has a scale to steer, a distilled one runs guidance-free and has none.
+    /// The server already accepts an override (`gen.zig` parses `guidance`/
+    /// `guidance_scale`, range-checked `[1,30]`) and falls back to the
+    /// checkpoint's own default when the field is absent; this control is
+    /// what lets the app reach that already-live knob instead of always
+    /// riding the default.
+    var supportsGuidance: Bool { supportsNegativePrompt }
 
     /// SDXL is trained on a fixed list of ~1 MP buckets, every one a multiple
     /// of 64. It is the SAME bucket list FLUX uses (that list came from here),
@@ -496,6 +509,63 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Distilled few-step SDXL — a picture in 1-4 steps, no guidance. Takes the same LoRAs as the base model."
     )
 
+    /// Stable Diffusion 1.5 — the original, non-XL checkpoint. Same backend
+    /// family as SDXL server-side (`sdxl_unet`/`sdxl_vae`/`sdxl_clip` reused
+    /// at SD 1.x's own config: one 768-wide CLIP-L tower, no micro-
+    /// conditioning), but its own capability facts: a smaller 512-trained
+    /// canvas (`resolutionGrid` above) and no LoRA verified here yet, even
+    /// though the server-side plumbing binds one (`lora.Arch.sd1`) — the
+    /// declaration stays conservative until a real SD 1.5 adapter has been
+    /// tried against it, the same discipline `supportsLoRA`'s doc comment
+    /// asks for everywhere else.
+    static let sd15 = ImageModelPreset(
+        id: "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        name: "Stable Diffusion 1.5 (~4 GB)",
+        variant: .sd1,
+        configName: "sd1",
+        repo: "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        approxDownloadGB: 4,
+        approxRAMGB: 6,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlSquare512,
+        qualityProfiles: [
+            .fast:         .init(steps: 15),
+            .good:         .init(steps: 25),
+            .quality:      .init(steps: 35),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "The original Stable Diffusion. Smaller and faster than SDXL — trained at 512×512 — with real guidance and a negative prompt. The checkpoint that started the open image-model ecosystem."
+    )
+
+    /// SD-Turbo — stability's own adversarially-distilled few-step build.
+    /// NOT an SD 1.5 distill: it is SD 2.1's UNet + OpenCLIP-H text tower,
+    /// which is exactly why it needs its OWN `FluxVariant` case rather than
+    /// riding `.sd1` — that variant's `supportsNegativePrompt`/`supportsGuidance`
+    /// are true, and Turbo generates guidance-free with no unconditional
+    /// branch for either to steer, same reasoning as SDXL Turbo beside SDXL
+    /// base. Still the `sd1` server backend and bundle shape: same
+    /// `StableDiffusionPipeline` class, same missing-`text_encoder_2` shape.
+    static let sdTurbo = ImageModelPreset(
+        id: "stabilityai/sd-turbo",
+        name: "SD-Turbo (~2 GB)",
+        variant: .sdTurbo,
+        configName: "sd1",
+        repo: "stabilityai/sd-turbo",
+        approxDownloadGB: 2,
+        approxRAMGB: 4,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlSquare512,
+        qualityProfiles: [
+            .fast:         .init(steps: 1),
+            .good:         .init(steps: 2),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 8),
+        ],
+        defaultQuality: .good,
+        description: "Distilled few-step Stable Diffusion — a picture in 1-4 steps, no guidance. Smaller and faster than SDXL Turbo, at SD-Turbo's own 512×512 native scale."
+    )
+
     /// Quality ladder shared by the full-guidance community finetunes. They are
     /// base-SDXL descendants, not distills, so they want base's step counts.
     private static let sdxlFinetuneQuality: [QualityPreset: ImageQualitySettings] = [
@@ -618,6 +688,8 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// about their download/load behaviour goes uncovered just because the app
     /// doesn't list them.
     static let all: [ImageModelPreset] = [
+        .sdTurbo,                                       // 2 / 4
+        .sd15,                                         // 4 / 6
         .illustriousXLv2_Q4,                           // 4 / 6
         .flux2Klein4B_Q4,                              // 5 / 8
         .sdxlBase10, .sdxlTurbo,                       // 7 / 10
@@ -1996,6 +2068,10 @@ struct ImageGenRequest {
     /// and is NOT the same tensor. `requestJson` therefore omits the key
     /// entirely when this is blank rather than sending an empty string.
     var negativePrompt: String = ""
+    /// Classifier-free guidance scale. Only sent when `model.supportsGuidance`
+    /// — an omitted `guidance` field lets the server fall back to the
+    /// checkpoint's own trained default.
+    var guidance: Double = 5.0
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
     var condGain: Double = 1.0
@@ -2044,6 +2120,12 @@ extension ImageModelPreset {
         // list — a finetune does not move the grid its base was trained on.
         case .sdxlBase10, .sdxlTurbo, .sdxlFinetune:
             return ResolutionGrid(alignment: 64, minDim: 512, maxDim: 2048)
+        // Mirrors `gen.clampSd1Dim`: SD 1.x/2.x train at 512 (occasionally
+        // 768 — SD-Turbo's `sample_size:64` is the same 512 native canvas),
+        // the same /64-bucket-drift reasoning as SDXL at its own scale — a
+        // lower floor and ceiling than SDXL's, not SDXL's grid reused.
+        case .sd1, .sdTurbo:
+            return ResolutionGrid(alignment: 64, minDim: 256, maxDim: 1536)
         }
     }
 

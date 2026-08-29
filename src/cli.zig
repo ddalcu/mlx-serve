@@ -144,6 +144,20 @@ pub const aliases = [_]Alias{
     .{ .name = "illustrious", .tag = "q4", .repo = "SceneWorks/illustrious-xl-v2-mlx", .is_default = true, .subdir = "q4", .dest_name = "SceneWorks/illustrious-xl-v2-q4" },
     .{ .name = "illustrious", .tag = "q8", .repo = "SceneWorks/illustrious-xl-v2-mlx", .subdir = "q8", .dest_name = "SceneWorks/illustrious-xl-v2-q8" },
     .{ .name = "illustrious", .tag = "bf16", .repo = "SceneWorks/illustrious-xl-v2-mlx", .subdir = "bf16", .dest_name = "SceneWorks/illustrious-xl-v2-bf16" },
+    // Stable Diffusion 1.5 — the original, non-XL checkpoint. Served by the
+    // `sd1` backend (`sd1_pipeline.zig`), which reuses SDXL's UNet/VAE/CLIP-L
+    // building blocks at SD 1.5's own config (single 768-wide tower, no
+    // micro-conditioning). Diffusers-folder repo only for now — a Civitai
+    // single-file SD 1.5 checkpoint is not yet convertible (`sd1_pipeline.zig`'s
+    // header).
+    .{ .name = "sd1", .tag = "v1.5", .repo = "stable-diffusion-v1-5/stable-diffusion-v1-5", .is_default = true },
+    // SD-Turbo — an SD 2.1 distill, NOT an SD 1.5 one, but the same
+    // `StableDiffusionPipeline` shape the `sd1` backend serves: one text
+    // tower (OpenCLIP-H, 1024-wide — `sdxl.CLIP_H_CONFIG`, chosen from the
+    // checkpoint's own `text_encoder/config.json` at load, never assumed
+    // from the alias). Guidance-free, 1-4 steps (`timestep_spacing:
+    // "trailing"` in its own scheduler config).
+    .{ .name = "sd1", .tag = "turbo", .repo = "stabilityai/sd-turbo" },
 };
 
 pub const Resolved = struct {

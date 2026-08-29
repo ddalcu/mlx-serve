@@ -122,7 +122,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
 // comment above for the taxonomy of naming schemes this covers.
 // ════════════════════════════════════════════════════════════════════════
 
-pub const Arch = enum { flux2, krea2, minimax_h3, sdxl, generic };
+pub const Arch = enum { flux2, krea2, minimax_h3, sdxl, sd1, generic };
 
 /// Which third of a fused up-projection a canonical target draws from, when
 /// the source tensor packs several linears together (BFL's fused QKV).
@@ -292,8 +292,11 @@ fn archTable(arch: Arch) []const AliasRow {
         // SDXL never reaches the template table — `canonicalize` routes it to
         // `canonicalizeSdxl` above, because its LDM names are a prefix
         // substitution with two varying indices, which `AliasRow` (one `{}`)
-        // cannot express.
+        // cannot express. SD 1.x's UNet is the same module tree (see
+        // `canonicalize`'s `arch == .sdxl or arch == .sd1` branch), so it
+        // never reaches this table either.
         .sdxl => &.{},
+        .sd1 => &.{},
         .generic => &.{},
     };
 }
@@ -443,7 +446,10 @@ pub fn canonicalize(
     var fbuf_alias: [128]u8 = undefined;
 
     // SDXL's LDM block naming is a prefix substitution, not a template match.
-    if (arch == .sdxl) {
+    // SD 1.x's UNet is the SAME module tree at a different stage count/width,
+    // so the same substitution binds it — only the number of blocks differs,
+    // and `canonicalizeSdxl` reads that from the module path, not a constant.
+    if (arch == .sdxl or arch == .sd1) {
         out[0] = .{ .canon = canonicalizeSdxl(module, &bufs[0]), .split = .none };
         return out[0..1];
     }

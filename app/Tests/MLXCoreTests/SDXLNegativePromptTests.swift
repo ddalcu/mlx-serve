@@ -40,8 +40,9 @@ final class SDXLNegativePromptTests: XCTestCase {
         // The community finetunes (Illustrious / Pony / NoobAI) are base-SDXL
         // descendants, NOT distills: they run the same real guidance, and the
         // anime-SDXL ecosystem steers with negative prompts more than base does.
-        // So the guidance-capable set is two variants, not one.
-        let guidanceCapable: Set<FluxVariant> = [.sdxlBase10, .sdxlFinetune]
+        // So the guidance-capable set is two variants, not one. SD 1.5 runs
+        // real guidance too — it is the SDXL backend's config, not a distill.
+        let guidanceCapable: Set<FluxVariant> = [.sdxlBase10, .sdxlFinetune, .sd1]
         XCTAssertFalse(ImageModelPreset.all.filter { $0.variant == .sdxlFinetune }.isEmpty,
                        "a finetune must be in the catalog or this assertion is vacuous")
         for p in ImageModelPreset.all where p.variant == .sdxlFinetune {

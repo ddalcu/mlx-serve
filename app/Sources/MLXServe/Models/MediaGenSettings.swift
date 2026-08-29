@@ -72,6 +72,11 @@ struct ImageGenSettings: Codable, Equatable {
     /// even while a model that cannot read one is selected — the same
     /// convention the conditioning fields follow.
     var negativePrompt: String = ""
+    /// Classifier-free guidance scale (Advanced). Only `supportsGuidance`
+    /// models read it — the server's own `default_guidance` (5.0 on SDXL
+    /// base) applies when this control is hidden, so the persisted value is
+    /// sticky like the rest of Advanced rather than reset per model.
+    var guidance: Double = 5.0
     /// Conditioning rebalance (Advanced): global gain + weights text.
     var condGain: Double = 1.0
     var condWeightsText: String = ""
@@ -159,6 +164,7 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .strength) { strength = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .editMode) { editMode = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .negativePrompt) { negativePrompt = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .guidance) { guidance = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .condGain) { condGain = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .condWeightsText) { condWeightsText = v }
         if let v = try c.decodeIfPresent([LoraAdapter].self, forKey: .loras), !v.isEmpty {

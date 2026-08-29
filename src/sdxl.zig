@@ -326,6 +326,30 @@ pub const CLIP_BIG_G_CONFIG = ClipTextConfig{
     .projection_dim = 1280,
 };
 
+/// OpenCLIP ViT-H/14 (LAION) — SD 2.x's / SD-Turbo's ONE tower. Verified
+/// against `stabilityai/sd-turbo/text_encoder/config.json`: 1024/23/16, gelu,
+/// projection_dim 512. NOT SDXL's bigG (1280/32/20) — a different LAION
+/// OpenCLIP checkpoint at a smaller scale, sharing only the architecture
+/// class and the standard 49408-token CLIP vocab (bos 49406, eos 49407, pad
+/// "!"=0 — the tokenizer's OWN `tokenizer_config.json` is what carries this;
+/// `config.json`'s `bos_token_id:0`/`eos_token_id:2` are unused
+/// `PretrainedConfig` defaults the model never reads, not the real ids).
+///
+/// The LAYER COUNT is 23, not the vision-tower-matching 24: diffusers ships
+/// this checkpoint already truncated to the layer SD 2.x/Turbo was trained
+/// against — `sd1_pipeline`'s `final_norm: true` therefore reads THIS
+/// tower's true final layer (after `final_layer_norm`), which is the
+/// original 24-layer OpenCLIP model's penultimate output baked in at
+/// conversion time rather than sliced off at inference.
+pub const CLIP_H_CONFIG = ClipTextConfig{
+    .hidden = 1024,
+    .layers = 23,
+    .heads = 16,
+    .intermediate = 4096,
+    .activation = .gelu,
+    .projection_dim = 512,
+};
+
 /// The two text encoders. SDXL concatenates their PENULTIMATE hidden states
 /// along the feature axis (768 + 1280 = 2048, the UNet's cross-attention dim)
 /// and takes the POOLED output from the bigG tower ALONE for the micro-
@@ -390,6 +414,38 @@ pub fn indexDeclaresSdxl(allocator: std.mem.Allocator, index_json: []const u8) b
     const cn = obj.get("_class_name") orelse return false;
     if (cn != .string or !isSdxlPipelineClass(cn.string)) return false;
     return obj.get("text_encoder_2") != null;
+}
+
+/// `StableDiffusionPipeline` and its img2img/inpaint siblings — the SD 1.x
+/// pipeline class. SD 2.x declares the SAME class name (only its UNet's
+/// `cross_attention_dim` and text tower differ), so this alone cannot tell
+/// the two apart; `indexDeclaresSd1` narrows further.
+pub fn isSd1PipelineClass(class_name: []const u8) bool {
+    const known = [_][]const u8{
+        "StableDiffusionPipeline",
+        "StableDiffusionImg2ImgPipeline",
+        "StableDiffusionInpaintPipeline",
+    };
+    for (known) |k| if (std.mem.eql(u8, class_name, k)) return true;
+    return false;
+}
+
+/// True when `model_index.json` bytes describe an SD 1.x pipeline: the
+/// pipeline class SD 1.x and SD 2.x share, narrowed by the ABSENCE of a
+/// second text encoder (`text_encoder_2`, which would make it SDXL — a
+/// diffusers repo never carries three towers). This does NOT distinguish
+/// SD 1.x from SD 2.x — both are single-tower `StableDiffusionPipeline`
+/// repos — so `sd1_pipeline`'s loader additionally refuses a text encoder
+/// whose own `config.json` isn't CLIP-L's 768-wide (SD 2.x's OpenCLIP
+/// ViT-H/14 is 1024-wide) rather than silently mis-loading it.
+pub fn indexDeclaresSd1(allocator: std.mem.Allocator, index_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, index_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = parsed.value.object;
+    const cn = obj.get("_class_name") orelse return false;
+    if (cn != .string or !isSd1PipelineClass(cn.string)) return false;
+    return obj.get("text_encoder_2") == null;
 }
 
 /// Tensor names that, all present, mark a SINGLE-FILE LDM SDXL checkpoint (the
@@ -733,6 +789,31 @@ test "an SDXL repo is recognized by its declared pipeline class, not its shape" 
 
     try testing.expect(!indexDeclaresSdxl(a, "not json"));
     try testing.expect(!indexDeclaresSdxl(a, "[]"));
+}
+
+test "an SD 1.x repo is recognized by class name AND the absent second tower" {
+    const a = testing.allocator;
+    const sd15 =
+        \\{"_class_name":"StableDiffusionPipeline",
+        \\"text_encoder":["transformers","CLIPTextModel"],
+        \\"unet":["diffusers","UNet2DConditionModel"],"vae":["diffusers","AutoencoderKL"]}
+    ;
+    try testing.expect(indexDeclaresSd1(a, sd15));
+    // The SDXL fixture above has the same class family shape but a second
+    // tower — that tower is what makes it XL, not SD 1.x.
+    const sdxl_json =
+        \\{"_class_name":"StableDiffusionXLPipeline",
+        \\"text_encoder":["transformers","CLIPTextModel"],
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"],
+        \\"unet":["diffusers","UNet2DConditionModel"],"vae":["diffusers","AutoencoderKL"]}
+    ;
+    try testing.expect(!indexDeclaresSd1(a, sdxl_json));
+    // Wrong class family entirely.
+    const flux =
+        \\{"_class_name":"FluxPipeline"}
+    ;
+    try testing.expect(!indexDeclaresSd1(a, flux));
+    try testing.expect(!indexDeclaresSd1(a, "not json"));
 }
 
 test "the two towers disagree about GELU" {

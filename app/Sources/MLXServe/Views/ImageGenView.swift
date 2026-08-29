@@ -46,6 +46,9 @@ struct ImageGenView: View {
     /// What to steer away from. Only shown for models that read it — see
     /// `ImageModelPreset.supportsNegativePrompt`.
     @State private var negativePrompt: String = ""
+    /// Classifier-free guidance scale. Only shown for models that read one —
+    /// see `ImageModelPreset.supportsGuidance`.
+    @State private var guidance: Double = 5.0
     /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
@@ -89,6 +92,7 @@ struct ImageGenView: View {
         .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: negativePrompt) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: guidance) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
@@ -494,6 +498,24 @@ struct ImageGenView: View {
                 }
                 Divider()
             }
+            // Same gate as the negative prompt: only a real-guidance backend has
+            // a scale worth steering. Range mirrors the server's own [1,30]
+            // check (`gen.zig`'s `guidance`/`guidance_scale` parse).
+            if model.supportsGuidance {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Guidance (CFG)").font(.caption.weight(.semibold))
+                        Spacer()
+                        Text(String(format: "%.1f", guidance)).font(.caption).foregroundStyle(.secondary)
+                        Stepper("", value: $guidance, in: 1...30, step: 0.5)
+                            .labelsHidden()
+                    }
+                    Text("How strongly the prompt steers the image. Higher follows the prompt more literally at the cost of variety; lower drifts but stays natural. This checkpoint defaults to ~5.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Divider()
+            }
             // Steps stay overridable even where the schedule is fixed — it's
             // the Advanced panel, and the hint says the cost.
             HStack {
@@ -829,6 +851,7 @@ struct ImageGenView: View {
         strength = s.strength
         editMode = s.editMode
         negativePrompt = s.negativePrompt
+        guidance = s.guidance
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         loras = s.loras
@@ -855,6 +878,7 @@ struct ImageGenView: View {
         s.strength = strength
         s.editMode = editMode
         s.negativePrompt = negativePrompt
+        s.guidance = guidance
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loras = loras
@@ -895,6 +919,7 @@ struct ImageGenView: View {
             editMode: effectiveEditMode,
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             negativePrompt: model.supportsNegativePrompt ? negativePrompt : "",
+            guidance: guidance,
             condGain: condGain,
             condWeightsText: condWeightsText,
             loras: loras

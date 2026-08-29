@@ -90,6 +90,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "sdxl") or
+        std.mem.eql(u8, model_type, "sd1") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -150,6 +151,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // class (`sdxl.indexDeclaresSdxl`, shared with gen.peekModelType).
         if (peekSdxlIndex(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "sdxl") catch return .missing_or_unparseable };
+        // SD 1.x is the same shape one level down — same fallback, keyed on
+        // the declared pipeline class MINUS the second tower that would make
+        // it SDXL (`sdxl.indexDeclaresSd1`, shared with gen.peekModelType).
+        if (peekSd1Index(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "sd1") catch return .missing_or_unparseable };
         // …or a SINGLE-FILE SDXL checkpoint: one LDM `.safetensors`, no configs
         // at all (the Civitai distribution of Illustrious XL / Pony). Keyed on
         // the LDM tensor markers in the file's own header (`sdxl.headerDeclares…`,
@@ -239,6 +245,18 @@ pub fn peekSdxlIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) 
     const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
     defer allocator.free(bytes);
     return sdxl.indexDeclaresSdxl(allocator, bytes);
+}
+
+/// True when `sub/model_index.json` declares an SD 1.x pipeline. Same shape
+/// as `peekSdxlIndex`, delegating to `sdxl.indexDeclaresSd1`.
+pub fn peekSd1Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    return sdxl.indexDeclaresSd1(allocator, bytes);
 }
 
 /// True when `sub` holds a single-file LDM SDXL checkpoint — a `.safetensors`

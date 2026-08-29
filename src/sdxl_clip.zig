@@ -209,7 +209,15 @@ pub const TextTower = struct {
     /// `eos_index` is where the pooled vector is read from. CLIP pools at the
     /// EOS token's POSITION, not at the last position of the padded window —
     /// with a padded prompt those differ, and pooling at the end reads padding.
-    pub fn encode(self: *TextTower, ids: []const i32, eos_index: usize) !Encoded {
+    ///
+    /// `final_norm` picks which hidden state `Encoded.penultimate` returns —
+    /// SDXL's convention (`false`: `hidden_states[-2]`, penultimate, never
+    /// final-normed) or SD 1.x's default (`true`: `hidden_states[-1]` AFTER
+    /// `final_layer_norm` — `CLIPTextModel(ids)[0]`, diffusers'
+    /// `StableDiffusionPipeline` reads with no `clip_skip`). The POOLED
+    /// vector (bigG only) always reads the final-normed state regardless —
+    /// that convention is SDXL-specific either way.
+    pub fn encode(self: *TextTower, ids: []const i32, eos_index: usize, final_norm: bool) !Encoded {
         const s = self.s;
         const seq: c_int = @intCast(ids.len);
         const hidden: c_int = @intCast(self.cfg.hidden);
@@ -256,7 +264,7 @@ pub const TextTower = struct {
 
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.headDim())));
         for (self.layers, 0..) |*layer, i| {
-            if (i + 1 == self.layers.len) {
+            if (!final_norm and i + 1 == self.layers.len) {
                 var captured = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_copy(&captured, h, s));
                 penultimate = captured;
@@ -345,12 +353,16 @@ pub const TextTower = struct {
             }
         }
 
-        // ── Pooled: EOS row of the FINAL-NORMED state, projected. bigG only.
+        // Final-normed state: SD 1.x's primary stream when `final_norm`, and
+        // ALWAYS what bigG's pooled vector reads from (`EOS row of the
+        // FINAL-NORMED state, projected` — an SDXL-specific convention
+        // independent of `final_norm`).
+        const final_normed = try layerNorm(h, self.final_ln_w, self.final_ln_b, s);
+        errdefer _ = mlx.mlx_array_free(final_normed);
+        _ = mlx.mlx_array_free(h);
+
         var pooled: ?mlx.mlx_array = null;
         if (self.text_projection) |proj_w| {
-            const normed = try layerNorm(h, self.final_ln_w, self.final_ln_b, s);
-            defer _ = mlx.mlx_array_free(normed);
-
             const idx: c_int = @intCast(@min(eos_index, ids.len - 1));
             var eos_row = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(eos_row);
@@ -358,7 +370,7 @@ pub const TextTower = struct {
                 const start = [_]c_int{ 0, idx, 0 };
                 const stop = [_]c_int{ 1, idx + 1, hidden };
                 const stride = [_]c_int{ 1, 1, 1 };
-                try mlx.check(mlx.mlx_slice(&eos_row, normed, &start, 3, &stop, 3, &stride, 3, s));
+                try mlx.check(mlx.mlx_slice(&eos_row, final_normed, &start, 3, &stop, 3, &stride, 3, s));
             }
             const flat = blk: {
                 const shape = [_]c_int{ 1, hidden };
@@ -368,8 +380,11 @@ pub const TextTower = struct {
             pooled = try matmul(flat, proj_w, s);
         }
 
-        _ = mlx.mlx_array_free(h);
-        return .{ .penultimate = penultimate.?, .pooled = pooled };
+        const primary = if (final_norm) final_normed else blk: {
+            _ = mlx.mlx_array_free(final_normed);
+            break :blk penultimate.?;
+        };
+        return .{ .penultimate = primary, .pooled = pooled };
     }
 };
 
@@ -577,7 +592,7 @@ test "sdxl clip forward: both towers load and produce the shapes SDXL consumes" 
         };
         defer tower.deinit();
 
-        var enc = try tower.encode(&ids, eos_index);
+        var enc = try tower.encode(&ids, eos_index, false);
         defer enc.deinit();
         _ = mlx.mlx_array_eval(enc.penultimate);
 
@@ -664,7 +679,7 @@ test "sdxl clip parity: both towers match transformers" {
     for (towers) |t| {
         var tower = try loadTower(io, a, s, dir, t.sub, t.cfg, towerDtype());
         defer tower.deinit();
-        var enc = try tower.encode(ids, eos_index);
+        var enc = try tower.encode(ids, eos_index, false);
         defer enc.deinit();
 
         const ref = fx.get(t.pen) orelse return error.MissingFixturePenultimate;

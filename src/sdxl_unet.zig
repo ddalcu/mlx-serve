@@ -79,6 +79,11 @@ pub const UnetConfig = struct {
     addition_time_embed_dim: u32 = 256,
     norm_eps: f32 = 1e-5,
     norm_num_groups: u32 = 32,
+    /// True for SDXL's `add_embedding` micro-conditioning path (pooled text +
+    /// crop/size ids). False for SD 1.x, whose `UNet2DConditionModel` has no
+    /// `addition_embed_type` at all — same block/resnet/attention topology,
+    /// just no augmentation on top of the plain time embedding.
+    has_micro_conditioning: bool = true,
 
     pub fn timeEmbedDim(self: UnetConfig) u32 {
         return self.block_out_channels[0] * 4;
@@ -186,13 +191,34 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !UnetCo
     }
     cfg.up_has_attn = uha;
 
-    if (root.get("layers_per_block")) |v| cfg.layers_per_block = @intCast(v.integer);
-    if (root.get("cross_attention_dim")) |v| cfg.cross_attention_dim = @intCast(v.integer);
-    if (root.get("in_channels")) |v| cfg.in_channels = @intCast(v.integer);
-    if (root.get("out_channels")) |v| cfg.out_channels = @intCast(v.integer);
-    if (root.get("addition_time_embed_dim")) |v| cfg.addition_time_embed_dim = @intCast(v.integer);
-    if (root.get("projection_class_embeddings_input_dim")) |v| cfg.add_embed_input_dim = @intCast(v.integer);
-    if (root.get("norm_num_groups")) |v| cfg.norm_num_groups = @intCast(v.integer);
+    // Every optional integer field below is guarded against a literal JSON
+    // `null` (`if (root.get(...)) |v|` binds THAT too, not just an absent
+    // key — see the `addition_embed_type` comment below): SD-Turbo's newer
+    // diffusers version writes `addition_time_embed_dim` and
+    // `projection_class_embeddings_input_dim` out as `null` rather than
+    // omitting them, and an unguarded `v.integer` on a `.null` value is a
+    // union-field-access panic, not a graceful skip.
+    if (root.get("layers_per_block")) |v| if (v == .integer) {
+        cfg.layers_per_block = @intCast(v.integer);
+    };
+    if (root.get("cross_attention_dim")) |v| if (v == .integer) {
+        cfg.cross_attention_dim = @intCast(v.integer);
+    };
+    if (root.get("in_channels")) |v| if (v == .integer) {
+        cfg.in_channels = @intCast(v.integer);
+    };
+    if (root.get("out_channels")) |v| if (v == .integer) {
+        cfg.out_channels = @intCast(v.integer);
+    };
+    if (root.get("addition_time_embed_dim")) |v| if (v == .integer) {
+        cfg.addition_time_embed_dim = @intCast(v.integer);
+    };
+    if (root.get("projection_class_embeddings_input_dim")) |v| if (v == .integer) {
+        cfg.add_embed_input_dim = @intCast(v.integer);
+    };
+    if (root.get("norm_num_groups")) |v| if (v == .integer) {
+        cfg.norm_num_groups = @intCast(v.integer);
+    };
     if (root.get("norm_eps")) |v| cfg.norm_eps = switch (v) {
         .float => @floatCast(v.float),
         .integer => @floatFromInt(v.integer),
@@ -205,12 +231,28 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !UnetCo
         if (v != .bool or !v.bool) return error.UnsupportedProjection;
     } else return error.UnsupportedProjection;
 
-    // The additive time conditioning is what makes this SDXL rather than SD 2.
+    // The additive time conditioning is what makes this SDXL rather than
+    // SD 1.x/2.x: SDXL declares `addition_embed_type: "text_time"`. An older
+    // SD 1.x config (pre-`0.7`-ish diffusers) omits the key entirely; a newer
+    // one (SD-Turbo's, `_diffusers_version: 0.24.0.dev0`) writes it out as a
+    // literal JSON `null` — `root.get` returns `Optional(.null)` for that,
+    // NOT Zig's absent-key `null`, so it must be checked explicitly or a
+    // Turbo config is refused as "unsupported" for a field it correctly
+    // leaves empty. Any OTHER declared value is an architecture this port
+    // has not built and is refused by name rather than silently treated as
+    // either shape.
     if (root.get("addition_embed_type")) |v| {
-        if (v != .string or !std.mem.eql(u8, v.string, "text_time")) {
-            return error.UnsupportedAdditionEmbedType;
+        switch (v) {
+            .null => cfg.has_micro_conditioning = false,
+            .string => |s| {
+                if (!std.mem.eql(u8, s, "text_time")) return error.UnsupportedAdditionEmbedType;
+                cfg.has_micro_conditioning = true;
+            },
+            else => return error.UnsupportedAdditionEmbedType,
         }
-    } else return error.UnsupportedAdditionEmbedType;
+    } else {
+        cfg.has_micro_conditioning = false;
+    }
 
     return cfg;
 }
@@ -654,8 +696,10 @@ pub const Unet = struct {
     conv_in_b: mlx.mlx_array,
     time_1: Linear,
     time_2: Linear,
-    add_1: Linear,
-    add_2: Linear,
+    /// Null on SD 1.x (`cfg.has_micro_conditioning == false`) — no checkpoint
+    /// tensors to bind.
+    add_1: ?Linear,
+    add_2: ?Linear,
     down: []DownBlock,
     mid: MidBlock,
     up: []UpBlock,
@@ -669,8 +713,8 @@ pub const Unet = struct {
         _ = mlx.mlx_array_free(self.conv_in_b);
         self.time_1.deinit();
         self.time_2.deinit();
-        self.add_1.deinit();
-        self.add_2.deinit();
+        if (self.add_1) |*l| l.deinit();
+        if (self.add_2) |*l| l.deinit();
         for (self.down) |*d| d.deinit();
         self.allocator.free(self.down);
         self.mid.deinit();
@@ -683,17 +727,21 @@ pub const Unet = struct {
         if (self.owns_cfg) freeConfig(self.allocator, self.cfg);
     }
 
-    /// Build the combined time + micro-conditioning embedding, `[1, 1280]`.
+    /// Build the time (+ SDXL micro-conditioning) embedding, `[1, timeEmbedDim]`.
     ///
-    /// This is the SDXL-specific half of the conditioning: `text_embeds` is
-    /// bigG's pooled vector and `time_ids` is the six-number crop descriptor,
-    /// sinusoidally expanded and concatenated. Getting it wrong does not error;
-    /// it shifts framing and composition, which reads as a bad checkpoint.
+    /// `text_embeds`/`time_ids` are SDXL-only: `text_embeds` is bigG's pooled
+    /// vector and `time_ids` the six-number crop descriptor, sinusoidally
+    /// expanded and concatenated. Null on `!cfg.has_micro_conditioning`
+    /// (SD 1.x has no augmentation branch at all) — passing one there, or
+    /// omitting one where the checkpoint expects it, is a programmer error
+    /// (`error.MissingTextEmbeds`/`error.MissingTimeIds`), not a silent
+    /// fallback, because getting it wrong does not error downstream; it
+    /// shifts framing and composition, which just reads as a bad checkpoint.
     fn buildEmbedding(
         self: *const Unet,
         timestep: f32,
-        text_embeds: mlx.mlx_array,
-        time_ids: *const sdxl.TimeIds,
+        text_embeds: ?mlx.mlx_array,
+        time_ids: ?*const sdxl.TimeIds,
     ) !mlx.mlx_array {
         const s = self.s;
         const a = self.allocator;
@@ -718,33 +766,40 @@ pub const Unet = struct {
         };
         errdefer _ = mlx.mlx_array_free(emb);
 
+        if (!self.cfg.has_micro_conditioning) return emb;
+
+        const te_in = text_embeds orelse return error.MissingTextEmbeds;
+        const ti_in = time_ids orelse return error.MissingTimeIds;
+        const add_1 = self.add_1 orelse return error.MissingAddEmbedding;
+        const add_2 = self.add_2 orelse return error.MissingAddEmbedding;
+
         // Micro-conditioning: each of the six ids gets its OWN sinusoidal
         // expansion, and they are concatenated in order — the same flatten
         // diffusers does via `add_time_proj(time_ids.flatten())`.
         const add_dim = self.cfg.addition_time_embed_dim;
-        const ids_buf = try a.alloc(f32, add_dim * time_ids.len);
+        const ids_buf = try a.alloc(f32, add_dim * ti_in.len);
         defer a.free(ids_buf);
-        for (time_ids, 0..) |v, i| {
+        for (ti_in, 0..) |v, i| {
             timestepEmbedding(v, add_dim, ids_buf[i * add_dim .. (i + 1) * add_dim]);
         }
-        const ids_shape = [_]c_int{ 1, @intCast(add_dim * time_ids.len) };
+        const ids_shape = [_]c_int{ 1, @intCast(add_dim * ti_in.len) };
         const ids_arr = mlx.mlx_array_new_data(ids_buf.ptr, &ids_shape, 2, .float32);
         defer _ = mlx.mlx_array_free(ids_arr);
         const ids_cast = try nn.astype(ids_arr, self.dtype, s);
         defer _ = mlx.mlx_array_free(ids_cast);
 
         // Order is [pooled_text, time_ids] — the reverse loads and is wrong.
-        const te = try nn.astype(text_embeds, self.dtype, s);
+        const te = try nn.astype(te_in, self.dtype, s);
         defer _ = mlx.mlx_array_free(te);
         const cat = try nn.concat(&[_]mlx.mlx_array{ te, ids_cast }, 1, s);
         defer _ = mlx.mlx_array_free(cat);
 
         const aug = blk: {
-            const l1 = try self.add_1.forward(cat, s);
+            const l1 = try add_1.forward(cat, s);
             defer _ = mlx.mlx_array_free(l1);
             const act = try nn.silu(l1, s);
             defer _ = mlx.mlx_array_free(act);
-            break :blk try self.add_2.forward(act, s);
+            break :blk try add_2.forward(act, s);
         };
         defer _ = mlx.mlx_array_free(aug);
 
@@ -755,15 +810,18 @@ pub const Unet = struct {
 
     /// One denoising forward.
     ///
-    /// `sample` is NCHW `[1, 4, h, w]`, `ctx` the `[1, 77, 2048]` text stream,
-    /// `text_embeds` bigG's pooled `[1, 1280]`. Returns NCHW `[1, 4, h, w]`.
+    /// `sample` is NCHW `[1, 4, h, w]`, `ctx` the text stream (`[1, 77, 2048]`
+    /// on SDXL, `[1, 77, 768]` on SD 1.x — `cross_attention_dim` is read from
+    /// the checkpoint, not hardcoded). `text_embeds`/`time_ids` are SDXL's
+    /// pooled-`[1,1280]`/six-number micro-conditioning; null on SD 1.x, whose
+    /// `has_micro_conditioning` config is false. Returns NCHW `[1, 4, h, w]`.
     pub fn forward(
         self: *const Unet,
         sample: mlx.mlx_array,
         timestep: f32,
         ctx: mlx.mlx_array,
-        text_embeds: mlx.mlx_array,
-        time_ids: *const sdxl.TimeIds,
+        text_embeds: ?mlx.mlx_array,
+        time_ids: ?*const sdxl.TimeIds,
     ) !mlx.mlx_array {
         const s = self.s;
         const a = self.allocator;
@@ -903,8 +961,13 @@ pub fn loadFromWeights(
     u.conv_in_b = try nn.dupWeight(w, "conv_in.bias", dtype, s);
     u.time_1 = try nn.loadLinear(w, "time_embedding.linear_1.weight", "time_embedding.linear_1.bias", dtype, s);
     u.time_2 = try nn.loadLinear(w, "time_embedding.linear_2.weight", "time_embedding.linear_2.bias", dtype, s);
-    u.add_1 = try nn.loadLinear(w, "add_embedding.linear_1.weight", "add_embedding.linear_1.bias", dtype, s);
-    u.add_2 = try nn.loadLinear(w, "add_embedding.linear_2.weight", "add_embedding.linear_2.bias", dtype, s);
+    if (cfg.has_micro_conditioning) {
+        u.add_1 = try nn.loadLinear(w, "add_embedding.linear_1.weight", "add_embedding.linear_1.bias", dtype, s);
+        u.add_2 = try nn.loadLinear(w, "add_embedding.linear_2.weight", "add_embedding.linear_2.bias", dtype, s);
+    } else {
+        u.add_1 = null;
+        u.add_2 = null;
+    }
 
     // ── Down blocks.
     u.down = try allocator.alloc(DownBlock, cfg.down_has_attn.len);
@@ -1030,6 +1093,65 @@ test "sdxl unet: config parse reads the real checkpoint contract" {
     // 2816 = pooled 1280 + 6 ids x 256.
     try testing.expectEqual(@as(u32, 2816), cfg.add_embed_input_dim);
     try testing.expectEqual(@as(u32, 1280 + 6 * 256), cfg.add_embed_input_dim);
+    try testing.expect(cfg.has_micro_conditioning);
+}
+
+test "sdxl unet: an SD 1.x config (no addition_embed_type) parses with micro-conditioning off" {
+    const a = testing.allocator;
+    // SD 1.5's real `unet/config.json` shape, trimmed to the keys the parser
+    // reads: no `addition_embed_type` at all (the key CLIP-only SD 1.x never
+    // declares), scalar `attention_head_dim` (8, not per-stage), and a fourth
+    // attention-free stage the way diffusers' own config ships it.
+    const json =
+        \\{"_class_name":"UNet2DConditionModel","act_fn":"silu",
+        \\"attention_head_dim":8,"block_out_channels":[320,640,1280,1280],
+        \\"cross_attention_dim":768,
+        \\"down_block_types":["CrossAttnDownBlock2D","CrossAttnDownBlock2D","CrossAttnDownBlock2D","DownBlock2D"],
+        \\"in_channels":4,"layers_per_block":2,"norm_eps":1e-05,"norm_num_groups":32,
+        \\"out_channels":4,"transformer_layers_per_block":1,
+        \\"up_block_types":["UpBlock2D","CrossAttnUpBlock2D","CrossAttnUpBlock2D","CrossAttnUpBlock2D"],
+        \\"use_linear_projection":true}
+    ;
+    const cfg = try parseConfig(a, json);
+    defer freeConfig(a, cfg);
+
+    try testing.expect(!cfg.has_micro_conditioning);
+    try testing.expectEqual(@as(u32, 768), cfg.cross_attention_dim);
+    try testing.expectEqualSlices(u32, &[_]u32{ 320, 640, 1280, 1280 }, cfg.block_out_channels);
+    // Scalar attention_head_dim broadcasts to every stage.
+    try testing.expectEqualSlices(u32, &[_]u32{ 8, 8, 8, 8 }, cfg.num_heads);
+    try testing.expectEqualSlices(bool, &[_]bool{ true, true, true, false }, cfg.down_has_attn);
+    try testing.expectEqualSlices(bool, &[_]bool{ false, true, true, true }, cfg.up_has_attn);
+}
+
+test "sdxl unet: addition_embed_type as a literal JSON null also means no micro-conditioning" {
+    // stabilityai/sd-turbo/unet/config.json, real bytes (fetched and verified
+    // against the live repo) — a NEWER diffusers version than SD 1.5's, which
+    // writes every declared-but-unset field out as `null` rather than
+    // omitting the key. `root.get` returns `Optional(.null)` for this, which
+    // is NOT Zig's absent-key `null` — a parser that only checks `if
+    // (root.get(...)) |v|` treats it as present-and-wrong and refuses a
+    // checkpoint that correctly declares no micro-conditioning.
+    const a = testing.allocator;
+    const json =
+        \\{"_class_name":"UNet2DConditionModel","act_fn":"silu",
+        \\"addition_embed_type":null,"addition_time_embed_dim":null,
+        \\"attention_head_dim":[5,10,20,20],"block_out_channels":[320,640,1280,1280],
+        \\"cross_attention_dim":1024,
+        \\"down_block_types":["CrossAttnDownBlock2D","CrossAttnDownBlock2D","CrossAttnDownBlock2D","DownBlock2D"],
+        \\"in_channels":4,"layers_per_block":2,"norm_eps":1e-05,"norm_num_groups":32,
+        \\"out_channels":4,"projection_class_embeddings_input_dim":null,
+        \\"transformer_layers_per_block":1,
+        \\"up_block_types":["UpBlock2D","CrossAttnUpBlock2D","CrossAttnUpBlock2D","CrossAttnUpBlock2D"],
+        \\"use_linear_projection":true}
+    ;
+    const cfg = try parseConfig(a, json);
+    defer freeConfig(a, cfg);
+
+    try testing.expect(!cfg.has_micro_conditioning);
+    try testing.expectEqual(@as(u32, 1024), cfg.cross_attention_dim);
+    try testing.expectEqualSlices(bool, &[_]bool{ true, true, true, false }, cfg.down_has_attn);
+    try testing.expectEqualSlices(bool, &[_]bool{ false, true, true, true }, cfg.up_has_attn);
 }
 
 test "sdxl unet: an unsupported projection or embed type is refused by name" {
