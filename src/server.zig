@@ -16275,6 +16275,31 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
     try std.testing.expectEqual(@as(usize, 1), single.len);
 }
 
+test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoint" {
+    // Exercises the EXACT function every HTTP dispatch site in this file calls,
+    // proving the new dialect is wired all the way through — not just reachable
+    // from chat.parseToolCalls in isolation. Uses the Agent shell tool's real
+    // declared schema shape.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
+}
+
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
     // The tool-call parse strips the leading think block BEFORE parsing args, and
     // the two families strip DIFFERENTLY (Qwen `<think>…</think>`, Gemma

@@ -165,6 +165,12 @@ const pythonic_weather_tool_schema =
     \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"},"metric":{"type":"boolean"},"tags":{"type":"array","items":{"type":"string"}}},"required":["city"]}}}]
 ;
 
+/// MiniCPM5's own headline example tool — reused by the minicpm5 corpus
+/// entries below (single-arg happy path, undeclared-param pass-through).
+const shell_tool_schema =
+    \\[{"type":"function","function":{"name":"shell","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+;
+
 const corpus = [_]Expect{
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
@@ -1534,6 +1540,143 @@ const corpus = [_]Expect{
         .no_tool_calls = true,
         .content_contains = "atem:function_calls block",
     },
+
+    // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
+    .{
+        .family = "minicpm5",
+        .name = "single string arg (shell pwd)",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "shell echo hello",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">echo hello</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo hello",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "git status",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "git status",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "CDATA-wrapped param value kept verbatim",
+        .raw = "<function name=\"write_file\">\n  <param name=\"path\"><![CDATA[notes.txt]]></param>\n  <param name=\"content\"><![CDATA[line one\nline <two> & \"three\"]]></param>\n</function>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "line one\nline <two> & \"three\"",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "two sequential calls, no wrapper",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n<function name=\"shell\">\n  <param name=\"command\">ls -la</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_count = 2,
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+        .last_tool_arg_value = "ls -la",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "undeclared function name is kept (not silently guessed away)",
+        .raw = "<function name=\"delete_everything\">\n  <param name=\"path\">/</param>\n</function>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "delete_everything",
+        .tool_arg_key = "path",
+        .tool_arg_value = "/",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "missing required param is never fabricated",
+        .raw = "<function name=\"write\">\n  <param name=\"path\">notes.txt</param>\n</function>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "notes.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "undeclared param passes through untouched",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n  <param name=\"timeout_ms\">5000</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "timeout_ms",
+        .tool_arg_value = "5000",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "duplicate param — first occurrence wins",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n  <param name=\"command\">ls -la</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    // ---- LIVE captures: mlx-community/MiniCPM5-1B-OptiQ-4bit, verbatim raw
+    // model output via MLX_SERVE_RAW_DUMP_FILE. The hand-written fixtures above
+    // use a multi-line layout; the model actually emits VALUE-ADJACENT, so
+    // these pin the real shape rather than our formatting of it.
+    .{
+        .family = "minicpm5",
+        .name = "LIVE: parameterised call, value-adjacent",
+        .raw = "<function name=\"shell\"><param name=\"command\">git status</param></function>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "git status",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "LIVE: zero-argument call, closed empty body",
+        .raw = "<function name=\"get_time\"></function>",
+        .tool_name = "get_time",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "LIVE: two consecutive calls separated by a newline",
+        .raw = "<function name=\"shell\"><param name=\"command\">get_time</param></function>\n<function name=\"shell\"><param name=\"command\">ls -la</param></function>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "get_time",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "LIVE: truncated at max_tokens, ZERO completed params",
+        .raw = "<function name=\"shell\"><param name=\"command\">git status",
+        .tool_name = "shell",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "malformed: dropped attribute quote never guesses a call",
+        .raw = "<function name=\"shell>\n  <param name=\"command\">pwd</param>\n</function>\nI'll run that now.",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "minicpm5",
+        .name = "prose before and after a call",
+        .raw = "Sure, let me check the working directory.\n<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\nDone — see the result above.",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "plain prose, and function-like tags are not mistaken for a call",
+        .raw = "Wrap the config in a <functional> or <function-like> block — this is just prose, no call here.",
+        .no_tool_calls = true,
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -1545,6 +1688,11 @@ const leak_tags = [_][]const u8{
     // Inkling message-channel markers (each a single special token).
                "<|content_text|>",
     "<|content_thinking|>", "<|end_message|>", "<|message_model|>", "<|content_invoke_tool_json|>",
+    // MiniCPM5 V3 attribute XML. Deliberately the ATTRIBUTE-BEARING spellings,
+    // never a bare `<function`: the corpus carries `<functional>` prose that
+    // must keep flowing, and a guard that fails on ordinary words is a guard
+    // nobody can keep green.
+    "<function name=",      "<param name=",    "</function>",       "</param>",
     // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
     "<｜DSML｜",
     // Muse-Glimmer channel markers (each a single special token). The
@@ -1907,6 +2055,73 @@ test "format corpus: streaming tool buffer never flushes Inkling call text" {
             }
         }
     }
+}
+
+test "format corpus: no flush boundary lands inside a tool-call opener, any family" {
+    // UNIVERSAL class guard. streamShouldBufferForTools is the only thing
+    // standing between a mid-marker token boundary and the wire, and the part
+    // of it that covers growing markers — `tail_prefixes` — is a HAND-MAINTAINED
+    // ladder. A missing rung flushes the fragment and leaks the rest of the tag,
+    // and the per-dialect unit tests could not see it because they were written
+    // by copying the same array (that is exactly how MiniCPM5's `<funct` rung
+    // went missing in both places at once). The offsets here are derived from
+    // the recorded bytes rather than from `tail_prefixes`, so this test is
+    // INDEPENDENT of the ladder it checks — a rung deleted from production
+    // fails here even though nothing in this file was edited.
+    //
+    // What it does NOT do, stated plainly so nobody trusts it further than it
+    // goes: `gate_split_markers` below is itself hand-authored, so a dialect
+    // added later inherits NOTHING until its marker is added here — this is a
+    // decorrelated second list, not an automatic one. And it walks only the
+    // INTERIOR bytes of each marker, so a gap in what follows a COMPLETED
+    // marker is out of its reach (the bare Hermes `<function=` split lives one
+    // byte past `<function` and is NOT covered anywhere — a documented known
+    // gap, see docs/gotchas/tool-calling.md). Adding a dialect means adding its marker here AND giving it a
+    // full-call prefix replay there.
+    //
+    // Invariant: for a marker occurrence in an entry that really does carry a
+    // tool call, the gate must HOLD at every interior byte offset. Equivalently
+    // "no flush boundary lands strictly inside the marker" — but stated over
+    // interior offsets it costs O(marker bytes) gate calls instead of one per
+    // byte of the entry (each call is itself O(prefix), so the naive full replay
+    // is quadratic; upstream had to memoize the think-gate replay for exactly
+    // this reason).
+    //
+    // Scope is deliberate on both sides:
+    //   * Only markers the ladder EXISTS to cover — i.e. ones a tokenizer can
+    //     split. Inkling's `<|content_*|>` and Muse's `<|start|>` are single
+    //     special tokens that arrive whole, so no interior offset is reachable
+    //     and upstream gives them no rungs by design; including them here would
+    //     assert something stricter than the tokenizer can produce. They are
+    //     covered by the atomic-marker Inkling replay above instead.
+    //   * Only entries that produce a call. `<function` also occurs inside the
+    //     prose word `<functional`, which must FLUSH — asserting over
+    //     no_tool_calls entries would demand the gate suppress ordinary text.
+    const gate_split_markers = [_][]const u8{
+        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+    };
+    var checked: usize = 0;
+    for (corpus) |entry| {
+        if (entry.tool_name == null) continue;
+        for (gate_split_markers) |marker| {
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, entry.raw, from, marker)) |at| {
+                from = at + 1;
+                // Interior offsets only: `at` itself is before the marker
+                // starts, and `at + marker.len` is the completed marker (the
+                // contains-checks own that one).
+                var i: usize = at + 1;
+                while (i < at + marker.len) : (i += 1) {
+                    checked += 1;
+                    if (!chat.streamShouldBufferForTools(entry.raw[0..i])) {
+                        try fail(entry, "flush boundary inside a tool-call opener", entry.raw[0..i]);
+                    }
+                }
+            }
+        }
+    }
+    // The guard is worthless if it silently matched nothing.
+    try std.testing.expect(checked > 0);
 }
 
 test "format corpus: history round-trip serialization survives any byte content" {
