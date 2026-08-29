@@ -67,6 +67,16 @@ struct ImageGenView: View {
     /// SeedVR2). Two different pipelines behind one window — not persisted,
     /// so the window always opens on Create.
     @State private var paneMode: ImagePaneMode = .create
+    /// The photo the upscale controls act on. It lives HERE rather than in
+    /// `RestoreUpscaleView` because that view is destroyed every time the mode
+    /// flips back to Create — a picked photo would not survive a glance at the
+    /// prompt. Hoisting it is also what lets a finished generation be handed
+    /// straight over (`enlarge`) instead of re-found through a file panel.
+    @State private var upscaleSource: URL? = nil
+    /// Set when a handoff can't proceed (the result file is gone). Shown as an
+    /// alert rather than silently doing nothing, which is what a dead button
+    /// looks like from the outside.
+    @State private var handoffError: String? = nil
 
     var body: some View {
         // No window-sized floor: this is a PAGE of the chat window now, and a
@@ -74,7 +84,7 @@ struct ImageGenView: View {
         // both edges. Small windows shrink the preview side instead.
         switch paneMode {
         case .create: createContent
-        case .upscale: RestoreUpscaleView(mode: $paneMode)
+        case .upscale: RestoreUpscaleView(mode: $paneMode, source: $upscaleSource)
         }
     }
 
@@ -139,6 +149,13 @@ struct ImageGenView: View {
             }
         } message: {
             Text(ramWarningMessage)
+        }
+        .alert("Can't enlarge this", isPresented: Binding(
+            get: { handoffError != nil },
+            set: { if !$0 { handoffError = nil } })) {
+            Button("OK", role: .cancel) { handoffError = nil }
+        } message: {
+            Text(handoffError ?? "")
         }
     }
 
@@ -742,7 +759,16 @@ struct ImageGenView: View {
             Group {
                 switch service.phase {
                 case .idle:
-                    ContentUnavailableView("No generation yet", systemImage: "photo", description: Text("Enter a prompt and press Generate."))
+                    ContentUnavailableView {
+                        Label("No generation yet", systemImage: "photo")
+                    } description: {
+                        Text("Enter a prompt and press Generate.")
+                    } actions: {
+                        // The other way in. A photo from the camera roll has
+                        // no result to press Enlarge on, and the mode picker
+                        // is not where anyone looks for "I already have one".
+                        Button("Upscale a photo instead") { paneMode = .upscale }
+                    }
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
@@ -794,6 +820,12 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
                 .buttonStyle(.borderless)
                 .help("Send to Chat — opens a new conversation with this attached")
+                // The verb belongs next to the picture it applies to. Without
+                // it, enlarging what you are looking at means Reveal in Finder
+                // or an NSOpenPanel aimed at the app's own output folder.
+                Button { enlarge(path) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                .buttonStyle(.borderless)
+                .help("Enlarge — upscale and restore detail with SeedVR2")
             }
         }
         .padding(8)
@@ -913,6 +945,21 @@ struct ImageGenView: View {
         }
 
         service.generate(req, server: server)
+    }
+
+    /// Hand a finished picture to the upscale controls: attach it as the
+    /// source and switch. `ImageSourceHandoff` owns the refusals — the file
+    /// can be gone, and a run already in flight owns its own source.
+    private func enlarge(_ path: String) {
+        switch ImageSourceHandoff.resolve(path: path, isRunning: appState.restoreGen.isRunning) {
+        case .accepted(let url):
+            upscaleSource = url
+            paneMode = .upscale
+        case .missing(let name):
+            handoffError = "\(name) is no longer in the output folder, so there is nothing to enlarge."
+        case .busy:
+            handoffError = "An upscale is already running. Cancel it first, or wait for it to finish."
+        }
     }
 
     private func showLogWindow() {

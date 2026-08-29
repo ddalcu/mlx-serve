@@ -34,8 +34,10 @@ struct RestoreUpscaleView: View {
 
     /// Shared with the Create side, so switching back is the same control.
     @Binding var mode: ImagePaneMode
-
-    @State private var sourceURL: URL? = nil
+    /// The photo being worked on. Owned by `ImageGenView` — this view is
+    /// destroyed on every switch back to Create, so a `@State` copy would lose
+    /// the pick, and a finished generation could not be handed in.
+    @Binding var source: URL?
     @State private var model: RestoreModelPreset = .seedvr2_3b
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
     @State private var lanModel: String? = nil
@@ -112,7 +114,7 @@ struct RestoreUpscaleView: View {
     private var sourceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Photo to upscale").font(.subheadline.weight(.semibold))
-            if let url = sourceURL {
+            if let url = source {
                 HStack(spacing: 8) {
                     if let img = NSImage(contentsOf: url) {
                         Image(nsImage: img)
@@ -124,7 +126,7 @@ struct RestoreUpscaleView: View {
                     Text(url.lastPathComponent)
                         .font(.caption).lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Button { sourceURL = nil } label: {
+                    Button { source = nil } label: {
                         Image(systemName: "xmark.circle.fill")
                     }
                     .buttonStyle(.borderless).foregroundStyle(.secondary).help("Remove photo")
@@ -144,7 +146,7 @@ struct RestoreUpscaleView: View {
             }
         }
         .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
-            if let url = urls.first { sourceURL = url }
+            if let url = urls.first { source = url }
         }
     }
 
@@ -152,7 +154,7 @@ struct RestoreUpscaleView: View {
     /// the file can't be decoded. Read once per source change by both
     /// `cropNote` and `scaleSection`'s target-size caption.
     private var sourcePixelSize: (width: Int, height: Int)? {
-        guard let url = sourceURL, let img = NSImage(contentsOf: url),
+        guard let url = source, let img = NSImage(contentsOf: url),
               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
         return (cg.width, cg.height)
     }
@@ -257,7 +259,7 @@ struct RestoreUpscaleView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(sourceURL == nil || (lanModel == nil && !downloads.bundleReady(model.bundle)))
+                    .disabled(source == nil || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -333,19 +335,19 @@ struct RestoreUpscaleView: View {
         // Through AppActivation, never a raw `panel.runModal()`: this is an
         // accessory app, so a picker opened without bringing it forward first
         // comes up unfocused and swallows the click (`testNoRawPanelPresentation`).
-        if AppActivation.runModal(panel) == .OK, let url = panel.url { sourceURL = url }
+        if AppActivation.runModal(panel) == .OK, let url = panel.url { source = url }
     }
 
     /// Soft gate — see ImageGenView.tryGenerate for the rationale.
     private func tryUpscale() {
-        guard let sourceURL else { return }
+        guard let source else { return }
         persist()
 
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
         if total < needed {
             ramWarningMessage = "This model needs about \(needed) GB of RAM, but your Mac has \(total) GB total. It may run very slowly or fail. Continue?"
-            pendingRequest = (sourceURL.path, model)
+            pendingRequest = (source.path, model)
             showRAMWarning = true
             return
         }
@@ -361,13 +363,13 @@ struct RestoreUpscaleView: View {
             if let msg = RestoreGeometry.memoryWarning(targetWidth: t.width, targetHeight: t.height,
                                                       modelGB: needed, totalRAMGB: total) {
                 ramWarningMessage = msg
-                pendingRequest = (sourceURL.path, model)
+                pendingRequest = (source.path, model)
                 showRAMWarning = true
                 return
             }
         }
 
-        service.restore(sourcePath: sourceURL.path, model: model, lanModelId: lanModel,
+        service.restore(sourcePath: source.path, model: model, lanModelId: lanModel,
                         scale: scale, seed: seed, keepResident: keepResident, server: server)
     }
 
