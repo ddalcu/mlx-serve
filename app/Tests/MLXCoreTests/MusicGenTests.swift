@@ -27,6 +27,95 @@ final class MusicGenTests: XCTestCase {
                        "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit")
     }
 
+    func testReferenceAudioIsDeclaredPerFamilyAndSentOnlyThere() {
+        // ACE-Step has a timbre slot; Music 3 names `ref_audio` a 400. The
+        // preset flag gates the control AND the field, so a clip left behind
+        // by a model switch never reaches the server that refuses it.
+        XCTAssertTrue(MusicModelPreset.acestepXLTurbo8bit.supportsReferenceAudio)
+        XCTAssertFalse(MusicModelPreset.miniMaxMusic3_8bit.supportsReferenceAudio)
+        for p in MusicModelPreset.all {
+            XCTAssertEqual(p.supportsReferenceAudio, p.family == .acestep, p.id)
+        }
+        let ace = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "lo-fi", refAudioPath: "/tmp/ref.wav")
+        XCTAssertEqual(MusicGenService.requestBody(ace, modelName: "ace", refAudioB64: "UklGRg==")["ref_audio"] as? String, "UklGRg==")
+        XCTAssertNil(MusicGenService.requestBody(ace, modelName: "ace")["ref_audio"], "no clip, no field")
+        let m3 = MusicGenRequest(model: .miniMaxMusic3_8bit, prompt: "lo-fi", lyrics: "la", refAudioPath: "/tmp/ref.wav")
+        XCTAssertNil(MusicGenService.requestBody(m3, modelName: "m3", refAudioB64: "UklGRg==")["ref_audio"])
+        XCTAssertNil(MusicGenService.referenceB64(m3))
+        // The sidecar names the clip where it was used, so a track stays reproducible.
+        XCTAssertTrue(MusicGenService.settingsText(ace, resolvedSeed: 1, modelName: "ace").contains("ref_audio: ref.wav"))
+        XCTAssertFalse(MusicGenService.settingsText(m3, resolvedSeed: 1, modelName: "m3").contains("ref_audio"))
+    }
+
+    func testSourceAudioTasksGateTheirFieldsOnModelAndTask() throws {
+        XCTAssertTrue(MusicModelPreset.acestepXLTurbo8bit.supportsSourceAudio)
+        XCTAssertFalse(MusicModelPreset.miniMaxMusic3_8bit.supportsSourceAudio)
+        // Cover: task + source + its two strengths; never the instrument list.
+        var cover = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "orchestral", task: .cover,
+                                    srcAudioPath: "/tmp/src.wav", coverStrength: 0.7, coverNoiseStrength: 1.4,
+                                    trackClasses: ["bass"])
+        var body = MusicGenService.requestBody(cover, modelName: "ace", srcAudioB64: "UklGRg==")
+        XCTAssertEqual(body["task"] as? String, "cover")
+        XCTAssertEqual(body["src_audio"] as? String, "UklGRg==")
+        XCTAssertEqual(body["cover_strength"] as? Double, 0.7)
+        XCTAssertEqual(body["cover_noise_strength"] as? Double, 1.0, "clamped into the server's [0,1]")
+        XCTAssertNil(body["track_classes"])
+        // Complete: task + source + the (vocabulary-filtered) list; no cover knobs.
+        cover.task = .complete
+        cover.trackClasses = ["bass", "kazoo", "drums"]
+        body = MusicGenService.requestBody(cover, modelName: "ace", srcAudioB64: "UklGRg==")
+        XCTAssertEqual(body["task"] as? String, "complete")
+        XCTAssertEqual(body["track_classes"] as? [String], ["bass", "drums"])
+        XCTAssertNil(body["cover_strength"]); XCTAssertNil(body["cover_noise_strength"])
+        // No source clip → plain text2music, whatever the task says (the
+        // server would 400 a source-less cover).
+        body = MusicGenService.requestBody(cover, modelName: "ace")
+        XCTAssertNil(body["task"]); XCTAssertNil(body["src_audio"]); XCTAssertNil(body["track_classes"])
+        // text2music never carries a source even with one attached.
+        cover.task = .text2music
+        body = MusicGenService.requestBody(cover, modelName: "ace", srcAudioB64: "UklGRg==")
+        XCTAssertNil(body["task"]); XCTAssertNil(body["src_audio"])
+        XCTAssertNil(MusicGenService.sourceB64(cover))
+        // Music 3 names every one of these a 400 — the FIELDS are gated.
+        let m3 = MusicGenRequest(model: .miniMaxMusic3_8bit, prompt: "p", lyrics: "la", task: .cover,
+                                 srcAudioPath: "/tmp/src.wav")
+        body = MusicGenService.requestBody(m3, modelName: "m3", srcAudioB64: "UklGRg==")
+        XCTAssertNil(body["task"]); XCTAssertNil(body["src_audio"]); XCTAssertNil(body["cover_strength"])
+        XCTAssertNil(MusicGenService.sourceB64(m3))
+        // The sidecar documents the task, so a cover stays reproducible.
+        cover.task = .cover
+        let txt = MusicGenService.settingsText(cover, resolvedSeed: 1, modelName: "ace")
+        XCTAssertTrue(txt.contains("task: cover") && txt.contains("src_audio: src.wav") && txt.contains("cover_strength: 0.7"))
+        XCTAssertFalse(MusicGenService.settingsText(m3, resolvedSeed: 1, modelName: "m3").contains("task:"))
+    }
+
+    func testCoverWeightsMissingIsAStatOnThePack() throws {
+        // The migration fetch keys on this one file; a pack that has it must
+        // never trigger a download, a pack without it must.
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("mlx-serve-cover-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        XCTAssertTrue(MusicGenService.coverWeightsMissing(packDir: dir))
+        try Data("x".utf8).write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("fsq.safetensors")))
+        XCTAssertFalse(MusicGenService.coverWeightsMissing(packDir: dir))
+        XCTAssertEqual(MusicGenService.coverWeightsFile, "fsq.safetensors")
+    }
+
+    /// The unreachable-settings class (#243): every source-task field the
+    /// request carries has a control bound to it in the pane.
+    func testSourceTaskControlsExistInThePane() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/MusicGenView.swift")
+        let src = try String(contentsOf: url, encoding: .utf8)
+        for needle in ["selection: $task", "value: $coverStrength", "value: $coverNoiseStrength",
+                       "MusicTask.trackClasses", "acceptSource(", "maxSeconds: 600"] {
+            XCTAssertTrue(src.contains(needle), "MusicGenView has no control for \(needle)")
+        }
+        // The migration fetch is reachable from the pane (service gets the manager).
+        XCTAssertTrue(src.contains("service.generate(req, server: server, downloads: downloads)"))
+    }
+
     // MARK: - Request wire contract
 
     func testRequestBodyOmitsEmptyOptionalFields() {
@@ -101,9 +190,32 @@ final class MusicGenTests: XCTestCase {
         s.durationSeconds = 90
         s.vocalLanguage = "ja"
         s.keepResident = true
+        // The pane UNMOUNTS on every navigation, so what the user TYPED must
+        // ride the sticky blob too — or a trip to Chat for a copy-paste
+        // wipes the prompt, the lyrics and the attached reference clip.
+        s.prompt = "upbeat synthwave"
+        s.lyrics = "[verse]\nla la"
+        s.refAudioPath = "/tmp/ref.wav"
+        s.task = .cover
+        s.srcAudioPath = "/tmp/src.wav"
+        s.coverStrength = 0.8
+        s.coverNoiseStrength = 0.3
+        s.trackClasses = ["bass", "drums"]
         let data = try JSONEncoder().encode(s)
         let back = try JSONDecoder().decode(MusicGenSettings.self, from: data)
         XCTAssertEqual(back, s)
+        XCTAssertEqual(back.prompt, "upbeat synthwave")
+        XCTAssertEqual(back.refAudioPath, "/tmp/ref.wav")
+        XCTAssertEqual(back.task, .cover)
+        XCTAssertEqual(back.srcAudioPath, "/tmp/src.wav")
+        XCTAssertEqual(back.trackClasses, ["bass", "drums"])
+        var a = AudioGenSettings()
+        a.text = "hello there"
+        a.refAudioPath = "/tmp/voice.wav"
+        a.refText = "hello"
+        let aback = try JSONDecoder().decode(AudioGenSettings.self, from: JSONEncoder().encode(a))
+        XCTAssertEqual(aback, a)
+        XCTAssertEqual(try JSONDecoder().decode(AudioGenSettings.self, from: Data("{}".utf8)), AudioGenSettings())
         XCTAssertEqual(back.resolvedModel.id, MusicModelPreset.acestepXLTurbo8bit.id)
 
         // Migration-safe: an old/partial payload decodes to defaults.
@@ -453,5 +565,166 @@ final class MusicGenTests: XCTestCase {
         for marker in comp.readyMarkers {
             XCTAssertTrue(picked.contains(marker), "readiness marker \(marker) not downloaded")
         }
+    }
+}
+
+// MARK: - Cover weights (fsq.safetensors) declared at the point of use
+
+/// #269: a pack downloaded before cover mode lacks `fsq.safetensors`, and the
+/// only signal was a 400 after the user had already attached a source track.
+/// The Music tab must say so by name, offer the ONE file, and never offer a
+/// button that cannot work.
+final class CoverWeightsFetchTests: XCTestCase {
+
+    private func tempDir() throws -> String {
+        let dir = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("mlx-serve-fsq-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    func testFileNameIsTheOneConstant() {
+        // One spelling, or the app fetches a file the server never looks for.
+        XCTAssertEqual(CoverWeightsFetch.fileName, "fsq.safetensors")
+        XCTAssertEqual(MusicGenService.coverWeightsFile, CoverWeightsFetch.fileName)
+        // The size quoted in the UI is the real file (420,148,465 bytes).
+        XCTAssertEqual(CoverWeightsFetch.approxMB, 420)
+    }
+
+    func testDecisionOnlyAppliesToCoverOnASourceAudioModel() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        // Vocal to BGM does NOT read the FSQ tokenizer — the server only gates
+        // task "cover" on it, and `complete` builds its context straight from
+        // the source latents. It must never be disabled by this.
+        for task in [MusicTask.text2music, .complete] {
+            XCTAssertEqual(
+                CoverWeightsFetch.decide(task: task, modelSupportsSourceAudio: true,
+                                         isRemote: false, packDir: dir, fetching: false),
+                .notApplicable, "\(task) must not be gated on \(CoverWeightsFetch.fileName)")
+        }
+        // A model with no source-audio tasks has no cover mode at all.
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: false,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .notApplicable)
+    }
+
+    func testMissingWritablePackOffersTheFetchAndPresentSaysReady() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .fetch)
+        try Data("x".utf8).write(to: URL(fileURLWithPath:
+            (dir as NSString).appendingPathComponent(CoverWeightsFetch.fileName)))
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .ready)
+    }
+
+    func testInFlightFetchOutranksMissing() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: true),
+            .downloading)
+    }
+
+    func testUnwritablePackSaysWhereRatherThanOfferingADeadButton() throws {
+        let dir = try tempDir()
+        defer {
+            _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir)
+            try? FileManager.default.removeItem(atPath: dir)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir)
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: dir, fetching: false),
+            .missingUnwritable(dir: dir))
+    }
+
+    func testRemoteModelIsNotOursToComplete() {
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: true, packDir: nil, fetching: false),
+            .unavailableRemotely)
+    }
+
+    func testAbsentPackDirIsNotAnOffer() {
+        // Not installed at all — the model row's own Download button covers it;
+        // offering one file into a pack that isn't there would fail.
+        XCTAssertEqual(
+            CoverWeightsFetch.decide(task: .cover, modelSupportsSourceAudio: true,
+                                     isRemote: false, packDir: nil, fetching: false),
+            .notApplicable)
+    }
+
+    func testEveryDeclaringStateNamesTheFileAndTheSize() {
+        // "The user must be able to read what is wrong without clicking."
+        for decision: CoverWeightsFetch.Decision in [.fetch, .missingUnwritable(dir: "/tmp/pack"),
+                                                     .unavailableRemotely] {
+            let text = CoverWeightsFetch.notice(decision)
+            XCTAssertNotNil(text, "\(decision) must say something")
+            XCTAssertTrue(text?.contains(CoverWeightsFetch.fileName) ?? false,
+                          "\(decision) must name the file: \(text ?? "nil")")
+        }
+        // The offer states the size AND that it is not the whole model again.
+        let offer = CoverWeightsFetch.notice(.fetch) ?? ""
+        XCTAssertTrue(offer.contains("420 MB"), offer)
+        XCTAssertTrue(offer.lowercased().contains("whole model"), offer)
+        // The unwritable state says WHERE to put it.
+        XCTAssertTrue(CoverWeightsFetch.notice(.missingUnwritable(dir: "/tmp/pack"))?
+            .contains("/tmp/pack") ?? false)
+        // Nothing to say when there is nothing wrong.
+        XCTAssertNil(CoverWeightsFetch.notice(.ready))
+        XCTAssertNil(CoverWeightsFetch.notice(.notApplicable))
+    }
+
+    func testTheModeLabelItselfDeclaresTheMissingFile() {
+        // Requirement 1: the Cover option declares it in its OWN label, so the
+        // reason is readable before the mode is even selected.
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(MusicTask.cover, decision: .ready), "Cover")
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(MusicTask.cover, decision: .notApplicable), "Cover")
+        for decision: CoverWeightsFetch.Decision in [.fetch, .downloading,
+                                                     .missingUnwritable(dir: "/d"), .unavailableRemotely] {
+            XCTAssertTrue(CoverWeightsFetch.modeLabel(.cover, decision: decision)
+                            .contains(CoverWeightsFetch.fileName),
+                          "\(decision) label: \(CoverWeightsFetch.modeLabel(.cover, decision: decision))")
+        }
+        // Never decorate the modes this has nothing to do with.
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(.complete, decision: .fetch), "Vocal to BGM")
+        XCTAssertEqual(CoverWeightsFetch.modeLabel(.text2music, decision: .fetch), "Text to music")
+    }
+
+    /// The wiring a unit test cannot reach: the pane must actually render the
+    /// notice, offer the fetch, and allow cancel (the source-scan idiom).
+    func testMusicPaneWiresTheCoverWeightsNotice() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/MusicGenView.swift")
+        let src = try String(contentsOf: url, encoding: .utf8)
+        for needle in ["CoverWeightsFetch.decide(", "CoverWeightsFetch.notice(",
+                       "CoverWeightsFetch.modeLabel(",
+                       "downloads.startPackFile(", "downloads.cancelPackFile("] {
+            XCTAssertTrue(src.contains(needle), "MusicGenView does not wire \(needle)")
+        }
+    }
+
+    /// The server's own gate must keep spelling the file the app fetches, and
+    /// must keep gating ONLY cover on it.
+    func testServerGatesOnlyCoverOnTheSameFileName() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let gen = try String(contentsOf: root.appendingPathComponent("src/gen.zig"), encoding: .utf8)
+        XCTAssertTrue(gen.contains("task == .cover and !music.fsqAvailable()"),
+                      "src/gen.zig no longer gates cover on the FSQ tokenizer")
+        let ace = try String(contentsOf: root.appendingPathComponent("src/acestep.zig"), encoding: .utf8)
+        XCTAssertTrue(ace.contains("FSQ_FILE = \"\(CoverWeightsFetch.fileName)\""),
+                      "src/acestep.zig no longer reads \(CoverWeightsFetch.fileName)")
     }
 }

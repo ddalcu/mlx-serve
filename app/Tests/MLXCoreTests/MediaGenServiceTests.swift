@@ -1346,10 +1346,12 @@ extension MediaGenServiceTests {
             XCTAssertEqual(n % 17, 5, "\(n) is not on the 17k+5 ladder")
             XCTAssertLessThanOrEqual(n, h3.maxFrames)
         }
-        // Floor is 124 (the reference node's own trained-range start), not
-        // the raw ladder's mathematical floor of 5 — below it the model
-        // generates off-distribution, so the picker must not offer it.
-        XCTAssertEqual(h3.frameOptions.first, 124)
+        // Floor is the ENGINE's 5, not the reference node's trained-range
+        // start of 124: off-distribution is a reason to warn (see
+        // `H3ReachableRangeTests`), not a reason to make a one-second test
+        // clip — or the server's own default length of 56 — unreachable.
+        XCTAssertEqual(h3.frameOptions.first, 5)
+        XCTAssertTrue(h3.frameOptions.contains(56))
         XCTAssertTrue(h3.frameOptions.contains(124))
         // Ceiling is the top of the model's own ladder: MiniMax states 4-15 s
         // at 24 fps, and 362 frames (15.1 s) is a run we have done in ONE

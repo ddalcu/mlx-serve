@@ -153,7 +153,7 @@ def send_request(messages, enable_thinking=False, max_tokens=2048, force_no_tool
     total_rounds += 1
 
     body = {
-        "model": "mlx-serve",
+        "model": os.environ.get("MODEL", "mlx-serve"),
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.7,

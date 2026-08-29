@@ -4,12 +4,12 @@
 # Self-contained: builds binary, starts server, runs tests, kills server.
 #
 # Usage: ./tests/test_vision_moe_regression.sh [model_dir] [port]
-# Default model: ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+# Default model: ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 # Default port: 8097
 
 set -euo pipefail
 
-MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}}"
+MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
 PORT="${2:-8097}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="./zig-out/bin/mlx-serve"
@@ -98,8 +98,8 @@ echo "Port:  $PORT"
 echo ""
 
 if [ ! -d "$MODEL_DIR" ]; then
-    echo -e "${RED}Model not found: $MODEL_DIR${NC}"
-    exit 1
+    echo -e "${YELLOW}SKIP${NC}: no model at $MODEL_DIR (pass a dir as \$1 or set MLX_SERVE_TEST_MODEL)"
+    exit 0
 fi
 
 CONFIG_FILE="$MODEL_DIR/config.json"

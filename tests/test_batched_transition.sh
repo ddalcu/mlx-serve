@@ -22,7 +22,7 @@
 #
 # Requires:
 #   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - BATCH_TEST_MODEL or ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#   - BATCH_TEST_MODEL or ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 #
 # Usage:
 #   ./tests/test_batched_transition.sh [port]
@@ -36,11 +36,11 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${BATCH_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+MODEL="${BATCH_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_batched_transition: model directory not found."
-    echo "  Set BATCH_TEST_MODEL or place a checkpoint at ~/.mlx-serve/models/gemma-4-e4b-it-8bit."
+    echo "  Set BATCH_TEST_MODEL or place a checkpoint at ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit."
     exit 0
 fi
 

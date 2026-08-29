@@ -154,7 +154,7 @@ Three fallbacks the live protocol forces, each a distinct failure: a `200` answe
 
 Also shipped here: the app finally sends an HF token (`hfToken` → `HF_TOKEN`, then `$HF_HOME/token`, then `~/.cache/huggingface/token`). A Finder-launched bundle has NO shell environment, so the env var the Zig CLI reads is almost never set in the app and the `huggingface-cli login` file is the one that actually works. Buys gated repos and API rate limit, not speed.
 
-**The entry-point question.** The app has six download entry points (`start`, both `startGguf` overloads, `startBundle`, `download`, `downloadGguf`) reached from ~14 call sites across the views, plus `ensureNsfwClassifier` and DocumentIndex's bge auto-pull. All of them funnel into `download` or `downloadGguf`, which are the only two callers of `transferFile` — so the change is app-wide by construction, not by inspection. A seventh entry point that hand-rolled its own `dataTask` would work PERFECTLY and silently opt out of chunking, the shared session and the token; nothing would fail, it would just be slow again, which is why it's source-audited rather than trusted. The same audit one level up ("no service fetches huggingface.co on `URLSession.shared`") had to be written at FILE scope: at LINE scope it passed vacuously, because the URL is built a line or two above the fetch — and that false negative was hiding `HFSearchService`, i.e. the Model Browser's search and per-repo size lookups, which had never sent the token and were the surface most likely to be rate-limited. Non-model downloads stay on their own paths and are unchanged: `OCIClient` (sandbox guest image, a different registry and protocol) and `UpdateChecker` (the app DMG).
+**The entry-point question.** The app has six download entry points (`start`, both `startGguf` overloads, `startBundle`, `download`, `downloadGguf`) reached from ~14 call sites across the views, plus DocumentIndex's bge auto-pull. All of them funnel into `download` or `downloadGguf`, which are the only two callers of `transferFile` — so the change is app-wide by construction, not by inspection. A seventh entry point that hand-rolled its own `dataTask` would work PERFECTLY and silently opt out of chunking, the shared session and the token; nothing would fail, it would just be slow again, which is why it's source-audited rather than trusted. The same audit one level up ("no service fetches huggingface.co on `URLSession.shared`") had to be written at FILE scope: at LINE scope it passed vacuously, because the URL is built a line or two above the fetch — and that false negative was hiding `HFSearchService`, i.e. the Model Browser's search and per-repo size lookups, which had never sent the token and were the surface most likely to be rate-limited. Non-model downloads stay on their own paths and are unchanged: `OCIClient` (sandbox guest image, a different registry and protocol) and `UpdateChecker` (the app DMG).
 
 Guards: `ChunkedDownloadTests` — planning invariants, sidecar validation, and an end-to-end suite against a `URLProtocol` stub that speaks real Range semantics, asserting the ASSEMBLED BYTES (a chunk writing at the wrong offset is precisely what arithmetic-only tests miss). `DownloadManagerTransferTests` drives the REAL `download(repoId:)` loop against a stub HF origin — a working transport and a commit path that strands a `.partial` both look like "it downloaded fine" — covering retry-then-land, skip-what's-present, cancel-leaves-zero-footprint, and both source audits. Two opt-in live measurements (`MLX_SERVE_LIVE_DOWNLOAD=1`) keep both halves re-measurable, one of them verifying the shipped 16-way reassembly byte-for-byte against the CDN. Known untested: HF's response to sustained 16-way range requests (a 429 degrades to the retry loop, i.e. slower, not broken).
 
@@ -638,3 +638,75 @@ Each failed connect (server dead or no answer within 30s) leaks one permanently-
 Fix: both losing paths call `client.disconnect()` (via `Task.detached` so it doesn't block the resume closure); the timeout path also terminates the child first. `connectOrFailFast` gained an injectable `hardCapSeconds` (default 30) and `onPathASettled` hook, and went `private`→`internal` for `@testable import`. Guard: `MCPConnectLeakTests.testAbandonedConnectSettlesAfterLosingTheRace` — real `sleep 60` child (accepts pipes, never speaks MCP, so the death-watcher never fires), 0.3s cap, asserts Path A settles within 5s.
 
 Rule: any race that abandons one arm must ask whether the abandoned arm can unstick itself — here, only `disconnect()` does. A "loser keeps running" comment is a code smell: re-read it whenever a related watchdog is added nearby, in case the treatments have diverged (they did, for ~months, between the tool-call watchdog and this race). Diagnosis: `/health` + `requests_running` rule out the server in under a second; `sample <pid>` on the app is the fastest way to catch a CPU-spinning leak — a thread still inside a one-shot async call hours in is the tell.
+
+## MLX Core crashed on every equation: a SwiftPM resource bundle no signed .app can hold (issue #233, 2026-08-20)
+
+v26.8.9 shipped LaTeX rendering. A reporter on an M5 MacBook Pro could not launch the app
+at all: it restored a chat containing math and died on the spot, `EXC_BREAKPOINT` in
+`_assertionFailure` under `KaTeXFontProvider.makeUnitFont` → `Bundle.module`. Reproduced
+here in seconds by asking a model to show a formula — the display-math path
+(`MathCanvasContent.body`) trapped identically. It looked user-specific and was universal.
+
+The first read was that their copy of the app was missing the font bundle, because the
+shipped DMG has it: `Contents/Resources/SwaTex_SwaTexRender.bundle` is present, sealed in
+`CodeResources`, `codesign -v --deep --strict` passes, and the same binary UUID on the same
+OS build (26.5 25F71) resolved the fonts from a scratch Swift snippet. All true, and all
+beside the point.
+
+The accessor is what SwiftPM generates for a target with resources:
+
+```swift
+let mainPath = Bundle.main.bundleURL.appendingPathComponent("SwaTex_SwaTexRender.bundle").path
+let buildPath = "/Users/runner/work/mlx-serve/mlx-serve/app/.build/.../SwaTex_SwaTexRender.bundle"
+guard let bundle = Bundle(path: mainPath) ?? Bundle(path: buildPath) else { Swift.fatalError(...) }
+```
+
+For an app bundle `Bundle.main.bundleURL` is the **.app itself** (measured with a throwaway
+.app: `bundleURL=/…/T.app`, `resourceURL=/…/T.app/Contents/Resources`), so it looks for
+`MLX Core.app/SwaTex_SwaTexRender.bundle`. The second candidate is a CI runner's build
+directory. Neither exists on any user's machine, and the miss is a `fatalError` rather than
+a nil the caller can absorb — `makeUnitFont` itself degrades to a system font perfectly
+well, it just never gets the chance.
+
+The obvious fix does not exist. Copying the bundle to the .app root and re-signing:
+
+```
+MLX Core.app: unsealed contents present in the bundle root      # codesign -v --deep --strict, rc=1
+MLX Core.app: rejected (unsealed contents present in the bundle root)   # spctl
+```
+
+Only `Contents/` may live in a bundle root, so the one place the accessor looks is the one
+place nothing can ship. An Xcode-built app is fine because Xcode emits a different accessor
+that also searches `Bundle.main.resourceURL`; every mlx-serve path — the DMG lane in
+release.yml and the MAS lane in build.sh — uses `swift build`, so both were broken.
+
+The fix patches the dependency's single call site before it is compiled
+(`scripts/patch-swatex-font-lookup.sh`, wired into build.sh, release.yml and ci.yml ahead of
+`swift build`): `Bundle.module.url(...)` becomes a candidate search over
+`Bundle.main.resourceURL`, `Bundle.main.bundleURL`, the reading bundle's own two, and that
+bundle's parent (the `swift test` layout, where the resource bundle is the .xctest's
+sibling). It is idempotent, `chmod u+w`s the read-only checkout, and REFUSES rather than
+silently no-opping when the upstream source stops matching — a patch that quietly fails to
+apply ships a build that crashes exactly where it did before. Proof it works is a probe
+binary placed inside a real assembled bundle, so `Bundle.main` is the .app:
+
+```
+KaTeX_Main-Regular -> /…/MLX Core.app/Contents/Resources/SwaTex_SwaTexRender.bundle/Fonts/KaTeX_Main-Regular.ttf
+old Bundle.module path would be -> /…/MLX Core.app/SwaTex_SwaTexRender.bundle (MISSING -> fatalError)
+```
+
+App-side, `LaTeXFonts.isAvailable` asks the same question once and both entry points
+(`InlineLaTeXRenderer.attributedAttachment`, `DisplayLaTeXRenderer.canRender`) decline when
+it is false, so the segment renders as its exact source — the fallback malformed TeX already
+takes. A missing resource must cost the math, not the process.
+
+Two lessons worth more than the bug. **A packaging guard has to assert the destination the
+code READS, not that a copy happens**: `testSwaTexFontBundleShipsInBothDeveloperIDPackagingPaths`
+scanned build.sh for the string `SwaTex_SwaTexRender.bundle` and was green through every
+crashing release, because the bundle really was being copied — just to a path nothing looks
+in. And **"the artifact is correct" does not answer "the artifact works"**: the DMG passed
+every structural check that could be run against it while being unable to render a single
+equation.
+
+## A dropped frame is a failed mux (issue #170, 2026-08-28)
+H3 REF2VA renders above 124 frames intermittently produced a ~28 KB mp4 of black frames. The server side was clean every time (`[minimax-h3] video decoded`, `[video] -> 226f 1344x768 (699826176 rgb bytes)`), and `decodeFrames` validates `rgb.count == frames*h*w*3`, so the loss was inside `VideoGenService.writeMP4`: `CVPixelBufferPoolCreatePixelBuffer` returning nil hit `guard let pb else { continue }`, and `adaptor.append(...)`'s Bool was discarded. Either way the loop went on, `finishWriting` reported `.completed`, and the app called it a success. Same settings passed and failed across runs (209 frames 768x1344: 1 fail / 3 ok), which is what a pool-exhaustion race looks like, not a size threshold. Fix: pool miss falls back to a standalone `CVPixelBufferCreate`; a nil buffer or a refused append throws `MuxError.frameBuffer/frameAppend`, cancels the writer and removes the file, so the user gets an error instead of a black clip. Not reproduced hermetically (needs the encoder to starve the pool); the existing realistic-scale mux tests stay green.

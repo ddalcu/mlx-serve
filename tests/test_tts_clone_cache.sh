@@ -17,8 +17,9 @@
 # Usage: TTS_MODEL=<dir> ./tests/test_tts_clone_cache.sh [port]
 set -euo pipefail
 PORT="${1:-11378}"
-MODEL="${TTS_MODEL:-$(ls -d ~/.mlx-serve/models/mlx-community/Qwen3-TTS-12Hz-*-Base-* 2>/dev/null | head -1)}"
+MODEL="${TTS_MODEL:-$(ls -d ~/.mlx-serve/models/mlx-community/Qwen3-TTS-12Hz-*-Base-* 2>/dev/null | head -1 || true)}"
 [ -n "$MODEL" ] || { echo "SKIP: no qwen3_tts model (set TTS_MODEL)"; exit 0; }
+[ -d "$MODEL" ] || { echo "FAIL: TTS_MODEL points at a missing dir: $MODEL" >&2; exit 1; }
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 TMP=$(mktemp -d /tmp/tts_clone_cache.XXXXXX)
 SRV=""

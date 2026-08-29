@@ -2,9 +2,11 @@
 # ACE-Step text2music on the ONE main server: headless boot -> load the music
 # model by absolute path -> /v1/models shows the "music" capability -> POST
 # /v1/audio/music-generations with a style prompt -> assert a valid 48 kHz
-# stereo PCM16 WAV of the requested duration -> 400s (missing prompt, bad
-# duration, TTS endpoint mismatch) -> SSE streaming -> coexist with a chat
-# model -> unload. Proves the second audio backend routes end to end.
+# stereo PCM16 WAV of the requested duration -> ref_audio -> tasks complete +
+# cover (source length kept, engagement lines) -> 400s (missing prompt, bad
+# duration, task/src_audio pairing, TTS endpoint mismatch) -> SSE streaming ->
+# coexist with a chat model -> unload. Proves the second audio backend routes
+# end to end.
 #
 # Skips gracefully when no converted model is present. Convert with:
 #   python3 tests/convert_acestep_weights.py --src-xl <dir> --src-main <dir>
@@ -74,6 +76,36 @@ PY
 
 # 3. Server survives the gen; the 400 family.
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server died after music gen"; exit 1; }
+
+# ── Reference audio (#259): the previous arm's WAV fed back as `ref_audio`.
+# The guard is the ENGAGEMENT line, never the output — a silently ignored
+# clip still yields a perfectly good track.
+base64 < /tmp/test_music_out.wav | tr -d '\n' > /tmp/test_music_out.b64
+# mkreq <out.json> '<json object of extra fields>' — base64 clips are read from
+# FILES (a 10 s WAV's base64 is past ARG_MAX): the value "@b64" expands to it.
+mkreq() { python3 - "$1" "$2" "$MUSIC_ID" <<'PY'
+import json, sys
+extra = json.loads(sys.argv[2])
+b64 = open('/tmp/test_music_out.b64').read()
+body = {'model': sys.argv[3]}
+body.update({k: (b64 if v == '@b64' else v) for k, v in extra.items()})
+json.dump(body, open(sys.argv[1], 'w'))
+PY
+}
+mkreq /tmp/test_music_ref_req.json '{"prompt":"lo-fi hip hop, mellow","duration_seconds":10,"seed":3,"ref_audio":"@b64"}'
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' --data @/tmp/test_music_ref_req.json -o /tmp/test_music_ref.wav -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: ref_audio music gen http $code"; head -c 300 /tmp/test_music_ref.wav; exit 1; }
+grep -q "\[acestep\] reference audio: 750 latent frames" /tmp/test_music_server.log \
+  || { echo "FAIL: reference audio not engaged (no '[acestep] reference audio: 750 latent frames' log line)"; grep "reference" /tmp/test_music_server.log | head -3; exit 1; }
+echo "PASS: ref_audio -> 200 + timbre slot fed from the clip (750 latent frames)"
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"duration_seconds\":10,\"ref_audio\":\"!!notbase64\"}" -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] && grep -q "ref_audio" /tmp/test_music_err.txt || { echo "FAIL: bad ref_audio returned $code (want named 400)"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: bad ref_audio base64 -> named 400"
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"duration_seconds\":10,\"ref_audio\":\"AAAA\"}" -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] && grep -q "WAV" /tmp/test_music_err.txt || { echo "FAIL: non-WAV ref_audio returned $code (want named 400)"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: non-WAV ref_audio -> named 400"
 code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MUSIC_ID\",\"duration_seconds\":10}" -o /dev/null -w "%{http_code}")
 [ "$code" = "400" ] || { echo "FAIL: missing prompt returned $code (want 400)"; exit 1; }
@@ -98,6 +130,60 @@ code=$(api /v1/audio/speech -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MUSIC_ID\",\"input\":\"hello\"}" -o /dev/null -w "%{http_code}")
 [ "$code" = "400" ] || { echo "FAIL: /v1/audio/speech on music model returned $code (want 400)"; exit 1; }
 echo "PASS: /v1/audio/speech on a music model -> 400"
+
+# ── Tasks: `complete` (vocal-to-BGM) needs no new weights; `cover` reads the
+# FSQ tokenizer (fsq.safetensors). Source = the first arm's 10 s WAV. Guards
+# are the ENGAGEMENT lines + the length contract (track == source length).
+mkreq /tmp/test_music_complete_req.json '{"prompt":"full band arrangement","duration_seconds":60,"seed":5,"task":"complete","src_audio":"@b64","track_classes":["bass","drums"]}'
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' --data @/tmp/test_music_complete_req.json -o /tmp/test_music_complete.wav -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: complete task http $code"; head -c 300 /tmp/test_music_complete.wav; exit 1; }
+grep -q "\[acestep\] complete: 250 source frames as context, classes=BASS | DRUMS" /tmp/test_music_server.log \
+  || { echo "FAIL: complete task not engaged (no '[acestep] complete: 250 source frames' line)"; grep "acestep\] complete" /tmp/test_music_server.log | head -3; exit 1; }
+python3 - /tmp/test_music_complete.wav <<'PY'
+import sys
+b = open(sys.argv[1], "rb").read()
+dur = ((len(b) - 44) // 4) / 48000
+assert abs(dur - 10.0) < 0.1, f"complete must keep the SOURCE length (10 s), got {dur:.2f} s"
+PY
+echo "PASS: task complete -> 200, source latent as context, BASS | DRUMS classes, source length kept"
+if [ -f "$MUSIC/fsq.safetensors" ]; then
+  mkreq /tmp/test_music_cover_req.json '{"prompt":"orchestral cover, strings and brass","duration_seconds":60,"seed":5,"task":"cover","src_audio":"@b64","cover_strength":0.75,"cover_noise_strength":0.5}'
+  code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' --data @/tmp/test_music_cover_req.json -o /tmp/test_music_cover.wav -w "%{http_code}")
+  [ "$code" = "200" ] || { echo "FAIL: cover task http $code"; head -c 300 /tmp/test_music_cover.wav; exit 1; }
+  grep -q "\[acestep\] cover: source 250 frames -> 50 codes" /tmp/test_music_server.log \
+    || { echo "FAIL: cover not engaged (no '[acestep] cover: source 250 frames -> 50 codes' line)"; grep "acestep\] cover" /tmp/test_music_server.log | head -3; exit 1; }
+  grep -q "\[acestep\] cover: switching to text2music conditioning" /tmp/test_music_server.log \
+    || { echo "FAIL: cover_strength<1 did not switch condition sets"; exit 1; }
+  grep -q "\[acestep\] cover: noise_strength=0.50 -> start at t=0.500" /tmp/test_music_server.log \
+    || { echo "FAIL: cover_noise_strength start point not applied"; grep "noise_strength" /tmp/test_music_server.log | head -3; exit 1; }
+  python3 - /tmp/test_music_cover.wav <<'PY'
+import sys
+b = open(sys.argv[1], "rb").read()
+dur = ((len(b) - 44) // 4) / 48000
+assert abs(dur - 10.0) < 0.1, f"cover must keep the SOURCE length (10 s), got {dur:.2f} s"
+PY
+  echo "PASS: task cover -> 200, 50 FSQ codes, strength switch + noise start, source length kept"
+else
+  echo "SKIP: cover arm ($MUSIC has no fsq.safetensors — tests/convert_acestep_weights.py --fsq-only)"
+fi
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"task\":\"cover\"}" -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] && grep -q "src_audio" /tmp/test_music_err.txt || { echo "FAIL: cover without src_audio returned $code (want named 400)"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: cover without src_audio -> named 400"
+mkreq /tmp/test_music_bad_req.json '{"prompt":"jazz","src_audio":"@b64"}'
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  --data @/tmp/test_music_bad_req.json -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] && grep -q "src_audio" /tmp/test_music_err.txt || { echo "FAIL: src_audio on text2music returned $code (want named 400)"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: src_audio on text2music -> named 400"
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"task\":\"remix\"}" -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] && grep -q "task" /tmp/test_music_err.txt || { echo "FAIL: bad task returned $code (want named 400)"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: unknown task -> named 400"
+mkreq /tmp/test_music_bad_req.json '{"prompt":"jazz","task":"complete","src_audio":"@b64","track_classes":["kazoo"]}'
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  --data @/tmp/test_music_bad_req.json -o /tmp/test_music_err.txt -w "%{http_code}")
+[ "$code" = "400" ] && grep -q "track_classes" /tmp/test_music_err.txt || { echo "FAIL: unknown track class returned $code (want named 400)"; cat /tmp/test_music_err.txt; exit 1; }
+echo "PASS: unknown track_classes entry -> named 400"
 
 # 4. Streaming: SSE progress (encode/diffuse/decode stages) + base64 complete.
 cat > /tmp/test_music_stream_req.json <<EOF

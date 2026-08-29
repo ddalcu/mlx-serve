@@ -73,9 +73,10 @@ grep -q 'instrumental' <(api /v1/audio/music-generations -X POST -H 'Content-Typ
   || { echo "FAIL: missing-lyrics 400 does not mention the instrumental escape hatch"; exit 1; }
 echo "PASS: missing-lyrics 400 names the instrumental escape hatch"
 # ACE-Step-only fields have NO music3 equivalent — refused by name, never ignored.
-for f in '"bpm":120' '"keyscale":"F# minor"' '"timesignature":"4/4"' '"vocal_language":"en"'; do
+# (bpm/keyscale are NOT in this list: since 259bd15 they ride the caption here.)
+for f in '"timesignature":"4/4"' '"vocal_language":"en"' '"ref_audio":"AAAA"' '"src_audio":"AAAA"' '"task":"cover"'; do
   b400 "ACE-Step field ${f%%:*}" "{\"model\":\"$MUSIC_ID\",\"prompt\":\"jazz\",\"lyrics\":\"la\",$f}"
-  grep -q 'ACE-Step field' /tmp/test_music3_err.txt || grep -q 'no equivalent' /tmp/test_music3_err.txt \
+  grep -q 'ACE-Step' /tmp/test_music3_err.txt || grep -q 'no equivalent' /tmp/test_music3_err.txt \
     || { echo "FAIL: unsupported-field 400 does not NAME the problem"; cat /tmp/test_music3_err.txt; exit 1; }
 done
 # The TTS endpoint against a music model is an explicit 400.

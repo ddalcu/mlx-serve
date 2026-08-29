@@ -13,7 +13,7 @@
 #   4. a streaming /v1/messages tools request still parses the tool call
 #
 # Requires a dense Gemma 4 target + matching assistant drafter:
-#   DRAFTER_TEST_TARGET (default ~/.mlx-serve/models/gemma-4-e4b-it-8bit)
+#   DRAFTER_TEST_TARGET (default ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit)
 #   DRAFTER_TEST_DRAFTER (default ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16)
 #
 # Usage: ./tests/test_drafter_tools.sh [port]
@@ -27,7 +27,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+MODEL="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 if [ ! -d "$MODEL" ] || [ ! -d "$DRAFTER" ]; then
     echo -e "${YELLOW}SKIP${NC} test_drafter_tools: target or drafter checkpoint not found."

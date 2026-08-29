@@ -83,3 +83,4 @@ containers/agent-shell-mlxserve/rootfs.tar.gz.sha256
 # drift apart. Checked-in context stays in CLAUDE.md / app/CLAUDE.md.
 /missionlog.md
 /.mc.json
+tests/soak_log.csv

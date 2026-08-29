@@ -23,7 +23,7 @@
 
 set -u
 
-MODEL="${1:-$HOME/.mlx-serve/models/Qwen3.6-35B-A3B-6bit}"
+MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit}"
 PORT="${2:-11263}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

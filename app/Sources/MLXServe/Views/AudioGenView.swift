@@ -27,10 +27,11 @@ struct AudioGenView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .controlSize(.large)
             .labelsHidden()
-            .frame(width: 240)
+            .frame(width: 280)
             .padding(.top, 10)
-            .padding(.bottom, 2)
+            .padding(.bottom, 14)
 
             switch tab {
             case .voice: VoiceGenView()
@@ -201,9 +202,7 @@ struct VoiceGenView: View {
         }
         .onDisappear { stopDictation() }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: speed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: temperature) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             // A new generation stops whatever is still playing.
             if case .running = phase { stopPlayback() }
@@ -372,8 +371,13 @@ struct VoiceGenView: View {
                     Text(url.lastPathComponent)
                         .font(.caption).lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Button { playReference(url) } label: { Image(systemName: "play.circle") }
-                        .buttonStyle(.borderless).help("Preview reference")
+                    if clipPlayer.playingPath == url.path {
+                        Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                            .buttonStyle(.borderless).help("Stop preview")
+                    } else {
+                        Button { playReference(url) } label: { Image(systemName: "play.circle") }
+                            .buttonStyle(.borderless).help("Preview reference")
+                    }
                     Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                 }
@@ -639,16 +643,27 @@ struct VoiceGenView: View {
         speed = s.speed
         temperature = s.temperature
         keepResident = s.keepResident
+        text = s.text
+        refText = s.refText
+        // The clip is a temp transcode; only restore it while it still exists.
+        refAudioURL = s.refAudioPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
     }
 
-    private func persist() {
+    /// Every sticky field (knobs AND the typed draft) as one `Equatable`
+    /// blob, so a single `onChange` persists all of it.
+    private var stickySnapshot: AudioGenSettings {
         var s = AudioGenSettings()
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.speed = speed
         s.temperature = temperature
         s.keepResident = keepResident
-        s.save()
+        s.text = text
+        s.refText = refText
+        s.refAudioPath = refAudioURL?.path
+        return s
     }
+
+    private func persist() { stickySnapshot.save() }
 
     // MARK: - Generate
 

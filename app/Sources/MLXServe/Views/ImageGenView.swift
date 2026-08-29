@@ -37,9 +37,6 @@ struct ImageGenView: View {
     /// Keep the model resident after generating (default off → unload to free
     /// GPU memory). On → the next generation reuses it instantly.
     @State private var keepResident: Bool = false
-    /// Apply the NSFW content filter (on by default). Off → sends safety:false so
-    /// the server skips it. (The license expects filtering in deployments.)
-    @State private var safeMode: Bool = true
     /// Image-to-image source (transient — not persisted, like video's first frame).
     @State private var initImageURL: URL? = nil
     /// Extra in-context references for edit mode (FLUX.2 multi-reference):
@@ -120,7 +117,6 @@ struct ImageGenView: View {
             // Freshen the network-model list so LAN entries are current in
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
-            downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
         }
         // Persist every other sticky field on change (model/quality persist in
         // their sections after applying preset defaults).
@@ -129,7 +125,6 @@ struct ImageGenView: View {
         .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: scale) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: restoreModel) { _, _ in guard !hydrating else { return }; persist() }
@@ -670,14 +665,11 @@ struct ImageGenView: View {
             Toggle("Keep model loaded afterwards", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next run is instant. Off (default): it's unloaded to free GPU memory.")
+
             // Everything below is a property of the IMAGE model — safety
             // filter, text-encoder rebalance, DiT LoRAs. None of it reaches
             // SeedVR2, and a control the backend ignores is worse than one
             // that isn't there.
-            if effectiveVerb == .enlarge { EmptyView() } else {
-            Toggle("Safe mode (NSFW content filter)", isOn: $safeMode)
-                .font(.caption)
-                .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
 
             // Rebalance scales the TAPPED text-encoder layers. A backend that
             // conditions on a single final hidden state has none to tap
@@ -771,8 +763,7 @@ struct ImageGenView: View {
                 }
             }
             } // model.supportsLoRA
-            } // image-model-only controls
-        }
+        } // image-model-only controls
     }
 
     /// The verbs this model can serve, in picker order. `enlarge` is always
@@ -1238,7 +1229,6 @@ struct ImageGenView: View {
         resolution = s.resolvedResolution(for: model)
         steps = s.steps
         seed = s.seed
-        safeMode = s.safeMode
         keepResident = s.keepResident
         strength = s.strength
         sourceVerb = s.sourceVerb
@@ -1270,7 +1260,6 @@ struct ImageGenView: View {
         s.customHeight = Int(customHeightText) ?? ImageGenSettings().customHeight
         s.steps = steps
         s.seed = seed
-        s.safeMode = safeMode
         s.keepResident = keepResident
         s.strength = strength
         s.sourceVerb = sourceVerb
@@ -1311,7 +1300,6 @@ struct ImageGenView: View {
             steps: steps,
             keepResident: keepResident,
             lanModelId: lanModel,
-            safeMode: safeMode,
             initImagePath: initImageURL?.path,
             strength: strength,
             editMode: effectiveEditMode,

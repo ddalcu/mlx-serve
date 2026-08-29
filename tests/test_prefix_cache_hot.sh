@@ -20,12 +20,12 @@
 
 set -uo pipefail
 
-MODEL_DIR="${1:-$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit}"
+MODEL_DIR="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-19040}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 
 [[ -x "$BINARY" ]] || { echo "Build first" >&2; exit 1; }
-[[ -d "$MODEL_DIR" ]] || { echo "Model not found: $MODEL_DIR" >&2; exit 1; }
+[[ -d "$MODEL_DIR" ]] || { echo "SKIP: no model at $MODEL_DIR (pass a dir as \$1)"; exit 0; }
 
 trap 'pkill -9 -x mlx-serve 2>/dev/null; true' EXIT
 

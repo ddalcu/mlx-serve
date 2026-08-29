@@ -20,7 +20,7 @@
 # Requires:
 #   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
 #   - EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit
-#   - (check 5 only) CHAT_TEST_MODEL or ~/.mlx-serve/models/Qwen3-0.6B-nvfp4
+#   - (check 5 only) CHAT_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4
 #
 # Usage: ./tests/test_embeddings.sh [port]
 
@@ -34,7 +34,7 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 EMBED_MODEL="${EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit}"
-CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/Qwen3-0.6B-nvfp4}"
+CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4}"
 if [ ! -d "$EMBED_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_embeddings: encoder model not found at $EMBED_MODEL"
     exit 0

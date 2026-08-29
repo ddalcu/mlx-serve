@@ -130,7 +130,7 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
     }
 }
 
-struct PlanStep: Identifiable, Codable {
+struct PlanStep: Identifiable, Codable, Equatable {
     let id: UUID
     var tool: AgentToolKind
     var description: String
@@ -153,7 +153,7 @@ enum PlanStatus: String, Codable {
     case failed
 }
 
-struct AgentPlan: Identifiable, Codable {
+struct AgentPlan: Identifiable, Codable, Equatable {
     let id: UUID
     var steps: [PlanStep]
     var status: PlanStatus
@@ -172,7 +172,7 @@ enum StepStatus: String, Codable {
     case failed
 }
 
-struct StepResult: Identifiable, Codable {
+struct StepResult: Identifiable, Codable, Equatable {
     let id: UUID
     let stepId: UUID
     var status: StepStatus

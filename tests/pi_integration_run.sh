@@ -47,9 +47,9 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 #   served_name is what mlx-serve reports in /v1/models (used by pi as id).
 # -----------------------------------------------------------------------------
 MODELS=(
-    "e4b|$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit|gemma4|no"
-    "a4b|$HOME/.mlx-serve/models/gemma-4-26b-a4b-it-4bit|gemma4|no"
-    "qwen|$HOME/.mlx-serve/models/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|yes"
+    "e4b|$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit|gemma4|no"
+    "a4b|$HOME/.mlx-serve/models/mlx-community/gemma-4-26b-a4b-it-4bit|gemma4|no"
+    "qwen|$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|yes"
 )
 
 kill_mlx_serve() {
@@ -425,28 +425,28 @@ declare -a CASES
 
 # Case format: label|path|served_name|thinking_flag|thinking_format|reasoning  (6 fields, 5 pipes)
 # Gemma 4 E4B — streaming, no thinking
-CASES+=("e4b-stream|$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit|gemma4|||false")
+CASES+=("e4b-stream|$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit|gemma4|||false")
 
 if [ "$MATRIX" = "all" ]; then
     # Gemma 4 26B-A4B — streaming, no thinking
-    CASES+=("a4b-stream|$HOME/.mlx-serve/models/gemma-4-26b-a4b-it-4bit|gemma4|||false")
+    CASES+=("a4b-stream|$HOME/.mlx-serve/models/mlx-community/gemma-4-26b-a4b-it-4bit|gemma4|||false")
 
     # Qwen3.6 35B — streaming, thinking OFF (pi sends enable_thinking=false)
-    CASES+=("qwen-no-think|$HOME/.mlx-serve/models/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|--thinking off|qwen|true")
+    CASES+=("qwen-no-think|$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|--thinking off|qwen|true")
 
     # Qwen3.6 35B — streaming, thinking MEDIUM (pi sends enable_thinking=true)
-    CASES+=("qwen-think|$HOME/.mlx-serve/models/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|--thinking medium|qwen|true")
+    CASES+=("qwen-think|$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|--thinking medium|qwen|true")
 fi
 
 # HTML scenario: one case per supported architecture (gemma4 dense E4B + 12B,
 # gemma4 MoE, qwen3_5_moe with thinking, qwen3_moe coder, gemma3 fallback).
 if [ "$SCENARIO" = "html" ]; then
     CASES=()
-    CASES+=("html-e4b|$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit|gemma4|||false")
+    CASES+=("html-e4b|$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit|gemma4|||false")
     if [ "$MATRIX" = "html" ]; then
         CASES+=("html-12b|$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit|gemma4|||false")
-        CASES+=("html-a4b|$HOME/.mlx-serve/models/gemma-4-26b-a4b-it-4bit|gemma4|||false")
-        CASES+=("html-qwen-think|$HOME/.mlx-serve/models/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|--thinking medium|qwen|true")
+        CASES+=("html-a4b|$HOME/.mlx-serve/models/mlx-community/gemma-4-26b-a4b-it-4bit|gemma4|||false")
+        CASES+=("html-qwen-think|$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit|qwen3_5_moe|--thinking medium|qwen|true")
         CASES+=("html-qwen36|$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-4bit|qwen3_5|--thinking medium|qwen|true")
         CASES+=("html-coder|$HOME/.mlx-serve/models/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit|qwen3_moe|||false")
         CASES+=("html-gemma3|$HOME/.mlx-serve/models/mlx-community/gemma-3-12b-it-qat-4bit|gemma3|||false")

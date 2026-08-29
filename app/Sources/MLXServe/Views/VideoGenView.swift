@@ -419,6 +419,9 @@ struct VideoGenView: View {
             if let warn = frameRAMWarning {
                 Text(warn).font(.caption2).foregroundStyle(.orange)
             }
+            if let advice = model.framesAdvisory(numFrames) {
+                Text(advice).font(.caption2).foregroundStyle(.orange)
+            }
         }
     }
 
@@ -449,7 +452,7 @@ struct VideoGenView: View {
     /// pick longer than RAM suggests — we just hint at it in the warning
     /// below the dropdown rather than removing the option.
     private var availableFrameOptions: [Int] {
-        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
+        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height, chainWindows: chainWindows)
     }
 
     /// Soft hint when the chosen length looks too aggressive for the Mac's
@@ -463,6 +466,12 @@ struct VideoGenView: View {
     private var effectiveStepsRange: ClosedRange<Int> {
         turboEngaged ? 4...16 : model.stepsRange
     }
+
+    /// Whether a few-step adapter is driving this render: the engine-owned
+    /// Turbo toggle, or any attached Style LoRA. The REF2VA pack has no Turbo
+    /// toggle at all — a community distillation loaded here is the ONLY way it
+    /// samples in 4 steps — so the LoRA list is load-bearing, not a nicety.
+    private var distilledSampling: Bool { turboEngaged || !loras.isEmpty }
 
     /// guess.
     private var frameRAMWarning: String? {
@@ -523,9 +532,9 @@ struct VideoGenView: View {
                      help: "Select an image to use as the first frame of the video.")
     }
 
-    // fl2va's second anchor. Hidden rather than offered-and-ignored on a
-    // backend without it (the `pipeline`-on-H3 rule): LTX's handler has no
-    // `last_frame_image`, and ref2va has no keyframe row to land on.
+    // The second anchor (H3 fl2va, LTX both pipelines). Hidden rather than
+    // offered-and-ignored on a backend without it (the `pipeline`-on-H3
+    // rule): ref2va has no keyframe row to land on.
     @ViewBuilder
     private var lastFrameSection: some View {
         if model.supportsLastFrame {
@@ -957,6 +966,11 @@ struct VideoGenView: View {
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
             Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
                 .font(.caption2).foregroundStyle(.secondary)
+            // The low end is REACHABLE and only advised against, so the pane
+            // can load a community few-step adapter the way the server can.
+            if let advice = model.stepsAdvisory(steps: steps, distilled: distilledSampling) {
+                Text(advice).font(.caption2).foregroundStyle(.orange)
+            }
 
             // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
             // backend has no guidance pass to scale — showing the slider there
@@ -1004,7 +1018,7 @@ struct VideoGenView: View {
             // Chained windows. Already wired end to end — this is the control
             // that never existed, which is why long clips were unreachable.
             if model.supportsChainedWindows {
-                Stepper(value: $chainWindows, in: 1...8) {
+                Stepper(value: $chainWindows, in: 1...6) {
                     Text("Chained windows: \(chainWindows)").font(.caption)
                 }
                 .help("Join several generations end to end, each starting from the last frame of the one before.")
@@ -1396,7 +1410,7 @@ struct VideoGenView: View {
         // would otherwise sit off-scale, and 0 stays Auto.
         stage2Steps = min(6, max(0, s.stage2Steps))
         cfgAudioScale = min(12, max(1, s.cfgAudioScale))
-        chainWindows = model.supportsChainedWindows ? min(8, max(1, s.chainWindows)) : 1
+        chainWindows = model.supportsChainedWindows ? min(6, max(1, s.chainWindows)) : 1
         seed = s.seed
         keepResident = s.keepResident
         bestQuality = s.bestQuality

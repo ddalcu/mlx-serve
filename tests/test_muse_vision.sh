@@ -52,7 +52,11 @@ echo "== token accounting (the splice depends on it) =="
 # 730x487 → smart_resize 756x504 → grid 54x36 patches → (54/2)*(36/2) = 486 pads,
 # plus <|image_start|>/<|image_end|>. A drift here scatters the tower's rows
 # into the wrong positions rather than failing loudly.
-grep -qE "Muse grid 36x54 \(486 tokens, resized 756x504\)" "$LOG" \
+# The arch name comes from `@tagName(vp.mode)` (server.zig), i.e. a Zig enum
+# tag, so it is always lowercase — an older literal "Muse" in this pattern
+# broke the assertion on a refactor while the math stayed correct. Match
+# case-insensitively; the NUMBERS are the contract.
+grep -qiE "muse grid 36x54 \(486 tokens, resized 756x504\)" "$LOG" \
   && echo "  OK: grid 36x54 → 486 tokens" || { echo "  FAIL: unexpected grid/token math"; grep -E "Decoded .* image" "$LOG"; FAIL=1; }
 grep -qE "Inserted 486 image .* \(prompt: [0-9]+ -> [0-9]+ tokens\)" "$LOG" \
   && echo "  OK: 486 pads spliced" || { echo "  FAIL: pad run not inserted"; FAIL=1; }

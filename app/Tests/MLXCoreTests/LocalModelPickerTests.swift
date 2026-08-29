@@ -3,8 +3,8 @@ import XCTest
 
 /// Chat-model pickers (tray menu, task sheet, auto-select) must only offer
 /// models loadable as the server's primary CHAT model. Media checkpoints
-/// (LTX "AudioVideo", FLUX/Krea/TTS) and non-chat models (Falconsai NSFW
-/// classifier "vit", "bert" embeddings encoders) live under
+/// (LTX "AudioVideo", FLUX/Krea/TTS) and non-chat models ("vit" image
+/// classifiers, "bert" embeddings encoders) live under
 /// `~/.mlx-serve/models` as gen-pane / RAG dependencies — they carry a
 /// config.json + safetensors so discovery classifies them `.base`, but
 /// selecting one in the tray and pressing Start can only fail (or serve
@@ -18,7 +18,7 @@ final class LocalModelPickerTests: XCTestCase {
     }
 
     func testMediaAndNonChatModelsAreNotChatPickable() {
-        // LTX-Video ("AudioVideo"), the Falconsai NSFW classifier ("vit"),
+        // LTX-Video ("AudioVideo"), a "vit" image classifier,
         // the other media archs, and embeddings-only encoders must never be
         // offered by a chat-model picker. Strings are the exact model_type
         // values from real ~/.mlx-serve/models checkpoints.

@@ -17,7 +17,7 @@
 #
 # Requires:
 #   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - PLD_TEST_MODEL or ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#   - PLD_TEST_MODEL or ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 #
 # Usage: ./tests/test_pld_tools.sh [port]
 
@@ -30,7 +30,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+MODEL="${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_pld_tools: model directory not found."
     exit 0

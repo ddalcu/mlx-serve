@@ -121,3 +121,24 @@ final class ChatRowBuilderTests: XCTestCase {
         XCTAssertTrue(ChatRowBuilder.isResultSummary(m))
     }
 }
+
+/// Issue #227: rows are rebuilt on every body pass, so SwiftUI needs to be able
+/// to see that nothing changed. That needs `ChatRow` to be `Equatable`.
+@MainActor
+final class ChatRowEquatableTests: XCTestCase {
+    func testSameMessagesProduceEqualRows() {
+        var call = ChatMessage(role: .assistant, content: "**t**(x)")
+        call.isAgentSummary = true
+        var result = ChatMessage(role: .assistant, content: "**t** → ok")
+        result.isAgentSummary = true
+        let msgs = [ChatMessage(role: .user, content: "hi"), call, result]
+        XCTAssertEqual(ChatRowBuilder.rows(from: msgs), ChatRowBuilder.rows(from: msgs))
+    }
+
+    func testContentChangeMakesRowsUnequal() {
+        let a = ChatMessage(role: .assistant, content: "x")
+        var b = a
+        b.content = "xy"
+        XCTAssertNotEqual(ChatRowBuilder.rows(from: [a]), ChatRowBuilder.rows(from: [b]))
+    }
+}

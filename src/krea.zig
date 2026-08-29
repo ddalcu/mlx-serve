@@ -464,7 +464,7 @@ pub const Conditioner = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_sink = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "array", mask, null_sink, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "array", mask, null_sink, false, s));
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
         const af = try reshape(at, &[_]c_int{ 1, seq, heads * hd }, s);
@@ -842,9 +842,9 @@ const Attention = struct {
         defer _ = mlx.mlx_array_free(attn);
         const null_a = mlx.mlx_array{ .ctx = null };
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qe, ke, v, scale, "array", m, null_a, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qe, ke, v, scale, "array", m, null_a, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qe, ke, v, scale, "", null_a, null_a, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qe, ke, v, scale, "", null_a, null_a, false, s));
         }
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
@@ -1565,7 +1565,7 @@ const AttnBlock3D = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, s)); // (1,1,HW,C)
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, false, s)); // (1,1,HW,C)
         const ar = try reshape(attn, &[_]c_int{ 1, H, Wd, C }, s); // NHWC
         defer _ = mlx.mlx_array_free(ar);
         const pj = try conv2d(ar, self.proj_w, self.proj_b, 0, s); // (1,H,W,C)

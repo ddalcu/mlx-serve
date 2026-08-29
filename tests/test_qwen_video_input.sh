@@ -76,6 +76,10 @@ echo "$TEXT" | grep -qiE "street|sign|road" && HITS=$((HITS + 1))
 echo "$TEXT" | grep -qiE "hot ?dog|app|screenshot|phone" && HITS=$((HITS + 1))
 echo "  matched $HITS/4 distinct-frame subjects"
 if [ "$HITS" -lt 2 ]; then echo "  FAIL: fewer than 2 distinct subjects recognized (frames may have collapsed to one)"; FAIL=1; fi
+# Something only the PIXELS supply: the generic subjects above passed for weeks
+# on a build that encoded the frames and never spliced them (the model narrated
+# a plausible clip). Frame 3's signs read "Grey Fox Trl" / "Waterfall Dr" / "STOP".
+if echo "$TEXT" | grep -qiE "stop|gr[ae]y fox|waterfall"; then echo "  OK: sign text from frame 3 surfaced (pixel-only content)"; else echo "  FAIL: no pixel-only content (STOP / Grey Fox / Waterfall) — frames may not have reached the prompt"; FAIL=1; fi
 
 echo "== Video decode + M-RoPE engagement (server log) =="
 grep -qE "Decoded 4 frames → qwen video" "$LOG" && echo "  OK: video decode ran (4 real frames)" || { echo "  FAIL: video decode did not engage"; FAIL=1; }

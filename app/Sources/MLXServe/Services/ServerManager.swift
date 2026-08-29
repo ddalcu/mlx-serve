@@ -41,6 +41,9 @@ class ServerManager: ObservableObject {
         allModels.filter { $0.lanAdvertises(capability) }
     }
     @Published var memoryInfo: MemoryInfo?
+    /// What the server's measured spec-decode cost model resolved for the
+    /// resident model. nil = the per-silicon tables applied.
+    @Published var specCost: SpecCostInfo?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -163,7 +166,7 @@ class ServerManager: ObservableObject {
         // `modelsDir` is the caller's primary root; the rest of the library's
         // folders ride along so a headless boot discovers everything the picker
         // shows, not just one folder (`launchModelDirs` de-dups).
-        var dirs = ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+        var dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
         if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
         let args = options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
         launch(args: args, options: options)
@@ -284,7 +287,15 @@ class ServerManager: ObservableObject {
         process = nil
         status = .stopped
         modelInfo = nil
+        // `residentChatModel` falls back to `allModels.first { loaded }` when
+        // `modelInfo` is nil — leaving this stale after a stop meant a picker
+        // switch made while stopped still reported the OLD model resident
+        // (nothing had reloaded `allModels` yet), so the pill kept naming the
+        // model that was resident before the stop instead of the one just
+        // picked, and Start looked like it might launch either one.
+        allModels = []
         memoryInfo = nil
+        specCost = nil
         throughput = nil
         decodeTPSNow = nil
         prefillTPSNow = nil
@@ -596,8 +607,9 @@ class ServerManager: ObservableObject {
     }
 
     private func refreshStatus() async {
-        if let mem = try? await api.fetchProps(port: port) {
-            memoryInfo = mem
+        if let props = try? await api.fetchProps(port: port) {
+            memoryInfo = props.memory
+            specCost = props.specCost
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
@@ -746,7 +758,7 @@ class ServerManager: ObservableObject {
     /// of them.
     nonisolated static func launchModelDirs(selectedModel: String,
                                             roots: [String]? = nil) -> [String] {
-        var dirs = roots ?? ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+        var dirs = roots ?? ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
         let model = (selectedModel as NSString).standardizingPath
         guard !model.isEmpty else { return dirs }
         let covered = dirs.contains { root in

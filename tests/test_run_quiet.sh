@@ -3,7 +3,7 @@
 #
 # Regression: the REPL log-quieting (info → warn) sat AFTER the models-root
 # discovery scan in main(), so every unsupported dir under ~/.mlx-serve/models
-# (LTX, Falconsai NSFW classifier, partial downloads, …) printed an info-level
+# (LTX, a ViT classifier, partial downloads, …) printed an info-level
 # skip line into the chat REPL greeting. The quieting must take effect BEFORE
 # discovery runs; an explicit --log-level keeps the diagnostics reachable.
 #
@@ -24,8 +24,8 @@ fi
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 FAKE_HOME="$SCRATCH/home"
-mkdir -p "$FAKE_HOME/.mlx-serve/models/fake-nsfw-classifier"
-printf '{"model_type": "vit"}\n' > "$FAKE_HOME/.mlx-serve/models/fake-nsfw-classifier/config.json"
+mkdir -p "$FAKE_HOME/.mlx-serve/models/fake-vit-classifier"
+printf '{"model_type": "vit"}\n' > "$FAKE_HOME/.mlx-serve/models/fake-vit-classifier/config.json"
 
 # Run `mlx-serve run` under a pty, transcript to $1. Bounded wait so a
 # regression can't hang the suite; the process normally exits on its own

@@ -243,7 +243,7 @@ enum MediaToolArgs {
     }
 
     static func image(_ args: [String: String], model: ImageModelPreset,
-                      saved: ResolutionOption, seed: Int, safeMode: Bool,
+                      saved: ResolutionOption, seed: Int,
                       keepResident: Bool, lanId: String?) throws -> ImageGenRequest {
         let prompt = try required(args, "prompt", tool: "generate_image",
                                   example: #"{"prompt": "a red fox in the snow at golden hour"}"#)
@@ -255,7 +255,7 @@ enum MediaToolArgs {
         return ImageGenRequest(
             model: model, prompt: prompt, seed: seed,
             width: resolution.width, height: resolution.height, steps: steps,
-            keepResident: keepResident, lanModelId: lanId, safeMode: safeMode)
+            keepResident: keepResident, lanModelId: lanId)
     }
 
     // MARK: - Speech
@@ -383,10 +383,15 @@ enum MediaToolArgs {
         let seconds = min(max(requested?.isFinite == true ? requested! : MediaChatDefaults.videoSeconds,
                               1.0 / Double(max(model.fps, 1))),
                           MediaChatDefaults.videoMaxSeconds)
-        let ladderFloor = model.frameOptions.first ?? 9
+        // The pane's ladder reaches below the model's trained range on purpose
+        // — with a warning under the slider. Chat has no such slider and nobody
+        // is watching, so an unattended preview stays inside the tested range:
+        // the floor here is the model's verdict floor, not the ladder's.
+        let ladderFloor = model.frameOptions.first { $0 >= model.testedFrameFloor }
+            ?? model.frameOptions.first ?? 9
         let cap = model.framesCovering(durationSeconds: MediaChatDefaults.videoMaxSeconds) ?? ladderFloor
         let n = model.framesCovering(durationSeconds: seconds) ?? ladderFloor
-        return min(n, cap)
+        return min(max(n, ladderFloor), max(cap, ladderFloor))
     }
 
     static func video(_ args: [String: String], model: VideoModelPreset,

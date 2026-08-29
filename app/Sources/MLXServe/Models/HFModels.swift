@@ -30,6 +30,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "muse",       // meta-models Muse-Glimmer-30B — repos tag "muse_glimmer" (and *_text)
     "bailing",    // inclusionAI Ling 3.0 — repos tag "bailing_moe_v3" and/or "bailing_hybrid"
     "ling",       // …and/or the family name
+    "gpt_oss",    // GPT-OSS family tags (e.g. mlx-community/gpt-oss-20b-MXFP4-Q8)
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -39,8 +40,9 @@ let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
     "diffusion_gemma", // DiffusionGemma block diffusion (text-only; vision tower not wired)
-    "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
+    "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen3_moe", "qwen3_moe_text",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
     "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
@@ -55,6 +57,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
+    "gpt_oss",
 ]
 
 /// model_type prefixes/exact values for native media-generation checkpoints

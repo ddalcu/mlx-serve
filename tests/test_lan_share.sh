@@ -28,8 +28,8 @@ PORT_B=$((PORT_A + 1))
 PEER_NAME="lantest-a-$$"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
-if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit" ]; then
-    MODEL="$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit"
+if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit" ]; then
+    MODEL="$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
 fi
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_lan_share: $MODEL not found."

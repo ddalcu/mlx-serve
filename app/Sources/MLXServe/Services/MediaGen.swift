@@ -504,9 +504,10 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Last-frame keyframe conditioning (server `last_frame_image`). The other
     /// half of fl2va — first-LAST frame to video+audio — where the first frame
     /// is the geometry anchor (plain stretch) and the last is a follower
-    /// (aspect-preserving center-cover). LTX's handler has no such field at
-    /// all, and a reference has no keyframe row to anchor, so this rides the
-    /// same partition complement as Turbo and chaining.
+    /// (aspect-preserving center-cover). LTX pins the last LATENT frame the
+    /// same way it pins the first (both anchors resized to the canvas). A
+    /// reference has no keyframe row to anchor, so on H3 this rides the same
+    /// partition complement as Turbo and chaining.
     var supportsLastFrame: Bool = false
     /// Denoising-step range the Steps slider offers. LTX's is the default; a
     /// backend whose floor is higher declares it, because a slider that goes
@@ -515,6 +516,41 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// One sentence under the Steps slider. Per-backend for the same reason —
     /// LTX's "runs well from ~8" is wrong advice on any other engine.
     var stepsHelp: String = "More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default."
+    /// Lowest step count we have a QUALITY verdict on. Below it the model
+    /// still runs — the server has no such floor — but it needs a distilled
+    /// few-step adapter to look like anything. This is advice, not a gate:
+    /// `stepsRange` stays as wide as the server's own acceptance, because a
+    /// pane that refuses what the API takes makes its own LoRA slot useless
+    /// (#254). 0 = the whole range is tested, so nothing is ever said.
+    var testedStepsFloor: Int = 0
+    /// What to say below it. The wording is the PRESET's, not the helper's:
+    /// which adapter unlocks the low end, and what goes wrong without one, is
+    /// a fact about this checkpoint.
+    var testedStepsFloorNote: String = ""
+    /// Lowest frame count we have a verdict on, same contract as
+    /// `testedStepsFloor`. 0 = no advisory.
+    var testedFrameFloor: Int = 0
+    /// What to say below it, appended to the clip's own length.
+    var testedFrameFloorNote: String = ""
+
+    /// Advice under the Steps slider when the user has gone below the tested
+    /// floor. `distilled` = a few-step adapter is engaged (the engine-owned
+    /// Turbo toggle, or any attached Style LoRA) — that is what the low end is
+    /// FOR, so warning there would argue against the setup the user just made.
+    func stepsAdvisory(steps: Int, distilled: Bool) -> String? {
+        guard testedStepsFloor > 0, steps < testedStepsFloor, !distilled else { return nil }
+        return testedStepsFloorNote
+    }
+
+    /// Advice under the Frames slider for a clip shorter than the model's own
+    /// stated range. Short clips stay OFFERED: the engine generates them, and
+    /// a 1-second test is how you find a step count without paying for a
+    /// 20-minute render.
+    func framesAdvisory(_ frames: Int) -> String? {
+        guard testedFrameFloor > 0, frames < testedFrameFloor else { return nil }
+        let seconds = Double(frames) / Double(max(1, fps))
+        return String(format: "%.1f s — ", seconds) + testedFrameFloorNote
+    }
     /// Weights resident DURING sampling, in GB. Distinct from `approxRAMGB`,
     /// which is the staged LOAD peak (`max(TE, DiT) + VAEs`): by the time the
     /// DiT is stepping, the text encoder has been run and freed. Only the H3
@@ -644,10 +680,12 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Frame counts offerable at this canvas: the `8N+1` ladder trimmed to what
     /// one response can carry. Always returns at least the first rung, so the
     /// picker can never render blank.
-    func frameOptions(width: Int, height: Int) -> [Int] {
+    func frameOptions(width: Int, height: Int, chainWindows: Int = 1) -> [Int] {
         let perFrame = max(1, width * height * 3)
         let budget = Self.maxFramePayloadBytes / perFrame
-        let fits = frameOptions.filter { $0 <= budget }
+        // Chained windows deliver `w*n - (w-1)` frames in ONE response (#283).
+        let w = max(1, chainWindows)
+        let fits = frameOptions.filter { $0 * w - (w - 1) <= budget }
         return fits.isEmpty ? Array(frameOptions.prefix(1)) : fits
     }
 
@@ -736,7 +774,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             defaultQuality: .good,
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
-            description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use."
+            description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use.",
+            supportsLastFrame: true
         )
     }()
 
@@ -774,6 +813,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use.",
+            supportsLastFrame: true,
             shipsOwnTextEncoder: true
         )
     }()
@@ -811,6 +851,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory.",
+            supportsLastFrame: true,
             shipsOwnTextEncoder: true,
             supportsDiffusionDecoder: true
         )
@@ -856,8 +897,13 @@ struct VideoModelPreset: Identifiable, Hashable {
 
     /// H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1` (its VAE folds 17
     /// source frames into 5 latent tokens) — offering a count off it means the
-    /// server silently snaps it. Floor is 124, the reference node's own
-    /// trained-range start; shorter is off-distribution, not just "fast".
+    /// server silently snaps it. The floor is the ENGINE's (5, from
+    /// `temporalShape`'s `max(5, length)`), not the reference node's
+    /// trained-range start: 124 frames at 960x544 is a 20-minute job, so
+    /// "shorter is off-distribution" made the cheapest way to try a prompt or
+    /// a step count — a one-second clip — unreachable at any setting, and left
+    /// the server's OWN default length (56) off the slider. Below the stated
+    /// range the pane says so (`testedFrameFloor`).
     private static func h3FrameLadder(minFrames: Int, maxFrames: Int) -> [Int] {
         var out: [Int] = []
         var n = minFrames
@@ -876,8 +922,9 @@ struct VideoModelPreset: Identifiable, Hashable {
                                         supportsReferences: Bool = false) -> VideoModelPreset {
         // The model's own range: MiniMax states 4-15 s at 24 fps, and the
         // reference node's trained range is ~124-362 on the 17k+5 ladder. The
-        // floor stays 124 — below it the model is off-distribution, which is a
-        // quality cliff, not a fast option.
+        // SLIDER goes down to the engine's floor anyway and warns below the
+        // stated range; the quality tiers below still start at 124, so the
+        // short end is somewhere you steer to, never somewhere you land.
         //
         // The ceiling used to be 209 (the rap demo, the longest clip we had
         // shipped a verdict on) with a comment calling 362 "untested-by-us" —
@@ -885,8 +932,13 @@ struct VideoModelPreset: Identifiable, Hashable {
         // generation on an M5 Max at 139.6 s/step. Length is bounded by MEMORY
         // and TIME, and both are now modelled and shown (`H3Plan`,
         // `H3TimeEstimate`) instead of hidden behind a cap.
-        let minF = 124
+        let minF = 5
         let cap = 362
+        // Where the tiers and the stale-value clamp start: the reference
+        // node's trained-range start, and the lowest rung at or above
+        // MiniMax's stated 4 s (107 = 4.5 s; 90 = 3.75 s is under it).
+        let tierMin = 124
+        let statedMin = 107
         // What the quality TIERS pick. Deliberately not `cap`: the ladder going
         // to 362 is the slider's reach, but a preset is a default, and at
         // 1344x768 the top of the ladder is a five-hour job. Picking "Quality"
@@ -911,8 +963,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             // .good = the eyeballed capstone A/B; .quality = the rap demo's
             // longer 209-frame run.
             qualityProfiles: [
-                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
-                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
+                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
+                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
                 .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
                 .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
             ],
@@ -940,12 +992,21 @@ struct VideoModelPreset: Identifiable, Hashable {
             supportsChainedWindows: !supportsReferences,
             supportsLastFrame: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
-            // maximum — so this range is OURS. 16 is the lowest tier we have a
-            // verdict on, and below ~6 the fast recipe's warmup and tail windows
-            // cover the whole schedule, so those runs pay full price per step
-            // while looking like the cheap option.
-            stepsRange: 16...50,
-            stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render.",
+            // maximum — so this range is OURS. It used to START at 16, the
+            // lowest tier we had a verdict on, which locked out every distilled
+            // few-step adapter the pane's own LoRA slot can load — including
+            // REF2VA Turbo distillations, on the one pack whose Turbo toggle
+            // does not exist (#254). The floor is now the server's (4, turbo's
+            // own), and 16 survives as `testedStepsFloor` advice. Below ~6 the
+            // fast recipe's warmup and tail windows still cover the whole
+            // schedule, so an undistilled run there pays full price per step
+            // while looking like the cheap option — which is what the note says.
+            stepsRange: 4...50,
+            stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render. Fewer than 16 only works with a distilled few-step adapter.",
+            testedStepsFloor: 16,
+            testedStepsFloorNote: "Under 16 steps this model needs a distilled few-step adapter — the engine-owned Turbo LoRA, or a community one attached under Style LoRAs. Without one the picture is rough and the soundtrack usually comes out garbled, and the fast recipe means those steps are not much cheaper each.",
+            testedFrameFloor: statedMin,
+            testedFrameFloorNote: "below MiniMax's stated 4-second minimum. Good for trying a prompt or a step count cheaply; motion and the soundtrack degrade outside the trained range.",
             ditResidentGB: ditGB,
             stagedPeakGB: stagedGB
         )
@@ -1368,6 +1429,19 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// nothing. `fixedSteps` stays the per-checkpoint default either way.
     var supportsSteps: Bool { family == .minimaxMusic3 }
     var stepsRange: ClosedRange<Int> { 4...100 }
+    /// Reference audio (server `ref_audio`, #259): ACE-Step feeds a 30 s
+    /// window of the clip's VAE latent into its timbre slot — ONE pooled
+    /// token among hundreds of lyric/text tokens, so it is style/timbre
+    /// guidance, never a cover (that mode needs the FSQ codes we don't
+    /// ship). Music 3 has no such slot and names the field a 400. Gates the
+    /// control AND the field.
+    var supportsReferenceAudio: Bool { family == .acestep }
+    /// Source-audio tasks (server `task` + `src_audio`): ACE-Step's `cover`
+    /// (the source's melody/structure through its FSQ codes, new caption) and
+    /// `complete` (vocal-to-BGM: the source latent as context, an instrument
+    /// list in the instruction). Music 3 names both fields a 400. Gates the
+    /// mode control AND every field it brings.
+    var supportsSourceAudio: Bool { family == .acestep }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -1807,9 +1881,6 @@ struct ImageGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
-    /// Apply the server's NSFW content filter (on by default). Off → sends
-    /// `"safety": false` so the server skips it for this request.
-    var safeMode: Bool = true
     /// Image-to-image: path to a source PNG/JPEG. The server resizes it to the
     /// requested resolution, VAE-encodes it, and partially renoises.
     var initImagePath: String? = nil
@@ -2113,10 +2184,46 @@ struct MusicGenRequest {
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every
     /// forward dense, ~2.8x slower at 768p, "just a smidge better").
     var bestQuality: Bool = false
+    /// Optional reference clip (48 kHz stereo WAV prepared by
+    /// `AudioReference.referenceWav`) whose style/timbre the track follows.
+    /// Only sent where `supportsReferenceAudio`.
+    var refAudioPath: String? = nil
+    /// What the track is made FROM. Anything but `.text2music` needs
+    /// `srcAudioPath` and is only sent where `supportsSourceAudio`.
+    var task: MusicTask = .text2music
+    /// The cover / complete source (48 kHz stereo WAV, full length — the
+    /// server makes the track exactly as long as this clip).
+    var srcAudioPath: String? = nil
+    /// Cover: share of the denoise steps that follow the source (1 = all).
+    var coverStrength: Double = 1.0
+    /// Cover: start from a blend with the source instead of pure noise (0 = off).
+    var coverNoiseStrength: Double = 0.0
+    /// Complete: instruments to add, from `MusicTask.trackClasses`; empty =
+    /// the model decides.
+    var trackClasses: [String] = []
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
+}
+
+/// ACE-Step generation tasks (server `task`). Raw values are the wire spelling.
+enum MusicTask: String, CaseIterable, Codable {
+    case text2music, cover, complete
+
+    var label: String {
+        switch self {
+        case .text2music: return "Text to music"
+        case .cover: return "Cover"
+        case .complete: return "Vocal to BGM"
+        }
+    }
+    var needsSource: Bool { self != .text2music }
+
+    /// The instrument vocabulary the `complete` instruction accepts (the
+    /// server refuses anything else by name).
+    static let trackClasses = ["woodwinds", "brass", "fx", "synth", "strings", "percussion",
+                               "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals"]
 }
 
 struct Model3DGenRequest {

@@ -710,6 +710,14 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(supportedModelTypes.contains("lfm2_vl"),
                       "config.json spells it lfm2_vl; a hyphen here silently unsupports every LFM2-VL download")
     }
+
+    func testGptOssTagIsSupportedArchitecture() {
+        let m = mlx(id: "mlx-community/gpt-oss-20b-MXFP4-Q8",
+                    tags: ["mlx", "safetensors", "gpt_oss", "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "gpt_oss tags should be treated as supported architecture")
+        XCTAssertNil(m.incompatibleReason)
+    }
 }
 
 // MARK: - HFModel.quantization label parsing
@@ -942,5 +950,39 @@ final class HFModelIsDrafterTests: XCTestCase {
     /// alone — the heuristic requires the gemma-4 shape too.
     func testNonGemma4ModelWithAssistantInNameIsNotADrafter() {
         XCTAssertFalse(hf(id: "someone/my-assistant-bot-7b").isDrafter)
+    }
+}
+
+// MARK: - Zig <-> Swift supported model_type sync
+
+/// The server's `supported_model_types` (src/model_discovery.zig) and the
+/// app's `supportedModelTypes` are the same list spelled twice. Every new
+/// arch has been added to one and forgotten on the other at least once, so
+/// this reads the Zig list and asserts the app knows every entry.
+final class SupportedModelTypeSyncTests: XCTestCase {
+    func testEveryZigSupportedModelTypeIsInTheAppSet() throws {
+        let zig = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("src/model_discovery.zig")
+        let src = try String(contentsOf: zig, encoding: .utf8)
+        guard let start = src.range(of: "const supported_model_types = [_][]const u8{"),
+              let end = src.range(of: "};", range: start.upperBound..<src.endIndex) else {
+            return XCTFail("supported_model_types list not found in model_discovery.zig")
+        }
+        var types: [String] = []
+        for line in src[start.upperBound..<end.lowerBound].split(separator: "\n") {
+            let code = line.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
+            for m in code.split(separator: ",") {
+                let t = m.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("\"") && t.hasSuffix("\"") && t.count > 2 {
+                    types.append(String(t.dropFirst().dropLast()))
+                }
+            }
+        }
+        XCTAssertGreaterThan(types.count, 20, "parsed too few entries; the Zig list's shape changed")
+        let missing = types.filter { !supportedModelTypes.contains($0) }
+        XCTAssertTrue(missing.isEmpty,
+                      "served by Zig but missing from HFModels.swift supportedModelTypes: \(missing)")
     }
 }

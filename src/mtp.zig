@@ -33,6 +33,7 @@ const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
+const io_util_mod = @import("io_util.zig");
 const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -65,10 +66,33 @@ pub const MAX_DEPTH: u32 = 8;
 /// The row carries its own LABEL so the resolve site can say which one it
 /// applied: a bare depth=4 in the spec-stats line is indistinguishable from
 /// the EV controller having picked 4 on its own, or from `--mtp-depth 4`.
-pub const DepthCap = struct { cap: u32, label: []const u8 };
+/// `measured` marks a row a HUMAN swept as realized throughput. Those beat the
+/// boot probe's cost ladder, which cannot see acceptance or the extension sync
+/// — see `generate.mtpDepthCapResolved`.
+pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = false };
 
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
-    if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro" };
+    if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
+    // Base M4 (2026-08-22, tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
+    // saturated echo, median of 5, decode tok/s by forced depth —
+    //   3: 47.44   4: 55.50   5: 47.50   6: 47.28
+    // Depth 4 is the only width where the cap BINDS (m_lo == cap), so the
+    // plan collapses to one chunk and pays no extension sync; from 5 on every
+    // round pays it to buy ~1 more accepted token (4.00 -> 4.96/round) and
+    // that trade is a 17% net LOSS there. Novel content sits at depth ~2
+    // whatever the cap is, so capping at 4 costs nothing outside the echo
+    // regime. The boot probe picks 6 on this chip — a cost ladder cannot see
+    // either half of that sentence.
+    if (std.mem.indexOf(u8, chip, "M4") != null and
+        std.mem.indexOf(u8, chip, "M4 Pro") == null and
+        std.mem.indexOf(u8, chip, "M4 Max") == null and
+        std.mem.indexOf(u8, chip, "M4 Ultra") == null) return .{ .cap = 4, .label = "m4-base", .measured = true };
+    if (std.mem.indexOf(u8, chip, "M4 Max") != null) return .{ .cap = default_cap, .label = "m4-max", .measured = true };
+    // Base M5 only — the Pro/Max/Ultra dies are their own (unmeasured) rows.
+    if (std.mem.indexOf(u8, chip, "M5") != null and
+        std.mem.indexOf(u8, chip, "M5 Pro") == null and
+        std.mem.indexOf(u8, chip, "M5 Max") == null and
+        std.mem.indexOf(u8, chip, "M5 Ultra") == null) return .{ .cap = 4, .label = "m5", .measured = true };
     return .{ .cap = default_cap, .label = "default" };
 }
 
@@ -83,6 +107,7 @@ pub const MtpCostProfile = enum {
     g17_nax_q6_gs64,
     g17_nax_q8_gs64,
     g17_nax_oq4e_q4_gs64,
+    g17_nax_qwen4_q4_gs64,
 };
 
 /// Target-side tensors that contribute materially to a complete MTP round.
@@ -131,6 +156,84 @@ pub fn m5NaxCostProfileForFingerprint(
     };
 }
 
+/// Pure first-stage classifier for the qwen4_exp in-checkpoint head. The
+/// trunk is MoE, so the sidecar fingerprint path above can never match it;
+/// this is its own measured surface, not a widening of the sidecar ones.
+pub fn qwen4G17CostProfileForFingerprint(
+    trunk_affine: bool,
+    trunk_bits: u32,
+    trunk_group_size: u32,
+    head_packs_match: bool,
+    nax_lane_live: bool,
+) MtpCostProfile {
+    if (!trunk_affine or trunk_bits != 4 or trunk_group_size != 64) return .generic;
+    if (!head_packs_match) return .generic;
+    if (!nax_lane_live) return .generic;
+    return .g17_nax_qwen4_q4_gs64;
+}
+
+var qwen4_g17_profile_logged: bool = false;
+var qwen4_g17_env_cache: ?bool = null;
+
+/// Profile-only revocation (MLX_SERVE_MTP_QWEN4_PROFILE=0): planning falls
+/// back to `generic` while every compute lane stays exactly as shipped —
+/// the isolation arm for cost-surface A/Bs, where killing the vqmm NAX lane
+/// would change the very costs under test.
+fn qwen4G17EnvEnabled() bool {
+    if (qwen4_g17_env_cache) |v| return v;
+    var on = true;
+    if (std.c.getenv("MLX_SERVE_MTP_QWEN4_PROFILE")) |p| {
+        const val = std.mem.span(p);
+        if (val.len > 0 and val[0] == '0') on = false;
+    }
+    qwen4_g17_env_cache = on;
+    return on;
+}
+
+/// Live resolver for the qwen4_exp head: validates the runtime fingerprint
+/// the G17 surface was measured on — uniform affine-4/gs-64 config and both
+/// head fc packs at that width (K derived from the scales, so no input-dim
+/// formula is assumed). Revoked by MLX_SERVE_VERIFY_QMM_NAX=0 like the
+/// sidecar profiles: auto depth never assumes a lane the environment
+/// disabled.
+pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
+    if (!qwen4G17EnvEnabled()) return .generic;
+    const head = if (target.qwen4_mtp) |*h| h else return .generic;
+    const cfg = &target.config;
+    if (cfg.hidden_size == 0 or cfg.hidden_size > std.math.maxInt(c_int)) return .generic;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const packs = qwen4PackTripleMatches(head.fc_emb_w, head.fc_emb_s, head.fc_emb_b, hidden) and
+        qwen4PackTripleMatches(head.fc_hid_w, head.fc_hid_s, head.fc_hid_b, hidden);
+    const profile = qwen4G17CostProfileForFingerprint(
+        cfg.quant_mode == .affine,
+        cfg.quant_bits,
+        cfg.quant_group_size,
+        packs,
+        transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable(),
+    );
+    if (profile != .generic and !qwen4_g17_profile_logged) {
+        qwen4_g17_profile_logged = true;
+        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged (MLX_SERVE_VERIFY_QMM_NAX=0 restores generic)\n", .{});
+    }
+    return profile;
+}
+
+/// One packed projection of the qwen4 head: uint32 codes [N, K*4/32] with
+/// bf16 scales and biases [N, K/64], N == hidden. K comes from the scales.
+fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, hidden: c_int) bool {
+    if (w.ctx == null or s.ctx == null or b.ctx == null) return false;
+    if (mlx.mlx_array_dtype(w) != .uint32) return false;
+    if (mlx.mlx_array_dtype(s) != .bfloat16 or mlx.mlx_array_dtype(b) != .bfloat16) return false;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(s);
+    const bs = mlx.getShape(b);
+    if (ws.len != 2 or ss.len != 2 or bs.len != 2) return false;
+    if (ws[0] != hidden or ss[0] != hidden or bs[0] != hidden) return false;
+    if (ss[1] <= 0 or ss[1] != bs[1]) return false;
+    const k = @as(u64, @intCast(ss[1])) * 64;
+    return @as(u64, @intCast(ws[1])) * 32 == k * 4;
+}
+
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
 /// others `last_window 8192` above a 16384-token threshold): prompts whose
 /// forwarded tail exceeds the threshold only build MTP history for the LAST
@@ -172,7 +275,7 @@ fn fcMatchesHidden(fc: *const QLinear, hidden_size: u32) bool {
     const h: c_int = @intCast(hidden_size);
     if (fc.s.ctx == null) return shape[0] == h * 2 and shape[1] == h;
     if (shape[0] != h) return false;
-    return transformer_mod.affineParamsFromGeometry(fc.w, fc.s, hidden_size * 2) != null;
+    return transformer_mod.quantParamsFromGeometry(fc.w, fc.s, fc.b.ctx != null, hidden_size * 2) != null;
 }
 
 fn m5NaxQLinearMatches(q: *const QLinear, in_dim: u32, out_dim: u32, bits: u32, group_size: u32) bool {
@@ -293,6 +396,11 @@ pub const MtpModel = struct {
     /// trunk, e.g. group 32 over a group-64 trunk, or 8-bit over 4-bit).
     quant_bits: u32,
     quant_group_size: u32,
+    /// Quant MODE the sidecar's packed weights are in. A sidecar file carries
+    /// no config, so this is solved from geometry at load
+    /// (`transformer_mod.quantParamsFromGeometry`) and handed to every
+    /// `mlx_quantized_matmul` — passing "affine" over fp8 scales throws.
+    quant_mode: model_mod.QuantMode = .affine,
 
     /// Qwen heads' concat projection (empty for Hy3). Dense bf16 ships
     /// pre-transposed `[2H, H]` for plain matmul; a checkpoint that ships it
@@ -403,12 +511,14 @@ pub const MtpModel = struct {
             .g17_nax_q8_gs32, .g17_nax_q8_gs64 => 8,
             .g17_nax_q6_gs64 => 6,
             .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64 => 4,
-            .generic => return .generic,
+            // The sidecar fingerprint classifier above never returns the
+            // qwen4 profile; keep the fallback honest anyway.
+            .generic, .g17_nax_qwen4_q4_gs64 => return .generic,
         };
         const sidecar_group_size: u32 = switch (profile) {
             .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
             .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => 64,
-            .generic => return .generic,
+            .generic, .g17_nax_qwen4_q4_gs64 => return .generic,
         };
 
         const cfg = &target.config;
@@ -1143,8 +1253,16 @@ const HeadQuantStats = struct {
     after_bytes: u64 = 0,
 };
 
-/// Load a (possibly quantized) linear `<prefix>.{weight,scales,biases}`.
+/// Load a (possibly quantized) linear `<prefix>.{weight,scales,biases?}`.
 /// bf16 weights (no scales) are pre-transposed for plain matmul.
+///
+/// `.biases` is optional PER TENSOR: affine is the only mode whose
+/// checkpoints carry per-group biases, so an nvfp4/mxfp4/mxfp8 sidecar ships
+/// `(weight, scales)` pairs only. Demanding the triple unconditionally made
+/// every fp-quantized head fail at load with `missing tensor: mtp.fc.biases`
+/// and silently disable MTP (ollama's `*-mlx` packs and mlx-community's
+/// `*-nvfp4` sidecars are all nvfp4). A null-ctx `b` is the trunk's own
+/// convention for an absent bias and rides straight into `qLinearFwd`.
 fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u8, s: mlx.mlx_stream) !QLinear {
     var key_buf: [256]u8 = undefined;
     const scales_key = try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix});
@@ -1153,7 +1271,7 @@ fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u
         return .{
             .w = try ownWeight(w, try std.fmt.bufPrint(&key_buf2, "{s}.weight", .{prefix})),
             .s = try ownWeight(w, try std.fmt.bufPrint(&key_buf2, "{s}.scales", .{prefix})),
-            .b = try ownWeight(w, try std.fmt.bufPrint(&key_buf2, "{s}.biases", .{prefix})),
+            .b = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf2, "{s}.biases", .{prefix})),
         };
     }
     _ = allocator;
@@ -1349,6 +1467,15 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
         2, 3, 4, 5, 6, 8 => bits,
         else => null,
     };
+}
+
+/// Model-wide quant MODE of a sidecar, read off its `q_proj` — the one
+/// contracted weight whose input width is known exactly (`hidden`). Per-weight
+/// modes still resolve individually in `qLinearFwd`; this is only the fallback
+/// for geometry that will not solve.
+fn sidecarQuantMode(q: *const QLinear, hidden: u32) model_mod.QuantMode {
+    const qp = transformer_mod.quantParamsFromGeometry(q.w, q.s, q.b.ctx != null, hidden) orelse return .affine;
+    return qp.mode;
 }
 
 /// Root prefix the sidecar's keys carry: mlx-serve-native sidecars use bare
@@ -1568,6 +1695,7 @@ pub fn loadMtp(
             @intCast(fc_shape[0]);
         m.quant_bits = inferBits(&m.q, hidden) orelse 4;
         m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+        m.quant_mode = sidecarQuantMode(&m.q, hidden);
     }
 
     // Materialize all weights now so first-token latency doesn't pay for it.
@@ -1575,10 +1703,10 @@ pub fn loadMtp(
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         const base = [_]mlx.mlx_array{
-            m.fc.w,       m.fc.s,            m.fc.b,               m.pre_fc_norm_emb,
-            m.pre_fc_norm_hidden,            m.final_norm,         m.input_norm,
-            m.post_attn_norm,                m.q_norm,             m.k_norm,
-            m.q.w,        m.k.w,             m.v.w,                m.o.w,
+            m.fc.w,               m.fc.s,       m.fc.b,       m.pre_fc_norm_emb,
+            m.pre_fc_norm_hidden, m.final_norm, m.input_norm, m.post_attn_norm,
+            m.q_norm,             m.k_norm,     m.q.w,        m.k.w,
+            m.v.w,                m.o.w,
         };
         for (base) |a| if (a.ctx != null) {
             _ = mlx.mlx_vector_array_append_value(eval_vec, a);
@@ -1694,6 +1822,7 @@ fn loadHy3Mtp(
         const hidden: u32 = if (en_shape.len == 1) @intCast(en_shape[0]) else 0;
         m.quant_bits = inferBits(&m.q, hidden) orelse 8;
         m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+        m.quant_mode = sidecarQuantMode(&m.q, hidden);
     }
 
     // Materialize now so the first draft doesn't pay for it.
@@ -1744,21 +1873,27 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
     }
     var bits = self.quant_bits;
     var group = self.quant_group_size;
+    var mode = self.quant_mode;
     const x_shape = mlx.getShape(x);
     if (x_shape.len > 0 and x_shape[x_shape.len - 1] > 0) {
         const in_dim: u32 = @intCast(x_shape[x_shape.len - 1]);
-        if (transformer_mod.affineParamsFromGeometry(lin.w, lin.s, in_dim)) |qp| {
+        if (transformer_mod.quantParamsFromGeometry(lin.w, lin.s, lin.b.ctx != null, in_dim)) |qp| {
             bits = qp.bits;
             group = qp.group_size;
+            mode = qp.mode;
         }
     }
     // Multi-row head forwards (the merged history+draft consume, prefill
     // history rebuilds) ride the same verify-width split-K kernel as the
     // trunk; ineligible shapes (seq 1 drafts, 5/6-bit MoE sidecars) fall
     // through to stock.
-    if (try transformer_mod.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
-        _ = mlx.mlx_array_free(out);
-        return vy;
+    // The verify lanes are affine-only kernels (they unpack affine
+    // scales/biases); fp modes fall straight through to stock.
+    if (mode == .affine) {
+        if (try transformer_mod.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
+            _ = mlx.mlx_array_free(out);
+            return vy;
+        }
     }
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
@@ -1769,7 +1904,7 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
         true,
         mlx.mlx_optional_int.some(@intCast(group)),
         mlx.mlx_optional_int.some(@intCast(bits)),
-        "affine",
+        mode.cstr(),
         self.s,
     ));
     return out;
@@ -2337,7 +2472,7 @@ pub fn forwardWithMrope(
     }
     if (!fused_done) {
         const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, seq_len > 1 and transformer_mod.sdpaForceFused(q_rope, kv_view.k), s));
     }
 
     const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);
@@ -2414,8 +2549,6 @@ pub fn appendHistoryWithMrope(
     out.hidden_next = .{ .ctx = null };
 }
 
-/// One lazy draft step: `[1]`-shaped (possibly lazy) token id + `[1,1,H]`
-/// hidden → logits + next hidden. Appends one entry to `cache`.
 pub fn stepArr(
     self: *const MtpModel,
     target: *Transformer,
@@ -3226,6 +3359,17 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForFingerprint(4, 64, .oqe_quantized_embedding));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(4, 64, .none));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(3, 32, .uniform_quantized_embedding));
+
+    // qwen4_exp in-checkpoint head: its own classifier — the MoE trunk can
+    // never reach the sidecar fingerprint path above. Only the measured
+    // uniform affine-4/gs-64 runtime with the NAX lane live is calibrated;
+    // every degraded condition falls back to generic, one at a time.
+    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_q4_gs64, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(false, 4, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 8, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 32, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, false, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, false));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
     defer sidecar.deinit();
@@ -4059,6 +4203,139 @@ test "mtp: a QUANTIZED fc loads verbatim and binds (avlp12 Alis layout)" {
     try testing.expect(!fcMatchesHidden(&m.fc, 8));
 }
 
+fn fpSidecarCase(mode: [*:0]const u8, bits: c_int, group: c_int, want: model_mod.QuantMode) !void {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // Every fp quant mode ships a `(weight, scales)` PAIR: affine is the only
+    // mode whose checkpoints carry per-group biases. `loadLinear` demanded
+    // `.biases` whenever `.scales` was present, so the whole head failed with
+    // `missing tensor: mtp.fc.biases` and MTP silently disabled — and
+    // `qLinearFwd` then passed a literal "affine" to mlx_quantized_matmul,
+    // which throws over fp8 scales. nvfp4 is the mode that shipped broken
+    // (ollama's `*-mlx` tags, mlx-community's `*-nvfp4`); mxfp4 and mxfp8
+    // are the same bug waiting, so the case runs for all three.
+    // Hidden 128 so every group size under test divides both H and fc's 2H.
+    const H: c_int = 128;
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const Hlp = struct {
+            fn bf16(shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1 + 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                return bf;
+            }
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                const bf = try bf16(shape, st);
+                defer _ = mlx.mlx_array_free(bf);
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+            /// fp-quantize a dense weight and insert ONLY `(weight, scales)`.
+            fn putFp(m: mlx.mlx_map_string_to_array, prefix: []const u8, shape: []const c_int, st: mlx.mlx_stream, md: [*:0]const u8, bt: c_int, gp: c_int) !void {
+                const dense = try bf16(shape, st);
+                defer _ = mlx.mlx_array_free(dense);
+                var pair = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(pair);
+                try mlx.check(mlx.mlx_quantize(&pair, dense, mlx.mlx_optional_int.some(gp), mlx.mlx_optional_int.some(bt), md, .{}, st));
+                const suffixes = [_][]const u8{ "weight", "scales" };
+                for (suffixes, 0..) |suf, i| {
+                    var a = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(a);
+                    try mlx.check(mlx.mlx_vector_array_get(&a, pair, i));
+                    try mlx.check(mlx.mlx_array_eval(a));
+                    var key_buf: [128]u8 = undefined;
+                    const key = try std.fmt.bufPrintSentinel(&key_buf, "{s}.{s}", .{ prefix, suf }, 0);
+                    _ = mlx.mlx_map_string_to_array_insert(m, key.ptr, a);
+                }
+            }
+        };
+        // fc: [out=H, in=2H] nvfp4, no biases — the tensor that used to fail.
+        try Hlp.putFp(map, "mtp.fc", &.{ H, H * 2 }, s, mode, bits, group);
+        try Hlp.put(map, "mtp.pre_fc_norm_embedding.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.pre_fc_norm_hidden.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.norm.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.layers.0.input_layernorm.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.layers.0.post_attention_layernorm.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.layers.0.self_attn.q_norm.weight", &.{64}, s);
+        try Hlp.put(map, "mtp.layers.0.self_attn.k_norm.weight", &.{64}, s);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.q_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.k_proj", &.{ 64, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.v_proj", &.{ 64, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.o_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.gate_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.up_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.down_proj", &.{ H, H }, s, mode, bits, group);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // The head loaded at all — biases are optional PER TENSOR, not mandatory.
+    try testing.expect(m.fc.s.ctx != null);
+    try testing.expect(m.fc.b.ctx == null);
+    try testing.expect(m.q.s.ctx != null);
+    try testing.expect(m.q.b.ctx == null);
+
+    // Geometry resolves to nvfp4's 4 bits / group 16, and the mode is carried
+    // so `qLinearFwd` does not hand fp8 scales to an "affine" matmul.
+    try testing.expectEqual(@as(u32, @intCast(bits)), m.quant_bits);
+    try testing.expectEqual(@as(u32, @intCast(group)), m.quant_group_size);
+    try testing.expectEqual(want, m.quant_mode);
+
+    // A packed fp fc still binds against its trunk — nvfp4's group of 16 is
+    // outside `affineParamsFromGeometry`'s 32/64/128 set, so the affine solve
+    // alone would reject it outright.
+    try testing.expect(fcMatchesHidden(&m.fc, @intCast(H)));
+    try testing.expect(!fcMatchesHidden(&m.fc, @intCast(H * 2)));
+
+    // And the forward actually runs in the checkpoint's own mode — an
+    // "affine" matmul over bias-less fp8 scales throws inside MLX.
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    const x_shape = [_]c_int{ 1, H * 2 };
+    try mlx.check(mlx.mlx_zeros(&x, &x_shape, 2, .bfloat16, s));
+    const y = try qLinearFwd(&m, x, &m.fc);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+    const y_shape = mlx.getShape(y);
+    try testing.expectEqual(@as(c_int, 1), y_shape[0]);
+    try testing.expectEqual(H, y_shape[1]);
+}
+
+test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama -mlx packs)" {
+    try fpSidecarCase("nvfp4", 4, 16, .nvfp4);
+}
+
+test "mtp: an mxfp4 sidecar loads bias-less and forwards in its own mode" {
+    try fpSidecarCase("mxfp4", 4, 32, .mxfp4);
+}
+
+test "mtp: an mxfp8 sidecar loads bias-less and forwards in its own mode" {
+    try fpSidecarCase("mxfp8", 8, 32, .mxfp8);
+}
+
 test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible widths stay dense" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -4211,13 +4488,35 @@ test "adaptiveDepthCapForMachine names the row it applied" {
     // indistinguishable from the EV controller having chosen 4 by itself —
     // same reason `dflash.blockCapForMachine` carries a label.
     try testing.expectEqualStrings("m1-pro", adaptiveDepthCapForMachine("Apple M1 Pro", 6).label);
-    try testing.expectEqualStrings("default", adaptiveDepthCapForMachine("Apple M4 Max", 6).label);
+    try testing.expectEqualStrings("m4-max", adaptiveDepthCapForMachine("Apple M4 Max", 6).label);
     try testing.expectEqualStrings("default", adaptiveDepthCapForMachine("", 6).label);
+}
+
+test "base M4 caps at 4 where M4 Pro/Max keep the default (2026-08-22 sweep)" {
+    // Depth 4 is the only width where the cap BINDS, collapsing the plan to
+    // one chunk; from 5 on every round pays an extension sync for ~1 more
+    // accepted token and loses 17%. The probe's cost cliff says 6 here.
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M4", 6).cap);
+    try testing.expectEqualStrings("m4-base", adaptiveDepthCapForMachine("Apple M4", 6).label);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
+    // Every row above is a HUMAN sweep and outranks the boot probe.
+    for ([_][]const u8{ "Apple M4", "Apple M4 Max", "Apple M1 Pro", "Apple M5" }) |c| {
+        try testing.expect(adaptiveDepthCapForMachine(c, 6).measured);
+    }
+    try testing.expect(!adaptiveDepthCapForMachine("Apple M2 Pro", 6).measured);
 }
 
 test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the default" {
     try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M1 Pro", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
-    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6).cap);
+}
+
+test "adaptiveDepthCapForMachine: base M5 caps at 4, Pro/Max/Ultra keep the default" {
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M5", 6).cap);
+    try testing.expectEqualStrings("m5", adaptiveDepthCapForMachine("Apple M5", 6).label);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Ultra", 6).cap);
 }

@@ -214,6 +214,7 @@ So there's a fund for a Mac Studio Ultra. If mlx-serve replaced an API bill for 
 @jcprichard
 @skudinov
 @davidfekke
+@lojza3d
 
 Everyone who chips in gets a line here, with a link if they want one, or stays anonymous. (msg me) Thank you in advance.
 

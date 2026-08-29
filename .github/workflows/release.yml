@@ -202,6 +202,12 @@ jobs:
         # Package manifests own their language modes. A global Swift 5 override
         # would also reach SwaTex, whose source correctly requires Swift 6.1.
         run: |
+          # SwaTexRender's generated `Bundle.module` looks for its KaTeX fonts
+          # beside the .app, a spot codesign refuses to seal, so it never finds
+          # them in a hand-assembled bundle and traps on the first equation
+          # (issue #233). Mirrors app/build.sh.
+          swift package resolve
+          bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
           swift build -c release
           echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
 

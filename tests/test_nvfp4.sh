@@ -6,13 +6,13 @@
 # override layers (which DO carry biases) resolve per weight, and discovery
 # lists nvfp4 models.
 # Usage: NVFP4_TEST_MODEL=/path/to/model PORT=8096 ./tests/test_nvfp4.sh
-# Defaults to ~/.mlx-serve/models/Qwen3-0.6B-nvfp4 (arthurcollet/Qwen3-0.6B-mlx-nvfp4).
+# Defaults to ~/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4 (arthurcollet/Qwen3-0.6B-mlx-nvfp4).
 # Pass a gemma-4-*-qat-nvfp4 dir to exercise the mixed-override path.
 # Skips silently when the model isn't available (CI-friendly).
 
 set -euo pipefail
 
-MODEL="${NVFP4_TEST_MODEL:-$HOME/.mlx-serve/models/Qwen3-0.6B-nvfp4}"
+MODEL="${NVFP4_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4}"
 PORT="${PORT:-8096}"
 HOST="127.0.0.1"
 

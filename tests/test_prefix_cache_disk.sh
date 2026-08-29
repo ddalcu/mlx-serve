@@ -29,8 +29,8 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 # Legacy flat layout fallback (pre-two-level model dirs).
-if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit" ]; then
-    MODEL="$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit"
+if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit" ]; then
+    MODEL="$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
 fi
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_prefix_cache_disk: $MODEL not found."
@@ -208,7 +208,7 @@ echo "== 6. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM sta
 # Qwen3.5-0.8B; SKIPs cleanly otherwise (the attention sections above cover the
 # non-hybrid path either way).
 HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
-[ -d "$HYBRID_MODEL" ] || HYBRID_MODEL="$HOME/.mlx-serve/models/Qwen3.5-0.8B-MLX-4bit"
+[ -d "$HYBRID_MODEL" ] || HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
 if [ ! -d "$HYBRID_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} hybrid section: Qwen3.5-0.8B-MLX-4bit not found."
 else

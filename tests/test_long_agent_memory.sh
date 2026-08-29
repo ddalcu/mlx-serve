@@ -44,7 +44,7 @@ set -u
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
-MODEL="${LONG_AGENT_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+MODEL="${LONG_AGENT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 DRAFTER="${LONG_AGENT_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 
 RED='\033[0;31m'

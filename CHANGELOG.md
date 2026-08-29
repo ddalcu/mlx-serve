@@ -9,25 +9,86 @@
 - **Community mirrors load as they ship.** mlx-community's 3B packs and the benc0 7B packs are exported from a different converter than ours: they name the shared attention weights per-stream, store the VAE's convolutions pre-permuted, and state their geometry in a `transformer_overrides` block. The server reads all of that off the pack instead of assuming one converter's conventions.
 - The 7B is not a scaled-up 3B — every layer is multimodal, the MLP is a plain GELU instead of gated SwiGLU, rope is half as wide and rotates video only, and the 3B's closing modulation does not exist. Each of those is read from the pack's own config, so a future variant that flips one of them needs no new code.
 - Over the API: `POST /v1/images/upscales` with a base64 `image`.
+## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
+
+### Highlights
+
+- **Qwen 3.8 Flash Next runs natively.** Alibaba's 125B model with its huge n-gram memory, on Apple silicon. About 60 tok/s on an M4 Max, 78 with speculative decoding, ~70 GB of RAM for the 4-bit pack (`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit`).
+- **It sees images and video.** Follow-up questions about the same picture answer instantly instead of re-reading it.
+- **Long prompts stay fast.** Sparse attention past 2k tokens runs on custom kernels, so an 8k-token prompt with speculative decoding no longer loses to plain decoding.
+- **Several chats at once.** Concurrent requests on Flash Next share one pass: 2 streams give 1.3x total throughput, 4 streams 1.8x. A single chat is as fast as before.
+- **Speculative decoding on Flash Next is opt-in** (`--mtp` or the MoE toggle in Settings): +41% on code, a wash on prose, so you choose. It also works on image questions now.
+- **MLX 0.32.2.** Up to +3% faster on MoE models at long context.
+- **gpt-oss 20B and 120B** (OpenAI MoE, harmony format) run natively (#247, thanks @justinluque).
+
+### Fixes
+
+- Two concurrent chats on Qwen 3.5 drifted from the single-chat answer.
+- Video input on Qwen 3.5/3.8 never reached the model.
+- `--no-vision` still answered image questions; now a clear error.
+- `--no-mtp` was ignored on Flash Next.
+- Very long prompts on Flash Next could run out of GPU memory instead of being refused up front.
+- A checkpoint the loader cannot read fails that one load instead of taking the server down (#217).
+- Shards not named by the model index are no longer loaded or counted toward `--max-resident-mem` (#274).
+- `POST /v1/images/edits` honours `lora_paths` / `lora_scales` (#268).
+- A tool call cut off mid-JSON keeps its tool name instead of vanishing from the reply.
+- A video whose mp4 encode dropped frames reports an error instead of saving a black clip (#170).
+- Thinking models whose `generation_config.json` declares a thinking default now use it (#219, thanks @Fe2-O3).
+- Request image/video/audio buffers no longer leak (#273, thanks @Fe2-O3).
+- Unit tests no longer assume non-NAX silicon (#277, thanks @lojza3d).
+- `--api-key-strict` and `--api-key-env` (#264, thanks @uxsmedjan).
+- Video pane: H3 steps and frames reach the ranges the server accepts (#263, thanks @justinluque).
+- Music tab: Cover offers the missing `fsq.safetensors` download on older ACE-Step packs (#276, thanks @Fe2-O3).
+- A hybrid (Qwen 3.5/3.8, Nemotron) GGUF served the previous request's tool calls after a long reply: llama.cpp refuses to trim its KV mid-tail, so we cold-prefill instead (#286, #287, thanks @twotonetobi).
+- Tool-call arguments keep their own whitespace: an `old_string` with leading indentation no longer loses it, so edits land at the right nesting (#294, thanks @Agnik47).
+- A cancelled prefill on a hybrid model now keeps the prefix it already computed, so the retry resumes instead of starting over (#270, thanks @codysk).
+- A chained 5-window H3 video no longer renders for half a minute and then fails to deliver; over-cap requests are refused up front (#283, thanks @ClackShen).
+- Image edits with an explicit output size get exactly that size (#290, thanks @justinluque).
+- The max resident models setting is exposed in Settings (#289, thanks @justinluque).
+- Stopping the server resets every loaded model so the model picker pill is correct (#291, thanks @justinluque).
+- Chat: a generated image is drawn from its file instead of a second copy kept in the history (#293, thanks @lojza3d).
+- `seed` now replays a sampled reply byte for byte. It was only honoured with `logprobs` on, and even then every token drew from the same key.
 
 ## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
 
 ### Highlights
 
-- **The Neural Engine now helps with long prompts.** Opt-in `--ane-prefill`, +19% at 16k and +26% at 32k on Qwen 3.8 27B.
-- **Concurrent chats on Qwen 3.5/3.6/3.8 decode together instead of one after another** — 2.76x aggregate throughput at 4 streams.
-- **DFlash 2 draft heads are supported**, and warm turns keep their draft history across the SSD prefix cache instead of drafting blind.
-- **Per-machine tuning**: the Neural Engine share, the draft block size and the speculative depth cap are now measured per chip rather than one number for every Mac in auto mode.
-- **Markdown tables**: chat now render as a real grid instead of monospaced ASCII-art text: bold header row, one divider, no vertical borders, with inline markdown (bold, code, links) rendered inside cells instead of shown as literal characters.
+- **Faster replies, zero setup.** The server now learns the fastest speculation settings for *your* Mac while it runs and remembers them. Up to +24% reply speed over 26.8.9.
+- **Long prompts, much faster.** Turn on Neural Engine prefill (`--ane-prefill` / Settings) and a 16k-token prompt loads up to 35% faster. Works on M1 through M4.
+- **DFlash 2 works**, including Muse-Glimmer 30B with its bundled draft head (86 tok/s on an M4 Max).
+- **LFM 2.5 gets DSpark speed.** Liquid's draft heads run on the 1.2B, 2.6B and the new 8B-A1B MoE — the 2.6B replies 1.4x faster.
+- **Several chats at once, no slowdown.** Concurrent requests on Qwen 3.5/3.6/3.8 decode together: 2.8x total throughput at 4 streams.
+- **Tables render as tables** in chat. Thanks @slava-kudzinau (#216).
+- **Cover a song, or build a track around a vocal.** ACE-Step gained Cover and Vocal to BGM modes plus reference audio for style, all in the Music tab.
+- **Videos that start and end where you say.** LTX takes a last frame next to the first one.
+- **Rewrite with LLM** in the Music tab: the chat model reshapes your style prompt or lyrics to match the loaded model's format, and you edit before applying.
+- **Image content filter removed.** The Safe mode toggle, the `--no-safety` flag and the classifier download are gone. Both are still accepted (`"safety"` in a request, `--no-safety` on the command line) and ignored.
+
+Same models, same Macs, 26.8.9 vs 26.8.10:
+
+| Mac | Model | 26.8.9 | 26.8.10 | |
+|---|---|---|---|---|
+| M1 Pro 32 GB | Qwen3.8 27B | 9.3 tok/s | 11.5 tok/s | **+24%** |
+| M1 Pro 32 GB | Qwen3.5 9B, 8k chat | 26.3 tok/s | 30.8 tok/s | **+17%** |
+| M4 Max | Qwen3.8 27B | 66 tok/s | 73 tok/s | **+10%** |
+| M4 16 GB | Qwen3.5 9B, 8k chat | 30.5 tok/s | 32.5 tok/s | **+7%** |
+
+Neural Engine prefill, 16k-token prompt (new, off by default):
+
+| Mac | Model | GPU only | + Neural Engine | |
+|---|---|---|---|---|
+| M1 Pro 32 GB | Qwen3.8 27B | 41 tok/s | 56 tok/s | **+35%** |
+| M4 16 GB | Qwen3.5 4B | 368 tok/s | 487 tok/s | **+32%** |
+| M4 Max | Qwen3.8 27B | 247 tok/s | 293 tok/s | **+19%** |
+| M3 Ultra 512 GB | Qwen3.8 27B | 414 tok/s | 498 tok/s (both Neural Engines) | **+20%** |
 
 ### Neural Engine prefill
 
-- **The Neural Engine now helps with long prompts.** New opt-in `--ane-prefill` (Settings ▸ "Neural Engine prefill boost") runs a slice of each Qwen-family projection on the Apple Neural Engine in parallel with the GPU: the ANE owns part of the MLP and GatedDeltaNet output channels through its own int8 copy of that slice, the GPU computes the rest, and long-prompt processing gets +19% at 16k and +26% at 32k tokens on Qwen 3.8 27B (306/301 tok/s on an M4 Max). Reply speed is unchanged. The extra copy is ~11 GB on a 27B, ~1 GB on a small model, and the server checks the exact fit per model at load, declining by name when it doesn't fit.
-- Covers Qwen 3.5/3.6/3.8 dense checkpoints (MLP + GatedDeltaNet) and MoE ones like the 35B-A3B (GatedDeltaNet only, +4% at 16k for ~0.5 GB). First load of a model compiles the ANE programs once (~1-2 minutes, cached after); a build that would run the disk out is refused by name instead of shipping partial coverage; `/props` and `/metrics` report what the Neural Engine is holding. Levers: `MLX_SERVE_ANE_MODE=row` (row split instead of channel slices), `MLX_SERVE_ANE_SPLIT` (share), `MLX_SERVE_ANE_GDN=0` (MLP-only).
-- The share of each projection the Neural Engine takes is now per chip: 0.45 on M4, 0.35 on M3 Ultra (+8.5%/+13.7% at 16k/32k, dual ANE more but I need hardware to test).
-- `--ane-prefill` is refused by name on M5-class GPUs, where the GPU prefill already outruns the offload and two testers measured a loss. `MLX_SERVE_ANE_FORCE=1` keeps it for future measurement.
-- `/props` reports Neural Engine dispatch counts and failures, so you can tell a built-but-never-used offload from a working one without reading the log.
-- Experimental `MLX_SERVE_ANE_DUAL=1` (off by default, M3 Ultra only) pins two Neural Engine units to the two dies and splits the share between them. Untested on hardware so far.
+- **Your Mac's Neural Engine now helps read long prompts.** Turn on `--ane-prefill` (Settings ▸ "Neural Engine prefill boost") and the GPU and Neural Engine split the work: a 16k-token prompt loads 19-35% faster depending on the Mac (table above). Reply speed is unchanged.
+- Works with Qwen 3.5/3.6/3.8 models on M1 through M4 Macs. The first load of a model compiles the Neural Engine programs once (1-2 minutes), then it is instant.
+- It needs extra memory next to the model (~11 GB for a 27B, ~1 GB for a small model). On a 16 GB Mac use a small model (a 4B fits and gets +32%); if it does not fit, the log says so and the model runs on the GPU alone.
+- Off on M5-class Macs, where the GPU is already faster on its own.
+- **M3 Ultra uses both of its Neural Engines** by default: +7% on a 16k prompt over one (498 vs 465 tok/s, Qwen3.8 27B). `MLX_SERVE_ANE_DUAL=0` turns it off.
 
 ### Concurrency
 
@@ -38,24 +99,43 @@
 
 - **DFlash 2 draft heads load and run** (the nested `dflash_config` sidecars), including the trained path selector and its convolutions. On an M4 the built-in MTP head is still the faster option; the selector's win needs the wider draft blocks only larger machines serve.
 - Draft-head history now survives the on-disk prefix cache, not just the in-memory one. Resuming a conversation after a restart used to draft blind.
-- The draft block size is capped per chip (8 on M3 Ultra), and so is the automatic speculation depth (4 on M1 Pro, where forcing depth 4 is +27% while the shipping cap of 6 was worth +0.7%). The log names which machine row it applied, so a depth of 4 is distinguishable from the planner having chosen it.
+- **The speculation width tunes itself.** The server measures how much each draft width actually costs and yields on your Mac, per model and context size, and keeps that in `~/.mlx-serve/round-cost/` so the next boot starts tuned. The first request on a new model may be a few percent slower while it learns; after that it is free. Reply speed +7% to +24% over 26.8.9 depending on the Mac (table above). `MLX_SERVE_MTP_COST_TABLE=0` restores the old behaviour.
+- Experimental, off by default: DFlash/DSpark drafters can pick their block per round the same way (`MLX_SERVE_DFLASH_CHOOSER=1`) — +53% on LFM2.5-2.6B on a base M4 in our test, not yet stable on MoE models.
 - +3% decode from removing a redundant copy in the draft gate, plus a re-scored draft shortlist: 62 → 64 tok/s on an M4 Max, and +5% on novel content.
 - A model that ships a draft head but fails to load it now says so instead of quietly falling back to the slower predictive path.
 
 ### Models
 
+- **Huge images no longer crash Qwen vision.** A 5100x3300 photo on Qwen3.8 27B used to kill the server (the pack allows 16.7 Mpx, which is 65k patches of attention the GPU cannot hold). Images are now capped at 1536x1536 worth of pixels before the vision tower; screenshots are untouched.
+
 - **Ling 3.0 flash-line checkpoints** that ship a direct query projection (`"q_lora_rank": null`) are no longer refused at load, and Ling 3.0 tiny loads under both converter layouts. Thanks @Fe2-O3 (#232). The published flash quants need a further layout change and still do not load.
 - **Alis (avlp12) Qwen packs are served**: their quantized draft-head projection binds, the vision tower's prefix and convolution layout are probed instead of assumed, and a false "broken norm" repair that was halving draft acceptance is fixed (33% → 70%).
 - Embedded DeepSeek and llama.cpp engines updated to their latest upstream versions.
+- **MLX 0.32.2.** Grouped-query decode attention reads each K/V byte once, quantized MoE matmuls skip idle work, and M5 Macs now run head-dim 256 attention (Qwen 3.5/3.6/3.8) on MLX's fused Neural Accelerator kernel for prompts and draft verification. `MLX_SERVE_NAX_SDPA=0` restores the previous kernels.
 
 ### Releases
 
 - The release workflow gained a **Pre-release** checkbox: it tags `v<version>-pre-release.1`, `.2`, `.3` instead of `v<version>`, so a build can go out for testing without spending the version number that the real release will use. Still created as a draft, still kept out of Homebrew.
 
+### Media
+
+- **ACE-Step Cover**: drop in a track, describe a new style, and it re-sings the song. Melody and structure stay, the caption and lyrics decide the rest. Cover strength picks how much of the render follows the source; noise strength blends a fresh start in. Needs the new `fsq.safetensors` in the pack; the app fetches it into packs downloaded before this release.
+- **ACE-Step Vocal to BGM**: arrange around a vocal stem (or any single part). Pick the instruments to add, or leave them all off and let the model decide. The new track is exactly as long as the clip, 10 seconds to 10 minutes.
+- **Reference audio for music** (#259): a clip whose feel and timbre the track follows. Up to 30 seconds is used; it is a style hint, not a copy. Thanks @Morac2.
+- **LTX first and last frame** (#260): `last_frame_image` pins the final frame the same way `first_frame_image` pins the first, on every LTX pipeline including two-stage. A request the model cannot honour (no VAE encoder, fewer than 9 frames) is a named 400 rather than a plausible video of something else.
+- `instrumental: true` beside non-empty lyrics is a named 400 instead of a silent choice.
+
 ### App
 
-- **Music mode gained an instrumental switch** plus tempo and key controls, and remembers your settings between generations. Instrumental is marked experimental on MiniMax Music 3, where the open weights have no real switch and the tag alone still leaves vocal texture in; ACE-Step's is documented and works. Closes #225.
-- **Media checkpoints in My Models stopped reading as "Unsupported"** and gained a Use button. MiniMax Music 3, MageFlow and Kokoro were missing from the app's copy of the architecture list, so a model the app itself offers to download came back with a red badge. Thanks @justinluque (#229).
+- **Send a video to Qwen3-VL models** and chat about it. Thanks @justinluque (#246).
+- **Rewrite with LLM**: wand buttons next to the style prompt and lyrics. The chat model rewrites the text in the loaded music model's own format (one-line ACE-Step caption, three-block Music 3 caption, tagged lyrics) and streams it into a sheet you can edit before applying.
+- Dropping a long audio file on the Music tab no longer freezes the window: the conversion runs in the background with a "Converting" indicator, and the WAV writer is a single pass instead of one append per sample.
+- The Music tab's Advanced controls line up in one grid, and the Voice / Music switch is larger with room above the pane.
+- The Video pane now exposes all five generation settings it used to hide. Thanks @Fe2-O3 (#244).
+- **MiniMax-H3 takes few-step LoRAs and short test clips** (#254): the Steps slider starts at 4 instead of 16, and the Frames slider reaches the engine's own floor of 5 rather than starting at 124. Both floors survive as a sentence under the control — under 16 steps needs a distilled adapter (the built-in Turbo LoRA, or a community one attached under Style LoRAs), and under 107 frames is below MiniMax's stated 4-second minimum. This is what the REF2VA pack needed most: it has no Turbo toggle, so a community 4-step distillation loaded through Style LoRAs was unusable without hand-writing the HTTP request. Quality presets, and the clips the chat model generates for you, are unchanged. Thanks @Morac2.
+
+- **Music mode gained an instrumental switch** plus tempo and key controls, and remembers your settings between generations. Instrumental is marked experimental on MiniMax Music 3, where the open weights have no real switch and the tag alone still leaves vocal texture in; ACE-Step's is documented and works. Closes #225. Thanks @Fe2-O3 (#226).
+- **Media checkpoints in My Models stopped reading as "Unsupported"** and gained a Use button. MiniMax Music 3, MageFlow and Kokoro were missing from the app's copy of the architecture list, so a model the app itself offers to download came back with a red badge. Thanks @Fe2-O3 (#229).
 - **The tray shows live prefill and decode tokens/s** Metrics are on by default now so those rows always have something to read — the cost is a few counters per request, never per token.
 - **The memory meter is one bar** — model, everything else in use, free — instead of two bars measured against the same total, which invited reading them as if they added up.
 

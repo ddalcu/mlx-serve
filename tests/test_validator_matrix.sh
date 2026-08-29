@@ -43,10 +43,10 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 # pi_case must exist in pi_integration_run.sh's html matrix.
 MODELS=(
     "qwen2|Qwen2.5-Coder 32B 8-bit (qwen2)|$HOME/.mlx-serve/models/mlx-community/Qwen2.5-Coder-32B-Instruct-8bit|html-coder|150"
-    "gemma4|Gemma 4 E4B 8-bit (gemma4)|$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit|html-e4b|90"
+    "gemma4|Gemma 4 E4B 8-bit (gemma4)|$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit|html-e4b|90"
     "gemma3|Gemma 3 12B QAT 4-bit (gemma3)|$HOME/.mlx-serve/models/mlx-community/gemma-3-12b-it-qat-4bit|html-gemma3|90"
     "qwen36|Qwen3.6 27B dense 4-bit (qwen3_5)|$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-4bit|html-qwen36|150"
-    "qwen36-moe|Qwen3.6 35B-A3B 6-bit (qwen3_5_moe)|$HOME/.mlx-serve/models/Qwen3.6-35B-A3B-6bit|html-qwen-think|150"
+    "qwen36-moe|Qwen3.6 35B-A3B 6-bit (qwen3_5_moe)|$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit|html-qwen-think|150"
     "qwen3-coder|Qwen3-Coder 30B-A3B 8-bit (qwen3_moe)|$HOME/.mlx-serve/models/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit|html-coder|150"
     "e4b-gguf|Gemma 4 E4B GGUF (llama engine)|$HOME/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf|html-e4b-gguf|150"
     "ds4|DeepSeek-V4-Flash GGUF (ds4 engine)|$HOME/.mlx-serve/models/antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf|html-ds4|240"

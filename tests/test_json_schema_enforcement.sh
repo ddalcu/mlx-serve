@@ -15,7 +15,7 @@
 
 set -u
 
-MODEL_DIR=${1:-~/.mlx-serve/models/gemma-4-e4b-it-8bit}
+MODEL_DIR=${1:-~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}
 PORT=${2:-8099}
 BASE="http://127.0.0.1:$PORT"
 PASS=0

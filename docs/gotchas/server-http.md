@@ -2,6 +2,10 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### A `seed` that only the synchronous sampler read (seeded replies flipped between identical requests)
+
+`integration_test.sh`'s "same seed produces same first token" went red on the v26.8.11 release run: `Ephemeral` vs `**Ephemeral**` with identical top-2 logprobs (gap 0.75 nats, not a tie). The lazy decode sampler (`sampleTokenLazy`, every serial/batched/spec site) passed a null key to `mlx_random_categorical`, i.e. MLX's global RNG; only the synchronous `sampleToken` (the `logprobs` path) built a key from `seed`, and it built the SAME key every step, so a seeded reply was a single coin flip replayed. The test had passed for months on an 82/18 draw. Fix: `seedKey(sampling)` mixes `seed` with a per-draw index (`SamplingParams.draw`); `Generator.sampleLazy` is the one lazy sampler a slot calls and advances the index; init paths hand the Generator `draw = 1` after drawing t1. Bar: seeded replay identical at temp 1.0 across cold and prefix-cache-hit requests; no seed still varies.
+
 ### A client-supplied path handed straight to mlx is a one-request server kill (lora_path)
 Found by a test that expected a 400 and got `000` — curl couldn't complete, because the server was gone. `POST /v1/images/generations` with `{"lora_path":"/tmp/nope.safetensors"}` flows into `lora.loadFile` → `mlx_load_safetensors`, which for a missing file raises an MLX error; mlx-c errors are FATAL, so the process dies. Log's last line is `MLX error: [load_safetensors] Failed to open file …` and nothing after it. This isn't a MageFlow issue — it's every image backend, and every client on the box loses its connection because one request named a moved or mistyped adapter. The path check that existed (`isAbsolute`, added for the `openFileAbsolute` UB class) proves the shape of the string, not that a file is there. Fix: open + stat before mlx sees it, and require a REGULAR FILE — a directory opens fine and would die one layer deeper — returning `error.BadLoraPath` → the existing 400. General rule: any request-supplied path that flows into an mlx loader must be validated on OUR side of that boundary, the same way `textGenRejectReason` 400s before prefill rather than letting a null transformer deref take the server down. Guards: two `loadFile` unit tests (missing file, directory) and the LoRA case in `tests/test_mageflow_edit.sh`. Multi-LoRA (`lora_paths`, an array) goes through the same `loadFile` per entry in `ImageEngine.setLoras`/`VideoEngine.setLoras` — a bad path anywhere in the array 400s before any adapter in that request attaches (partial stacks never install; `lora.Stack.deinit` unwinds whatever loaded before the failing entry).
 
@@ -1393,3 +1397,115 @@ joined in order with `'\n'` (matching the Responses parser and the Anthropic
 user arm), single-part borrows the JSON's bytes / 2+ parts allocate
 (`{text, owned}`, the provenance rule), wired at all three sites. Guard:
 unit tests on the exact opencode two-part shape.
+
+
+## An adopted spec cache has ONE owner at a time (issue #266)
+
+SIGSEGV in `KVCache.deinit -> freeKVEntry -> mlx_array_free` on the inference
+thread, during long agent sessions with hot-cache hits + MTP/DFlash, typically
+in a client-disconnect storm (repeated retries of a 100k+ prompt, each
+cancelled mid-prefill).
+
+`scheduler.runPrefill` restores the MTP history / DFlash context from the hot
+prefix cache into locals guarded by `errdefer ... .deinit()`, then hands them
+to `Generator.initWithOptions` — which adopts them and ALSO guards them with
+its own `errdefer`. Any init failure past the adoption point (the common one:
+`error.Cancelled` from the chunk loop when the conn thread flags the slot on
+disconnect) frees them inside the generator; the `try` then unwinds
+runPrefill's errdefers and frees them AGAIN. `MtpCacheRef` and `DflashCtx`
+hold their `KVCache` by value, so both copies share one entries slice and the
+same mlx handles: the second `freeKVEntry` walks freed array ctxs — an
+EXC_BAD_ACCESS several frames from the disconnect that caused it (the
+`KVCache.reinit` class again, in cross-function form). It only bites on the
+restored path — a hot-cache MISS builds the caches inside the generator, where
+one errdefer owns them.
+
+Fix: ownership transfers AT THE CALL. runPrefill moves the restored caches
+into `dflash_pass`/`mtp_pass` and nulls the errdefer-guarded locals BEFORE the
+`try`, so on failure exactly one owner (the generator) frees them. Guard:
+`scheduler.zig` test "runPrefill clears restored spec-cache ownership BEFORE
+Generator.initWithOptions (issue #266)" pins the clear-before-call ordering.
+
+## `messages.deinit(allocator)` frees the Message array and NOTHING it points at
+
+Live 2026-08-25. `handleChatCompletions` and the Anthropic `/v1/messages`
+handler each decoded a request's `images[].pixels` (and, on the OpenAI surface,
+`videos[].pixels` and `audio[].samples`) into a local `std.ArrayList`, handed
+the buffer to `chat_mod.Message` with `toOwnedSlice`, and then only ever ran
+`defer messages.deinit(allocator)`. That defer frees the Message array. The
+decoded CHW buffers each Message points at had no owner at all, so EVERY
+request carrying an image leaked its full decoded pixel buffer on the SUCCESS
+path — and on every early return after the parse loop too (context-overflow
+400, the memory preflight's 503, a client disconnect mid-stream). Measured on
+the shipped binary: 40 chat requests each carrying a 3 MB `x-mlx-pixels`
+payload grew RSS by 121 MB, i.e. exactly the payload, retained forever.
+
+Only the Anthropic path had a partial guard: an `errdefer` covering the
+`try`s between the decode and the `messages.append`. It covered the ERROR path
+and not the success one, which is the inverse of the usual bug and is why the
+leak survived review — the file looked like it was already thinking about
+ownership.
+
+The Responses API was already correct: `responses.ParsedInput` carries an
+`owned_images` list and frees `pixels` in its `deinit`. That is the shape the
+fix generalizes.
+
+Fix: `server.RequestMedia`, one owner per request, installed beside the
+`messages` list in both handlers. Ownership is by PROVENANCE — a media list is
+only obtainable from `openImages`/`openVideos`/`openAudio` and is owned from
+its first append, so a `try` between the decode and the message append cannot
+leak either, and a new early return cannot leak by omission. `Message` borrows
+the slice (`imagesSlice` returns null for an empty slot, so a message with no
+media keeps a null field rather than an empty slice). Slots are INDICES, not
+pointers: opening another slot may move every `ArrayList` header in the bag,
+while the buffers those headers point at stay put. A fourth modality that
+spells its buffer something other than `pixels`/`samples` fails to COMPILE in
+`mediaBuffer` rather than leaking quietly.
+
+Guards: the source scan "a request handler never owns its own media list —
+RequestMedia does" (no `std.ArrayList(chat_mod.{Image,Video,Audio}Data).empty`
+anywhere in server.zig, and at least two `RequestMedia.init(allocator)` sites),
+plus the `std.testing.allocator` unit test "RequestMedia frees every decoded
+buffer it was handed" — gut the free in `MediaBag.deinit` and it reports 4
+leaked allocations.
+
+
+## Vision prefixes in the prefix cache are keyed on the pixels (2026-08-26)
+
+`commitSlotIfApplicable` and the lookup both returned early on `vision_embeddings != null`, so an image conversation re-prefilled everything on every turn. The KV under image placeholder tokens is a function of the pixels, and two different images produce IDENTICAL token sequences, so a plain token-prefix match would restore the wrong image's rows. The fix keys every RAM entry on `vision_key` beside `has_tools`: `server.mediaKey` hashes the request's image/video/audio bytes in `processVisionImages` (0 = text only), the key rides `SubmitParams` → `Slot` → `commitWithState` / `lookupAndRestore` / `findBestMatch`. A text entry never serves an image request and vice versa (no partial-prefix sharing across the two — deliberate, KISS). Vision entries stay in RAM: the SSD tier's manifest has no key column and is never consulted for `vision_key != 0`.
+
+The second half is the splice: a restored prefix already holds its image rows, so the Generator's placeholder-row counter starts at `countSpliceRows(full_prompt[0..hot_matched])` (`InitOptions.vision_rows_before`) and `vision_splice_offset` is set on BOTH the chunk loop and the final-span forward whenever the request has vision, not only under chunked-vision. M-RoPE positions/delta are re-derived per request from the same images, so nothing else needs to ride the entry.
+
+Guard: `tests/test_vision_prefix_cache.sh` (not yet run live as of 2026-08-26) + the `vision_key` arms of the `findBestMatch` unit test.
+
+First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 514)` — the tokens matched, but `shouldCheckpointSsmPrefill` still returned false for any vision prompt (from before #197, when vision prefilled in one un-chunked forward and had no boundary to snapshot at). It now follows `visionChunkedPrefillEnabled()`. After that: 483/514 reused, the warm answer moved by one token (the hybrid restore class, so the script asserts content, not bytes).
+
+## A missing tensor ended the process (issue #217, 2026-08-28)
+
+`transformer.zig`'s weight getters logged `MISSING WEIGHT: <name>` and hit `unreachable`. In ReleaseFast that is a process exit: one checkpoint the loader cannot read (a converter's tensor naming we don't probe, one shard short from a bad download) took the server down with every request queued behind it — three times in one reporter's benchmark run. The scheduler already crosses load failures by name (`req.error_name` → `loadErrorFromName` → 503), so the fix is only that the getters return `error.MissingWeight` and the ~200 call sites `try`. Guard: `test "a missing weight is a load ERROR, not a process exit (issue #217)"`. Not covered: a weight that is PRESENT but the wrong shape still dies inside MLX (uncatchable, see the Metal OOM story).
+
+## `--max-resident-mem` billed shards nothing reads (issue #274, 2026-08-28)
+
+`scheduler.modelDiskBytes` summed every `*.safetensors` in the directory. A third-party gemma-4 E4B pack shipped two shards no `weight_map` entry references; the bill was 2x the loaded size, so loading a small image model evicted the chat model. The index is the truth when present: `indexShardSet` reads `model.safetensors.index.json` and only named shards count. Guard: `test "modelDiskBytes bills only the shards the index names (issue #274)"`.
+
+## The edit form dropped LoRA fields (issue #268, 2026-08-28)
+
+`gen.openaiEditFormToJson` rebuilds the multipart body into the JSON `mode:"edit"` request field by field; `lora_paths`/`lora_scales` were not in the list, so a client attaching adapters through the OpenAI surface got an un-adapted edit with a 200. Now forwarded verbatim (array forms as raw JSON text, scalar `lora_path` JSON-escaped) so `parseLoraFields` sees the same body the native endpoint would. Guard: the lora case in `test "openaiEditFormToJson: OpenAI multipart becomes our edit request"`.
+
+## A llama session trim that was never checked served the previous request (#286, 2026-08-28)
+
+Reported as "PLD leaks tool calls across requests": a request offering ONE tool (`read`) came back calling `bash` with the previous session's `cd /private/tmp/mlxcode && pytest` command, on a qwen35moe GGUF and on a Flash-Next pack; `--no-pld` "fixed" it. Reproduced on a Qwen3.5-0.8B GGUF with `--no-pld` already set: request A (bash+glob tools), then request B (read only) three times, B answered `read` once and then A's `bash` call twice, with the log showing `285 cached / 286 total`.
+
+The mechanism is the persistent llama session's prefix reuse. `LlamaSession.sync` computes the common prefix, calls `mlx_llama_session_trim(common)`, shrinks its resident-token mirror and decodes the suffix. The shim called `llama_memory_seq_rm(mem, 0, n_keep, -1)` and ignored the result, on the comment "removing a whole tail never fails". That is true for attention KV and false for recurrent memory: `llama_memory_recurrent::seq_rm` can roll a tail back only within its per-token snapshot window (`n_rs_seq`, one or a few tokens) and otherwise returns false having mutated nothing; `llama_memory_hybrid::seq_rm` tries the recurrent half first and bails before touching the attention KV. So after any generated tail longer than the window, NOTHING was trimmed, `pos` and the mirror said it was, and the new suffix was decoded at positions the old tail still occupied, under a recurrent state that had read the old conversation. The model continued the old conversation. Every hybrid GGUF arch is exposed (qwen35, qwen35moe, qwen3next, nemotron_h, lfm2, any Mamba); dense GGUFs were fine, which is why the existing warm-reuse test never saw it.
+
+Fix: the shim checks the return and, on refusal, clears the memory and returns 1; `sync` reads 1 as "nothing resident" and cold-prefills the whole prompt. On a hybrid that means prefix reuse only survives when the tail is inside the snapshot window (rarely), which is the correct trade: a cold prefill costs milliseconds, a poisoned state costs the user's trust in the model. The MLX-pack half of the report (Flash-Next) is a different path and was not reproduced here; the GGUF half is closed by this fix. The PLD attribution was coincidence: the llama tick has no PLD at all. Issue #287 ("streaming drops tool calls", `stream=true` answered `stop` with empty content) is the same bug seen from the other side: on the reporter's Ornith-1.5-35B (qwen35moe) the SECOND request on the release tarball logged `280+0 tokens (279 cached)`, the model hitting EOS at once on the poisoned state, and the fix makes four streamed requests in a row answer the call.
+
+Test: `llama: re-sync after a long generated tail is a cold decode` (needs `LLAMA_TEST_MODEL` pointing at a HYBRID GGUF, e.g. Qwen3.5-0.8B) greedy-matches a fresh session after a 30-token junk tail; the older `prefix reuse is byte-identical` test no longer demands `cached > 0`, since 0 is the right answer on a hybrid.
+
+## A chained video render finished and died at the socket (#283, 2026-08-28)
+
+MiniMax-H3, Turbo, 1056x864, 141 frames x 5 chained windows: every window sampled and decoded, `chain joined: 5 windows -> 701 frames`, then `[video] -> 701f 864x1056 (1918743552 rgb bytes)` and `video job failed: WriteFailed`. `WriteFailed` is the socket: the app hung up on a 2.5 GB base64 body. The app already knows a response can carry at most `maxFramePayloadBytes` (768 MB raw) and trims the frame picker to it, but the bill was per WINDOW: `chain_windows` multiplied the delivery and nothing looked. The server had no cap at all, so 29 s of GPU time went into a body nobody could receive.
+
+Fix: `gen.videoRgbTransportReason(delivered, w, h)` with `MAX_VIDEO_RGB_BYTES` (the app's number) refuses at admission on both video paths, naming frames, canvas, MB and the cap; the H3 site bills `chainDeliveredFrames(windows, frames)`. The app's `frameOptions` takes `chainWindows` and the stepper stops at 6 (the server refused 7-8 anyway). Lifting the cap is a transport change (stream frames or mux server-side), not a number to raise.
+
+Also filed the same day, #285: a Mage-Flow-Edit pack failing `MissingMageFlowWeight model.visual.patch_embed.proj.weight`. The reporter's `text_encoder/model.safetensors` loaded 902 tensors; the published Edit pack's has 1425 (523 `model.visual.*`), 902 is the TURBO text encoder. A pack-content problem on the user's disk, not a loader bug; the log line was relabeled from `MISSING VAE WEIGHT` to name the file and both counts.

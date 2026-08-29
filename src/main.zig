@@ -114,8 +114,6 @@ fn printUsage(io: std.Io) void {
         \\                      that keeps generating never times out, however long it runs.
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
-        \\  --no-safety         Disable the image-gen NSFW content filter (on by
-        \\                      default; or set "safety":false per request)
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -310,6 +308,13 @@ fn printUsage(io: std.Io) void {
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
         \\                        Basic (key = password), or ?api_key=. /health
         \\                        stays open. Unset = no auth (default).
+        \\  --api-key-strict    Require the key from loopback too (localhost is
+        \\                        exempt by default). For embedders that want
+        \\                        "only the key holder drives inference" on a
+        \\                        shared machine. No effect without --api-key.
+        \\  --api-key-env <VAR> Read the key from environment variable VAR
+        \\                        instead of argv (the process table is
+        \\                        world-readable). Unset/empty VAR = no auth.
         \\  --lan-share <all|id,...>
         \\                      Share models with the local network: advertise
         \\                        this server over Bonjour and let LAN clients
@@ -569,7 +574,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {
-            server_mod.image_safety_filter = false;
+            // Retired image content filter; accepted as a no-op.
         } else if (std.mem.eql(u8, args[i], "--pld")) {
             enable_pld = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
@@ -595,6 +600,26 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
             if (args[i].len > 0) server_mod.g_api_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--api-key-strict")) {
+            server_mod.g_api_key_strict = true;
+        } else if (std.mem.eql(u8, args[i], "--api-key-env") and i + 1 < args.len) {
+            i += 1;
+            // The key read from a named environment variable instead of argv:
+            // the process table is world-readable, argv with it. Same
+            // borrow-for-the-process lifetime as --api-key; empty/unset
+            // leaves the server open, exactly like an empty --api-key.
+            // getenv needs a null-terminated name; args[i] is a plain
+            // slice, so print a `:0` copy (process-lifetime, like the argv
+            // borrow --api-key uses). std.c.getenv is how every other env
+            // read in this codebase works. An unset var leaves the server
+            // open, exactly like an empty --api-key.
+            const name = std.fmt.allocPrintSentinel(allocator, "{s}", .{args[i]}, 0) catch null;
+            if (name) |name_z| {
+                if (std.c.getenv(name_z.ptr)) |value| {
+                    const key = std.mem.span(value);
+                    if (key.len > 0) server_mod.g_api_key = key;
+                }
+            }
         } else if (std.mem.eql(u8, args[i], "--lan-share") and i + 1 < args.len) {
             i += 1;
             // Borrowed from argv, like --api-key. serve() starts the LAN

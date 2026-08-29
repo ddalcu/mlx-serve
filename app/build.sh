@@ -139,6 +139,12 @@ else
     SWIFT_CONFIG=release
 fi
 SWIFT_BUILD_FLAGS=(-c "$SWIFT_CONFIG" ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[@]}"})
+# SwaTexRender's generated `Bundle.module` looks for its KaTeX fonts beside the
+# .app, which codesign refuses to seal — so it can never find them in a bundle
+# we assemble by hand and traps on the first equation (issue #233). Patch the
+# lookup before compiling; the script is idempotent and fails loudly.
+swift package resolve
+bash "$PROJECT_ROOT/scripts/patch-swatex-font-lookup.sh" "$SCRIPT_DIR/.build/checkouts/SwaTex"
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
 SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"

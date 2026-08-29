@@ -1,0 +1,73 @@
+name: Bug report
+description: Crash, wrong output, API misbehavior, or app problem
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How badly this affects you
+      options:
+        - high (blocks my use of mlx-serve)
+        - medium (workaround exists)
+        - low (minor annoyance)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Server / API (chat, completions, messages, responses, embeddings)
+        - Tool calling / agent harness (Claude Code, pi, opencode, ...)
+        - Media generation (image / video / audio / 3D / TTS)
+        - Mac app (UI, downloads, model browser)
+        - CLI / launch
+        - Crash (SIGSEGV / process died)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: mlx-serve version
+      description: From the app About panel or `mlx-serve --version`
+      placeholder: "26.8.10"
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware + macOS
+      placeholder: "M4 Max 128 GB, macOS 26.6.2"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Exact HF repo + quant, and any spec settings (MTP / PLD / drafter / kv-quant)
+      placeholder: "ddalcu/Qwen3.8-27B-MLX-Serve-8bit, MTP depth 6, PLD on"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened vs what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Client used (curl / app / agent), endpoint, stream or non-stream, and the smallest request that shows it. If you can, retry with `stream:false` first.
+      placeholder: |
+        1. Launch with ...
+        2. curl http://127.0.0.1:8080/v1/chat/completions -d '...'
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log tail
+      description: "`~/.mlx-serve/logs/mlx-serve-<port>.log` — last ~50 lines around the failure (relaunch with `--log-level debug` if possible). For crashes, attach the macOS crash report (.ips) too."
+      render: text

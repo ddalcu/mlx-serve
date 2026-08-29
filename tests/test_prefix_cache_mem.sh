@@ -16,7 +16,7 @@
 
 set -e
 
-MODEL="${1:-$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-8094}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'

@@ -20,6 +20,7 @@ PORT="${1:-11321}"
 MODEL_DIR="${FLUX_LOWMEM_MODEL:-$HOME/.mlx-serve/models/mlx-community/FLUX.2-Klein-4B-3bit}"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 TMP="$(mktemp -d)"
+SRV_PID=""   # seeded: the EXIT trap runs on the SKIP path too, before any server starts
 trap 'kill $SRV_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 pass() { echo "  ✅ $1"; }

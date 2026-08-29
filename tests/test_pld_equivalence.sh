@@ -17,7 +17,7 @@
 #   - A built mlx-serve binary (run `zig build -Doptimize=ReleaseFast` first)
 #   - Either:
 #       PLD_TEST_MODEL set to a model directory, OR
-#       a default MLX checkpoint at ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#       a default MLX checkpoint at ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 #
 # Usage:
 #   PLD_TEST_MODEL=/path/to/model ./tests/test_pld_equivalence.sh [port]
@@ -34,13 +34,13 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 # Resolve model directory: explicit env var first, else a sensible default.
-MODEL="${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+MODEL="${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_pld_equivalence: model directory not found."
     echo
     echo "  Set PLD_TEST_MODEL to a model directory, or place an MLX checkpoint"
-    echo "  at ~/.mlx-serve/models/gemma-4-e4b-it-8bit (the default this test"
+    echo "  at ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit (the default this test"
     echo "  looks for). PLD works on any model so the choice is arbitrary."
     exit 0
 fi

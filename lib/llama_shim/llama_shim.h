@@ -85,8 +85,9 @@ int32_t mlx_llama_session_sync(mlx_llama_session *s, const int32_t *tokens, int3
 // Drop all KV entries at positions >= n_keep (i.e. keep the first n_keep tokens),
 // leaving the cache at position n_keep so the next sync continues from there.
 // No-op when n_keep >= current position. Used for prompt-prefix reuse: keep the
-// common prefix, discard the divergent tail. Returns 0 (the underlying seq_rm of
-// a whole tail never fails for our single-sequence usage).
+// common prefix, discard the divergent tail. Returns 0 on success, 1 when the
+// memory could not trim partially (recurrent/hybrid state past its rollback
+// window) and was cleared instead: nothing is resident, cold-prefill everything.
 int32_t mlx_llama_session_trim(mlx_llama_session *s, int32_t n_keep);
 
 // Clear the entire KV cache (position → 0). For a prompt that shares nothing with

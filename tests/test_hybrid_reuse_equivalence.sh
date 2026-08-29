@@ -38,6 +38,7 @@ pkill -9 -f "mlx-serve.*port $PORT" 2>/dev/null
 sleep 1
 
 LOG="$(mktemp)"
+SERVER_PID=""   # seeded: the EXIT trap runs on the SKIP path too, before any server starts
 trap 'kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; true' EXIT
 
 "$BIN" --model "$MODEL" --serve --port "$PORT" --ctx-size 8192 \

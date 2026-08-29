@@ -171,8 +171,81 @@ PY
   else
     echo "FAIL: I2V http $code"; head -c 300 "$I2V"; rc=1
   fi
+
+  # ── First + last frame (#260) ─────────────────────────────────────────────
+  # The last anchor is a top-dark/bottom-bright split; the first stays the
+  # left/right one. Frame 0 must show the left/right split, the final frame
+  # the top/bottom one, and the engine must log BOTH anchors engaged.
+  LAST_IMG=/tmp/test_flf_last.png
+  python3 - "$LAST_IMG" <<'PY'
+import sys, struct, zlib
+W, H = 384, 256
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+raw = bytearray()
+for y in range(H):
+    raw.append(0)
+    v = 20 if y < H // 2 else 235   # top dark, bottom bright
+    raw += bytes((v, v, v)) * W
+png = b"\x89PNG\r\n\x1a\n"
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+png += chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
+  LB64=$(base64 < "$LAST_IMG" | tr -d '\n')
+  FLF=/tmp/test_video_flf.json
+  python3 -c "import json,sys;json.dump({'prompt':'a red fox running through a snowy forest','num_frames':17,'height':256,'width':384,'steps':4,'seed':7,'first_frame_image':sys.argv[1],'last_frame_image':sys.argv[2]}, open('/tmp/test_flf_req.json','w'))" "$B64" "$LB64"
+  code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_flf_req.json -o "$FLF" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    grep -q "\[ltx\] keyframe conditioning: first=true last=true" /tmp/test_video_server.log \
+      || { echo "FAIL: last-frame anchor not engaged (no first=true last=true log line)"; rc=1; }
+    python3 - "$FLF" <<'PY'
+import sys, json, base64
+d = json.load(open(sys.argv[1]))
+F, H, W = d["frames"], d["height"], d["width"]
+assert F == 17, f"expected 17 frames, got {F}"
+raw = base64.b64decode(d["data"])
+fb = H * W * 3
+def gray(px, i): return (px[i] + px[i+1] + px[i+2]) / 3.0
+def halves(frame, axis):
+    a = b = na = nb = 0.0
+    for y in range(H):
+        for x in range(W):
+            g = gray(frame, (y * W + x) * 3)
+            first = (x < W // 2) if axis == "x" else (y < H // 2)
+            if first: a += g; na += 1
+            else: b += g; nb += 1
+    return a / na, b / nb
+l, r = halves(raw[:fb], "x")
+t, b = halves(raw[(F - 1) * fb:F * fb], "y")
+print(f"FLF frame0 left={l:.1f} right={r:.1f}; last top={t:.1f} bottom={b:.1f}")
+assert r - l > 30, f"first frame did not adhere to the first anchor ({l:.1f} vs {r:.1f})"
+assert b - t > 30, f"last frame did not adhere to the last anchor ({t:.1f} vs {b:.1f})"
+print("PASS: first/last frame anchors both reconstruct")
+PY
+    [ $? -eq 0 ] || rc=1
+  else
+    echo "FAIL: FLF http $code"; head -c 300 "$FLF"; rc=1
+  fi
+  # Refusals are named, never a silent text-to-video downgrade.
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","num_frames":9,"height":256,"width":384,"steps":2,"last_frame_image":"!!notbase64"}' -o /tmp/test_flf_bad.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "last_frame_image" /tmp/test_flf_bad.json \
+    && echo "PASS: bad last_frame_image -> named 400" \
+    || { echo "FAIL: bad last_frame_image http $code"; head -c 200 /tmp/test_flf_bad.json; rc=1; }
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data "{\"prompt\":\"x\",\"num_frames\":5,\"height\":256,\"width\":384,\"steps\":2,\"last_frame_image\":\"$LB64\"}" -o /tmp/test_flf_short.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "9 frames" /tmp/test_flf_short.json \
+    && echo "PASS: last frame on a one-latent-frame canvas -> named 400" \
+    || { echo "FAIL: short canvas with last frame http $code"; head -c 200 /tmp/test_flf_short.json; rc=1; }
 else
   echo "no vae_encoder.safetensors in $MODEL -> skipping image-to-video test"
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","num_frames":9,"height":256,"width":384,"steps":2,"last_frame_image":"AAAA"}' -o /tmp/test_flf_noenc.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "vae_encoder" /tmp/test_flf_noenc.json \
+    && echo "PASS: last_frame_image without encoder -> named 400" \
+    || { echo "FAIL: last_frame_image without encoder http $code"; rc=1; }
 fi
 
 # ── Two-stage pipeline (dev CFG half-res → x2 upsample → distilled refine) ──

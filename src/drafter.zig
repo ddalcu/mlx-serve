@@ -1191,11 +1191,11 @@ fn layerForward(
     var attn_out = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_out);
     if (mask_owned) |mask| {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, scale, "array", mask, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, scale, "array", mask, .{ .ctx = null }, false, s));
     } else {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, scale, "", none_mask, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, scale, "", none_mask, .{ .ctx = null }, false, s));
     }
 
     // [B, H, S, D] → [B, S, H*D]

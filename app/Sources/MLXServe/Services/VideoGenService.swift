@@ -553,6 +553,9 @@ final class VideoGenService: ObservableObject {
         if let path = request.firstFrameImagePath, !path.isEmpty {
             lines.append("first_frame: \(basename(path))")
         }
+        if let path = request.lastFrameImagePath, !path.isEmpty {
+            lines.append("last_frame: \(basename(path))")
+        }
         if hasAudio, let path = request.audioPath {
             lines.append("input_audio: \(basename(path))")
         }
@@ -787,7 +790,7 @@ final class VideoGenService: ObservableObject {
         return out
     }
 
-    enum MuxError: Error { case writerInit, noPool, finishFailed(String), audioBuffer }
+    enum MuxError: Error { case writerInit, noPool, frameBuffer(Int), frameAppend(Int, String), finishFailed(String), audioBuffer }
 
     /// Mux raw RGB frames (+ optional stereo PCM) → h264/aac mp4 via AVAssetWriter.
     nonisolated static func writeMP4(rgb: Data, frames: Int, width: Int, height: Int, fps: Int, to url: URL,
@@ -846,13 +849,22 @@ final class VideoGenService: ObservableObject {
         guard let pool = adaptor.pixelBufferPool else { throw MuxError.noPool }
 
         let ts: Int32 = 600
+        // Every frame is appended or the mux FAILS. A dropped frame (pool
+        // exhausted, encoder refused the buffer) used to `continue` and the
+        // writer still finished "successfully" — issue #170's 28 KB black mp4
+        // after an hours-long H3 render. Pool misses fall back to a standalone
+        // buffer; a refused append throws with the writer's own error.
+        var muxFailure: MuxError? = nil
         rgb.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let src = raw.bindMemory(to: UInt8.self).baseAddress!
             for f in 0..<frames {
                 while !input.isReadyForMoreMediaData { usleep(500) }
                 var pbOut: CVPixelBuffer?
                 CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbOut)
-                guard let pb = pbOut else { continue }
+                if pbOut == nil {
+                    CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pbOut)
+                }
+                guard let pb = pbOut else { muxFailure = .frameBuffer(f); return }
                 CVPixelBufferLockBaseAddress(pb, [])
                 if let base = CVPixelBufferGetBaseAddress(pb) {
                     let dst = base.assumingMemoryBound(to: UInt8.self)
@@ -871,10 +883,19 @@ final class VideoGenService: ObservableObject {
                 }
                 CVPixelBufferUnlockBaseAddress(pb, [])
                 let pts = CMTime(value: Int64(f) * Int64(ts) / Int64(max(fps, 1)), timescale: ts)
-                adaptor.append(pb, withPresentationTime: pts)
+                if !adaptor.append(pb, withPresentationTime: pts) {
+                    muxFailure = .frameAppend(f, String(describing: writer.error))
+                    return
+                }
             }
         }
         input.markAsFinished()
+        if let failure = muxFailure {
+            audioInput?.markAsFinished()
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: url)
+            throw failure
+        }
 
         let sem = DispatchSemaphore(value: 0)
         writer.finishWriting { sem.signal() }

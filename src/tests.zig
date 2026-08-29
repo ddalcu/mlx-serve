@@ -27,8 +27,10 @@ test {
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
+    _ = @import("round_cost.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
+    _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
@@ -51,7 +53,6 @@ test {
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
-    _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
     _ = @import("ltx_diffvae_kernel.zig");

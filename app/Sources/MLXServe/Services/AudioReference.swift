@@ -56,12 +56,42 @@ enum AudioReference {
         return try writeTempWav(wav)
     }
 
+    /// Music reference (ACE-Step `ref_audio`): the engine wants 48 kHz STEREO,
+    /// not the 24 kHz mono voice-clone shape. Decodes any file AVFoundation
+    /// reads, keeps/duplicates to two channels, resamples, crops to
+    /// `maxSeconds` (the server only ever uses 30 s) and writes a temp WAV.
+    static func referenceWav(fromFile url: URL, sampleRate: Double = 48_000, maxSeconds: Double = 30) throws -> URL {
+        let dec = try decodeToFloat(url)
+        guard !dec.channels.isEmpty, !dec.channels[0].isEmpty else { throw RefError.emptyRecording }
+        let stereo = dec.channels.count >= 2 ? Array(dec.channels[0..<2]) : [dec.channels[0], dec.channels[0]]
+        var out: [[Float]] = []
+        for ch in stereo {
+            let r = dec.sampleRate == sampleRate ? ch : try resample(ch, from: dec.sampleRate, to: sampleRate)
+            out.append(r)
+        }
+        let interleaved = interleaveAndCrop(out, sampleRate: sampleRate, maxSeconds: maxSeconds)
+        let wav = wavData(fromInterleaved: interleaved, channels: 2, sampleRate: Int(sampleRate))
+        return try writeTempWav(wav)
+    }
+
+    /// Interleave equal-length channel buffers, cropped to `maxSeconds`. Pure.
+    static func interleaveAndCrop(_ channels: [[Float]], sampleRate: Double, maxSeconds: Double) -> [Float] {
+        let n = min(channels.map(\.count).min() ?? 0, Int(maxSeconds * sampleRate))
+        var out = [Float](repeating: 0, count: n * channels.count)
+        for i in 0..<n { for (c, ch) in channels.enumerated() { out[i * channels.count + c] = ch[i] } }
+        return out
+    }
+
     // MARK: - Pure WAV writer
 
     /// Encode mono float samples (`-1...1`) as a canonical 16-bit PCM WAV blob.
     /// Pure + deterministic so it can be unit-tested without AVFoundation.
     static func wavData(fromMonoFloat samples: [Float], sampleRate: Int) -> Data {
-        let channels: UInt16 = 1
+        wavData(fromInterleaved: samples, channels: 1, sampleRate: sampleRate)
+    }
+
+    /// Interleaved `channels`-channel float samples → canonical 16-bit PCM WAV.
+    static func wavData(fromInterleaved samples: [Float], channels: UInt16, sampleRate: Int) -> Data {
         let bitsPerSample: UInt16 = 16
         let bytesPerSample = Int(bitsPerSample / 8)
         let dataBytes = samples.count * bytesPerSample
@@ -89,11 +119,10 @@ enum AudioReference {
         // "data" subchunk
         append("data")
         append32(UInt32(dataBytes))
-        for s in samples {
-            let clamped = max(-1.0, min(1.0, s))
-            let v = Int16(clamping: Int((clamped * 32767.0).rounded()))
-            append16(UInt16(bitPattern: v))
-        }
+        // One pass to Int16 + one append: the per-sample `Data.append` this
+        // replaced froze the UI for seconds on a 10-minute source clip.
+        let pcm = samples.map { Int16(clamping: Int((max(-1.0, min(1.0, $0)) * 32767.0).rounded())).littleEndian }
+        pcm.withUnsafeBufferPointer { data.append(UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self)) }
         return data
     }
 
@@ -143,6 +172,20 @@ enum AudioReference {
     /// Decode a file to mono float samples at its native rate (downmixing
     /// stereo). Returns samples + the file's sample rate for a later resample.
     private static func decodeToMonoFloat(_ url: URL) throws -> (samples: [Float], sampleRate: Double) {
+        let dec = try decodeToFloat(url)
+        let n = dec.channels[0].count
+        if dec.channels.count == 1 { return (dec.channels[0], dec.sampleRate) }
+        var mono = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            var sum: Float = 0
+            for ch in dec.channels { sum += ch[i] }
+            mono[i] = sum / Float(dec.channels.count)
+        }
+        return (mono, dec.sampleRate)
+    }
+
+    /// Decode a file to per-channel float samples at its native rate.
+    private static func decodeToFloat(_ url: URL) throws -> (channels: [[Float]], sampleRate: Double) {
         let file: AVAudioFile
         do { file = try AVAudioFile(forReading: url) }
         catch { throw RefError.decodeFailed(error.localizedDescription) }
@@ -157,18 +200,9 @@ enum AudioReference {
 
         let n = Int(buffer.frameLength)
         guard n > 0, let chData = buffer.floatChannelData else { throw RefError.decodeFailed("no PCM data") }
-        let channels = Int(processing.channelCount)
-        var mono = [Float](repeating: 0, count: n)
-        if channels <= 1 {
-            mono.withUnsafeMutableBufferPointer { $0.baseAddress!.update(from: chData[0], count: n) }
-        } else {
-            for i in 0..<n {
-                var sum: Float = 0
-                for c in 0..<channels { sum += chData[c][i] }
-                mono[i] = sum / Float(channels)
-            }
-        }
-        return (mono, processing.sampleRate)
+        let channels = max(1, Int(processing.channelCount))
+        let out = (0..<channels).map { Array(UnsafeBufferPointer(start: chData[$0], count: n)) }
+        return (out, processing.sampleRate)
     }
 
     private static func writeTempWav(_ data: Data) throws -> URL {

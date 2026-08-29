@@ -744,7 +744,7 @@ fn ropeAt(x: mlx.mlx_array, dims: c_int, theta: f32, offset: c_int, s: S) !mlx.m
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mode: [*:0]const u8, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     const null_a = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, null_a, null_a, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, null_a, null_a, false, s));
     return o;
 }
 fn zerosA(shape: []const c_int, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {

@@ -18,6 +18,7 @@ final class VideoSettingsSidecarTests: XCTestCase {
         req.stgScale = 1.0
         req.diffusionDecoder = true
         req.firstFrameImagePath = "/private/reference/start.png"
+        req.lastFrameImagePath = "/private/reference/end.png"
         req.audioPath = "/private/reference/dialogue.m4a"
         req.loras = [LoraAdapter(path: "/private/loras/cinematic.safetensors", scale: 0.75)]
 
@@ -43,6 +44,7 @@ final class VideoSettingsSidecarTests: XCTestCase {
         XCTAssertTrue(text.contains("stg_scale: 1.00"))
         XCTAssertTrue(text.contains("decoder: diffusion"))
         XCTAssertTrue(text.contains("first_frame: start.png"))
+        XCTAssertTrue(text.contains("last_frame: end.png"))
         XCTAssertTrue(text.contains("input_audio: dialogue.m4a"))
         XCTAssertTrue(text.contains("lora_1_file: cinematic.safetensors"))
         XCTAssertTrue(text.contains("lora_1_scale: 0.75"))

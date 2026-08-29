@@ -9,7 +9,7 @@
 # (echo-heavy code rename) so the drafter's verify path is well exercised.
 #
 # Default pair (Apple Silicon, ~3.3 GB peak RSS):
-#   target  = ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#   target  = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 #   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16
 #
 # Override with env vars:
@@ -30,7 +30,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 
 if [ ! -d "$TARGET" ]; then

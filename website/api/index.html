@@ -194,7 +194,7 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
       <tr><td><code>ref_images</code></td><td>Up to 3 extra base64 reference images beside <code>image</code> in <code>"edit"</code> mode — refer to them by number in the prompt: <i>"replace the face of the man in image 1 with the face from image 2"</i>. Each keeps its own aspect ratio.</td></tr>
       <tr><td><code>lora_paths</code> / <code>lora_scales</code></td><td>Runtime style LoRAs (<code>.safetensors</code>, diffusers / kohya / PEFT layouts), up to 8, absolute paths. They stack: every adapter is summed at forward time, never merged, so nothing is re-quantized. Each file's own declared alpha is honored. The singular <code>lora_path</code> / <code>lora_scale</code> still works.</td></tr>
       <tr><td><code>cond_gain</code> / <code>cond_weights</code></td><td>Text-conditioning rebalance knobs.</td></tr>
-      <tr><td><code>steps</code>, <code>seed</code>, <code>safety</code></td><td>Sampler steps, reproducibility, NSFW filter (<code>false</code> to disable per request).</td></tr>
+      <tr><td><code>steps</code>, <code>seed</code></td><td>Sampler steps, reproducibility.</td></tr>
     </table>
 
     <h3><span class="method m-post">POST</span><code>/v1/images/edits</code></h3>

@@ -39,6 +39,7 @@ const supported_model_types = [_][]const u8{
     "qwen3_5_text",     "qwen3_5_moe",
     "qwen3_5_moe_text", "qwen3_moe",
     "qwen3_moe_text",   "qwen3_next",
+    "qwen4_exp",        "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",            "mistral",
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
@@ -50,6 +51,7 @@ const supported_model_types = [_][]const u8{
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
+    "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -266,6 +268,41 @@ pub fn peekMfluxFlux2(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir)
         return std.mem.indexOf(u8, head[8..], flux2_dit_marker) != null;
     }
     return false;
+}
+
+/// The set of shard basenames in `model.safetensors.index.json`'s `weight_map`,
+/// or null when there is no usable index (single-file packs, media packs).
+pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(void) {
+    const a = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return null;
+    defer a.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const wm = parsed.value.object.get("weight_map") orelse return null;
+    if (wm != .object) return null;
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    for (wm.object.values()) |v| {
+        if (v != .string) continue;
+        if (set.contains(v.string)) continue;
+        const key = a.dupe(u8, v.string) catch continue;
+        set.put(a, key, {}) catch {
+            a.free(key);
+            continue;
+        };
+    }
+    if (set.count() == 0) {
+        set.deinit(a);
+        return null;
+    }
+    return set;
+}
+
+/// Free a set from `indexShardSet`.
+pub fn freeShardSet(set: *std.StringHashMapUnmanaged(void)) void {
+    var keys = set.keyIterator();
+    while (keys.next()) |k| std.heap.page_allocator.free(k.*);
+    set.deinit(std.heap.page_allocator);
 }
 
 /// Read at most `buf.len` bytes of `dir/name` into `buf`; null when it can't be
@@ -880,10 +917,13 @@ fn tryAddModel(
         var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
         if (sub_iter_dir) |*sd| {
             defer sd.close(io);
+            var referenced = indexShardSet(io, sd.*);
+            defer if (referenced) |*r| freeShardSet(r);
             var sd_iter = sd.iterate();
             while (sd_iter.next(io) catch null) |sub_entry| {
                 if (sub_entry.kind != .file and sub_entry.kind != .sym_link) continue;
                 if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
+                if (referenced) |r| if (!r.contains(sub_entry.name)) continue;
                 const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
                 if (st.kind != .file) continue;
                 bytes += @intCast(st.size);

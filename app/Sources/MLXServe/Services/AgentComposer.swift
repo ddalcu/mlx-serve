@@ -25,6 +25,17 @@ enum AgentComposer {
     /// Run one prompt to completion and return the whole reply.
     static func complete(userText: String, systemPrompt: String,
                          appState: AppState, maxTokens: Int = 512) async throws -> String {
+        var reply = ""
+        for try await delta in try await stream(userText: userText, systemPrompt: systemPrompt,
+                                                appState: appState, maxTokens: maxTokens) {
+            reply += delta
+        }
+        return reply
+    }
+
+    /// Same request, content deltas as they arrive.
+    static func stream(userText: String, systemPrompt: String,
+                       appState: AppState, maxTokens: Int = 512) async throws -> AsyncThrowingStream<String, Error> {
         guard appState.server.status == .running else { throw ComposerError.noModel }
         await appState.server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
 
@@ -40,11 +51,19 @@ enum AgentComposer {
             defaults: APIClient.RequestDefaults.from(appState.serverOptions),
             modelId: appState.server.chatModelId)
 
-        var reply = ""
-        for try await event in stream {
-            if case .content(let delta) = event { reply += delta }
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await event in stream {
+                        if case .content(let delta) = event { continuation.yield(delta) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
-        return reply
     }
 
     /// Describe an agent, get back a name and a system prompt.

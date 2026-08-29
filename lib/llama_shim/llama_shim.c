@@ -201,9 +201,17 @@ int32_t mlx_llama_session_sync(mlx_llama_session *s, const int32_t *tokens, int3
 int32_t mlx_llama_session_trim(mlx_llama_session *s, int32_t n_keep) {
     if (n_keep < 0) n_keep = 0;
     if (n_keep >= s->pos) return 0; // nothing resident beyond n_keep
-    // Single-sequence (seq 0) usage: remove positions [n_keep, inf). Removing a
-    // whole tail of one sequence never returns false (see llama.h seq_rm doc).
-    llama_memory_seq_rm(llama_get_memory(s->ctx), 0, n_keep, -1);
+    // Single-sequence (seq 0) usage: remove positions [n_keep, inf). Recurrent /
+    // hybrid memory (Mamba, GDN: qwen35, qwen3next, nemotron_h) can only roll a
+    // tail back within its per-token snapshot window and returns false past it,
+    // mutating nothing. Ignoring that left the previous request's whole tail
+    // resident under the new suffix (#286). Fall back to a full clear: 1 =
+    // cleared, caller must cold-prefill.
+    if (!llama_memory_seq_rm(llama_get_memory(s->ctx), 0, n_keep, -1)) {
+        llama_memory_clear(llama_get_memory(s->ctx), true);
+        s->pos = 0;
+        return 1;
+    }
     s->pos = n_keep;
     return 0;
 }

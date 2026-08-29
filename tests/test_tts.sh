@@ -3,8 +3,9 @@
 # Usage: TTS_MODEL=<dir> ./tests/test_tts.sh [port]
 set -euo pipefail
 PORT="${1:-11377}"
-MODEL="${TTS_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-bf16/snapshots/* 2>/dev/null | head -1)}"
+MODEL="${TTS_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-bf16/snapshots/* 2>/dev/null | head -1 || true)}"
 [ -n "$MODEL" ] || { echo "SKIP: no qwen3_tts model (set TTS_MODEL)"; exit 0; }
+[ -d "$MODEL" ] || { echo "FAIL: TTS_MODEL points at a missing dir: $MODEL" >&2; exit 1; }
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 "$BIN" --model "$MODEL" --serve --port "$PORT" >/tmp/test_tts_server.log 2>&1 &
 SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT

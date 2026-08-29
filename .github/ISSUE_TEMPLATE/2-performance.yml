@@ -1,0 +1,49 @@
+name: Performance issue
+description: Slower than expected, regression between releases, memory growth
+labels: ["perf"]
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How badly this affects you
+      options:
+        - high (blocks my use of mlx-serve)
+        - medium (workaround exists)
+        - low (minor annoyance)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: mlx-serve version(s)
+      description: If it's a regression, name BOTH versions
+      placeholder: "26.8.10 vs 26.8.9"
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware + macOS
+      placeholder: "M1 Pro 32 GB, macOS 26.6"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model + settings
+      placeholder: "Qwen3.5-4B 4bit, kv-quant 8, ctx 32768"
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Measured numbers
+      description: Decode tok/s, prefill tok/s, or TTFT — with prompt length, how you measured, and what you expected. Same-machine, same-session comparisons only; note if another engine is the reference.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log tail
+      render: text

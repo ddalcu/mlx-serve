@@ -20,8 +20,8 @@ LOADED_MODEL="${3:-gemma-4-e4b-it-4bit}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 
 [[ -x "$BINARY" ]] || { echo "Build first" >&2; exit 1; }
-[[ -d "$MODELS_ROOT" ]] || { echo "Root not found: $MODELS_ROOT" >&2; exit 1; }
-[[ -d "$MODELS_ROOT/$LOADED_MODEL" ]] || { echo "Loaded model not found: $MODELS_ROOT/$LOADED_MODEL" >&2; exit 1; }
+[[ -d "$MODELS_ROOT" ]] || { echo "SKIP: root not found: $MODELS_ROOT"; exit 0; }
+[[ -d "$MODELS_ROOT/$LOADED_MODEL" ]] || { echo "SKIP: no checkpoint at $MODELS_ROOT/$LOADED_MODEL"; exit 0; }
 
 trap 'pkill -9 -x mlx-serve 2>/dev/null; true' EXIT
 
@@ -106,13 +106,24 @@ for _ in $(seq 1 240); do
     kill -0 "$PID" 2>/dev/null || { echo "FAIL: server died (auto-select path)" >&2; cat /tmp/test_disc2.log; exit 1; }
 done
 
-if ! grep -q "Auto-selected --model" /tmp/test_disc2.log; then
-    echo "FAIL: --model-dir auto-select log line missing" >&2
-    grep -E "Auto-selected|Discovered" /tmp/test_disc2.log >&2 || true
+# --model-dir WITHOUT --model starts headless: no primary model is loaded and
+# every discovery is registered as a stub that loads on demand. The old
+# "Auto-selected --model" line was deliberately removed when that shipped
+# (src/main.zig: "No auto-select ... the server starts HEADLESS"), so asserting
+# it convicted the server of a bug it does not have.
+loaded_count=$(curl -sf "http://127.0.0.1:$PORT/v1/models" \
+    | grep -o '"loaded":true' | wc -l | tr -d ' ')
+if [[ "$loaded_count" != "0" ]]; then
+    echo "FAIL: headless boot loaded $loaded_count model(s); expected 0" >&2
     exit 1
 fi
-auto=$(grep "Auto-selected --model" /tmp/test_disc2.log | head -1)
-echo "  $auto"
+stub_count=$(curl -sf "http://127.0.0.1:$PORT/v1/models" \
+    | grep -o '"loaded":false' | wc -l | tr -d ' ')
+if [[ "$stub_count" -lt 1 ]]; then
+    echo "FAIL: headless boot registered no stubs; expected the discovered siblings" >&2
+    exit 1
+fi
+echo "  headless: 0 loaded, $stub_count stub(s) registered on demand"
 echo "  PASS"
 
 pkill -9 -x mlx-serve 2>/dev/null

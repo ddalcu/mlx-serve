@@ -23,7 +23,9 @@ acestep/models/mlx/{dit_convert,vae_convert}.py). Structural transforms:
       for Conv1d, per-IN-channel for ConvTranspose1d), then (a).
   (c) Snake alpha/beta         PT [1, C, 1] -> [C], kept FLOAT32 (exp() headroom).
   (d) silence_latent.pt        [1, 64, 15000] -> transpose -> `silence_latent` [1, 15000, 64].
-  (e) FSQ tokenizer/detokenizer/attention-pooler DROPPED (cover-mode only, not text2music).
+  (e) FSQ tokenizer/detokenizer/attention-pooler (cover mode) -> fsq.safetensors, a
+      SEPARATE file so packs that predate cover mode gain it without a re-download
+      (`--fsq-only` writes just that file). Always DENSE bf16 (FSQ_BITS).
   (f) fp32 source -> bf16 dense; --bits 8/4 quantizes eligible 2-D linears with mlx
       affine group_size 64 (packed uint32 .weight + bf16 .scales/.biases). At
       --bits 4 the timestep-embedding family stays 8-bit (adaLN sensitivity).
@@ -199,7 +201,7 @@ def build_model(src, silence_np):
     """XL-turbo checkpoint (decoder.* + encoder.* + null_condition_emb) -> converted names.
 
     Names pass through unchanged EXCEPT decoder.proj_in.1/proj_out.1 (Sequential
-    index dropped + conv layout swapped). FSQ tokenizer/detokenizer/pooler dropped.
+    index dropped + conv layout swapped). tokenizer.*/detokenizer.* go to `build_fsq`.
     """
     out = {}
 
@@ -263,11 +265,50 @@ def build_model(src, silence_np):
     return out
 
 
-# leftover keys that are legitimately dropped, per namespace.
-MODEL_DROP_RULES = [
-    ("tokenizer.", "FSQ audio tokenizer — cover-mode only, not used for text2music"),
-    ("detokenizer.", "FSQ audio detokenizer — cover-mode only, not used for text2music"),
-]
+# leftover keys that are legitimately dropped, per namespace (none today: the
+# FSQ path is served, see build_fsq).
+MODEL_DROP_RULES = []
+
+# ── FSQ audio tokenizer + detokenizer (cover mode) ────────────────────────────
+NUM_POOLER_LAYERS = 2
+POOL_WINDOW = 5
+FSQ_LEVELS = [8, 8, 8, 5, 5, 5]
+FSQ_FILE = "fsq.safetensors"
+FSQ_PREFIXES = ("tokenizer.", "detokenizer.")
+# The FSQ projections (2048<->6) feed a soft clamp + floor onto a 6-d grid —
+# a bf16 ulp there flips a code, so they stay fp32. ~50 KB.
+DENSE_F32_PREFIXES = ("tokenizer.quantizer.",)
+# The whole FSQ file ships DENSE bf16 whatever --bits says (420 MB vs 223 MB):
+# an 8-bit pooler moves the pre-quantization values by up to 0.04 and flips
+# near-tie codes, and over a real clip that compounds into a cover that only
+# correlates 0.64 with the reference's (0.985 dense). Measured 2026-08-22.
+FSQ_BITS = 16
+
+
+def build_fsq(src):
+    """tokenizer.* (acoustic proj + AttentionPooler + ResidualFSQ projections) and
+    detokenizer.* (AudioTokenDetokenizer) -> converted names, unchanged: both
+    stacks are AceStepEncoderLayers the engine already runs."""
+    out = {}
+    for p in ("weight", "bias"):
+        out[f"tokenizer.audio_acoustic_proj.{p}"] = src.pop(f"tokenizer.audio_acoustic_proj.{p}")
+        out[f"tokenizer.quantizer.project_in.{p}"] = src.pop(f"tokenizer.quantizer.project_in.{p}")
+        out[f"tokenizer.quantizer.project_out.{p}"] = src.pop(f"tokenizer.quantizer.project_out.{p}")
+        out[f"detokenizer.proj_out.{p}"] = src.pop(f"detokenizer.proj_out.{p}")
+    assert list(out["tokenizer.quantizer.project_in.weight"].shape) == [len(FSQ_LEVELS), ENC_HIDDEN]
+    for stack in ("tokenizer.attention_pooler", "detokenizer"):
+        out[f"{stack}.embed_tokens.weight"] = src.pop(f"{stack}.embed_tokens.weight")
+        out[f"{stack}.embed_tokens.bias"] = src.pop(f"{stack}.embed_tokens.bias")
+        out[f"{stack}.norm.weight"] = src.pop(f"{stack}.norm.weight")
+        for i in range(NUM_POOLER_LAYERS):
+            _map_encoder_layer(out, src, f"{stack}.layers.{i}", f"{stack}.layers.{i}")
+    st = src.pop("tokenizer.attention_pooler.special_token")
+    assert list(st.shape) == [1, 1, ENC_HIDDEN], f"pooler special_token shape {st.shape}"
+    out["tokenizer.attention_pooler.special_token"] = st
+    st = src.pop("detokenizer.special_tokens")
+    assert list(st.shape) == [1, POOL_WINDOW, ENC_HIDDEN], f"detokenizer special_tokens shape {st.shape}"
+    out["detokenizer.special_tokens"] = st
+    return out
 
 
 def enforce_leftovers(src, drop_rules):
@@ -334,7 +375,9 @@ def save_model_safetensors(out_np, path, bits):
     for name, arr in out_np.items():
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         eff_bits = quant_bits_for(name, arr.shape, bits)
-        if eff_bits is not None:
+        if name.startswith(DENSE_F32_PREFIXES):
+            packed[name] = mx.array(arr)
+        elif eff_bits is not None:
             wq, scales, biases = mx.quantize(mx.array(arr), group_size=GROUP_SIZE, bits=eff_bits)
             base = name[: -len(".weight")]
             packed[f"{base}.weight"] = wq
@@ -365,8 +408,9 @@ def save_vae_safetensors(out_np, path):
 
 
 # ── loading helpers ───────────────────────────────────────────────────────────
-def load_sharded_safetensors_fp32(model_dir):
-    """Load model-0000N-of-00004.safetensors shards -> flat {name: np.float32}."""
+def load_sharded_safetensors_fp32(model_dir, prefixes=None):
+    """Load model-0000N-of-00004.safetensors shards -> flat {name: np.float32}.
+    `prefixes` keeps only matching keys (the FSQ-only path skips the 20 GB DiT)."""
     from safetensors import safe_open
     shards = sorted(glob.glob(os.path.join(model_dir, "model-*.safetensors")))
     if not shards:
@@ -380,6 +424,8 @@ def load_sharded_safetensors_fp32(model_dir):
         print(f"[load] {os.path.basename(s)}")
         with safe_open(s, framework="np") as f:
             for k in f.keys():
+                if prefixes is not None and not k.startswith(prefixes):
+                    continue
                 flat[k] = np.asarray(f.get_tensor(k), dtype=np.float32)
     return flat
 
@@ -463,6 +509,19 @@ def copy_license(src_xl, out):
     print("[license] no LICENSE under --src-xl (MIT per README; add manually before publishing)")
 
 
+def convert_fsq(src_xl, out, bits):
+    """Write ONLY fsq.safetensors (tokenizer.* + detokenizer.*) into an existing
+    pack dir — the migration path for packs converted before cover mode."""
+    os.makedirs(out, exist_ok=True)
+    print("[load] XL-turbo shards, FSQ keys only ...")
+    flat = load_sharded_safetensors_fp32(src_xl, prefixes=FSQ_PREFIXES)
+    fsrc = Source(flat, "fsq")
+    fsq_out = build_fsq(fsrc)
+    enforce_leftovers(fsrc, [])
+    n, nq, nbytes = save_model_safetensors(fsq_out, os.path.join(out, FSQ_FILE), FSQ_BITS)
+    print(f"[save] {FSQ_FILE}: {n} tensors ({nq} quantized, dense by design), {nbytes/1e6:.1f} MB")
+
+
 def convert(src_xl, src_main, out, bits):
     os.makedirs(out, exist_ok=True)
 
@@ -473,12 +532,16 @@ def convert(src_xl, src_main, out, bits):
     print("[map] DiT + condition encoder ...")
     msrc = Source(flat, "model")
     model_out = build_model(msrc, silence)
+    fsq_out = build_fsq(msrc)
     enforce_leftovers(msrc, MODEL_DROP_RULES)
     del flat
 
     n, nq, nbytes = save_model_safetensors(model_out, os.path.join(out, "model.safetensors"), bits)
     print(f"[save] model.safetensors: {n} tensors ({nq} quantized), {nbytes/1e9:.2f} GB")
     del model_out
+    n, nq, nbytes = save_model_safetensors(fsq_out, os.path.join(out, FSQ_FILE), FSQ_BITS)
+    print(f"[save] {FSQ_FILE}: {n} tensors ({nq} quantized, dense by design), {nbytes/1e6:.1f} MB")
+    del fsq_out
 
     print("[load] VAE ...")
     vae_flat = load_vae_bf16(os.path.join(src_main, "vae"))
@@ -608,13 +671,32 @@ def self_test():
             add_mlp(b, ENC_HIDDEN, ENC_INTERMEDIATE)
     mini["encoder.timbre_encoder.special_token"] = rng.standard_normal((1, 1, ENC_HIDDEN)).astype(np.float32)
     mini["null_condition_emb"] = rng.standard_normal((1, 1, ENC_HIDDEN)).astype(np.float32)
-    # FSQ leftovers that must be DROPPED, not fatal
-    mini["tokenizer.quantizer.project_in.weight"] = rng.standard_normal((6, ENC_HIDDEN)).astype(np.float32)
+    # FSQ tokenizer/detokenizer: every key the checkpoint ships, now KEPT.
+    for p, shp in (("weight", (ENC_HIDDEN, ACOUSTIC_DIM)), ("bias", (ENC_HIDDEN,))):
+        mini[f"tokenizer.audio_acoustic_proj.{p}"] = rng.standard_normal(shp).astype(np.float32)
+    for p, shp in (("weight", (6, ENC_HIDDEN)), ("bias", (6,))):
+        mini[f"tokenizer.quantizer.project_in.{p}"] = rng.standard_normal(shp).astype(np.float32)
+    for p, shp in (("weight", (ENC_HIDDEN, 6)), ("bias", (ENC_HIDDEN,))):
+        mini[f"tokenizer.quantizer.project_out.{p}"] = rng.standard_normal(shp).astype(np.float32)
+    for p, shp in (("weight", (ACOUSTIC_DIM, ENC_HIDDEN)), ("bias", (ACOUSTIC_DIM,))):
+        mini[f"detokenizer.proj_out.{p}"] = rng.standard_normal(shp).astype(np.float32)
+    for e in ("tokenizer.attention_pooler", "detokenizer"):
+        mini[f"{e}.embed_tokens.weight"] = rng.standard_normal((ENC_HIDDEN, ENC_HIDDEN)).astype(np.float32)
+        mini[f"{e}.embed_tokens.bias"] = rng.standard_normal((ENC_HIDDEN,)).astype(np.float32)
+        mini[f"{e}.norm.weight"] = rng.standard_normal((ENC_HIDDEN,)).astype(np.float32)
+        for i in range(NUM_POOLER_LAYERS):
+            b = f"{e}.layers.{i}"
+            add_attn(f"{b}.self_attn", ENC_HEADS * HEAD_DIM, ENC_KV_HEADS * HEAD_DIM, ENC_HIDDEN)
+            add_mlp(b, ENC_HIDDEN, ENC_INTERMEDIATE)
+            mini[f"{b}.input_layernorm.weight"] = rng.standard_normal((ENC_HIDDEN,)).astype(np.float32)
+            mini[f"{b}.post_attention_layernorm.weight"] = rng.standard_normal((ENC_HIDDEN,)).astype(np.float32)
+    mini["tokenizer.attention_pooler.special_token"] = rng.standard_normal((1, 1, ENC_HIDDEN)).astype(np.float32)
     mini["detokenizer.special_tokens"] = rng.standard_normal((1, 5, ENC_HIDDEN)).astype(np.float32)
 
     silence = rng.standard_normal((1, ACOUSTIC_DIM, SILENCE_FRAMES)).astype(np.float32)
     msrc = Source(dict(mini), "model")
     out = build_model(msrc, silence)
+    fsq = build_fsq(msrc)
     enforce_leftovers(msrc, MODEL_DROP_RULES)
 
     # 829 source tensors in the real ckpt; here: same count minus the FSQ family
@@ -625,7 +707,19 @@ def self_test():
     assert out["decoder.proj_out.weight"][5, 1, 9] == mini["decoder.proj_out.1.weight"][9, 5, 1]
     assert out["silence_latent"].shape == (1, SILENCE_FRAMES, ACOUSTIC_DIM)
     assert out["silence_latent"][0, 123, 7] == silence[0, 7, 123]
+    # The FSQ family lands in its OWN file, names unchanged, nothing left behind.
     assert "tokenizer.quantizer.project_in.weight" not in out
+    assert fsq["tokenizer.quantizer.project_in.weight"].shape == (6, ENC_HIDDEN)
+    assert fsq["detokenizer.special_tokens"].shape == (1, POOL_WINDOW, ENC_HIDDEN)
+    assert fsq["detokenizer.layers.1.mlp.down_proj.weight"].shape == (ENC_HIDDEN, ENC_INTERMEDIATE)
+    assert len(fsq) == 8 + 2 * (3 + NUM_POOLER_LAYERS * 11) + 2, len(fsq)
+    assert not msrc.leftover(), msrc.leftover()
+    # The --fsq-only path maps the same keys from a prefix-filtered load.
+    fsrc = Source({k: v for k, v in mini.items() if k.startswith(FSQ_PREFIXES)}, "fsq")
+    assert build_fsq(fsrc).keys() == fsq.keys() and not fsrc.leftover()
+    assert quant_bits_for("tokenizer.quantizer.project_in.weight", (6, ENC_HIDDEN), 8) is None
+    assert quant_bits_for("detokenizer.embed_tokens.weight", (ENC_HIDDEN, ENC_HIDDEN), FSQ_BITS) is None, \
+        "the FSQ file is dense whatever --bits says (an 8-bit pooler flips codes)"
     # decoder non-layer (proj_in 2 + proj_out 2 + time embeds 12 + cond_embedder 2
     # + norm_out 1 + table 1 = 20) + 32×19 layers + text_projector + lyric (3 + 8×11)
     # + timbre (4 + 4×11) + null + silence = 770 (= 829 source − 60 FSQ + 1 silence)
@@ -683,10 +777,19 @@ def main():
                     help="4/8 = quantize big linears (4-bit keeps time embeds at 8), "
                          "16 = dense bf16 parity build")
     ap.add_argument("--self-test", action="store_true", help="run synthetic unit tests and exit")
+    ap.add_argument("--fsq-only", action="store_true",
+                    help="write only fsq.safetensors (cover-mode tokenizer/detokenizer) into --out, "
+                         "for packs converted before cover mode; needs --src-xl only")
     args = ap.parse_args()
 
     if args.self_test:
         self_test()
+        return
+
+    if args.fsq_only:
+        if not args.src_xl or not args.out:
+            raise SystemExit("--fsq-only needs --src-xl and --out (the existing pack dir)")
+        convert_fsq(args.src_xl, args.out, args.bits)
         return
 
     if not args.src_xl or not args.src_main:

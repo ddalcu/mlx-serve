@@ -22,7 +22,7 @@ RESULTS="${RESULTS:-AGENT_MEMORY_RESULTS.md}"
 MODELS=(
     "gemma4-e2b-4bit|Gemma 4 E2B (4-bit)|$HOME/.lmstudio/models/mlx-community/gemma-4-e2b-it-4bit|mlx"
     "gemma4-e4b-4bit|Gemma 4 E4B (4-bit)|$HOME/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit|mlx"
-    "gemma4-26b-moe-4bit|Gemma 4 26B-A4B MoE (4-bit)|$HOME/.mlx-serve/models/gemma-4-26b-a4b-it-4bit|mlx"
+    "gemma4-26b-moe-4bit|Gemma 4 26B-A4B MoE (4-bit)|$HOME/.mlx-serve/models/mlx-community/gemma-4-26b-a4b-it-4bit|mlx"
     "gemma4-31b-4bit|Gemma 4 31B (4-bit)|$HOME/.lmstudio/models/mlx-community/gemma-4-31b-it-4bit|mlx"
     "qwen36-27b-4bit|Qwen 3.6 27B dense (4-bit)|$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-4bit|mlx"
     "qwen36-35b-moe-ud|Qwen 3.6 35B-A3B MoE UD (4-bit)|$HOME/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit|mlx"

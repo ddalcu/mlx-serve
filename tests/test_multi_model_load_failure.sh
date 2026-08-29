@@ -26,7 +26,7 @@
 
 set -e
 
-VALID="${1:-$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit}"
+VALID="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'

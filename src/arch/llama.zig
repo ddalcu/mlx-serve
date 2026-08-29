@@ -308,7 +308,9 @@ pub const LlamaSession = struct {
         if (common == prompt_ids.len and common > 0) common -= 1;
 
         if (common < self.resident.items.len) {
-            _ = ffi.mlx_llama_session_trim(self.handle, @intCast(common));
+            // 1 = the tail could not be rolled back (recurrent state) and the
+            // whole memory was cleared: nothing is resident any more.
+            if (ffi.mlx_llama_session_trim(self.handle, @intCast(common)) == 1) common = 0;
             self.resident.shrinkRetainingCapacity(common);
         }
 
@@ -393,6 +395,50 @@ fn testModelPath() ?[]const u8 {
     const raw = std.c.getenv("LLAMA_TEST_MODEL") orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;
+}
+
+test "llama: re-sync after a long generated tail is a cold decode, never a poisoned one (hybrid recurrent state, #286)" {
+    const allocator = std.testing.allocator;
+    const path = testModelPath() orelse return error.SkipZigTest;
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+
+    const prompt = try engine.tokenizeText(allocator, "Read the file store/pricing.py and", true);
+    defer allocator.free(prompt);
+
+    const N = 8;
+    var cold_out: [N]i32 = undefined;
+    {
+        var sess = try engine.createSession(4096);
+        defer sess.free();
+        _ = try sess.sync(prompt);
+        var tok = sess.argmax();
+        for (&cold_out) |*o| {
+            o.* = tok;
+            try sess.eval(tok);
+            tok = sess.argmax();
+        }
+    }
+
+    // A previous request left a long generated tail resident: longer than any
+    // recurrent per-token snapshot window, so the tail cannot be rolled back.
+    var sess = try engine.createSession(4096);
+    defer sess.free();
+    _ = try sess.sync(prompt);
+    const junk = try engine.tokenizeText(allocator, "cd /private/tmp/mlxcode && python3 -m pytest 2>&1 | head -60 and then glob every python file in the tree", false);
+    defer allocator.free(junk);
+    for (junk) |t| try sess.eval(t);
+    try std.testing.expect(sess.resident.items.len > prompt.len + 16);
+
+    _ = try sess.sync(prompt);
+    try std.testing.expectEqual(prompt.len, sess.resident.items.len);
+    var tok = sess.argmax();
+    for (cold_out) |want| {
+        try std.testing.expectEqual(want, tok);
+        try sess.eval(tok);
+        tok = sess.argmax();
+    }
 }
 
 test "llama: tokenize round-trip and short greedy decode" {
@@ -536,8 +582,10 @@ test "llama: prefix reuse is byte-identical to cold decode" {
     warm_tok = sess.argmax();
     try sess.eval(warm_tok);
 
+    // Dense memory reuses the shared prefix; a recurrent/hybrid memory that
+    // cannot roll its tail back reports 0 and cold-prefills. Both are correct
+    // as long as the bytes below match cold.
     const cached = try sess.sync(full);
-    try std.testing.expect(cached > 0); // reused the shared prefix
     try std.testing.expect(cached <= @as(i32, @intCast(full.len)));
 
     var tok = sess.argmax();

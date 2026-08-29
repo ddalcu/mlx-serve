@@ -1012,6 +1012,18 @@ private struct ServerSectionContent: View {
                 )
             }
         }
+        if let m = meta["maxResidentModels"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentModels)
+            ) {
+                Stepper(value: $appState.serverOptions.maxResidentModels, in: 1...8) {
+                    Text("\(appState.serverOptions.maxResidentModels)")
+                        .font(.body.monospacedDigit())
+                }
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,
@@ -1287,9 +1299,9 @@ private struct SpecDecodeSectionContent: View {
         // Native multi-token prediction — the model's OWN trained head, so it's
         // a different mechanism from PLD (which guesses by copying from the
         // prompt) and from the drafter (a separate small model). It needs no
-        // extra download and no compatible pairing: a Qwen 3.5/3.6 checkpoint
+        // extra download and no compatible pairing: a Qwen 3.5/3.8 checkpoint
         // either ships the head or it doesn't.
-        SettingsSubheader("Multi-Token Prediction — Qwen 3.5 / 3.6")
+        SettingsSubheader("Multi-Token Prediction — Qwen 3.5 / 3.8")
         if let m = meta["enableMTP"] {
             SettingsRow(
                 title: m.title,
@@ -1311,7 +1323,12 @@ private struct SpecDecodeSectionContent: View {
                 // 1...6 is the fixed range it accepts — 7+ hits a measured
                 // occupancy cliff in the verify kernel, so it isn't offered.
                 Picker("", selection: opts.mtpDepth) {
-                    Text("Automatic").tag(0)
+                    // Automatic is ONE entry, probe-backed internally with the
+                    // per-silicon table as fallback — shipping "Automatic"
+                    // beside "Probe" would ask a question nobody can answer
+                    // without benchmarking. It DISPLAYS what it resolved to
+                    // instead (MLX_SERVE_SPEC_COST_PROBE=0 is the A/B arm).
+                    Text(server.specCost?.automaticLabel ?? "Automatic").tag(0)
                     ForEach(1...6, id: \.self) { n in
                         Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
                     }

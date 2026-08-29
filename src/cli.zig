@@ -101,6 +101,11 @@ pub const aliases = [_]Alias{
     // 8-bit attention/router/shared, MTP layer included. ~110 GB on disk;
     // needs a 128 GB Mac.
     .{ .name = "hy3", .tag = "295b", .repo = "mlx-community/Hy3-oQ2e", .is_default = true },
+    // OpenAI gpt-oss. The MXFP4-Q8 conversions keep the native mxfp4 expert
+    // banks (what the model was released in) and put attention/embeddings at
+    // affine 8-bit: ~12 GB for the 20B, ~63 GB for the 120B.
+    .{ .name = "gpt-oss", .tag = "20b", .repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", .is_default = true },
+    .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
 };
 
@@ -242,6 +247,17 @@ pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile
 /// Chat-default file selection (mirrors the app's `FileSelection.chatDefault`):
 /// top-level files + the `mtp/` spec-decode sidecar; repo housekeeping and
 /// demo assets are skipped.
+/// `pytorch_model.bin` / `pytorch_model-0000N-of-0000M.bin` — the HF torch
+/// weights that sit beside the safetensors copy. Shared rule with the app's
+/// `DownloadManager.selectNeededFiles`; keep them in sync.
+pub fn isTorchShadowBin(path: []const u8) bool {
+    if (!std.ascii.endsWithIgnoreCase(path, ".bin")) return false;
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+    return std.ascii.startsWithIgnoreCase(base, "pytorch_model") or
+        std.ascii.startsWithIgnoreCase(base, "rust_model") or
+        std.ascii.startsWithIgnoreCase(base, "tf_model");
+}
+
 pub fn shouldDownload(path: []const u8) bool {
     if (path.len == 0 or path[0] == '.') return false;
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
@@ -251,10 +267,15 @@ pub fn shouldDownload(path: []const u8) bool {
     for (skip_exact) |s| {
         if (std.ascii.eqlIgnoreCase(path, s)) return false;
     }
-    const skip_ext = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".md" };
+    // Torch/flax shadow weights are a second copy of the same model in a format
+    // the server never reads — a doubled download. `.bin` itself stays allowed:
+    // qwen4_exp's `ngram_table.bin` is an engine-read sidecar (mmapped at serve
+    // time), and dropping it is what made app-downloaded packs fail to load.
+    const skip_ext = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".md", ".pth", ".h5", ".msgpack", ".ckpt" };
     for (skip_ext) |ext| {
         if (path.len > ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return false;
     }
+    if (isTorchShadowBin(path)) return false;
     return true;
 }
 
@@ -880,6 +901,13 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(!shouldDownload("assets/demo.png"));
     try testing.expect(!shouldDownload("banner.png"));
     try testing.expect(!shouldDownload("vae/weights.safetensors")); // media subdirs are app-bundle territory
+    // A `.bin` the engine READS (qwen4_exp ngram_table) is needed; torch-format
+    // shadow weights are a second copy of the same model. Same rule as the app's
+    // `DownloadManager.selectNeededFiles` — keep them in sync.
+    try testing.expect(shouldDownload("ngram_table.bin"));
+    try testing.expect(!shouldDownload("pytorch_model-00001-of-00002.bin"));
+    try testing.expect(!shouldDownload("consolidated.pth"));
+    try testing.expect(!shouldDownload("flax_model.msgpack"));
 }
 
 test "cli: modelPresentInDir requires a COMPLETE checkpoint" {

@@ -1,0 +1,32 @@
+name: Model support request
+description: A model or architecture you want served
+labels: ["model-request"]
+body:
+  - type: input
+    id: repo
+    attributes:
+      label: Hugging Face repo
+      placeholder: "org/Model-Name"
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture (`model_type` in config.json), if known
+      placeholder: "qwen3_5_moe"
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this model / what you'd use it for
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I tried loading it and it failed (paste the error below if so)
+        - label: An MLX-format conversion already exists on HF
+  - type: textarea
+    id: error
+    attributes:
+      label: Load error, if any
+      render: text
