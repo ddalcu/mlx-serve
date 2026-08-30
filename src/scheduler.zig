@@ -307,6 +307,20 @@ pub const NextResult = union(enum) {
     err: void,
 };
 
+fn firstMediaPlaceholder(
+    tokens: []const u32,
+    image_token_id: u32,
+    audio_token_id: u32,
+    video_token_id: u32,
+) ?usize {
+    for (tokens, 0..) |token, i| {
+        if ((image_token_id > 0 and token == image_token_id) or
+            (audio_token_id > 0 and token == audio_token_id) or
+            (video_token_id > 0 and token == video_token_id)) return i;
+    }
+    return null;
+}
+
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
     allocator: std.mem.Allocator,
@@ -335,6 +349,9 @@ pub const Slot = struct {
     cancelled_prefill: Generator.CancelledCheckpointSink = .{},
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
+    /// state before this position is safe to share across media hashes.
+    media_start: ?usize,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -529,6 +546,12 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
+        const media_start = firstMediaPlaceholder(
+            full_prompt_owned,
+            config.image_token_id,
+            config.audio_token_id,
+            config.video_token_id,
+        );
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
 
@@ -541,6 +564,7 @@ pub const Slot = struct {
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
+            .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -2725,7 +2749,6 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
-
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -4471,7 +4494,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         };
         break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4520,7 +4543,8 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // aborted prefill.
     const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse return;
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, cps, null, null) catch |err| {
+    const media_start = if (slot.media_start) |start| if (start < len) start else null else null;
+    hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, media_start, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         // The sink still owns the checkpoints; Slot.deinit frees them.
         return;
@@ -5194,7 +5218,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
-            const lookup = hc.lookupAndRestore(
+            const lookup = hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5202,6 +5226,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.full_prompt,
                 slot.has_tools,
                 slot.vision_key,
+                slot.media_start,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
             ) catch |err| blk: {
@@ -5488,7 +5513,6 @@ pub const SpecInitWiring = struct {
 /// module-owned arch arrived with the same `Model.state` shape and a 0-layer
 /// shell cache, got no conjunct, and `--pld` drove verify forwards straight
 /// through it. One predicate, one place to extend.
-
 pub fn specInitWiring(
     owns_module_state: bool,
     module_spec_rollback: bool,
@@ -5781,6 +5805,15 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
 }
 
+test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
+    const tokens = [_]u32{ 0, 11, 22, 33, 44 };
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22));
+    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0) == null);
+}
+
 test "cancelled-prefill commit length: floor, clamp, and zero" {
     // A cancelled prefill only pays its way into the LRU once the forwarded
     // prefix is past the chat-template-prologue class (~dozens of tokens);
@@ -5850,7 +5883,7 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     // `cache.step` only advances when Generator init COMPLETES, so it reads
     // 0 on every aborted prefill (found live: step=0 while pos=1536).
     try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithState") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
 }
 
 test "Generator.initWithOptions hands off checkpoints on cancel" {
