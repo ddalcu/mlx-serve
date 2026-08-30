@@ -80,7 +80,13 @@ Used in mlx-serve (`src/transformer.zig`):
     `custom_kernels/qwen35_prefill/gdn.py` (`gated_delta_blocked_seq`).
   * The per-dispatch key-chunk budget in the head-dim-256 fused causal
     attention path, whose design comes from `qwen35_fa256_attention.py`.
-
+  * The direct-index Qwen4 QSA prefill design (attend to each query's
+    selected blocks by gathered index, never through a dense [S, kv] mask;
+    one threadgroup per query token), from the exact QSA prefill of PR #3244
+    (`qsa_fast.py`, `qwen4_qsa_sparse_gqa`). The `msv_attn_qsa256` kernel
+    body itself derives from our own `msv_attn_p256`, not from their source.
+    thank you Jonathan Spangler.
+    
 Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
 
   * The Neural Engine instance-affinity option keys and the requirement that
