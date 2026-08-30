@@ -2653,6 +2653,434 @@ fn qsaSkipTable(s: mlx.mlx_stream, mask: mlx.mlx_array) !mlx.mlx_array {
     return out;
 }
 
+var qsa_gather_env_cached: ?bool = null;
+pub var qsa_gather_override: ?bool = null;
+
+/// MLX_SERVE_QSA_GATHER=0 restores the dense [S, kv] mask arm for the
+/// qwen4_exp QSA prefill (the block-gather kernel is the default).
+pub fn qsaGatherEnabled() bool {
+    if (qsa_gather_override) |v| return v;
+    if (qsa_gather_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_GATHER") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_gather_env_cached = v;
+    return v;
+}
+
+/// Below this many keys the mask arm wins: it reads at most kv rows per
+/// 64-row tile, the gather reads 2051 rows per token unshared (ladder: 8k
+/// -3%, 16k +4%, 32k +19%, 64k +42%). MLX_SERVE_QSA_GATHER_MIN_KV.
+pub const QSA_GATHER_MIN_KV_DEFAULT: c_int = 8192;
+var qsa_gather_min_kv_cached: ?c_int = null;
+pub var qsa_gather_min_kv_override: ?c_int = null;
+
+fn qsaGatherMinKv() c_int {
+    if (qsa_gather_min_kv_override) |v| return v;
+    if (qsa_gather_min_kv_cached) |v| return v;
+    var v: c_int = QSA_GATHER_MIN_KV_DEFAULT;
+    if (std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV")) |raw| {
+        v = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
+    }
+    qsa_gather_min_kv_cached = v;
+    return v;
+}
+
+pub const QSA_GATHER_BK_DEFAULT: c_int = 32;
+var qsa_gather_bk_cached: ?c_int = null;
+pub var qsa_gather_bk_override: ?c_int = null;
+
+/// Key tile of the gather kernel: 16 or 32 (MLX_SERVE_QSA_GATHER_BK).
+fn qsaGatherBk() c_int {
+    if (qsa_gather_bk_override) |v| return v;
+    if (qsa_gather_bk_cached) |v| return v;
+    var v: c_int = QSA_GATHER_BK_DEFAULT;
+    if (std.c.getenv("MLX_SERVE_QSA_GATHER_BK")) |raw| {
+        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
+        if (parsed == 16 or parsed == 32) v = parsed;
+    }
+    qsa_gather_bk_cached = v;
+    return v;
+}
+
+/// Virtual key index -> cache position for one query's block selection:
+/// the `sel_len` tokens of its sorted blocks, then its own incomplete tail.
+const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++
+    \\inline int msv_qsa_pos(const device int* blk, int vi, int sel_len, int tail_start, int ratio) {
+    \\  const int b = vi / ratio;
+    \\  return (vi < sel_len) ? (blk[b] * ratio + (vi - b * ratio)) : (tail_start + (vi - sel_len));
+    \\}
+    \\
+;
+
+/// msv_attn_qsa256: one threadgroup per (query token, kv head, batch). The
+/// direct-index approach (gather each query's selected blocks, never a dense
+/// [S, kv] mask) follows oMLX's Qwen4 exact QSA prefill (jundot/omlx PR
+/// #3244, Apache-2.0); no code was ported — the kernel body is derived from
+/// our own msv_attn_p256 (whose K/V staging their kernel credits in turn).
+/// token's `gqa` query heads are the tile rows (NSG simdgroups x 8); its keys
+/// are gathered by the token's sorted selected blocks (`blocks[b, s, :]`,
+/// RATIO tokens each, INT_MAX past the row's count) followed by its own
+/// incomplete tail — O(budget) per token, never O(kv). Fragment math,
+/// staging and online softmax mirror msv_attn_p256.
+const ATTN_QSA256_KERNEL_SOURCE =
+    \\constexpr int BD = 256;
+    \\constexpr int LDK = BK + 8;
+    \\constexpr int LDV = BD + 8;
+    \\constexpr int NT = 32 * NSG;
+    \\constexpr int KT = BK / 8;
+    \\
+    \\const int qL = q_shape[2];
+    \\const int kL = k_shape[2];
+    \\const int Hq = q_shape[1];
+    \\const int Hk = k_shape[1];
+    \\const int gqa = Hq / Hk;
+    \\const int KB = blocks_shape[2];
+    \\
+    \\const int s = int(threadgroup_position_in_grid.x);
+    \\const int hk = int(threadgroup_position_in_grid.y);
+    \\const int bb = int(threadgroup_position_in_grid.z);
+    \\const ushort lane = ushort(thread_index_in_simdgroup);
+    \\const ushort warp = ushort(simdgroup_index_in_threadgroup);
+    \\const int tix = int(thread_index_in_threadgroup);
+    \\
+    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
+    \\// Query s sits at absolute key position p (bottom-right aligned). Its
+    \\// visible keys: `count` complete blocks, then the tail [tail_start, p].
+    \\const int p = (kL - qL) + s;
+    \\const int complete = (p + 1) / RATIO;
+    \\const int count = metal::min(complete, KB);
+    \\const int sel_len = count * RATIO;
+    \\const int tail_start = complete * RATIO;
+    \\const int L = sel_len + (p + 1 - tail_start);
+    \\
+    \\const device int* blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
+    \\const device T* Kp = k + bb * k_strides[0] + hk * k_strides[1];
+    \\const device T* Vp = v + bb * v_strides[0] + hk * v_strides[1];
+    \\
+    \\threadgroup T KVs[LDK * BD];
+    \\threadgroup T* Ks = KVs;
+    \\threadgroup T* Vs = KVs;
+    \\
+    \\const short2 sc = msv_coord(lane);
+    \\const short sn = sc.x;
+    \\const short sm = sc.y;
+    \\const short tm = 8 * short(warp);
+    \\const int Ks_off = sm * LDK + sn;
+    \\const int Vs_off = sm * LDV + sn;
+    \\const int row = tm + sm;
+    \\const bool row_ok = row < gqa;
+    \\
+    \\float2 Qfrag[BD / 8];
+    \\if (row_ok) {
+    \\  const device T* Qrow = q + bb * q_strides[0] + (long)(hk * gqa + row) * q_strides[1] + (long)s * q_strides[2];
+    \\  for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    const vec<T, 2> pr = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
+    \\    Qfrag[dd] = float2(float(pr.x), float(pr.y));
+    \\  }
+    \\} else {
+    \\  for (int dd = 0; dd < BD / 8; ++dd) Qfrag[dd] = float2(0.0f);
+    \\}
+    \\float2 Ofrag[BD / 8];
+    \\for (int i = 0; i < BD / 8; ++i) Ofrag[i] = float2(0.0f);
+    \\float max_score = -3.0e38f;
+    \\float sum_score = 0.0f;
+    \\
+    \\for (int t0 = 0; t0 < L; t0 += BK) {
+    \\  const int rows_k = metal::min(BK, L - t0);
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = *((const device uint4*)(Kp + (long)pos * k_strides[2]) + c8);
+    \\    }
+    \\    thread T* e = (thread T*)&w;
+    \\    const int cb = c8 * 8;
+    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  float2 Sfrag[KT];
+    \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
+    \\  for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    const float2 qf = Qfrag[dd];
+    \\    const int kbase = Ks_off + dd * 8 * LDK;
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      const float2 kf = float2(float(Ks[kbase + kt * 8]), float(Ks[kbase + kt * 8 + 1]));
+    \\      msv_mma(Sfrag[kt], qf, kf);
+    \\    }
+    \\  }
+    \\  for (int kt = 0; kt < KT; ++kt) Sfrag[kt] *= scale_log2e;
+    \\  if (rows_k < BK) {
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      if (kt * 8 + sn >= rows_k) Sfrag[kt].x = -INFINITY;
+    \\      if (kt * 8 + sn + 1 >= rows_k) Sfrag[kt].y = -INFINITY;
+    \\    }
+    \\  }
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = *((const device uint4*)(Vp + (long)pos * v_strides[2]) + c8);
+    \\    }
+    \\    *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;
+    \\  }
+    \\
+    \\  float new_max = max_score;
+    \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, msv_row_max(Sfrag[kt]));
+    \\  float rowsum = 0.0f;
+    \\  for (int kt = 0; kt < KT; ++kt) {
+    \\    Sfrag[kt] = metal::exp2(Sfrag[kt] - new_max);
+    \\    rowsum += msv_row_sum(Sfrag[kt]);
+    \\  }
+    \\  const float factor = metal::exp2(max_score - new_max);
+    \\  max_score = new_max;
+    \\  sum_score = sum_score * factor + rowsum;
+    \\  for (int i = 0; i < BD / 8; ++i) Ofrag[i] *= factor;
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\    const int vbase = Vs_off + id * 8;
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      const float2 vf = float2(float(Vs[vbase + kt * 8 * LDV]), float(Vs[vbase + kt * 8 * LDV + 1]));
+    \\      msv_mma(Ofrag[id], Sfrag[kt], vf);
+    \\    }
+    \\  }
+    \\}
+    \\
+    \\if (row_ok) {
+    \\  const float inv = 1.0f / sum_score;
+    \\  device T* Optr = out + (((long)bb * Hq + (hk * gqa + row)) * (long)qL + (long)s) * BD + sn;
+    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\    Optr[id * 8] = T(Ofrag[id].x * inv);
+    \\    Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
+    \\  }
+    \\}
+;
+
+var attn_qsa256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getAttnQsa256Kernel() !mlx.mlx_fast_metal_kernel {
+    if (attn_qsa256_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "blocks" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_attn_qsa256",
+        in_vec,
+        out_vec,
+        ATTN_QSA256_KERNEL_SOURCE,
+        ATTN_QSA256_KERNEL_HEADER,
+        false, // K/V are cache views (see msv_attn_p256)
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    attn_qsa256_kernel_cached = kernel;
+    return kernel;
+}
+
+var qsa_gather_logged = false;
+
+/// Block-gathered QSA attention (qwen4_exp prefill): `blocks` is the
+/// [B, S, KB] int32 selection, each row ascending with INT_MAX past its
+/// count; `ratio` tokens per block. Same envelope as the p256 kernel (hd
+/// 256, bf16, q <= k). Null = declined (kill switch, dtype, geometry) — the
+/// caller expands the selection to the dense mask arm.
+pub fn gatherQsa256(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    scale: f32,
+    blocks: mlx.mlx_array,
+    ratio: c_int,
+) !?mlx.mlx_array {
+    if (!qsaGatherEnabled()) return null;
+    if (blocks.ctx == null or mlx.mlx_array_ndim(blocks) != 3 or mlx.mlx_array_dtype(blocks) != .int32) return null;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const vs = mlx.getShape(v);
+    const bs = mlx.getShape(blocks);
+    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
+    const gqa: c_int = @divTrunc(qs[1], ks[1]);
+    if (gqa > 64) return null;
+    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
+    if (bs[0] != qs[0] or bs[1] != qs[2] or bs[2] <= 0) return null;
+    if (ratio <= 0) return null;
+    if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
+
+    const kernel = getAttnQsa256Kernel() catch return null;
+    const one = [_]c_int{1};
+    const scl_data = [_]f32{scale};
+    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+    const nsg: c_int = @divTrunc(gqa + 7, 8);
+    const bk = qsaGatherBk();
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, qs[2] * 32, ks[1] * nsg, qs[0]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", bk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio));
+
+    const inputs_arr = [_]mlx.mlx_array{ q, k, v, scl, blocks };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    if (!qsa_gather_logged) {
+        qsa_gather_logged = true;
+        log.info("[qsa-gather] engaged: msv_attn_qsa256 qL={d} kL={d} blocks={d} bk={d} (MLX_SERVE_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk });
+    }
+    return out;
+}
+
+/// Dense [B,1,S,kv] bool mask equivalent to a block selection (fallback arm
+/// + fixture trace): the selected blocks' tokens ∪ each row's own incomplete
+/// tail, ∧ causal. Sentinel entries land in a spare column and are sliced off.
+pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ratio: c_int) !mlx.mlx_array {
+    const bs = mlx.getShape(blocks);
+    const batch = bs[0];
+    const seq_len = bs[1];
+    const nb: c_int = @divTrunc(kv, ratio);
+    const nb_i = mlx.mlx_array_new_int(nb);
+    defer _ = mlx.mlx_array_free(nb_i);
+    var valid = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(valid);
+    try mlx.check(mlx.mlx_less(&valid, blocks, nb_i, s));
+    var safe = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(safe);
+    try mlx.check(mlx.mlx_where(&safe, valid, blocks, nb_i, s));
+    var falses = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(falses);
+    try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ batch, seq_len, nb + 1 }, 3, .bool_, s));
+    const true_v = mlx.mlx_array_new_bool(true);
+    defer _ = mlx.mlx_array_free(true_v);
+    var put = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(put);
+    try mlx.check(mlx.mlx_put_along_axis(&put, falses, safe, true_v, -1, s));
+    var blk_sel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk_sel);
+    const strides3 = [_]c_int{ 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(&blk_sel, put, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, seq_len, nb }, 3, &strides3, 3, s));
+    return qsaMaskFromBlockSel(s, blk_sel, kv - seq_len, seq_len, kv, nb, ratio, batch);
+}
+
+/// Expand a [B,S,nb] bool block selection to the [B,1,S,kv] token mask:
+/// selected blocks' tokens (zero-padded to kv) ∪ each query's own incomplete
+/// tail (tokens at/after ratio*floor((p+1)/ratio) — always visible), ∧ the
+/// causal bound. `offset` is the cache position of row 0.
+fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_int, seq_len: c_int, kv: c_int, nb: c_int, ratio: c_int, batch: c_int) !mlx.mlx_array {
+    var pos_col = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos_col);
+    try mlx.check(mlx.mlx_arange(&pos_col, @floatFromInt(offset), @floatFromInt(offset + seq_len), 1.0, .int32, s));
+    var pos2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos2);
+    try mlx.check(mlx.mlx_reshape(&pos2, pos_col, &[_]c_int{ seq_len, 1 }, 2, s));
+    var sel4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel4);
+    try mlx.check(mlx.mlx_expand_dims(&sel4, blk_sel, -1, s)); // [B,S,nb,1]
+    var sel_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel_b);
+    try mlx.check(mlx.mlx_broadcast_to(&sel_b, sel4, &[_]c_int{ batch, seq_len, nb, ratio }, 4, s));
+    var sel_tok = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel_tok);
+    try mlx.check(mlx.mlx_reshape(&sel_tok, sel_b, &[_]c_int{ batch, seq_len, nb * ratio }, 3, s));
+    var sel_full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel_full);
+    const pad: c_int = kv - nb * ratio;
+    if (pad > 0) {
+        var zeros_pad = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zeros_pad);
+        try mlx.check(mlx.mlx_zeros(&zeros_pad, &[_]c_int{ batch, seq_len, pad }, 3, .bool_, s));
+        const parts = [_]mlx.mlx_array{ sel_tok, zeros_pad };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&sel_full, vec, 2, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&sel_full, sel_tok));
+    }
+    var kv_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kv_idx);
+    try mlx.check(mlx.mlx_arange(&kv_idx, 0, @floatFromInt(kv), 1.0, .int32, s));
+    var kv_idx2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kv_idx2);
+    try mlx.check(mlx.mlx_reshape(&kv_idx2, kv_idx, &[_]c_int{ 1, kv }, 2, s));
+    // tail_start[p] = ratio * floor((p+1)/ratio), via integer arithmetic.
+    const one_i = mlx.mlx_array_new_int(1);
+    defer _ = mlx.mlx_array_free(one_i);
+    const ratio_i = mlx.mlx_array_new_int(ratio);
+    defer _ = mlx.mlx_array_free(ratio_i);
+    var p1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p1);
+    try mlx.check(mlx.mlx_add(&p1, pos2, one_i, s));
+    var nb_p = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(nb_p);
+    try mlx.check(mlx.mlx_floor_divide(&nb_p, p1, ratio_i, s));
+    var tail_start = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail_start);
+    try mlx.check(mlx.mlx_multiply(&tail_start, nb_p, ratio_i, s)); // [S,1]
+    var tail_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail_mask);
+    try mlx.check(mlx.mlx_greater_equal(&tail_mask, kv_idx2, tail_start, s)); // [S,kv]
+    var tok_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tok_mask);
+    try mlx.check(mlx.mlx_logical_or(&tok_mask, sel_full, tail_mask, s));
+    var causal = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(causal);
+    try mlx.check(mlx.mlx_less_equal(&causal, kv_idx2, pos2, s)); // [S, kv]
+    var mask3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask3);
+    try mlx.check(mlx.mlx_logical_and(&mask3, tok_mask, causal, s));
+    var mask = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&mask, mask3, &[_]c_int{ batch, 1, seq_len, kv }, 4, s));
+    return mask;
+}
+
+/// Bound on the per-chunk [n_idx, rows, nb] f32 indexer score sheet: the
+/// prefill selection runs in row chunks so 4096 rows x 64k blocks x 4 heads
+/// (4.3 GB at 256k) never materializes at once.
+pub const QSA_SCORE_SHEET_BUDGET: u64 = 256 << 20;
+
+pub fn qsaScoreRowsPerChunk(n_idx: u64, nb: u64, rows: u64) u64 {
+    const per_row = n_idx * nb * 4;
+    if (per_row == 0) return rows;
+    return @max(16, @min(rows, QSA_SCORE_SHEET_BUDGET / per_row));
+}
+
+/// Prefill transient of the block-gathered QSA path for ONE live layer:
+/// the row-chunked score sheet (matmul out + relu per head, summed/biased/
+/// masked scores + argpartition temps) plus the selection itself.
+pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64) u64 {
+    if (ratio == 0) return 0;
+    const nb = kv / ratio;
+    const rows = qsaScoreRowsPerChunk(n_idx, nb, fwd);
+    return rows * nb * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
+}
+
 fn fusedSdpa256Impl(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
@@ -5231,6 +5659,10 @@ pub const ForwardCtx = struct {
     /// qwen4_exp QSA: the bool `[B, 1, S, kv]` mask (indexer-selected blocks
     /// ∧ causal) `gatedFullAttnWith` must apply this layer. Null-ctx = dense.
     qsa_mask: mlx.mlx_array = .{ .ctx = null },
+    /// qwen4_exp QSA prefill: the sorted `[B, S, kb]` int32 block selection
+    /// for `gatherQsa256` (INT_MAX past each row's count); set INSTEAD of
+    /// `qsa_mask` at prefill widths. Null-ctx = not selected.
+    qsa_blocks: mlx.mlx_array = .{ .ctx = null },
     /// Phase 2 (Plan ricky): when true, attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
     /// instead of dequantizing through `DenseKVView`. Only effective when
@@ -6911,6 +7343,7 @@ pub const Transformer = struct {
                 st.table.close();
                 return error.NgramTableMismatch;
             }
+            st.table.startWarm(); // the weights load just evicted the table from page cache
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
@@ -11672,12 +12105,30 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &kperm, 4, self.s)); // [B,1,hd,nb]
         // Scores in f32 like the reference (`q.float() @ k.float()`): a bf16
         // product flips near-tie block picks.
-        var q32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q32);
-        try mlx.check(mlx.mlx_astype(&q32, q_rope, .float32, self.s));
         var k32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k32);
         try mlx.check(mlx.mlx_astype(&k32, kt, .float32, self.s));
+
+        if (batch == 1 and seq_len >= FUSED256_MIN_Q_LEN and kv > qsaGatherMinKv() and qsaGatherEnabled()) {
+            // Prefill: sorted per-row block indices for the gather kernel;
+            // the dense [S, kv] mask is never built.
+            const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+            var clk: ProfClock = undefined;
+            if (prof) {
+                try mlx.check(mlx.mlx_array_eval(k32));
+                clk = ProfClock.init();
+            }
+            ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, offset, seq_len, nb, block_topk);
+            if (prof) {
+                try mlx.check(mlx.mlx_array_eval(ctx.qsa_blocks));
+                log.info("[qsa-prof] select S={d} nb={d}: {d:.2} ms\n", .{ seq_len, nb, @as(f64, @floatFromInt(clk.lap())) / 1e6 });
+            }
+            return mlx.mlx_array_new();
+        }
+
+        var q32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q32);
+        try mlx.check(mlx.mlx_astype(&q32, q_rope, .float32, self.s));
         var sc = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sc);
         try mlx.check(mlx.mlx_matmul(&sc, q32, k32, self.s)); // [B,n,S,nb]
@@ -11703,53 +12154,16 @@ pub const Transformer = struct {
                 std.debug.print("\n", .{});
             }
         }
-        // Block visibility: block blk is complete for query at position p iff
-        // blk*ratio + ratio - 1 <= p.
-        var pos_col = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(pos_col);
-        try mlx.check(mlx.mlx_arange(&pos_col, @floatFromInt(offset), @floatFromInt(offset + seq_len), 1.0, .int32, self.s));
-        var pos2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(pos2);
-        try mlx.check(mlx.mlx_reshape(&pos2, pos_col, &[_]c_int{ seq_len, 1 }, 2, self.s));
-        var blk_end = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blk_end);
-        try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, self.s));
-        var blk_end2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blk_end2);
-        try mlx.check(mlx.mlx_reshape(&blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, self.s));
-        var vis = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(vis);
-        try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, self.s)); // [S, nb]
-        var vis3 = mlx.mlx_array_new();
+        const vis3 = try qsaBlockVisibility(self.s, offset, seq_len, nb, ratio);
         defer _ = mlx.mlx_array_free(vis3);
-        try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, self.s)); // [1,S,nb]
 
         var blk_sel = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(blk_sel);
         if (nb <= block_topk) {
             try mlx.check(mlx.mlx_array_set(&blk_sel, vis3));
         } else {
-            const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-            defer _ = mlx.mlx_array_free(neg_inf);
-            // torch.topk keeps the LOWER index among equal scores (relu leaves
-            // many exact zeros): a tiny index-descending bias reproduces it.
-            var blk_idx_f = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(blk_idx_f);
-            try mlx.check(mlx.mlx_arange(&blk_idx_f, 0, @floatFromInt(nb), 1.0, .float32, self.s));
-            const tie_eps = mlx.mlx_array_new_float(1e-7);
-            defer _ = mlx.mlx_array_free(tie_eps);
-            var bias = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(bias);
-            try mlx.check(mlx.mlx_multiply(&bias, blk_idx_f, tie_eps, self.s));
-            var biased = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(biased);
-            try mlx.check(mlx.mlx_subtract(&biased, scores, bias, self.s));
-            var masked = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(masked);
-            try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, self.s));
-            var part = mlx.mlx_array_new();
+            const part = try qsaTopBlocks(self.s, scores, vis3, nb, block_topk);
             defer _ = mlx.mlx_array_free(part);
-            try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, self.s));
             var top_idx = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(top_idx);
             try mlx.check(mlx.mlx_slice(&top_idx, part, &[_]c_int{ 0, 0, nb - block_topk }, 3, &[_]c_int{ batch, seq_len, nb }, 3, &strides3, 3, self.s));
@@ -11763,68 +12177,145 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_put_along_axis(&picked, falses, top_idx, true_v, -1, self.s));
             try mlx.check(mlx.mlx_logical_and(&blk_sel, picked, vis3, self.s));
         }
+        return qsaMaskFromBlockSel(self.s, blk_sel, offset, seq_len, kv, nb, ratio, batch);
+    }
 
-        // Expand blocks to tokens (zero-padded to kv), OR each query's own
-        // incomplete tail (tokens at/after ratio*floor((p+1)/ratio) — always
-        // visible), AND the causal bound.
-        var sel4 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sel4);
-        try mlx.check(mlx.mlx_expand_dims(&sel4, blk_sel, -1, self.s)); // [B,S,nb,1]
-        var sel_b = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sel_b);
-        try mlx.check(mlx.mlx_broadcast_to(&sel_b, sel4, &[_]c_int{ batch, seq_len, nb, ratio }, 4, self.s));
-        var sel_tok = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sel_tok);
-        try mlx.check(mlx.mlx_reshape(&sel_tok, sel_b, &[_]c_int{ batch, seq_len, nb * ratio }, 3, self.s));
-        var sel_full = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sel_full);
-        const pad: c_int = kv - nb * ratio;
-        if (pad > 0) {
-            var zeros_pad = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(zeros_pad);
-            try mlx.check(mlx.mlx_zeros(&zeros_pad, &[_]c_int{ batch, seq_len, pad }, 3, .bool_, self.s));
-            const parts = [_]mlx.mlx_array{ sel_tok, zeros_pad };
-            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            try mlx.check(mlx.mlx_concatenate_axis(&sel_full, vec, 2, self.s));
-        } else {
-            try mlx.check(mlx.mlx_array_set(&sel_full, sel_tok));
+    /// Block visibility [1,S,nb]: block blk is complete for the query at
+    /// cache position p iff blk*ratio + ratio - 1 <= p.
+    fn qsaBlockVisibility(s: mlx.mlx_stream, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+        var pos_col = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos_col);
+        try mlx.check(mlx.mlx_arange(&pos_col, @floatFromInt(offset), @floatFromInt(offset + seq_len), 1.0, .int32, s));
+        var pos2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos2);
+        try mlx.check(mlx.mlx_reshape(&pos2, pos_col, &[_]c_int{ seq_len, 1 }, 2, s));
+        var blk_end = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blk_end);
+        try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
+        var blk_end2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blk_end2);
+        try mlx.check(mlx.mlx_reshape(&blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
+        var vis = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vis);
+        try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, s)); // [S, nb]
+        var vis3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s)); // [1,S,nb]
+        return vis3;
+    }
+
+    /// argpartition of the visibility-masked scores [B,S,nb]: the last
+    /// `block_topk` columns are the picks. torch.topk keeps the LOWER index
+    /// among equal scores (relu leaves many exact zeros): a tiny
+    /// index-descending bias reproduces it.
+    fn qsaTopBlocks(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_array, nb: c_int, block_topk: c_int) !mlx.mlx_array {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var blk_idx_f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blk_idx_f);
+        try mlx.check(mlx.mlx_arange(&blk_idx_f, 0, @floatFromInt(nb), 1.0, .float32, s));
+        const tie_eps = mlx.mlx_array_new_float(1e-7);
+        defer _ = mlx.mlx_array_free(tie_eps);
+        var bias = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bias);
+        try mlx.check(mlx.mlx_multiply(&bias, blk_idx_f, tie_eps, s));
+        var biased = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(biased);
+        try mlx.check(mlx.mlx_subtract(&biased, scores, bias, s));
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
+        var part = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, s));
+        return part;
+    }
+
+    /// Prefill block selection for the gather kernel: per row the top-k
+    /// visible blocks ascending, INT_MAX past the row's count ([1,S,kb]
+    /// int32). Row-chunked so the [n_idx, rows, nb] f32 score sheet stays
+    /// under QSA_SCORE_SHEET_BUDGET. `k32t` is the pooled key bank
+    /// [1,1,hd,nb] f32.
+    fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_array, offset: c_int, seq_len: c_int, nb: c_int, block_topk: c_int) !mlx.mlx_array {
+        const n_idx: c_int = @intCast(self.config.indexer_n_heads);
+        const idx_hd: c_int = @intCast(self.config.indexer_head_dim);
+        const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
+        const kb: c_int = @min(nb, block_topk);
+        const rows_per: c_int = @intCast(qsaScoreRowsPerChunk(@intCast(n_idx), @intCast(nb), @intCast(seq_len)));
+        const strides4 = [_]c_int{ 1, 1, 1, 1 };
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        const zero = mlx.mlx_array_new_float(0.0);
+        defer _ = mlx.mlx_array_free(zero);
+        const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
+        defer _ = mlx.mlx_array_free(int_max);
+        var canonical = mlx.mlx_array{ .ctx = null };
+        defer if (canonical.ctx != null) {
+            _ = mlx.mlx_array_free(canonical);
+        };
+        if (nb <= block_topk) {
+            var ar = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ar);
+            try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(nb), 1.0, .int32, self.s));
+            canonical = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&canonical, ar, &[_]c_int{ 1, 1, nb }, 3, self.s));
         }
-        var kv_idx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kv_idx);
-        try mlx.check(mlx.mlx_arange(&kv_idx, 0, @floatFromInt(kv), 1.0, .int32, self.s));
-        var kv_idx2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kv_idx2);
-        try mlx.check(mlx.mlx_reshape(&kv_idx2, kv_idx, &[_]c_int{ 1, kv }, 2, self.s));
-        // tail_start[p] = ratio * floor((p+1)/ratio), via integer arithmetic.
-        const one_i = mlx.mlx_array_new_int(1);
-        defer _ = mlx.mlx_array_free(one_i);
-        const ratio_i = mlx.mlx_array_new_int(ratio);
-        defer _ = mlx.mlx_array_free(ratio_i);
-        var p1 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(p1);
-        try mlx.check(mlx.mlx_add(&p1, pos2, one_i, self.s));
-        var nb_p = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(nb_p);
-        try mlx.check(mlx.mlx_floor_divide(&nb_p, p1, ratio_i, self.s));
-        var tail_start = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tail_start);
-        try mlx.check(mlx.mlx_multiply(&tail_start, nb_p, ratio_i, self.s)); // [S,1]
-        var tail_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tail_mask);
-        try mlx.check(mlx.mlx_greater_equal(&tail_mask, kv_idx2, tail_start, self.s)); // [S,kv]
-        var tok_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tok_mask);
-        try mlx.check(mlx.mlx_logical_or(&tok_mask, sel_full, tail_mask, self.s));
-        var causal = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(causal);
-        try mlx.check(mlx.mlx_less_equal(&causal, kv_idx2, pos2, self.s)); // [S, kv]
-        var mask3 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mask3);
-        try mlx.check(mlx.mlx_logical_and(&mask3, tok_mask, causal, self.s));
-        var mask = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&mask, mask3, &[_]c_int{ batch, 1, seq_len, kv }, 4, self.s));
-        return mask;
+
+        var parts: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (parts.items) |a| _ = mlx.mlx_array_free(a);
+            parts.deinit(self.allocator);
+        }
+        var r0: c_int = 0;
+        while (r0 < seq_len) : (r0 += rows_per) {
+            const r1: c_int = @min(r0 + rows_per, seq_len);
+            const rows = r1 - r0;
+            var q_chunk = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_chunk);
+            try mlx.check(mlx.mlx_slice(&q_chunk, q_rope, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ 1, n_idx, r1, idx_hd }, 4, &strides4, 4, self.s));
+            var q32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q32);
+            try mlx.check(mlx.mlx_astype(&q32, q_chunk, .float32, self.s));
+            var sc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sc);
+            try mlx.check(mlx.mlx_matmul(&sc, q32, k32t, self.s)); // [1,n,rows,nb]
+            var relu = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(relu);
+            try mlx.check(mlx.mlx_maximum(&relu, sc, zero, self.s));
+            var scores = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(scores);
+            try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, self.s)); // [1,rows,nb]
+            const vis3 = try qsaBlockVisibility(self.s, offset + r0, rows, nb, ratio);
+            defer _ = mlx.mlx_array_free(vis3);
+
+            var top_idx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(top_idx);
+            if (canonical.ctx != null) {
+                try mlx.check(mlx.mlx_broadcast_to(&top_idx, canonical, &[_]c_int{ 1, rows, nb }, 3, self.s));
+            } else {
+                const part = try qsaTopBlocks(self.s, scores, vis3, nb, block_topk);
+                defer _ = mlx.mlx_array_free(part);
+                var tail = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(tail);
+                try mlx.check(mlx.mlx_slice(&tail, part, &[_]c_int{ 0, 0, nb - kb }, 3, &[_]c_int{ 1, rows, nb }, 3, &strides3, 3, self.s));
+                try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, self.s));
+            }
+            // Invisible picks (rows with fewer visible blocks than the
+            // budget) become INT_MAX and sort to the end of the row.
+            var picked_vis = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(picked_vis);
+            try mlx.check(mlx.mlx_take_along_axis(&picked_vis, vis3, top_idx, -1, self.s));
+            var sel = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sel);
+            try mlx.check(mlx.mlx_where(&sel, picked_vis, top_idx, int_max, self.s));
+            var sorted = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(sorted);
+            try mlx.check(mlx.mlx_sort_axis(&sorted, sel, -1, self.s));
+            try parts.append(self.allocator, sorted);
+        }
+        if (parts.items.len == 1) return parts.pop().?;
+        const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var merged = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&merged, vec, 1, self.s));
+        return merged;
     }
 
     /// Full-attention layer with the QSA mask threaded through
@@ -11834,11 +12325,19 @@ pub const Transformer = struct {
             ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
         }
         if (layer == 3) if (qwen4_trace) |tr| {
-            if (ctx.qsa_mask.ctx != null) Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
+            if (ctx.qsa_mask.ctx != null) {
+                Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
+            } else if (ctx.qsa_blocks.ctx != null) {
+                const m = try qsaMaskFromBlocks(self.s, ctx.qsa_blocks, cache_len + seq_len, @intCast(self.config.indexer_compress_ratio));
+                defer _ = mlx.mlx_array_free(m);
+                Qwen4Trace.set(&tr.qsa_mask, m);
+            }
         };
         defer {
             if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
             ctx.qsa_mask = .{ .ctx = null };
+            if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
+            ctx.qsa_blocks = .{ .ctx = null };
         }
         return self.gatedFullAttnWith(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill);
     }
@@ -14092,20 +14591,42 @@ pub const Transformer = struct {
         // (kernel-or-DENSE — a declined kernel falls to the arms below).
         const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
         var kv_fused_done = false;
-        if (ctx.qsa_mask.ctx != null) {
+        if (ctx.qsa_blocks.ctx != null or ctx.qsa_mask.ctx != null) {
             // qwen4_exp QSA: the indexer already chose the visible blocks
-            // (causal folded in) — plain SDPA under the bool mask.
-            if (qwen4Standin().attn_sdpa) {
+            // (causal folded in). Prefill gathers them by index; decode/
+            // verify widths (and a declined gather) run under the bool mask.
+            const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
+            var gathered: ?mlx.mlx_array = null;
+            if (ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
+                const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+                var clk: ProfClock = undefined;
+                if (prof) {
+                    try mlx.check(mlx.mlx_array_eval(q_rope));
+                    clk = ProfClock.init();
+                }
+                gathered = try gatherQsa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_blocks, ratio);
+                if (prof) if (gathered) |g| {
+                    try mlx.check(mlx.mlx_array_eval(g));
+                    log.info("[qsa-prof] gather S={d} kv={d}: {d:.2} ms\n", .{ seq_len, mlx.getShape(full_k)[2], @as(f64, @floatFromInt(clk.lap())) / 1e6 });
+                };
+            }
+            if (gathered) |g| {
                 _ = mlx.mlx_array_free(attn_out);
-                attn_out = try standinRef(q_rope);
-            } else if (try fusedSdpa256Masked(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_mask)) |fused| {
-                _ = mlx.mlx_array_free(attn_out);
-                attn_out = fused;
-            } else if (try splitMaskedSdpa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_mask)) |split_out| {
-                _ = mlx.mlx_array_free(attn_out);
-                attn_out = split_out;
+                attn_out = g;
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", ctx.qsa_mask, .{ .ctx = null }, false, self.s));
+                if (ctx.qsa_mask.ctx == null) ctx.qsa_mask = try qsaMaskFromBlocks(self.s, ctx.qsa_blocks, mlx.getShape(full_k)[2], ratio);
+                if (qwen4Standin().attn_sdpa) {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = try standinRef(q_rope);
+                } else if (try fusedSdpa256Masked(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_mask)) |fused| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = fused;
+                } else if (try splitMaskedSdpa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_mask)) |split_out| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = split_out;
+                } else {
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", ctx.qsa_mask, .{ .ctx = null }, false, self.s));
+                }
             }
             kv_fused_done = true;
         } else if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
@@ -34235,6 +34756,112 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, bad)) == null);
     qsa_fused_override = false;
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
+}
+
+/// A sorted qwen4 block selection [1,qL,kb] int32 for rows straddling the
+/// "every block fits" boundary (INT_MAX past each row's count), plus the
+/// equivalent dense [1,1,qL,kL] mask the composed reference consumes.
+const QsaBlockFixture = struct {
+    blocks: mlx.mlx_array,
+    mask: mlx.mlx_array,
+    fn build(rnd: std.Random, qL: c_int, kL: c_int, kb: c_int, ratio: c_int) !QsaBlockFixture {
+        const ta = std.testing.allocator;
+        const nq: usize = @intCast(qL);
+        const nk: usize = @intCast(kL);
+        const nkb: usize = @intCast(kb);
+        const blocks = try ta.alloc(i32, nq * nkb);
+        defer ta.free(blocks);
+        const mask = try ta.alloc(bool, nq * nk);
+        defer ta.free(mask);
+        const picked = try ta.alloc(bool, @intCast(@divTrunc(kL, ratio) + 1));
+        defer ta.free(picked);
+        const q_off = kL - qL;
+        for (0..nq) |r| {
+            const p: c_int = q_off + @as(c_int, @intCast(r));
+            const complete: c_int = @divTrunc(p + 1, ratio);
+            const count: c_int = @min(complete, kb);
+            @memset(picked, false);
+            var n: c_int = 0;
+            while (n < count) {
+                const b: usize = rnd.uintLessThan(usize, @intCast(complete));
+                if (picked[b]) continue;
+                picked[b] = true;
+                n += 1;
+            }
+            var w: usize = 0;
+            for (0..@intCast(complete)) |b| if (picked[b]) {
+                blocks[r * nkb + w] = @intCast(b);
+                w += 1;
+            };
+            while (w < nkb) : (w += 1) blocks[r * nkb + w] = std.math.maxInt(i32);
+            for (0..nk) |c| {
+                const ci: c_int = @intCast(c);
+                mask[r * nk + c] = ci <= p and (ci >= complete * ratio or picked[@intCast(@divTrunc(ci, ratio))]);
+            }
+        }
+        const bshape = [_]c_int{ 1, qL, kb };
+        const mshape = [_]c_int{ 1, 1, qL, kL };
+        return .{
+            .blocks = mlx.mlx_array_new_data(blocks.ptr, &bshape, 3, .int32),
+            .mask = mlx.mlx_array_new_data(mask.ptr, &mshape, 4, .bool_),
+        };
+    }
+    fn deinit(self: *QsaBlockFixture) void {
+        _ = mlx.mlx_array_free(self.blocks);
+        _ = mlx.mlx_array_free(self.mask);
+    }
+};
+
+test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask (gqa 12, sentinel rows, 16/32 key tiles)" {
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    defer qsa_gather_bk_override = null;
+    var prng = std.Random.DefaultPrng.init(0x9a7e);
+    const rnd = prng.random();
+
+    // qwen4_exp geometry (24/2 heads, hd 256, ratio 4) with a tiny block
+    // budget so the chunk's rows cross from "every block fits" to top-k.
+    const qL: c_int = 40;
+    const kL: c_int = 101;
+    const kb: c_int = 6;
+    const q_shape = [_]c_int{ 1, 24, qL, 256 };
+    const kv_shape = [_]c_int{ 1, 2, kL, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 16.0;
+
+    const ref = try attn256Reference(q, k, v, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    for ([_]c_int{ 16, 32 }) |bk| {
+        qsa_gather_bk_override = bk;
+        const out = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(out);
+        try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
+    }
+
+    // The production expansion (fallback arm + fixture trace) is the same mask.
+    const expanded = try qsaMaskFromBlocks(s, fx.blocks, kL, 4);
+    defer _ = mlx.mlx_array_free(expanded);
+    var ours32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ours32);
+    try mlx.check(mlx.mlx_astype(&ours32, expanded, .float32, s));
+    var ref32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref32);
+    try mlx.check(mlx.mlx_astype(&ref32, fx.mask, .float32, s));
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(ours32, ref32, s));
+
+    // Kill switch declines; so does a non-int32 selection.
+    qsa_gather_override = false;
+    try std.testing.expect((try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) == null);
+    qsa_gather_override = true;
+    try std.testing.expect((try gatherQsa256(s, q, k, v, scale, ours32, 4)) == null);
 }
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {
