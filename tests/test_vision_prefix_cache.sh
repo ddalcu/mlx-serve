@@ -19,7 +19,9 @@ F2="tests/fixtures/house.jpeg"
 for f in "$F1" "$F2"; do [ -f "$f" ] || { echo "SKIP: fixture $f missing"; exit 0; }; done
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level debug --prefix-cache-entries 4 > "$LOG" 2>&1 &
+"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level debug \
+  --prefix-cache-entries 4 --prefill-chunk 1024 \
+  --ssm-checkpoint-stride 1024 --ssm-checkpoint-max 8 > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 U="http://127.0.0.1:$PORT"
@@ -54,6 +56,45 @@ echo "[4] same image, a different question: the image span restores, the tail pr
 r4=$(body "$F1" "What shape is the red sign? One word." | ask); echo "  $r4"
 check "same-image follow-up: cached_tokens > 0" "$(python3 -c "print(1 if int('${r4%% |*}')>0 else 0)")" "1"
 check "follow-up answer reads the stop sign" "$(echo "$r4" | grep -ciE 'octagon|stop' | sed 's/^[1-9][0-9]*$/1/')" "1"
+
+# Growing image conversations move the current image span on every turn. A
+# hybrid cache entry may have the longest raw token match at the previous image
+# boundary while its first SSM checkpoint sits just beyond that boundary. An
+# older entry with a slightly shorter match can still restore safely. The old
+# longest-raw-match policy produced cached-token counts 0,2048,0,2048 here;
+# selecting by the restorable checkpoint keeps every continuation warm.
+conversation_body() { # $1 image, $2 turn count
+  python3 - "$1" "$2" <<'PY'
+import base64, json, sys
+
+path, turns = sys.argv[1], int(sys.argv[2])
+with open(path, "rb") as f:
+    image_url = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+messages = [{"role": "system", "content": "alpha " * 2600}]
+for turn in range(1, turns + 1):
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": f"Turn {turn}: reply with OK only."},
+        ],
+    })
+    if turn < turns:
+        messages.append({"role": "assistant", "content": "OK"})
+print(json.dumps({
+    "model": "mlx-serve", "max_tokens": 4, "temperature": 0,
+    "enable_thinking": False, "enable_mtp": False, "messages": messages,
+}))
+PY
+}
+
+echo "[5] same image across a growing conversation: every continuation restores"
+for turn in 1 2 3 4; do
+  r=$(conversation_body "$F1" "$turn" | ask); echo "  turn $turn: $r"
+  if [ "$turn" -gt 1 ]; then
+    check "growing image turn $turn: cached_tokens > 0" "$(python3 -c "print(1 if int('${r%% |*}')>0 else 0)")" "1"
+  fi
+done
 
 echo "pass=$pass fail=$fail"
 [ "$fail" = "0" ] && echo "PASS: vision prefix cache" || { echo "FAIL: vision prefix cache"; grep -E "hot-cache|cache\]" "$LOG" | tail -20; }
