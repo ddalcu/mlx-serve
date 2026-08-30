@@ -2519,6 +2519,38 @@ test "MixedLinear infers bits/group_size from quantized geometry" {
     }
 }
 
+test "krea solves every quant width instead of assuming one" {
+    // The class guard behind the file header's claim that ONE engine loads
+    // every build. `ltx_video.zig` shipped `bits=4` as a LITERAL at three call
+    // sites and could only ever load the pack it was written against — its
+    // 8-bit sibling died at the first matmul with an MLX "shapes ...
+    // incompatible", which reads like a corrupt download rather than an engine
+    // that never asked. The test above proves `MixedLinear` solves (bits, gs)
+    // from geometry; this proves nothing ELSE in the file bypasses it.
+    const src = @embedFile("krea.zig");
+    var it = std.mem.splitScalar(u8, src, '\n');
+    var checked: usize = 0;
+    while (it.next()) |line| {
+        // `mlx.check(` keeps the scan on real CALL SITES — this test's own
+        // search literals name the same functions.
+        if (std.mem.indexOf(u8, line, "mlx.check(") == null) continue;
+        if (std.mem.indexOf(u8, line, "mlx_quantized_matmul(") == null and
+            std.mem.indexOf(u8, line, "mlx_dequantize(") == null) continue;
+        checked += 1;
+        // A literal width, spelled the way `mlx_optional_int.some` takes one.
+        for ([_][]const u8{ "some(2)", "some(3)", "some(4)", "some(5)", "some(6)", "some(8)" }) |lit| {
+            try testing.expect(std.mem.indexOf(u8, line, lit) == null);
+        }
+        // ...and the width it DOES pass comes off the loaded geometry.
+        try testing.expect(std.mem.indexOf(u8, line, ".bits") != null);
+        try testing.expect(std.mem.indexOf(u8, line, ".group_size") != null);
+    }
+    // One today (`MixedLinear.forward`, the file's only quantized read — the
+    // VAE is dense f32 and the text encoder's linears ARE MixedLinears). A
+    // zero here means the scan stopped matching and is guarding nothing.
+    try testing.expect(checked >= 1);
+}
+
 // ── Oracle tests (env-gated; fixtures from tests/dump_krea_fixtures.py) ──
 
 fn readI32(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]i32 {

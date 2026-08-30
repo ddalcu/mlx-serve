@@ -226,7 +226,7 @@ class HFSearchService: ObservableObject {
                     if let arch = model.mediaFamilyModelType,
                        let bundle = CustomMediaModels.bundle(arch: arch, repoId: model.id) {
                         verified = Self.mediaStructureSatisfied(
-                            markers: bundle.components[0].readyMarkers, files: entries)
+                            component: bundle.components[0], files: entries)
                     }
                     return (model.id, Self.parseFallbackSize(files: entries), verified)
                 }
@@ -278,10 +278,26 @@ class HFSearchService: ObservableObject {
     /// or a directory (something must live under it). The markers are the
     /// family bundle's own `readyMarkers` — the same contract a finished
     /// download is checked against, applied before any bytes move.
-    nonisolated static func mediaStructureSatisfied(markers: [String], files: [TreeFileEntry]) -> Bool {
+    /// HALF the contract — the marker list only. Named apart from
+    /// `mediaStructureSatisfied` on purpose: a component can carry structural
+    /// requirements its markers deliberately cannot express (see
+    /// `requiresRootSafetensors`), and a call site reaching for the marker
+    /// list alone silently drops them. Verification goes through the
+    /// component form.
+    nonisolated static func markersSatisfied(markers: [String], files: [TreeFileEntry]) -> Bool {
         markers.allSatisfy { m in
             files.contains { $0.path == m || $0.path.hasPrefix(m + "/") }
         }
+    }
+
+    /// Whether a repo TREE satisfies a bundle component's structure — the same
+    /// contract a finished download is checked against (`componentReady`),
+    /// applied before any bytes move.
+    nonisolated static func mediaStructureSatisfied(component: MediaComponent,
+                                                    files: [TreeFileEntry]) -> Bool {
+        guard markersSatisfied(markers: component.readyMarkers, files: files) else { return false }
+        guard component.requiresRootSafetensors else { return true }
+        return files.contains { !$0.path.contains("/") && $0.path.hasSuffix(".safetensors") }
     }
 
     // MARK: - Pure tree-parsing helpers (testable without a network)

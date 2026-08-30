@@ -94,8 +94,8 @@ final class CustomMediaRepoTests: XCTestCase {
             .init(path: "text_encoder/model.safetensors", size: 9),
             .init(path: "scheduler/scheduler_config.json", size: 9),
         ]
-        XCTAssertTrue(HFSearchService.mediaStructureSatisfied(markers: markers, files: tree))
-        XCTAssertFalse(HFSearchService.mediaStructureSatisfied(
+        XCTAssertTrue(HFSearchService.markersSatisfied(markers: markers, files: tree))
+        XCTAssertFalse(HFSearchService.markersSatisfied(
             markers: markers, files: tree.filter { !$0.path.hasPrefix("transformer/") }))
     }
 
@@ -104,20 +104,61 @@ final class CustomMediaRepoTests: XCTestCase {
     func testStructureCheckIsTheFamilyBundlesOwnMarkers() {
         let markers = CustomMediaModels.bundle(
             arch: "minimax_h3", repoId: "antocorr/x")!.components[0].readyMarkers
-        XCTAssertTrue(HFSearchService.mediaStructureSatisfied(markers: markers, files: h3PackTree))
+        XCTAssertTrue(HFSearchService.markersSatisfied(markers: markers, files: h3PackTree))
         // A raw upstream repo (no converted transformer.safetensors) fails.
         let raw = h3PackTree.filter { $0.path != "transformer.safetensors" }
-        XCTAssertFalse(HFSearchService.mediaStructureSatisfied(markers: markers, files: raw))
+        XCTAssertFalse(HFSearchService.markersSatisfied(markers: markers, files: raw))
+    }
+
+    /// Krea's transformer is a top-level FILE whose NAME encodes the pack's
+    /// quantization (`transformer_mixed_4_8` / `transformer_4bit` / …). The
+    /// engine never reads the name — `krea.loadDit` merges every root-level
+    /// `*.safetensors` — so pinning one spelling as a readyMarker denies the
+    /// Download button to every krea pack quantized differently from the one
+    /// the marker was written against, and makes a finished download read as
+    /// permanently incomplete. The requirement is a root-level safetensors,
+    /// not a filename.
+    ///
+    /// Not hypothetical: `justintime47/Krea-2-Turbo-MLX-Serve-4bit` ships
+    /// `transformer_4bit.safetensors` and is served purely by discovery under
+    /// `~/.mlx-serve/models` — no preset names it. `CustomMediaModels`
+    /// resolves any `krea*` arch onto the base preset's bundle via
+    /// `asCustom`, so this component is the one such a pack is checked
+    /// against.
+    func testKreaStructureAcceptsAnyRootTransformerFilename() {
+        let comp = CustomMediaModels.bundle(
+            arch: "krea2_turbo", repoId: "someone/Krea-2-Turbo-MLX-4bit")!.components[0]
+        func tree(_ transformer: String) -> [HFSearchService.TreeFileEntry] {
+            [.init(path: "config.json", size: 28),
+             .init(path: transformer, size: 8_167_000_000),
+             .init(path: "vae/diffusion_pytorch_model.safetensors", size: 9),
+             .init(path: "text_encoder/model.safetensors", size: 9),
+             .init(path: "tokenizer/tokenizer.json", size: 9)]
+        }
+        for name in ["transformer_mixed_4_8.safetensors", "transformer_4bit.safetensors",
+                     "transformer_8bit.safetensors", "transformer.safetensors"] {
+            XCTAssertTrue(
+                HFSearchService.mediaStructureSatisfied(component: comp, files: tree(name)),
+                "krea pack rejected for its transformer filename: \(name)")
+        }
+        // ...but the root weight file is still REQUIRED. A repo carrying only
+        // the VAE/encoder subdirs is an incomplete pack, and the generic
+        // "has at least one safetensors" check cannot see that on its own —
+        // `vae/` satisfies it.
+        XCTAssertFalse(HFSearchService.mediaStructureSatisfied(
+            component: comp,
+            files: tree("transformer_4bit.safetensors")
+                .filter { !$0.path.hasSuffix("transformer_4bit.safetensors") }))
     }
 
     func testDirectoryMarkersMatchByPathPrefix() {
         // FLUX markers name SUBDIRS ("vae", "tokenizer") — the tree only has
         // files, so a marker must match anything living under it.
-        XCTAssertTrue(HFSearchService.mediaStructureSatisfied(
+        XCTAssertTrue(HFSearchService.markersSatisfied(
             markers: ["config.json", "vae"],
             files: [.init(path: "config.json", size: 1),
                     .init(path: "vae/diffusion_pytorch_model.safetensors", size: 9)]))
-        XCTAssertFalse(HFSearchService.mediaStructureSatisfied(
+        XCTAssertFalse(HFSearchService.markersSatisfied(
             markers: ["vae"],
             files: [.init(path: "vae.txt", size: 1)]))
     }

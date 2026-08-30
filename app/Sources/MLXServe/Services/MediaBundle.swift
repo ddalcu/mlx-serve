@@ -49,6 +49,20 @@ struct MediaComponent: Equatable {
     /// "ready". Combined with a generic "has at least one .safetensors" check
     /// so a config-only partial download never reads as ready.
     let readyMarkers: [String]
+    /// Demand a `.safetensors` at the TOP LEVEL of the model dir, beyond the
+    /// generic recursive one. For a layout whose weight subdirs each carry
+    /// safetensors (krea's `vae/`, `text_encoder/`), the recursive check is
+    /// satisfied by the subdirs alone, so a pack missing its root transformer
+    /// would read as ready.
+    ///
+    /// This exists because the root weight file's NAME is not a contract —
+    /// krea's encodes the pack's quantization (`transformer_mixed_4_8`,
+    /// `transformer_4bit`, …) while `krea.loadDit` merges every root-level
+    /// `*.safetensors` and never looks at the name. Naming one spelling as a
+    /// marker denies the Download button to every krea pack quantized
+    /// differently, and makes a finished download read as permanently
+    /// incomplete.
+    var requiresRootSafetensors: Bool = false
 
     static func == (l: MediaComponent, r: MediaComponent) -> Bool { l.repo == r.repo }
 }
@@ -303,9 +317,16 @@ extension MediaBundle {
     /// Krea-2-Turbo (mlx-serve bundle): ONE public repo, assembled so the engine
     /// loads it directly — a top-level transformer file + `vae/`/`text_encoder/`/
     /// `tokenizer/` subdirs + `config.json`. Recursive download (no auth, no
-    /// gated base repo); ready when the transformer file + three subdirs + config
-    /// are present. Unlike FLUX the transformer is a top-level FILE, not a
-    /// `transformer/` subdir — hence its own readyMarkers.
+    /// gated base repo); ready when the three subdirs + config + a root-level
+    /// weight file are present. Unlike FLUX the transformer is a top-level FILE,
+    /// not a `transformer/` subdir — hence `requiresRootSafetensors` instead of
+    /// a "transformer" directory marker.
+    ///
+    /// The transformer's FILENAME is deliberately not a marker: it encodes the
+    /// pack's quantization (`transformer_mixed_4_8.safetensors`,
+    /// `transformer_4bit.safetensors`, …) and the engine merges every
+    /// root-level `*.safetensors` without reading the name, so one spelling as
+    /// a marker would lock the app to one pack.
     static func krea(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
         MediaBundle(
             id: "krea:\(repo)",
@@ -314,7 +335,8 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true),
-                    readyMarkers: ["config.json", "transformer_mixed_4_8.safetensors", "vae", "text_encoder", "tokenizer"]
+                    readyMarkers: ["config.json", "vae", "text_encoder", "tokenizer"],
+                    requiresRootSafetensors: true
                 ),
             ],
             sizeEstimateGB: sizeGB

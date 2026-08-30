@@ -1049,15 +1049,25 @@ class DownloadManager: ObservableObject {
 
     /// A component is ready when its model dir resolves, ALL `readyMarkers`
     /// exist (file or dir), AND at least one `.safetensors` is present — so a
-    /// config-only partial download isn't mistaken for ready. `nonisolated` +
-    /// static so it's unit-testable against a temp dir.
+    /// config-only partial download isn't mistaken for ready. A component that
+    /// sets `requiresRootSafetensors` additionally needs one at the TOP level
+    /// (its weight subdirs would otherwise satisfy the recursive check on
+    /// their own). `nonisolated` + static so it's unit-testable against a temp
+    /// dir.
     nonisolated static func componentReady(_ comp: MediaComponent, modelsRoot: String) -> Bool {
         guard let dir = existingModelDir(rootDir: modelsRoot, repoId: comp.repo) else { return false }
         let fm = FileManager.default
         for marker in comp.readyMarkers {
             guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) else { return false }
         }
+        if comp.requiresRootSafetensors, !hasSafetensorsAtRoot(dir) { return false }
         return hasSafetensorsRecursive(dir)
+    }
+
+    /// A `.safetensors` directly in `dir` — not in a subdirectory.
+    nonisolated static func hasSafetensorsAtRoot(_ dir: String) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return false }
+        return names.contains { $0.hasSuffix(".safetensors") }
     }
 
     nonisolated static func hasSafetensorsRecursive(_ dir: String) -> Bool {

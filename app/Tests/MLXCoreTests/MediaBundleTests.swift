@@ -554,14 +554,49 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(k.dependencyRepos.isEmpty)
         XCTAssertTrue(k.components[0].selection.recursive)
         XCTAssertNil(k.components[0].selection.keepSafetensors)
-        // Transformer is a TOP-LEVEL FILE (not a `transformer/` subdir like FLUX),
-        // plus the three Qwen subdirs + config.
+        // Transformer is a TOP-LEVEL FILE (not a `transformer/` subdir like
+        // FLUX) whose NAME varies with the pack's quantization — so it is
+        // required as a root-level weight file, never as a marker naming one
+        // spelling.
         let m = k.components[0].readyMarkers
-        XCTAssertTrue(m.contains("transformer_mixed_4_8.safetensors"))
+        XCTAssertTrue(k.components[0].requiresRootSafetensors)
         XCTAssertFalse(m.contains("transformer"))
+        XCTAssertFalse(m.contains { $0.hasSuffix(".safetensors") })
         for marker in ["config.json", "vae", "text_encoder", "tokenizer"] {
             XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
         }
+    }
+
+    /// The on-disk half of `testKreaStructureAcceptsAnyRootTransformerFilename`.
+    /// A downloaded 4-bit pack must read as READY: `krea.loadDit` merges every
+    /// root-level `*.safetensors`, so the transformer's filename is not a
+    /// contract and a marker naming one spelling offers Download forever.
+    func testKreaReadinessDoesNotDependOnTheTransformerFilename() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "krea4bit-\(UUID().uuidString)"
+        let dir = (root as NSString).appendingPathComponent("someone/Krea-4bit")
+        for sub in ["vae", "text_encoder", "tokenizer"] {
+            try fm.createDirectory(atPath: (dir as NSString).appendingPathComponent(sub),
+                                   withIntermediateDirectories: true)
+        }
+        defer { try? fm.removeItem(atPath: root) }
+        func put(_ rel: String) {
+            fm.createFile(atPath: (dir as NSString).appendingPathComponent(rel), contents: Data([0, 1, 2]))
+        }
+        put("config.json")
+        put("vae/diffusion_pytorch_model.safetensors")
+        put("text_encoder/model.safetensors")
+        put("tokenizer/tokenizer.json")
+
+        let comp = MediaBundle.krea(repo: "someone/Krea-4bit", displayName: "K", sizeGB: 12)
+            .components[0]
+        // Subdirs complete but no root transformer: NOT ready. `vae/` already
+        // satisfies the generic recursive-safetensors check, so this is the
+        // case the root requirement exists for.
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        // The 4-bit pack's own filename — nothing else changes.
+        put("transformer_4bit.safetensors")
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
     func testMageFlowBundleIsSinglePublicRecursiveComponentDiffusersLayout() {
