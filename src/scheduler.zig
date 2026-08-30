@@ -56,6 +56,7 @@ const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zi
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
+const sleep_inhibit = @import("sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -3779,9 +3780,23 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
 }
 
+/// Caller holds `queue_mu`. Shared with the wait condition below.
+fn hasWorkPendingLocked(sch: *const Scheduler) bool {
+    return sch.pending.items.len > 0 or
+        sch.decoding.items.len > 0 or
+        sch.vision_queue.items.len > 0 or
+        sch.embed_queue.items.len > 0 or
+        sch.cleanup_queue.items.len > 0 or
+        sch.load_queue.items.len > 0 or
+        sch.gen_queue.items.len > 0 or
+        sch.unload_queue.items.len > 0;
+}
+
 fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
     const params = ctx.params;
+    // Covers shutdown and startup-load failure.
+    defer sleep_inhibit.release();
 
     // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
     //    binding). On failure, mark the entry `.error_state` in the
@@ -3796,6 +3811,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         log.info("Headless: no primary model loaded; models load on demand.\n", .{});
         signalStarted(sch);
     } else {
+        // Startup load runs before the wait loop can acquire.
+        sleep_inhibit.setActive(true);
         if (doLoadOnInferenceThread(sch, params)) |_| {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);
@@ -3895,10 +3912,14 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+                // No later tick runs while parked, so release here.
+                sleep_inhibit.setActive(false);
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
+            // Hold until the loop parks again.
+            sleep_inhibit.setActive(true);
 
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
@@ -5813,6 +5834,24 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // The SSD tier has no finishSlot flush on this path — the drain must
     // flush what it just committed itself.
     try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "the inference loop parks without holding the sleep-inhibition assertion" {
+    // Pin release < park < acquire and startup acquire < load.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+    const body = source[start..end];
+    const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
+    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+    const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(drop < park);
+    try testing.expect(park < hold);
+    try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
+    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
+    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(boot_arm < boot_load);
+    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
 }
 
 test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {

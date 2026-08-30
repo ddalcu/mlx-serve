@@ -1509,3 +1509,11 @@ MiniMax-H3, Turbo, 1056x864, 141 frames x 5 chained windows: every window sample
 Fix: `gen.videoRgbTransportReason(delivered, w, h)` with `MAX_VIDEO_RGB_BYTES` (the app's number) refuses at admission on both video paths, naming frames, canvas, MB and the cap; the H3 site bills `chainDeliveredFrames(windows, frames)`. The app's `frameOptions` takes `chainWindows` and the stepper stops at 6 (the server refused 7-8 anyway). Lifting the cap is a transport change (stream frames or mux server-side), not a number to raise.
 
 Also filed the same day, #285: a Mage-Flow-Edit pack failing `MissingMageFlowWeight model.visual.patch_embed.proj.weight`. The reporter's `text_encoder/model.safetensors` loaded 902 tensors; the published Edit pack's has 1425 (523 `model.visual.*`), 902 is the TURBO text encoder. A pack-content problem on the user's disk, not a loader bug; the log line was relabeled from `MISSING VAE WEIGHT` to name the file and both counts.
+
+## The sleep-inhibition gate sat in the tick that never runs (issue #251, 2026-08-30)
+
+A long render needs sleep protection only while work is active. Use `PreventUserIdleSystemSleep`; display sleep remains allowed.
+
+Release immediately before `queue_cond.wait` and acquire after wake. The startup load runs before that loop, so it acquires separately. The deferred release covers shutdown and load failure.
+
+`tests/test_sleep_inhibit.sh` checks idle, active generation, return to idle, startup load, and `--no-prevent-sleep`. It matches the assertion name because powerd uses the same assertion type.

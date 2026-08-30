@@ -22,6 +22,7 @@ const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -114,6 +115,8 @@ fn printUsage(io: std.Io) void {
         \\                      that keeps generating never times out, however long it runs.
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
+        \\                      loads. Display sleep is always allowed.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -571,6 +574,8 @@ pub fn main(init: std.process.Init) !void {
             // Module global so on-demand /v1/load-model cold loads honor the
             // flag too (they used to hardcode vision from config.has_vision).
             scheduler_mod.no_vision_global = true;
+        } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
+            sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {
@@ -1048,12 +1053,13 @@ pub fn main(init: std.process.Init) !void {
         log.info("[args] drafter: <none>\n", .{});
     }
     if (serve_mode) {
-        log.info("[args] serve: {s}:{d}, ctx-size={d}, pld={s}, no-vision={}\n", .{
+        log.info("[args] serve: {s}:{d}, ctx-size={d}, pld={s}, no-vision={}, prevent-sleep={}\n", .{
             host,
             port,
             ctx_size,
             if (enable_pld) "on" else "off",
             no_vision,
+            sleep_inhibit_mod.isEnabled(),
         });
     }
     switch (kv_quant_config.scheme) {
