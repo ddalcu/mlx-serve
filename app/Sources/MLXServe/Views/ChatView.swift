@@ -155,7 +155,7 @@ struct ToolApprovalSheet: View {
 /// above the message input. Extracted from `ChatDetailView` so its body stays
 /// within the Swift type-checker's complexity budget.
 private struct AttachmentPreviewRow: View {
-    @Binding var images: [NSImage]
+    @Binding var images: [PendingImage]
     @Binding var pdfs: [(name: String, text: String)]
     @Binding var videos: [ChatVideo]
     @Binding var audio: [ChatAudio]
@@ -163,8 +163,8 @@ private struct AttachmentPreviewRow: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(Array(images.enumerated()), id: \.offset) { idx, img in
-                    imageChip(idx: idx, img: img)
+                ForEach(Array(images.enumerated()), id: \.offset) { idx, pending in
+                    imageChip(idx: idx, img: pending.image)
                 }
                 ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
                     fileChip(idx: idx, name: pdf.name, detail: "PDF · \(pdf.text.count) chars",
@@ -1547,7 +1547,7 @@ struct ChatDetailView: View {
     @StateObject private var scrollModel = ChatScrollModel()
     @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
     @State private var pasteMonitor: Any?
-    @State private var pendingImages: [NSImage] = []
+    @State private var pendingImages: [PendingImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
     @State private var pendingVideos: [ChatVideo] = []
     @State private var pendingAudio: [ChatAudio] = []
@@ -2373,10 +2373,44 @@ struct ChatDetailView: View {
                             }
                         }
                     }
-                } else {
-                    provider.loadObject(ofClass: NSImage.self) { image, _ in
-                        if let image = image as? NSImage {
-                            DispatchQueue.main.async { pendingImages.append(image) }
+                } else if let imageType = provider.registeredTypeIdentifiers.first(where: {
+                    UTType($0)?.conforms(to: .image) == true
+                }) {
+                    // The image's OWN bytes, asked for by the type the provider
+                    // actually REGISTERED — a Finder drag of a PNG registers
+                    // `public.png`, not `public.image`, so a request for the
+                    // umbrella type fails. `loadItem` hands back the file URL
+                    // (Finder) or the data, and either way the encoding survives:
+                    // `loadObject(ofClass: NSImage.self)` decodes to an NSImage
+                    // and throws the bytes away, so a dropped PNG used to be
+                    // stored as a re-encoded JPEG.
+                    //
+                    // The name comes from the URL when there is one and from
+                    // `suggestedName` otherwise (`droppedName`); an extension
+                    // neither supplies comes from the bytes themselves
+                    // (`AttachmentStore.payload`).
+                    //
+                    // The fallback is for a provider that only offers the decoded
+                    // object. It is not what makes a browser drag work: a drag
+                    // out of a page registers `public.jpeg` with NO loader block
+                    // behind it (measured, Brave), so nothing loads by any route
+                    // and the drop does nothing — as it did before this change.
+                    let suggested = provider.suggestedName
+                    provider.loadItem(forTypeIdentifier: imageType) { item, _ in
+                        let url = item as? URL
+                        let bytes: Data? = (item as? Data) ?? url.flatMap { try? Data(contentsOf: $0) }
+                        if let bytes, let image = NSImage(data: bytes) {
+                            let name = AttachmentStore.droppedName(url: url, suggested: suggested)
+                            DispatchQueue.main.async {
+                                pendingImages.append(PendingImage(image: image, original: bytes, filename: name))
+                            }
+                            return
+                        }
+                        provider.loadObject(ofClass: NSImage.self) { image, _ in
+                            guard let image = image as? NSImage else { return }
+                            DispatchQueue.main.async {
+                                pendingImages.append(PendingImage(image: image))
+                            }
                         }
                     }
                 }
@@ -2740,8 +2774,14 @@ struct ChatDetailView: View {
         }
         if handled { return true }
         // Raw image data (screenshots, copy-image-from-a-browser) — no file URL.
+        //
+        // Take the pasteboard's PNG when it has one, so a copied PNG is stored
+        // byte for byte. What it usually has is TIFF, which is UNCOMPRESSED: a
+        // 3000x2000 screenshot is ~24 MB of it, so those bytes are deliberately
+        // NOT kept and `AttachmentStore` encodes the image to PNG instead.
         if let image = NSImage(pasteboard: pb) {
-            pendingImages.append(image)
+            let png = pb.data(forType: .png)
+            pendingImages.append(PendingImage(image: image, original: png))
             return true
         }
         return false
@@ -2766,8 +2806,10 @@ struct ChatDetailView: View {
         case .video:
             addVideoAttachment(url)
         case .image:
-            guard let image = NSImage(contentsOf: url) else { return false }
-            pendingImages.append(image)
+            guard let bytes = try? Data(contentsOf: url),
+                  let image = NSImage(data: bytes) else { return false }
+            pendingImages.append(PendingImage(image: image, original: bytes,
+                                              filename: url.lastPathComponent))
         case .unhandled:
             return false
         }
@@ -2798,8 +2840,10 @@ struct ChatDetailView: View {
                     addAudioAttachment(url)
                 } else if videoSupported, let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .movie) {
                     addVideoAttachment(url)
-                } else if let image = NSImage(contentsOf: url) {
-                    pendingImages.append(image)
+                } else if let bytes = try? Data(contentsOf: url),
+                          let image = NSImage(data: bytes) {
+                    pendingImages.append(PendingImage(image: image, original: bytes,
+                                                      filename: url.lastPathComponent))
                 }
             }
         }
@@ -2936,22 +2980,24 @@ struct ChatDetailView: View {
         return combined
     }
 
-    /// Convert NSImage to JPEG data suitable for API transport.
-    private static func nsImageToJPEG(_ image: NSImage) -> Data? {
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) else {
-            return nil
-        }
-        return jpeg
-    }
-
-    /// Convert pending NSImages to ChatImage array, clearing the pending list.
+    /// Write the pending attachments out and hand back the messages' images,
+    /// clearing the pending list.
+    ///
+    /// Written on SEND, not on attach: the preview row lets an attachment be
+    /// removed again, and a file per abandoned pick is how a folder fills up
+    /// with things no conversation names.
+    ///
+    /// A failed write is not fatal to the turn. The `ChatImage` keeps its bytes,
+    /// so the model still sees the picture and the transcript still draws it —
+    /// only the next launch finds no file, and says so.
     private func consumePendingImages() -> [ChatImage]? {
         guard !pendingImages.isEmpty else { return nil }
-        let chatImages = pendingImages.compactMap { img -> ChatImage? in
-            guard let data = Self.nsImageToJPEG(img) else { return nil }
-            return ChatImage(data: data)
+        let chatImages = pendingImages.compactMap { pending -> ChatImage? in
+            var image = ChatImage(data: Data())
+            guard let payload = AttachmentStore.payload(for: pending, id: image.id) else { return nil }
+            image.data = payload.data
+            image.path = AttachmentStore.write(payload.data, named: payload.name)
+            return image
         }
         pendingImages = []
         return chatImages.isEmpty ? nil : chatImages
@@ -3627,7 +3673,19 @@ struct MessageBubble: View {
                    message.media?.contains(where: { $0.kind == .image }) != true {
                     HStack(spacing: 4) {
                         ForEach(images) { img in
-                            if let nsImage = NSImage(data: img.data) {
+                            // No bytes: the file under `attachments/` is gone,
+                            // or this message predates attachments on disk and
+                            // its base64 is no longer read. Say so rather than
+                            // leave a hole where a picture was.
+                            if img.data.isEmpty {
+                                Label("attachment no longer on disk", systemImage: "questionmark.folder")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(.quaternary.opacity(0.4))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            } else if let nsImage = NSImage(data: img.data) {
                                 Image(nsImage: nsImage)
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)

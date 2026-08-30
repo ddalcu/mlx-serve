@@ -165,17 +165,51 @@ struct SerializedToolCall: Codable, Equatable {
     let arguments: String // JSON string
 }
 
+/// An image on a message.
+///
+/// The bytes are NOT persisted: `CodingKeys` carries `id` and `path` only, and
+/// a decode reads the picture back from the file. Uploads used to ride
+/// `chat-history.json` as base64, which measured 97% of an ordinary
+/// conversation's file.
 struct ChatImage: Identifiable, Codable, Equatable {
     let id: UUID
-    let data: Data  // JPEG bytes
+    /// The file under `~/.mlx-serve/attachments/`, when there is one.
+    ///
+    /// Optional so a history written before attachments moved to disk still
+    /// DECODES: its `data` key is simply unknown here and `path` is absent, so
+    /// the record survives and only its picture is gone. A required field would
+    /// throw instead, and `loadChatHistory`'s `?? []` turns one throw into an
+    /// EMPTY history — the whole file, not one image.
+    ///
+    /// Also nil for bytes that were never meant to outlive the turn: a Telegram
+    /// photo, whose session is never persisted at all, and a `browse`
+    /// screenshot, which no reopened conversation reads or draws.
+    var path: String?
+    /// The picture itself, for this run of the app. Empty when the file is gone.
+    var data: Data
 
-    init(data: Data) {
+    enum CodingKeys: String, CodingKey { case id, path }
+
+    init(data: Data, path: String? = nil) {
         self.id = UUID()
         self.data = data
+        self.path = path
     }
 
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        data = path.flatMap { FileManager.default.contents(atPath: $0) } ?? Data()
+    }
+
+    /// Sniffed, not assumed: an attachment we encoded ourselves is PNG, and
+    /// labelling PNG bytes as JPEG is the kind of lie that works until it
+    /// doesn't.
     var base64URL: String {
-        "data:image/jpeg;base64,\(data.base64EncodedString())"
+        let b = [UInt8](data.prefix(4))
+        let isPNG = b.count >= 4 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47
+        return "data:image/\(isPNG ? "png" : "jpeg");base64,\(data.base64EncodedString())"
     }
 }
 

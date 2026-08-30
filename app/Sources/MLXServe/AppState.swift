@@ -791,6 +791,12 @@ class AppState: ObservableObject {
     /// cannot point at.
     func deleteSessions(_ ids: Set<UUID>) {
         guard !ids.isEmpty else { return }
+        // Attachments the deleted chats own. Computed BEFORE the sessions go,
+        // and spared when a surviving chat still names the same file: a fork
+        // COPIES its messages, so two conversations can point at one picture.
+        for path in AttachmentStore.removablePaths(deleting: ids, in: chatSessions) {
+            AttachmentStore.remove(path)
+        }
         for id in ids {
             processRegistry.killSession(id)
             documentIndexes[id]?.cancel()
