@@ -4,11 +4,11 @@
 # Live 2026-08-05 (under pi): five loop-stops in a row, each
 # firing sooner than the last, surfaced to the user as "Model stopped because
 # it reached the maximum output token limit" while the session's own status
-# bar read 32.4%/66k. Both readings were right — `finish_reason: "length"` is
-# the only value in the OpenAI schema for a server-side cut, and pi renders it
-# the only way it can. The reason cannot move ("length" is what truncation
-# recovery keys on — the 2026-07-14 php.html post-mortem), so the cause rides
-# BESIDE it as `finish_details`.
+# bar read 32.4%/66k. The mismatch came from `finish_reason: "length"`: pi
+# treated the loop guard as context/output exhaustion and compacted at 18% of
+# a 256k window. A loop guard now reports "stop" and carries the specific cause
+# beside it as `finish_details`. Tool-call parsing is suppressed for that cause
+# so a cut fragment cannot become an executable `tool_calls` response.
 #
 # Two things are asserted, because either alone can silently regress:
 #   1. the SIGNAL — `finish_details.type == "repetition_loop"` on chat
@@ -87,7 +87,7 @@ print("reason", ch.get("finish_reason"))
 print("details", (ch.get("finish_details") or {}).get("type"))
 print("chars", len(ch["message"].get("content") or ""))
 ' > "$LOG.chat" 2>/dev/null
-grep -q "^reason length$" "$LOG.chat"; check "finish_reason stays \"length\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+grep -q "^reason stop$" "$LOG.chat"; check "finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 grep -q "^details repetition_loop$" "$LOG.chat"; check "finish_details.type = repetition_loop" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 grep -q "\[loop-stop\]" "$LOG"; check "the cut is logged with its tier + trim point" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
@@ -138,10 +138,11 @@ grep -q "^usage_choices_empty True$" "$LOG.usage"; check "the usage chunk ships 
 
 # ── 3. completions, non-streaming ────────────────────────────────────────
 echo "[3/6] /v1/completions non-streaming"
-curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0}" \
-  | grep -c '"finish_details":{"type":"repetition_loop"}' > "$LOG.cmpl"
+CMPL=$(curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0}")
+echo "$CMPL" | grep -c '"finish_details":{"type":"repetition_loop"}' > "$LOG.cmpl"
 [ "$(cat "$LOG.cmpl")" -ge 1 ]; check "completions carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+echo "$CMPL" | grep -q '"finish_reason":"stop"'; check "completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 4. completions, streaming ────────────────────────────────────────────
 # Same usage-chunk contract as chat: with include_usage the usage rides its
@@ -154,16 +155,21 @@ grep -c '"finish_details":{"type":"repetition_loop"}' "$LOG.rawcmpl" > "$LOG.cmp
 [ "$(cat "$LOG.cmplstream")" -ge 1 ]; check "the completions final chunk carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 python3 - "$LOG.rawcmpl" <<'PY' > "$LOG.cmplusage"
 import json, sys
-usage_ok = None
+usage_ok, finish = None, None
 for line in open(sys.argv[1]):
     if not line.startswith("data: ") or line.strip() == "data: [DONE]":
         continue
     c = json.loads(line[6:])
+    for ch in c.get("choices", []):
+        if ch.get("finish_reason") is not None:
+            finish = ch["finish_reason"]
     if isinstance(c.get("usage"), dict) and "prompt_tokens" in c["usage"]:
         usage_ok = (c.get("choices") == [])
 print("usage_choices_empty", usage_ok)
+print("finish_reason", finish)
 PY
 grep -q "^usage_choices_empty True$" "$LOG.cmplusage"; check "the completions usage chunk ships \"choices\":[]" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+grep -q "^finish_reason stop$" "$LOG.cmplusage"; check "streaming completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 5. an ORDINARY response must be byte-unchanged ───────────────────────
 echo "[5/6] a normal answer says nothing new"

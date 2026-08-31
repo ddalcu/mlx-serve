@@ -454,7 +454,7 @@ WHICH failure it is is the assertion: past the gate the answer is no longer the
 gate's 503. Verified red-on-revert, where it reproduces the reporter's 41.30 GiB
 exactly.
 
-## A loop cut that says only "length" reads as a limit nobody set (2026-08-05)
+## A loop cut must not say "length": clients treat it as context exhaustion (2026-08-05, updated 2026-08-31)
 
 A pi session against a collapse-prone 4-bit MoE repeated itself and then died with
 "Model stopped because it reached the maximum output token limit", while its own
@@ -476,22 +476,21 @@ End to end:
    the loop sooner, because the client re-sent the cut turn as history and the
    model read its own loop back. That is the error-echo class (Inkling
    name-salvage) with the server's own output as the error.
-4. `finish_reason: "length"` is deliberate and cannot move — `"stop"` became
-   `"tool_calls"` and presented a server-cut fragment as a completed write
-   (the 2026-07-14 php.html post-mortem). pi renders `length` the only way the
-   OpenAI schema allows. pi never set a `max_tokens` at all (the log shows the
-   unbounded sentinel `1073741823`), so the message names a limit neither side
-   imposed.
+4. The original `finish_reason: "length"` workaround prevented a cut tool-call
+   fragment from becoming `"tool_calls"`, but pi also treats any short length
+   stop as recoverable context pressure. At 46,190 / 262,144 prompt tokens it
+   compacted and retried. The wire reason is now `"stop"`; tool parsing is
+   independently suppressed when `finish_details.type` is `repetition_loop`.
 
 Two fixes, and the split between them is forced by the transport:
 
-- **The cause rides beside the reason.** `finish_details:{"type":
+- **The cause rides beside the stop.** `finish_details:{"type":
   "repetition_loop"}` on chat + completions, stream and non-stream. Unknown
   causes are dropped rather than interpolated (`finishDetailsField`) — this
   string is spliced into a JSON literal, and a literal is arbitrary bytes too.
-  `/v1/messages` is deliberately excluded: `anthropicStopReason` maps a loop cut
-  to `max_tokens` (the same misattribution), but inventing a key inside
-  Anthropic's schema is worse than the gap.
+  `/v1/messages` is deliberately excluded because inventing a sibling key
+  inside Anthropic's schema is worse than the gap; it now maps the stop honestly
+  to `end_turn` and suppresses any cut tool fragment.
 - **The trim is what breaks the spiral, and it only reaches non-streaming.**
   `generate.degenerateTail` returns where the degenerate span STARTS, not just
   that one exists: the exact tiers walk their cycle back past the repetitions

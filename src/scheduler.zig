@@ -434,11 +434,9 @@ pub const Slot = struct {
     finished: bool,
     error_code: ?[]const u8,
     finish_reason: []const u8,
-    /// Set ONLY by the degenerate-tail guard. `finish_reason` stays "length"
-    /// (see `loopStopReason`) — this is the sibling signal that says WHICH
-    /// kind of "length" it was, so a client can tell a server-cut loop from a
-    /// genuine max_tokens truncation without log archaeology. Static string,
-    /// never freed.
+    /// Set ONLY by the degenerate-tail guard. The wire reason is "stop" so a
+    /// client does not mistake the guard for output/context exhaustion; this
+    /// sibling signal preserves the specific cause. Static string, never freed.
     finish_details: ?[]const u8,
     /// Index into the emitted tokens where the degenerate span begins;
     /// everything from here on is the loop. Non-streaming responses are cut
@@ -4619,23 +4617,21 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
 /// has collapsed into a short repeating cycle, returns the finish reason to
 /// cut the request with; null while generation is healthy.
 ///
-/// The reason is "length", NOT "stop": the SERVER is truncating the generation
-/// (the model didn't finish — we cut a runaway loop), and "length" is the one
-/// reason server.toolCallFinishReason preserves through tool-call parsing, so
-/// a call salvaged from the cut buffer reaches the client as a TRUNCATION and
-/// its recovery fires. Live 2026-07-14 (plang/php.html): "stop" became
-/// "tool_calls", presenting a server-cut fragment as a model-completed write.
+/// The reason is "stop", not "length": this guard fired far below the requested
+/// output cap, and clients such as pi treat "length" as context-overflow recovery
+/// and compact unnecessarily. The server separately suppresses tool-call parsing
+/// for this cause, so a cut fragment cannot be promoted to a completed call.
 pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
     const d = loopStopDecision(generated_ids) orelse return null;
     return d.finish_reason;
 }
 
 /// What a loop cut tells the rest of the server. `finish_reason` is the wire
-/// value (always "length" — see above); `finish_details` is the sibling
+/// value (always "stop" — see above); `finish_details` is the sibling
 /// signal that names the CAUSE, and `trim_start` is where the client's copy
 /// of the answer should end.
 pub const LoopStop = struct {
-    finish_reason: []const u8 = "length",
+    finish_reason: []const u8 = "stop",
     /// The `finish_details.type` value. One string for all three tiers: a
     /// client's decision ("this turn is unusable, don't feed it back") is the
     /// same whichever tier convicted, and the tier is in the log.
@@ -6662,16 +6658,11 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
-test "loopStopReason: a degenerate tail cut reports length, a healthy tail is not cut" {
-    // The reason MUST be "length": the SERVER is truncating the generation
-    // (the model didn't finish — we cut a runaway repetition loop), and
-    // "length" is the one reason server.toolCallFinishReason preserves through
-    // tool-call parsing, so a call salvaged from the cut buffer reaches the
-    // client as a TRUNCATION and its recovery fires. Live 2026-07-14
-    // (plang/php.html): the cut reported "stop" → "tool_calls", presenting a
-    // server-cut fragment as a model-completed write call — pi validated
-    // garbage while the actual cause stayed invisible (the cut also never
-    // logged). Reverting the reason to "stop" turns this red.
+test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {
+    // A loop guard is an intentional server stop, not exhaustion of the
+    // requested output budget. Reporting "length" makes clients such as pi
+    // run context-overflow recovery and compact a mostly-empty context. Tool
+    // calls from this truncated buffer are suppressed separately at emission.
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
 
@@ -6687,7 +6678,7 @@ test "loopStopReason: a degenerate tail cut reports length, a healthy tail is no
         }
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
 }
 
 test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
@@ -6707,18 +6698,13 @@ test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
     for (0..9) |_| try ids.appendSlice(testing.allocator, &cycle);
     try testing.expect(loopStopReason(ids.items) == null);
 
-    // Tenth repetition crosses it — cut, and as a truncation ("length").
+    // Tenth repetition crosses it — cut as an intentional stop.
     try ids.appendSlice(testing.allocator, &cycle);
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
 }
 
-test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it" {
-    // The reason must not move to "stop" or a new value — clients key on
-    // "length" for truncation recovery, and "tool_calls" on a server-cut
-    // fragment is the 2026-07-14 php.html failure. The cause is a SIBLING
-    // field, so pi keeps rendering "maximum output token limit" while a
-    // client that reads finish_details can tell the two apart.
+test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
     try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
@@ -6727,7 +6713,7 @@ test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it"
     }
 
     const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", stop.finish_reason);
+    try testing.expectEqualStrings("stop", stop.finish_reason);
     try testing.expectEqualStrings("repetition_loop", stop.finish_details);
     try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
     // Trimmed to the honest prefix plus one copy of the cycle.
@@ -6770,7 +6756,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
         try ids.appendSlice(testing.allocator, phrasings[i % phrasings.len]);
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
 
     // A long answer that keeps introducing new material is untouched, however
     // repetitive its scaffolding.
