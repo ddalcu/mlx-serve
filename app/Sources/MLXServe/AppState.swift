@@ -1034,7 +1034,19 @@ class AppState: ObservableObject {
             removed.insert(i)
             i += 1
         }
+        // Captured BEFORE the removal, because the transcript is the only record
+        // of which files a message owned.
+        let dropped = removed.map { chatSessions[sIdx].messages[$0] }
         chatSessions[sIdx].messages.remove(atOffsets: removed)
+        // The second and last removal site. A message delete is a FINAL act, so
+        // its files go now: leaving them would orphan them for good, since the
+        // session-level cleanup reads the messages a session still holds.
+        // `truncateMessages` deliberately does not do this - regenerate and
+        // edit-and-resend truncate and then rebuild the turn from the very same
+        // `ChatImage` values, paths included.
+        for path in AttachmentStore.removablePaths(orphanedBy: dropped, in: chatSessions) {
+            AttachmentStore.remove(path)
+        }
         chatSessions[sIdx].updatedAt = Date()
         saveChatHistory()
     }
