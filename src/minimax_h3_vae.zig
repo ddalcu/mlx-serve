@@ -29,6 +29,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const h3 = @import("minimax_h3.zig");
+const preview = @import("preview.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -1963,4 +1964,110 @@ test "minimax h3 vae live: encode->decode round trip preserves orientation" {
     // Input: left dark, right bright, top dark. A mirror flips the sign.
     try testing.expect(rm - lm > 0.5);
     try testing.expect(tm < rm - 0.5);
+}
+
+test "minimax h3 vae live: the Latent2RGB preview resembles the decoded frame" {
+    // The fixture oracle in preview.zig proves our projection IS ComfyUI's.
+    // It cannot prove ComfyUI's projection looks like the video, which is the
+    // whole point of a preview (issue #208 review: "no oracle or perceptual
+    // test proving it looks like anything"). So: encode a real image with the
+    // real VAE, decode it back, box-average the decode down to the latent grid
+    // and correlate. The GOLDEN-ANGLE HUE WHEEL this file used to ship is the
+    // control arm — a bar the retired projection also clears proves nothing.
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    if (model_dir.len == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+
+    const vae_path = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{model_dir});
+    defer a.free(vae_path);
+    // The VAE is the only weight file this test needs, so a dir that has it is
+    // enough: a missing one SKIPS rather than failing an unrelated pack.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (std.Io.Dir.openFileAbsolute(io, vae_path, .{})) |f| f.close(io) else |_| return error.SkipZigTest;
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+    var enc = try Encoder.load(a, &vw, s);
+    defer enc.deinit();
+    var dec = try Decoder.load(a, &vw, .{}, mlx.mlx_dtype.bfloat16, s);
+    defer dec.deinit();
+
+    // One independent colour per LATENT CELL (H3 compresses 16x spatially), so
+    // the bar is 3 real predictions per cell rather than a gradient any linear
+    // map reproduces.
+    const px: u32 = 256;
+    const buf = try preview.perceptualTestFrame(a, px, VAE_RATIO);
+    defer a.free(buf);
+    const shape5 = [_]c_int{ 1, 3, 1, @intCast(px), @intCast(px) };
+    const img = mlx.mlx_array_new_data(buf.ptr, &shape5, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(img);
+
+    const lat = try enc.encodeImage(img, a, s);
+    defer _ = mlx.mlx_array_free(lat);
+    const latf = try astype(lat, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(latf);
+    try mlx.check(mlx.mlx_array_eval(latf));
+    const lshp = mlx.getShape(latf);
+    const lc: u32 = @intCast(lshp[1]);
+    const lt: u32 = @intCast(lshp[2]);
+    const lh: u32 = @intCast(lshp[3]);
+    const lw: u32 = @intCast(lshp[4]);
+    try testing.expectEqual(preview.minimax_h3.channels(), lc);
+    const ldata = mlx.mlx_array_data_float32(latf) orelse return error.NoPixelData;
+    const lat_host = ldata[0 .. @as(usize, lc) * lt * lh * lw];
+
+    // The preview the client would see for this latent, at latent resolution.
+    const fit = try a.alloc(u8, @as(usize, lh) * lw * 3);
+    defer a.free(fit);
+    preview.latentSliceToRgb(preview.minimax_h3, lat_host, lt, lh, lw, 0, fit);
+    const ctrl_map = preview.goldenAngleControlMap(24);
+    const ctrl = try a.alloc(u8, @as(usize, lh) * lw * 3);
+    defer a.free(ctrl);
+    preview.latentSliceToRgb(ctrl_map, lat_host, lt, lh, lw, 0, ctrl);
+
+    // What the user eventually gets: the same latent through the real decoder.
+    const pixels = try decode(&dec, lat, a, s);
+    defer _ = mlx.mlx_array_free(pixels);
+    const pf = try astype(pixels, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(pf);
+    try mlx.check(mlx.mlx_array_eval(pf));
+    const pshp = mlx.getShape(pf);
+    const ot: usize = @intCast(pshp[2]);
+    const oh: usize = @intCast(pshp[3]);
+    const ow: usize = @intCast(pshp[4]);
+    const pdata = mlx.mlx_array_data_float32(pf) orelse return error.NoPixelData;
+    const decoded = try a.alloc(u8, oh * ow * 3);
+    defer a.free(decoded);
+    for (0..oh) |y| {
+        for (0..ow) |x| {
+            for (0..3) |c| {
+                const v = pdata[c * ot * oh * ow + y * ow + x];
+                const u = (v + 1.0) * 0.5 * 255.0;
+                decoded[(y * ow + x) * 3 + c] = @intFromFloat(@min(255.0, @max(0.0, u)));
+            }
+        }
+    }
+    const decoded_small = try preview.boxDownsampleRgb(a, decoded, @intCast(ow), @intCast(oh), lw, lh);
+    defer a.free(decoded_small);
+
+    const corr_fit = preview.rgbCorrelation(fit, decoded_small);
+    const corr_ctrl = preview.rgbCorrelation(ctrl, decoded_small);
+    const chroma_fit = preview.rgbChromaCorrelation(fit, decoded_small);
+    const chroma_ctrl = preview.rgbChromaCorrelation(ctrl, decoded_small);
+    std.debug.print(
+        "[h3-preview] latent={d}x{d}x{d} decode={d}x{d}x{d} corr_fit={d:.4} corr_huewheel={d:.4} chroma_fit={d:.4} chroma_huewheel={d:.4}\n",
+        .{ lc, lh, lw, ot, oh, ow, corr_fit, corr_ctrl, chroma_fit, chroma_ctrl },
+    );
+    // The published fit tracks the decode; the hue wheel does not. All four
+    // numbers are the assertion: an absolute bar alone passes on a metric any
+    // linear map clears, a relative one alone passes on two bad maps, and full
+    // RGB alone is mostly luminance — which is the half a hue wheel gets free.
+    // Measured 2026-08-30 (FL2VA 8-bit, M-series): fit 0.740 / chroma 0.880,
+    // control 0.029 / 0.042. The absolute floors are sanity bounds; the CONTROL
+    // margin is the discriminator, and it sits near 0.7 with the bar at 0.3.
+    try testing.expect(corr_fit > 0.6);
+    try testing.expect(corr_fit > corr_ctrl + 0.3);
+    try testing.expect(chroma_fit > 0.7);
+    try testing.expect(chroma_fit > chroma_ctrl + 0.3);
 }

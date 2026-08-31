@@ -73,6 +73,10 @@ const Entry = struct {
     /// tokens are identical across images, so the KV under them is keyed on
     /// the pixels. Non-zero entries stay in RAM (never spilled to the SSD tier).
     vision_key: u64 = 0,
+    /// Position of the first dynamic media placeholder in `tokens`. Prefix
+    /// state strictly before this boundary is independent of the media pixels
+    /// and can be shared across different `vision_key` values.
+    media_start: ?usize = null,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
@@ -369,8 +373,11 @@ pub const HotPrefixCache = struct {
         return total;
     }
 
-    /// Find the entry with the longest prefix shared with `prompt_ids` AND
-    /// matching `(has_tools, quant_config)`. Returns the entry index and
+    /// Find the entry with the longest EFFECTIVELY RESTORABLE prefix shared
+    /// with `prompt_ids` and matching `(has_tools, quant_config)`. For a hybrid
+    /// target that means the highest SSM checkpoint at or below the raw token
+    /// match; a longer raw match with no usable checkpoint must not hide an
+    /// older entry that can actually restore. Returns the entry index and raw
     /// shared-prefix length; null if no entry matches the key. Wave 1.A:
     /// the config filter exists because cross-config buffer layouts differ
     /// — a slot running `kv_quant=4` cannot restore from an entry committed
@@ -378,24 +385,61 @@ pub const HotPrefixCache = struct {
     /// (scheme + bits + group_size) is compared because `Scheme.affine`
     /// covers BOTH 4-bit and 8-bit packings: filtering on `Scheme` alone
     /// would let a 4-bit entry alias to an 8-bit slot and crash SDPA on
-    /// restore. See `tests/test_kv_quant_per_request.sh`.
-    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+    /// restore. Different media keys may share only the text state before
+    /// the earliest known media-placeholder boundary; without a boundary the
+    /// lookup stays conservative and rejects the entry. See
+    /// `tests/test_kv_quant_per_request.sh`.
+    fn findBestRestorableMatch(
+        self: *const HotPrefixCache,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        quant_config: kv_quant.KVQuantConfig,
+        require_ssm_checkpoint: bool,
+    ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
+        var best_effective: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
-            if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
-            const max_shared = @min(e.tokens.len, prompt_ids.len);
+
+            var max_shared = @min(e.tokens.len, prompt_ids.len);
+            if (e.vision_key != vision_key) {
+                // Placeholder token IDs do not encode media pixels. Once an
+                // image/audio/video row is forwarded, model state depends on
+                // the media hash and cannot cross keys. State strictly before
+                // the first such row remains ordinary text.
+                const safe_boundary = if (e.media_start) |entry_start|
+                    if (media_start) |request_start| @min(entry_start, request_start) else entry_start
+                else
+                    media_start orelse continue;
+                max_shared = @min(max_shared, safe_boundary);
+            }
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
-            if (shared > best_shared) {
+
+            const effective = if (require_ssm_checkpoint) blk: {
+                const cps = e.ssm_checkpoints orelse continue;
+                const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
+                break :blk cp.pos;
+            } else shared;
+            if (effective > best_effective or
+                (effective == best_effective and shared > best_shared))
+            {
+                best_effective = effective;
                 best_shared = shared;
                 best_idx = i;
             }
         }
         if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
         return null;
+    }
+
+    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+        const match = self.findBestRestorableMatch(prompt_ids, has_tools, vision_key, null, quant_config, false) orelse return null;
+        return .{ .idx = match.idx, .shared = match.shared };
     }
 
     /// Try to restore a matching entry into `target_cache`. On success, returns
@@ -418,7 +462,41 @@ pub const HotPrefixCache = struct {
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
     ) !LookupResult {
-        const match = self.findBestMatch(prompt_ids, has_tools, vision_key, target_cache.config);
+        return self.lookupAndRestoreWithMedia(
+            target_cache,
+            target_moe_seq_offset,
+            target_ssm_entries,
+            s,
+            prompt_ids,
+            has_tools,
+            vision_key,
+            null,
+            dflash_target,
+            mtp_target,
+        );
+    }
+
+    pub fn lookupAndRestoreWithMedia(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+    ) !LookupResult {
+        const match = self.findBestRestorableMatch(
+            prompt_ids,
+            has_tools,
+            vision_key,
+            media_start,
+            target_cache.config,
+            target_ssm_entries != null,
+        );
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
         // (fresh boot, post-eviction). Phase 3 handles hybrid targets too —
@@ -618,6 +696,20 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !void {
+        return self.commitWithMediaState(source_cache, tokens, has_tools, vision_key, null, ssm_cps, dflash, mtp);
+    }
+
+    pub fn commitWithMediaState(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+    ) !void {
         const quant_config = source_cache.config;
 
         var replace_idx: ?usize = null;
@@ -803,6 +895,7 @@ pub const HotPrefixCache = struct {
             e.snapshot = new_snap;
             e.has_tools = has_tools;
             e.vision_key = vision_key;
+            e.media_start = media_start;
             e.quant_config = quant_config;
             e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
             e.ssm_checkpoints = merged_cps;
@@ -843,6 +936,7 @@ pub const HotPrefixCache = struct {
             .tokens = tokens_owned,
             .has_tools = has_tools,
             .vision_key = vision_key,
+            .media_start = media_start,
             .snapshot = new_snap,
             .last_used = self.bumpCounter(),
             .quant_config = quant_config,
@@ -1622,6 +1716,123 @@ fn pcEmptySsm() [3]SSMCacheEntry {
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
+}
+
+// A new image changes the KV only when its dynamic placeholder rows are
+// forwarded. The text prefix before that boundary remains valid even though
+// the media hash changes. Hybrid models must restore the last checkpoint at
+// or before the boundary, never a later checkpoint whose SSM state has seen
+// the old pixels.
+test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media" {
+    const s = mlx.gpuStream();
+    const media_start: usize = 8;
+    const cached_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 900, 900, 20, 21 };
+    const lookup_tokens = cached_tokens;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var source_cache = try KVCache.init(testing.allocator, 3);
+    defer source_cache.deinit();
+    try testFillCache(&source_cache, s, 3, cached_tokens.len);
+    var source_ssm = pcBuildHybrid(s, 123.0, 456.0);
+    defer pcFreeHybrid(&source_ssm);
+    const checkpoints = try testing.allocator.alloc(SSMCheckpoint, 2);
+    checkpoints[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start, s);
+    checkpoints[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start + 2, s);
+    try hc.commitWithMediaState(
+        &source_cache,
+        &cached_tokens,
+        false,
+        0x1111,
+        media_start,
+        checkpoints,
+        null,
+        null,
+    );
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&target_ssm);
+    var moe_off: usize = 0;
+    const result = try hc.lookupAndRestoreWithMedia(
+        &target_cache,
+        &moe_off,
+        &target_ssm,
+        s,
+        &lookup_tokens,
+        false,
+        0x2222,
+        media_start,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(media_start, result.matched);
+    try testing.expectEqual(media_start, target_cache.step);
+    try testing.expectEqual(media_start, moe_off);
+    try testing.expectEqual(@as(f32, 123.0), pcSsmVal(target_ssm[0].conv_state, 0, s));
+}
+
+// A vision turn can move the current image span when the same image becomes
+// conversation history. The newest entry then has the longest raw token match
+// (ending exactly at the old image boundary), but its first SSM checkpoint can
+// sit just AFTER that boundary. An older entry for the same pixels may have a
+// slightly shorter token match with a usable checkpoint. Picking by raw token
+// match alone turns that recoverable case into a full cold prefill.
+test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry" {
+    const s = mlx.gpuStream();
+    const vision_key: u64 = 0xdecaf;
+    const older_tokens = [_]u32{ 1, 2, 3, 4, 5, 90, 91, 92, 93, 94 };
+    const newer_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 80, 81, 82 };
+    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var older_cache = try KVCache.init(testing.allocator, 3);
+    defer older_cache.deinit();
+    try testFillCache(&older_cache, s, 3, older_tokens.len);
+    var older_ssm = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&older_ssm);
+    const older_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    older_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &older_ssm, 4, s);
+    try hc.commitWithState(&older_cache, &older_tokens, false, vision_key, older_cps, null, null);
+
+    var newer_cache = try KVCache.init(testing.allocator, 3);
+    defer newer_cache.deinit();
+    try testFillCache(&newer_cache, s, 3, newer_tokens.len);
+    var newer_ssm = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&newer_ssm);
+    const newer_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    // The raw match with this entry is 7, so this checkpoint cannot restore it.
+    newer_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &newer_ssm, 8, s);
+    try hc.commitWithState(&newer_cache, &newer_tokens, false, vision_key, newer_cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&target_ssm);
+    var moe_off: usize = 0;
+    const result = try hc.lookupAndRestore(
+        &target_cache,
+        &moe_off,
+        &target_ssm,
+        s,
+        &lookup_tokens,
+        false,
+        vision_key,
+        null,
+        null,
+    );
+
+    // The newer 7-token raw match is unusable; the older checkpoint at 4 is
+    // still vastly better than a cold prefill and must win the hybrid lookup.
+    try testing.expectEqual(@as(usize, 4), result.matched);
+    try testing.expectEqual(@as(usize, 4), target_cache.step);
+    try testing.expectEqual(@as(usize, 4), moe_off);
+    try testing.expectEqual(@as(f32, 100.0), pcSsmVal(target_ssm[0].conv_state, 0, s));
 }
 
 test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a restart" {

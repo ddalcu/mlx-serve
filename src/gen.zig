@@ -2705,6 +2705,19 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     };
 }
 
+/// SSE sink for a video request. Preview JPEGs are opt-in and require stream.
+fn videoStreamCtx(conn: *Conn, allocator: std.mem.Allocator, body: []const u8, want_stream: bool) sse.StreamCtx {
+    const pr = sse.parsePreview(body);
+    return .{
+        .conn = conn,
+        .stream = want_stream,
+        .allocator = allocator,
+        .preview = want_stream and pr.enabled,
+        .preview_frames = pr.frames,
+        .preview_max_side = pr.max_side,
+    };
+}
+
 /// Base64-decode a JSON string value (unescaping `\/` first — Swift clients
 /// escape every slash) into an owned buffer.
 fn jsonB64Alloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -3057,7 +3070,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     if (videoRgbTransportReason(minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count), width, height)) |reason|
         return sendError(conn, 400, reason);
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream });
+    const preview_req = sse.parsePreview(body);
+    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream, preview_req.enabled });
 
     // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
     // frame): an undecodable image is a named 400, never a silent t2va. The
@@ -3148,7 +3162,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // emits nothing but still gets the disconnect probe, or a client that gives
     // up (or times out: a 1344x768 clip outlasts most default timeouts) leaves
     // the GPU running to the end with every queued request behind it.
-    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
@@ -3231,7 +3245,8 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     const stage2_steps: u32 = @intCast(extractJsonInt(body, "stage2_steps") orelse 0);
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[video] generating {s} {d}f {d}x{d} steps={d} cfg={d:.1}/{d:.1} stg={d:.1} stream={}: {d} chars\n", .{ @tagName(pipeline), num_frames, height, width, steps, guiders.vp.cfg, guiders.ap.cfg, guiders.vp.stg, want_stream, prompt.len });
+    const preview_req = sse.parsePreview(body);
+    log.info("[video] generating {s} {d}f {d}x{d} steps={d} cfg={d:.1}/{d:.1} stg={d:.1} stream={} preview={}: {d} chars\n", .{ @tagName(pipeline), num_frames, height, width, steps, guiders.vp.cfg, guiders.ap.cfg, guiders.vp.stg, want_stream, preview_req.enabled, prompt.len });
 
     // Two-stage prerequisites: even half-res grid, the VAE encoder (latent
     // statistics), the upsampler, and BOTH transformer variants on disk.
@@ -3416,7 +3431,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         }
     }
 
-    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?ltx.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 

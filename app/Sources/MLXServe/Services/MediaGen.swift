@@ -1971,6 +1971,10 @@ struct VideoGenRequest {
     /// fidelity and is several times slower — reference tokens ride through
     /// every sampling step.
     var refImageSize: RefImageSizing = .match
+    /// Per-step latent previews (`preview`). Off by default: it is not free
+    /// (an x0 solve and a host copy of the previewed frames, per step), so the
+    /// absent field keeps meaning "no previews" for every other client too.
+    var livePreview: Bool = false
 }
 
 /// ref2va references already encoded for the wire. Kept apart from

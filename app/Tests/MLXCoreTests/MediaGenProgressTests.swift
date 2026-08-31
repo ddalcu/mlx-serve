@@ -84,6 +84,21 @@ final class MediaGenProgressTests: XCTestCase {
         XCTAssertEqual(MediaSSE.classify([:]), .ignored)
     }
 
+    func testPreviewJPEGReadsOptInProgressPayload() {
+        // A 1x1 JPEG SOI stub, base64. classify() must stay Equatable without
+        // the bytes — the image is a sidecar.
+        let b64 = Data([0xFF, 0xD8, 0xFF, 0x00]).base64EncodedString()
+        let ev: [String: Any] = ["type": "progress", "step": 8, "total": 30,
+                                 "preview": b64, "mime": "image/jpeg", "w": 256, "h": 144]
+        XCTAssertEqual(MediaSSE.classify(ev), .progress(step: 8, total: 30, stage: "Generating"))
+        XCTAssertEqual(MediaSSE.previewJPEG(ev), Data([0xFF, 0xD8, 0xFF, 0x00]))
+        XCTAssertNil(MediaSSE.previewJPEG(["type": "progress", "step": 1]))
+        // `preview` is the ONE key the server emits. Reading invented aliases
+        // would make a typo look like a working client.
+        XCTAssertNil(MediaSSE.previewJPEG(["image": b64]))
+        XCTAssertNil(MediaSSE.previewJPEG(["b64_json": b64]))
+    }
+
     func testStageNamesTheEnginesEmitBecomeReadableLabels() {
         XCTAssertEqual(MediaSSE.stageLabel("encode"), "Encoding prompt")
         XCTAssertEqual(MediaSSE.stageLabel("diffuse"), "Composing")

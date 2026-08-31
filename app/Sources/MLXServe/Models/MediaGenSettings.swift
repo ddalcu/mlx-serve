@@ -338,6 +338,10 @@ struct VideoGenSettings: Codable, Equatable {
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
     /// Empty = none attached.
     var loras: [LoraAdapter] = []
+    /// Per-step latent previews on the SSE stream (issue #208). Default OFF:
+    /// every step pays an x0 solve plus a host copy of the previewed frames,
+    /// and the picture is a linear projection of the latent, not a decode.
+    var livePreview: Bool = false
     /// Height of the drag-resizable prompt editor.
     var promptHeight: Double = PromptEditorHeight.defaultHeight
     /// The size last typed into the Custom… fields, kept across preset switches
@@ -431,6 +435,7 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .bestQuality) { bestQuality = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turbo) { turbo = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .livePreview) { livePreview = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .promptHeight) {
             promptHeight = PromptEditorHeight.clamp(v)
         }

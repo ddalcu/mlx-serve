@@ -15,6 +15,14 @@ comptime {
     }
 }
 
+/// stb_image_write's JPEG bit-packer relies on WRAPPING left shifts of a signed
+/// int (`bitBuf <<= 8`), which is UB by the letter of C and which Zig's C
+/// frontend TRAPS under UBSan — so a Debug build of any graph that encodes a
+/// JPEG aborts inside libc. One flag list, used at every site that compiles it,
+/// because the flag is about the C source and not about which graph it is in
+/// (`zig build test` is Debug and ran 6 crashed tests without it).
+const stb_write_flags: []const []const u8 = &.{ "-O2", "-fno-sanitize=undefined" };
+
 pub fn build(b: *std.Build) void {
     // Pin LC_BUILD_VERSION minos to macOS 26.2 — the honest floor: the linked
     // libmlx is built at deployment target 26.2 (NAX kernels, scripts/
@@ -48,6 +56,16 @@ pub fn build(b: *std.Build) void {
         verifyBrewDeps(b);
         verifyMlxStage(b);
     }
+
+    // Hermetic Latent2RGB/JPEG tests: the COMPILED artifact links no MLX and
+    // no Homebrew webp, which is what lets a Linux Cloud Agent build it — on
+    // Linux this is the only graph registered. On a Mac the step builds the
+    // same hermetic artifact, but `verifyBrewDeps`/`verifyMlxStage` above run
+    // at CONFIGURE time for every step, so it is not a way to build without a
+    // staged mlx.
+    // Native query — do not inherit the macOS 26.2 minos default_target.
+    addPreviewTest(b, b.resolveTargetQuery(.{}));
+    if (builtin.os.tag != .macos) return;
 
     // App version. Release builds pass it explicitly (app/build.sh computes the
     // next CalVer from the GitHub releases and stamps it into app/Info.plist;
@@ -117,7 +135,7 @@ pub fn build(b: *std.Build) void {
     // stb_image for JPEG/PNG decoding in the vision pipeline
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     // stb_image_write for PNG encoding (native image-generation endpoint)
-    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
     mod.addIncludePath(b.path("lib"));
 
     // xatlas UV unwrapping (MIT, vendored amalgamation) + C shim for the
@@ -198,7 +216,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
+    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
     test_mod.addIncludePath(b.path("lib"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
@@ -268,6 +286,29 @@ pub fn build(b: *std.Build) void {
     const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+}
+
+/// Hermetic Latent2RGB + JPEG tests. No MLX, no Homebrew — the only `zig build`
+/// graph that is valid on Linux (issue #208). The ARTIFACT is hermetic, the
+/// STEP is not a way around a missing mlx: `verifyBrewDeps` + `verifyMlxStage`
+/// run at configure time for every step, so on a Mac `lib/mlx/` must be staged
+/// before this builds. UBSan is off for stb (its bit shifts trip the sanitizer).
+fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/preview.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
+    mod.addIncludePath(b.path("lib"));
+    const tests = b.addTest(.{
+        .name = "preview-test",
+        .root_module = mod,
+    });
+    const run = b.addRunArtifact(tests);
+    const step = b.step("preview-test", "Hermetic JPEG / Latent2RGB preview tests (no MLX)");
+    step.dependOn(&run.step);
 }
 
 /// `zig build vz-agent` → `zig-out/guest/vz-agent` (static aarch64 Linux ELF),
@@ -394,7 +435,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addImport("stb", addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), ios_target, .ReleaseFast, ios_sdk));
     mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{ios_include}) }, .{ .cwd_relative = ios_include }, ios_target, .ReleaseFast, ios_sdk));
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
     // xatlas UV unwrapping (C++), used by the Hunyuan3D texture paint stage via
     // src/uvwrap.zig extern decls — compiled into the lib like the macOS exe.
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });

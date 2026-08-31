@@ -59,7 +59,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `POST /v1/images/generations`, `POST /v1/images/edits` — image generation and instruction edits; the edits endpoint speaks the OpenAI SDK's multipart shape (`client.images.edit`), including repeated `image[]` for multi-reference
 - `POST /v1/audio/speech` — Qwen3-TTS (`ref_audio` clones a voice) or Kokoro (`voice` picks or blends one of 54), WAV out
 - `POST /v1/audio/music-generations` — text-to-music, WAV out: ACE-Step (48 kHz stereo, fast) or MiniMax Music 3 (`lyrics` required, 44.1 kHz, songs up to six minutes)
-- `POST /v1/video/generations` — LTX-Video 2.3 / 2.5 or MiniMax-H3; base64 `rgb8` frames plus `pcm_s16le` audio, mux on your side. LTX 2.5 takes `"decoder": "diffusion"` for its sharper diffusion decoder; long H3 clips chain via `chain_windows`
+- `POST /v1/video/generations` — LTX-Video 2.3 / 2.5 or MiniMax-H3; base64 `rgb8` frames plus `pcm_s16le` audio, mux on your side. LTX 2.5 takes `"decoder": "diffusion"` for its sharper diffusion decoder; long H3 clips chain via `chain_windows`. Opt-in `"preview": true` on `"stream": true` attaches a Latent2RGB JPEG to each denoise `progress` event (`preview_frames`, `preview_max_side`)
 - `POST /v1/3d/generations` — Hunyuan3D-2.1, base64 GLB
 - `POST /v1/load-model`, `POST /v1/unload-model` — load a discovered model (or one by absolute path), free one now; `"default": true` makes the loaded model the serving default without a restart
 - `POST /v1/models/rescan` — pick up models downloaded while the server runs (the app calls it after every download)
@@ -67,4 +67,4 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `GET /metrics`, `GET /metrics.json` — Prometheus + JSON (needs `--metrics`)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` — fetch / delete stored responses
 
-Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked.
+Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Video streams also accept `"preview": true` for a cheap JPEG on each denoise step (off by default; cached-velocity H3 steps stay preview-less). Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked.

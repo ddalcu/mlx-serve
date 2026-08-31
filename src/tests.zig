@@ -64,6 +64,8 @@ test {
     _ = @import("minimax_h3_vae.zig");
     _ = @import("minimax_h3_audio.zig");
     _ = @import("png.zig");
+    _ = @import("jpeg.zig");
+    _ = @import("preview.zig");
     _ = @import("marching_cubes.zig");
     _ = @import("glb.zig");
     _ = @import("hunyuan3d.zig");

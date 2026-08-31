@@ -2781,6 +2781,10 @@ const QSA_MASK_BYTES_PER_KEY: u64 = 4;
 /// prompt length.
 pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64 {
     if (config.indexer_budget == 0) return 0;
+    // Prefill widths gather by block index (row-chunked score sheet, no
+    // [S, kv] mask); decode/verify widths still build the dense mask.
+    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
+        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -3164,7 +3168,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -5434,6 +5438,7 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     };
+    const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
     const tokenize_ns = tokenize_sw.read();
@@ -5450,12 +5455,12 @@ fn handleChatCompletions(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -5471,7 +5476,7 @@ fn handleChatCompletions(
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
     // slot at submit (mirrors the vision-embeddings handoff below).
-    var local_mrope = computeQwenMrope(allocator, prompt_ids, messages.items, config) catch MropeData{};
+    var local_mrope = computeQwenMrope(allocator, prompt_ids, if (active_media) |selected| selected.message else null, config) catch MropeData{};
     defer {
         if (local_mrope.pos) |p| allocator.free(p);
     }
@@ -9497,11 +9502,217 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
 
 // ── Vision Processing ──
 
+/// Return the newest media-bearing user message in the active turn.
+///
+/// Agent clients may append user-role context injections after the human's
+/// message. Looking only at the final user message therefore drops media from
+/// requests shaped like `[user(image), user(context)]`. The last assistant
+/// message is the durable turn boundary: media before it belongs to history
+/// and is deliberately not re-encoded by this request, while media after it
+/// is new input. Reconstructing historical multimodal placeholders is a
+/// separate, multi-message concern; this selector only identifies new media.
+const ActiveTurnMedia = struct {
+    message: *const chat_mod.Message,
+    /// Number of user messages rendered after `message`. This selects the
+    /// matching user-turn marker when media is followed by injected context.
+    user_markers_after: usize,
+    /// Tool-role messages after `message`, and the maximal consecutive runs
+    /// they form. ChatML templates wrap each tool-response RUN in its own
+    /// `<|im_start|>user`, so tool turns can add user markers the role count
+    /// above cannot see; `resolvedUserMarkersAfter` decides from the rendered
+    /// prompt which convention is in play.
+    tool_msgs_after: usize = 0,
+    tool_runs_after: usize = 0,
+    /// Whole-conversation totals the same resolver compares against.
+    total_users: usize = 0,
+    total_tool_msgs: usize = 0,
+    total_tool_runs: usize = 0,
+};
+
+fn activeTurnMediaMessage(msgs: []const chat_mod.Message, continue_final: bool) ?ActiveTurnMedia {
+    var i = msgs.len;
+    var user_markers_after: usize = 0;
+    var follows_tool_result = false;
+    while (i > 0) {
+        i -= 1;
+        const msg = &msgs[i];
+        if (std.mem.eql(u8, msg.role, "tool")) {
+            follows_tool_result = true;
+            continue;
+        }
+        if (std.mem.eql(u8, msg.role, "assistant")) {
+            // An explicit assistant-prefix continuation ends in an assistant
+            // message that is part of the current turn, not its boundary.
+            if (continue_final and i + 1 == msgs.len) continue;
+            // Tool results continue the user turn that caused the assistant's
+            // tool call. Cross only that typed boundary; an ordinary assistant
+            // answer still closes the turn. Repeated tool-call/result pairs
+            // work because the next result rearms this condition.
+            if (follows_tool_result and msg.tool_calls != null and msg.tool_calls.?.len > 0) {
+                follows_tool_result = false;
+                continue;
+            }
+            break;
+        }
+        if (!std.mem.eql(u8, msg.role, "user")) continue;
+        if ((msg.images != null and msg.images.?.len > 0) or
+            (msg.videos != null and msg.videos.?.len > 0) or
+            (msg.audio != null and msg.audio.?.len > 0))
+        {
+            var media = ActiveTurnMedia{ .message = msg, .user_markers_after = user_markers_after };
+            var prev_tool = false;
+            for (msgs, 0..) |*m, j| {
+                const is_tool = std.mem.eql(u8, m.role, "tool");
+                if (std.mem.eql(u8, m.role, "user")) media.total_users += 1;
+                if (is_tool) {
+                    media.total_tool_msgs += 1;
+                    if (!prev_tool) media.total_tool_runs += 1;
+                    if (j > i) {
+                        media.tool_msgs_after += 1;
+                        if (!prev_tool) media.tool_runs_after += 1;
+                    }
+                }
+                prev_tool = is_tool;
+            }
+            return media;
+        }
+        user_markers_after += 1;
+    }
+    return null;
+}
+
+/// How many user-turn markers sit after the media message in the RENDERED
+/// prompt. The role count alone cannot answer that: ChatML templates wrap a
+/// tool-response run in its own `<|im_start|>user` (token-exact — the
+/// `<tool_response>` special token keeps the marker's trailing newline its
+/// own token), while Llama renders tool results under an ipython header. The
+/// prompt is the authority: its total marker count matches exactly one
+/// convention's prediction; an unrecognized total keeps the conservative
+/// role-only count.
+fn resolvedUserMarkersAfter(prompt_ids: []const u32, config: *const model_mod.ModelConfig, media: ActiveTurnMedia) usize {
+    if (media.tool_msgs_after == 0) return media.user_markers_after;
+    const marker = config.userTurnMarkerSlice();
+    if (marker.len == 0 or prompt_ids.len < marker.len) return media.user_markers_after;
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i + marker.len <= prompt_ids.len) {
+        if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) {
+            found += 1;
+            i += marker.len;
+        } else i += 1;
+    }
+    if (found == media.total_users + media.total_tool_runs)
+        return media.user_markers_after + media.tool_runs_after;
+    if (found == media.total_users + media.total_tool_msgs)
+        return media.user_markers_after + media.tool_msgs_after;
+    return media.user_markers_after;
+}
+
+test "activeTurnMediaMessage sees media before trailing user context" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "system", .content = "system" },
+        .{ .role = "user", .content = "human image prompt", .images = &images },
+        .{ .role = "user", .content = "<system-reminder>injected context</system-reminder>" },
+    };
+
+    const selected = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("human image prompt", selected.message.content);
+    try std.testing.expectEqual(@as(usize, 1), selected.user_markers_after);
+}
+
+test "activeTurnMediaMessage does not reprocess media before the assistant boundary" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "historical image", .images = &images },
+        .{ .role = "assistant", .content = "historical answer" },
+        .{ .role = "user", .content = "text-only continuation" },
+        .{ .role = "user", .content = "<system-reminder>current context</system-reminder>" },
+    };
+
+    try std.testing.expect(activeTurnMediaMessage(&msgs, false) == null);
+}
+
+test "activeTurnMediaMessage includes media before an assistant prefix continuation" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "partial answer" },
+    };
+
+    try std.testing.expect(activeTurnMediaMessage(&msgs, false) == null);
+    const selected = activeTurnMediaMessage(&msgs, true) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("image prompt", selected.message.content);
+}
+
+test "activeTurnMediaMessage crosses an assistant tool call and tool result" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const calls = [_]chat_mod.ToolCall{.{
+        .id = "call-1",
+        .name = "inspect",
+        .arguments = "{}",
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call-1" },
+    };
+
+    const selected = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("image prompt", selected.message.content);
+
+    const ordinary = [_]chat_mod.Message{
+        .{ .role = "user", .content = "historical image", .images = &images },
+        .{ .role = "assistant", .content = "ordinary answer" },
+        .{ .role = "tool", .content = "malformed stray result" },
+    };
+    try std.testing.expect(activeTurnMediaMessage(&ordinary, false) == null);
+}
+
+test "activeTurnMediaMessage chooses the newest media-bearing user in the active turn" {
+    const old_images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const new_images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 2,
+        .height = 2,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "historical image", .images = &old_images },
+        .{ .role = "assistant", .content = "historical answer" },
+        .{ .role = "user", .content = "new image", .images = &new_images },
+        .{ .role = "user", .content = "trailing injected context" },
+    };
+
+    const selected = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("new image", selected.message.content);
+    try std.testing.expectEqual(@as(u32, 2), selected.message.images.?[0].width);
+}
+
 /// Collect images from messages, run vision encoder, set embeddings on transformer.
-/// Encode vision images from the last user message and return the resulting
+/// Encode vision images from the active turn and return the resulting
 /// `[1, total_tokens, hidden]` array. Caller owns the returned array (free
 /// via `mlx_array_free` if not transferred to a scheduler slot). Returns
-/// `null` when there are no images on the last user turn.
+/// `null` when the active turn has no media.
 ///
 /// Phase A8: per-request ownership. Earlier versions wrote the result into
 /// `xfm.vision_embeddings` (a global field on Transformer), which raced
@@ -9529,7 +9740,7 @@ fn processVisionImages(
     allocator: std.mem.Allocator,
     lm: *LoadedModel,
     vision_enc: *VisionEncoder,
-    msgs: []const chat_mod.Message,
+    active_media: ?ActiveTurnMedia,
     out_n_vision: *usize,
     out_n_video: *usize,
     out_n_audio: *usize,
@@ -9539,27 +9750,13 @@ fn processVisionImages(
     out_n_video.* = 0;
     out_n_audio.* = 0;
     out_vision_key.* = 0;
-    // Only process media from the LAST user message. Previous turns' images /
-    // videos / audio were already processed in their original request;
-    // re-processing wastes context and causes stale feature confusion.
-    var last_user_images: ?[]const chat_mod.ImageData = null;
-    var last_user_videos: ?[]const chat_mod.VideoData = null;
-    var last_user_audio: ?[]const chat_mod.AudioData = null;
-    var i = msgs.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, msgs[i].role, "user")) {
-            last_user_images = msgs[i].images;
-            last_user_videos = msgs[i].videos;
-            last_user_audio = msgs[i].audio;
-            break;
-        }
-    }
-
-    const images: []const chat_mod.ImageData = last_user_images orelse &.{};
-    const videos: []const chat_mod.VideoData = last_user_videos orelse &.{};
-    const audio: []const chat_mod.AudioData = last_user_audio orelse &.{};
-    if (images.len == 0 and videos.len == 0 and audio.len == 0) return null;
+    // Restrict selection to the suffix after the last assistant message so a
+    // text-only continuation does not re-encode historical media, while
+    // trailing user-role context injections cannot hide a new attachment.
+    const media_msg = (active_media orelse return null).message;
+    const images: []const chat_mod.ImageData = media_msg.images orelse &.{};
+    const videos: []const chat_mod.VideoData = media_msg.videos orelse &.{};
+    const audio: []const chat_mod.AudioData = media_msg.audio orelse &.{};
     out_vision_key.* = mediaKey(images, videos, audio);
 
     log.info("Multimodal: processing {d} image(s), {d} video(s), {d} audio clip(s)\n", .{ images.len, videos.len, audio.len });
@@ -9757,14 +9954,19 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
     return result;
 }
 
-/// Locate the byte offset just after the last user-turn marker in `prompt_ids`.
-/// Mirrors insertImageTokens' search; shared by the multimodal inserter.
-fn userTurnInsertPos(prompt_ids: []const u32, config: *const model_mod.ModelConfig) usize {
+/// Locate the byte offset just after the user-turn marker that owns the media.
+/// `markers_after=0` preserves the historical last-user behavior; injected
+/// user-role context increments it so media is placed beside its source turn.
+fn userTurnInsertPos(prompt_ids: []const u32, config: *const model_mod.ModelConfig, markers_after: usize) usize {
     const marker = config.userTurnMarkerSlice();
     if (marker.len > 0 and prompt_ids.len >= marker.len) {
+        var remaining = markers_after;
         var i = prompt_ids.len - marker.len;
         while (true) {
-            if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) return i + marker.len;
+            if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) {
+                if (remaining == 0) return i + marker.len;
+                remaining -= 1;
+            }
             if (i == 0) break;
             i -= 1;
         }
@@ -9787,30 +9989,24 @@ pub const MropeData = struct {
 };
 
 /// Compute the interleaved-M-RoPE table from the FINAL prompt_ids (after image-pad
-/// expansion) + the last user turn's image grids. Returns an empty bundle when the
+/// expansion) + the active media message's image grids. Returns an empty bundle when the
 /// model isn't Qwen-vision or there are no images. Caller owns `pos`.
-fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs: []const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
+fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, media_msg: ?*const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
     if (!config.qwen_vision) return .{};
-    // Collect the last user message's image AND video grids (full patch grid
+    const msg = media_msg orelse return .{};
+    // Collect the active message's image AND video grids (full patch grid
     // per block, in their own modality's document order — getRopeIndex
     // interleaves the two lists by whichever marker occurs first in tokens).
     var image_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
     defer image_grids.deinit(allocator);
     var video_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
     defer video_grids.deinit(allocator);
-    var i = msgs.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, msgs[i].role, "user")) {
-            if (msgs[i].images) |imgs| for (imgs) |im| {
-                if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
-            };
-            if (msgs[i].videos) |vids| for (vids) |vd| {
-                try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
-            };
-            break;
-        }
-    }
+    if (msg.images) |imgs| for (imgs) |im| {
+        if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+    };
+    if (msg.videos) |vids| for (vids) |vd| {
+        try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
+    };
     if (image_grids.items.len == 0 and video_grids.items.len == 0) return .{};
 
     var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, image_grids.items, video_grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
@@ -9838,19 +10034,12 @@ fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs:
 /// which case the caller falls back to the flat BOI/pads/EOI run.
 fn lfm2ImageSegment(
     allocator: std.mem.Allocator,
-    msgs: []const chat_mod.Message,
+    media_msg: ?*const chat_mod.Message,
     config: *const model_mod.ModelConfig,
 ) !?[]u32 {
     if (!config.lfm2_vision or config.image_token_id == 0) return null;
-    var images: []const chat_mod.ImageData = &.{};
-    var i = msgs.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, msgs[i].role, "user")) {
-            images = msgs[i].images orelse &.{};
-            break;
-        }
-    }
+    const msg = media_msg orelse return null;
+    const images: []const chat_mod.ImageData = msg.images orelse &.{};
     if (images.len == 0) return null;
 
     var seg = std.ArrayList(u32).empty;
@@ -9901,14 +10090,14 @@ fn insertMultimodalTokens(
     audio_token_id: u32,
     n_audio: usize,
     config: *const model_mod.ModelConfig,
-    msgs: []const chat_mod.Message,
+    active_media: ?ActiveTurnMedia,
 ) ![]u32 {
     const want_image = image_token_id != 0 and n_image > 0;
     const want_video = video_token_id != 0 and n_video > 0;
     const want_audio = audio_token_id != 0 and n_audio > 0;
     if (!want_image and !want_video and !want_audio) return try allocator.dupe(u32, prompt_ids);
 
-    const insert_pos = userTurnInsertPos(prompt_ids, config);
+    const insert_pos = userTurnInsertPos(prompt_ids, config, if (active_media) |media| resolvedUserMarkersAfter(prompt_ids, config, media) else 0);
 
     // Qwen3-VL wraps the image-pad run (and, identically, the video-pad run)
     // with <|vision_start|>/<|vision_end|> (get_rope_index keys on vision_start
@@ -9918,7 +10107,7 @@ fn insertMultimodalTokens(
     const boa = config.boa_token_id;
     const eoa = config.eoa_token_id;
 
-    const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, msgs, config) else null;
+    const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
     defer if (lfm2_seg) |ls| allocator.free(ls);
 
     var seg = std.ArrayList(u32).empty;
@@ -10713,7 +10902,6 @@ test "RequestMedia frees every decoded buffer it was handed" {
     media.deinit();
 }
 
-
 // ── Anthropic Messages API ──
 
 fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
@@ -11371,6 +11559,7 @@ fn handleAnthropicMessages(
     // endpoint has always given.
     const continue_final = chat_mod.continuationRequested(messages.items) and
         continuationRejectReason(lm.ds4_engine != null) == null;
+    const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
@@ -11390,12 +11579,12 @@ fn handleAnthropicMessages(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -13006,6 +13195,7 @@ fn handleResponses(
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
     const tokenize_ns = tokenize_sw.read();
+    const active_media = activeTurnMediaMessage(pi.messages.items, false);
 
     // ── vision encoder ──
     // Phase A8: per-request ownership. Defer frees if we don't end up
@@ -13019,12 +13209,12 @@ fn handleResponses(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, pi.messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -15672,7 +15862,7 @@ test "lfm2ImageSegment labels every tile and closes on the thumbnail" {
         .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 4 },
     };
     const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
-    const seg = (try lfm2ImageSegment(testing.allocator, &msgs, &config)) orelse return error.NoSegment;
+    const seg = (try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
     defer testing.allocator.free(seg);
 
     // Row/col ids are laid out over the MAX grid (10 wide), not this image's:
@@ -15706,14 +15896,14 @@ test "lfm2ImageSegment wraps an untiled image and declines every other arch" {
         .{ .pixels = "", .width = 0, .height = 0, .grid_h = 4, .grid_w = 2 },
     };
     const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
-    const seg = (try lfm2ImageSegment(testing.allocator, &msgs, &config)) orelse return error.NoSegment;
+    const seg = (try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
     defer testing.allocator.free(seg);
     const want = [_]u32{ 125009, 124907, 124907, 125010 };
     try testing.expectEqualSlices(u32, &want, seg);
 
     // Not LFM2-VL ⇒ null, so every other arch keeps the flat BOI/pads/EOI run.
     config.lfm2_vision = false;
-    try testing.expect((try lfm2ImageSegment(testing.allocator, &msgs, &config)) == null);
+    try testing.expect((try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) == null);
 }
 
 test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
@@ -15747,7 +15937,7 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
 
     const prompt = [_]u32{ 2, 500, 105, 2364, 107, 900, 901 };
     // image_token=999 ×2, video absent (token=777, n=0), audio_token=888 ×3.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 3, &config, &.{});
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 3, &config, null);
     defer testing.allocator.free(out);
 
     // Inserted after marker (position 5): [BOI 999 999 EOI][BOA 888 888 888 EOA].
@@ -15775,7 +15965,7 @@ test "insertMultimodalTokens lays out image block then video block then audio bl
     const prompt = [_]u32{ 1, 105, 7 };
 
     // image_token=999 ×2, video_token=777 ×3, audio_token=888 ×1.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 3, 888, 1, &config, &.{});
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 3, 888, 1, &config, null);
     defer testing.allocator.free(out);
     const expected = [_]u32{
         1, 105,
@@ -15798,26 +15988,103 @@ test "insertMultimodalTokens handles audio-only, image-only, and video-only" {
     const prompt = [_]u32{ 1, 105, 7 };
 
     // Audio only (n_image=0, n_video=0) → just the audio block.
-    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 2, &config, &.{});
+    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 2, &config, null);
     defer testing.allocator.free(ao);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 7 }, ao);
 
     // Image only (n_video=0, n_audio=0) → just the image block.
-    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 0, &config, &.{});
+    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 0, &config, null);
     defer testing.allocator.free(io);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 7 }, io);
 
     // Video only (n_image=0, n_audio=0) → just the video block, wrapped in the
     // SAME BOI/EOI as an image block (non-Qwen config here; Qwen's vision_start
     // is exercised by the interleaved test above).
-    const vo = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 2, 888, 0, &config, &.{});
+    const vo = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 2, 888, 0, &config, null);
     defer testing.allocator.free(vo);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 777, 777, 201, 7 }, vo);
 
     // Neither → unchanged.
-    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 0, &config, &.{});
+    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 0, &config, null);
     defer testing.allocator.free(none);
     try testing.expectEqualSlices(u32, &prompt, none);
+}
+
+test "insertMultimodalTokens targets the media user before injected context" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "user", .content = "context one" },
+        .{ .role = "user", .content = "context two" },
+    };
+    const media = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    const prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 33 };
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(out);
+
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+}
+
+test "insertMultimodalTokens counts a ChatML tool-response user marker" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    // ChatML templates wrap a tool-response run in its OWN `<|im_start|>user`
+    // (token-exact: `<tool_response>` is a special token, so the marker bytes
+    // survive BPE). Counting user-ROLE messages alone lands the pads after the
+    // tool response instead of the human's image turn.
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const calls = [_]chat_mod.ToolCall{.{ .id = "call-1", .name = "inspect", .arguments = "{}" }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call-1" },
+        .{ .role = "user", .content = "injected context" },
+    };
+    const media = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    // Markers: image turn, tool-response wrapper, injected context — 3 total
+    // for 2 user messages + 1 tool run, which is the ChatML signature.
+    const prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 33 };
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+
+    // Consecutive tool messages share ONE wrapper (a run), still 3 markers.
+    const run_msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result a", .tool_call_id = "call-1" },
+        .{ .role = "tool", .content = "result b", .tool_call_id = "call-2" },
+        .{ .role = "user", .content = "injected context" },
+    };
+    const run_media = activeTurnMediaMessage(&run_msgs, false) orelse return error.TestExpectedMedia;
+    const run_out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, run_media);
+    defer testing.allocator.free(run_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, run_out);
+
+    // A per-message template (no run merging) renders one marker per tool
+    // message: 4 markers for 2 users + 2 tool messages.
+    const permsg_prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 23, 105, 33 };
+    const permsg_out = try insertMultimodalTokens(testing.allocator, &permsg_prompt, 999, 1, 777, 0, 888, 0, &config, run_media);
+    defer testing.allocator.free(permsg_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 23, 105, 33 }, permsg_out);
+
+    // A family that renders tool results under its OWN header (Llama ipython)
+    // emits NO user marker for the tool turn: 2 markers for 2 user messages —
+    // the role-only count is already right and must stay untouched.
+    const llama_prompt = [_]u32{ 1, 105, 11, 44, 44, 105, 33 };
+    const llama_out = try insertMultimodalTokens(testing.allocator, &llama_prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(llama_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 44, 44, 105, 33 }, llama_out);
 }
 
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
@@ -16273,6 +16540,31 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
         allocator.free(single);
     }
     try std.testing.expectEqual(@as(usize, 1), single.len);
+}
+
+test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoint" {
+    // Exercises the EXACT function every HTTP dispatch site in this file calls,
+    // proving the new dialect is wired all the way through — not just reachable
+    // from chat.parseToolCalls in isolation. Uses the Agent shell tool's real
+    // declared schema shape.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
 }
 
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
@@ -17049,8 +17341,19 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     twin.max_position_embeddings = 262144;
     var q4 = twin;
     q4.indexer_budget = 2048;
+    q4.indexer_n_heads = 4;
+    q4.indexer_head_dim = 128;
+    q4.indexer_compress_ratio = 4;
     try t.expectEqual(@as(u64, 0), qsaMaskBytes(&twin, 4096, 25000));
-    try t.expectEqual(@as(u64, 4 * 4096 * 25000 * 5 / 4), qsaMaskBytes(&q4, 4096, 25000));
+    // Decode/verify widths build the dense mask; prefill widths gather by
+    // block and bill the bounded score sheet instead of 4 B x rows x keys.
+    try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
+    transformer_mod.qsa_gather_override = true;
+    defer transformer_mod.qsa_gather_override = null;
+    const gathered = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expect(gathered > 0);
+    try t.expect(gathered < 4 * 4096 * 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4), gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);
     const q4_bill = prefillTransientReserve(&q4, 16, 8192);
     try t.expectEqual(twin_bill + qsaMaskBytes(&q4, 8192, 8192), q4_bill);

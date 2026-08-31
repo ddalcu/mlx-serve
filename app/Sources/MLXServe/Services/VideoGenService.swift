@@ -30,6 +30,7 @@ final class VideoGenService: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
+    @Published private(set) var livePreview: NSImage? = nil
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
     @Published private(set) var residency: Residency? = nil
@@ -44,6 +45,15 @@ final class VideoGenService: ObservableObject {
     private func setPhase(_ p: Phase, for gen: Int) {
         guard gen == generationSeq else { return }
         phase = p
+        switch p {
+        case .running: break
+        default: livePreview = nil
+        }
+    }
+
+    private func setLivePreview(_ img: NSImage?, for gen: Int) {
+        guard gen == generationSeq else { return }
+        livePreview = img
     }
 
     /// A cancelled URLSession request surfaces as URLError.cancelled, not
@@ -79,6 +89,7 @@ final class VideoGenService: ObservableObject {
         task?.cancel()
         generationSeq += 1
         let gen = generationSeq
+        livePreview = nil
         phase = .running(step: 0, total: 3, message: "Loading model…")
         log = []
 
@@ -182,6 +193,9 @@ final class VideoGenService: ObservableObject {
                                                floorPerStep: pricing.perStep, tail: pricing.tail),
                            eta > 0 {
                             message += " \(H3TimeEstimate.duration(eta)) left"
+                        }
+                        if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
+                            setLivePreview(img, for: gen)
                         }
                         setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
                     case "complete":
@@ -318,7 +332,10 @@ final class VideoGenService: ObservableObject {
         task?.cancel()
         task = nil
         // Instant feedback; the cancelled task's own catch re-confirms it.
-        if isRunning { phase = .cancelled }
+        if isRunning {
+            phase = .cancelled
+            livePreview = nil
+        }
     }
 
     // MARK: - Residency (model loaded? GPU memory?)
@@ -475,6 +492,16 @@ final class VideoGenService: ObservableObject {
             // `match` is the server's default; only an opt-out is stated.
             if request.refImageSize != .match { body["ref_image_size"] = request.refImageSize.rawValue }
         }
+        // Per-step latent previews on the SSE stream (issue #208), opt-in from
+        // the pane's own toggle. Absent = off, so a client that never asks
+        // pays nothing; asking costs an x0 solve plus a host copy of the
+        // previewed frames on every step.
+        if request.livePreview {
+            body["preview"] = true
+            body["preview_frames"] = 1
+            body["preview_max_side"] = 256
+        }
+
         return body
     }
 

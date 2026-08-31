@@ -3011,7 +3011,82 @@ pub const ProgressWindow = struct {
     label: []const u8 = "Generating",
     base: u32 = 0,
     total: u32 = 0, // 0 → use the sampler's own step count
+    /// Latent volume for opt-in per-step JPEG (#208). Zero F → no preview.
+    preview_f: u32 = 0,
+    preview_h: u32 = 0,
+    preview_w: u32 = 0,
+    preview_first_frame: bool = false,
 };
+
+fn copyArrayF32(alloc: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
+    const f = try asF32(x, s);
+    defer _ = mlx.mlx_array_free(f);
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const n: usize = mlx.mlx_array_size(c);
+    const raw = mlx.mlx_array_data_float32(c) orelse return error.NoData;
+    return alloc.dupe(f32, raw[0..n]);
+}
+
+/// Predicted clean video x0 (already unguided/guided) → Latent2RGB JPEG.
+/// Failures fall back to a preview-less progress event.
+fn tryEmitLtxPreview(
+    p: Progress,
+    alloc: std.mem.Allocator,
+    win: ProgressWindow,
+    step: u32,
+    total: u32,
+    x0_tokens: mlx.mlx_array,
+    s: S,
+) void {
+    if (!p.wantsPreview() or win.preview_f == 0 or win.preview_h == 0 or win.preview_w == 0) {
+        p.emit(win.label, step, total);
+        return;
+    }
+    const frame = renderLtxPreview(alloc, p.preview_opts, win, x0_tokens, s) catch {
+        p.emit(win.label, step, total);
+        return;
+    };
+    defer alloc.free(frame.jpeg);
+    p.emitPreview(win.label, step, total, frame);
+}
+
+/// Only the frames the strip shows cross to the host: a 480p 121-frame clip is
+/// F=31 latent frames, so the whole [1,128,F,H,W] volume is ~25 MB of f32 per
+/// step and one frame is 0.8 MB. The temporal pick therefore happens on the GPU
+/// (gather on the token grid's F axis), and `jpegFromLatent` sees a clip that is
+/// already exactly the wanted frames in order.
+fn renderLtxPreview(
+    alloc: std.mem.Allocator,
+    opts: @import("preview.zig").Opts,
+    win: ProgressWindow,
+    x0_tokens: mlx.mlx_array,
+    s: S,
+) !@import("preview.zig").Encoded {
+    const preview_mod = @import("preview.zig");
+    const shp = mlx.getShape(x0_tokens);
+    if (shp.len < 3) return error.BadLatentShape;
+    const nv: u32 = @intCast(shp[1]);
+    if (nv != win.preview_f * win.preview_h * win.preview_w) return error.BadLatentShape;
+
+    var idx_buf: [preview_mod.Opts.max_frames]u32 = undefined;
+    const idx = preview_mod.temporalIndices(&idx_buf, win.preview_f, opts.normalize().frames, win.preview_first_frame);
+    const n: u32 = @intCast(idx.len);
+
+    const vol = try unpatchifyVideoFrames(x0_tokens, win.preview_f, win.preview_h, win.preview_w, idx, s);
+    defer _ = mlx.mlx_array_free(vol);
+    const cpu = try copyArrayF32(alloc, vol, s);
+    defer alloc.free(cpu);
+    // The gather already applied the temporal pick, so the sub-clip's own
+    // frames are 0..n-1 in order.
+    return preview_mod.jpegFromLatent(alloc, preview_mod.ltx_av, cpu, n, win.preview_h, win.preview_w, .{
+        .enabled = true,
+        .frames = n,
+        .max_side = opts.max_side,
+    }, false);
+}
 
 /// One guided x0 prediction for both modalities (reference guided_denoise_loop
 /// steps 1-5): conditional forward, plus the unconditional / STG-perturbed /
@@ -3174,7 +3249,7 @@ pub fn ditSampleCfg(
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
         if (progress) |p| {
-            p.emit(win.label, win.base + @as(u32, @intCast(i + 1)), total);
+            tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(i + 1)), total, x0.v, s);
             // Client hung up (progress write failed) → stop burning GPU on a
             // video nobody will receive; the queued next request unblocks.
             if (p.cancelled()) {
@@ -3555,7 +3630,8 @@ pub fn ditSampleRes2s(
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
         if (progress) |p| {
-            p.emit(win.label, win.base + @as(u32, @intCast(step + 1)), total);
+            // d2.v is the second-stage x0 prediction (the later, refined one).
+            tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(step + 1)), total, d2.v, s);
             // vx/ax are released by the function's errdefers.
             if (p.cancelled()) return error.Cancelled;
         }
@@ -3862,6 +3938,36 @@ pub fn unpatchifyVideo(tokens: mlx.mlx_array, F: u32, H: u32, W: u32, s: S) !mlx
     return out;
 }
 
+/// `unpatchifyVideo` for a SUBSET of the temporal axis: `[1,C,n,H,W]` holding
+/// frames `want` in the order given. The gather runs before the transpose so the
+/// materialized result is n frames wide, not F.
+pub fn unpatchifyVideoFrames(tokens: mlx.mlx_array, F: u32, H: u32, W: u32, want: []const u32, s: S) !mlx.mlx_array {
+    if (want.len == 0) return error.BadLatentShape;
+    const C: c_int = mlx.getShape(tokens)[2];
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_reshape(&r, tokens, &[_]c_int{ 1, @intCast(F), @intCast(H), @intCast(W), C }, 5, s));
+
+    var idx_i32: [8]i32 = undefined;
+    if (want.len > idx_i32.len) return error.BadLatentShape;
+    for (want, 0..) |v, i| {
+        if (v >= F) return error.BadLatentShape;
+        idx_i32[i] = @intCast(v);
+    }
+    const idx = mlx.mlx_array_new_data(&idx_i32, &[_]c_int{@intCast(want.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_take_axis(&g, r, idx, 1, s)); // [1,n,H,W,C]
+
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, g, &[_]c_int{ 0, 4, 1, 2, 3 }, 5, s)); // [1,C,n,H,W]
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, t, false, s));
+    return out;
+}
+
 /// Convert decoded pixels [1,3,F,H,W] (≈[-1,1]) to RGB uint8 frames laid out as
 /// [F, H, W, 3] (row-major). Matches the reference clip→(x+1)*127.5→uint8→HWC.
 /// Returns a freshly-allocated `[]u8` of length F*H*W*3 (caller frees).
@@ -4157,7 +4263,15 @@ pub fn generateVideoFrames(
 
     // ── denoise ──
     const total_steps: u32 = @intCast(sigmas.len - 1);
-    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, sampler_vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
+    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, sampler_vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{
+        .label = "Generating",
+        .base = 0,
+        .total = total_steps,
+        .preview_f = F,
+        .preview_h = H,
+        .preview_w = W,
+        .preview_first_frame = cond_image != null,
+    }, s);
     defer _ = mlx.mlx_array_free(final.v);
     // final.a (audio latent [1, Na, 128]) is transferred to the caller below for
     // optional audio decode; if anything fails before then, free it.
@@ -4483,7 +4597,15 @@ pub fn generateVideoFramesTwoStage(
 
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
     const stage1_vpos = if (cond1) |c| c.positions else vpos1;
-    const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
+    const win1 = ProgressWindow{
+        .label = "Stage 1",
+        .base = 0,
+        .total = total,
+        .preview_f = F,
+        .preview_h = H1,
+        .preview_w = W1,
+        .preview_first_frame = cond_image_half != null,
+    };
     const out1 = if (opts.hq)
         try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, stage1_vpos, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
     else
@@ -4545,7 +4667,15 @@ pub fn generateVideoFramesTwoStage(
 
     const stage2_v = if (cond2) |c| c.init_latent else noisy_v2;
     const stage2_vpos = if (cond2) |c| c.positions else vpos2;
-    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, stage2_vpos, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
+    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, stage2_vpos, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{
+        .label = "Stage 2",
+        .base = opts.stage1_steps,
+        .total = total,
+        .preview_f = F,
+        .preview_h = H2,
+        .preview_w = W2,
+        .preview_first_frame = cond_image_full != null,
+    }, s);
     defer _ = mlx.mlx_array_free(out2.v);
     // stage-2 audio replaces stage-1 as the decoded track.
     _ = mlx.mlx_array_free(audio1.?);
@@ -4877,6 +5007,120 @@ test "ltx VAE encoder reproduces reference VideoEncoder" {
     const corr = corrF32(mlx.mlx_array_data_float32(outf).?, ref, 0);
     std.debug.print("[ltx-enc] n={d} corr={d:.6}\n", .{ n, corr });
     try testing.expect(corr > 0.998);
+}
+
+// The PERCEPTUAL bar for the denoise preview (issue #208 review). preview.zig's
+// fixture oracle proves our projection is ComfyUI's; it cannot prove ComfyUI's
+// projection looks like the video. So: encode a real image with the real VAE,
+// decode it back, box-average the decode down to the latent grid and correlate
+// against the preview of the same latent. The golden-angle hue wheel this used
+// to ship is the control arm — the H3 twin lives in minimax_h3_vae.zig.
+// This needs vae_encoder + vae_decoder and NOTHING else — 1.45 GB of a pack
+// whose full form is 40 GB. So it takes its own var and only falls back to the
+// full-pack one: pointing LTX_TEST_MODEL at a VAE-only dir would fail the seven
+// live tests that legitimately demand a connector, a transformer and fixtures.
+//   LTX_VAE_DIR (preferred) or LTX_TEST_MODEL
+test "ltx preview: the Latent2RGB preview resembles the decoded frame" {
+    const raw = std.c.getenv("LTX_VAE_DIR") orelse std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.mem.span(raw);
+    if (dir.len == 0) return error.SkipZigTest;
+    const preview_mod = @import("preview.zig");
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const ep = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_encoder.safetensors", .{dir}, 0);
+    defer allocator.free(ep);
+    const dp = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{dir}, 0);
+    defer allocator.free(dp);
+    var enc = loadComponent(allocator, ep, cpu_s) catch return error.SkipZigTest;
+    defer enc.deinit();
+    var dec = loadComponent(allocator, dp, cpu_s) catch return error.SkipZigTest;
+    defer dec.deinit();
+    {
+        var it = enc.map.iterator();
+        while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+        var it2 = dec.map.iterator();
+        while (it2.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+    }
+
+    // 512 px = a 16x16 latent grid at LTX's 32x spatial compression, one
+    // independent colour per cell. Ramps do NOT discriminate here: summing 128
+    // channels at uniform magnitude reproduced a gradient's chroma at 0.79
+    // against the fit's 0.94, so the control arm was passing on content, not on
+    // being right.
+    const px: u32 = 512;
+    const buf = try preview_mod.perceptualTestFrame(allocator, px, 32);
+    defer allocator.free(buf);
+    const pshape = [_]c_int{ 1, 3, 1, @intCast(px), @intCast(px) };
+    const px_f32 = mlx.mlx_array_new_data(buf.ptr, &pshape, 5, .float32);
+    defer _ = mlx.mlx_array_free(px_f32);
+    var pxb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pxb);
+    try mlx.check(mlx.mlx_astype(&pxb, px_f32, .bfloat16, s));
+
+    const lat = try vaeEncode(&enc, pxb, s);
+    defer _ = mlx.mlx_array_free(lat);
+    var latf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(latf);
+    try mlx.check(mlx.mlx_astype(&latf, lat, .float32, s));
+    _ = mlx.mlx_array_eval(latf);
+    const lshp = mlx.getShape(latf);
+    const lc: u32 = @intCast(lshp[1]);
+    const lt: u32 = @intCast(lshp[2]);
+    const lh: u32 = @intCast(lshp[3]);
+    const lw: u32 = @intCast(lshp[4]);
+    try testing.expectEqual(preview_mod.ltx_av.channels(), lc);
+    const lat_host = (mlx.mlx_array_data_float32(latf) orelse return error.NoLatentData)[0 .. @as(usize, lc) * lt * lh * lw];
+
+    const fit = try allocator.alloc(u8, @as(usize, lh) * lw * 3);
+    defer allocator.free(fit);
+    preview_mod.latentSliceToRgb(preview_mod.ltx_av, lat_host, lt, lh, lw, 0, fit);
+    const ctrl_map = preview_mod.goldenAngleControlMap(128);
+    const ctrl = try allocator.alloc(u8, @as(usize, lh) * lw * 3);
+    defer allocator.free(ctrl);
+    preview_mod.latentSliceToRgb(ctrl_map, lat_host, lt, lh, lw, 0, ctrl);
+
+    const out = try vaeDecode(&dec, lat, s);
+    defer _ = mlx.mlx_array_free(out);
+    var outf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(outf);
+    try mlx.check(mlx.mlx_astype(&outf, out, .float32, s));
+    _ = mlx.mlx_array_eval(outf);
+    const oshp = mlx.getShape(outf);
+    const ot: usize = @intCast(oshp[2]);
+    const oh: usize = @intCast(oshp[3]);
+    const ow: usize = @intCast(oshp[4]);
+    const odata = mlx.mlx_array_data_float32(outf) orelse return error.NoPixelData;
+    const decoded = try allocator.alloc(u8, oh * ow * 3);
+    defer allocator.free(decoded);
+    for (0..oh) |y| {
+        for (0..ow) |x| {
+            for (0..3) |c| {
+                const v = (odata[c * ot * oh * ow + y * ow + x] + 1.0) * 0.5 * 255.0;
+                decoded[(y * ow + x) * 3 + c] = @intFromFloat(@min(255.0, @max(0.0, v)));
+            }
+        }
+    }
+    const small = try preview_mod.boxDownsampleRgb(allocator, decoded, @intCast(ow), @intCast(oh), lw, lh);
+    defer allocator.free(small);
+
+    const corr_fit = preview_mod.rgbCorrelation(fit, small);
+    const corr_ctrl = preview_mod.rgbCorrelation(ctrl, small);
+    const chroma_fit = preview_mod.rgbChromaCorrelation(fit, small);
+    const chroma_ctrl = preview_mod.rgbChromaCorrelation(ctrl, small);
+    std.debug.print(
+        "[ltx-preview] latent={d}x{d}x{d} decode={d}x{d}x{d} corr_fit={d:.4} corr_huewheel={d:.4} chroma_fit={d:.4} chroma_huewheel={d:.4}\n",
+        .{ lc, lh, lw, ot, oh, ow, corr_fit, corr_ctrl, chroma_fit, chroma_ctrl },
+    );
+    // Same four-part bar as the H3 twin. Measured 2026-08-30 (LTX-2.5 8-bit VAE
+    // pair, M-series): fit 0.898 / chroma 0.923, control 0.196 / 0.262.
+    try testing.expect(corr_fit > 0.6);
+    try testing.expect(corr_fit > corr_ctrl + 0.3);
+    try testing.expect(chroma_fit > 0.7);
+    try testing.expect(chroma_fit > chroma_ctrl + 0.3);
 }
 
 fn corrOf(a: []const f32, b: []const f32) f64 {

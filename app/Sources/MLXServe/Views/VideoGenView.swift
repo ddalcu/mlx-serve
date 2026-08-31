@@ -88,6 +88,8 @@ struct VideoGenView: View {
     @State private var keepResident: Bool = false
     @State private var bestQuality: Bool = false
     @State private var diffusionDecoder: Bool = false
+    /// Per-step latent previews on the SSE stream (issue #208).
+    @State private var livePreview: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, recipe off.
     @State private var turbo: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -98,6 +100,30 @@ struct VideoGenView: View {
     @State private var isDropTargeted: Bool = false
     /// The same, for the ref2va References section, which is its own target.
     @State private var isRefDropTargeted: Bool = false
+
+    /// Every persist-only control's value as ONE `Equatable`, so the body
+    /// carries one observation instead of one per field.
+    private struct PersistedScalars: Equatable {
+        var numFrames: Int
+        var fps: Int
+        var mode: VideoPipelineMode
+        var steps: Int
+        var cfgScale: Double
+        var stgScale: Double
+        var stage2Steps: Int
+        var cfgAudioScale: Double
+        var chainWindows: Int
+        var seed: Int
+        var keepResident: Bool
+        var livePreview: Bool
+    }
+
+    private var persistedScalars: PersistedScalars {
+        PersistedScalars(numFrames: numFrames, fps: fps, mode: mode, steps: steps,
+                         cfgScale: cfgScale, stgScale: stgScale, stage2Steps: stage2Steps,
+                         cfgAudioScale: cfgAudioScale, chainWindows: chainWindows,
+                         seed: seed, keepResident: keepResident, livePreview: livePreview)
+    }
 
     var body: some View {
         // No window-sized floor — see ImageGenView: pages shrink their
@@ -115,19 +141,13 @@ struct VideoGenView: View {
             if server.status == .running { Task { await server.refreshModels() } }
         }
         // Persist the fields not owned by the model/quality/resolution sections.
-        .onChange(of: numFrames) { _, _ in guard !hydrating else { return }; persist() }
+        // ONE observation over all of them: as a dozen sibling `onChange`
+        // modifiers all calling `persist()`, adding a thirteenth made SwiftUI's
+        // type-checker give up on this body outright.
+        .onChange(of: persistedScalars) { _, _ in guard !hydrating else { return }; persist() }
+        // The two size fields are separate because they do more than persist.
         .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
         .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
-        .onChange(of: fps) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: mode) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: cfgScale) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: stgScale) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: stage2Steps) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: cfgAudioScale) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: chainWindows) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             if case .completed(let path) = phase {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
@@ -1077,6 +1097,9 @@ struct VideoGenView: View {
                     // toggle that could not change anything is a dead control.
                     .disabled(turboEngaged)
             }
+            Toggle("Show live preview while generating", isOn: $livePreview)
+                .font(.caption)
+                .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
@@ -1316,6 +1339,13 @@ struct VideoGenView: View {
                     ContentUnavailableView("No generation yet", systemImage: "film", description: Text("Enter a prompt and press Generate."))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
+                        if let img = service.livePreview {
+                            Image(nsImage: img)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxHeight: 220)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)
@@ -1413,6 +1443,7 @@ struct VideoGenView: View {
         chainWindows = model.supportsChainedWindows ? min(6, max(1, s.chainWindows)) : 1
         seed = s.seed
         keepResident = s.keepResident
+        livePreview = s.livePreview
         bestQuality = s.bestQuality
         diffusionDecoder = s.diffusionDecoder
         promptHeight = PromptEditorHeight.clamp(s.promptHeight)
@@ -1440,6 +1471,7 @@ struct VideoGenView: View {
         s.chainWindows = chainWindows
         s.seed = seed
         s.keepResident = keepResident
+        s.livePreview = livePreview
         s.bestQuality = bestQuality
         s.diffusionDecoder = diffusionDecoder
         s.turbo = turbo
@@ -1556,7 +1588,8 @@ struct VideoGenView: View {
             refImagePaths: model.supportsReferences ? refImageURLs.map(\.path) : [],
             refVideoPaths: model.supportsReferences ? refVideoURLs.map(\.path) : [],
             refAudioPaths: model.supportsReferences ? refAudioURLs.map(\.path) : [],
-            refImageSize: refImageSize
+            refImageSize: refImageSize,
+            livePreview: livePreview
         )
         persist()
 
