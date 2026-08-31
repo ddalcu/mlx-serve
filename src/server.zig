@@ -5028,7 +5028,16 @@ fn handleChatCompletions(
         content_allocs.deinit(allocator);
     }
 
-    for (messages_val.array.items) |msg_val| {
+    // Decide which raw message owns current-turn media before the parse loop
+    // materializes any attachment. The JSON tree keeps every data URL alive
+    // for the request, so historical attachments can remain borrowed strings
+    // instead of becoming multi-megabyte pixel buffers merely to be ignored by
+    // activeTurnMediaMessage below.
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items) and
+        (if (root.get("continue_final_message")) |v| v == .bool and v.bool else false);
+    const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .openai);
+
+    for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
         // `.object`. Skip it rather than crash — consistent with how malformed
         // inner fields are already tolerated below.
@@ -5042,6 +5051,8 @@ fn handleChatCompletions(
         var msg_images: ?[]const chat_mod.ImageData = null;
         var msg_videos: ?[]const chat_mod.VideoData = null;
         var msg_audio: ?[]const chat_mod.AudioData = null;
+        const decode_this_message = active_wire_media != null and active_wire_media.? == raw_msg_index;
+        const wire_presence = wireMediaPresence(msg_val, .openai);
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
@@ -5053,6 +5064,7 @@ fn handleChatCompletions(
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
+                        if (!decode_this_message) continue;
                         // Parse image_url content block
                         const img_obj = part.object.get("image_url") orelse continue;
                         if (img_obj != .object) continue;
@@ -5060,6 +5072,7 @@ fn handleChatCompletions(
                         if (url_val != .string) continue;
                         appendImageUrlContent(allocator, media.images(img_slot), url_val.string, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
+                        if (!decode_this_message) continue;
                         // A video is, on the wire, an ordered array of already-
                         // decoded frame images — no video codec exists anywhere
                         // in this codebase, so frame extraction is the CLIENT's
@@ -5075,6 +5088,7 @@ fn handleChatCompletions(
                         }
                         appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
+                        if (!decode_this_message) continue;
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
                         // (format "mlx_pcm_f32") base64-encoded in `data`.
@@ -5143,7 +5157,7 @@ fn handleChatCompletions(
             null;
 
         // Skip messages with no content, no tool_calls, and no images/videos/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !wire_presence.any() and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -9568,6 +9582,202 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
 
 // ── Vision Processing ──
 
+/// The two chat wire formats describe the same turn graph with different
+/// shapes: OpenAI uses role=`tool` messages, while Anthropic nests tool_result
+/// blocks inside a user message. This selector reads only JSON metadata. It is
+/// deliberately upstream of image decoding so historical data URLs never have
+/// to become pixel tensors just to discover that they sit behind an assistant
+/// boundary.
+const WireMediaStyle = enum { openai, anthropic };
+
+const WireMediaPresence = struct {
+    images: bool = false,
+    videos: bool = false,
+    audio: bool = false,
+
+    fn any(self: WireMediaPresence) bool {
+        return self.images or self.videos or self.audio;
+    }
+};
+
+fn wireRole(msg: std.json.Value) ?[]const u8 {
+    if (msg != .object) return null;
+    const role = msg.object.get("role") orelse return null;
+    return if (role == .string) role.string else null;
+}
+
+fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresence {
+    if (msg != .object) return .{};
+    const content = msg.object.get("content") orelse return .{};
+    if (content != .array) return .{};
+    var out: WireMediaPresence = .{};
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv != .string) continue;
+        if (style == .anthropic) {
+            if (std.mem.eql(u8, tv.string, "image")) out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "image_url")) {
+            out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "video_url")) {
+            out.videos = true;
+        } else if (std.mem.eql(u8, tv.string, "input_audio")) {
+            out.audio = true;
+        }
+    }
+    return out;
+}
+
+fn wireMessageHasToolResult(msg: std.json.Value, style: WireMediaStyle) bool {
+    const role = wireRole(msg) orelse return false;
+    if (style == .openai) return std.mem.eql(u8, role, "tool");
+    if (!std.mem.eql(u8, role, "user") or msg != .object) return false;
+    const content = msg.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "tool_result")) return true;
+    }
+    return false;
+}
+
+fn wireAssistantHasTools(msg: std.json.Value, style: WireMediaStyle) bool {
+    const role = wireRole(msg) orelse return false;
+    if (!std.mem.eql(u8, role, "assistant") or msg != .object) return false;
+    if (style == .openai) {
+        const calls = msg.object.get("tool_calls") orelse return false;
+        return calls == .array and calls.array.items.len > 0;
+    }
+    const content = msg.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "tool_use")) return true;
+    }
+    return false;
+}
+
+fn wireMessageHasText(msg: std.json.Value) bool {
+    if (msg != .object) return false;
+    const content = msg.object.get("content") orelse return false;
+    if (content == .string) return std.mem.trim(u8, content.string, " \t\r\n").len > 0;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        const text = part.object.get("text") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "text") and text == .string and
+            std.mem.trim(u8, text.string, " \t\r\n").len > 0) return true;
+    }
+    return false;
+}
+
+fn wireContinuationRequested(msgs: []const std.json.Value) bool {
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        const role = wireRole(msgs[i]) orelse continue;
+        return std.mem.eql(u8, role, "assistant") and wireMessageHasText(msgs[i]);
+    }
+    return false;
+}
+
+/// Return the raw-message index whose media belongs to the active turn.
+/// Mirrors activeTurnMediaMessage but consults only content-block types. This
+/// is the key ordering guarantee: callers invoke it before their parse loop,
+/// then decode attachments only when the loop reaches the returned index.
+fn activeWireMediaIndex(msgs: []const std.json.Value, continue_final: bool, style: WireMediaStyle) ?usize {
+    var last_valid: ?usize = null;
+    var j = msgs.len;
+    while (j > 0) {
+        j -= 1;
+        if (wireRole(msgs[j]) != null) {
+            last_valid = j;
+            break;
+        }
+    }
+
+    var i = msgs.len;
+    var follows_tool_result = false;
+    while (i > 0) {
+        i -= 1;
+        const role = wireRole(msgs[i]) orelse continue;
+        if (style == .openai and std.mem.eql(u8, role, "tool")) {
+            follows_tool_result = true;
+            continue;
+        }
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (continue_final and last_valid != null and i == last_valid.?) continue;
+            if (follows_tool_result and wireAssistantHasTools(msgs[i], style)) {
+                follows_tool_result = false;
+                continue;
+            }
+            break;
+        }
+        if (!std.mem.eql(u8, role, "user")) continue;
+        if (wireMediaPresence(msgs[i], style).any()) return i;
+        if (style == .anthropic and wireMessageHasToolResult(msgs[i], style)) follows_tool_result = true;
+    }
+    return null;
+}
+
+test "activeWireMediaIndex skips historical OpenAI images without decoding" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"seen"},
+        \\  {"role":"user","content":"continue"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(activeWireMediaIndex(msgs, false, .openai) == null);
+}
+
+test "activeWireMediaIndex finds media before trailing injected context" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"user","content":"injected context"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .openai));
+}
+
+test "activeWireMediaIndex crosses Anthropic tool use and result" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}},{"type":"text","text":"inspect"}]},
+        \\  {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"inspect","input":{}}]},
+        \\  {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .anthropic));
+}
+
+test "activeWireMediaIndex keeps media for an assistant-prefix continuation" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"The image shows "}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireContinuationRequested(msgs));
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
+}
+
 /// Return the newest media-bearing user message in the active turn.
 ///
 /// Agent clients may append user-role context injections after the human's
@@ -11249,14 +11459,22 @@ fn handleAnthropicMessages(
         }
     }
 
+    // Anthropic carries tool results inside user content blocks, but the same
+    // active-turn rule applies: inspect those blocks without decoding their
+    // media, then materialize only the selected raw message below.
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items) and
+        continuationRejectReason(lm.ds4_engine != null) == null;
+    const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .anthropic);
+
     // Convert Anthropic messages to internal format
-    for (messages_val.array.items) |msg_val| {
+    for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         if (msg_val != .object) continue;
         const msg_obj = msg_val.object;
         const role_val = msg_obj.get("role") orelse continue;
         if (role_val != .string) continue;
         const role = role_val.string;
         const content_val = msg_obj.get("content");
+        const decode_this_message = active_wire_media != null and active_wire_media.? == raw_msg_index;
 
         if (std.mem.eql(u8, role, "user")) {
             if (content_val) |cv| switch (cv) {
@@ -11264,6 +11482,7 @@ fn handleAnthropicMessages(
                     try messages.append(allocator, .{ .role = "user", .content = s, .tool_calls = null, .tool_call_id = null });
                 },
                 .array => |arr| {
+                    const wire_presence = wireMediaPresence(msg_val, .anthropic);
                     // Process tool_result blocks first, then text+image blocks.
                     for (arr.items) |block| {
                         if (block != .object) continue;
@@ -11299,6 +11518,7 @@ fn handleAnthropicMessages(
                                 try msg_text.appendSlice(allocator, text);
                             }
                         } else if (std.mem.eql(u8, btype, "image")) {
+                            if (!decode_this_message) continue;
                             // Anthropic image block: source = {type:"base64", media_type, data}
                             //                    or = {type:"url", url}
                             const src_val = block.object.get("source") orelse continue;
@@ -11324,7 +11544,11 @@ fn handleAnthropicMessages(
                             }
                         }
                     }
-                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0) {
+                    // Preserve a historical image-only user turn even though
+                    // its pixels were deliberately not materialized. It still
+                    // contributes the same empty user-role template boundary
+                    // as before this optimization.
+                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0 or wire_presence.images) {
                         const owned_text = if (msg_text.items.len > 0) blk: {
                             const s = try allocator.dupe(u8, msg_text.items);
                             try content_allocs.append(allocator, s);

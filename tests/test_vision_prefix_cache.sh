@@ -35,6 +35,8 @@ body() { # $1 image, $2 question
   printf '{"model":"mlx-serve","max_tokens":48,"temperature":0,"enable_thinking":false,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:%s;base64,%s"}},{"type":"text","text":"%s"}]}]}' "$(mime_for "$1")" "$(base64 -i "$1")" "$2"
 }
 ask() { curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['usage']['prompt_tokens_details']['cached_tokens'], '|', d['choices'][0]['message']['content'].replace(chr(10),' '))"; }
+ask_prompt_tokens() { curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['usage']['prompt_tokens'])"; }
+ask_anthropic() { curl -s -m 600 "$U/v1/messages" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(''.join(x.get('text','') for x in d.get('content',[]) if x.get('type') == 'text').replace(chr(10),' '))"; }
 Q="What text is written on the green street signs? Answer with the words only."
 
 injected_context_body() { # $1 image, $2 fresh|continuation
@@ -106,12 +108,102 @@ check "injected-context turn builds Qwen M-RoPE" "$((mrope_after-mrope_before))"
 
 echo "[6] text continuation does not reprocess historical media"
 mm_before=$mm_after
+decode_before=$(grep -c 'Decoded .* image' "$LOG" || true)
 r0c=$(injected_context_body "$F1" continuation | ask); echo "  $r0c"
 mm_after=$(grep -c 'Multimodal: processing' "$LOG" || true)
+decode_after=$(grep -c 'Decoded .* image' "$LOG" || true)
 check "historical image stays behind assistant boundary" "$((mm_after-mm_before))" "0"
+check "historical image is not decoded during parsing" "$((decode_after-decode_before))" "0"
 check "text-only continuation completes" "$(echo "$r0c" | grep -cE '\| .+' | sed 's/^[1-9][0-9]*$/1/')" "1"
 
-echo "[7] assistant-prefix continuation keeps current-turn media"
+historical_many_body() { # $1 image, $2 count
+  python3 - "$1" "$2" <<'PY'
+import base64, json, sys
+
+path, count = sys.argv[1], int(sys.argv[2])
+with open(path, "rb") as f:
+    image_url = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+messages = []
+for i in range(count):
+    messages.extend([
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": f"Historical image {i + 1}."},
+        ]},
+        {"role": "assistant", "content": "Seen."},
+    ])
+messages.append({"role": "user", "content": "Reply with CURRENT only."})
+print(json.dumps({
+    "model": "mlx-serve", "max_tokens": 8, "temperature": 0,
+    "enable_thinking": False, "messages": messages,
+}))
+PY
+}
+
+anthropic_historical_body() { # $1 image
+  python3 - "$1" <<'PY'
+import base64, json, sys
+
+with open(sys.argv[1], "rb") as f:
+    image_data = base64.b64encode(f.read()).decode()
+print(json.dumps({
+    "model": "mlx-serve", "max_tokens": 8, "temperature": 0,
+    "messages": [
+        {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
+            {"type": "text", "text": "Historical image."},
+        ]},
+        {"role": "assistant", "content": "Seen."},
+        {"role": "user", "content": "Reply with CURRENT only."},
+    ],
+}))
+PY
+}
+
+image_only_history_body() { # $1 image, $2 image|empty
+  python3 - "$1" "$2" <<'PY'
+import base64, json, sys
+
+path, mode = sys.argv[1:]
+with open(path, "rb") as f:
+    image_url = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+first_content = ([{"type": "image_url", "image_url": {"url": image_url}}]
+                 if mode == "image" else "")
+print(json.dumps({
+    "model": "mlx-serve", "max_tokens": 4, "temperature": 0,
+    "enable_thinking": False,
+    "messages": [
+        {"role": "user", "content": first_content},
+        {"role": "assistant", "content": "Seen."},
+        {"role": "user", "content": "Reply with CURRENT only."},
+    ],
+}))
+PY
+}
+
+echo "[7] twenty historical images remain lazy on a text-only turn"
+decode_before=$decode_after
+r0h=$(historical_many_body "$F1" 20 | ask); echo "  $r0h"
+decode_after=$(grep -c 'Decoded .* image' "$LOG" || true)
+check "twenty historical images trigger zero decodes" "$((decode_after-decode_before))" "0"
+check "large historical-media request completes" "$(echo "$r0h" | grep -cE '\| .+' | sed 's/^[1-9][0-9]*$/1/')" "1"
+
+echo "[8] an image-only historical user turn remains in the rendered prompt"
+decode_before=$decode_after
+image_only_tokens=$(image_only_history_body "$F1" image | ask_prompt_tokens)
+dropped_empty_tokens=$(image_only_history_body "$F1" empty | ask_prompt_tokens)
+decode_after=$(grep -c 'Decoded .* image' "$LOG" || true)
+check "image-only history triggers zero decodes" "$((decode_after-decode_before))" "0"
+check "image-only user boundary contributes prompt tokens" "$(python3 -c "print(1 if int('$image_only_tokens') > int('$dropped_empty_tokens') else 0)")" "1"
+
+echo "[9] Anthropic text continuation also leaves historical images lazy"
+decode_before=$decode_after
+r0a=$(anthropic_historical_body "$F1" | ask_anthropic); echo "  $r0a"
+decode_after=$(grep -c 'Decoded .* image' "$LOG" || true)
+check "Anthropic historical image triggers zero decodes" "$((decode_after-decode_before))" "0"
+check "Anthropic text-only continuation completes" "$(echo "$r0a" | grep -cE '.+' | sed 's/^[1-9][0-9]*$/1/')" "1"
+
+echo "[10] assistant-prefix continuation keeps current-turn media"
 mm_before=$mm_after
 r0p=$(injected_context_body "$F1" assistant-prefix | ask); echo "  $r0p"
 mm_after=$(grep -c 'Multimodal: processing' "$LOG" || true)
@@ -149,7 +241,7 @@ print(json.dumps({
 PY
 }
 
-echo "[8] same image across a growing conversation: every continuation restores"
+echo "[11] same image across a growing conversation: every continuation restores"
 for turn in 1 2 3 4; do
   r=$(conversation_body "$F1" "$turn" | ask); echo "  turn $turn: $r"
   if [ "$turn" -gt 1 ]; then
@@ -180,7 +272,7 @@ PY
 # F1 commits a >2K text prefix followed by its image rows. Switching to F2
 # must recover the 2048 checkpoint before those rows, while the short F2 entry
 # from [3] has no useful checkpoint. Exact vision-key filtering made this cold.
-echo "[9] changed image reuses only the long text prefix before media"
+echo "[12] changed image reuses only the long text prefix before media"
 r9a=$(long_prefix_body "$F1" | ask); echo "  first image: $r9a"
 r9b=$(long_prefix_body "$F2" | ask); echo "  changed image: $r9b"
 check "changed image: cached_tokens > 0 before media" "$(python3 -c "print(1 if int('${r9b%% |*}')>0 else 0)")" "1"
