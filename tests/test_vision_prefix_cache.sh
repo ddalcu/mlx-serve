@@ -210,6 +210,45 @@ mm_after=$(grep -c 'Multimodal: processing' "$LOG" || true)
 check "assistant-prefix continuation processes one image" "$((mm_after-mm_before))" "1"
 check "assistant-prefix continuation reads the signs" "$(echo "$r0p" | grep -ciE 'gr[ae]y fox|waterfall' | sed 's/^[1-9][0-9]*$/1/')" "1"
 
+openai_parser_gap_body() { # $1 image, $2 empty-assistant|trailing-empty-user
+  python3 - "$1" "$2" <<'PY'
+import base64, json, sys
+
+path, mode = sys.argv[1:]
+with open(path, "rb") as f:
+    image_url = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+human = {"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": image_url}},
+    {"type": "text", "text": "What text is written on the green street signs? Answer with the words only."},
+]}
+if mode == "empty-assistant":
+    messages = [human, {"role": "assistant", "content": ""}, {"role": "user", "content": "Answer the image question."}]
+else:
+    messages = [human, {"role": "assistant", "content": "The green street signs read "}, {"role": "user", "content": ""}]
+payload = {
+    "model": "mlx-serve", "max_tokens": 48, "temperature": 0,
+    "enable_thinking": False, "messages": messages,
+}
+if mode == "trailing-empty-user":
+    payload["continue_final_message"] = True
+print(json.dumps(payload))
+PY
+}
+
+echo "[11] an empty OpenAI assistant skipped by parsing is not a media boundary"
+decode_before=$(grep -c 'Decoded .* image' "$LOG" || true)
+r0e=$(openai_parser_gap_body "$F1" empty-assistant | ask); echo "  $r0e"
+decode_after=$(grep -c 'Decoded .* image' "$LOG" || true)
+check "empty assistant still decodes the active image" "$((decode_after-decode_before))" "1"
+check "empty assistant response reads the signs" "$(echo "$r0e" | grep -ciE 'gr[ae]y fox|waterfall' | sed 's/^[1-9][0-9]*$/1/')" "1"
+
+echo "[12] a trailing empty OpenAI user skipped by parsing preserves continuation"
+decode_before=$decode_after
+r0u=$(openai_parser_gap_body "$F1" trailing-empty-user | ask); echo "  $r0u"
+decode_after=$(grep -c 'Decoded .* image' "$LOG" || true)
+check "trailing empty user still decodes the active image" "$((decode_after-decode_before))" "1"
+check "trailing empty user continues with the sign text" "$(echo "$r0u" | grep -ciE 'gr[ae]y fox|waterfall' | sed 's/^[1-9][0-9]*$/1/')" "1"
+
 # Growing image conversations move the current image span on every turn. A
 # hybrid cache entry may have the longest raw token match at the previous image
 # boundary while its first SSM checkpoint sits just beyond that boundary. An
@@ -241,7 +280,7 @@ print(json.dumps({
 PY
 }
 
-echo "[11] same image across a growing conversation: every continuation restores"
+echo "[13] same image across a growing conversation: every continuation restores"
 for turn in 1 2 3 4; do
   r=$(conversation_body "$F1" "$turn" | ask); echo "  turn $turn: $r"
   if [ "$turn" -gt 1 ]; then
@@ -272,7 +311,7 @@ PY
 # F1 commits a >2K text prefix followed by its image rows. Switching to F2
 # must recover the 2048 checkpoint before those rows, while the short F2 entry
 # from [3] has no useful checkpoint. Exact vision-key filtering made this cold.
-echo "[12] changed image reuses only the long text prefix before media"
+echo "[14] changed image reuses only the long text prefix before media"
 r9a=$(long_prefix_body "$F1" | ask); echo "  first image: $r9a"
 r9b=$(long_prefix_body "$F2" | ask); echo "  changed image: $r9b"
 check "changed image: cached_tokens > 0 before media" "$(python3 -c "print(1 if int('${r9b%% |*}')>0 else 0)")" "1"

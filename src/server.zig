@@ -5033,7 +5033,7 @@ fn handleChatCompletions(
     // for the request, so historical attachments can remain borrowed strings
     // instead of becoming multi-megabyte pixel buffers merely to be ignored by
     // activeTurnMediaMessage below.
-    const wire_continue_final = wireContinuationRequested(messages_val.array.items) and
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items, .openai) and
         (if (root.get("continue_final_message")) |v| v == .bool and v.bool else false);
     const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .openai);
 
@@ -9674,10 +9674,45 @@ fn wireMessageHasText(msg: std.json.Value) bool {
     return false;
 }
 
-fn wireContinuationRequested(msgs: []const std.json.Value) bool {
+/// Whether OpenAI's parse loop will retain any content from this wire message.
+/// This deliberately accepts malformed non-empty tool_calls as visible: the
+/// wire gate may be wider than parsing (one wasted decode), never narrower
+/// (pixels missing from a prompt that still renders their placeholder).
+fn wireOpenAiParserSkips(msg: std.json.Value) bool {
+    const role = wireRole(msg) orelse return true;
+    if (std.mem.eql(u8, role, "tool")) return false;
+    if (wireMediaPresence(msg, .openai).any()) return false;
+    if (msg == .object) {
+        if (msg.object.get("content")) |content| switch (content) {
+            .string => |s| if (s.len > 0) return false,
+            .array => |parts| for (parts.items) |part| {
+                if (part != .object) continue;
+                const tv = part.object.get("type") orelse continue;
+                const text = part.object.get("text") orelse continue;
+                if (tv == .string and std.mem.eql(u8, tv.string, "text") and
+                    text == .string and text.string.len > 0) return false;
+            },
+            else => {},
+        };
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (wireAssistantHasTools(msg, .openai)) return false;
+            if (messageReasoningFromObj(msg.object) != null) return false;
+        }
+    }
+    return true;
+}
+
+fn wireParserSkips(msg: std.json.Value, style: WireMediaStyle) bool {
+    // Anthropic appends empty assistant/user strings, so every valid-role
+    // message remains a real boundary on that surface.
+    return style == .openai and wireOpenAiParserSkips(msg);
+}
+
+fn wireContinuationRequested(msgs: []const std.json.Value, style: WireMediaStyle) bool {
     var i = msgs.len;
     while (i > 0) {
         i -= 1;
+        if (wireParserSkips(msgs[i], style)) continue;
         const role = wireRole(msgs[i]) orelse continue;
         return std.mem.eql(u8, role, "assistant") and wireMessageHasText(msgs[i]);
     }
@@ -9693,6 +9728,7 @@ fn activeWireMediaIndex(msgs: []const std.json.Value, continue_final: bool, styl
     var j = msgs.len;
     while (j > 0) {
         j -= 1;
+        if (wireParserSkips(msgs[j], style)) continue;
         if (wireRole(msgs[j]) != null) {
             last_valid = j;
             break;
@@ -9703,6 +9739,7 @@ fn activeWireMediaIndex(msgs: []const std.json.Value, continue_final: bool, styl
     var follows_tool_result = false;
     while (i > 0) {
         i -= 1;
+        if (wireParserSkips(msgs[i], style)) continue;
         const role = wireRole(msgs[i]) orelse continue;
         if (style == .openai and std.mem.eql(u8, role, "tool")) {
             follows_tool_result = true;
@@ -9774,7 +9811,36 @@ test "activeWireMediaIndex keeps media for an assistant-prefix continuation" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const msgs = parsed.value.object.get("messages").?.array.items;
-    try std.testing.expect(wireContinuationRequested(msgs));
+    try std.testing.expect(wireContinuationRequested(msgs, .openai));
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
+}
+
+test "activeWireMediaIndex ignores an OpenAI assistant the parser skips" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":""},
+        \\  {"role":"user","content":"hi"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .openai));
+}
+
+test "wireContinuationRequested ignores an OpenAI user the parser skips" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"The image shows "},
+        \\  {"role":"user","content":""}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireContinuationRequested(msgs, .openai));
     try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
 }
 
@@ -11462,7 +11528,7 @@ fn handleAnthropicMessages(
     // Anthropic carries tool results inside user content blocks, but the same
     // active-turn rule applies: inspect those blocks without decoding their
     // media, then materialize only the selected raw message below.
-    const wire_continue_final = wireContinuationRequested(messages_val.array.items) and
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items, .anthropic) and
         continuationRejectReason(lm.ds4_engine != null) == null;
     const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .anthropic);
 
