@@ -121,7 +121,7 @@ struct WelcomeView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("MLX Core")
                     .font(.system(size: 22, weight: .semibold))
-                Text("Local AI on Apple Silicon")
+                Text(L10n.text("Local AI on Apple Silicon"))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -138,7 +138,7 @@ struct WelcomeView: View {
                     Image(systemName: "star.fill")
                         .font(.system(size: 11))
                         .foregroundStyle(.yellow)
-                    Text("Star on GitHub")
+                    Text(L10n.text("Star on GitHub"))
                 }
                 .font(.subheadline)
             }
@@ -168,7 +168,7 @@ struct WelcomeView: View {
 
     private var featureCards: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("GET STARTED")
+            Text(L10n.text("GET STARTED"))
                 .font(.caption2.weight(.semibold))
                 .tracking(0.7)
                 .foregroundStyle(.tertiary)
@@ -295,7 +295,7 @@ struct WelcomeView: View {
 
     /// Stated, not offered: these two are the app itself.
     private var installedBadge: some View {
-        Label("Installed", systemImage: "checkmark.circle.fill")
+        Label(L10n.text("Installed"), systemImage: "checkmark.circle.fill")
             .font(.callout.weight(.semibold))
             .foregroundStyle(.green)
             .labelStyle(.titleAndIcon)
@@ -358,7 +358,7 @@ struct WelcomeView: View {
                     leave(.browseModels)
                 } label: {
                     HStack(spacing: 4) {
-                        Text("Browse all models")
+                        Text(L10n.text("Browse all models"))
                         Image(systemName: "arrow.right")
                             .font(.caption2.weight(.semibold))
                     }
@@ -374,7 +374,7 @@ struct WelcomeView: View {
     /// One small-caps label inside the panel. Same treatment as the tray's
     /// section headers, so the two surfaces read as one design.
     private func panelLabel(_ text: String) -> some View {
-        Text(text)
+        Text(L10n.text(text))
             .font(.caption2.weight(.semibold))
             .tracking(0.6)
             .foregroundStyle(.secondary)
@@ -384,7 +384,7 @@ struct WelcomeView: View {
 
     private var footer: some View {
         HStack(spacing: 16) {
-            Toggle("Don't show again", isOn: $suppressWelcome)
+            Toggle(L10n.text("Don't show again"), isOn: $suppressWelcome)
                 .toggleStyle(.checkbox)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -397,7 +397,7 @@ struct WelcomeView: View {
             Button {
                 leave(.startChatting)
             } label: {
-                Text(hasChatModels ? "Start Chatting" : "Continue")
+                Text(L10n.text(hasChatModels ? "Start Chatting" : "Continue"))
                     .font(.headline)
                     .frame(minWidth: 150)
                     .padding(.vertical, 4)
@@ -588,7 +588,7 @@ private struct WelcomeModelRow: View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(entry.category)
+                    Text(L10n.text(entry.category))
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 1)
@@ -603,7 +603,7 @@ private struct WelcomeModelRow: View {
                             .help("Recommended for your Mac")
                     }
                 }
-                Text(entry.strength)
+                Text(L10n.text(entry.strength))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

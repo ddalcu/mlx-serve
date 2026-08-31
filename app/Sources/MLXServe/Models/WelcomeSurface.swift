@@ -22,9 +22,9 @@ enum WelcomeSurface: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .app:      return "App"
-        case .menuBar:  return "Menu bar"
-        case .terminal: return "Terminal"
+        case .app:      return L10n.text("App")
+        case .menuBar:  return L10n.text("Menu bar")
+        case .terminal: return L10n.text("Terminal")
         }
     }
 
@@ -33,8 +33,8 @@ enum WelcomeSurface: String, CaseIterable, Identifiable {
     /// constant here would be a second copy that silently stops matching.
     var caption: String? {
         switch self {
-        case .app:      return "This window: chat, models, tasks and media generation."
-        case .menuBar:  return "The icon top-right: start the server, switch models, talk."
+        case .app:      return L10n.text("This window: chat, models, tasks and media generation.")
+        case .menuBar:  return L10n.text("The icon top-right: start the server, switch models, talk.")
         case .terminal: return nil
         }
     }

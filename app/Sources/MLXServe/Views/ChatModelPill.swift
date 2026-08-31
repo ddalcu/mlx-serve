@@ -194,8 +194,8 @@ struct ChatModelPill: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help(pill.isLoading
-              ? "Loading \(ModelDisplayName.pretty(pill.name))…"
-              : "Chat model. Click to switch — models on this Mac and any shared by other Macs on your network.")
+              ? L10n.format("Loading %@…", ModelDisplayName.pretty(pill.name))
+              : L10n.text("Chat model. Click to switch — models on this Mac and any shared by other Macs on your network."))
     }
 
     @ViewBuilder

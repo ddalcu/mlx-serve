@@ -190,7 +190,7 @@ private struct EmptyStateChipLabel: View {
             Image(systemName: item.systemImage)
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(item.tint)
-            Text(item.title)
+            Text(L10n.text(item.title))
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(.primary)
             if showsChevron {

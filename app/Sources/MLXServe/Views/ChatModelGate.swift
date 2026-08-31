@@ -37,9 +37,9 @@ struct ChatModelGateSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(headline)
+                Text(L10n.text(headline))
                     .font(.title3.weight(.semibold))
-                Text(subhead)
+                Text(L10n.text(subhead))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

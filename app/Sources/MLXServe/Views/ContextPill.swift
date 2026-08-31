@@ -46,7 +46,11 @@ struct ContextPill: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help("Context window — \(stats.percentText) of \(ContextWindowStats.compact(stats.contextLength)) tokens used. Click for the breakdown.")
+        .help(L10n.format(
+            "Context window — %@ of %@ tokens used. Click for the breakdown.",
+            stats.percentText,
+            ContextWindowStats.compact(stats.contextLength)
+        ))
         .popover(isPresented: $showDetail, arrowEdge: .top) {
             ContextWindowDetail(stats: stats, modelName: modelName, decodeSpeed: decodeSpeed)
         }

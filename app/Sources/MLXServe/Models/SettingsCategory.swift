@@ -38,19 +38,19 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// engine a knob applies to.
     var title: String {
         switch self {
-        case .modelFolders:      return "Model Folders"
-        case .server:            return "Server"
-        case .lanSharing:        return "LAN Sharing"
-        case .performance:       return "Performance"
-        case .specDecode:        return "Speculative Decoding (MLX only)"
-        case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
-        case .ds4:               return "DeepSeek-V4 (ds4 engine)"
-        case .requestDefaults:   return "Per-Request Defaults"
-        case .voice:             return "Voice"
-        case .sandbox:           return "Agent Sandbox"
-        case .messaging:         return "Messaging — Telegram bot"
-        case .updates:           return "Updates"
-        case .about:             return "About mlx-serve"
+        case .modelFolders:      return L10n.text("Model Folders")
+        case .server:            return L10n.text("Server")
+        case .lanSharing:        return L10n.text("LAN Sharing")
+        case .performance:       return L10n.text("Performance")
+        case .specDecode:        return L10n.text("Speculative Decoding (MLX only)")
+        case .ggufPerformance:   return L10n.text("GGUF Performance (llama.cpp)")
+        case .ds4:               return L10n.text("DeepSeek-V4 (ds4 engine)")
+        case .requestDefaults:   return L10n.text("Per-Request Defaults")
+        case .voice:             return L10n.text("Voice")
+        case .sandbox:           return L10n.text("Agent Sandbox")
+        case .messaging:         return L10n.text("Messaging — Telegram bot")
+        case .updates:           return L10n.text("Updates")
+        case .about:             return L10n.text("About mlx-serve")
         }
     }
 
@@ -58,10 +58,10 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// form (the sidebar is already grouped by engine context).
     var sidebarLabel: String {
         switch self {
-        case .specDecode:        return "Speculative Decoding"
-        case .ggufPerformance:   return "GGUF Performance"
-        case .ds4:               return "DeepSeek-V4"
-        case .messaging:         return "Messaging"
+        case .specDecode:        return L10n.text("Speculative Decoding")
+        case .ggufPerformance:   return L10n.text("GGUF Performance")
+        case .ds4:               return L10n.text("DeepSeek-V4")
+        case .messaging:         return L10n.text("Messaging")
         default:                 return title
         }
     }

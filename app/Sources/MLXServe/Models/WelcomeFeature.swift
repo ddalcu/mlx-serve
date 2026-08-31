@@ -26,20 +26,20 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
 
     var title: String {
         switch self {
-        case .runModels:  return "Run models locally"
-        case .menuBar:    return "App, Menu Bar, or Terminal"
-        case .agentTools: return "Agent with tools"
+        case .runModels:  return L10n.text("Run models locally")
+        case .menuBar:    return L10n.text("App, Menu Bar, or Terminal")
+        case .agentTools: return L10n.text("Agent with tools")
         }
     }
 
     var description: String {
         switch self {
         case .runModels:
-            return "No cloud, no API keys. All processing stays on your device."
+            return L10n.text("No cloud, no API keys. All processing stays on your device.")
         case .menuBar:
-            return "Use the window, the menu-bar icon, or the mlx-serve command — whichever suits the moment."
+            return L10n.text("Use the window, the menu-bar icon, or the mlx-serve command — whichever suits the moment.")
         case .agentTools:
-            return "Let the model read files, run commands, search the web, and write code."
+            return L10n.text("Let the model read files, run commands, search the web, and write code.")
         }
     }
 

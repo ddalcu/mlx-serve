@@ -20,11 +20,11 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .recommended: return "Recommended"
-        case .discover:     return "Discover"
-        case .myModels:     return "My Models"
-        case .downloads:    return "Downloads"
-        case .media:        return "Media"
+        case .recommended: return L10n.text("Recommended")
+        case .discover:     return L10n.text("Discover")
+        case .myModels:     return L10n.text("My Models")
+        case .downloads:    return L10n.text("Downloads")
+        case .media:        return L10n.text("Media")
         }
     }
 
@@ -147,9 +147,9 @@ enum ModelUseState: Equatable {
     var label: String {
         switch self {
         case .idle:     return ""
-        case .inUse:    return "In use"
-        case .loading:  return "Loading…"
-        case .selected: return "Selected"
+        case .inUse:    return L10n.text("In use")
+        case .loading:  return L10n.text("Loading…")
+        case .selected: return L10n.text("Selected")
         }
     }
 
@@ -157,9 +157,9 @@ enum ModelUseState: Equatable {
     var help: String {
         switch self {
         case .idle:     return ""
-        case .inUse:    return "This model is loaded and serving requests."
-        case .loading:  return "The server is loading this model…"
-        case .selected: return "This model will load when you start the server."
+        case .inUse:    return L10n.text("This model is loaded and serving requests.")
+        case .loading:  return L10n.text("The server is loading this model…")
+        case .selected: return L10n.text("This model will load when you start the server.")
         }
     }
 }

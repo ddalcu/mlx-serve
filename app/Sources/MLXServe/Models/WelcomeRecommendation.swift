@@ -33,6 +33,6 @@ struct WelcomeRecommendation: Equatable {
     /// machine headroom (see `starterPick`), so "with memory to spare" is
     /// honest for every tier.
     static func rationale(memoryText: String) -> String {
-        "Chosen to run smoothly on your \(memoryText) Mac, with memory to spare for everything else."
+        L10n.format("Chosen to run smoothly on your %@ Mac, with memory to spare for everything else.", memoryText)
     }
 }

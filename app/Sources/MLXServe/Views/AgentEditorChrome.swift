@@ -75,7 +75,7 @@ struct AgentSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: AgentEditorMetrics.labelSpacing) {
-            Text(title)
+            Text(L10n.text(title))
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.primary)
             content()
@@ -117,7 +117,7 @@ struct AgentLabeledField<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: AgentEditorMetrics.labelSpacing) {
-            Text(label)
+            Text(L10n.text(label))
                 .font(.headline)
                 .foregroundStyle(.secondary)
             content()
@@ -153,14 +153,14 @@ struct AgentEditorRow<Trailing: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: alignment, spacing: 12) {
-                Text(title)
+                Text(L10n.text(title))
                     .font(.headline)
                     .foregroundStyle(.primary)
                 Spacer(minLength: 8)
                 trailing()
             }
             if let caption {
-                Text(caption)
+                Text(L10n.text(caption))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -189,7 +189,7 @@ struct AgentPillButton: View {
                     Image(systemName: systemImage)
                         .font(.system(size: 11, weight: .semibold))
                 }
-                Text(title).font(.callout)
+                Text(L10n.text(title)).font(.callout)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)

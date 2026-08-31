@@ -581,7 +581,7 @@ struct MusicGenView: View {
     /// intrinsic-width and was centring itself inside the column.
     private func advancedCell<C: View>(_ label: String, @ViewBuilder control: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             control()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -697,7 +697,7 @@ struct MusicGenView: View {
                     advancedCell("Vocal language") {
                         Picker("", selection: $vocalLanguage) {
                             ForEach(MusicOptions.languages, id: \.code) { opt in
-                                Text(opt.label).tag(opt.code)
+                                Text(L10n.text(opt.label)).tag(opt.code)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
@@ -706,7 +706,7 @@ struct MusicGenView: View {
                         Picker("", selection: $timesignature) {
                             Text("Auto").tag("")
                             ForEach(MusicOptions.timeSignatures, id: \.value) { opt in
-                                Text(opt.label).tag(opt.value)
+                                Text(L10n.text(opt.label)).tag(opt.value)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
@@ -1051,7 +1051,7 @@ struct PromptRewriteSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(title).font(.headline)
+                Text(L10n.text(title)).font(.headline)
                 Spacer()
                 if isWriting { ProgressView().controlSize(.small) }
             }

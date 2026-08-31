@@ -35,7 +35,7 @@ struct SettingsView: View {
 
     var body: some View {
         shell
-        .navigationTitle("Settings")
+        .navigationTitle(L10n.text("Settings"))
         // An engine switch can retire the selected category (load a GGUF model
         // while "MLX Performance" is selected) — fall back to All rather than
         // leave a blank pane.
@@ -567,9 +567,9 @@ private struct SettingsSection<Content: View>: View {
         VStack(alignment: .leading, spacing: collapsed ? 0 : 12) {
             if !collapsed {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
+                    Text(L10n.text(title))
                         .font(.title3.weight(.semibold))
-                    Text(subtitle)
+                    Text(L10n.text(subtitle))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -602,11 +602,13 @@ private struct SettingsRow<Control: View>: View {
     @ViewBuilder var control: Control
 
     var body: some View {
-        SearchableRow(searchText: [title, explainer]) {
+        let localizedTitle = L10n.text(title)
+        let localizedExplainer = L10n.text(explainer)
+        SearchableRow(searchText: [title, explainer, localizedTitle, localizedExplainer]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
-                        Text(title)
+                        Text(localizedTitle)
                             .font(.body)
                         if isDirty {
                             Image(systemName: "arrow.clockwise.circle.fill")
@@ -619,7 +621,7 @@ private struct SettingsRow<Control: View>: View {
                     control
                         .frame(maxWidth: 280, alignment: .trailing)
                 }
-                Text(explainer)
+                Text(localizedExplainer)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -700,8 +702,8 @@ private struct ModelFoldersSectionContent: View {
                     }
                 }
                 Text(unavailable
-                     ? "That folder isn't reachable right now, so downloads are going to \(ModelRoots.builtInRoot) instead."
-                     : Self.defaultExplainer)
+                     ? L10n.format("That folder isn't reachable right now, so downloads are going to %@ instead.", ModelRoots.builtInRoot)
+                     : L10n.text(Self.defaultExplainer))
                     .font(.caption2)
                     .foregroundStyle(unavailable ? .orange : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -743,7 +745,7 @@ private struct ModelFoldersSectionContent: View {
     private var customFolderRow: some View {
         let pathText: String = {
             let raw = downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return raw.isEmpty ? "(none)" : raw
+            return raw.isEmpty ? L10n.text("(none)") : raw
         }()
         let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
@@ -770,7 +772,7 @@ private struct ModelFoldersSectionContent: View {
                         .disabled(!hasPath)
                     }
                 }
-                Text(Self.explainer)
+                Text(L10n.text(Self.explainer))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -977,7 +979,7 @@ private struct ServerSectionContent: View {
             ) {
                 Picker("", selection: $appState.serverOptions.logLevel) {
                     ForEach(ServerOptions.LogLevel.allCases) { lvl in
-                        Text(lvl.label).tag(lvl)
+                        Text(L10n.text(lvl.label)).tag(lvl)
                     }
                 }
                 .labelsHidden()
@@ -1168,12 +1170,12 @@ private struct ContextSizeRow: View {
                             step: 1
                         )
                         .frame(width: 200)
-                        Text(Self.formatTokens(appState.serverOptions.ctxSize))
+                        Text(L10n.text(Self.formatTokens(appState.serverOptions.ctxSize)))
                             .font(.body.monospacedDigit())
                             .frame(minWidth: 56, alignment: .trailing)
                     }
                 }
-                Text(ContextSizeDisplay.helpText)
+                Text(L10n.text(ContextSizeDisplay.helpText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1214,7 +1216,7 @@ private struct ContextSizeRow: View {
         let labelColor: Color = warn ? .orange : .secondary
         let valueColor: Color = warn ? .orange : .primary
         HStack(spacing: 4) {
-            Text(label)
+            Text(L10n.text(label))
                 .font(.caption2)
                 .foregroundStyle(labelColor)
             Text(value)
@@ -1328,7 +1330,11 @@ private struct SpecDecodeSectionContent: View {
                     // beside "Probe" would ask a question nobody can answer
                     // without benchmarking. It DISPLAYS what it resolved to
                     // instead (MLX_SERVE_SPEC_COST_PROBE=0 is the A/B arm).
-                    Text(server.specCost?.automaticLabel ?? "Automatic").tag(0)
+                    if let specCost = server.specCost {
+                        Text(L10n.format("Automatic (measured: %lld tokens)", Int64(specCost.mtpDepthCap))).tag(0)
+                    } else {
+                        Text("Automatic").tag(0)
+                    }
                     ForEach(1...6, id: \.self) { n in
                         Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
                     }
@@ -1380,7 +1386,7 @@ private struct SettingsSubheader: View {
 
     var body: some View {
         if SettingsSearch.tokens(query).isEmpty {
-            Text(text)
+            Text(L10n.text(text))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
@@ -1465,7 +1471,7 @@ private struct PerformanceSectionContent: View {
             ) {
                 Picker("", selection: opts.kvQuant) {
                     ForEach(ServerOptions.KVQuant.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .labelsHidden()
@@ -1588,7 +1594,7 @@ private struct LlamaPerformanceSectionContent: View {
             ) {
                 Picker("", selection: opts.llamaKvQuant) {
                     ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .labelsHidden()
@@ -1736,7 +1742,7 @@ private struct DrafterRow: View {
                 control
                     .frame(maxWidth: 280, alignment: .trailing)
             }
-            Text(explainer)
+            Text(L10n.text(explainer))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1983,7 +1989,7 @@ private struct WakePhraseSectionContent: View {
                 TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 220)
-                Text(Self.explainer)
+                Text(L10n.text(Self.explainer))
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
@@ -2048,7 +2054,7 @@ private struct VoiceCloneSectionContent: View {
             Text("Voice engine").font(.subheadline.weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
                 ForEach(VoiceEngine.allCases, id: \.self) { e in
-                    Text(e.label).tag(e)
+                    Text(L10n.text(e.label)).tag(e)
                 }
             }
             .labelsHidden()
@@ -2160,7 +2166,7 @@ private struct VoiceCloneSectionContent: View {
                 }
             }
             .font(.caption)
-            Text(Self.explainer)
+            Text(L10n.text(Self.explainer))
                 .font(.caption2).foregroundStyle(.secondary)
             if let voiceError {
                 Text(voiceError).font(.caption).foregroundStyle(.red)
@@ -2642,7 +2648,7 @@ private func snappingSlider(
             step: 1
         )
         .frame(width: 200)
-        Text(label)
+        Text(L10n.text(label))
             .font(.body.monospacedDigit())
             .frame(minWidth: 70, alignment: .trailing)
     }

@@ -47,7 +47,8 @@ struct BundleDownloadBar: View {
             .buttonStyle(.borderedProminent)
             }
             if bundle.components.count > 1 {
-                Text("Includes \(bundle.components.count) models (e.g. the text encoder).")
+                Text(L10n.format("Includes %lld models (e.g. the text encoder).",
+                                 Int64(bundle.components.count)))
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }

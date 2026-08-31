@@ -112,7 +112,7 @@ private struct ModelBrowserSectionBar: View {
             HStack(spacing: 5) {
                 Image(systemName: item.systemImage)
                     .font(.system(size: 11, weight: .medium))
-                Text(item.title).font(.callout).lineLimit(1)
+                Text(L10n.text(item.title)).font(.callout).lineLimit(1)
                 if item == .downloads, isDownloading {
                     ProgressView()
                         .controlSize(.small)
@@ -281,7 +281,7 @@ private struct RecommendedModelTable: View {
             Image(systemName: family.systemImage)
                 .font(.caption)
                 .foregroundStyle(family.tint)
-            Text(family.title)
+            Text(L10n.text(family.title))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
@@ -410,13 +410,13 @@ private struct RecommendedModelTableRow: View {
                                 .foregroundStyle(.tint)
                         }
                     }
-                    Text(pick.tagline)
+                    Text(L10n.text(pick.tagline))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .help(pick.blurb)
+                .help(L10n.text(pick.blurb))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -462,12 +462,13 @@ private struct RecommendedModelTableRow: View {
             HStack(spacing: 3) {
                 Image(systemName: fitIcon)
                     .font(.system(size: 9))
-                Text(fit.label)
+                Text(L10n.text(fit.label))
                     .font(.caption2)
             }
             .foregroundStyle(fitColor)
         }
-        .help("Needs about \(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB)) — your Mac can use about \(memory.usableLabel) for a model.")
+        .help(L10n.format("Needs about %@ — your Mac can use about %@ for a model.",
+                          SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB), memory.usableLabel))
     }
 
     private var fitIcon: String {
@@ -766,7 +767,7 @@ private struct MyModelsPane: View {
                                 Divider().padding(.horizontal, 12)
                             }
                         } header: {
-                            Text(group.title)
+                            Text(L10n.text(group.title))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -907,8 +908,8 @@ private struct ModelGroupSection<Content: View>: View {
                     .foregroundStyle(tint)
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.subheadline.weight(.semibold))
-                    Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.subheadline.weight(.semibold))
+                    Text(L10n.text(subtitle)).font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -957,10 +958,10 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         HStack(alignment: .top, spacing: 12) {
             Button { card = ModelCardRequest(repoId: bundle.primaryRepo, title: preset.name) } label: {
             VStack(alignment: .leading, spacing: 3) {
-                Text(preset.name)
+                Text(L10n.text(preset.name))
                     .font(.callout.weight(.medium))
 
-                Text(preset.description)
+                Text(L10n.text(preset.description))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1158,7 +1159,7 @@ private struct ModelUseBadge: View {
             default:
                 EmptyView()
             }
-            Text(state.label)
+            Text(L10n.text(state.label))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(tint)
                 .lineLimit(1)
@@ -1237,7 +1238,7 @@ private struct SortableHeader: View {
                 searchService.sort(by: field)
             } label: {
                 HStack(spacing: 2) {
-                    Text(title)
+                    Text(L10n.text(title))
                     if isActive {
                         Image(systemName: searchService.sortDescending ? "chevron.down" : "chevron.up")
                             .font(.system(size: 8))
@@ -1248,7 +1249,7 @@ private struct SortableHeader: View {
             .buttonStyle(.plain)
             .foregroundStyle(isActive ? .primary : .secondary)
         } else {
-            Text(title)
+            Text(L10n.text(title))
         }
     }
 }
