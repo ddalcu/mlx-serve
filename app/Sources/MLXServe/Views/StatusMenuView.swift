@@ -395,7 +395,7 @@ struct StatusMenuView: View {
                 } else if let systemImageName = control.systemImageName {
                     Image(systemName: systemImageName)
                 }
-                Text(control.title)
+                Text(L10n.text(control.title))
             }
             .frame(maxWidth: .infinity)
         }
@@ -1364,4 +1364,3 @@ struct TerminalLogTextView: NSViewRepresentable {
         context.coordinator.lastAutoScroll = autoScroll
     }
 }
-

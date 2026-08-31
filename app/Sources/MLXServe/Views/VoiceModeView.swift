@@ -164,6 +164,9 @@ struct VoiceComposerToggle: View {
         .buttonStyle(.plain)
         .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
         .disabled(disabled)
-        .help("Voice mode (\(ownedHere ? "ON in this chat" : controller.isActive ? "ON in another chat — click to move it here" : "OFF")) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
+        .help(L10n.format(
+            "Voice mode (%@) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).",
+            L10n.text(ownedHere ? "ON in this chat" : controller.isActive ? "ON in another chat — click to move it here" : "OFF")
+        ))
     }
 }

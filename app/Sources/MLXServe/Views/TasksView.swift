@@ -119,7 +119,7 @@ private struct TaskRow: View {
 private struct AutonomyBadge: View {
     let autonomy: TaskAutonomy
     var body: some View {
-        Text(autonomy.shortLabel)
+        Text(L10n.text(autonomy.shortLabel))
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(autonomy.tint.opacity(0.18), in: Capsule())

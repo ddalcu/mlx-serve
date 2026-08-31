@@ -23,9 +23,9 @@ enum VoiceEngine: String, Codable, CaseIterable, Sendable {
 
     var label: String {
         switch self {
-        case .system: return "System voice"
-        case .clone: return "My cloned voice"
-        case .kokoro: return "Kokoro (fast, built-in voices)"
+        case .system: return L10n.text("System voice")
+        case .clone: return L10n.text("My cloned voice")
+        case .kokoro: return L10n.text("Kokoro (fast, built-in voices)")
         }
     }
 }

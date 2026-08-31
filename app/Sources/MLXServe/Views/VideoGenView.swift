@@ -323,13 +323,13 @@ struct VideoGenView: View {
             Text("Quality").font(.subheadline.weight(.semibold))
             Picker("", selection: $quality) {
                 ForEach(QualityPreset.allCases) { q in
-                    Text(q.label).tag(q)
+                    Text(L10n.text(q.label)).tag(q)
                 }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
-            Text(qualityHint)
+            Text(L10n.text(qualityHint))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -343,7 +343,8 @@ struct VideoGenView: View {
         // Gated on the capability so a stale clip can't make H3 claim it.
         let label = (model.supportsAudioInput && audioURL != nil && s.mode == .oneStage)
             ? "2-stage (audio-to-video)" : modeLabel(s.mode)
-        return "\(label), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
+        return L10n.format("%@, %lld steps, %lld frames (~%.1fs)",
+                           L10n.text(label), Int64(s.steps), Int64(s.numFrames), durationSec)
     }
 
     private func modeLabel(_ m: VideoPipelineMode) -> String {
@@ -359,7 +360,7 @@ struct VideoGenView: View {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
                 ForEach(model.resolutionOptions()) { r in
-                    Text(r.label).tag(r)
+                    Text(L10n.text(r.label)).tag(r)
                 }
             }
             .labelsHidden()
@@ -399,7 +400,7 @@ struct VideoGenView: View {
 
     private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(L10n.text(title)).font(.caption2).foregroundStyle(.secondary)
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 80)
@@ -429,7 +430,7 @@ struct VideoGenView: View {
             HStack {
                 Text("Frames").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(numFrames) frames · ~\(String(format: "%.1f", Double(numFrames) / Double(fps)))s")
+                Text(L10n.format("%lld frames · ~%.1fs", Int64(numFrames), Double(numFrames) / Double(fps)))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -465,7 +466,8 @@ struct VideoGenView: View {
             in: 0...Double(maxIdx),
             step: 1
         )
-        .help("Clip length. LTX only generates \(opts.first ?? 9)–\(opts.last ?? 193) frames on its 8N+1 ladder; the slider snaps to valid counts.")
+        .help(L10n.format("Clip length. LTX only generates %lld–%lld frames on its 8N+1 ladder; the slider snaps to valid counts.",
+                          Int64(opts.first ?? 9), Int64(opts.last ?? 193)))
     }
 
     /// Always show every option up to the model's hard cap. The user can
@@ -505,7 +507,7 @@ struct VideoGenView: View {
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
-            return "May exceed your Mac's RAM (\(total) GB total) at this length."
+            return L10n.format("May exceed your Mac's RAM (%lld GB total) at this length.", Int64(total))
         }
         // Ask whether THIS configuration fits, not whether it is longer than
         // the cap: the cap has a floor, so "cap == 124" means both "124 frames
@@ -578,9 +580,9 @@ struct VideoGenView: View {
                               isTargeted: Binding<Bool>, help: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(title).font(.subheadline.weight(.semibold))
+                Text(L10n.text(title)).font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(note)
+                Text(L10n.text(note))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -671,7 +673,7 @@ struct VideoGenView: View {
                 if !refImageURLs.isEmpty {
                     Picker("Image detail", selection: $refImageSize) {
                         ForEach(RefImageSizing.allCases, id: \.self) { s in
-                            Text(s.label).tag(s)
+                    Text(L10n.text(s.label)).tag(s)
                         }
                     }
                     .font(.caption)
@@ -705,7 +707,7 @@ struct VideoGenView: View {
                          add: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                Text(L10n.text(title)).font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 Spacer()
                 Text("\(urls.wrappedValue.count)/\(limit)")
                     .font(.caption2)
@@ -1261,7 +1263,7 @@ struct VideoGenView: View {
     private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, help: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
                 Spacer()
                 Text(String(format: "%.1f", value.wrappedValue))
                     .font(.caption.monospacedDigit())
@@ -1276,7 +1278,7 @@ struct VideoGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, help: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
                 Spacer()
                 Text("\(value.wrappedValue)")
                     .font(.caption.monospacedDigit())

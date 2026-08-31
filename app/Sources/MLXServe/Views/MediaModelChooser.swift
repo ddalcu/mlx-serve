@@ -100,7 +100,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                 if !cur.detail.isEmpty || cur.ram != nil {
                     HStack(spacing: 4) {
                         if !cur.detail.isEmpty {
-                            Text(cur.detail)
+                            Text(L10n.text(cur.detail))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -127,7 +127,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                 if isDownloaded(preset) {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
-                        .help("Downloaded and ready to use")
+                        .help(L10n.text("Downloaded and ready to use"))
                         .padding(.top, 1)
                 } else {
                     Button {
@@ -138,7 +138,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("Download this model — you can keep using the app while it transfers")
+                    .help(L10n.text("Download this model — you can keep using the app while it transfers"))
                 }
             }
         }
@@ -234,7 +234,7 @@ extension MediaModelChooser {
             lanModel: lanModel.wrappedValue,
             capabilityOf: capabilityOf,
             isDownloaded: { downloads.bundleReady(bundleOf($0)) },
-            downloadLabel: { "Download \(bundleOf($0).approxSizeLabel)" },
+            downloadLabel: { L10n.format("Download %@", bundleOf($0).approxSizeLabel) },
             onSelect: { preset in
                 lanModel.wrappedValue = nil
                 selected.wrappedValue = preset

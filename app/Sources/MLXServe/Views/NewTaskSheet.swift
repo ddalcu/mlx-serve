@@ -179,7 +179,7 @@ struct NewTaskSheet: View {
         let selected = scheduleText.trimmingCharacters(in: .whitespaces)
             .caseInsensitiveCompare(value) == .orderedSame
         return Button { scheduleText = value } label: {
-            Text(title)
+            Text(L10n.text(title))
                 .font(.caption.weight(.medium))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
@@ -197,7 +197,7 @@ struct NewTaskSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 Picker("", selection: $autonomy) {
                     ForEach(TaskAutonomy.allCases, id: \.self) { level in
-                        Text(level.shortLabel).tag(level)
+                        Text(L10n.text(level.shortLabel)).tag(level)
                     }
                 }
                 .labelsHidden()
@@ -307,10 +307,10 @@ struct NewTaskSheet: View {
     private func field<Content: View>(_ title: String, hint: String? = nil,
                                       @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.subheadline.weight(.semibold))
+            Text(L10n.text(title)).font(.subheadline.weight(.semibold))
             content()
             if let hint {
-                Text(hint)
+                Text(L10n.text(hint))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

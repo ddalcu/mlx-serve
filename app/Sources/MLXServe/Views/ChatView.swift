@@ -1253,7 +1253,7 @@ struct ChatSidebar: View {
 
     /// A section heading, sitting on the same left edge as the rows under it.
     private func sectionHeader(_ title: String) -> some View {
-        Text(title)
+        Text(L10n.text(title))
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1301,8 +1301,9 @@ struct ChatSidebar: View {
                             .font(.system(size: 10))
                             .foregroundStyle(Color.accentColor)
                     }
-                    Text(ChatSessionTitle.display(title: session.title,
-                                                  agentName: agent?.name))
+                    let displayTitle = ChatSessionTitle.display(title: session.title,
+                                                                agentName: agent?.name)
+                    Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
@@ -1445,7 +1446,7 @@ struct ChatSidebar: View {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
                 .frame(width: 16)
-            Text(title).font(.subheadline.weight(.medium))
+            Text(L10n.text(title)).font(.subheadline.weight(.medium))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
@@ -2540,7 +2541,7 @@ struct ChatDetailView: View {
     /// The input field. No background or border of its own — the composer
     /// container draws those around both rows. NSTextView-backed so a big paste
     /// stays smooth and the mouse wheel scrolls once it grows past the cap.
-    private var composerPlaceholder: String { "Ask me anything…" }
+    private var composerPlaceholder: String { L10n.text("Ask me anything…") }
 
     private var composerField: some View {
         GrowingTextEditor(text: $inputText,
@@ -3947,7 +3948,7 @@ struct MessageBubble: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(help)
+        .help(L10n.text(help))
     }
 
     private func copyMessage() {

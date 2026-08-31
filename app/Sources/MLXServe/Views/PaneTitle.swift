@@ -11,7 +11,7 @@ struct PaneTitleBar: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(title)
+            Text(L10n.text(title))
                 .font(.headline)
                 .foregroundStyle(.primary)
             Button(action: add) {
@@ -29,7 +29,7 @@ struct PaneTitleBar: View {
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
-            .help(addHelp)
+            .help(L10n.text(addHelp))
         }
         // Breathing room from the column's leading edge; the toolbar gives none
         // once the shared background is off.

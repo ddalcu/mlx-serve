@@ -212,7 +212,7 @@ struct MLXCoreApp: App {
 
         .commands {
             CommandGroup(replacing: .newItem) {
-                    Button("New Chat") {
+                    Button(L10n.text("New Chat")) {
                         openAndFocus("chat")
                         _ = appState.newChatSession()
                     }
@@ -224,33 +224,33 @@ struct MLXCoreApp: App {
                     // a ScrollView of plain Buttons never is — see the note in
                     // `ChatSidebar.conversationsSidebar`. It also makes the
                     // shortcut discoverable, which a bare key never was.
-                    Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
+                    Button(L10n.text("Delete Chat")) { appState.requestChatDeletionFromMenu() }
                         .keyboardShortcut(.delete, modifiers: [.command])
                         .disabled(appState.chatDeletionTarget == nil)
                 }
-            CommandMenu("Agent") {
-                Button("Agents…") { openAndFocus("agents") }
+            CommandMenu(L10n.text("Agent")) {
+                Button(L10n.text("Agents…")) { openAndFocus("agents") }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
 
-                Button("Browser") { openAndFocus("browser") }
+                Button(L10n.text("Browser")) { openAndFocus("browser") }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
 
-                Button("Settings…") { appState.showSettings() }
+                Button(L10n.text("Settings…")) { appState.showSettings() }
                     .keyboardShortcut(",", modifiers: [.command])
 
-                Button("Edit System Prompt") {
+                Button(L10n.text("Edit System Prompt")) {
                     AgentPrompt.openSystemPromptInEditor()
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
 
                 // Pull in the latest built-in default when ours has moved ahead of
                 // the on-disk copy. Backs up the user's current prompt first.
-                Button("Update System Prompt to Latest…") {
+                Button(L10n.text("Update System Prompt to Latest…")) {
                     AgentPrompt.runSystemPromptUpdateFlow()
                 }
                 .disabled(!AgentPrompt.isSystemPromptOutdated())
 
-                Button("Open Memory File") {
+                Button(L10n.text("Open Memory File")) {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath
                     if !FileManager.default.fileExists(atPath: path) {
                         try? "".write(toFile: path, atomically: true, encoding: .utf8)
@@ -258,7 +258,7 @@ struct MLXCoreApp: App {
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
 
-                Button("Open Skills Folder") {
+                Button(L10n.text("Open Skills Folder")) {
                     // Accessing the shared manager seeds the example skill on
                     // first run; the create is a no-op if it already exists.
                     let path = AgentPrompt.skillManager.skillsDirectory
@@ -266,7 +266,7 @@ struct MLXCoreApp: App {
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
 
-                Button("Open MLX Serve Folder") {
+                Button(L10n.text("Open MLX Serve Folder")) {
                     let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
@@ -277,18 +277,18 @@ struct MLXCoreApp: App {
             // the tray popover, reachable from the menu bar and Help-menu
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
-            CommandMenu("Tools") {
+            CommandMenu(L10n.text("Tools")) {
                 // ⌘L: the model switcher, over the same rows the composer's
                 // pill offers. A menu key equivalent so it works from every
                 // window, and it goes through AppState's door — which raises
                 // the picker AND brings the chat window forward.
-                Button("Switch Model…") { appState.showModelPalette() }
+                Button(L10n.text("Switch Model…")) { appState.showModelPalette() }
                     .keyboardShortcut("l", modifiers: [.command])
 
-                Button("Browse Models…") { appState.showModels() }
+                Button(L10n.text("Browse Models…")) { appState.showModels() }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
 
-                Button("Scheduled Tasks…") { appState.showTasks() }
+                Button(L10n.text("Scheduled Tasks…")) { appState.showTasks() }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
 
                 Divider()
@@ -307,7 +307,7 @@ struct MLXCoreApp: App {
                 // DMG builds only — the MAS build can't detect or launch
                 // other apps' CLIs (same gate as the tray's Code button).
                 if BuildFeatures.current.cliLauncher {
-                    Button("Launch Claude Code…") {
+                    Button(L10n.text("Launch Claude Code…")) {
                         launchClaudeCodeWithPicker(
                             baseURL: appState.server.baseURL,
                             serverContextLength: appState.server.chatModelInfo?.contextLength)

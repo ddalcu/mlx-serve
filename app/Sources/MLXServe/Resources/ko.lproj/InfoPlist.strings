@@ -1,0 +1,5 @@
+"CFBundleDisplayName" = "MLX Core";
+"NSAppleEventsUsageDescription" = "MLX Core가 사용자가 요청한 작업을 수행하기 위해 다른 앱을 제어하도록 허용합니다.";
+"NSLocalNetworkUsageDescription" = "MLX Core가 로컬 네트워크에서 모델 서버와 다른 Mac을 찾도록 허용합니다.";
+"NSMicrophoneUsageDescription" = "음성 대화를 위해 MLX Core가 마이크를 사용하도록 허용합니다.";
+"NSSpeechRecognitionUsageDescription" = "음성 대화를 위해 MLX Core가 말한 내용을 텍스트로 변환하도록 허용합니다.";
