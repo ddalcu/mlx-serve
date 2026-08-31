@@ -715,11 +715,14 @@ private struct MyModelsPane: View {
     @Binding var filter: String
     @EnvironmentObject var appState: AppState
 
+    @State private var freeDiskSpace: String = ""
+
     private var groups: [LocalModelGroup] {
         ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
     }
 
     private var total: Int { groups.reduce(0) { $0 + $1.models.count } }
+
 
     var body: some View {
         VStack(spacing: 0) {
@@ -791,11 +794,35 @@ private struct MyModelsPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if !freeDiskSpace.isEmpty {
+                    Text("\(freeDiskSpace) available")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
         }
         .navigationTitle("My Models")
+        .onAppear {
+             updateDiskSpace()
+         }
+    }
+
+    // Internal handler to pull clean Foundation storage metrics
+    private func updateDiskSpace() {
+        let fileURL = URL(fileURLWithPath: NSHomeDirectory())
+        do {
+            let values = try fileURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            if let freeSpace = values.volumeAvailableCapacityForImportantUsage {
+                let formatter = ByteCountFormatter()
+                formatter.allowedUnits = [.useAll]
+                formatter.countStyle = .file
+                freeDiskSpace = formatter.string(fromByteCount: freeSpace)
+            }
+        } catch {
+            print("Failed to get storage metadata: \(error.localizedDescription)")
+        }
     }
 }
 
