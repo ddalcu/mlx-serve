@@ -22,6 +22,20 @@ final class LaTeXFontsTests: XCTestCase {
         XCTAssertEqual(located, bundle)
     }
 
+    /// The layouts that ACTUALLY occur on disk: both a SwiftPM resource bundle
+    /// and a sealed .app's copy keep fonts at `<bundle>/Contents/Resources/Fonts`.
+    /// The probe used to try `<bundle>/Fonts` alone — a layout nothing produces —
+    /// so `isAvailable` was false everywhere and every equation silently fell
+    /// back to its source text.
+    func testASealedBundleLayoutIsAHit() {
+        let debugDir = URL(fileURLWithPath: "/b/out/Products/Debug")
+        let bundle = debugDir.appendingPathComponent(LaTeXFonts.bundleName)
+        let font = bundle.appendingPathComponent("Contents/Resources")
+            .appendingPathComponent(LaTeXFonts.probeFont)
+        let located = LaTeXFonts.locate(searching: [debugDir], fileExists: present([font.path]))
+        XCTAssertEqual(located, bundle)
+    }
+
     func testAFontBundleWithoutItsFontsIsNotAHit() {
         let resources = URL(fileURLWithPath: "/Applications/MLX Core.app/Contents/Resources")
         XCTAssertNil(

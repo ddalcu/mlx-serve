@@ -31,7 +31,14 @@ enum LaTeXFonts {
     ) -> URL? {
         for base in candidates {
             let bundle = base.appendingPathComponent(bundleName)
+            // BOTH sealings exist on disk: a SwiftPM resource bundle and a
+            // signed .app's copy both keep fonts under Contents/Resources,
+            // while the flat <bundle>/Fonts shape is what older hand copies
+            // produced. A bundle of the right name without the probe font is
+            // still a miss — a half-finished copy is not a hit.
             if fileExists(bundle.appendingPathComponent(probeFont)) { return bundle }
+            if fileExists(bundle.appendingPathComponent("Contents/Resources")
+                .appendingPathComponent(probeFont)) { return bundle }
         }
         return nil
     }

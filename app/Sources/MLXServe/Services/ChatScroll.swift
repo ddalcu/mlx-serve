@@ -32,6 +32,11 @@ enum ChatScrollEvent: Equatable {
     case transcriptShown
     case userSentMessage
     case jumpTapped
+    /// Jumped to a SPECIFIC message (a sidebar search hit). The view scrolls
+    /// itself to the id; the core's job is only to release follow — you asked
+    /// to be here, not at the end, and a stream must not yank you back down.
+    /// Scrolling back to the end re-engages through the ordinary geometry rule.
+    case messageTargeted
     case driverChanged(ChatScrollDriver)
     /// Negative when the scroll view is rubber-banding past the end.
     case geometryChanged(distanceFromBottom: CGFloat)
@@ -75,6 +80,10 @@ struct ChatScrollState: Equatable {
         case .userSentMessage, .jumpTapped:
             isPinnedToBottom = true
             return .toBottom(animated: true)
+
+        case .messageTargeted:
+            isPinnedToBottom = false
+            return .none
 
         case .driverChanged(let driver):
             self.driver = driver
