@@ -3225,16 +3225,17 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
     // stay generic.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
-    // A hot-cache restore materializes a COPY of the matched entry's KV into
-    // the slot while the entry stays resident (~7-8 GB at a 138k match) —
-    // bill the largest resident entry. Conservative (billed even on a miss),
-    // but the honest direction.
-    const hot_restore: u64 = if (lm.prefix_cache) |*pc| pc.largestEntryBytes() else 0;
-    const needed: u64 = hot_restore +| (if (is_dsv4)
+    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
+    // allocate another copy of the cached buffers. `active_mem` below already
+    // includes the resident entry, while `prefillMemoryNeeded` bills the full
+    // destination KV capacity that may be allocated when the restored cache
+    // grows. Adding the resident entry here again would invent a third copy
+    // and reject long warm prompts (and even cache misses) spuriously.
+    const needed: u64 = if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq));
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -17703,6 +17704,22 @@ test "checkAttentionMemory routes deepseek_v4 through its own estimator with the
     const call = "dsv4PrefillMemoryNeeded(seq, layers, " ++
         "kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))";
     try t.expect(std.mem.indexOf(u8, src, call) != null);
+}
+
+test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
+    // RAM restore uses refcount-sharing. The resident entry is already inside
+    // `active_mem`, and prefillMemoryNeeded bills the destination KV growth.
+    // Pin the chokepoint so a future cache-accounting change cannot add the
+    // resident entry to `needed` again (the 138k-token false-400 regression).
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const start = std.mem.indexOf(u8, src, "fn checkAttention" ++ "Memory(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
+    const body = tail[0..end];
+    try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
+    try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
+    try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
 }
 
 test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {

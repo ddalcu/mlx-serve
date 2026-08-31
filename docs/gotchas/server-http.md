@@ -1564,17 +1564,27 @@ exactly this crash — and the clamp never returns 0, because `initWithMem`
 reads 0 as "no byte cap". When it bites: `[hot-cache] budget clamped … MB`.
 Crash-case numbers: 96 − 70 − ~6.4 (262k ctx KV) − ~4 ≈ 15 GB instead of 40.
 
-Second hole, same crash: a hot-cache restore materializes a COPY of the
-matched entry's KV into the slot while the entry stays resident (~7–8 GB at a
-138k match), and the prefill admission guard never billed it. The guard now
-adds the cache's largest resident entry (`HotPrefixCache.largestEntryBytes`,
-an atomic mirror refreshed on every mutation — the guard reads it from conn
-threads). Conservative: billed even on a miss.
+Follow-up correction: RAM restore does **not** materialize a copy.
+`KVCache.restore` rebinds the destination handles with `mlx_array_set`, so the
+slot refcount-shares the entry's buffers until a later grow allocates its
+destination buffer. The admission calculation already covers both sides:
+`active_mem` includes the resident entry, and `prefillMemoryNeeded` bills the
+full destination KV capacity. Adding the largest entry once more invented a
+third copy and falsely rejected a 138k warm prompt — as well as cache misses,
+because the guard ran before lookup. Do not add resident cache bytes to
+`needed`; they belong only in the active-memory side of the equation.
 
-Guards: `clampedPrefixCacheMem` unit test (the crash's numbers),
-the `initWithMem`-site source scan in scheduler.zig (a second construction
-site can't skip the clamp — the cold-load flags class), and the
-`largestEntryBytes` tracking test in prefix_cache.zig.
+The byte budget is also a hard cap now. Previously the eviction loop emptied
+the cache but appended an oversized candidate once no entries remained, so a
+single long conversation could exceed the load-time clamp. An entry larger
+than `max_kv_bytes` is declined while an existing smaller prefix is preserved;
+the replacement path also permits eviction of its sole final entry if inherited
+SSM checkpoints push it over the cap.
+
+Guards: `clampedPrefixCacheMem` unit test (the crash's numbers), the
+`initWithMem`-site source scan in scheduler.zig (a second construction site
+can't skip the clamp — the cold-load flags class), and the oversized sole-entry
+regression in prefix_cache.zig.
 
 App-side twin: the crash banner showed `> "9:23:51 PM [vite] Pre-transform
 error: …"` — the agent conversation's own request-preview log line — because

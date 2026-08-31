@@ -169,12 +169,6 @@ pub const HotPrefixCache = struct {
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
-    /// Cross-thread mirror of the largest live entry's `kv_bytes`. The
-    /// prefill admission guard (conn thread) reads it to bill the restore
-    /// transient — a restore materializes a COPY of the matched entry's KV
-    /// into the slot while the entry stays resident. Refreshed on the
-    /// inference thread after every mutation.
-    largest_entry_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     allocator: std.mem.Allocator,
     counter: u64 = 0,
     /// Set to true once we've called `xfm.resetCache()` at least once after
@@ -762,6 +756,27 @@ pub const HotPrefixCache = struct {
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
         }
         const new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
+        // The byte budget is a hard retention cap, including for the first (or
+        // only) entry. The old eviction loop could empty the cache and then
+        // append an entry larger than the cap, defeating the load-time clamp
+        // precisely for long single-conversation prefixes. Keep any existing
+        // entry and decline this candidate instead.
+        if (self.max_kv_bytes > 0 and new_bytes > self.max_kv_bytes) {
+            var discarded_snap = new_snap;
+            discarded_snap.deinit();
+            if (new_dflash) |*d| d.deinit();
+            if (new_mtp) |*m3| m3.deinit();
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
+            log.info("  [hot-cache] skipped oversized entry ({d} tokens, {d:.2} MB > {d:.2} MB budget)\n", .{
+                tokens.len,
+                @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
+            });
+            return;
+        }
         const tokens_owned = self.allocator.dupe(u32, tokens) catch |err| {
             var snap = new_snap;
             snap.deinit();
@@ -912,20 +927,18 @@ pub const HotPrefixCache = struct {
             e.mtp_bytes = new_mtp_bytes;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
-            // The insert path below enforces the byte budget; this path used to
-            // return without it, so an entry that only ever grows could hold the
-            // cache above `max_kv_bytes` indefinitely. `e` was just bumped to the
-            // newest `last_used`, so `evictOneLru` cannot pick it while another
-            // entry exists.
+            // Inherited SSM checkpoints can make a replacement larger than
+            // `new_bytes`, so enforce the cap again on the final entry. Allow
+            // eviction of the sole entry: retaining one over-budget entry would
+            // make the load-time headroom clamp advisory instead of real.
             if (self.max_kv_bytes > 0) {
                 while (self.current_kv_bytes > self.max_kv_bytes and
-                    self.entries.items.len > 1)
+                    self.entries.items.len > 0)
                 {
                     self.evictOneLru("byte budget");
                 }
             }
             if (self.disk != null) self.disk_dirty = true;
-            self.refreshLargestEntry();
             self.logResident();
             return;
         }
@@ -968,7 +981,6 @@ pub const HotPrefixCache = struct {
         };
         self.current_kv_bytes += new_bytes;
         if (self.disk != null) self.disk_dirty = true;
-        self.refreshLargestEntry();
         self.logResident();
     }
 
@@ -1077,7 +1089,6 @@ pub const HotPrefixCache = struct {
         }
         self.entries.clearRetainingCapacity();
         self.current_kv_bytes = 0;
-        self.refreshLargestEntry();
     }
 
     /// Drop the most recently committed entry — used after a pad-only
@@ -1099,24 +1110,11 @@ pub const HotPrefixCache = struct {
         var evicted = self.entries.swapRemove(newest_idx);
         self.current_kv_bytes -|= evicted.kv_bytes;
         freeEntryOwnedState(self.allocator, &evicted);
-        self.refreshLargestEntry();
         log.info("  [hot-cache] invalidated latest entry: {s}\n", .{reason});
     }
 
     pub fn entryCount(self: *const HotPrefixCache) usize {
         return self.entries.items.len;
-    }
-
-    /// Largest live entry's bytes (KV + ssm + spec snapshots) — safe to read
-    /// from any thread. What a restore's copy transient is bounded by.
-    pub fn largestEntryBytes(self: *const HotPrefixCache) u64 {
-        return self.largest_entry_bytes.load(.monotonic);
-    }
-
-    fn refreshLargestEntry(self: *HotPrefixCache) void {
-        var largest: u64 = 0;
-        for (self.entries.items) |*e| largest = @max(largest, e.kv_bytes);
-        self.largest_entry_bytes.store(largest, .monotonic);
     }
 };
 
@@ -2051,9 +2049,7 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testing.expectEqual(@as(usize, 800), kept[3].pos);
 }
 
-test "HotPrefixCache: largestEntryBytes tracks commits and removals (restore-copy bill)" {
-    // The prefill admission guard bills a restore's copy transient by this
-    // value from a conn thread — it must follow every mutation.
+test "HotPrefixCache: byte budget rejects an oversized sole entry and preserves a smaller prefix" {
     const s = mlx.gpuStream();
 
     var a = try KVCache.init(testing.allocator, 2);
@@ -2070,21 +2066,32 @@ test "HotPrefixCache: largestEntryBytes tracks commits and removals (restore-cop
     var toks_b: [600]u32 = undefined;
     for (&toks_b, 0..) |*t2, i| t2.* = @intCast(i + 100);
 
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    try testing.expectEqual(@as(u64, 0), hc.largestEntryBytes());
-
-    try hc.commit(&a, &toks_a, false);
-    const small = hc.largestEntryBytes();
-    try testing.expect(small > 0);
-
-    try hc.commit(&b, &toks_b, false);
-    const big = hc.largestEntryBytes();
+    var a_snap = try a.snapshot();
+    defer a_snap.deinit();
+    var b_snap = try b.snapshot();
+    defer b_snap.deinit();
+    const small = HotPrefixCache.snapshotBytes(&a_snap);
+    const big = HotPrefixCache.snapshotBytes(&b_snap);
     try testing.expect(big > small);
 
-    // Dropping the newest (the big one) shrinks the bill back down.
-    hc.invalidateLatest("test");
-    try testing.expectEqual(small, hc.largestEntryBytes());
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, small);
+    defer hc.deinit();
+
+    try hc.commit(&a, &toks_a, false);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+
+    // B extends A, so this exercises the replacement path. It is too large
+    // for the cap: retain A rather than replacing it or keeping B over budget.
+    @memcpy(toks_b[0..toks_a.len], &toks_a);
+    try hc.commit(&b, &toks_b, false);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(toks_a.len, hc.entries.items[0].tokens.len);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+
+    // The same oversized candidate cannot enter an empty cache either.
     hc.invalidateAll("test");
-    try testing.expectEqual(@as(u64, 0), hc.largestEntryBytes());
+    try hc.commit(&b, &toks_b, false);
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expectEqual(@as(u64, 0), hc.current_kv_bytes);
 }

@@ -8,6 +8,7 @@
 
 ### Fixes
 
+- Long cached Pi/agent conversations are no longer refused by a phantom second KV-cache copy. RAM prefix restores share MLX buffers, and the cache memory limit now remains a hard cap even when one entry alone is oversized.
 - Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
