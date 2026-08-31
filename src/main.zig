@@ -113,6 +113,9 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Stall timeout in seconds: abort a request after n seconds
         \\                      WITHOUT producing a token (default: 300, 0=none). A request
         \\                      that keeps generating never times out, however long it runs.
+        \\  --loop-repetitions <n>
+        \\                      Cut exact short-token loops after n repeats (default: 16;
+        \\                      0 disables all repetition-loop detection)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
@@ -569,6 +572,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--loop-repetitions") and i + 1 < args.len) {
+            i += 1;
+            const repetitions = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--loop-repetitions: expected 0 or an integer >= 2; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            if (repetitions == 1) {
+                log.err("--loop-repetitions: expected 0 or an integer >= 2; got '1'\n", .{});
+                std.process.exit(1);
+            }
+            scheduler_mod.loop_repetitions = @intCast(repetitions);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
             // Module global so on-demand /v1/load-model cold loads honor the

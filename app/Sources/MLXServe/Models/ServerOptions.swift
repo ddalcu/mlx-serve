@@ -44,6 +44,10 @@ struct ServerOptions: Codable, Equatable {
     /// ONLY when disabled, so a default launch stays flag-free.
     var logToFile: Bool = true
     var requestTimeout: Int = 300       // seconds; 0 = unlimited
+    /// Short exact-token cycles required before the repetition guard cuts a
+    /// generation. 0 disables all three loop-detection tiers. The default 16
+    /// mirrors `generate.degenerate_loop_reps`.
+    var loopRepetitions: Int = 16
 
     // Observability (server-launch flag). When true, launches with `--metrics`,
     // exposing the Prometheus `/metrics` scrape endpoint AND a live throughput/
@@ -487,6 +491,7 @@ struct ServerOptions: Codable, Equatable {
         logLevel == other.logLevel &&
         logToFile == other.logToFile &&
         requestTimeout == other.requestTimeout &&
+        loopRepetitions == other.loopRepetitions &&
         enableMetrics == other.enableMetrics &&
         apiKey == other.apiKey &&
         toolAutocorrect == other.toolAutocorrect &&
@@ -563,6 +568,11 @@ struct ServerOptions: Codable, Equatable {
         return min(requested, ceiling)
     }
 
+    /// Curated values for the GUI picker. A free-form integer invites `1`,
+    /// which is invalid, while these choices cover the useful range without
+    /// pretending token repetition can be tuned with single-step precision.
+    static let loopRepetitionPresets = [0, 16, 24, 32, 48, 64]
+
     func toCLIArgs(modelDirOverride: String? = nil,
                    physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
         toCLIArgs(modelDirs: modelDirOverride.map { [$0] } ?? [],
@@ -601,6 +611,9 @@ struct ServerOptions: Codable, Equatable {
         }
         if requestTimeout != 300 {
             args += ["--timeout", "\(requestTimeout)"]
+        }
+        if loopRepetitions != 16 {
+            args += ["--loop-repetitions", "\(loopRepetitions)"]
         }
         if enableMetrics {
             args += ["--metrics"]
@@ -816,6 +829,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .logToFile) { logToFile = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .loopRepetitions) { loopRepetitions = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .toolAutocorrect) { toolAutocorrect = v }
@@ -984,6 +998,10 @@ extension ServerOptions {
         "requestTimeout": .init(
             title: "Request timeout (s)",
             explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
+            needsRestart: true),
+        "loopRepetitions": .init(
+            title: "Repeat-loop cutoff",
+            explainer: "How many identical short token cycles the server permits before stopping a generation. Raise this for legitimate repetitive output. Off disables exact, long-cycle, and fuzzy loop detection, so a genuinely stuck model can run until max_tokens. Passes --loop-repetitions and requires a restart.",
             needsRestart: true),
         "enableMetrics": .init(
             title: "Metrics panel",

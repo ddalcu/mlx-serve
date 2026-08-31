@@ -4644,10 +4644,22 @@ pub const LoopStop = struct {
     trim_start: usize,
 };
 
+/// Short exact-cycle repetitions required before the process-wide loop guard
+/// cuts generation. Set by `--loop-repetitions`; 0 disables every loop tier.
+/// The default must stay in sync with `generate.degenerate_loop_reps`.
+pub var loop_repetitions: usize = generate_mod.degenerate_loop_reps;
+
 /// Pure decision + trim point. The three tiers live in generate.zig
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
-    const d = generate_mod.degenerateTail(generated_ids) orelse return null;
+    return loopStopDecisionWithRepetitions(generated_ids, loop_repetitions);
+}
+
+/// Pure configurable decision used by the process-wide wrapper and tests.
+/// `0` is the explicit escape hatch: no exact, long-cycle, or fuzzy cut.
+pub fn loopStopDecisionWithRepetitions(generated_ids: []const u32, repetitions: usize) ?LoopStop {
+    if (repetitions == 0) return null;
+    const d = generate_mod.degenerateTailWithExactReps(generated_ids, repetitions) orelse return null;
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
@@ -6738,6 +6750,17 @@ test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it"
     for (&healthy, 0..) |*v, i| v.* = @intCast(i);
     try testing.expect(loopStopDecision(&healthy) == null);
     try testing.expect(loopStopReason(&healthy) == null);
+}
+
+test "loopStopDecision: repetition threshold is configurable and zero disables the guard" {
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
+    for (0..20) |_| try ids.append(testing.allocator, 404);
+
+    try testing.expect(loopStopDecisionWithRepetitions(ids.items, 16) != null);
+    try testing.expect(loopStopDecisionWithRepetitions(ids.items, 32) == null);
+    try testing.expect(loopStopDecisionWithRepetitions(ids.items, 0) == null);
 }
 
 test "loopStopReason: periods past the long tier stay uncut" {

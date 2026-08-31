@@ -39,6 +39,7 @@ final class SettingsSectionResetTests: XCTestCase {
         o.drafterPath = "/tmp/drafter"; o.draftBlockSize = 9
         o.enableMTP = false; o.mtpDepth = 6
         o.maxConcurrent = 8; o.kvQuant = .int4; o.prefixCacheEntries = 99
+        o.loopRepetitions = 32
         o.prefixCacheMem = "9GB"; o.enablePrefixCacheDisk = true; o.prefixCacheDisk = "99GB"
         o.llamaKvQuant = .q4; o.llamaCacheEntries = 9
         o.ssdStreaming = true
