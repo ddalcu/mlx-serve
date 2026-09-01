@@ -392,7 +392,54 @@ pub const Constraint = struct {
     grammar: *json_grammar.Grammar,
     token_bytes: *const token_mask.TokenBytes,
     mask_buf: []bool,
+    /// Final-answer grammars normally apply at token 0. A template-opened
+    /// reasoning turn instead starts inside an unconstrained channel; in that
+    /// case the mask is armed only after the model emits the channel's atomic
+    /// close token. The Generator observes this itself, before sampling the
+    /// next token, so the transition keeps the live KV/SSM state and cannot
+    /// race response-side parsing.
+    phase: ConstraintPhase = .{},
 };
+
+/// Pure transition state for a constraint whose scope begins after reasoning.
+/// Kept separate from `Constraint` so the boundary contract is hermetically
+/// testable without an MLX model or a JSON grammar allocation.
+pub const ConstraintPhase = struct {
+    active: bool = true,
+    activate_after_token: ?u32 = null,
+
+    pub fn deferUntil(token_id: u32) ConstraintPhase {
+        return .{ .active = false, .activate_after_token = token_id };
+    }
+
+    /// Observe one token sampled while the grammar is inactive. Returns true
+    /// exactly on the reasoning→final transition.
+    pub fn observe(self: *ConstraintPhase, token_id: u32) bool {
+        if (self.active) return false;
+        const boundary = self.activate_after_token orelse return false;
+        if (boundary != token_id) return false;
+        self.active = true;
+        self.activate_after_token = null;
+        return true;
+    }
+
+    /// Close a deferred phase without sampling. Returns the one configured
+    /// boundary token exactly once and activates the grammar immediately.
+    pub fn force(self: *ConstraintPhase) ?u32 {
+        if (self.active) return null;
+        const boundary = self.activate_after_token orelse return null;
+        self.active = true;
+        self.activate_after_token = null;
+        return boundary;
+    }
+};
+
+pub const FINAL_ANSWER_RESERVE_TOKENS: u32 = 64;
+
+pub fn answerReserveReached(completion_tokens: u32, max_tokens: u32) bool {
+    const remaining = max_tokens -| completion_tokens;
+    return remaining <= FINAL_ANSWER_RESERVE_TOKENS + 1;
+}
 
 /// RAII bundle for grammar-constrained sampling. Owns the parsed schema,
 /// grammar state machine, and per-step mask buffer. The embedded `Constraint`
@@ -438,7 +485,50 @@ pub const SchemaConstraint = struct {
         self.grammar.deinit();
         self.schema.deinit();
     }
+
+    /// Keep reasoning unconstrained and arm this schema immediately after the
+    /// supplied channel-close token. Must be called before generation starts.
+    pub fn deferUntilToken(self: *SchemaConstraint, token_id: u32) void {
+        self.constraint.phase = ConstraintPhase.deferUntil(token_id);
+    }
 };
+
+test "ConstraintPhase defers the final-answer grammar through reasoning" {
+    var phase = ConstraintPhase.deferUntil(42);
+    try std.testing.expect(!phase.active);
+    try std.testing.expect(!phase.observe(7)); // ordinary reasoning token
+    try std.testing.expect(!phase.active);
+    try std.testing.expect(phase.observe(42)); // atomic </think>
+    try std.testing.expect(phase.active);
+    try std.testing.expect(phase.activate_after_token == null);
+    try std.testing.expect(!phase.observe(42)); // transition is one-shot
+
+    var forced = ConstraintPhase.deferUntil(99);
+    try std.testing.expectEqual(@as(?u32, 99), forced.force());
+    try std.testing.expect(forced.active);
+    try std.testing.expect(forced.activate_after_token == null);
+    try std.testing.expectEqual(@as(?u32, null), forced.force());
+}
+
+test "deferred final-answer reserve stays inside the completion cap" {
+    try std.testing.expect(answerReserveReached(0, 64));
+    try std.testing.expect(answerReserveReached(0, 65));
+    try std.testing.expect(!answerReserveReached(0, 66));
+    try std.testing.expect(answerReserveReached(35, 100));
+    try std.testing.expect(!answerReserveReached(34, 100));
+}
+
+test "forced reasoning boundary is committed and counted exactly once" {
+    const src = @embedFile("generate.zig");
+    const start = std.mem.indexOf(u8, src, "pub fn forceDeferredConstraint" ++ "Boundary(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const end = std.mem.indexOf(u8, tail, "\n    pub fn deinit(") orelse return error.CallSiteMoved;
+    const body = tail[0..end];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "generated_ids.append(allocator, boundary)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "advanceStep(1)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "constraint.phase.force()"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "xfm.forwardWith(&self.ctx, tok_input)"));
+}
 
 /// Per-token logprob info (OpenAI format).
 pub const TokenLogprob = struct {
@@ -860,6 +950,11 @@ pub const Generator = struct {
     done: bool,
     eos_token_ids: []const u32,
     generated_ids: std.ArrayList(u32),
+    /// Degenerate-tail detection must not reconsider a reasoning loop after
+    /// its boundary has activated the final-answer grammar. The scheduler
+    /// scans only this suffix; a later loop in the answer is still handled by
+    /// the ordinary repetition-stop policy.
+    loop_guard_start: usize = 0,
     consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
     timeout_ns: u64, // 0 = no timeout; measures SILENCE, not total time (see StallClock)
     stall: StallClock = .{},
@@ -2581,6 +2676,59 @@ pub const Generator = struct {
             _ = mlx.mlx_clear_cache();
             self.last_cache_clear_step = self.step;
         }
+    }
+
+    pub fn hasDeferredConstraint(self: *const Generator) bool {
+        const constraint = self.sampling.constraint orelse return false;
+        return !constraint.phase.active and constraint.phase.activate_after_token != null;
+    }
+
+    pub fn loopGuardStart(self: *const Generator) usize {
+        return @min(self.loop_guard_start, self.generated_ids.items.len);
+    }
+
+    pub fn deferredAnswerReserveReached(self: *const Generator) bool {
+        return self.hasDeferredConstraint() and
+            @as(u32, self.completion_tokens) < self.max_tokens and
+            answerReserveReached(@intCast(self.completion_tokens), self.max_tokens);
+    }
+
+    /// Commit the configured reasoning close token through the live model
+    /// state, then leave its logits pending for the first constrained sample.
+    /// This is used only for model-driven terminal paths; cancellation, stop
+    /// sequences, inference errors, and stalled forwards never call it.
+    pub fn forceDeferredConstraintBoundary(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        const constraint = self.sampling.constraint orelse return null;
+        if (constraint.phase.active) return null;
+        const boundary = constraint.phase.activate_after_token orelse return null;
+        if (self.completion_tokens >= self.max_tokens) return null;
+
+        if (self.has_pending_logits) {
+            _ = mlx.mlx_array_free(self.pending_logits);
+            self.has_pending_logits = false;
+        }
+        std.debug.assert(!self.has_pending_token);
+
+        try self.generated_ids.append(allocator, boundary);
+        self.loop_guard_start = self.generated_ids.items.len;
+        const forced = constraint.phase.force() orelse unreachable;
+        std.debug.assert(forced == boundary);
+        self.next_token_id = boundary;
+        self.advanceStep(1);
+        self.consecutive_pad = 0;
+
+        const tok_i32: i32 = @intCast(boundary);
+        const tok_shape = [_]c_int{ 1, 1 };
+        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tok_input);
+        const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+        const arr = [_]mlx.mlx_array{next_logits};
+        const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+        _ = mlx.mlx_async_eval(vec);
+        _ = mlx.mlx_vector_array_free(vec);
+        self.pending_logits = next_logits;
+        self.has_pending_logits = true;
+        return boundary;
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
@@ -7443,11 +7591,11 @@ pub const Generator = struct {
         return token;
     }
 
-    /// Synchronous, grammar-constrained sampling step. Used whenever
-    /// `sampling.constraint` is non-null. Builds a token mask from the grammar's
-    /// current state, applies it to the pending logits, samples, advances the
-    /// grammar by the sampled token's bytes, and pre-launches the next forward
-    /// pass to overlap with the next mask build.
+    /// Synchronous sampling step for a request carrying a grammar. A deferred
+    /// final-answer grammar uses this same path without a mask until its
+    /// reasoning boundary; unlike the ordinary lazy path, no token is sampled
+    /// one step ahead of that transition. Once active, this builds the mask,
+    /// samples, advances the grammar, and pre-launches the next forward pass.
     fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (!self.has_pending_logits) {
             self.done = true;
@@ -7463,52 +7611,83 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return null;
         }
-
-        const constraint = self.sampling.constraint.?;
-        const s = self.xfm.s;
-
-        const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
-        if (allowed == 0) {
-            // No legal token: every logit would be -inf and argmax over that
-            // row returns id 0, whose bytes then fail `acceptByte` and switch
-            // enforcement off anyway — one garbage token later, and with the
-            // grammar bug reported as model output. Say so and degrade here.
-            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
-            constraint.grammar.dead = true;
-            @memset(constraint.mask_buf, true);
+        if (self.deferredAnswerReserveReached()) {
+            const forced = try self.forceDeferredConstraintBoundary(allocator);
+            if (forced != null) {
+                log.info("[grammar] reasoning boundary forced to preserve {d} final-answer tokens\n", .{FINAL_ANSWER_RESERVE_TOKENS});
+                return forced;
+            }
         }
 
-        // Also allow every stop-id the generator recognises once the grammar is
-        // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
-        // but models often have additional stop tokens (e.g. `<|im_end|>` for
-        // Qwen, `<end_of_turn>` for Gemma 4) registered via the config — without
-        // this, the model can never stop.
-        if (constraint.grammar.isComplete()) {
-            for (self.eos_token_ids) |eos_id| {
-                if (eos_id < constraint.mask_buf.len) constraint.mask_buf[eos_id] = true;
+        const constraint = self.sampling.constraint.?;
+        const enforcing = constraint.phase.active;
+        const s = self.xfm.s;
+
+        var natural_activation = false;
+        if (enforcing) {
+            const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+            if (allowed == 0) {
+                // No legal token: every logit would be -inf and argmax over that
+                // row returns id 0, whose bytes then fail `acceptByte` and switch
+                // enforcement off anyway — one garbage token later, and with the
+                // grammar bug reported as model output. Say so and degrade here.
+                log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+                constraint.grammar.dead = true;
+                @memset(constraint.mask_buf, true);
+            }
+
+            // Also allow every stop-id the generator recognises once the grammar is
+            // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
+            // but models often have additional stop tokens (e.g. `<|im_end|>` for
+            // Qwen, `<end_of_turn>` for Gemma 4) registered via the config — without
+            // this, the model can never stop.
+            if (constraint.grammar.isComplete()) {
+                for (self.eos_token_ids) |eos_id| {
+                    if (eos_id < constraint.mask_buf.len) constraint.mask_buf[eos_id] = true;
+                }
             }
         }
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        defer _ = mlx.mlx_array_free(step_logits);
+        var owns_step_logits = true;
+        defer {
+            if (owns_step_logits) _ = mlx.mlx_array_free(step_logits);
+        }
 
-        var masked_logits = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(masked_logits);
-        try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
+        var masked_logits: mlx.mlx_array = .{ .ctx = null };
+        defer if (masked_logits.ctx != null) {
+            _ = mlx.mlx_array_free(masked_logits);
+        };
+        const sample_logits = if (enforcing) blk: {
+            masked_logits = mlx.mlx_array_new();
+            try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
+            break :blk masked_logits;
+        } else step_logits;
 
         // Synchronous sample: we need the realized token id to advance the grammar.
-        const lazy = self.sampleLazy(masked_logits);
+        const lazy = self.sampleLazy(sample_logits);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
         _ = mlx.mlx_array_free(lazy);
         const token: u32 = @intCast(val);
         self.next_token_id = token;
+        const natural_boundary = self.hasDeferredConstraint() and
+            self.sampling.constraint.?.phase.activate_after_token == token;
 
         // Stop on EOS — do not advance grammar or include in output.
         for (self.eos_token_ids) |eos_id| {
-            if (token == eos_id) {
+            if (token == eos_id and !natural_boundary) {
+                if (self.hasDeferredConstraint()) {
+                    _ = mlx.mlx_array_free(step_logits);
+                    owns_step_logits = false;
+                    const forced = try self.forceDeferredConstraintBoundary(allocator);
+                    if (forced != null) {
+                        log.info("[grammar] reasoning boundary forced after premature EOS\n", .{});
+                        return forced;
+                    }
+                }
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -7517,6 +7696,15 @@ pub const Generator = struct {
         if (token == 0) {
             self.consecutive_pad += 1;
             if (self.consecutive_pad >= 3) {
+                if (self.hasDeferredConstraint()) {
+                    _ = mlx.mlx_array_free(step_logits);
+                    owns_step_logits = false;
+                    const forced = try self.forceDeferredConstraintBoundary(allocator);
+                    if (forced != null) {
+                        log.info("[grammar] reasoning boundary forced after terminal padding\n", .{});
+                        return forced;
+                    }
+                }
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -7525,24 +7713,30 @@ pub const Generator = struct {
             self.consecutive_pad = 0;
         }
 
-        // Advance the grammar by the sampled token's byte sequence. The mask
-        // guarantees every byte is accepted (or the token has no byte form, e.g. a
-        // special tag) — so a rejection here means a bug we want to surface.
-        if (token < constraint.token_bytes.bytes.len) {
-            if (constraint.token_bytes.bytes[token]) |bytes| {
-                for (bytes) |b| {
-                    const ok = try constraint.grammar.acceptByte(b);
-                    if (!ok) {
-                        log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
-                        constraint.grammar.dead = true;
-                        break;
+        if (enforcing) {
+            // Advance the grammar by the sampled token's byte sequence. The
+            // mask guarantees every byte is accepted (or the token has no byte
+            // form, e.g. a special tag).
+            if (token < constraint.token_bytes.bytes.len) {
+                if (constraint.token_bytes.bytes[token]) |bytes| {
+                    for (bytes) |b| {
+                        const ok = try constraint.grammar.acceptByte(b);
+                        if (!ok) {
+                            log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
+                            constraint.grammar.dead = true;
+                            break;
+                        }
                     }
                 }
             }
+        } else if (constraint.phase.observe(token)) {
+            natural_activation = true;
+            log.info("[grammar] reasoning boundary reached; enforcing final-answer schema\n", .{});
         }
 
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
+        if (natural_activation) self.loop_guard_start = self.generated_ids.items.len;
 
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);

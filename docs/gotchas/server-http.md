@@ -1655,28 +1655,37 @@ shed-not-evict, FailingAllocator ownership) and the catch-arm/detach source
 scan in scheduler.zig. NOT built: the issue's proposed `--prefix-cache-mem
 auto` context-sized floor — the default-sizing question is still open.
 
-## The schema thinking-off gate lived on one surface of three (#331, 2026-08-31)
+## A final-answer grammar is not a whole-generation grammar (#331, 2026-08-31)
 
-A JSON-schema grammar mask constrains from token 0 and cannot express "think
-first, then JSON". On templates that end the rendered prompt inside a bare
-`<think>` block (qwen3.5/3.8), `</think>` is not valid JSON, so the model
-emits the schema-valid object inside the reasoning block: `reasoning_content`
-carries the JSON, `content` ships empty, streaming routes it through
-`delta.reasoning_content`.
+Qwen's template opens `<think>` in the prompt. A request combining thinking
+with `response_format.type=json_schema` used to install the JSON grammar before
+the first generated token, so `</think>` became unreachable. The model emitted
+the only legal thing — the final JSON object — while it was still inside the
+template-opened reasoning channel. Response parsing then correctly exposed that
+object as `reasoning_content` and left `content` empty. Copying one field into
+the other would hide the symptom while preserving both the missing reasoning
+phase and the incorrectly scoped constraint.
 
-`/v1/messages` got the rule in the output_config fix (live: qwen3.5, effort
-high + schema): schema + no tools ⇒ thinking forced OFF in the prompt (the
-noThinkTailSuffix machinery). `/v1/chat/completions` and `/v1/responses`
-built the same mask with no gate — issue #331 re-found the identical symptom
-via `reasoning_effort` + `response_format`.
+The constraint now has an explicit phase, but only for a rendered prompt that
+ends in a bare `<think>` and a tokenizer that exposes atomic `</think>`. Normal
+reasoning tokens are unmasked. A naturally sampled close token is committed,
+then the JSON mask applies before the next sample. If reasoning instead reaches
+loop-stop, EOS, terminal padding, or the reserved final-answer tail, the server
+commits that same close token through the live model state and continues. The
+close counts toward the existing completion limit; 64 tokens are reserved for
+the constrained answer without increasing `max_tokens`.
 
-Fix: one predicate (`server.schemaMasksThinking`) consulted at all three
-mask-building sites. Tools present = no mask on every surface (tool calls
-must stay reachable), so thinking stays whatever the request resolved.
-"Real reasoning then schema-valid JSON" would need a mask that arms only
-after the think block closes — not built; schema stays a content-only
-contract.
+The forced and natural paths keep the same KV/SSM state, grammar object, and
+prompt; there is no recomputation or cache reset. Streaming and non-streaming
+therefore observe the same boundary. Ordinary schema truncation is still
+possible when the final object itself does not fit.
 
-Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
-+ mask-engagement count) and the server.zig source scan pairing every
-`[grammar] enforcing` site with a gate call.
+The request remains off speculative/MTP decoding for its full lifetime because
+those paths cannot honor a mid-block grammar transition. Tools retain the
+existing policy of skipping the grammar mask so tool-call syntax remains
+reachable. When either capability check fails, the endpoint rerenders with
+thinking off and applies the grammar from token zero, preserving the existing
+safety net for Hy3, Muse, LFM2.5-VL, and other reasoning formats. Those formats
+need their own unambiguous generation boundary in separate work. Reasoning-
+budget aliases and global streaming visibility semantics are deliberately
+unchanged here.

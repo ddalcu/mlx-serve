@@ -996,6 +996,22 @@ fn promptOpensThink(
     return chat_mod.promptTailOpensThink(tail);
 }
 
+/// Generation-side grammar switching currently has one exact boundary: the
+/// atomic bare `</think>` token. Keep this narrower than response parsing,
+/// which also recognizes suffixed and channel-based reasoning families.
+fn promptOpensBareThink(
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+) bool {
+    if (prompt_ids.len == 0) return false;
+    const n = @min(prompt_ids.len, 8);
+    const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    defer allocator.free(tail);
+    return chat_mod.promptTailOpensBareThink(tail);
+}
+
 /// In-memory store for OpenAI Responses API state (`store: true` requests).
 /// Bounded LRU; lost on restart.
 var global_response_store: ?responses_mod.ResponseStore = null;
@@ -4873,17 +4889,28 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
-/// A grammar mask constrains from token 0 — it cannot express "think first,
-/// then JSON", so a schema request is a content-only contract and thinking is
-/// enforced OFF in the prompt (the noThinkTailSuffix machinery). Without this
-/// the mask pushes the JSON into the template's open think block and `content`
-/// ships EMPTY (live: qwen3.5 effort high + schema on /v1/messages; issue #331
-/// re-found the same hole on /v1/chat/completions and /v1/responses). Tools
-/// present = no mask (every surface skips it so tool calls stay reachable),
-/// so thinking stays whatever the request resolved. Every surface that builds
-/// a grammar mask consults this — the source scan pins the pairing.
-fn schemaMasksThinking(has_schema: bool, has_tools: bool) bool {
-    return has_schema and !has_tools;
+const SchemaThinkingPolicy = enum {
+    no_mask,
+    token_zero,
+    deferred,
+    fallback_thinking_off,
+};
+
+/// A schema grammar is safe with thinking only when generation starts in the
+/// one reasoning protocol this change can close: a bare template-opened
+/// `<think>` with an atomic `</think>` token. Every other masked surface keeps
+/// the upstream thinking-off safety net. Tools still skip the mask entirely.
+fn schemaMasksThinking(
+    has_schema: bool,
+    has_tools: bool,
+    enable_thinking: bool,
+    prompt_opens_bare_think: bool,
+    close_token: ?u32,
+) SchemaThinkingPolicy {
+    if (!has_schema or has_tools) return .no_mask;
+    if (!enable_thinking) return .token_zero;
+    if (prompt_opens_bare_think and close_token != null) return .deferred;
+    return .fallback_thinking_off;
 }
 
 /// `continue_final_message`: extend the trailing assistant message instead of
@@ -5328,7 +5355,7 @@ fn handleChatCompletions(
                 // Extract the schema JSON string from the raw body
                 var schema_instruction = std.ArrayList(u8).empty;
                 defer schema_instruction.deinit(allocator);
-                try schema_instruction.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
+                try schema_instruction.appendSlice(allocator, "If a separate reasoning channel is available, you may reason there. Respond with valid JSON only in the final answer. No other final-answer text, markdown, or explanation. ");
 
                 if (rf.object.get("json_schema")) |js| {
                     if (js == .object) {
@@ -5338,7 +5365,7 @@ fn handleChatCompletions(
                             defer out.deinit();
                             var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
                             schema_val.jsonStringify(&jws) catch {};
-                            try schema_instruction.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
+                            try schema_instruction.appendSlice(allocator, "Your final answer MUST conform to this JSON schema:\n");
                             try schema_instruction.appendSlice(allocator, out.written());
                         }
                     }
@@ -5354,7 +5381,7 @@ fn handleChatCompletions(
                     try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
                 }
             } else if (std.mem.eql(u8, rf_type, "json_object")) {
-                const instruction = "Respond with valid JSON only. No other text, no markdown fences (no ``` or ```json), no explanation. Begin your response with `{` or `[`.";
+                const instruction = "If a separate reasoning channel is available, you may reason there. Respond with valid JSON only in the final answer. No other final-answer text, markdown fences (no ``` or ```json), or explanation. Begin the final answer with `{` or `[`.";
                 if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
                     const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, instruction });
                     try rf_allocs.append(allocator, combined);
@@ -5394,7 +5421,6 @@ fn handleChatCompletions(
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
-    if (schemaMasksThinking(grammar_schema_val != null, has_tools)) enable_thinking = false;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -5513,9 +5539,6 @@ fn handleChatCompletions(
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
 
-    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
-    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
-
     // Format chat template. ds4-backed models render through the engine's
     // built-in template/tokenizer; the MLX path renders via Jinja and
     // tokenizes through the loaded BPE tokenizer. Both paths now thread
@@ -5541,7 +5564,30 @@ fn handleChatCompletions(
     const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
+    var schema_boundary_token: ?u32 = null;
+    const prompt_opens_bare_think = grammar_schema_val != null and !has_tools and enable_thinking and
+        promptOpensBareThink(allocator, lm, tok, prompt_ids_raw);
+    const atomic_think_close = if (prompt_opens_bare_think) tok.specialTokenId("</think>") else null;
+    switch (schemaMasksThinking(
+        grammar_schema_val != null,
+        has_tools,
+        enable_thinking,
+        prompt_opens_bare_think,
+        atomic_think_close,
+    )) {
+        .deferred => schema_boundary_token = atomic_think_close,
+        .fallback_thinking_off => {
+            allocator.free(prompt_ids_raw);
+            enable_thinking = false;
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (prompt_opens_bare_think) "tokenizer has no atomic </think>" else "prompt does not end in bare <think>"});
+        },
+        .no_mask, .token_zero => {},
+    }
     const tokenize_ns = tokenize_sw.read();
+
+    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
+    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Run vision encoder if any messages contain images. Phase A8: each
     // request owns its embedding locally; we hand it off to the slot at
@@ -5669,8 +5715,16 @@ fn handleChatCompletions(
             const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
+                const deferred = if (schema_boundary_token) |boundary| blk: {
+                    sc.deferUntilToken(boundary);
+                    break :blk true;
+                } else false;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                if (deferred) {
+                    log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                } else {
+                    log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                }
             } else |err| {
                 log.warn("[grammar] schema parse failed ({s}); falling back to prompt-only enforcement\n", .{@errorName(err)});
             }
@@ -11839,8 +11893,6 @@ fn handleAnthropicMessages(
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
-    if (schemaMasksThinking(output_cfg.schema != null, has_tools)) enable_thinking = false;
-
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -11880,13 +11932,13 @@ fn handleAnthropicMessages(
     if (output_cfg.schema != null) {
         var schema_instruction = std.ArrayList(u8).empty;
         defer schema_instruction.deinit(allocator);
-        try schema_instruction.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
+        try schema_instruction.appendSlice(allocator, "If a separate reasoning channel is available, you may reason there. Respond with valid JSON only in the final answer. No other final-answer text, markdown, or explanation. ");
         {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
             output_cfg.schema.?.jsonStringify(&jws) catch {};
-            try schema_instruction.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
+            try schema_instruction.appendSlice(allocator, "Your final answer MUST conform to this JSON schema:\n");
             try schema_instruction.appendSlice(allocator, out.written());
         }
         if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
@@ -11908,11 +11960,6 @@ fn handleAnthropicMessages(
         if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
-    });
-    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
-
     // Format chat template. Iteration 1 timing + Iteration 2 cache. The
     // `effective_tools_json` swap (`null` when has_tools is false) keeps
     // the cache key consistent with what the encoder actually sees.
@@ -11934,7 +11981,32 @@ fn handleAnthropicMessages(
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    var schema_boundary_token: ?u32 = null;
+    const prompt_opens_bare_think = output_cfg.schema != null and !has_tools and enable_thinking and
+        promptOpensBareThink(allocator, lm, tok, prompt_ids_raw);
+    const atomic_think_close = if (prompt_opens_bare_think) tok.specialTokenId("</think>") else null;
+    switch (schemaMasksThinking(
+        output_cfg.schema != null,
+        has_tools,
+        enable_thinking,
+        prompt_opens_bare_think,
+        atomic_think_close,
+    )) {
+        .deferred => schema_boundary_token = atomic_think_close,
+        .fallback_thinking_off => {
+            allocator.free(prompt_ids_raw);
+            enable_thinking = false;
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (prompt_opens_bare_think) "tokenizer has no atomic </think>" else "prompt does not end in bare <think>"});
+        },
+        .no_mask, .token_zero => {},
+    }
     const tokenize_ns = tokenize_sw.read();
+
+    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
+    });
+    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Vision encoder: encode any images on the last user message and splice
     // image tokens into the prompt at the model's configured image_token_id.
@@ -12027,8 +12099,16 @@ fn handleAnthropicMessages(
             const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
+                const deferred = if (schema_boundary_token) |boundary| blk: {
+                    sc.deferUntilToken(boundary);
+                    break :blk true;
+                } else false;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                if (deferred) {
+                    log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                } else {
+                    log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                }
             } else |err| {
                 log.warn("[grammar] schema parse failed ({s}); falling back to prompt-only enforcement\n", .{@errorName(err)});
             }
@@ -13179,7 +13259,7 @@ fn buildResponsesJsonInstruction(allocator: std.mem.Allocator, schema_val: ?std.
     if (tools_active) {
         try instruction_buf.appendSlice(allocator, "If you answer without calling a function, respond with valid JSON only. Do not include markdown or explanation outside the JSON. If a function call is needed, call the function instead; this JSON format applies only to final assistant messages. ");
     } else {
-        try instruction_buf.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
+        try instruction_buf.appendSlice(allocator, "If a separate reasoning channel is available, you may reason there. Respond with valid JSON only in the final answer. No other final-answer text, markdown, or explanation. ");
     }
 
     if (schema_val) |sv| {
@@ -13187,7 +13267,7 @@ fn buildResponsesJsonInstruction(allocator: std.mem.Allocator, schema_val: ?std.
         defer out.deinit();
         var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
         sv.jsonStringify(&jws) catch {};
-        try instruction_buf.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
+        try instruction_buf.appendSlice(allocator, "Your final answer MUST conform to this JSON schema:\n");
         try instruction_buf.appendSlice(allocator, out.written());
     }
 
@@ -13499,8 +13579,6 @@ fn handleResponses(
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
-    if (schemaMasksThinking(grammar_schema_val != null, active_has_tools)) enable_thinking = false;
-
     // ── model name ──
     const model_name = if (root.get("model")) |v|
         (if (v == .string) v.string else config.model_type)
@@ -13554,17 +13632,36 @@ fn handleResponses(
         }
     }
 
-    log.info("POST /v1/responses ({d} msgs, max_out={d}, temp={d:.2}, stream={}, thinking={}, prev={?s})\n", .{
-        pi.messages.items.len, max_tokens, temperature, is_stream, enable_thinking, prev_id,
-    });
-
     // ── format chat template ──
     // Iteration 1 timing + Iteration 2 cache. Responses sees the same
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var schema_boundary_token: ?u32 = null;
+    const prompt_opens_bare_think = grammar_schema_val != null and !active_has_tools and enable_thinking and
+        promptOpensBareThink(allocator, lm, tok, prompt_ids_raw);
+    const atomic_think_close = if (prompt_opens_bare_think) tok.specialTokenId("</think>") else null;
+    switch (schemaMasksThinking(
+        grammar_schema_val != null,
+        active_has_tools,
+        enable_thinking,
+        prompt_opens_bare_think,
+        atomic_think_close,
+    )) {
+        .deferred => schema_boundary_token = atomic_think_close,
+        .fallback_thinking_off => {
+            allocator.free(prompt_ids_raw);
+            enable_thinking = false;
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (prompt_opens_bare_think) "tokenizer has no atomic </think>" else "prompt does not end in bare <think>"});
+        },
+        .no_mask, .token_zero => {},
+    }
     const tokenize_ns = tokenize_sw.read();
+    log.info("POST /v1/responses ({d} msgs, max_out={d}, temp={d:.2}, stream={}, thinking={}, prev={?s})\n", .{
+        pi.messages.items.len, max_tokens, temperature, is_stream, enable_thinking, prev_id,
+    });
     const active_media = activeTurnMediaMessage(pi.messages.items, false);
 
     // ── vision encoder ──
@@ -13628,8 +13725,16 @@ fn handleResponses(
             const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
+                const deferred = if (schema_boundary_token) |boundary| blk: {
+                    sc.deferUntilToken(boundary);
+                    break :blk true;
+                } else false;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                if (deferred) {
+                    log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                } else {
+                    log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                }
             } else |err| {
                 log.warn("[grammar] schema parse failed ({s})\n", .{@errorName(err)});
             }
@@ -17269,14 +17374,28 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     }
 }
 
-test "every JSON grammar mask site pairs with the schema thinking-off gate" {
-    // The gate lived only on /v1/messages while chat-completions and responses
-    // built the same token-0 mask against a prompt still inside <think>
-    // (issue #331). A NEW surface that builds a mask without consulting the
-    // gate re-ships the hole, so the pairing is pinned by count: one gate call
-    // per mask-enforcement site.
+test "schema thinking policy defers only a supported bare think boundary" {
+    const decide = schemaMasksThinking;
+    try std.testing.expectEqual(SchemaThinkingPolicy.no_mask, decide(false, false, true, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.no_mask, decide(true, true, true, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.token_zero, decide(true, false, false, false, null));
+    try std.testing.expectEqual(SchemaThinkingPolicy.deferred, decide(true, false, true, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, true, null));
+
+    const unsupported_tails = [_][]const u8{
+        "<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>",
+        "<|channel|>analysis<|message|>",
+        "<|im_start|>assistant\n",
+    };
+    for (unsupported_tails) |tail| {
+        try std.testing.expect(!chat_mod.promptTailOpensBareThink(tail));
+        try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, chat_mod.promptTailOpensBareThink(tail), 42));
+    }
+}
+
+test "every JSON grammar mask site consults the fallback or deferral policy" {
     const src = @embedFile("server.zig");
-    const mask_line = "[grammar] enforcing JSON " ++ "schema";
+    const mask_line = "[grammar] enforcing JSON schema from " ++ "token 0";
     const call = "schemaMasks" ++ "Thinking(";
     const def = "fn schemaMasks" ++ "Thinking(";
     const masks = std.mem.count(u8, src, mask_line);

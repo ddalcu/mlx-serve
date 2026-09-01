@@ -4648,6 +4648,20 @@ pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
+const LoopStopResolution = union(enum) {
+    none,
+    force_boundary,
+    finish: LoopStop,
+};
+
+fn resolveLoopStop(generated_ids: []const u32, loop_guard_start: usize, has_deferred_constraint: bool) LoopStopResolution {
+    const start = @min(loop_guard_start, generated_ids.len);
+    var stop = loopStopDecision(generated_ids[start..]) orelse return .none;
+    if (has_deferred_constraint) return .force_boundary;
+    stop.trim_start += start;
+    return .{ .finish = stop };
+}
+
 var loop_trim_env: ?bool = null;
 /// `MLX_SERVE_LOOP_TRIM=0` keeps the whole degenerate tail in the response —
 /// the A/B arm, and the escape hatch for anyone who needs to see exactly what
@@ -5722,19 +5736,32 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // with no repeat penalty by default and a generous max_tokens, nothing else
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
-    if (loopStopDecision(gen.generated_ids.items)) |stop| {
-        // Never cut silently: the 2026-07-14 php.html post-mortem took log
-        // archaeology because this guard left no trace of having fired. The
-        // tier and the trim point are logged too — five cuts in a row is a
-        // different diagnosis from one, and the trim is what breaks the chain.
-        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
-            gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
-            @tagName(stop.tier),         stop.trim_start,
-        });
-        slot.finish_details = stop.finish_details;
-        if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
-        finishSlot(sch, slot, stop.finish_reason);
-        return;
+    switch (resolveLoopStop(gen.generated_ids.items, gen.loopGuardStart(), gen.hasDeferredConstraint())) {
+        .none => {},
+        .force_boundary => {
+            const boundary = try gen.forceDeferredConstraintBoundary(slot.allocator) orelse {
+                slot.markError("deferred_boundary_missing");
+                return;
+            };
+            slot.pushToken(boundary);
+            slot.completion_tokens += 1;
+            std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+            if (boundary != 0) slot.was_pad_only = false;
+            log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
+            return;
+        },
+        .finish => |stop| {
+            // Never cut silently: the 2026-07-14 php.html post-mortem took log
+            // archaeology because this guard left no trace of having fired.
+            log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
+                gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
+                @tagName(stop.tier),         stop.trim_start,
+            });
+            slot.finish_details = stop.finish_details;
+            if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
+            finishSlot(sch, slot, stop.finish_reason);
+            return;
+        },
     }
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
@@ -6753,6 +6780,28 @@ test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it"
     try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
     // Trimmed to the honest prefix plus one copy of the cycle.
     try testing.expectEqual(@as(usize, 6), stop.trim_start);
+
+    try testing.expect(resolveLoopStop(ids.items, 0, true) == .force_boundary);
+    const active = resolveLoopStop(ids.items, 0, false);
+    try testing.expect(active == .finish);
+    try testing.expectEqualStrings("length", active.finish.finish_reason);
+    try testing.expectEqualStrings("repetition_loop", active.finish.finish_details);
+
+    // Once a deferred boundary has been committed, the old reasoning loop is
+    // outside the guard window and cannot stop the very next answer tick.
+    try ids.append(testing.allocator, 99);
+    const answer_start = ids.items.len;
+    try testing.expect(resolveLoopStop(ids.items, answer_start, false) == .none);
+
+    // A new loop wholly inside the constrained answer retains the existing
+    // length/repetition result, with an absolute trim point for response code.
+    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+        try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
+    }
+    const answer_loop = resolveLoopStop(ids.items, answer_start, false);
+    try testing.expect(answer_loop == .finish);
+    try testing.expectEqualStrings("length", answer_loop.finish.finish_reason);
+    try testing.expect(answer_loop.finish.trim_start >= answer_start);
 
     // Healthy output decides nothing at all — no reason, and nothing to trim.
     var healthy: [512]u32 = undefined;
