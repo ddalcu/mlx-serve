@@ -1824,6 +1824,7 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.appearanceMode) private var appearanceModeRaw = AppAppearanceMode.system.rawValue
     @AppStorage(InterfacePrefKey.accentColor) private var accentColorRaw = AppAccentColor.system.rawValue
     @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
+    @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
 
     var body: some View {
@@ -1854,6 +1855,17 @@ private struct InterfaceSectionContent: View {
             }
             .labelsHidden()
             .frame(width: 140)
+        }
+        SettingsRow(title: "Chat Column",
+                    explainer: "How much of the window a conversation fills. Tables always keep the full width.") {
+            Picker("", selection: $chatColumnRaw) {
+                ForEach(ChatColumnWidth.allCases) { width in
+                    Text(width.label).tag(width.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 220)
         }
         SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen.") {
             Toggle("", isOn: $compactMode)

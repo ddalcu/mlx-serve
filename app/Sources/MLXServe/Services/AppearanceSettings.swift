@@ -13,6 +13,44 @@ enum InterfacePrefKey {
     static let accentColor = "accentColorName"
     static let textSize = "chatTextSize"
     static let compactMode = "compactMode"
+    static let chatColumn = "chatColumnWidth"
+}
+
+/// How wide a conversation reads, as a fraction of the SCREEN rather than of
+/// the window.
+///
+/// Measuring the screen is what makes the setting mean something: the reading
+/// width becomes a physical constant the eye can learn, and resizing the window
+/// eats the margins rather than reflowing every line. Shrink the window past
+/// the setting's own width and the text starts wrapping to the window instead,
+/// because there is nothing left to give.
+enum ChatColumnWidth: String, CaseIterable, Identifiable {
+    case narrow, medium, wide
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .narrow: return "Narrow"
+        case .medium: return "Medium"
+        case .wide: return "Wide"
+        }
+    }
+    /// The reading width in POINTS, or nil for "let the window decide"
+    /// (`ChatMetrics.contentWidthFraction` of it, not the whole thing).
+    ///
+    /// Points rather than a fraction of anything: a reading measure is a
+    /// physical property of text, not of the furniture around it. 840 is
+    /// roughly 60 characters at the default size, 1260 half again as much.
+    var proseWidth: CGFloat? {
+        switch self {
+        case .narrow: return 840
+        case .medium: return 1260
+        case .wide: return nil
+        }
+    }
+
+    static var current: ChatColumnWidth {
+        ChatColumnWidth(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.chatColumn) ?? "") ?? .wide
+    }
 }
 
 enum AppAppearanceMode: String, CaseIterable, Identifiable {

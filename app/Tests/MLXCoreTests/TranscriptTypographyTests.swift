@@ -83,22 +83,96 @@ final class TranscriptTypographyTests: XCTestCase {
                        ChatTextSize.xlarge.proseSize)
     }
 
-    /// Prose wraps at `ChatMetrics.proseMeasure` (a paragraph tailIndent);
-    /// code blocks — and tables, which share the no-indent default — keep the
-    /// full column. The measure must never become a frame cap on wide content.
-    func testProseWrapsEarlyWhileCodeKeepsTheFullColumn() {
+    /// Every indent is measured from a MARGIN, never as an absolute wrap point.
+    ///
+    /// A positive `tailIndent` is a distance from the LEADING edge, so it stops
+    /// a line at a fixed x whatever the column does. That is what the reading
+    /// measure used to be, and it is why prose ended mid-column while the table
+    /// beside it ran the full width. Negative (or zero) is measured from the
+    /// trailing edge, so the text tracks the column instead of a constant.
+    func testIndentsAreMeasuredFromTheMarginsNotAnAbsoluteWrapPoint() {
         let rendered = MarkdownText.attributedString(for: "flowing prose\n\n```\nwide code\n```")
         let text = rendered.string as NSString
         let proseStyle = rendered.attribute(.paragraphStyle, at: text.range(of: "flowing").location,
                                             effectiveRange: nil) as? NSParagraphStyle
         let codeStyle = rendered.attribute(.paragraphStyle, at: text.range(of: "wide code").location,
                                            effectiveRange: nil) as? NSParagraphStyle
-        XCTAssertEqual(proseStyle?.tailIndent, ChatMetrics.proseMeasure)
-        // Code keeps its own trailing inset (≤ 0 = relative to the trailing
-        // margin, full column) — a POSITIVE tailIndent is the prose measure
-        // leaking onto wide content.
-        XCTAssertLessThanOrEqual(codeStyle?.tailIndent ?? 0, 0, "code must not inherit the prose measure")
+        XCTAssertLessThanOrEqual(proseStyle?.tailIndent ?? 1, 0, "prose must track the column")
+        XCTAssertLessThanOrEqual(codeStyle?.tailIndent ?? 1, 0, "code must track the column")
         XCTAssertEqual(proseStyle?.lineHeightMultiple, ChatMetrics.proseLineHeightMultiple)
+    }
+
+    /// A bullet's hanging indent is measured off the bullet glyph, so wrapped
+    /// lines align under the text rather than under the dot.
+    func testABulletHangsUnderItsOwnText() {
+        let rendered = MarkdownText.attributedString(for: "- an item")
+        let style = rendered.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertGreaterThan(style?.headIndent ?? 0, 0, "the bullet's own hang is missing")
+        XCTAssertEqual(style?.firstLineHeadIndent ?? 0, 0, "only the WRAPPED lines hang")
+    }
+
+    // MARK: - The setting
+
+    private func withColumn(_ width: ChatColumnWidth, _ body: () -> Void) {
+        UserDefaults.standard.set(width.rawValue, forKey: InterfacePrefKey.chatColumn)
+        defer { UserDefaults.standard.removeObject(forKey: InterfacePrefKey.chatColumn) }
+        body()
+    }
+
+    /// The reading width is a FIXED number of points, so resizing the window
+    /// spends the margins and leaves the lines where they are. That is the
+    /// whole reason it is points and not a fraction of the window.
+    func testTheReadingWidthIsFixedWhileTheWindowHasRoom() {
+        withColumn(.narrow) {
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 1800), 840)
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 1000), 840,
+                           "a smaller window must spend its margins, not the text")
+        }
+        withColumn(.medium) {
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 1800), 1260)
+        }
+    }
+
+    /// Past that point there is no margin left to spend, so the window takes
+    /// over and the lines wrap to it.
+    func testAWindowNarrowerThanTheSettingWrapsTheTextInstead() {
+        withColumn(.medium) {
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 900), 900)
+        }
+        withColumn(.narrow) {
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 600), 600)
+        }
+    }
+
+    /// Wide follows the window, but keeps a margin: text running into the very
+    /// edge of a wide window reads as unfinished.
+    func testWideFollowsTheWindowButKeepsAMargin() {
+        withColumn(.wide) {
+            XCTAssertNil(ChatColumnWidth.wide.proseWidth, "wide has no fixed width")
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 2000), 1600)
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 1000), 800)
+        }
+    }
+
+    /// Narrow has to be the narrower of the two, or the setting reads backwards.
+    func testNarrowIsNarrowerThanMedium() throws {
+        let narrow = try XCTUnwrap(ChatColumnWidth.narrow.proseWidth)
+        let medium = try XCTUnwrap(ChatColumnWidth.medium.proseWidth)
+        XCTAssertLessThan(narrow, medium)
+    }
+
+    /// Before the first `onGeometryChange` the panel measures zero. A width of
+    /// zero would collapse the column to nothing on the first frame.
+    func testAnUnmeasuredPanelFallsBackRatherThanCollapsing() {
+        withColumn(.narrow) {
+            XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 0), ChatMetrics.contentFallbackWidth)
+        }
+    }
+
+    func testAnUnknownStoredColumnFallsBackToWide() {
+        UserDefaults.standard.set("gigantic", forKey: InterfacePrefKey.chatColumn)
+        defer { UserDefaults.standard.removeObject(forKey: InterfacePrefKey.chatColumn) }
+        XCTAssertEqual(ChatColumnWidth.current, .wide)
     }
 
     /// SF Pro is the macOS system font, so the app gets it by asking for the

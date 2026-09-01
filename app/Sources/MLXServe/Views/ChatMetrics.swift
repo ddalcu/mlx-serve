@@ -81,14 +81,27 @@ enum ChatMetrics {
     /// height), so both roles read at one density.
     static var userLineSpacing: CGFloat { (transcriptFontSize * 0.48).rounded() }
 
-    /// Prose line length, applied as a paragraph `tailIndent` INSIDE the
-    /// attributed string — never a frame cap: tables, code blocks and XML
-    /// keep the full column (`contentWidthFraction` of the window, so on a
-    /// wide window prose used to run edge to edge with it), only flowing
-    /// text wraps early. ~45em of the reading size (≈ 95 chars at 14pt); a
-    /// narrower column wins automatically, since the text container bounds
-    /// the line before the indent does.
-    static var proseMeasure: CGFloat { (transcriptFontSize * 45).rounded() }
+    /// Settings ▸ Interface ▸ Chat Column. Absent = `.wide`.
+    static var chatColumn: ChatColumnWidth { ChatColumnWidth.current }
+
+    /// The reading column: the setting's width in points, or the window when
+    /// that is narrower.
+    ///
+    /// A fixed width rather than a fraction of the window, so resizing spends
+    /// the MARGINS and leaves the lines alone. Past the setting's own width
+    /// there is nothing left to spend, so the window takes over and wraps them.
+    ///
+    /// `.wide` is the exception and stays proportional
+    /// (`contentWidthFraction`): it is the setting for people who want the
+    /// window to decide, and running text to the very edge of a wide window
+    /// looks unfinished no matter how wide the window is.
+    static func proseWidth(panelWidth: CGFloat) -> CGFloat {
+        guard panelWidth > 0 else { return contentFallbackWidth }
+        guard let target = chatColumn.proseWidth else {
+            return (panelWidth * contentWidthFraction).rounded()
+        }
+        return min(target, panelWidth)
+    }
     /// Fenced/inline code inside the transcript. Monospaced digits and glyphs
     /// run wide, so matching the prose size makes code look larger than the
     /// sentence around it.

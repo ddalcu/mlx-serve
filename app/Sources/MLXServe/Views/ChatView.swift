@@ -1527,6 +1527,10 @@ struct ChatDetailView: View {
     // on the row stack, which is what forces the rebuild.
     @AppStorage(InterfacePrefKey.textSize) private var interfaceTextSize = ChatTextSize.medium.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var interfaceCompact = false
+    /// Read here only to re-render the transcript when it changes: the indents
+    /// are baked into cached attributed strings, so the rows have to be rebuilt
+    /// rather than re-laid-out.
+    @AppStorage(InterfacePrefKey.chatColumn) private var interfaceChatColumn = ChatColumnWidth.wide.rawValue
     @State private var inputText = ""
     /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
     /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
@@ -1576,8 +1580,10 @@ struct ChatDetailView: View {
 
     /// The shared reading measure all three capped sites (transcript,
     /// composer, empty-state greeting) apply. See `ChatMetrics.contentWidthFraction`.
+    /// Settings ▸ Interface ▸ Chat Column: the reading column every capped
+    /// site shares - transcript, composer and the empty-state greeting.
     private var contentWidth: CGFloat {
-        columnWidth > 0 ? columnWidth * ChatMetrics.contentWidthFraction : ChatMetrics.contentFallbackWidth
+        ChatMetrics.proseWidth(panelWidth: columnWidth)
     }
     @State private var composerHeight: CGFloat = 36
     // The composer's "create mode" (the chip rewired the composer into a
@@ -2182,7 +2188,7 @@ struct ChatDetailView: View {
                     // @AppStorage pair above). Only fires on a Settings edit —
                     // the transcript isn't even visible then (Settings is a
                     // mode of this window), so the scroll reset is unseen.
-                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)")
+                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
                     .frame(maxWidth: contentWidth)
@@ -4550,13 +4556,12 @@ struct MarkdownText: View {
             case .paragraph(let text):
                 // Leading + a real gap after each paragraph (single-newline
                 // "**Label.** text" runs the models love are paragraphs too),
-                // and the reading measure as a POSITIVE tailIndent — an
-                // absolute wrap point, so prose stops at ~45em while tables,
-                // code and XML keep the full column.
+                // and the reading measure as SYMMETRIC indents: a negative
+                // tailIndent is measured from the trailing edge, so prose sits
+                // centred in the column while tables keep its full width.
                 let p = NSMutableParagraphStyle()
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
                 p.paragraphSpacing = 8
-                p.tailIndent = ChatMetrics.proseMeasure
                 let para = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
                 para.addAttribute(.paragraphStyle, value: p,
                                   range: NSRange(location: 0, length: para.length))
@@ -4571,7 +4576,6 @@ struct MarkdownText: View {
                 p.paragraphSpacingBefore = 10
                 p.paragraphSpacing = 2
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
-                p.tailIndent = ChatMetrics.proseMeasure
                 let heading = NSMutableAttributedString(
                     attributedString: renderInline(text, theme: theme, fontSize: size)
                 )
@@ -4586,11 +4590,11 @@ struct MarkdownText: View {
                 let p = NSMutableParagraphStyle()
                 p.paragraphSpacingBefore = 4
                 p.paragraphSpacing = 4
+                // Its own gutter, so the tinted block stands off the text.
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 p.tailIndent = -8
-                // Less air than prose — a listing wants rows. And never the
-                // prose measure: code keeps the full column.
+                // Less air than prose — a listing wants rows.
                 p.lineHeightMultiple = ChatMetrics.codeLineHeightMultiple
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular),
@@ -4613,7 +4617,6 @@ struct MarkdownText: View {
                 p.headIndent = bullet.size().width.rounded(.up)
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
                 p.paragraphSpacing = 4
-                p.tailIndent = ChatMetrics.proseMeasure
                 let inline = renderInline(text, theme: theme)
                 let combined = NSMutableAttributedString()
                 combined.append(bullet)
@@ -4683,6 +4686,10 @@ struct MarkdownText: View {
         table.numberOfColumns = cols
         let fractions = MarkdownTable.columnFractions(headers: headers, rows: rows)
         let dividerColor = NSColor.separatorColor
+        // Lighter than the rules, or the header reads as a filled bar rather
+        // than as a heading. Both are dynamic colors, so the pair holds up in
+        // dark mode without a second palette.
+        let headerFill = NSColor.quaternaryLabelColor
 
         func textAlignment(_ column: Int) -> NSTextAlignment {
             guard column < alignments.count else { return .left }
@@ -4693,6 +4700,18 @@ struct MarkdownText: View {
             }
         }
 
+        // The grid: one hairline under every row, a full-weight rule under the
+        // header, and an outline drawn by the cells that sit on the table's
+        // edges — `NSTextTable` has no frame of its own to stroke, and no
+        // corner radius either, so the outline is four sets of cell borders and
+        // the corners stay square.
+        //
+        // Only ever `.maxY` between rows: a neighbour's `.minY` would land on
+        // the same line and draw it twice as thick.
+        let outlineWeight: CGFloat = 1
+        let rowRuleWeight: CGFloat = 0.5
+        let lastRow = rows.count   // header is row 0
+
         func appendRow(_ cells: [String], rowIndex: Int, bold: Bool) {
             for column in 0..<cols {
                 let text = column < cells.count ? cells[column] : ""
@@ -4702,12 +4721,30 @@ struct MarkdownText: View {
                 )
                 block.setContentWidth(Double(fractions[column]) * 100, type: .percentageValueType)
                 block.setWidth(6, type: .absoluteValueType, for: .padding)
-                // Divider under the header row only — no vertical borders,
-                // no rules between data rows, matching the "minimal GFM"
-                // look chat UIs use.
+
                 if rowIndex == 0 {
-                    block.setBorderColor(dividerColor, for: .maxY)
-                    block.setWidth(1, type: .absoluteValueType, for: .border, edge: .maxY)
+                    // Header: its own fill, lighter than the rules around it,
+                    // and the top of the outline.
+                    block.backgroundColor = headerFill
+                    block.setBorderColor(dividerColor, for: .minY)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minY)
+                }
+                // Bottom edge: the outline on the last row, a hairline between
+                // rows everywhere else. The header's own rule stays at full
+                // weight — it separates the labels from the data.
+                block.setBorderColor(dividerColor, for: .maxY)
+                block.setWidth(rowIndex == lastRow || rowIndex == 0 ? outlineWeight : rowRuleWeight,
+                               type: .absoluteValueType, for: .border, edge: .maxY)
+
+                // Sides of the outline. No rules BETWEEN columns: vertical
+                // rules turn a comparison into a spreadsheet.
+                if column == 0 {
+                    block.setBorderColor(dividerColor, for: .minX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minX)
+                }
+                if column == cols - 1 {
+                    block.setBorderColor(dividerColor, for: .maxX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .maxX)
                 }
                 let pStyle = NSMutableParagraphStyle()
                 pStyle.textBlocks = [block]
