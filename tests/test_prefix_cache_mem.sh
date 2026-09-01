@@ -8,9 +8,17 @@
 #   * At least one `[hot-cache] evicted LRU entry (byte budget; …)` log line
 #     fires once the resident bytes would exceed the budget.
 #   * The server stays healthy through all requests.
+#   * (#330) ONE growing conversation crossing the budget gets TRIMMED, not
+#     flat-declined — a `trimmed oversized entry to N/…` line appears and a
+#     later turn logs `reused M/…` with M >= N. From the outside a trim that
+#     silently stops engaging looks exactly like a legit decline, so only the
+#     log can pin it; the unit tests own the trim's correctness. A hybrid
+#     whose single checkpoint outweighs the whole budget legitimately
+#     declines (`skipped oversized entry`) — that arm WARNs instead.
 #
 # Tunables (env): SHORT_BUDGET_MB (default 64), N_REQ (default 5),
-#                 PROMPT_REPEATS (default 200).
+#                 PROMPT_REPEATS (default 200), GROW_TURNS (default 5),
+#                 GROW_WORDS (default 2000).
 #
 # Usage: ./tests/test_prefix_cache_mem.sh [/path/to/model] [port]
 
@@ -27,6 +35,8 @@ NC='\033[0m'
 SHORT_BUDGET_MB="${SHORT_BUDGET_MB:-64}"
 N_REQ="${N_REQ:-5}"
 PROMPT_REPEATS="${PROMPT_REPEATS:-200}"
+GROW_TURNS="${GROW_TURNS:-5}"
+GROW_WORDS="${GROW_WORDS:-2000}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_prefix_cache_mem: $MODEL not found."
@@ -159,6 +169,83 @@ else
     else
         echo -e "${YELLOW}WARN${NC} no byte-budget eviction (budget may be too generous for $N_REQ requests)"
     fi
+fi
+
+# ── #330: one growing conversation past the budget must TRIM, not go dark ──
+echo
+echo "== #330: growing conversation past the budget (${GROW_TURNS} turns x ~${GROW_WORDS} words) =="
+GROW_MARK=$(wc -l < "$LOGFILE")
+GROW_OK=1
+python3 - "$BASE" "$GROW_TURNS" "$GROW_WORDS" <<'EOF' || GROW_OK=0
+import json, sys, urllib.request
+
+base, turns, words = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+msgs = [{"role": "system", "content": "You are a terse assistant."}]
+for t in range(1, turns + 1):
+    filler = " ".join(f"entry {t}.{i} value {(i * 7) % 97}" for i in range(words // 4))
+    msgs.append({"role": "user", "content": f"Turn {t} log:\n{filler}\nAcknowledge in one sentence."})
+    body = json.dumps({"model": "mlx-serve", "messages": msgs,
+                       "max_tokens": 16, "temperature": 0.0}).encode()
+    req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        resp = json.load(r)
+    content = resp["choices"][0]["message"].get("content") or ""
+    if not content:
+        print(f"turn {t}: empty content", file=sys.stderr)
+        sys.exit(1)
+    msgs.append({"role": "assistant", "content": content})
+    u = resp.get("usage", {})
+    print(f"  turn {t}: prompt={u.get('prompt_tokens')} cached={u.get('prompt_tokens_details', {}).get('cached_tokens')}")
+EOF
+if [ "$GROW_OK" != "1" ]; then
+    echo -e "${RED}FAIL${NC} growing conversation request failed"
+    FAIL=1
+fi
+
+GROW_LOG=$(tail -n "+$((GROW_MARK + 1))" "$LOGFILE")
+TRIM_LEN=$(echo "$GROW_LOG" | python3 -c "
+import sys, re
+best = 0
+for line in sys.stdin:
+    m = re.search(r'trimmed oversized entry to (\d+)/\d+ tokens', line)
+    if m:
+        best = max(best, int(m.group(1)))
+print(best)
+")
+if [ "$TRIM_LEN" -gt 0 ]; then
+    MAX_REUSED=$(echo "$GROW_LOG" | python3 -c "
+import sys, re
+best = 0
+for line in sys.stdin:
+    m = re.search(r'\[hot-cache\] reused (\d+)/\d+ tokens', line)
+    if m:
+        best = max(best, int(m.group(1)))
+print(best)
+")
+    if [ "$MAX_REUSED" -ge "$TRIM_LEN" ]; then
+        echo -e "${GREEN}PASS${NC} oversized entry trimmed to ${TRIM_LEN} tokens and later reused ${MAX_REUSED}"
+    else
+        echo -e "${RED}FAIL${NC} trimmed to ${TRIM_LEN} tokens but best later reuse was ${MAX_REUSED} — the trimmed entry never served"
+        echo "$GROW_LOG" | grep -E '\[hot-cache\]' | tail -20
+        FAIL=1
+    fi
+elif echo "$GROW_LOG" | grep -q '\[hot-cache\] skipped oversized entry'; then
+    # Only a HYBRID can decline legitimately here (its smallest restorable
+    # checkpoint alone can outweigh the budget — checkpoint stride = prefill
+    # chunk). Hybrid entries are identifiable by the `; ssm` clause their
+    # eviction lines carry; on a plain-attention arch a decline IS the #330
+    # cliff and must fail.
+    if grep -qE '\[hot-cache\] evicted LRU entry \(.*; ssm ' "$LOGFILE"; then
+        echo -e "${YELLOW}WARN${NC} conversation crossed the budget but only declined — no restorable checkpoint fits ${SHORT_BUDGET_MB}MB on this hybrid"
+    else
+        echo -e "${RED}FAIL${NC} oversized conversation was declined instead of trimmed (#330 cliff) — every turn cold-prefills"
+        echo "$GROW_LOG" | grep -E '\[hot-cache\]' | tail -20
+        FAIL=1
+    fi
+else
+    echo -e "${RED}FAIL${NC} conversation never crossed the ${SHORT_BUDGET_MB}MB budget — grow GROW_TURNS/GROW_WORDS; the #330 arm proved nothing"
+    FAIL=1
 fi
 
 exit $FAIL

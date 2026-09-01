@@ -260,6 +260,40 @@ final class ServerLogBufferTests: XCTestCase {
         XCTAssertEqual(ServerManager.summarizeCrash("   \n  ", exitCode: 9), "exit code 9")
     }
 
+    // A request/tool-result preview line (`> "..."`) is the CONVERSATION's own
+    // text echoed into the log — its content matching an error needle must not
+    // be presented as the crash cause (live 2026-08-30: the banner showed a
+    // vite error from the agent's transcript after a Metal OOM that only
+    // reached os_log).
+    func testSummarizeCrashSkipsRequestPreviewLines() {
+        let log = """
+        <- 143210+512 tokens
+          > "9:23:51 PM [vite] Pre-transform error: Failed to load url /src/main.tsx"
+        [cache] reusing 138000 tokens
+        """
+        let msg = ServerManager.summarizeCrash(log, exitCode: 134)
+        XCTAssertFalse(msg.contains("vite"), "a preview line must never be the crash summary: \(msg)")
+        XCTAssertEqual(msg, "[cache] reusing 138000 tokens")
+    }
+
+    func testSummarizeCrashPreferMetalMarkerOverPreviewLines() {
+        let log = """
+          > "9:23:51 PM [vite] Pre-transform error: Failed to load url /src/main.tsx"
+        libc++abi: terminating due to uncaught exception of type std::runtime_error: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+        """
+        let msg = ServerManager.summarizeCrash(log, exitCode: 134)
+        XCTAssertTrue(msg.localizedCaseInsensitiveContains("GPU memory"), "got: \(msg)")
+    }
+
+    func testSummarizeCrashFallbackLastLineSkipsPreviews() {
+        let log = """
+        boot line
+          > "some quoted conversation text"
+        """
+        let msg = ServerManager.summarizeCrash(log, exitCode: 1)
+        XCTAssertEqual(msg, "boot line")
+    }
+
     // MARK: - Crash log view (wrapping, not horizontal scroll)
     //
     // The crash alert used to configure its log text view for horizontal

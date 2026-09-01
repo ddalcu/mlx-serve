@@ -71,7 +71,7 @@ final class SettingsCategoryTests: XCTestCase {
     func testSidebarOrderMatchesRenderOrder() {
         XCTAssertEqual(SettingsCategory.visible(engine: .mlx, selfUpdate: true), [
             .modelFolders, .server, .lanSharing, .specDecode, .performance,
-            .requestDefaults, .voice, .sandbox, .messaging, .updates, .about,
+            .requestDefaults, .interface, .voice, .sandbox, .messaging, .updates, .about,
         ])
     }
 

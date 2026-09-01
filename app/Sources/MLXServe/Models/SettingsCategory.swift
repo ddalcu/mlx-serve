@@ -23,6 +23,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case ggufPerformance
     case ds4
     case requestDefaults
+    case interface
     case voice
     case sandbox
     case messaging
@@ -46,6 +47,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
         case .ds4:               return "DeepSeek-V4 (ds4 engine)"
         case .requestDefaults:   return "Per-Request Defaults"
+        case .interface:         return "Interface"
         case .voice:             return "Voice"
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
@@ -77,6 +79,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .ggufPerformance:   return "shippingbox"
         case .ds4:               return "cube"
         case .requestDefaults:   return "slider.horizontal.3"
+        case .interface:         return "paintbrush"
         case .voice:             return "waveform"
         case .sandbox:           return "shield.lefthalf.filled"
         case .messaging:         return "paperplane"

@@ -37,7 +37,11 @@ struct MusicGenView: View {
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: MusicGenRequest? = nil
-    @StateObject private var clipPlayer = AudioClipPlayer()
+    // The app-wide singleton, not a per-view instance: this view unmounts on
+    // navigation (see the tab-persistence note on AudioGenView), and a
+    // private player left playing when that happens is a leaked NSSound with
+    // no reachable Stop button — see .onDisappear below.
+    @ObservedObject private var clipPlayer = AudioClipPlayer.shared
     // Kept across preset switches like the video pane's first frame; the
     // SERVICE gates the field on `supportsReferenceAudio`.
     @State private var refAudioURL: URL? = nil
@@ -76,6 +80,7 @@ struct MusicGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
+        .onDisappear { stopPlayback() }
         .onChange(of: model) { _, m in
             guard !hydrating else { return }
             durationSeconds = min(max(durationSeconds, m.durationRange.lowerBound), m.durationRange.upperBound)
@@ -147,11 +152,7 @@ struct MusicGenView: View {
                     paths: service.recent,
                     playingPath: clipPlayer.playingPath,
                     onPlay: { play($0) },
-                    onStop: { stopPlayback() },
-                    onSendToChat: { path in
-                        appState.sendGeneratedMediaToNewChat(
-                            path: path, prompt: AudioSidecar.prompt(forTrack: path), kind: .audio)
-                    }
+                    onStop: { stopPlayback() }
                 )
                 outputFolderLink
             }
@@ -828,15 +829,6 @@ struct MusicGenView: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless).help("Reveal in Finder")
-                // The one bridge from the workshop to a conversation — the
-                // Voice tab has had it, music did not. Chat renders a real
-                // player for an `.audio` ref (ChatMediaAttachmentView).
-                Button {
-                    appState.sendGeneratedMediaToNewChat(
-                        path: path, prompt: prompt, kind: .audio)
-                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
-                .buttonStyle(.borderless)
-                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(16)

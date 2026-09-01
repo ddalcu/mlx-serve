@@ -4,15 +4,118 @@ import Carbon.HIToolbox
 
 // MARK: - Hotkey combo
 
-/// The launcher's summon combo: ⌃Space. Fixed for v1 — note macOS binds
-/// ⌃Space to "Select the previous input source" when multiple input sources
-/// are enabled, and that system shortcut wins over any app registration
-/// (RegisterEventHotKey still succeeds). The tray row's help text points
-/// there when "nothing happens".
+/// The launcher's summon combo. Defaults to ⌃Space; Settings ▸ Interface can
+/// rebind it (`QuickLauncherHotKeyStore`) — some keyboard layouts and input
+/// methods already claim ⌃Space for "Select the previous input source", and
+/// that system shortcut wins over any app registration (RegisterEventHotKey
+/// still succeeds; the tray row's help text points there when "nothing
+/// happens").
 enum QuickLauncherHotKey {
-    static let keyCode: UInt32 = UInt32(kVK_Space)
-    static let carbonModifiers: UInt32 = UInt32(controlKey)
-    static let display = "⌃Space"
+    static let defaultKeyCode: UInt32 = UInt32(kVK_Space)
+    static let defaultCarbonModifiers: UInt32 = UInt32(controlKey)
+
+    static var keyCode: UInt32 { QuickLauncherHotKeyStore.keyCode }
+    static var carbonModifiers: UInt32 { QuickLauncherHotKeyStore.carbonModifiers }
+    static var display: String { HotKeyDisplay.string(keyCode: keyCode, carbonModifiers: carbonModifiers) }
+}
+
+/// Persisted override for the combo above. Two raw `Int`s in UserDefaults —
+/// absent means "use the default", so shipping a new default later still
+/// reaches everyone who never touched Settings.
+enum QuickLauncherHotKeyStore {
+    private static let keyCodeKey = "quickLauncherKeyCode"
+    private static let modifiersKey = "quickLauncherModifiers"
+
+    static var keyCode: UInt32 {
+        guard let stored = UserDefaults.standard.object(forKey: keyCodeKey) as? Int else {
+            return QuickLauncherHotKey.defaultKeyCode
+        }
+        return UInt32(stored)
+    }
+
+    static var carbonModifiers: UInt32 {
+        guard let stored = UserDefaults.standard.object(forKey: modifiersKey) as? Int else {
+            return QuickLauncherHotKey.defaultCarbonModifiers
+        }
+        return UInt32(stored)
+    }
+
+    static var isDefault: Bool {
+        UserDefaults.standard.object(forKey: keyCodeKey) == nil
+    }
+
+    static func set(keyCode: UInt32, carbonModifiers: UInt32) {
+        UserDefaults.standard.set(Int(keyCode), forKey: keyCodeKey)
+        UserDefaults.standard.set(Int(carbonModifiers), forKey: modifiersKey)
+    }
+
+    static func reset() {
+        UserDefaults.standard.removeObject(forKey: keyCodeKey)
+        UserDefaults.standard.removeObject(forKey: modifiersKey)
+    }
+}
+
+/// Renders a Carbon (keyCode, modifiers) pair the way macOS shows shortcuts
+/// (⌃⌥⇧⌘ prefix, then the key). Names come from the ANSI layout — a full
+/// per-layout translation needs `UCKeyTranslate`, and every shortcut recorder
+/// carries the same approximation on non-US layouts. The recorder only binds
+/// keys this table can name (`hasName`).
+enum HotKeyDisplay {
+    static func string(keyCode: UInt32, carbonModifiers: UInt32) -> String {
+        modifierSymbols(carbonModifiers) + keySymbol(keyCode)
+    }
+
+    static func modifierSymbols(_ carbonModifiers: UInt32) -> String {
+        var s = ""
+        if carbonModifiers & UInt32(controlKey) != 0 { s += "⌃" }
+        if carbonModifiers & UInt32(optionKey) != 0 { s += "⌥" }
+        if carbonModifiers & UInt32(shiftKey) != 0 { s += "⇧" }
+        if carbonModifiers & UInt32(cmdKey) != 0 { s += "⌘" }
+        return s
+    }
+
+    static func keySymbol(_ keyCode: UInt32) -> String {
+        // The recorder refuses unmapped keys (`HotKeyCapture.verdict`), so the
+        // fallback only renders for a combo stored by an older build.
+        keyNames[keyCode] ?? "Key \(keyCode)"
+    }
+
+    static func hasName(_ keyCode: UInt32) -> Bool { keyNames[keyCode] != nil }
+
+    private static let keyNames: [UInt32: String] = {
+        var names: [UInt32: String] = [
+            UInt32(kVK_ANSI_A): "A", UInt32(kVK_ANSI_B): "B", UInt32(kVK_ANSI_C): "C",
+            UInt32(kVK_ANSI_D): "D", UInt32(kVK_ANSI_E): "E", UInt32(kVK_ANSI_F): "F",
+            UInt32(kVK_ANSI_G): "G", UInt32(kVK_ANSI_H): "H", UInt32(kVK_ANSI_I): "I",
+            UInt32(kVK_ANSI_J): "J", UInt32(kVK_ANSI_K): "K", UInt32(kVK_ANSI_L): "L",
+            UInt32(kVK_ANSI_M): "M", UInt32(kVK_ANSI_N): "N", UInt32(kVK_ANSI_O): "O",
+            UInt32(kVK_ANSI_P): "P", UInt32(kVK_ANSI_Q): "Q", UInt32(kVK_ANSI_R): "R",
+            UInt32(kVK_ANSI_S): "S", UInt32(kVK_ANSI_T): "T", UInt32(kVK_ANSI_U): "U",
+            UInt32(kVK_ANSI_V): "V", UInt32(kVK_ANSI_W): "W", UInt32(kVK_ANSI_X): "X",
+            UInt32(kVK_ANSI_Y): "Y", UInt32(kVK_ANSI_Z): "Z",
+            UInt32(kVK_ANSI_0): "0", UInt32(kVK_ANSI_1): "1", UInt32(kVK_ANSI_2): "2",
+            UInt32(kVK_ANSI_3): "3", UInt32(kVK_ANSI_4): "4", UInt32(kVK_ANSI_5): "5",
+            UInt32(kVK_ANSI_6): "6", UInt32(kVK_ANSI_7): "7", UInt32(kVK_ANSI_8): "8",
+            UInt32(kVK_ANSI_9): "9",
+            UInt32(kVK_ANSI_Minus): "-", UInt32(kVK_ANSI_Equal): "=",
+            UInt32(kVK_ANSI_LeftBracket): "[", UInt32(kVK_ANSI_RightBracket): "]",
+            UInt32(kVK_ANSI_Backslash): "\\", UInt32(kVK_ANSI_Semicolon): ";",
+            UInt32(kVK_ANSI_Quote): "'", UInt32(kVK_ANSI_Comma): ",",
+            UInt32(kVK_ANSI_Period): ".", UInt32(kVK_ANSI_Slash): "/",
+            UInt32(kVK_ANSI_Grave): "`",
+            UInt32(kVK_Space): "Space", UInt32(kVK_Return): "↩", UInt32(kVK_Tab): "⇥",
+            UInt32(kVK_Escape): "⎋", UInt32(kVK_Delete): "⌫",
+            UInt32(kVK_LeftArrow): "←", UInt32(kVK_RightArrow): "→",
+            UInt32(kVK_UpArrow): "↑", UInt32(kVK_DownArrow): "↓",
+        ]
+        let fKeys: [UInt32] = [
+            UInt32(kVK_F1), UInt32(kVK_F2), UInt32(kVK_F3), UInt32(kVK_F4), UInt32(kVK_F5),
+            UInt32(kVK_F6), UInt32(kVK_F7), UInt32(kVK_F8), UInt32(kVK_F9), UInt32(kVK_F10),
+            UInt32(kVK_F11), UInt32(kVK_F12),
+        ]
+        for (i, code) in fKeys.enumerated() { names[code] = "F\(i + 1)" }
+        return names
+    }()
 }
 
 // MARK: - Pure logic
@@ -203,12 +306,30 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         }
     }
 
+    /// Re-registers with whatever combo `QuickLauncherHotKeyStore` currently
+    /// holds. Returns false when the system refused the combo (owned by
+    /// another app) — the recorder row reverts and says so. While disabled
+    /// the combo is only saved, which cannot fail: `setEnabled` picks it up
+    /// the next time it's turned on.
+    @discardableResult
+    func updateHotKey() -> Bool {
+        guard appState.quickLauncherEnabled else { return true }
+        return hotKey.register(keyCode: QuickLauncherHotKey.keyCode,
+                               carbonModifiers: QuickLauncherHotKey.carbonModifiers)
+    }
+
     func toggle() {
         if panel?.isVisible == true { hide() } else { show() }
     }
 
     func show() {
         let panel = ensurePanel()
+        // The SwiftUI content forces its scheme via `.appAppearance()`, but
+        // the panel's own chrome — the NSVisualEffectView material — follows
+        // the WINDOW's appearance, and forced-dark content over a
+        // system-light vibrancy reads as a broken half-theme. Re-read per
+        // summon: Settings can change it while the panel exists.
+        panel.appearance = AppAppearanceMode.current.nsAppearance
         updatePanelFrame(keepTopEdge: false)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
@@ -332,6 +453,7 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         let hosting = NSHostingView(rootView: AnyView(
             QuickLauncherView(controller: self, engine: appState.chatEngine)
                 .environmentObject(appState)
+                .appAppearance()
         ))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(hosting)

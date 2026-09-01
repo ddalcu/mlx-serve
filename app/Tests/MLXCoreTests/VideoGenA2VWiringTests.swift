@@ -34,4 +34,20 @@ final class VideoGenA2VWiringTests: XCTestCase {
         XCTAssertTrue(source.contains("framesCovering"),
                       "Attaching a clip should auto-suggest a frame count that covers it")
     }
+
+    /// The live preview is opt-in, which is only true if the pane HAS the
+    /// control and every half of it is wired: a `@State` nobody persists resets
+    /// each launch, and a toggle that never reaches the request is the
+    /// silently-dropped-setting class this file exists for.
+    func testLivePreviewToggleIsPresentAndFullyWired() throws {
+        let source = try videoGenViewSource()
+        XCTAssertTrue(source.contains("isOn: $livePreview"),
+                      "The video pane must offer a live-preview toggle — the server default is off, so without a control the feature is unreachable")
+        XCTAssertTrue(source.contains("livePreview: livePreview"),
+                      "The toggle must reach VideoGenRequest.livePreview, or it changes nothing on the wire")
+        XCTAssertTrue(source.contains("livePreview = s.livePreview"),
+                      "The toggle must hydrate from VideoGenSettings, or it reads off after every launch")
+        XCTAssertTrue(source.contains("s.livePreview = livePreview"),
+                      "The toggle must persist into VideoGenSettings, or it forgets the user's choice")
+    }
 }

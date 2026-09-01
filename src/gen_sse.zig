@@ -7,6 +7,7 @@
 const std = @import("std");
 const server_mod = @import("server.zig");
 const Conn = server_mod.Conn;
+const preview = @import("preview.zig");
 
 /// Erased progress callback handed into the model code (flux/tts/ltx) so the
 /// inner loops can report step/total without importing the HTTP layer.
@@ -17,8 +18,22 @@ pub const Progress = struct {
     /// each step and abort with error.Cancelled — without it a cancelled
     /// request burns the GPU to completion and queues everything behind it.
     cancelled_cb: ?*const fn (ctx: *anyopaque) bool = null,
+    /// Opt-in per-step JPEG (issue #208). Null unless the client asked and
+    /// the sink is an SSE stream. Cached-velocity H3 steps leave this unused.
+    preview_cb: ?*const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void = null,
+    preview_opts: preview.Opts = .{},
     pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
         self.cb(self.ctx, stage, step, total);
+    }
+    pub fn emitPreview(self: Progress, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void {
+        if (self.preview_cb) |f| {
+            f(self.ctx, stage, step, total, frame);
+        } else {
+            self.emit(stage, step, total);
+        }
+    }
+    pub fn wantsPreview(self: Progress) bool {
+        return self.preview_cb != null and self.preview_opts.enabled;
     }
     pub fn cancelled(self: Progress) bool {
         const f = self.cancelled_cb orelse return false;
@@ -44,11 +59,38 @@ pub const StreamCtx = struct {
     /// runs.
     stream: bool = true,
     cancelled: bool = false,
+    /// Heap events (preview JPEGs) need an allocator. Stage/step/total still
+    /// fit in the 256-byte stack buffer when preview is off.
+    allocator: ?std.mem.Allocator = null,
+    preview: bool = false,
+    preview_frames: u32 = 1,
+    preview_max_side: u32 = 256,
     pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (!self.stream) return;
         var buf: [256]u8 = undefined;
         const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}\n\n", .{ stage, step, total }) catch return;
+        self.conn.writeAll(ev) catch {
+            self.cancelled = true;
+        };
+    }
+    pub fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void {
+        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        if (!self.stream) return;
+        const alloc = self.allocator orelse {
+            StreamCtx.cb(ptr, stage, step, total);
+            return;
+        };
+        const json = preview.formatProgressJson(alloc, stage, step, total, frame) catch {
+            StreamCtx.cb(ptr, stage, step, total);
+            return;
+        };
+        defer alloc.free(json);
+        const ev = std.fmt.allocPrint(alloc, "data: {s}\n\n", .{json}) catch {
+            StreamCtx.cb(ptr, stage, step, total);
+            return;
+        };
+        defer alloc.free(ev);
         self.conn.writeAll(ev) catch {
             self.cancelled = true;
         };
@@ -67,7 +109,18 @@ pub const StreamCtx = struct {
         return false;
     }
     pub fn progress(self: *StreamCtx) Progress {
-        return .{ .ctx = self, .cb = StreamCtx.cb, .cancelled_cb = StreamCtx.cancelledCb };
+        const opts = (preview.Opts{
+            .enabled = self.preview,
+            .frames = self.preview_frames,
+            .max_side = self.preview_max_side,
+        }).normalize();
+        return .{
+            .ctx = self,
+            .cb = StreamCtx.cb,
+            .cancelled_cb = StreamCtx.cancelledCb,
+            .preview_cb = if (self.preview and self.stream) StreamCtx.previewCb else null,
+            .preview_opts = opts,
+        };
     }
 };
 
@@ -130,6 +183,28 @@ test "bodyBool is tri-state (absent != false)" {
     try std.testing.expectEqual(@as(?bool, true), bodyBool("{\"fast\": true}", "fast"));
     try std.testing.expectEqual(@as(?bool, false), bodyBool("{\"fast\":false}", "fast"));
     try std.testing.expectEqual(@as(?bool, null), bodyBool("{\"fast\": \"yes\"}", "fast"));
+}
+
+/// Unsigned integer for `key`, or null when absent / unreadable.
+pub fn bodyU32(body: []const u8, key: []const u8) ?u32 {
+    var pat_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, pat) orelse return null;
+    var i = ki + pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    const start = i;
+    while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
+    if (i == start) return null;
+    return std.fmt.parseInt(u32, body[start..i], 10) catch null;
+}
+
+/// `"preview"` / `"preview_frames"` / `"preview_max_side"` from a video body.
+/// Default off. Clamped by `preview.Opts.normalize`.
+pub fn parsePreview(body: []const u8) preview.Opts {
+    var o = preview.Opts{ .enabled = bodyWantsTrue(body, "preview") };
+    if (bodyU32(body, "preview_frames")) |n| o.frames = n;
+    if (bodyU32(body, "preview_max_side")) |n| o.max_side = n;
+    return o.normalize();
 }
 
 /// True if the JSON body contains `"key": true`.
@@ -225,4 +300,72 @@ test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {
     const cancelled = p.cancelled();
     _ = std.c.close(sv[0]);
     try std.testing.expect(cancelled);
+}
+
+test "parsePreview is off by default and clamps frames / max_side" {
+    try std.testing.expect(!parsePreview("{}").enabled);
+    try std.testing.expect(!parsePreview("{\"stream\":true}").enabled);
+    const on = parsePreview("{\"preview\": true, \"preview_frames\": 4, \"preview_max_side\": 128}");
+    try std.testing.expect(on.enabled);
+    try std.testing.expectEqual(@as(u32, 4), on.frames);
+    try std.testing.expectEqual(@as(u32, 128), on.max_side);
+    const clamped = parsePreview("{\"preview\":true,\"preview_frames\":99,\"preview_max_side\":99999}");
+    try std.testing.expectEqual(preview.Opts.max_frames, clamped.frames);
+    try std.testing.expectEqual(preview.Opts.max_side_cap, clamped.max_side);
+    const native = parsePreview("{\"preview\":true,\"preview_max_side\":0}");
+    try std.testing.expectEqual(@as(u32, 0), native.max_side);
+}
+
+test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    // A real `Conn.init`, not a hand-filled one: this is the only test here
+    // that reaches `Conn.writeAll`, which stamps the keepalive off `c.io` and
+    // writes through `c.write_state` — an `undefined` Conn segfaults on the
+    // vtable in Debug and only LOOKS fine in ReleaseFast.
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } },
+              std.Io.Threaded.global_single_threaded.io());
+
+    var sctx = StreamCtx{
+        .conn = &conn,
+        .stream = true,
+        .allocator = std.testing.allocator,
+        .preview = true,
+    };
+    const p = sctx.progress();
+    try std.testing.expect(p.wantsPreview());
+    const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xD9 };
+    p.emitPreview("Generating", 8, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });
+
+    var buf: [2048]u8 = undefined;
+    const n = std.c.recv(sv[1], &buf, buf.len, std.posix.MSG.DONTWAIT);
+    try std.testing.expect(n > 0);
+    const got = buf[0..@intCast(n)];
+    try std.testing.expect(std.mem.startsWith(u8, got, "data: "));
+    const json = got[6 .. got.len - 2]; // strip "data: " and "\n\n"
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("progress", o.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 8), o.get("step").?.integer);
+    try std.testing.expectEqualStrings("image/jpeg", o.get("mime").?.string);
+    try std.testing.expect(o.get("preview").?.string.len > 0);
+
+    _ = std.c.close(sv[1]);
+    _ = std.c.close(sv[0]);
+}
+
+test "Progress.wantsPreview is false when the client did not opt in" {
+    const H = struct {
+        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+            _ = ctx;
+            _ = stage;
+            _ = step;
+            _ = total;
+        }
+    };
+    var dummy: u8 = 0;
+    const p = Progress{ .ctx = &dummy, .cb = H.emitCb };
+    try std.testing.expect(!p.wantsPreview());
 }

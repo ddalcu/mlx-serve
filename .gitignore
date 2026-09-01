@@ -51,6 +51,10 @@ app/MLXCore.dmg
 server_err.log
 .vscode
 
+# Cursor IDE / Cloud Agents. Local tooling only; not for upstream PRs.
+.cursor/
+agent-tools/
+
 # Speculative-decoding working notes (MTP + PLD planning/scratchpad)
 .mtp-progress.md
 .spec-progress.md

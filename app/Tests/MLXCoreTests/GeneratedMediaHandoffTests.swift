@@ -38,15 +38,17 @@ final class GeneratedMediaHandoffTests: XCTestCase {
         }
     }
 
-    /// The panes must not each build their own hand-off. Four copies of "make a
-    /// session, make a message, switch modes" is four chances for one of them to
-    /// land in the wrong chat.
+    /// The panes must not each build their own hand-off. Two copies of "make a
+    /// session, make a message, switch modes" is two chances for one of them to
+    /// land in the wrong chat. Audio & Music deliberately has no "Send to
+    /// Chat" control (removed 2026-08-31 — its purpose read as unclear with
+    /// no label, just a bare icon on every history row and preview panel).
     func testEveryPaneUsesTheSharedHandoff() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        for pane in ["ImageGenView", "VideoGenView", "AudioGenView"] {
+        for pane in ["ImageGenView", "VideoGenView"] {
             let text = try String(
                 contentsOf: root.appendingPathComponent("Sources/MLXServe/Views/\(pane).swift"),
                 encoding: .utf8)

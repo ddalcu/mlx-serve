@@ -876,6 +876,11 @@ inline fn addA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_add(&o, a, b, s));
     return o;
 }
+inline fn subA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_subtract(&o, a, b, s));
+    return o;
+}
 inline fn mulA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_multiply(&o, a, b, s));
@@ -3351,6 +3356,119 @@ pub fn patchifyVideo(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     return reshape(trc, &[_]c_int{ t * h2 * w2, c * @as(c_int, @intCast(PATCH_H * PATCH_W)) }, s);
 }
 
+/// Inverse of `patchifyVideo`: `[T*(H/2)*(W/2), C*2*2]` → `[1, C, T, H, W]`.
+fn unpatchifyVideoRows(video_x: mlx.mlx_array, latent_t: u32, lat_h: u32, lat_w: u32, s: S) !mlx.mlx_array {
+    const lh2: c_int = @intCast(lat_h / PATCH_H);
+    const lw2: c_int = @intCast(lat_w / PATCH_W);
+    const c24: c_int = 24;
+    const v6 = try reshape(video_x, &[_]c_int{ @intCast(latent_t), lh2, lw2, c24, @intCast(PATCH_H), @intCast(PATCH_W) }, s);
+    defer _ = mlx.mlx_array_free(v6);
+    const vp = try transpose(v6, &[_]c_int{ 3, 0, 1, 4, 2, 5 }, s);
+    defer _ = mlx.mlx_array_free(vp);
+    const vpc = try contig(vp, s);
+    defer _ = mlx.mlx_array_free(vpc);
+    return reshape(vpc, &[_]c_int{ 1, c24, @intCast(latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
+}
+
+fn copyArrayF32(allocator: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
+    const f = try astype(x, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(f);
+    const c = try contig(f, s);
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_array_eval(c));
+    const n: usize = @intCast(mlx.mlx_array_size(c));
+    const raw = mlx.mlx_array_data_float32(c) orelse return error.NoData;
+    return allocator.dupe(f32, raw[0..n]);
+}
+
+fn sliceLatentT(x: mlx.mlx_array, t: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const start = [_]c_int{ 0, 0, t, 0, 0 };
+    const stop = [_]c_int{ shp[0], shp[1], t + 1, shp[3], shp[4] };
+    const step = [_]c_int{ 1, 1, 1, 1, 1 };
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 5, &stop, 5, &step, 5, s));
+    return contig(o, s);
+}
+
+/// Predicted clean video x0 = x - sigma * v (rectified-flow, sigma 1→0).
+/// Failures fall back to a preview-less progress event so a bad JPEG never
+/// kills a 50-minute job.
+fn tryEmitH3Preview(
+    p: gen_sse.Progress,
+    allocator: std.mem.Allocator,
+    stage: []const u8,
+    step: u32,
+    total: u32,
+    video_x: mlx.mlx_array,
+    velocity: mlx.mlx_array,
+    sigma: f64,
+    latent_t: u32,
+    lat_h: u32,
+    lat_w: u32,
+    first_frame: bool,
+    s: S,
+) void {
+    if (!p.wantsPreview()) {
+        p.emit(stage, step, total);
+        return;
+    }
+    const frame = renderH3Preview(allocator, p.preview_opts, video_x, velocity, sigma, latent_t, lat_h, lat_w, first_frame, s) catch {
+        p.emit(stage, step, total);
+        return;
+    };
+    defer allocator.free(frame.jpeg);
+    p.emitPreview(stage, step, total, frame);
+}
+
+fn renderH3Preview(
+    allocator: std.mem.Allocator,
+    opts: @import("preview.zig").Opts,
+    video_x: mlx.mlx_array,
+    velocity: mlx.mlx_array,
+    sigma: f64,
+    latent_t: u32,
+    lat_h: u32,
+    lat_w: u32,
+    first_frame: bool,
+    s: S,
+) !@import("preview.zig").Encoded {
+    const preview_mod = @import("preview.zig");
+    const sv = try scalarLike(@floatCast(sigma), velocity, s);
+    defer _ = mlx.mlx_array_free(sv);
+    const scaled = try mulA(velocity, sv, s);
+    defer _ = mlx.mlx_array_free(scaled);
+    const x0 = try subA(video_x, scaled, s);
+    defer _ = mlx.mlx_array_free(x0);
+    const vol = try unpatchifyVideoRows(x0, latent_t, lat_h, lat_w, s);
+    defer _ = mlx.mlx_array_free(vol);
+
+    var idx_buf: [preview_mod.Opts.max_frames]u32 = undefined;
+    const idx = preview_mod.temporalIndices(&idx_buf, latent_t, opts.frames, first_frame);
+    const n: u32 = @intCast(idx.len);
+    const hw: usize = @as(usize, lat_h) * @as(usize, lat_w);
+    const c: usize = preview_mod.minimax_h3.channels();
+    const packed_lat = try allocator.alloc(f32, c * @as(usize, n) * hw);
+    defer allocator.free(packed_lat);
+    for (idx, 0..) |ti, fi| {
+        const sl = try sliceLatentT(vol, @intCast(ti), s);
+        defer _ = mlx.mlx_array_free(sl);
+        const cpu = try copyArrayF32(allocator, sl, s);
+        defer allocator.free(cpu);
+        // sl is [1,24,1,H,W] → C*H*W channel-major.
+        if (cpu.len < c * hw) return error.BadLatentShape;
+        for (0..c) |ci| {
+            @memcpy(packed_lat[ci * @as(usize, n) * hw + fi * hw ..][0..hw], cpu[ci * hw ..][0..hw]);
+        }
+    }
+    return preview_mod.jpegFromLatent(allocator, preview_mod.minimax_h3, packed_lat, n, lat_h, lat_w, .{
+        .enabled = true,
+        .frames = n,
+        .max_side = opts.max_side,
+    }, false);
+}
+
 /// Text-to-audio-video. Dispatches: `chain_windows > 1` runs N single-window
 /// generations chained by fl2va keyframes (`generateChain`); everything else
 /// is one window (`generateOne`).
@@ -3847,6 +3965,15 @@ fn generateOne(
         var sc_consec: u32 = 0;
         var sc_skipped: u32 = 0;
 
+        // I2V / chain windows pin the first temporal slice; T2V uses mid-clip.
+        var preview_first_frame = false;
+        for (req.keyframes) |kf| {
+            if (kf.anchor == .first) {
+                preview_first_frame = true;
+                break;
+            }
+        }
+
         for (0..req.steps) |i| {
             model.ablate = switch (abl_mode) {
                 .off => .none,
@@ -3936,6 +4063,14 @@ fn generateOne(
             var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
             defer out.deinit();
 
+            // Per-step JPEG from predicted clean x0 = x - σ·v, using the
+            // pre-Euler noisy latent. Cached-velocity steps already continued
+            // above without a preview. A failed JPEG never fails the job.
+            if (progress) |p| {
+                if (p.cancelled()) return error.Cancelled;
+                tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
+            }
+
             // Euler on the flat ODE: x += model_output * dsigma. The audio
             // velocity already carries d(sigma_a)/d(sigma_v), so both streams
             // integrate against the SAME video-schedule step — except under
@@ -3975,10 +4110,7 @@ fn generateOne(
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
             if (progress) |p| {
-                // Poll BEFORE emitting: a vanished client should stop the GPU,
-                // not have one more step charged to it first.
                 if (p.cancelled()) return error.Cancelled;
-                p.emit("Generating", @intCast(i + 1), req.steps);
             }
             // Every denoise loop owes a periodic cache clear: MLX's pool is
             // unbounded and these shapes repeat, so without it the process
@@ -4002,17 +4134,7 @@ fn generateOne(
     // ── 4. VAE decode ──
     // Unpatchify the video rows back to a latent volume: rows are
     // (t, h/2, w/2) major with C*2*2 per row.
-    const lh2: c_int = @intCast(lat_h / PATCH_H);
-    const lw2: c_int = @intCast(lat_w / PATCH_W);
-    const c24: c_int = 24;
-    const v6 = try reshape(video_x, &[_]c_int{ @intCast(shape.latent_t), lh2, lw2, c24, @intCast(PATCH_H), @intCast(PATCH_W) }, s);
-    defer _ = mlx.mlx_array_free(v6);
-    // (t,h,w,c,ph,pw) -> (c, t, h, ph, w, pw)
-    const vp = try transpose(v6, &[_]c_int{ 3, 0, 1, 4, 2, 5 }, s);
-    defer _ = mlx.mlx_array_free(vp);
-    const vpc = try contig(vp, s);
-    defer _ = mlx.mlx_array_free(vpc);
-    const zlat = try reshape(vpc, &[_]c_int{ 1, c24, @intCast(shape.latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
+    const zlat = try unpatchifyVideoRows(video_x, shape.latent_t, lat_h, lat_w, s);
     defer _ = mlx.mlx_array_free(zlat);
 
     if (progress) |p| p.emit("Decoding video", req.steps, req.steps);
@@ -4176,8 +4298,23 @@ const ChainProgress = struct {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         return self.inner.cancelled();
     }
+    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: @import("preview.zig").Encoded) void {
+        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
+        var buf: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
+        if (total > 0)
+            self.inner.emitPreview(label, self.window * total + step, self.windows * total, frame)
+        else
+            self.inner.emitPreview(label, step, 0, frame);
+    }
     fn progress(self: *ChainProgress) gen_sse.Progress {
-        return .{ .ctx = self, .cb = cb, .cancelled_cb = cancelledCb };
+        return .{
+            .ctx = self,
+            .cb = cb,
+            .cancelled_cb = cancelledCb,
+            .preview_cb = if (self.inner.preview_cb != null) previewCb else null,
+            .preview_opts = self.inner.preview_opts,
+        };
     }
 };
 

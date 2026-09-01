@@ -23,15 +23,22 @@ enum ChatMetrics {
     /// measured its own column (`onGeometryChange` hasn't fired yet).
     static let contentFallbackWidth: CGFloat = 740
 
+    /// Interface ▸ Compact mode — tighter vertical rhythm for more on screen.
+    /// Read directly off UserDefaults (like the font-size constants below):
+    /// this is a display density knob, not a launch flag, so it has no place
+    /// on `ServerOptions`.
+    static var compactMode: Bool { UserDefaults.standard.bool(forKey: InterfacePrefKey.compactMode) }
+
     /// Between turns in the transcript. Wider than the old 12: with the column
     /// capped, vertical rhythm is what separates one turn from the next — the
-    /// window's edges no longer do it.
-    static let transcriptSpacing: CGFloat = 18
+    /// window's edges no longer do it. Compact mode trades that rhythm for
+    /// density.
+    static var transcriptSpacing: CGFloat { compactMode ? 10 : 18 }
 
     /// Inner padding + radius of a message bubble (and the tool-call card,
     /// which is styled as one).
     static let bubblePaddingH: CGFloat = 14
-    static let bubblePaddingV: CGFloat = 10
+    static var bubblePaddingV: CGFloat { compactMode ? 6 : 10 }
     static let bubbleCornerRadius: CGFloat = 14
 
     /// Indent of the token-stats caption under an assistant reply so it
@@ -53,12 +60,39 @@ enum ChatMetrics {
     static let sidebarButtonHeight: CGFloat = 28
     static let sidebarButtonCornerRadius: CGFloat = 6
 
+    /// Settings ▸ Interface ▸ Text Size. Absent = `.medium`, which is the same
+    /// 14/13pt this shipped with before the setting existed.
+    static var textSize: ChatTextSize {
+        ChatTextSize(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.textSize) ?? "") ?? .medium
+    }
     /// The transcript's reading size.
-    static let transcriptFontSize: CGFloat = 16
+    static var transcriptFontSize: CGFloat { textSize.proseSize }
+
+    /// Leading. AppKit's default (~1.19 × size) is what made the transcript
+    /// read as a wall next to every web chat (~1.6–1.75 of the font size);
+    /// 1.4 × natural lands in that zone. Code gets less — a listing wants
+    /// rows, not air.
+    static let proseLineHeightMultiple: CGFloat = 1.4
+    static let codeLineHeightMultiple: CGFloat = 1.2
+
+    /// The user's bubble is plain SwiftUI `Text`, where leading is EXTRA
+    /// points, not a multiple — this is `proseLineHeightMultiple` restated in
+    /// that unit (1.4 × the ~1.19·size natural height, minus the natural
+    /// height), so both roles read at one density.
+    static var userLineSpacing: CGFloat { (transcriptFontSize * 0.48).rounded() }
+
+    /// Prose line length, applied as a paragraph `tailIndent` INSIDE the
+    /// attributed string — never a frame cap: tables, code blocks and XML
+    /// keep the full column (`contentWidthFraction` of the window, so on a
+    /// wide window prose used to run edge to edge with it), only flowing
+    /// text wraps early. ~45em of the reading size (≈ 95 chars at 14pt); a
+    /// narrower column wins automatically, since the text container bounds
+    /// the line before the indent does.
+    static var proseMeasure: CGFloat { (transcriptFontSize * 45).rounded() }
     /// Fenced/inline code inside the transcript. Monospaced digits and glyphs
     /// run wide, so matching the prose size makes code look larger than the
     /// sentence around it.
-    static let transcriptCodeFontSize: CGFloat = 14
+    static var transcriptCodeFontSize: CGFloat { textSize.codeSize }
 
     /// Panel edge → row edge. Every row in the sidebar reads it, so the
     /// destinations and the conversations are the same width by construction.

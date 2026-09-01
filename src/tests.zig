@@ -37,6 +37,7 @@ test {
     _ = @import("prefix_cache.zig");
     _ = @import("metrics.zig");
     _ = @import("status.zig");
+    _ = @import("sleep_inhibit.zig");
     _ = @import("kv_disk_cache.zig");
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
@@ -69,6 +70,8 @@ test {
     _ = @import("minimax_h3_vae.zig");
     _ = @import("minimax_h3_audio.zig");
     _ = @import("png.zig");
+    _ = @import("jpeg.zig");
+    _ = @import("preview.zig");
     _ = @import("marching_cubes.zig");
     _ = @import("glb.zig");
     _ = @import("hunyuan3d.zig");

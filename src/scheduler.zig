@@ -56,6 +56,7 @@ const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zi
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
+const sleep_inhibit = @import("sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -151,6 +152,10 @@ pub const LoadParams = struct {
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
+    /// Clamp the hot-cache byte budget against live post-load headroom
+    /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
+    /// deliberately has no server.zig import. Null = no clamp (tests).
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -307,6 +312,20 @@ pub const NextResult = union(enum) {
     err: void,
 };
 
+fn firstMediaPlaceholder(
+    tokens: []const u32,
+    image_token_id: u32,
+    audio_token_id: u32,
+    video_token_id: u32,
+) ?usize {
+    for (tokens, 0..) |token, i| {
+        if ((image_token_id > 0 and token == image_token_id) or
+            (audio_token_id > 0 and token == audio_token_id) or
+            (video_token_id > 0 and token == video_token_id)) return i;
+    }
+    return null;
+}
+
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
     allocator: std.mem.Allocator,
@@ -335,6 +354,9 @@ pub const Slot = struct {
     cancelled_prefill: Generator.CancelledCheckpointSink = .{},
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
+    /// state before this position is safe to share across media hashes.
+    media_start: ?usize,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -529,6 +551,12 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
+        const media_start = firstMediaPlaceholder(
+            full_prompt_owned,
+            config.image_token_id,
+            config.audio_token_id,
+            config.video_token_id,
+        );
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
 
@@ -541,6 +569,7 @@ pub const Slot = struct {
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
+            .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -993,6 +1022,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1116,6 +1146,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -1300,6 +1331,7 @@ pub const Scheduler = struct {
             .gguf_ctx_size = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
@@ -1781,6 +1813,7 @@ pub const Scheduler = struct {
             // which silently degraded warm reuse after every model switch.
             .prefix_cache_capacity = self.prefix_cache_capacity,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
@@ -2726,7 +2759,6 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
-
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -2854,7 +2886,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
         "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
-        "ane_chunk_resolver",      "ane_headroom_resolver",
+        "ane_chunk_resolver",      "ane_headroom_resolver",     "prefix_cache_mem_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -2866,6 +2898,26 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // The stale TODO that stood in for the wiring must be gone.
     const old = "Phase E will wire the load-model API" ++ " to set this.";
     try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never the raw launch flag" {
+    // 2026-08-30 Metal OOM: a 40 GB `--prefix-cache-mem` beside a ~70 GB pack
+    // was never validated against what the weights left under the GPU ceiling;
+    // the cache filled to its cap and a 143k prefill died uncatchably. The
+    // budget must pass through the resolver (server.prefixCacheMemForLoad)
+    // before it reaches initWithMem — and a SECOND construction site must not
+    // be able to skip the clamp (the cold-load launch flags class).
+    const src = @embedFile("scheduler.zig");
+    const needle = "HotPrefixCache.initWith" ++ "Mem(";
+    var found: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, needle)) |at| : (pos = at + needle.len) {
+        found += 1;
+        const window = src[at..@min(at + 240, src.len)];
+        try testing.expect(std.mem.indexOf(u8, window, "clamped_prefix_mem") != null);
+        try testing.expect(std.mem.indexOf(u8, window, "params.prefix_cache_mem_bytes") == null);
+    }
+    try testing.expect(found >= 1);
 }
 
 test "coldLoadVision honors the process-wide vision opt-out" {
@@ -3689,10 +3741,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.prefix_cache_capacity > 0 and
         prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
     {
+        // The weights are resident here, so the resolver's active-memory read
+        // is honest; the raw launch budget never reaches initWithMem (a 40 GB
+        // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
+            resolve(params.config, params.prefix_cache_mem_bytes)
+        else
+            params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             params.prefix_cache_capacity,
-            params.prefix_cache_mem_bytes,
+            clamped_prefix_mem,
         );
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
@@ -3725,6 +3784,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
+        // The cache re-applies the cap after a replace-path merge; without this
+        // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
+        entry.prefix_cache.?.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
     // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
     // chat-template renders. Applies to MLX, ds4, and llama engines —
@@ -3777,9 +3839,23 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
 }
 
+/// Caller holds `queue_mu`. Shared with the wait condition below.
+fn hasWorkPendingLocked(sch: *const Scheduler) bool {
+    return sch.pending.items.len > 0 or
+        sch.decoding.items.len > 0 or
+        sch.vision_queue.items.len > 0 or
+        sch.embed_queue.items.len > 0 or
+        sch.cleanup_queue.items.len > 0 or
+        sch.load_queue.items.len > 0 or
+        sch.gen_queue.items.len > 0 or
+        sch.unload_queue.items.len > 0;
+}
+
 fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
     const params = ctx.params;
+    // Covers shutdown and startup-load failure.
+    defer sleep_inhibit.release();
 
     // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
     //    binding). On failure, mark the entry `.error_state` in the
@@ -3794,6 +3870,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         log.info("Headless: no primary model loaded; models load on demand.\n", .{});
         signalStarted(sch);
     } else {
+        // Startup load runs before the wait loop can acquire.
+        sleep_inhibit.setActive(true);
         if (doLoadOnInferenceThread(sch, params)) |_| {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);
@@ -3893,10 +3971,14 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+                // No later tick runs while parked, so release here.
+                sleep_inhibit.setActive(false);
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
+            // Hold until the loop parks again.
+            sleep_inhibit.setActive(true);
 
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
@@ -4469,15 +4551,11 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         };
         break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+        // Ownership of the checkpoints transferred to the cache regardless of
+        // the outcome — its error paths free them (#330 adjacent: freeing
+        // here too was a double free, with a different allocator).
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
-        // Commit failed — we still own the checkpoints. Free them so they
-        // don't leak.
-        const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
-        if (ssm_cps_opt) |cps| {
-            for (cps) |*cp| cp.deinit(a);
-            a.free(cps);
-        }
     };
 }
 
@@ -4518,13 +4596,15 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // aborted prefill.
     const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse return;
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, cps, null, null) catch |err| {
+    const media_start = if (slot.media_start) |start| if (start < len) start else null else null;
+    // Ownership of the checkpoints transfers to the cache unconditionally —
+    // its error paths free them (#330 adjacent) — so detach from the slot
+    // BEFORE the call or Slot.deinit frees them a second time.
+    slot.cancelled_prefill = .{};
+    hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, media_start, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
-        // The sink still owns the checkpoints; Slot.deinit frees them.
         return;
     };
-    // Ownership of the checkpoints transferred to the entry.
-    slot.cancelled_prefill = .{};
     log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ len, slot.full_prompt.len });
 }
 
@@ -5192,7 +5272,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
-            const lookup = hc.lookupAndRestore(
+            const lookup = hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5200,6 +5280,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.full_prompt,
                 slot.has_tools,
                 slot.vision_key,
+                slot.media_start,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
             ) catch |err| blk: {
@@ -5486,7 +5567,6 @@ pub const SpecInitWiring = struct {
 /// module-owned arch arrived with the same `Model.state` shape and a 0-layer
 /// shell cache, got no conjunct, and `--pld` drove verify forwards straight
 /// through it. One predicate, one place to extend.
-
 pub fn specInitWiring(
     owns_module_state: bool,
     module_spec_rollback: bool,
@@ -5779,6 +5859,15 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
 }
 
+test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
+    const tokens = [_]u32{ 0, 11, 22, 33, 44 };
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22));
+    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0) == null);
+}
+
 test "cancelled-prefill commit length: floor, clamp, and zero" {
     // A cancelled prefill only pays its way into the LRU once the forwarded
     // prefix is past the chat-template-prologue class (~dozens of tokens);
@@ -5811,6 +5900,24 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // The SSD tier has no finishSlot flush on this path — the drain must
     // flush what it just committed itself.
     try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "the inference loop parks without holding the sleep-inhibition assertion" {
+    // Pin release < park < acquire and startup acquire < load.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+    const body = source[start..end];
+    const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
+    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+    const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(drop < park);
+    try testing.expect(park < hold);
+    try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
+    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
+    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(boot_arm < boot_load);
+    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
 }
 
 test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
@@ -5848,7 +5955,31 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     // `cache.step` only advances when Generator init COMPLETES, so it reads
     // 0 on every aborted prefill (found live: step=0 while pos=1536).
     try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithState") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
+}
+
+test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
+    // Ownership of the SSM checkpoint slice transfers to the cache
+    // UNCONDITIONALLY — commitWithMediaState's error paths free it (and after
+    // a byte-budget trim the slice may be a cache-allocated replacement). A
+    // caller-side free after a failed commit is therefore a double free, with
+    // a different allocator at that (gen_ptr.ssm_checkpoint_alloc vs the
+    // cache's). Live shape: any commit error, e.g. OOM.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "commitWithMediaState") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "cp.deinit") == null);
+
+    // The cancelled-prefill commit detaches the salvage BEFORE the call so
+    // Slot.deinit cannot free what the cache now owns.
+    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
+    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
+    const cp_body = source[cp_start..cp_end];
+    const detach = std.mem.indexOf(u8, cp_body, "slot.cancelled_prefill = .{};") orelse return error.MissingDetach;
+    const commit_pos = std.mem.indexOf(u8, cp_body, "hc.commitWithMediaState") orelse return error.MissingCommit;
+    try testing.expect(detach < commit_pos);
 }
 
 test "Generator.initWithOptions hands off checkpoints on cancel" {

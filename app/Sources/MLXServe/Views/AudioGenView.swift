@@ -70,9 +70,6 @@ struct AudioHistoryShelf: View {
     let playingPath: String?
     let onPlay: (String) -> Void
     let onStop: () -> Void
-    /// Send this track to a new conversation. Optional so a shelf without a
-    /// chat to send to still compiles; both audio tabs pass it.
-    var onSendToChat: ((String) -> Void)? = nil
 
     var body: some View {
         Group {
@@ -116,17 +113,6 @@ struct AudioHistoryShelf: View {
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
             .help("Reveal in Finder")
-            // Reaching a conversation should not depend on a track being the
-            // one this session happened to make last: the completed panel is
-            // transient, the shelf is every track you have.
-            if let send = onSendToChat {
-                Button { send(path) } label: {
-                    Image(systemName: "bubble.left.and.text.bubble.right")
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .help("Send to Chat — opens a new conversation with this attached")
-            }
         }
         .padding(.vertical, 3)
         .padding(.horizontal, 6)
@@ -178,7 +164,10 @@ struct VoiceGenView: View {
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: AudioGenRequest? = nil
-    @StateObject private var clipPlayer = AudioClipPlayer()
+    // The app-wide singleton, not a per-view instance — see the matching note
+    // in MusicGenView: a private player left playing when this view unmounts
+    // on tab navigation is a leaked NSSound nothing can stop.
+    @ObservedObject private var clipPlayer = AudioClipPlayer.shared
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -200,7 +189,10 @@ struct VoiceGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onDisappear { stopDictation() }
+        .onDisappear {
+            stopDictation()
+            stopPlayback()
+        }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
@@ -239,11 +231,7 @@ struct VoiceGenView: View {
                     paths: service.recent,
                     playingPath: clipPlayer.playingPath,
                     onPlay: { play($0) },
-                    onStop: { stopPlayback() },
-                    onSendToChat: { path in
-                        appState.sendGeneratedMediaToNewChat(
-                            path: path, prompt: AudioSidecar.prompt(forTrack: path), kind: .audio)
-                    }
+                    onStop: { stopPlayback() }
                 )
                 outputFolderLink
             }
@@ -548,15 +536,6 @@ struct VoiceGenView: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless).help("Reveal in Finder")
-                // The one bridge from the workshop to a conversation. It opens
-                // a NEW chat and switches to it — see
-                // `AppState.sendGeneratedMediaToNewChat`.
-                Button {
-                    appState.sendGeneratedMediaToNewChat(
-                        path: path, prompt: text, kind: .audio)
-                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
-                .buttonStyle(.borderless)
-                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(16)

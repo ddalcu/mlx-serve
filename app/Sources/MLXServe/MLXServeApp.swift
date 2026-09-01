@@ -167,6 +167,7 @@ struct MLXCoreApp: App {
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
                 }
+                .appAppearance()
         }
         // Roomier than the old 900x650: this window is three things now
         // (transcript, model browser, media generators) and the two it gained
@@ -175,6 +176,7 @@ struct MLXCoreApp: App {
 
         Window("Browser", id: "browser") {
             BrowserView()
+                .appAppearance()
         }
         .defaultSize(width: 1024, height: 768)
 
@@ -185,6 +187,7 @@ struct MLXCoreApp: App {
         Window("Server Log", id: "serverLog") {
             ServerLogWindowView()
                 .environmentObject(appState.server)
+                .appAppearance()
         }
         .defaultSize(width: 900, height: 560)
 
@@ -196,6 +199,7 @@ struct MLXCoreApp: App {
             SandboxTerminalView()
                 .environmentObject(appState)
                 .environmentObject(appState.server)
+                .appAppearance()
         }
         .defaultSize(width: 780, height: 560)
 
@@ -208,6 +212,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.agents)
                 .environmentObject(appState.server)
                 .frame(minWidth: 760, minHeight: 520)
+                .appAppearance()
         }
         .defaultSize(width: 900, height: 640)
 

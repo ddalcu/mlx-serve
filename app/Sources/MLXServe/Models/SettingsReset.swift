@@ -33,8 +33,11 @@ enum SettingsReset {
         // ServerOptions, and each row carries its own Clear/Reset button beside
         // the path it clears; Updates holds no settings, and About is links
         // only. None offers a section Reset button (`isResettable`), rather
-        // than a button that does nothing.
-        case .modelFolders, .updates, .about:
+        // than a button that does nothing. Interface is the same shape:
+        // `@AppStorage`-backed display prefs, not a `ServerOptions` field —
+        // each of its rows (appearance/accent/text size/compact/shortcut)
+        // carries its own control default or Reset (the shortcut row's).
+        case .modelFolders, .updates, .about, .interface:
             return []
 
         case .server:

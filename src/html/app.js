@@ -329,9 +329,10 @@
     'POST /v1/images/edits — multipart/form-data, NOT JSON. Accepted fields: model, prompt, image[] (repeat the field once per reference file), size. REJECTED with a 400, never list these as options: mask (the editors are maskless), n greater than 1, response_format "url", any output_format other than png, stream.',
     'POST /v1/audio/speech — model, input, optional ref_audio (base64 WAV) to clone a voice, stream; returns audio/wav bytes.',
     'POST /v1/audio/music-generations — model, prompt (style/genre/mood, required), lyrics, duration_seconds (10-600), vocal_language, bpm, seed, stream; returns audio/wav bytes.',
+    'POST /v1/video/generations — model, prompt, width, height, num_frames, steps, seed, stream; optional preview, preview_frames, preview_max_side (opt-in JPEG on each SSE progress event); LTX: pipeline, first_frame_image, last_frame_image, audio, cfg_scale, stg_scale; H3: turbo, fast, chain_windows, first_frame_image / last_frame_image or ref_images / ref_videos / ref_audios.',
     'POST /v1/embeddings — model, input (string or array), optional dimensions.',
     'POST /v1/load-model and /v1/unload-model — model (a discovered id, or an absolute path to register one).',
-    'Media endpoints with stream:true emit SSE {"type":"progress"|"complete"|"error"} instead of a JSON body.',
+    'Media endpoints with stream:true emit SSE {"type":"progress"|"complete"|"error"} instead of a JSON body. Video progress may include preview (JPEG b64) when preview:true.',
   ].join('\n');
 
   /// The one system message, built from what this server actually has. Not a

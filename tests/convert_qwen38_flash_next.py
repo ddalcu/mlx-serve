@@ -18,7 +18,8 @@ Layout / renames:
         mmap on the host).
 
 Widths: routed experts `--bits` (default 4, gs 64); n-gram table
-`--ngram-bits` (default 4, gs 32 because the row width is 160); every other
+`--ngram-bits` (default 4, gs 32 because the row width is 160; 3/5/6 need
+mlx-serve >= 26.9.1, older readers unpack them as noise, #305); every other
 2-D projection `--nonexpert-bits` (default 8, 4 = the -all pack) gs 64; embed_tokens 4-bit gs 64; 2-D weights with fewer
 than 32 rows (router `mlp.gate`, `shared_expert_gate`, `block_inject_weight`,
 GDN `in_proj_a/b`) and every 1-D tensor stay bf16.

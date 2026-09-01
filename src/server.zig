@@ -2795,6 +2795,10 @@ const QSA_MASK_BYTES_PER_KEY: u64 = 4;
 /// prompt length.
 pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64 {
     if (config.indexer_budget == 0) return 0;
+    // Prefill widths gather by block index (row-chunked score sheet, no
+    // [S, kv] mask); decode/verify widths still build the dense mask.
+    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
+        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -2894,6 +2898,67 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         }
     }
     return config.pinned_prefill_chunk;
+}
+
+/// PURE: clamp the hot prefix cache's byte budget to what the loaded weights
+/// leave under the GPU ceiling after the serving context's KV and the prefill
+/// transient reserve. A 40 GB `--prefix-cache-mem` beside a ~70 GB pack was
+/// never validated against this headroom: the cache filled toward its cap and
+/// a 143k prefill died in an uncatchable Metal OOM (2026-08-30, Flash-Next on
+/// 128 GB). `requested == 0` (byte cap disabled) is bounded too — an uncapped
+/// cache beside a large model is exactly that crash. Never returns 0:
+/// `initWithMem` reads 0 as "no byte cap", the opposite of no headroom.
+pub fn clampedPrefixCacheMem(
+    requested: u64,
+    gpu_ceiling: u64,
+    active_weights: u64,
+    ctx_kv_bytes: u64,
+    transient_reserve: u64,
+) u64 {
+    const headroom = @max(gpu_ceiling -| (active_weights +| ctx_kv_bytes +| transient_reserve), 1);
+    if (requested == 0) return headroom;
+    return @min(requested, headroom);
+}
+
+/// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
+/// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
+/// deliberately has no server.zig import): the weights are resident there, so
+/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites.
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const kv_bits: u64 = defaultKvBits();
+    const chunk: u64 = pinPrefillChunk(config);
+    const ctx_kv: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *|
+        getEffectiveContextLength(config);
+    const clamped = clampedPrefixCacheMem(
+        requested,
+        currentGpuMemoryCeiling(active_mem),
+        active_mem,
+        ctx_kv,
+        prefillTransientReserve(config, kv_bits, chunk),
+    );
+    if (requested > 0 and clamped < requested) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+    } else if (requested == 0) {
+        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+    }
+    return clamped;
+}
+
+test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {
+    const t = std.testing;
+    const GB: u64 = 1 << 30;
+    // The crash's numbers: 96 GB ceiling, ~70 GB weights, ~6.4 GB of 262k-ctx
+    // KV, ~4 GB prefill reserve, --prefix-cache-mem 40 GB → ~15.6 GB budget.
+    const crash = clampedPrefixCacheMem(40 * GB, 96 * GB, 70 * GB, 6 * GB + (400 << 20), 4 * GB);
+    try t.expect(crash >= 10 * GB and crash < 16 * GB);
+    // Small model with plenty of headroom: the request is untouched.
+    try t.expectEqual(8 * GB, clampedPrefixCacheMem(8 * GB, 96 * GB, 20 * GB, 2 * GB, 2 * GB));
+    // requested == 0 (byte cap disabled today): headroom still bounds it.
+    try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
+    // No headroom at all: never 0 — initWithMem reads 0 as "no byte cap".
+    try t.expectEqual(@as(u64, 1), clampedPrefixCacheMem(40 * GB, 64 * GB, 70 * GB, 6 * GB, 4 * GB));
 }
 
 /// The largest context this model's per-token footprint fits into RAM right
@@ -3174,11 +3239,17 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
     // stay generic.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
+    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
+    // allocate another copy of the cached buffers. `active_mem` below already
+    // includes the resident entry, while `prefillMemoryNeeded` bills the full
+    // destination KV capacity that may be allocated when the restored cache
+    // grows. Adding the resident entry here again would invent a third copy
+    // and reject long warm prompts (and even cache misses) spuriously.
     const needed: u64 = if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -4826,6 +4897,19 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
+/// A grammar mask constrains from token 0 — it cannot express "think first,
+/// then JSON", so a schema request is a content-only contract and thinking is
+/// enforced OFF in the prompt (the noThinkTailSuffix machinery). Without this
+/// the mask pushes the JSON into the template's open think block and `content`
+/// ships EMPTY (live: qwen3.5 effort high + schema on /v1/messages; issue #331
+/// re-found the same hole on /v1/chat/completions and /v1/responses). Tools
+/// present = no mask (every surface skips it so tool calls stay reachable),
+/// so thinking stays whatever the request resolved. Every surface that builds
+/// a grammar mask consults this — the source scan pins the pairing.
+fn schemaMasksThinking(has_schema: bool, has_tools: bool) bool {
+    return has_schema and !has_tools;
+}
+
 /// `continue_final_message`: extend the trailing assistant message instead of
 /// answering after it. vLLM's spelling, because a client that already knows how
 /// to ask another local server for this should not have to learn a second name.
@@ -4987,7 +5071,16 @@ fn handleChatCompletions(
         content_allocs.deinit(allocator);
     }
 
-    for (messages_val.array.items) |msg_val| {
+    // Decide which raw message owns current-turn media before the parse loop
+    // materializes any attachment. The JSON tree keeps every data URL alive
+    // for the request, so historical attachments can remain borrowed strings
+    // instead of becoming multi-megabyte pixel buffers merely to be ignored by
+    // activeTurnMediaMessage below.
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items, .openai) and
+        (if (root.get("continue_final_message")) |v| v == .bool and v.bool else false);
+    const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .openai);
+
+    for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
         // `.object`. Skip it rather than crash — consistent with how malformed
         // inner fields are already tolerated below.
@@ -5001,6 +5094,8 @@ fn handleChatCompletions(
         var msg_images: ?[]const chat_mod.ImageData = null;
         var msg_videos: ?[]const chat_mod.VideoData = null;
         var msg_audio: ?[]const chat_mod.AudioData = null;
+        const decode_this_message = active_wire_media != null and active_wire_media.? == raw_msg_index;
+        const wire_presence = wireMediaPresence(msg_val, .openai);
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
@@ -5012,6 +5107,7 @@ fn handleChatCompletions(
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
+                        if (!decode_this_message) continue;
                         // Parse image_url content block
                         const img_obj = part.object.get("image_url") orelse continue;
                         if (img_obj != .object) continue;
@@ -5019,6 +5115,7 @@ fn handleChatCompletions(
                         if (url_val != .string) continue;
                         appendImageUrlContent(allocator, media.images(img_slot), url_val.string, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
+                        if (!decode_this_message) continue;
                         // A video is, on the wire, an ordered array of already-
                         // decoded frame images — no video codec exists anywhere
                         // in this codebase, so frame extraction is the CLIENT's
@@ -5034,6 +5131,7 @@ fn handleChatCompletions(
                         }
                         appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
+                        if (!decode_this_message) continue;
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
                         // (format "mlx_pcm_f32") base64-encoded in `data`.
@@ -5102,7 +5200,7 @@ fn handleChatCompletions(
             null;
 
         // Skip messages with no content, no tool_calls, and no images/videos/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !wire_presence.any() and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -5319,7 +5417,8 @@ fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
-    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    if (schemaMasksThinking(grammar_schema_val != null, has_tools)) enable_thinking = false;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -5463,6 +5562,7 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     };
+    const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
     const tokenize_ns = tokenize_sw.read();
@@ -5479,12 +5579,12 @@ fn handleChatCompletions(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -5500,7 +5600,7 @@ fn handleChatCompletions(
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
     // slot at submit (mirrors the vision-embeddings handoff below).
-    var local_mrope = computeQwenMrope(allocator, prompt_ids, messages.items, config) catch MropeData{};
+    var local_mrope = computeQwenMrope(allocator, prompt_ids, if (active_media) |selected| selected.message else null, config) catch MropeData{};
     defer {
         if (local_mrope.pos) |p| allocator.free(p);
     }
@@ -9554,11 +9654,479 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
 
 // ── Vision Processing ──
 
+/// The two chat wire formats describe the same turn graph with different
+/// shapes: OpenAI uses role=`tool` messages, while Anthropic nests tool_result
+/// blocks inside a user message. This selector reads only JSON metadata. It is
+/// deliberately upstream of image decoding so historical data URLs never have
+/// to become pixel tensors just to discover that they sit behind an assistant
+/// boundary.
+const WireMediaStyle = enum { openai, anthropic };
+
+const WireMediaPresence = struct {
+    images: bool = false,
+    videos: bool = false,
+    audio: bool = false,
+
+    fn any(self: WireMediaPresence) bool {
+        return self.images or self.videos or self.audio;
+    }
+};
+
+fn wireRole(msg: std.json.Value) ?[]const u8 {
+    if (msg != .object) return null;
+    const role = msg.object.get("role") orelse return null;
+    return if (role == .string) role.string else null;
+}
+
+fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresence {
+    if (msg != .object) return .{};
+    const content = msg.object.get("content") orelse return .{};
+    if (content != .array) return .{};
+    var out: WireMediaPresence = .{};
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv != .string) continue;
+        if (style == .anthropic) {
+            if (std.mem.eql(u8, tv.string, "image")) out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "image_url")) {
+            out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "video_url")) {
+            out.videos = true;
+        } else if (std.mem.eql(u8, tv.string, "input_audio")) {
+            out.audio = true;
+        }
+    }
+    return out;
+}
+
+fn wireMessageHasToolResult(msg: std.json.Value, style: WireMediaStyle) bool {
+    const role = wireRole(msg) orelse return false;
+    if (style == .openai) return std.mem.eql(u8, role, "tool");
+    if (!std.mem.eql(u8, role, "user") or msg != .object) return false;
+    const content = msg.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "tool_result")) return true;
+    }
+    return false;
+}
+
+fn wireAssistantHasTools(msg: std.json.Value, style: WireMediaStyle) bool {
+    const role = wireRole(msg) orelse return false;
+    if (!std.mem.eql(u8, role, "assistant") or msg != .object) return false;
+    if (style == .openai) {
+        const calls = msg.object.get("tool_calls") orelse return false;
+        return calls == .array and calls.array.items.len > 0;
+    }
+    const content = msg.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "tool_use")) return true;
+    }
+    return false;
+}
+
+fn wireMessageHasText(msg: std.json.Value) bool {
+    if (msg != .object) return false;
+    const content = msg.object.get("content") orelse return false;
+    if (content == .string) return std.mem.trim(u8, content.string, " \t\r\n").len > 0;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        const text = part.object.get("text") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "text") and text == .string and
+            std.mem.trim(u8, text.string, " \t\r\n").len > 0) return true;
+    }
+    return false;
+}
+
+/// Whether OpenAI's parse loop will retain any content from this wire message.
+/// This deliberately accepts malformed non-empty tool_calls as visible: the
+/// wire gate may be wider than parsing (one wasted decode), never narrower
+/// (pixels missing from a prompt that still renders their placeholder).
+fn wireOpenAiParserSkips(msg: std.json.Value) bool {
+    const role = wireRole(msg) orelse return true;
+    if (std.mem.eql(u8, role, "tool")) return false;
+    if (wireMediaPresence(msg, .openai).any()) return false;
+    if (msg == .object) {
+        if (msg.object.get("content")) |content| switch (content) {
+            .string => |s| if (s.len > 0) return false,
+            .array => |parts| for (parts.items) |part| {
+                if (part != .object) continue;
+                const tv = part.object.get("type") orelse continue;
+                const text = part.object.get("text") orelse continue;
+                if (tv == .string and std.mem.eql(u8, tv.string, "text") and
+                    text == .string and text.string.len > 0) return false;
+            },
+            else => {},
+        };
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (wireAssistantHasTools(msg, .openai)) return false;
+            if (messageReasoningFromObj(msg.object) != null) return false;
+        }
+    }
+    return true;
+}
+
+fn wireParserSkips(msg: std.json.Value, style: WireMediaStyle) bool {
+    // Anthropic appends empty assistant/user strings, so every valid-role
+    // message remains a real boundary on that surface.
+    return style == .openai and wireOpenAiParserSkips(msg);
+}
+
+fn wireContinuationRequested(msgs: []const std.json.Value, style: WireMediaStyle) bool {
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (wireParserSkips(msgs[i], style)) continue;
+        const role = wireRole(msgs[i]) orelse continue;
+        return std.mem.eql(u8, role, "assistant") and wireMessageHasText(msgs[i]);
+    }
+    return false;
+}
+
+/// Return the raw-message index whose media belongs to the active turn.
+/// Mirrors activeTurnMediaMessage but consults only content-block types. This
+/// is the key ordering guarantee: callers invoke it before their parse loop,
+/// then decode attachments only when the loop reaches the returned index.
+fn activeWireMediaIndex(msgs: []const std.json.Value, continue_final: bool, style: WireMediaStyle) ?usize {
+    var last_valid: ?usize = null;
+    var j = msgs.len;
+    while (j > 0) {
+        j -= 1;
+        if (wireParserSkips(msgs[j], style)) continue;
+        if (wireRole(msgs[j]) != null) {
+            last_valid = j;
+            break;
+        }
+    }
+
+    var i = msgs.len;
+    var follows_tool_result = false;
+    while (i > 0) {
+        i -= 1;
+        if (wireParserSkips(msgs[i], style)) continue;
+        const role = wireRole(msgs[i]) orelse continue;
+        if (style == .openai and std.mem.eql(u8, role, "tool")) {
+            follows_tool_result = true;
+            continue;
+        }
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (continue_final and last_valid != null and i == last_valid.?) continue;
+            if (follows_tool_result and wireAssistantHasTools(msgs[i], style)) {
+                follows_tool_result = false;
+                continue;
+            }
+            break;
+        }
+        if (!std.mem.eql(u8, role, "user")) continue;
+        if (wireMediaPresence(msgs[i], style).any()) return i;
+        if (style == .anthropic and wireMessageHasToolResult(msgs[i], style)) follows_tool_result = true;
+    }
+    return null;
+}
+
+test "activeWireMediaIndex skips historical OpenAI images without decoding" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"seen"},
+        \\  {"role":"user","content":"continue"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(activeWireMediaIndex(msgs, false, .openai) == null);
+}
+
+test "activeWireMediaIndex finds media before trailing injected context" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"user","content":"injected context"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .openai));
+}
+
+test "activeWireMediaIndex crosses Anthropic tool use and result" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}},{"type":"text","text":"inspect"}]},
+        \\  {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"inspect","input":{}}]},
+        \\  {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .anthropic));
+}
+
+test "activeWireMediaIndex keeps media for an assistant-prefix continuation" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"The image shows "}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireContinuationRequested(msgs, .openai));
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
+}
+
+test "activeWireMediaIndex ignores an OpenAI assistant the parser skips" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":""},
+        \\  {"role":"user","content":"hi"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .openai));
+}
+
+test "wireContinuationRequested ignores an OpenAI user the parser skips" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"The image shows "},
+        \\  {"role":"user","content":""}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireContinuationRequested(msgs, .openai));
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
+}
+
+/// Return the newest media-bearing user message in the active turn.
+///
+/// Agent clients may append user-role context injections after the human's
+/// message. Looking only at the final user message therefore drops media from
+/// requests shaped like `[user(image), user(context)]`. The last assistant
+/// message is the durable turn boundary: media before it belongs to history
+/// and is deliberately not re-encoded by this request, while media after it
+/// is new input. Reconstructing historical multimodal placeholders is a
+/// separate, multi-message concern; this selector only identifies new media.
+const ActiveTurnMedia = struct {
+    message: *const chat_mod.Message,
+    /// Number of user messages rendered after `message`. This selects the
+    /// matching user-turn marker when media is followed by injected context.
+    user_markers_after: usize,
+    /// Tool-role messages after `message`, and the maximal consecutive runs
+    /// they form. ChatML templates wrap each tool-response RUN in its own
+    /// `<|im_start|>user`, so tool turns can add user markers the role count
+    /// above cannot see; `resolvedUserMarkersAfter` decides from the rendered
+    /// prompt which convention is in play.
+    tool_msgs_after: usize = 0,
+    tool_runs_after: usize = 0,
+    /// Whole-conversation totals the same resolver compares against.
+    total_users: usize = 0,
+    total_tool_msgs: usize = 0,
+    total_tool_runs: usize = 0,
+};
+
+fn activeTurnMediaMessage(msgs: []const chat_mod.Message, continue_final: bool) ?ActiveTurnMedia {
+    var i = msgs.len;
+    var user_markers_after: usize = 0;
+    var follows_tool_result = false;
+    while (i > 0) {
+        i -= 1;
+        const msg = &msgs[i];
+        if (std.mem.eql(u8, msg.role, "tool")) {
+            follows_tool_result = true;
+            continue;
+        }
+        if (std.mem.eql(u8, msg.role, "assistant")) {
+            // An explicit assistant-prefix continuation ends in an assistant
+            // message that is part of the current turn, not its boundary.
+            if (continue_final and i + 1 == msgs.len) continue;
+            // Tool results continue the user turn that caused the assistant's
+            // tool call. Cross only that typed boundary; an ordinary assistant
+            // answer still closes the turn. Repeated tool-call/result pairs
+            // work because the next result rearms this condition.
+            if (follows_tool_result and msg.tool_calls != null and msg.tool_calls.?.len > 0) {
+                follows_tool_result = false;
+                continue;
+            }
+            break;
+        }
+        if (!std.mem.eql(u8, msg.role, "user")) continue;
+        if ((msg.images != null and msg.images.?.len > 0) or
+            (msg.videos != null and msg.videos.?.len > 0) or
+            (msg.audio != null and msg.audio.?.len > 0))
+        {
+            var media = ActiveTurnMedia{ .message = msg, .user_markers_after = user_markers_after };
+            var prev_tool = false;
+            for (msgs, 0..) |*m, j| {
+                const is_tool = std.mem.eql(u8, m.role, "tool");
+                if (std.mem.eql(u8, m.role, "user")) media.total_users += 1;
+                if (is_tool) {
+                    media.total_tool_msgs += 1;
+                    if (!prev_tool) media.total_tool_runs += 1;
+                    if (j > i) {
+                        media.tool_msgs_after += 1;
+                        if (!prev_tool) media.tool_runs_after += 1;
+                    }
+                }
+                prev_tool = is_tool;
+            }
+            return media;
+        }
+        user_markers_after += 1;
+    }
+    return null;
+}
+
+/// How many user-turn markers sit after the media message in the RENDERED
+/// prompt. The role count alone cannot answer that: ChatML templates wrap a
+/// tool-response run in its own `<|im_start|>user` (token-exact — the
+/// `<tool_response>` special token keeps the marker's trailing newline its
+/// own token), while Llama renders tool results under an ipython header. The
+/// prompt is the authority: its total marker count matches exactly one
+/// convention's prediction; an unrecognized total keeps the conservative
+/// role-only count.
+fn resolvedUserMarkersAfter(prompt_ids: []const u32, config: *const model_mod.ModelConfig, media: ActiveTurnMedia) usize {
+    if (media.tool_msgs_after == 0) return media.user_markers_after;
+    const marker = config.userTurnMarkerSlice();
+    if (marker.len == 0 or prompt_ids.len < marker.len) return media.user_markers_after;
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i + marker.len <= prompt_ids.len) {
+        if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) {
+            found += 1;
+            i += marker.len;
+        } else i += 1;
+    }
+    if (found == media.total_users + media.total_tool_runs)
+        return media.user_markers_after + media.tool_runs_after;
+    if (found == media.total_users + media.total_tool_msgs)
+        return media.user_markers_after + media.tool_msgs_after;
+    return media.user_markers_after;
+}
+
+test "activeTurnMediaMessage sees media before trailing user context" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "system", .content = "system" },
+        .{ .role = "user", .content = "human image prompt", .images = &images },
+        .{ .role = "user", .content = "<system-reminder>injected context</system-reminder>" },
+    };
+
+    const selected = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("human image prompt", selected.message.content);
+    try std.testing.expectEqual(@as(usize, 1), selected.user_markers_after);
+}
+
+test "activeTurnMediaMessage does not reprocess media before the assistant boundary" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "historical image", .images = &images },
+        .{ .role = "assistant", .content = "historical answer" },
+        .{ .role = "user", .content = "text-only continuation" },
+        .{ .role = "user", .content = "<system-reminder>current context</system-reminder>" },
+    };
+
+    try std.testing.expect(activeTurnMediaMessage(&msgs, false) == null);
+}
+
+test "activeTurnMediaMessage includes media before an assistant prefix continuation" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "partial answer" },
+    };
+
+    try std.testing.expect(activeTurnMediaMessage(&msgs, false) == null);
+    const selected = activeTurnMediaMessage(&msgs, true) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("image prompt", selected.message.content);
+}
+
+test "activeTurnMediaMessage crosses an assistant tool call and tool result" {
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const calls = [_]chat_mod.ToolCall{.{
+        .id = "call-1",
+        .name = "inspect",
+        .arguments = "{}",
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call-1" },
+    };
+
+    const selected = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("image prompt", selected.message.content);
+
+    const ordinary = [_]chat_mod.Message{
+        .{ .role = "user", .content = "historical image", .images = &images },
+        .{ .role = "assistant", .content = "ordinary answer" },
+        .{ .role = "tool", .content = "malformed stray result" },
+    };
+    try std.testing.expect(activeTurnMediaMessage(&ordinary, false) == null);
+}
+
+test "activeTurnMediaMessage chooses the newest media-bearing user in the active turn" {
+    const old_images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+    }};
+    const new_images = [_]chat_mod.ImageData{.{
+        .pixels = &.{},
+        .width = 2,
+        .height = 2,
+    }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "historical image", .images = &old_images },
+        .{ .role = "assistant", .content = "historical answer" },
+        .{ .role = "user", .content = "new image", .images = &new_images },
+        .{ .role = "user", .content = "trailing injected context" },
+    };
+
+    const selected = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    try std.testing.expectEqualStrings("new image", selected.message.content);
+    try std.testing.expectEqual(@as(u32, 2), selected.message.images.?[0].width);
+}
+
 /// Collect images from messages, run vision encoder, set embeddings on transformer.
-/// Encode vision images from the last user message and return the resulting
+/// Encode vision images from the active turn and return the resulting
 /// `[1, total_tokens, hidden]` array. Caller owns the returned array (free
 /// via `mlx_array_free` if not transferred to a scheduler slot). Returns
-/// `null` when there are no images on the last user turn.
+/// `null` when the active turn has no media.
 ///
 /// Phase A8: per-request ownership. Earlier versions wrote the result into
 /// `xfm.vision_embeddings` (a global field on Transformer), which raced
@@ -9586,7 +10154,7 @@ fn processVisionImages(
     allocator: std.mem.Allocator,
     lm: *LoadedModel,
     vision_enc: *VisionEncoder,
-    msgs: []const chat_mod.Message,
+    active_media: ?ActiveTurnMedia,
     out_n_vision: *usize,
     out_n_video: *usize,
     out_n_audio: *usize,
@@ -9596,27 +10164,13 @@ fn processVisionImages(
     out_n_video.* = 0;
     out_n_audio.* = 0;
     out_vision_key.* = 0;
-    // Only process media from the LAST user message. Previous turns' images /
-    // videos / audio were already processed in their original request;
-    // re-processing wastes context and causes stale feature confusion.
-    var last_user_images: ?[]const chat_mod.ImageData = null;
-    var last_user_videos: ?[]const chat_mod.VideoData = null;
-    var last_user_audio: ?[]const chat_mod.AudioData = null;
-    var i = msgs.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, msgs[i].role, "user")) {
-            last_user_images = msgs[i].images;
-            last_user_videos = msgs[i].videos;
-            last_user_audio = msgs[i].audio;
-            break;
-        }
-    }
-
-    const images: []const chat_mod.ImageData = last_user_images orelse &.{};
-    const videos: []const chat_mod.VideoData = last_user_videos orelse &.{};
-    const audio: []const chat_mod.AudioData = last_user_audio orelse &.{};
-    if (images.len == 0 and videos.len == 0 and audio.len == 0) return null;
+    // Restrict selection to the suffix after the last assistant message so a
+    // text-only continuation does not re-encode historical media, while
+    // trailing user-role context injections cannot hide a new attachment.
+    const media_msg = (active_media orelse return null).message;
+    const images: []const chat_mod.ImageData = media_msg.images orelse &.{};
+    const videos: []const chat_mod.VideoData = media_msg.videos orelse &.{};
+    const audio: []const chat_mod.AudioData = media_msg.audio orelse &.{};
     out_vision_key.* = mediaKey(images, videos, audio);
 
     log.info("Multimodal: processing {d} image(s), {d} video(s), {d} audio clip(s)\n", .{ images.len, videos.len, audio.len });
@@ -9814,14 +10368,19 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
     return result;
 }
 
-/// Locate the byte offset just after the last user-turn marker in `prompt_ids`.
-/// Mirrors insertImageTokens' search; shared by the multimodal inserter.
-fn userTurnInsertPos(prompt_ids: []const u32, config: *const model_mod.ModelConfig) usize {
+/// Locate the byte offset just after the user-turn marker that owns the media.
+/// `markers_after=0` preserves the historical last-user behavior; injected
+/// user-role context increments it so media is placed beside its source turn.
+fn userTurnInsertPos(prompt_ids: []const u32, config: *const model_mod.ModelConfig, markers_after: usize) usize {
     const marker = config.userTurnMarkerSlice();
     if (marker.len > 0 and prompt_ids.len >= marker.len) {
+        var remaining = markers_after;
         var i = prompt_ids.len - marker.len;
         while (true) {
-            if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) return i + marker.len;
+            if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) {
+                if (remaining == 0) return i + marker.len;
+                remaining -= 1;
+            }
             if (i == 0) break;
             i -= 1;
         }
@@ -9844,30 +10403,24 @@ pub const MropeData = struct {
 };
 
 /// Compute the interleaved-M-RoPE table from the FINAL prompt_ids (after image-pad
-/// expansion) + the last user turn's image grids. Returns an empty bundle when the
+/// expansion) + the active media message's image grids. Returns an empty bundle when the
 /// model isn't Qwen-vision or there are no images. Caller owns `pos`.
-fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs: []const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
+fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, media_msg: ?*const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
     if (!config.qwen_vision) return .{};
-    // Collect the last user message's image AND video grids (full patch grid
+    const msg = media_msg orelse return .{};
+    // Collect the active message's image AND video grids (full patch grid
     // per block, in their own modality's document order — getRopeIndex
     // interleaves the two lists by whichever marker occurs first in tokens).
     var image_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
     defer image_grids.deinit(allocator);
     var video_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
     defer video_grids.deinit(allocator);
-    var i = msgs.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, msgs[i].role, "user")) {
-            if (msgs[i].images) |imgs| for (imgs) |im| {
-                if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
-            };
-            if (msgs[i].videos) |vids| for (vids) |vd| {
-                try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
-            };
-            break;
-        }
-    }
+    if (msg.images) |imgs| for (imgs) |im| {
+        if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+    };
+    if (msg.videos) |vids| for (vids) |vd| {
+        try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
+    };
     if (image_grids.items.len == 0 and video_grids.items.len == 0) return .{};
 
     var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, image_grids.items, video_grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
@@ -9895,19 +10448,12 @@ fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs:
 /// which case the caller falls back to the flat BOI/pads/EOI run.
 fn lfm2ImageSegment(
     allocator: std.mem.Allocator,
-    msgs: []const chat_mod.Message,
+    media_msg: ?*const chat_mod.Message,
     config: *const model_mod.ModelConfig,
 ) !?[]u32 {
     if (!config.lfm2_vision or config.image_token_id == 0) return null;
-    var images: []const chat_mod.ImageData = &.{};
-    var i = msgs.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, msgs[i].role, "user")) {
-            images = msgs[i].images orelse &.{};
-            break;
-        }
-    }
+    const msg = media_msg orelse return null;
+    const images: []const chat_mod.ImageData = msg.images orelse &.{};
     if (images.len == 0) return null;
 
     var seg = std.ArrayList(u32).empty;
@@ -9958,14 +10504,14 @@ fn insertMultimodalTokens(
     audio_token_id: u32,
     n_audio: usize,
     config: *const model_mod.ModelConfig,
-    msgs: []const chat_mod.Message,
+    active_media: ?ActiveTurnMedia,
 ) ![]u32 {
     const want_image = image_token_id != 0 and n_image > 0;
     const want_video = video_token_id != 0 and n_video > 0;
     const want_audio = audio_token_id != 0 and n_audio > 0;
     if (!want_image and !want_video and !want_audio) return try allocator.dupe(u32, prompt_ids);
 
-    const insert_pos = userTurnInsertPos(prompt_ids, config);
+    const insert_pos = userTurnInsertPos(prompt_ids, config, if (active_media) |media| resolvedUserMarkersAfter(prompt_ids, config, media) else 0);
 
     // Qwen3-VL wraps the image-pad run (and, identically, the video-pad run)
     // with <|vision_start|>/<|vision_end|> (get_rope_index keys on vision_start
@@ -9975,7 +10521,7 @@ fn insertMultimodalTokens(
     const boa = config.boa_token_id;
     const eoa = config.eoa_token_id;
 
-    const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, msgs, config) else null;
+    const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
     defer if (lfm2_seg) |ls| allocator.free(ls);
 
     var seg = std.ArrayList(u32).empty;
@@ -10770,7 +11316,6 @@ test "RequestMedia frees every decoded buffer it was handed" {
     media.deinit();
 }
 
-
 // ── Anthropic Messages API ──
 
 fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
@@ -11052,14 +11597,22 @@ fn handleAnthropicMessages(
         }
     }
 
+    // Anthropic carries tool results inside user content blocks, but the same
+    // active-turn rule applies: inspect those blocks without decoding their
+    // media, then materialize only the selected raw message below.
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items, .anthropic) and
+        continuationRejectReason(lm.ds4_engine != null) == null;
+    const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .anthropic);
+
     // Convert Anthropic messages to internal format
-    for (messages_val.array.items) |msg_val| {
+    for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         if (msg_val != .object) continue;
         const msg_obj = msg_val.object;
         const role_val = msg_obj.get("role") orelse continue;
         if (role_val != .string) continue;
         const role = role_val.string;
         const content_val = msg_obj.get("content");
+        const decode_this_message = active_wire_media != null and active_wire_media.? == raw_msg_index;
 
         if (std.mem.eql(u8, role, "user")) {
             if (content_val) |cv| switch (cv) {
@@ -11067,6 +11620,7 @@ fn handleAnthropicMessages(
                     try messages.append(allocator, .{ .role = "user", .content = s, .tool_calls = null, .tool_call_id = null });
                 },
                 .array => |arr| {
+                    const wire_presence = wireMediaPresence(msg_val, .anthropic);
                     // Process tool_result blocks first, then text+image blocks.
                     for (arr.items) |block| {
                         if (block != .object) continue;
@@ -11102,6 +11656,7 @@ fn handleAnthropicMessages(
                                 try msg_text.appendSlice(allocator, text);
                             }
                         } else if (std.mem.eql(u8, btype, "image")) {
+                            if (!decode_this_message) continue;
                             // Anthropic image block: source = {type:"base64", media_type, data}
                             //                    or = {type:"url", url}
                             const src_val = block.object.get("source") orelse continue;
@@ -11127,7 +11682,11 @@ fn handleAnthropicMessages(
                             }
                         }
                     }
-                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0) {
+                    // Preserve a historical image-only user turn even though
+                    // its pixels were deliberately not materialized. It still
+                    // contributes the same empty user-role template boundary
+                    // as before this optimization.
+                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0 or wire_presence.images) {
                         const owned_text = if (msg_text.items.len > 0) blk: {
                             const s = try allocator.dupe(u8, msg_text.items);
                             try content_allocs.append(allocator, s);
@@ -11332,14 +11891,7 @@ fn handleAnthropicMessages(
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
-    // A grammar mask constrains from token 0 — it cannot express "think
-    // first, then JSON", so a schema request is a content-only contract and
-    // thinking is enforced OFF in the prompt (the noThinkTailSuffix
-    // machinery). Without this the mask pushes the JSON into the template's
-    // open think block and `content` ships EMPTY (live: qwen3.5, effort high
-    // + schema). Tools present = no mask (see the grammar block below), so
-    // thinking stays whatever the request resolved.
-    if (output_cfg.schema != null and !has_tools) enable_thinking = false;
+    if (schemaMasksThinking(output_cfg.schema != null, has_tools)) enable_thinking = false;
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
@@ -11428,6 +11980,7 @@ fn handleAnthropicMessages(
     // endpoint has always given.
     const continue_final = chat_mod.continuationRequested(messages.items) and
         continuationRejectReason(lm.ds4_engine != null) == null;
+    const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
@@ -11447,12 +12000,12 @@ fn handleAnthropicMessages(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -12964,7 +13517,7 @@ fn handleResponses(
     // pass; thinking truncation happens via finish_reason="length" if the model
     // overruns max_output_tokens.
     const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
-    const enable_thinking = reasoning_cfg.enable;
+    var enable_thinking = reasoning_cfg.enable;
     _ = reasoning_cfg.budget;
 
     // ── tools ──
@@ -12998,6 +13551,7 @@ fn handleResponses(
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
+    if (schemaMasksThinking(grammar_schema_val != null, active_has_tools)) enable_thinking = false;
 
     // ── model name ──
     const model_name = if (root.get("model")) |v|
@@ -13063,6 +13617,7 @@ fn handleResponses(
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
     const tokenize_ns = tokenize_sw.read();
+    const active_media = activeTurnMediaMessage(pi.messages.items, false);
 
     // ── vision encoder ──
     // Phase A8: per-request ownership. Defer frees if we don't end up
@@ -13076,12 +13631,12 @@ fn handleResponses(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, pi.messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -15729,7 +16284,7 @@ test "lfm2ImageSegment labels every tile and closes on the thumbnail" {
         .{ .pixels = "", .width = 0, .height = 0, .grid_h = 2, .grid_w = 2, .tile_rows = 2, .tile_cols = 2, .tile_index = 4 },
     };
     const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
-    const seg = (try lfm2ImageSegment(testing.allocator, &msgs, &config)) orelse return error.NoSegment;
+    const seg = (try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
     defer testing.allocator.free(seg);
 
     // Row/col ids are laid out over the MAX grid (10 wide), not this image's:
@@ -15763,14 +16318,14 @@ test "lfm2ImageSegment wraps an untiled image and declines every other arch" {
         .{ .pixels = "", .width = 0, .height = 0, .grid_h = 4, .grid_w = 2 },
     };
     const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
-    const seg = (try lfm2ImageSegment(testing.allocator, &msgs, &config)) orelse return error.NoSegment;
+    const seg = (try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
     defer testing.allocator.free(seg);
     const want = [_]u32{ 125009, 124907, 124907, 125010 };
     try testing.expectEqualSlices(u32, &want, seg);
 
     // Not LFM2-VL ⇒ null, so every other arch keeps the flat BOI/pads/EOI run.
     config.lfm2_vision = false;
-    try testing.expect((try lfm2ImageSegment(testing.allocator, &msgs, &config)) == null);
+    try testing.expect((try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) == null);
 }
 
 test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
@@ -15804,7 +16359,7 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
 
     const prompt = [_]u32{ 2, 500, 105, 2364, 107, 900, 901 };
     // image_token=999 ×2, video absent (token=777, n=0), audio_token=888 ×3.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 3, &config, &.{});
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 3, &config, null);
     defer testing.allocator.free(out);
 
     // Inserted after marker (position 5): [BOI 999 999 EOI][BOA 888 888 888 EOA].
@@ -15832,7 +16387,7 @@ test "insertMultimodalTokens lays out image block then video block then audio bl
     const prompt = [_]u32{ 1, 105, 7 };
 
     // image_token=999 ×2, video_token=777 ×3, audio_token=888 ×1.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 3, 888, 1, &config, &.{});
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 3, 888, 1, &config, null);
     defer testing.allocator.free(out);
     const expected = [_]u32{
         1, 105,
@@ -15855,26 +16410,103 @@ test "insertMultimodalTokens handles audio-only, image-only, and video-only" {
     const prompt = [_]u32{ 1, 105, 7 };
 
     // Audio only (n_image=0, n_video=0) → just the audio block.
-    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 2, &config, &.{});
+    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 2, &config, null);
     defer testing.allocator.free(ao);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 7 }, ao);
 
     // Image only (n_video=0, n_audio=0) → just the image block.
-    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 0, &config, &.{});
+    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 0, &config, null);
     defer testing.allocator.free(io);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 7 }, io);
 
     // Video only (n_image=0, n_audio=0) → just the video block, wrapped in the
     // SAME BOI/EOI as an image block (non-Qwen config here; Qwen's vision_start
     // is exercised by the interleaved test above).
-    const vo = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 2, 888, 0, &config, &.{});
+    const vo = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 2, 888, 0, &config, null);
     defer testing.allocator.free(vo);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 777, 777, 201, 7 }, vo);
 
     // Neither → unchanged.
-    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 0, &config, &.{});
+    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 0, &config, null);
     defer testing.allocator.free(none);
     try testing.expectEqualSlices(u32, &prompt, none);
+}
+
+test "insertMultimodalTokens targets the media user before injected context" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "user", .content = "context one" },
+        .{ .role = "user", .content = "context two" },
+    };
+    const media = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    const prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 33 };
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(out);
+
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+}
+
+test "insertMultimodalTokens counts a ChatML tool-response user marker" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    // ChatML templates wrap a tool-response run in its OWN `<|im_start|>user`
+    // (token-exact: `<tool_response>` is a special token, so the marker bytes
+    // survive BPE). Counting user-ROLE messages alone lands the pads after the
+    // tool response instead of the human's image turn.
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const calls = [_]chat_mod.ToolCall{.{ .id = "call-1", .name = "inspect", .arguments = "{}" }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call-1" },
+        .{ .role = "user", .content = "injected context" },
+    };
+    const media = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    // Markers: image turn, tool-response wrapper, injected context — 3 total
+    // for 2 user messages + 1 tool run, which is the ChatML signature.
+    const prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 33 };
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+
+    // Consecutive tool messages share ONE wrapper (a run), still 3 markers.
+    const run_msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result a", .tool_call_id = "call-1" },
+        .{ .role = "tool", .content = "result b", .tool_call_id = "call-2" },
+        .{ .role = "user", .content = "injected context" },
+    };
+    const run_media = activeTurnMediaMessage(&run_msgs, false) orelse return error.TestExpectedMedia;
+    const run_out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, run_media);
+    defer testing.allocator.free(run_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, run_out);
+
+    // A per-message template (no run merging) renders one marker per tool
+    // message: 4 markers for 2 users + 2 tool messages.
+    const permsg_prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 23, 105, 33 };
+    const permsg_out = try insertMultimodalTokens(testing.allocator, &permsg_prompt, 999, 1, 777, 0, 888, 0, &config, run_media);
+    defer testing.allocator.free(permsg_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 23, 105, 33 }, permsg_out);
+
+    // A family that renders tool results under its OWN header (Llama ipython)
+    // emits NO user marker for the tool turn: 2 markers for 2 user messages —
+    // the role-only count is already right and must stay untouched.
+    const llama_prompt = [_]u32{ 1, 105, 11, 44, 44, 105, 33 };
+    const llama_out = try insertMultimodalTokens(testing.allocator, &llama_prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(llama_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 44, 44, 105, 33 }, llama_out);
 }
 
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
@@ -16332,6 +16964,31 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
     try std.testing.expectEqual(@as(usize, 1), single.len);
 }
 
+test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoint" {
+    // Exercises the EXACT function every HTTP dispatch site in this file calls,
+    // proving the new dialect is wired all the way through — not just reachable
+    // from chat.parseToolCalls in isolation. Uses the Agent shell tool's real
+    // declared schema shape.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
+}
+
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
     // The tool-call parse strips the leading think block BEFORE parsing args, and
     // the two families strip DIFFERENTLY (Qwen `<think>…</think>`, Gemma
@@ -16662,6 +17319,22 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         const effort = parseReasoningEffort(parsed.value.object, -1, false);
         try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
     }
+}
+
+test "every JSON grammar mask site pairs with the schema thinking-off gate" {
+    // The gate lived only on /v1/messages while chat-completions and responses
+    // built the same token-0 mask against a prompt still inside <think>
+    // (issue #331). A NEW surface that builds a mask without consulting the
+    // gate re-ships the hole, so the pairing is pinned by count: one gate call
+    // per mask-enforcement site.
+    const src = @embedFile("server.zig");
+    const mask_line = "[grammar] enforcing JSON " ++ "schema";
+    const call = "schemaMasks" ++ "Thinking(";
+    const def = "fn schemaMasks" ++ "Thinking(";
+    const masks = std.mem.count(u8, src, mask_line);
+    const calls = std.mem.count(u8, src, call) - std.mem.count(u8, src, def);
+    try std.testing.expect(masks >= 3);
+    try std.testing.expectEqual(masks, calls);
 }
 
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
@@ -17106,8 +17779,19 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     twin.max_position_embeddings = 262144;
     var q4 = twin;
     q4.indexer_budget = 2048;
+    q4.indexer_n_heads = 4;
+    q4.indexer_head_dim = 128;
+    q4.indexer_compress_ratio = 4;
     try t.expectEqual(@as(u64, 0), qsaMaskBytes(&twin, 4096, 25000));
-    try t.expectEqual(@as(u64, 4 * 4096 * 25000 * 5 / 4), qsaMaskBytes(&q4, 4096, 25000));
+    // Decode/verify widths build the dense mask; prefill widths gather by
+    // block and bill the bounded score sheet instead of 4 B x rows x keys.
+    try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
+    transformer_mod.qsa_gather_override = true;
+    defer transformer_mod.qsa_gather_override = null;
+    const gathered = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expect(gathered > 0);
+    try t.expect(gathered < 4 * 4096 * 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4), gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);
     const q4_bill = prefillTransientReserve(&q4, 16, 8192);
     try t.expectEqual(twin_bill + qsaMaskBytes(&q4, 8192, 8192), q4_bill);
@@ -17391,6 +18075,22 @@ test "checkAttentionMemory routes deepseek_v4 through its own estimator with the
     const call = "dsv4PrefillMemoryNeeded(seq, layers, " ++
         "kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))";
     try t.expect(std.mem.indexOf(u8, src, call) != null);
+}
+
+test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
+    // RAM restore uses refcount-sharing. The resident entry is already inside
+    // `active_mem`, and prefillMemoryNeeded bills the destination KV growth.
+    // Pin the chokepoint so a future cache-accounting change cannot add the
+    // resident entry to `needed` again (the 138k-token false-400 regression).
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const start = std.mem.indexOf(u8, src, "fn checkAttention" ++ "Memory(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
+    const body = tail[0..end];
+    try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
+    try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
+    try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
 }
 
 test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {

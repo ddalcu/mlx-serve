@@ -53,6 +53,42 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body["first_frame_image"])
     }
 
+    func testLivePreviewIsOptInAndCarriesItsShapeWhenAsked() {
+        // A preview costs an x0 solve plus a host copy of the previewed frame on
+        // EVERY step, so the default has to be the one nobody pays for: absent,
+        // which is also the server's own default for any other client. The three
+        // fields travel together — `preview_frames`/`preview_max_side` without
+        // `preview` are read by nothing.
+        func body(_ on: Bool) -> [String: Any] {
+            var r = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                    numFrames: 97, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+            r.livePreview = on
+
+            return VideoGenService.requestBody(model: "m", prompt: "p", request: r,
+                                               firstFrameB64: nil)
+        }
+        XCTAssertFalse(VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                       numFrames: 97, fps: 24, mode: .oneStage, steps: 8,
+                                       cfgScale: 1.0).livePreview)
+        XCTAssertFalse(VideoGenSettings().livePreview)
+        XCTAssertNil(body(false)["preview"])
+        XCTAssertNil(body(false)["preview_frames"])
+        XCTAssertNil(body(false)["preview_max_side"])
+        XCTAssertEqual(body(true)["preview"] as? Bool, true)
+        XCTAssertEqual(body(true)["preview_frames"] as? Int, 1)
+        XCTAssertEqual(body(true)["preview_max_side"] as? Int, 256)
+    }
+
+    func testLivePreviewSurvivesASaveLoadRoundTrip() {
+        // The pane's decoder is hand-listed, so a field that is saved but never
+        // decoded resets on every launch (the `bestQuality` class).
+        var s = VideoGenSettings()
+        s.livePreview = true
+        let data = try! JSONEncoder().encode(s)
+        let back = try! JSONDecoder().decode(VideoGenSettings.self, from: data)
+        XCTAssertTrue(back.livePreview)
+    }
+
     func testDiffusionDecoderFieldIsGatedOnThePacksOwnCapability() {
         // `vae_diffusion_decoder.safetensors` ships in the 8-bit LTX-2.5 pack
         // and NOT in the 4-bit one, so the toggle is per preset — and the state
@@ -1469,7 +1505,9 @@ extension MediaGenServiceTests {
         XCTAssertNil(body["audio"], "H3 takes no audio input")
         // Adapters DO travel — H3 resolves them against its own module names.
         XCTAssertEqual(body["lora_paths"] as? [String], ["/tmp/some.safetensors"])
-        // The fields every backend needs must still be there.
+        // The fields every backend needs must still be there. `preview` is NOT
+        // one of them — it is the pane's own opt-in (see
+        // testLivePreviewIsOptInAndCarriesItsShapeWhenAsked).
         for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed"] {
             XCTAssertNotNil(body[k], "\(k) must always be sent")
         }

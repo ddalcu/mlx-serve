@@ -13,8 +13,14 @@ final class TranscriptTypographyTests: XCTestCase {
         return try String(contentsOf: url, encoding: .utf8)
     }
 
-    func testTheTranscriptReadsAtSixteenPoints() {
-        XCTAssertEqual(ChatMetrics.transcriptFontSize, 16)
+    /// The default (Settings ▸ Interface ▸ Text Size = Default) reads at
+    /// 14pt — bumped down from the original 16pt (2026-08-31, felt too large
+    /// at normal reading distance); the size is a user setting now
+    /// (`ChatTextSize`), and `.medium` is what nobody who never opens that
+    /// picker gets.
+    func testTheTranscriptReadsAtFourteenPointsByDefault() {
+        XCTAssertEqual(ChatTextSize.medium.proseSize, 14)
+        XCTAssertEqual(ChatMetrics.transcriptFontSize, ChatTextSize.medium.proseSize)
     }
 
     /// Headings scale FROM the body size. As three literals (18/16/14) raising
@@ -56,6 +62,43 @@ final class TranscriptTypographyTests: XCTestCase {
                 from ChatMetrics.transcriptFontSize / .transcriptCodeFontSize.
                 """)
         }
+    }
+
+    /// The markdown render cache is keyed on the text-size setting: identical
+    /// bytes rendered at Small and then Extra Large must come back at two
+    /// sizes, not as a stale cache hit built at the old size.
+    func testTheRenderedTranscriptFollowsTheTextSizeSetting() {
+        let original = UserDefaults.standard.object(forKey: InterfacePrefKey.textSize)
+        defer {
+            if let original { UserDefaults.standard.set(original, forKey: InterfacePrefKey.textSize) }
+            else { UserDefaults.standard.removeObject(forKey: InterfacePrefKey.textSize) }
+        }
+        UserDefaults.standard.set(ChatTextSize.small.rawValue, forKey: InterfacePrefKey.textSize)
+        let small = MarkdownText.attributedString(for: "same bytes, two sizes")
+        UserDefaults.standard.set(ChatTextSize.xlarge.rawValue, forKey: InterfacePrefKey.textSize)
+        let large = MarkdownText.attributedString(for: "same bytes, two sizes")
+        XCTAssertEqual((small.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)?.pointSize,
+                       ChatTextSize.small.proseSize)
+        XCTAssertEqual((large.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)?.pointSize,
+                       ChatTextSize.xlarge.proseSize)
+    }
+
+    /// Prose wraps at `ChatMetrics.proseMeasure` (a paragraph tailIndent);
+    /// code blocks — and tables, which share the no-indent default — keep the
+    /// full column. The measure must never become a frame cap on wide content.
+    func testProseWrapsEarlyWhileCodeKeepsTheFullColumn() {
+        let rendered = MarkdownText.attributedString(for: "flowing prose\n\n```\nwide code\n```")
+        let text = rendered.string as NSString
+        let proseStyle = rendered.attribute(.paragraphStyle, at: text.range(of: "flowing").location,
+                                            effectiveRange: nil) as? NSParagraphStyle
+        let codeStyle = rendered.attribute(.paragraphStyle, at: text.range(of: "wide code").location,
+                                           effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(proseStyle?.tailIndent, ChatMetrics.proseMeasure)
+        // Code keeps its own trailing inset (≤ 0 = relative to the trailing
+        // margin, full column) — a POSITIVE tailIndent is the prose measure
+        // leaking onto wide content.
+        XCTAssertLessThanOrEqual(codeStyle?.tailIndent ?? 0, 0, "code must not inherit the prose measure")
+        XCTAssertEqual(proseStyle?.lineHeightMultiple, ChatMetrics.proseLineHeightMultiple)
     }
 
     /// SF Pro is the macOS system font, so the app gets it by asking for the

@@ -1247,8 +1247,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 toolMsg.toolName = result.name
 
                 // Inline images. `browse` screenshots attach to the (hidden) tool
-                // message as VISION INPUT for the next turn: there is no file
-                // behind a screenshot, so its bytes are all there is.
+                // message as VISION INPUT for the next turn, and they live only
+                // as long as this run of the app. Nothing reads them from a
+                // reopened conversation: the transcript hides tool messages
+                // (`ChatRows.rows` drops everything with a `toolCallId`) and
+                // the agent loop sends images from the last USER message only.
+                // A file under `attachments/` would be one nobody looks at,
+                // kept until the conversation is deleted.
                 //
                 // A GENERATED image keeps none. The generator already wrote the
                 // original to `~/.mlx-serve/generations`, and the ref below

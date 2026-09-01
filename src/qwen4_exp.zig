@@ -9,6 +9,7 @@
 //! [R, dim/gs]) written by `tests/convert_qwen38_flash_next.py`.
 
 const std = @import("std");
+const log = @import("log.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -124,6 +125,20 @@ pub const NgramHash = struct {
 };
 
 /// The merged quantized table, mmapped read-only.
+var warm_env_cached: ?bool = null;
+pub var warm_override: ?bool = null;
+
+fn warmEnabled() bool {
+    if (warm_override) |v| return v;
+    if (warm_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_NGRAM_WARM") orelse break :blk true;
+        break :blk raw[0] != '0';
+    };
+    warm_env_cached = v;
+    return v;
+}
+
 pub const NgramTable = struct {
     map: []align(std.heap.page_size_min) const u8,
     rows: u64,
@@ -139,6 +154,12 @@ pub const NgramTable = struct {
     /// serialize on the VM map lock; preads run in parallel).
     fd: std.c.fd_t = -1,
     pool: ?*PrefetchPool = null,
+    /// Boot-time page-cache warm: the weights load evicts this file, and the
+    /// first long prompt then faults 48 rows/token from SSD (38k: 174 s vs
+    /// 55 s warm). preads through the kept fd, never the mapping.
+    warm_thread: ?std.Thread = null,
+    warm_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    warm_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -196,6 +217,11 @@ pub const NgramTable = struct {
     }
 
     pub fn close(self: *NgramTable) void {
+        if (self.warm_thread) |th| {
+            self.warm_stop.store(true, .release);
+            th.join();
+            self.warm_thread = null;
+        }
         if (self.pool) |p| p.destroy();
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
@@ -203,8 +229,40 @@ pub const NgramTable = struct {
         std.posix.munmap(self.map);
     }
 
-    /// Dequantize one row into `out[0..dim]` (MLX affine layout: element i
-    /// sits at bits [(i % per_word) * bits ..] of word i / per_word).
+    const WARM_CHUNK: usize = 8 << 20;
+
+    /// Read the whole table through the fd once, in the background, so the
+    /// first prompt's PLE gathers hit a warm page cache. Call only once the
+    /// table sits at its final address (the thread holds `self`). Off via
+    /// MLX_SERVE_NGRAM_WARM=0.
+    pub fn startWarm(self: *NgramTable) void {
+        if (!warmEnabled() or self.fd < 0 or self.warm_thread != null) return;
+        self.warm_stop.store(false, .release);
+        self.warm_bytes.store(0, .release);
+        self.warm_thread = std.Thread.spawn(.{}, warmMain, .{self}) catch null;
+    }
+
+    fn warmMain(self: *NgramTable) void {
+        var scratch: [WARM_CHUNK]u8 align(16) = undefined;
+        const wio = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(wio, .boot);
+        var off: u64 = 0;
+        const total: u64 = self.map.len;
+        while (off < total) {
+            if (self.warm_stop.load(.acquire)) return;
+            const want: usize = @intCast(@min(total - off, WARM_CHUNK));
+            const got = std.c.pread(self.fd, &scratch, want, @intCast(off));
+            if (got <= 0) return;
+            off += @intCast(got);
+            self.warm_bytes.store(off, .release);
+        }
+        const secs: f64 = @as(f64, @floatFromInt(t0.untilNow(wio, .boot).nanoseconds)) / 1e9;
+        log.info("[qwen4] ngram table warm: {d:.1} GB in {d:.1} s (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{ @as(f64, @floatFromInt(total)) / 1073741824.0, secs });
+    }
+
+    /// Dequantize one row into `out[0..dim]` (mx.quantize packing: element i
+    /// sits at bit offset i * bits of the little-endian u32 stream and may
+    /// straddle a word boundary at 3/5/6 bits).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
         std.debug.assert(r < self.rows and out.len >= self.dim);
         const words = self.map[self.w_off + r * self.wcols * 4 ..][0 .. self.wcols * 4];
@@ -214,12 +272,15 @@ pub const NgramTable = struct {
     }
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
-        const per_word: u32 = 32 / self.bits;
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         var i: u32 = 0;
         while (i < self.dim) : (i += 1) {
-            const word = std.mem.readInt(u32, words[(i / per_word) * 4 ..][0..4], .little);
-            const q: u32 = (word >> @intCast((i % per_word) * self.bits)) & mask;
+            const off = i * self.bits;
+            const w = off / 32;
+            const shift = off % 32;
+            var v: u64 = std.mem.readInt(u32, words[w * 4 ..][0..4], .little);
+            if (shift + self.bits > 32) v |= @as(u64, std.mem.readInt(u32, words[w * 4 + 4 ..][0..4], .little)) << 32;
+            const q: u32 = @truncate((v >> @intCast(shift)) & mask);
             const g = i / self.group_size;
             const sc = bf16ToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
             const bi = bf16ToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
@@ -441,6 +502,40 @@ test "ngram table row dequant follows the MLX affine nibble layout" {
     try testing.expectEqual(@as(f32, 5.0), out[13]);
 }
 
+test "ngram table row dequant reads the dense mx.quantize packing at every width" {
+    // mx.quantize packs element i at bit offset i*bits of the little-endian
+    // u32 stream (wcols = dim*bits/32); at 3/5/6 bits elements straddle words.
+    // dim 32, one group, q[i] = i % 4, scale 1, bias 0 ⇒ out[i] == i % 4.
+    inline for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+        const wcols = 32 * bits / 32;
+        var packed_words: [8]u32 = @splat(0);
+        var i: u32 = 0;
+        while (i < 32) : (i += 1) {
+            const off = i * bits;
+            const q: u64 = i % 4;
+            const w = off / 32;
+            packed_words[w] |= @truncate(q << @intCast(off % 32));
+            if (off % 32 + bits > 32) packed_words[w + 1] |= @truncate(q >> @intCast(32 - off % 32));
+        }
+        var hbuf: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(&hbuf, "{{\"__metadata__\":{{\"bits\":\"{d}\",\"group_size\":\"32\"}},\"weight\":{{\"dtype\":\"U32\",\"shape\":[1,{d}],\"data_offsets\":[0,{d}]}},\"scales\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[{d},{d}]}},\"biases\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[{d},{d}]}}}}", .{ bits, wcols, wcols * 4, wcols * 4, wcols * 4 + 2, wcols * 4 + 2, wcols * 4 + 4 });
+        const total = 8 + 256 + wcols * 4 + 4;
+        const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), total);
+        defer std.heap.page_allocator.free(buf);
+        @memset(buf, ' ');
+        std.mem.writeInt(u64, buf[0..8], 256, .little);
+        @memcpy(buf[8 .. 8 + header.len], header);
+        const data = buf[264..];
+        for (0..wcols) |w| std.mem.writeInt(u32, data[w * 4 ..][0..4], packed_words[w], .little);
+        std.mem.writeInt(u16, data[wcols * 4 ..][0..2], 0x3F80, .little);
+        std.mem.writeInt(u16, data[wcols * 4 + 2 ..][0..2], 0, .little);
+        const t = try NgramTable.parse(buf, buf[8..264], 264);
+        var out: [32]f32 = undefined;
+        t.row(0, &out);
+        for (out, 0..) |v, k| try testing.expectEqual(@as(f32, @floatFromInt(k % 4)), v);
+    }
+}
+
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
 /// the mmapped table. Non-null on `Transformer.qwen4` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
@@ -454,3 +549,49 @@ pub const Qwen4State = struct {
         self.table.close();
     }
 };
+
+test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {
+    // The 4-bit fixture from the nibble-layout test, written to a real file
+    // so open()'s kept fd serves the warm preads.
+    var buf: [8 + 512 + 2 * 16 + 2 * 2 + 2 * 2]u8 = undefined;
+    const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"},\"weight\":{\"dtype\":\"U32\",\"shape\":[2,4],\"data_offsets\":[0,32]},\"scales\":{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[32,36]},\"biases\":{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[36,40]}}";
+    var hdr: [512]u8 = @splat(' ');
+    @memcpy(hdr[0..header.len], header);
+    std.mem.writeInt(u64, buf[0..8], 512, .little);
+    @memcpy(buf[8..520], &hdr);
+    @memset(buf[520..], 0x33);
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = &buf });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]});
+
+    warm_override = true;
+    defer warm_override = null;
+    var t = try NgramTable.open(path);
+    t.startWarm();
+    try testing.expect(t.warm_thread != null);
+    var spins: u32 = 0;
+    while (t.warm_bytes.load(.acquire) < buf.len) : (spins += 1) {
+        if (spins > 10_000) return error.WarmNeverFinished;
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    try testing.expectEqual(@as(u64, buf.len), t.warm_bytes.load(.acquire));
+    t.close();
+
+    // close() during the warm joins instead of racing the fd/munmap.
+    var t2 = try NgramTable.open(path);
+    t2.startWarm();
+    t2.close();
+
+    // Kill switch: no thread.
+    warm_override = false;
+    var t3 = try NgramTable.open(path);
+    t3.startWarm();
+    try testing.expect(t3.warm_thread == null);
+    t3.close();
+}

@@ -1382,6 +1382,46 @@ theoretical 16.2) puts the 8K roofline at ~30.9s and both engines within 3-6% of
 Nobody beats anybody by 5% on a dense-27B prefill on this hardware; the winnable margins
 live at short contexts (fixed overheads) and on MoE/small models.
 
+<<<<<<< HEAD
+### A changed image invalidates state from its media row, not token zero (2026-08-30)
+
+A 135K-token Qwen3.8 vision-agent session alternated healthy ~2K-token tail prefills with
+full cold prefills lasting almost ten minutes. The first use of each new image changed
+`vision_key`, and exact-key filtering rejected every RAM entry before token-prefix comparison.
+A 137,748-token request therefore did a full ~9.5-minute prefill even though nearly all of its
+history preceded the new image.
+
+The media hash does not invalidate token zero onward. It first affects model state when the
+first dynamic image/audio/video placeholder row is forwarded. RAM entries now retain that
+`media_start` position. When media hashes differ, lookup caps the candidate's token match at
+the earliest known media boundary from the entry or request. Thus a hybrid checkpoint exactly
+at the boundary is safe (it contains tokens strictly before the dynamic row), while any
+checkpoint after it is foreign-pixel state and cannot restore. If neither side knows a
+boundary, lookup remains conservative and rejects the cross-key entry. SSD vision entries
+remain unsupported.
+
+The hermetic regression includes a tempting later checkpoint and requires restoration at the
+boundary. `tests/test_vision_prefix_cache.sh` changes images after a >2K shared text prefix;
+the real Uncensored Qwen3.8 run restored exactly 2,048 tokens after the swap while the short
+foreign-image arm remained cold, 10/10 checks green.
+=======
+### Hybrid cache lookup must rank the checkpoint it can restore, not the raw token match (2026-08-30)
+
+A 135K-token Qwen3.8 vision-agent session alternated healthy ~2K-token tail prefills with
+full cold prefills lasting almost eight minutes. Each miss ended exactly at the prior image
+insertion boundary: the newest RAM entry had the longest raw token match, but its first SSM
+checkpoint sat just after that boundary. `findBestMatch` selected it, `lookupAndRestore`
+found no checkpoint at or below the match, and the server threw the whole match away even
+though an older entry for the same `vision_key` had a slightly shorter, usable checkpoint.
+
+The candidate score for a hybrid target is therefore the highest SSM checkpoint at or below
+that entry's token match. Entries without one are skipped; pure-attention lookup remains the
+longest raw prefix. A real Qwen3.8 four-turn reproduction changed cached-token counts from
+`0, 2048, 0, 2048` to `0, 2048, 2048, 2048`; turn three fell from 4.79 s to 2.17 s. The
+hermetic regression uses the same shape: a 7-token raw match with its first checkpoint at 8
+must lose to a 5-token raw match that can restore at 4.
+>>>>>>> main
+
 ### A synthetic-dtype reference probe nearly shipped a 2x-bandwidth Inkling forward (2026-07-30)
 Porting Inkling Small, the dtype question was "does the residual stream run bf16 or f32?" — the reference multiplies every dense-MLP output by a `[1]` `global_scale` tensor, and an early python probe (reference modules, MY casts: global_scale → f32 like the "keep_hi" converter comment implied) showed bf16 × f32-array promoting the whole stream to f32 from layer 0. Plan accordingly: f32 KV, f32 experts, 2x bandwidth. WRONG: the REAP25 checkpoint STORES the dense `mlp.global_scale` tensors as BF16 (the base model's were bf16, so the converter's f32-keep condition never fired); only the ROUTER's `gate.bias`/`gate.global_scale` are f32. The real stream is bf16 end-to-end. The probe proved the reference's promotion SEMANTICS while saying nothing about the checkpoint — same family as "read the CHECKPOINT, not the reference source" (Kokoro AdaIN, laguna YaRN), one level up: read the checkpoint's DTYPES, not the converter's intent.
 
@@ -4299,3 +4339,30 @@ The accepted verdict, two clean counterbalanced pairs (persist off, serial drift
 The plan's premise was "verification rows bottlenecked by routed expert banks lacking NAX optimization." Half is true: the per-block profiler (deltas only, the M4 methodology) puts the MoE at ~60% of the verify-row marginal on M5 Max (+4.31 ms/row of +7.12 at S1→S2, +2.41 of +4.13 at S2→S4), with hc/gdn/attn all small after the row-batched kernels. The other half is not: a grouped-expert m16 NAX kernel — one threadgroup per equal-expert run of the sorted pairs (in-kernel group discovery; a host readback mid-layer is a GPU barrier), both banks streamed through the tensor-ops tile, the swept-table SwiGLU fused at the sort path's exact rounding sites — passed mirrored-fp32-truth parity on every group shape and `test_mtp_equivalence.sh` 11/11 armed, and LOST ~9% on the forward in BOTH variants: two-pass NSG 8 measured S=2 20.30 vs 18.66 ms and S=4 27.12 vs 24.91; single-pass dual-accumulator NSG 4 measured 20.29/26.96 vs 18.62/24.88. Halving barriers and K passes moved nothing, so the cost is structural, not synchronization.
 
 The structural read: at verify widths a run is 1-2 rows, so the m16 tile's row amortization never engages while its costs are fully paid, and SORTED gather_qmm is already near the expert-byte floor (~1.7 ms/row: 10 experts x 2.46 MB x 48 layers / ~700 GB/s). NAX is not the missing piece for routed experts; the bytes are irreducible without cross-row expert overlap, which S<=9 with top-10 routing does not produce. The declining mlp marginal at wider S is that overlap slowly arriving — a wider-batch regime (S=16+, larger draft blocks, batched verify) could revisit this. Nothing ships; the working kernel, its hermetic parity test and the ubench arms live on the contributor branch [`holtsway/mlx-serve@feat/qwen4-moe-verify-nax`](https://github.com/holtsway/mlx-serve/tree/feat/qwen4-moe-verify-nax). Anyone tempted by a "fuse the whole verify MoE" variant should start from these numbers: the multi-row gather kernel (+38% at S=4) and the per-row gatherQmv loop (−11% at S=4) are the same lesson from other angles.
+
+### A 6-bit n-gram table that reads as noise (#305)
+
+`NgramTable.dequantRow` unpacked the mmapped `ngram_table.bin` with `per_word = 32 / bits`, one element per aligned slot. `mx.quantize`, which the converter uses to write the table, packs densely: `wcols = dim * bits / 32`, element i at bit offset `i * bits` of the little-endian u32 stream, so at 3/5/6 bits elements straddle word boundaries. The two layouts agree only when bits divides 32. `parse` already checked `dim * bits == wcols * 32` (the dense geometry), so a 6-bit pack loaded cleanly, logged `(6-bit, mmapped)`, and served a PLE injection with cosine 0.066 to the bf16 rows. The model stayed fluent; the tell was duplicated BPE fragments when copying paths at temperature 0 (`code-w-walk-review.json`), with the correct token absent from the top-4. Rebuilding the same pack at 8 bits fixed it 0/9 to 9/9.
+
+The only test hardcoded 4 bits. The fix reads a u64 window across the straddle; the test now packs a known row at 2/3/4/5/6/8 bits and expects exact values. Class lesson: a hand-rolled unpack of an MLX-quantized tensor is tested at every width mx.quantize ships, not the width the default pack uses.
+
+## qwen4 QSA prefill: the mask arm walked every key block; gather by index (2026-08-30)
+
+Long-context prompt processing on Qwen3.8-Flash-Next fell off a cliff past 16k (1129 → 635 tok/s at 128k → 441 at 256k in the 26.8.11 column) while oMLX's curve went flat (1096 → 1068) after their commit 7467dce ("flatten exact QSA prefill"). Their path never builds the `[q, kv]` matrix: top-512 block indices per query, sorted, and a direct-index kernel that reads only those 2048 rows (+ the ≤3-token tail) from K/V.
+
+Ours built the dense `[1,1,S,kv]` bool mask (`qsaMaskFromQk`: block expand → tail OR → causal AND; 4096 x 256k = 1 GB of bool plus its intermediates, billed by `qsaMaskBytes`) and fed it to the mask arm of `msv_attn_p256`. That arm stages every 32-key block of the whole cache and skips a block only when NONE of its 64-row q tile's rows sees it — and 64 adjacent queries' top-512 picks out of 64k blocks cover nearly every key tile. The rule already recorded it ("the win is fusion, not sparsity"): the kernel was O(q x kv) per chunk, i.e. dense attention over 256k keys twelve times per chunk. The indexer score matmul was also a full `[4, S, nb]` f32 sheet (4.3 GB at 256k).
+
+What shipped:
+
+- `msv_attn_qsa256` (`gatherQsa256`, kill switch `MLX_SERVE_QSA_GATHER=0`): one threadgroup per (query token, kv head, batch); the token's 12 GQA heads are the tile rows (NSG = ceil(gqa/8) simdgroups), keys are gathered by the token's sorted block list (`blocks[b, s, :]`, RATIO tokens each, INT_MAX past the row's count) followed by its own incomplete tail. Same fragment math, transposed K staging and fp32 online softmax as p256. BK is a template arg; 16 and 32 measured identical (~75 ms per 4096-row chunk-layer), 32 is the default.
+- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Decode/verify widths (S < 16) and batched decode keep the dense mask path; a declined gather expands the selection with `qsaMaskFromBlocks` (also the fixture trace's mask at layer 3).
+- `server.qsaMaskBytes` bills the bounded sheet at prefill widths, the old `4 B x rows x keys` below 16 rows.
+
+Measured (M4 Max, 4-bit pack, warm, same boot type, natural 38k prompt): gather 55.1 s (692 tok/s) vs mask arm 67.0 s (568 tok/s). Same-session llmprobe ladder, 26.8.11 app binary vs the tree (prefill tok/s): 512 545/532, 4k 784/742, 8k 753/728, 16k 681/707, 32k 589/699, 64k 479/681; single-prompt 128k 395/654, 256k 267/551 (the app needed 954 s for 254k tokens). The 4-8k dip is structural (the gather reads 2051 rows per token with no sharing; the mask arm at kv ≤ 8k reads ≤ kv rows per 64-row tile), so chunks at kv ≤ 8192 keep the mask arm (`QSA_GATHER_MIN_KV_DEFAULT`, `MLX_SERVE_QSA_GATHER_MIN_KV`); a 38k prompt is unchanged by the threshold (55.3 s). The comparison chart that prompted this (mlx 1210 @ 8k) is from ANOTHER machine: no bench artifact or llmprobe card on this box ever exceeded ~800 prefill on flash-next, and our own Aug-28 26.8.11 column reads 685 @ 8k — today's app run (753) was FASTER. Cross-machine charts set the shape of the curve, never the absolute bar. With attention stood in (`QWEN4_STANDIN=attn_sdpa`) the prompt takes 46.8 s, so attention went from ~20 s to 8.9 s (`QWEN4_PROFILE_QSA=1`: gather 53 ms at kv 4k, 71 ms at 8k, 75-79 ms flat to 37k per chunk-layer; selection 1.4 s per prompt). What is left past the flat attention term is the trunk itself (GDN + MoE + PLE + MTP-head history), not QSA.
+
+Two traps met on the way:
+
+- The first long prompt after a boot took 174 s, not 55 s. Loading 66 GB of weights evicts the 32 GB `ngram_table.bin` from the page cache, and prefill's PLE gather (48 rows per token) then page-faults from SSD serially: 38k x 48 = 1.8M faults. The `PrefetchPool` is decode-only by design ("prefill rows are page-cache hits") — true only once warm. Fixed same session: `NgramTable.startWarm` (called right after the geometry check at load) preads the whole file through the kept fd in a background thread — never through the mapping, so there is no munmap race and `close()` only needs a stop-flag + join. `MLX_SERVE_NGRAM_WARM=0` disables; `[qwen4] ngram table warm:` logs GB + seconds; bar = `ngram table warm` unit test (whole-file byte count, close-mid-warm join, kill switch).
+- `QWEN4_STANDIN=attn_qsa` is not a "no indexer" meter: with the indexer stood in there is no selection, the QSA branch is skipped, and the layer runs DENSE causal attention over the whole cache (67 s at 38k, slower than with QSA). Time the selection in-process instead (`[qsa-prof] select`).
+
+Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask` (gqa 12, rows straddling the every-block-fits boundary, sentinel rows, both tiles, the expansion helper equal to the host-built mask). The qwen4 text + vision fixtures run T=20/T=28 prefills through the gather path (layer-3 mask EXACT, cos > 0.9999).

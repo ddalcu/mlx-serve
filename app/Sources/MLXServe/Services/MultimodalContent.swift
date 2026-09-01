@@ -36,7 +36,10 @@ enum MultimodalContent {
         serverPreprocess: Bool = false,
         preprocessImage: (Data) -> Data? = { ImagePreprocessor.preprocess($0) }
     ) -> [[String: Any]] {
-        var blocks: [[String: Any]] = images.map { img in
+        // An attachment whose file is gone decodes with no bytes. Sending it
+        // anyway is an `image_url` with an empty payload: the model is told
+        // there is a picture and handed nothing.
+        var blocks: [[String: Any]] = images.filter { !$0.data.isEmpty }.map { img in
             if !serverPreprocess, let pixelData = preprocessImage(img.data) {
                 return [
                     "type": "image_url",

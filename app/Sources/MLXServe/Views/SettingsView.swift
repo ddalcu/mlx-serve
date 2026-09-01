@@ -115,6 +115,13 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
+                        category: .interface,
+                        subtitle: "How the app looks and how you summon the Quick Launcher. Applies immediately — no restart needed."
+                    ) {
+                        InterfaceSectionContent()
+                    }
+
+                    SettingsSection(
                         category: .voice,
                         subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
                     ) {
@@ -1808,6 +1815,57 @@ private struct DrafterRow: View {
 }
 
 // MARK: - Per-request defaults section
+
+/// Appearance mode, accent color, text size, compact mode and the Quick
+/// Launcher shortcut — client-side display prefs, none of them a launch
+/// flag, so they're `@AppStorage`-backed instead of riding `ServerOptions`.
+private struct InterfaceSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @AppStorage(InterfacePrefKey.appearanceMode) private var appearanceModeRaw = AppAppearanceMode.system.rawValue
+    @AppStorage(InterfacePrefKey.accentColor) private var accentColorRaw = AppAccentColor.system.rawValue
+    @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
+    @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
+
+    var body: some View {
+        SettingsRow(title: "Appearance", explainer: "Follow the system setting, or force light/dark for this app only.") {
+            Picker("", selection: $appearanceModeRaw) {
+                ForEach(AppAppearanceMode.allCases) { mode in
+                    Text(mode.label).tag(mode.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 180)
+        }
+        SettingsRow(title: "Accent Color", explainer: "Tint for buttons, links and the selected message bubble.") {
+            Picker("", selection: $accentColorRaw) {
+                ForEach(AppAccentColor.allCases) { accent in
+                    Text(accent.label).tag(accent.rawValue)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 140)
+        }
+        SettingsRow(title: "Text Size", explainer: "Size of the chat transcript's prose and code.") {
+            Picker("", selection: $textSizeRaw) {
+                ForEach(ChatTextSize.allCases) { size in
+                    Text(size.label).tag(size.rawValue)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 140)
+        }
+        SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen.") {
+            Toggle("", isOn: $compactMode)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+        SettingsRow(title: "Quick Launcher Shortcut",
+                    explainer: "The global combo that summons the Quick Launcher (⌃Space by default) from any app. Must include at least one modifier key.") {
+            HotKeyRecorderControl(onChange: { appState.quickLauncher.updateHotKey() })
+        }
+    }
+}
 
 private struct RequestDefaultsSectionContent: View {
     @EnvironmentObject var appState: AppState

@@ -333,8 +333,9 @@ class ServerManager: ObservableObject {
             return "Out of GPU memory while loading the model — free memory (close other models/apps) and try again."
         }
         // Otherwise surface the most meaningful fatal line, scanning from the end.
+        // Request/tool-result preview lines are conversation text, never a cause.
         let needles = ["terminating due to", "MLX error", "MISSING WEIGHT", "[fatal]", "panic", "error:"]
-        for line in lines.reversed() {
+        for line in lines.reversed() where !isRequestPreviewLine(line) {
             if needles.contains(where: { line.localizedCaseInsensitiveContains($0) }) {
                 // Strip the C++ "...uncaught exception of type T: " preamble.
                 if let r = line.range(of: "std::runtime_error: ") {
@@ -343,7 +344,14 @@ class ServerManager: ObservableObject {
                 return line
             }
         }
-        return lines.last ?? "exit code \(exitCode)"
+        return lines.last(where: { !isRequestPreviewLine($0) }) ?? "exit code \(exitCode)"
+    }
+
+    /// A server request/tool-result preview line (`> "..."`) echoes the
+    /// conversation's own text into the log — its content can match any error
+    /// needle without being the crash cause.
+    nonisolated static func isRequestPreviewLine(_ line: String) -> Bool {
+        line.trimmingCharacters(in: .whitespaces).hasPrefix("> \"")
     }
 
     /// Whether a crashed server's log is a memory failure — either our own

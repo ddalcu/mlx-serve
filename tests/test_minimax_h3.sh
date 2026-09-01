@@ -177,6 +177,35 @@ print(f"PASS: SSE -> {prog} progress events, complete with {complete['frames']} 
 PY
 [ $? -eq 0 ] || rc=1
 
+# [4b] opt-in per-step JPEG (issue #208): preview:true attaches a JPEG to
+# Generating events; absent preview keeps the original {stage,step,total} shape
+# (pinned above). Cached-velocity steps may omit the image; a real forward at
+# 1 step / 64px always produces one.
+SSE_PREV=/tmp/test_minimax_h3_sse_preview.txt
+curl -sN --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"a red fox in snow","num_frames":40,"width":64,"height":64,"steps":1,"seed":1,"stream":true,"preview":true}' >"$SSE_PREV"
+python3 - "$SSE_PREV" <<'PY'
+import sys, json, base64
+jpg = 0
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line.startswith("data: "):
+        continue
+    ev = json.loads(line[6:])
+    if ev.get("type") != "progress":
+        continue
+    if "preview" not in ev:
+        continue
+    raw = base64.b64decode(ev["preview"])
+    assert raw[:2] == b"\xff\xd8", raw[:8]
+    assert ev.get("mime") == "image/jpeg"
+    assert ev.get("w") and ev.get("h")
+    jpg += 1
+assert jpg >= 1, "preview:true must attach at least one JPEG to a Generating event"
+print(f"PASS: SSE preview -> {jpg} JPEG progress event(s)")
+PY
+[ $? -eq 0 ] || rc=1
+
 # [5] fl2va first-frame conditioning: a pinned high-contrast left/right split
 # image must survive into frame 0 (left dark, right bright) regardless of the
 # prompt — a t2va run that silently ignored the image shows no such structure.

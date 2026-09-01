@@ -2,6 +2,14 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Historical images decoded on every text-only continuation (2026-08-30)
+
+The active-turn media fix stopped the vision tower from re-encoding images behind the latest assistant boundary, but both chat parsers still eagerly base64-decoded, JPEG-decoded, resized, normalized and patchified every attachment before that selector ran. A Harness session retaining 24 images therefore logged 24 image decodes on every later text-only request. Qwen's 44x44 patch grid retains about 8.7 MiB of preprocessed float data per image until the request ends, so the request also carried roughly 200 MiB of avoidable transient buffers. Warm prefix reuse hid most of the latency at 24 images, but the CPU and allocation work grew linearly with conversation history and multiplied under concurrency.
+
+The fix performs a metadata-only pass over the parsed JSON tree first. `activeWireMediaIndex` mirrors `activeTurnMediaMessage` across ordinary assistant boundaries, assistant-prefix continuations and tool-call/result chains, with separate OpenAI and Anthropic wire shapes. The handler's existing parse loop then materializes attachments only for that selected raw message; historical data URLs remain borrowed JSON strings and allocate no media buffers. Skipped image-only history must still append its empty user message, because the role boundary is part of the rendered prompt even when its pixels are not active.
+
+The HTTP regression sends one historical image, twenty historical images, an image-only historical turn and an Anthropic historical image. All must complete with zero new `Decoded … image` log lines; the image-only case also compares prompt-token counts against a dropped empty turn so preserving the boundary is observable. Fresh images, trailing Harness context, assistant-prefix continuation, growing image conversations and changed-image prefix reuse remain covered in the same script.
+
 ### A `seed` that only the synchronous sampler read (seeded replies flipped between identical requests)
 
 `integration_test.sh`'s "same seed produces same first token" went red on the v26.8.11 release run: `Ephemeral` vs `**Ephemeral**` with identical top-2 logprobs (gap 0.75 nats, not a tie). The lazy decode sampler (`sampleTokenLazy`, every serial/batched/spec site) passed a null key to `mlx_random_categorical`, i.e. MLX's global RNG; only the synchronous `sampleToken` (the `logprobs` path) built a key from `seed`, and it built the SAME key every step, so a seeded reply was a single coin flip replayed. The test had passed for months on an 82/18 draw. Fix: `seedKey(sampling)` mixes `seed` with a per-draw index (`SamplingParams.draw`); `Generator.sampleLazy` is the one lazy sampler a slot calls and advances the index; init paths hand the Generator `draw = 1` after drawing t1. Bar: seeded replay identical at temp 1.0 across cold and prefix-cache-hit requests; no seed still varies.
@@ -1509,3 +1517,166 @@ MiniMax-H3, Turbo, 1056x864, 141 frames x 5 chained windows: every window sample
 Fix: `gen.videoRgbTransportReason(delivered, w, h)` with `MAX_VIDEO_RGB_BYTES` (the app's number) refuses at admission on both video paths, naming frames, canvas, MB and the cap; the H3 site bills `chainDeliveredFrames(windows, frames)`. The app's `frameOptions` takes `chainWindows` and the stepper stops at 6 (the server refused 7-8 anyway). Lifting the cap is a transport change (stream frames or mux server-side), not a number to raise.
 
 Also filed the same day, #285: a Mage-Flow-Edit pack failing `MissingMageFlowWeight model.visual.patch_embed.proj.weight`. The reporter's `text_encoder/model.safetensors` loaded 902 tensors; the published Edit pack's has 1425 (523 `model.visual.*`), 902 is the TURBO text encoder. A pack-content problem on the user's disk, not a loader bug; the log line was relabeled from `MISSING VAE WEIGHT` to name the file and both counts.
+
+### A tool-response turn can render under the USER marker (2026-08-30)
+
+PR #318's `activeTurnMediaMessage` counts the user-role messages after the media
+message so `userTurnInsertPos` can pick the marker that opens the media turn
+instead of the last one. That count assumed one rendered user marker per
+user-ROLE message — but ChatML-family templates (Qwen 3/3.5/3.8) wrap each
+tool-response RUN in its own `<|im_start|>user`, merging consecutive tool
+messages into one wrapper, and the match is token-exact: `<tool_response>` is a
+special token, so the marker's trailing `\n` stays its own token (`[im_start,
+"user", "\n"]` appears verbatim). With `[user(image), assistant(tool_call),
+tool(result), user(context)]` the role count says one marker after the media
+message while the render has two, and the image pads land after the tool
+response. Llama renders tool results under an `ipython` header and adds no
+user marker, so a fixed per-family rule in the counter would just move the bug.
+
+`server.resolvedUserMarkersAfter` lets the rendered prompt arbitrate: it counts
+the marker's occurrences in `prompt_ids` and compares against the conversation's
+role totals — `users + tool_runs` (ChatML, runs merged), `users + tool_msgs`
+(per-message wrapping), or `users` (no tool marker). The matching convention's
+tool count is added to `user_markers_after`; an unrecognized total (template
+merged or dropped something) falls back to the role-only count, which is the
+pre-fix behavior. Guard: `insertMultimodalTokens counts a ChatML tool-response
+user marker` (server.zig) pins all three conventions by insert position.
+
+## The sleep-inhibition gate sat in the tick that never runs (issue #251, 2026-08-30)
+
+A long render needs sleep protection only while work is active. Use `PreventUserIdleSystemSleep`; display sleep remains allowed.
+
+Release immediately before `queue_cond.wait` and acquire after wake. The startup load runs before that loop, so it acquires separately. The deferred release covers shutdown and load failure.
+
+`tests/test_sleep_inhibit.sh` checks idle, active generation, return to idle, startup load, and `--no-prevent-sleep`. It matches the assertion by owner pid AND name: powerd holds the same assertion type, and the bare name matches any other mlx-serve instance on the box (a live server generating concurrently false-fails the idle/opt-out arms).
+
+## The hot-cache budget was never validated against what the weights left (2026-08-30)
+
+A long agentic run on the ~70 GB Flash-Next pack (143k-token prompt) killed the
+server with an uncatchable Metal OOM (`kIOGPUCommandBufferCallbackErrorOutOfMemory`).
+The memory never fit: weights + a 40 GB `--prefix-cache-mem` budget (32.5 GB
+resident at death) + the live 143k KV and prefill transients against the ~96 GB
+Metal working-set limit on a 128 GB Mac. The registry had refused the load at
+the 64 GB cap; the app's `--skip-mem-preflight` let it through, and nothing
+anywhere compared the cache budget to the headroom the weights left.
+
+Fix: `server.clampedPrefixCacheMem` (pure) caps the budget at
+`gpu_ceiling − (weights + ctx KV + prefill transient reserve)`. The impure
+wrapper `prefixCacheMemForLoad` runs at the load site in
+`scheduler.doLoadOnInferenceThread` — weights are resident there, so
+`mlx_get_active_memory` is honest — reached through a
+`prefix_cache_mem_resolver` fn pointer because the scheduler deliberately has
+no server.zig import (the `ane_chunk_resolver` pattern). `requested == 0`
+(byte cap disabled) is bounded too — an uncapped cache beside a large model is
+exactly this crash — and the clamp never returns 0, because `initWithMem`
+reads 0 as "no byte cap". When it bites: `[hot-cache] budget clamped … MB`.
+Crash-case numbers: 96 − 70 − ~6.4 (262k ctx KV) − ~4 ≈ 15 GB instead of 40.
+
+Follow-up correction: RAM restore does **not** materialize a copy.
+`KVCache.restore` rebinds the destination handles with `mlx_array_set`, so the
+slot refcount-shares the entry's buffers until a later grow allocates its
+destination buffer. The admission calculation already covers both sides:
+`active_mem` includes the resident entry, and `prefillMemoryNeeded` bills the
+full destination KV capacity. Adding the largest entry once more invented a
+third copy and falsely rejected a 138k warm prompt — as well as cache misses,
+because the guard ran before lookup. Do not add resident cache bytes to
+`needed`; they belong only in the active-memory side of the equation.
+
+The byte budget is also a hard cap now. Previously the eviction loop emptied
+the cache but appended an oversized candidate once no entries remained, so a
+single long conversation could exceed the load-time clamp. An entry larger
+than `max_kv_bytes` is trimmed to the longest restorable prefix that fits
+(see the #330 story below); only a candidate with nothing above the floor is
+declined, preserving any existing smaller prefix.
+
+Guards: `clampedPrefixCacheMem` unit test (the crash's numbers), the
+`initWithMem`-site source scan in scheduler.zig (a second construction site
+can't skip the clamp — the cold-load flags class), and the oversized sole-entry
+regression in prefix_cache.zig.
+
+App-side twin: the crash banner showed `> "9:23:51 PM [vite] Pre-transform
+error: …"` — the agent conversation's own request-preview log line — because
+`summarizeCrash`'s `error:` needle matched it (the Metal marker only reaches
+os_log, not stderr). Preview lines (`> "` prefix) are now skipped by both the
+needle scan and the last-line fallback (`isRequestPreviewLine`).
+
+## An oversized hot-cache decline is a cliff, not a cap (#330)
+
+#326 made `--prefix-cache-mem` a hard cap by declining any commit whose
+snapshot exceeds the budget. In a long agent session that is the steady state,
+not an edge case: the conversation's KV crosses the budget once mid-session
+and from that turn on NOTHING commits — the reporter's log showed 9/9 requests
+skipped, zero `reused`/`resident=` lines, ~23 minutes of re-prefill in one
+window, a cap "enforced" by holding zero bytes. Reproduced locally on
+Qwen3.5-2B at `--prefix-cache-mem 400MB`: pre-fix the cache froze at turn 1's
+21k-token entry while prompts grew to 107k.
+
+The fix costs the prefix, not the whole entry:
+
+- `trimLenForBudget` (prefix_cache.zig) picks the longest retainable length.
+  Hybrids must cut at a CHECKPOINT's `pos` (a KV-only hybrid prefix restores
+  as a cold miss while occupying an LRU slot) and the cost includes every
+  checkpoint kept. Plain attention prices tokens directly. Floor:
+  `MIN_CANCELLED_COMMIT_TOKENS`. Media entries cap the trim at `media_start`
+  — trimming INTO placeholder rows is not a shape we reason about.
+- `KVCacheSnapshot.trimmedCopy` (transformer.zig) is a REAL slice + copy per
+  array against its own shape, batch-evaled. `KVCache.truncate` is
+  offset-only and a refcount-shared snapshot bills the parent's CAPACITY —
+  an offset trim would be an accounting fiction that retains the full 6 GB.
+- Spec payloads (dflash/mtp snaps) describe the full-length state and are
+  dropped on trim; the first reused turn rebuilds them.
+- ONE-SHOT: when the resident covered entry already retains ≥ the trim
+  target, the candidate is dropped and the entry kept. The target is
+  budget-derived and stable, so without this every turn re-copies an
+  identical multi-GB prefix. (On hybrids the steady state usually converges
+  via the decline arm instead — the candidate's own checkpoints all sit
+  above the restored prefix — which preserves the resident entry too.)
+
+Two adjacent defects from the same report:
+
+- The replace path could evict its own sole entry: inherited SSM checkpoints
+  push the merged entry over a cap the pre-check passed (it only prices
+  `new_bytes`), and the old loop evicted down to empty — commit → evict
+  everything → cold prefill, every near-budget turn. Now it evicts OTHER
+  entries first, then `shedCheckpointsToFit` drops this entry's checkpoints
+  (interior thinning, same rule as the merge cap); sole-entry eviction stays
+  as the last resort that keeps the load-time clamp real.
+- `ssm_cps` double free: the commit's dupe/append error paths freed the
+  checkpoints AND the scheduler's catch arm freed them again — with a
+  different allocator. Contract now: ownership transfers to the cache on
+  EVERY outcome (after a trim the slice may be a cache-allocated
+  replacement, so only the cache can free correctly); the scheduler frees
+  nothing, and `commitCancelledPrefillSlot` detaches the salvage BEFORE the
+  call so `Slot.deinit` can't free what the cache owns.
+
+Guards: the `#330` unit tests in prefix_cache.zig (attention + hybrid trim
+with byte-exact restored rows, one-shot handle identity, no-fit decline,
+shed-not-evict, FailingAllocator ownership) and the catch-arm/detach source
+scan in scheduler.zig. NOT built: the issue's proposed `--prefix-cache-mem
+auto` context-sized floor — the default-sizing question is still open.
+
+## The schema thinking-off gate lived on one surface of three (#331, 2026-08-31)
+
+A JSON-schema grammar mask constrains from token 0 and cannot express "think
+first, then JSON". On templates that end the rendered prompt inside a bare
+`<think>` block (qwen3.5/3.8), `</think>` is not valid JSON, so the model
+emits the schema-valid object inside the reasoning block: `reasoning_content`
+carries the JSON, `content` ships empty, streaming routes it through
+`delta.reasoning_content`.
+
+`/v1/messages` got the rule in the output_config fix (live: qwen3.5, effort
+high + schema): schema + no tools ⇒ thinking forced OFF in the prompt (the
+noThinkTailSuffix machinery). `/v1/chat/completions` and `/v1/responses`
+built the same mask with no gate — issue #331 re-found the identical symptom
+via `reasoning_effort` + `response_format`.
+
+Fix: one predicate (`server.schemaMasksThinking`) consulted at all three
+mask-building sites. Tools present = no mask on every surface (tool calls
+must stay reachable), so thinking stays whatever the request resolved.
+"Real reasoning then schema-valid JSON" would need a mask that arms only
+after the think block closes — not built; schema stays a content-only
+contract.
+
+Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
++ mask-engagement count) and the server.zig source scan pairing every
+`[grammar] enforcing` site with a gate call.
