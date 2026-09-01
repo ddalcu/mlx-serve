@@ -179,7 +179,7 @@ pub const NgramTable = struct {
         if (8 + hlen > size) return error.NgramTableTruncated;
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
-        if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
+        if (plePrefetchEnabled()) t.pool = PrefetchPool.create(plePrefetchWorkerCount()) catch null;
         return t;
     }
 
@@ -322,7 +322,6 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -332,9 +331,10 @@ pub const NgramTable = struct {
 /// instead and dequantize their rows in place. Workers wake on a generation
 /// bump and count themselves down; the caller spins (the job is ~100 us).
 const PrefetchPool = struct {
-    const N = 48;
+    const MAX_WORKERS = 48;
     const MAX_ROWS = 64;
     const ROW_BUF = 512;
+    n: usize,
     mu: std.Io.Mutex = .init,
     cv: std.Io.Condition = .init,
     gen: u64 = 0,
@@ -344,18 +344,19 @@ const PrefetchPool = struct {
     bufs: [MAX_ROWS][ROW_BUF]u8 = undefined,
     pending: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(u32) = .init(0),
-    threads: [N]std.Thread = undefined,
+    threads: [MAX_WORKERS]std.Thread = undefined,
 
-    fn create() !*PrefetchPool {
+    fn create(n: usize) !*PrefetchPool {
+        std.debug.assert(n >= 1 and n <= MAX_WORKERS);
         const a = std.heap.page_allocator;
         const p = try a.create(PrefetchPool);
-        p.* = .{};
+        p.* = .{ .n = n };
         var started: usize = 0;
         errdefer {
             p.shutdown(started);
             a.destroy(p);
         }
-        for (0..N) |i| {
+        for (0..n) |i| {
             p.threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{ p, i });
             started += 1;
         }
@@ -363,7 +364,7 @@ const PrefetchPool = struct {
     }
 
     fn destroy(self: *PrefetchPool) void {
-        self.shutdown(N);
+        self.shutdown(self.n);
         std.heap.page_allocator.destroy(self);
     }
 
@@ -383,7 +384,7 @@ const PrefetchPool = struct {
         self.table = table;
         self.rows = rows;
         self.failed.store(0, .release);
-        self.pending.store(N, .release);
+        self.pending.store(@intCast(self.n), .release);
         self.gen += 1;
         self.cv.broadcast(io);
         self.mu.unlock(io);
@@ -406,13 +407,24 @@ const PrefetchPool = struct {
             const rows = self.rows;
             self.mu.unlock(io);
             var i = idx;
-            while (i < rows.len * 3) : (i += N) {
+            while (i < rows.len * 3) : (i += self.n) {
                 if (!table.preadSite(@intCast(rows[i / 3]), i % 3, &self.bufs[i / 3])) _ = self.failed.fetchAdd(1, .acq_rel);
             }
             _ = self.pending.fetchSub(1, .acq_rel);
         }
     }
 };
+
+fn parsePlePrefetchWorkers(raw: ?[]const u8) usize {
+    const text = raw orelse return PrefetchPool.MAX_WORKERS;
+    const requested = std.fmt.parseInt(usize, text, 10) catch return PrefetchPool.MAX_WORKERS;
+    return @min(PrefetchPool.MAX_WORKERS, @max(1, requested));
+}
+
+fn plePrefetchWorkerCount() usize {
+    const raw = std.c.getenv("QWEN4_PLE_PREFETCH_WORKERS");
+    return parsePlePrefetchWorkers(if (raw) |value| std.mem.span(value) else null);
+}
 
 fn plePrefetchEnabled() bool {
     const S = struct {
@@ -432,6 +444,20 @@ pub fn bf16ToF32(u: u16) f32 {
 // ── tests ──
 
 const testing = std.testing;
+
+test "qwen4 PLE prefetch workers keep the measured default for missing or invalid values" {
+    try testing.expectEqual(@as(usize, 48), parsePlePrefetchWorkers(null));
+    try testing.expectEqual(@as(usize, 48), parsePlePrefetchWorkers(""));
+    try testing.expectEqual(@as(usize, 48), parsePlePrefetchWorkers("not-a-number"));
+}
+
+test "qwen4 PLE prefetch workers clamp the construction-time override" {
+    try testing.expectEqual(@as(usize, 1), parsePlePrefetchWorkers("0"));
+    try testing.expectEqual(@as(usize, 1), parsePlePrefetchWorkers("1"));
+    try testing.expectEqual(@as(usize, 16), parsePlePrefetchWorkers("16"));
+    try testing.expectEqual(@as(usize, 48), parsePlePrefetchWorkers("48"));
+    try testing.expectEqual(@as(usize, 48), parsePlePrefetchWorkers("96"));
+}
 
 test "ngram hash reproduces the reference multipliers, primes and offsets" {
     const h = NgramHash.init(248320, 3, 8, 20_000_000, 128, 1234, 0, 248044);
