@@ -135,6 +135,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.audioGen)
                 .environmentObject(appState.musicGen)
                 .environmentObject(appState.model3dGen)
+                .environmentObject(appState.restoreGen)
                 // Settings, Tasks and Agents render here as modes too, so their
                 // objects ride this scene (`ChatWorkspace`).
                 .environmentObject(appState.taskScheduler)

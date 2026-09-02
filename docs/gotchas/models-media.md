@@ -1338,6 +1338,232 @@ The fix is a dtype-conditional cast at the ONE place the scores enter the expert
 
 **Validated live** on LFM2-VL (hybrid arm, image split across chunks 1–3 at chunk 32: identical answers), gemma-4-12B-qat (standard arm + PLE), and Muse-Glimmer-30B-4bit (muse arm, window-attention ViT). Qwen3.5-VL (M-RoPE) rides the same shared splice but had no local checkpoint in the loop — M-RoPE indexes its position table by absolute offset and rebuilds cos/sin per forward, so a chunk boundary inside an image is positionally safe there by construction. Guards: `tests/test_vision_chunked_prefill.sh` (two-arm engagement + color-set invariant), `spliceVisionRows` chunk-equivalence + audio-ordering tests (transformer.zig), `countSpliceRows` + wiring scan (generate.zig), guard-billing scan (server.zig).
 
+## SeedVR2: an upscale came back PURE WHITE, and nothing anywhere said so (2026-08-21)
+
+**Live failure.** A 904x960 photo at 2x produced a 1808x1920 PNG in which every
+pixel was 255. The run before it produced the same geometry as a flat grey
+(min 123, max 128). Status 200, a plausible file on disk, nothing in the log.
+Both files were still in `~/.mlx-serve/generations/restored/` and are what
+turned this from a guess into a measurement.
+
+**It was never a math bug.** The port is correct: 128, 256, 512, 768 and 1024 px
+squares all restore properly, and 1024 was byte-identical across the first fix
+(so the recipe was not touched). The whole failure is memory. SeedVR2's VAE runs
+the WHOLE frame at f32, so its transient cost is LINEAR IN OUTPUT PIXELS —
+measured peak-minus-resident on an M4 Max / 24 GB / 3B checkpoint:
+
+| canvas | pixels | transient | KB/px |
+| --- | --- | --- | --- |
+| 512x512 | 0.26 M | 1.25 GB | 4.77 |
+| 768x768 | 0.59 M | 2.83 GB | 4.80 |
+| 1024x1024 | 1.05 M | 5.02 GB | 4.79 |
+| 1280x1280 | 1.64 M | 7.85 GB | 4.79 |
+| 1536x1536 | 2.36 M | 12.43 GB | 5.27 |
+
+Past what the machine has, **MLX returns degenerate values rather than raising**
+(root `## Rules`) — which is what a flat rectangle IS. The colour changed run to
+run (brown, then green, at the same size) and that non-determinism is the tell:
+a code bug repeats, a working-set-edge symptom does not.
+
+**Three separate things were wrong, in the order they bite.**
+
+1. **The VAE mid-block attention materialised a dense `[T, HW, HW]` f32 score
+   matrix.** `HW` is `(px/8)^2`, so the matrix is QUARTIC in linear size: 1.07 GB
+   at 1024, 5.44 GB at 1536 (twice over — `precise=true` softmax keeps its own
+   f32 copy), and **17179869184 bytes at 2048**, which is past Metal's 14.3 GB
+   max buffer and killed the process. That byte count is exactly `65536^2 * 4`
+   and `65536 = (2048/8)^2`, which is how it was attributed without a profiler.
+   Fixed by tiling the QUERY axis (`attnQueryChunk`, 256 MiB tiles). Exact, not
+   an approximation — softmax runs along the KEY axis, so a query row's output
+   does not depend on which rows share its tile — and pinned by a 1024 px
+   restore that came back BYTE-IDENTICAL to the dense path.
+
+2. **`extendHead` tripled every conv's input for a still image.** The causal
+   conv prepends `times` copies of frame 0, then `contig` copies the result:
+   two 1.6 GB arrays per conv at 1024x1024x128. At T == 1 all three frames are
+   the SAME frame, so the output is `sum_k w[:,k] conv x0` — a one-tap conv
+   with the taps summed. Folding it cut the encoder block's peak 5.02 -> 4.02 GB,
+   total 13.27 -> 12.27 GB, and made a 1024 restore ~33% faster. Exact only
+   because the frames are literal replicas; video (T > 1) keeps the general path.
+
+3. **Nothing billed the geometry.** Now `restoreMemoryRefusal` compares
+   `pixels * RESTORE_TRANSIENT_BYTES_PER_PIXEL` against free RAM and 400s BY
+   NAME on both routes, quoting both numbers. The user's exact geometry now says
+   "restoring 1808x1920 needs about 17.5 GB of free memory beyond the loaded
+   model, but only 9.3 GB is free".
+
+**Two dead ends worth not repeating.** Banding the convolution's output rows to
+cap an im2col expansion made peak WORSE (13.3 -> 17.1 GB): MLX has a real kernel
+at these shapes and never unfolded, so the banding only added a padded copy, the
+band outputs and a concatenation. And rewriting `groupNormPerFrame` from five
+concurrent frame-sized temporaries down to two moved peak by **exactly zero
+bytes** — MLX is lazy, so Zig-side handle lifetimes do not decide residency, the
+scheduler does. Both were reverted. What DID move the number was forcing
+evaluation at stage boundaries (block: -2.25 GB, per-resnet: -1.0 GB), because
+that bounds what one command buffer holds.
+
+**The rule that generalises.** A media pass whose cost scales with pixel area
+owes a BILL and a refusal, not a best effort — because the failure mode is not
+an error, it is a good-looking 200 with a ruined picture in it. And measure the
+peak per stage (`MLX_SERVE_SEEDVR2_MEM=1`) before attributing it: the attention
+matrix, the conv unfold and the temporal replication are three different terms
+that all scale together, and two of the three theories here were wrong.
+
+Guards: `tests/test_seedvr2_upscale.sh` (verified red — without the gate an
+8000x8000 request kills the server), `attnQueryChunk` /
+`restoreMemoryRefusal` unit tests, `RestoreGeometryTests` app-side.
+
+## SeedVR2 follow-up: where the graph is CUT is the residency, and tiling does not pay (2026-08-21)
+
+Chasing the same restore's memory bill further produced one large free win and
+two measured refusals, all from the same underlying fact: **MLX is lazy, batches
+an unevaluated graph into ONE command buffer, and does not release a buffer's
+arrays until it completes.** Residency is therefore decided by where the graph
+is cut, not by how promptly this file drops handles.
+
+**The win (kept).** `evalA` at every full-frame op boundary in the VAE — each
+GroupNorm, SiLU, convolution, pixel shuffle, residual add and the attention's
+q/k/v and output. Transient went **4.79 -> 3.84 KB per output pixel** (measured
+flat across 512/768/1024/1280 px squares), peak at 1024x1024 12.27 -> 11.27 GB,
+with **no measurable time cost** — these are big ops and the sync disappears
+into them. Output is BYTE-IDENTICAL at 1536x1536 across the change, which is
+what evaluation order guarantees and worth pinning anyway. 1536x1536 restores
+went from refused to working on a 24 GB Mac.
+
+**Refusal 1: evaluating INSIDE a fusible chain costs memory.** Adding the same
+`evalA` calls between `groupNormPerFrame`'s elementwise steps (diff, normalise,
+scale, shift) moved the encoder block's peak the WRONG way, 2.01 -> 2.51 GB,
+because each one forces a frame MLX would otherwise have fused into a single
+pass. Cut the graph BETWEEN kinds of ops, never inside an elementwise run.
+
+**Refusal 2: exact spatial tiling does not pay in MLX.** The arithmetic is
+tempting — convolutions are local and tile exactly with a halo, GroupNorm's
+statistics tile exactly in two accumulate-then-apply passes, everything else is
+pointwise — so a tiled VAE looks like it should hold one tile instead of one
+frame. It does not, because **MLX's array API is functional and has no in-place
+tile write**: assembling tiled output means `concatenate`, which allocates the
+whole frame again and copies every tile into it, so a tiled op costs its input,
+its tiles AND its output. Measured twice, in both directions:
+
+- Banding a convolution's output rows (to cap an im2col that turned out not to
+  exist) took peak from 13.27 to **17.05 GB** — the pre-padded input, the band
+  outputs and the concatenation all added frames while nothing was saved.
+- `slice_update` is not an escape hatch: it returns a NEW array, so writing N
+  tiles into a preallocated frame copies the frame N times.
+
+So the residency floor here is the two or three full frames a stage genuinely
+holds, and the way to move it is fewer frames in flight (done) rather than
+smaller ones. Tiling would pay against an API with in-place writes; against
+this one it is strictly worse, and the number says so.
+
+**What is still not possible.** ~3.84 KB/px means a 24 GB Mac with the 3B
+resident tops out near 2.6 Mpx — roughly 1600x1600. Bigger canvases are refused
+by name, which is the point: the alternative is not a slower restore, it is a
+flat rectangle with a 200 behind it.
+
+## SeedVR2 optimisation scan: what the time is, and three things that do not work (2026-08-21)
+
+Stage split of a 1024x1024 restore, measured warm with `MLX_SERVE_SEEDVR2_MEM=1`
+(which now prints elapsed time per stage beside the bytes) on an M4 Pro / 20-core:
+
+| stage | time | share |
+| --- | --- | --- |
+| VAE encode | 1.49 s | 17% |
+| DiT (one forward) | 4.41 s | 50% |
+| VAE decode | 3.18 s | 36% |
+
+**The DiT is at roofline and there is nothing to take.** ~3.15B parameters over
+4096 video tokens is ~26 TFLOP; 4.41 s is ~5.9 TFLOPS effective, which on a
+20-core M4 Pro (~7.2 TFLOPS fp32, bf16 GEMM maybe 1.5-2x that) is most of what
+the part can do. Wall clock there moves only by doing fewer forwards, and
+SeedVR2 already does exactly one.
+
+**Rejected 1: fusing the window attention.** `attend` rounds q/k/v to bf16, then
+widens them to f32, runs a hand-composed attention that materialises
+`[heads, L, L]` scores, rounds the result and widens it again — eight dtype
+conversions per window per layer, 512 of those at 1024x1024, to simulate a
+precision the arrays are ALREADY at under the default compute dtype. Replacing
+it with `mlx_fast_scaled_dot_product_attention` on the bf16 arrays directly
+(head_dim 128, inside the kernel's width) measured **4.41 -> 4.39 s**, i.e.
+nothing. Engagement was proven by its own log line (`fused attention engaged
+(L=458 heads=20 hd=128)`), not assumed — attention simply is not where the DiT's
+time is, the linear projections are. Reverted: an unmeasured numerical change to
+a sensitive path buys nothing.
+
+**Rejected 2: running the VAE in bf16.** This one is worth knowing because the
+numbers are GOOD and it still fails. Halving the VAE's dtype (statistics kept in
+f32, with the f32 scalars in the norm and the attention cast back so they cannot
+promote a frame) measured:
+
+- peak at 1024x1024 **11.27 -> 8.81 GB**, transient exactly halved,
+  3.84 -> 1.92 KB per output pixel — which would have roughly doubled the
+  largest canvas that fits
+- encode 1.49 -> 1.09 s, decode 3.18 -> 2.28 s, total ~9.1 -> ~7.8 s
+
+And the picture is visibly worse: the white background comes back mottled
+green-grey with a checkerboard, the apple loses its speckle texture and the leaf
+its veins (PSNR 14.5 dB against the f32 output, while the global mean and std
+stay put — so the summary statistics do NOT catch it and only looking does).
+The file's existing "the VAE stays f32" note is right, and its reasoning
+generalises: a VAE is the one component with no later stage to wash out a bias,
+its GroupNorm reduces over a whole frame, and its output IS the picture. This is
+the MageFlow rule ("only the sensitive component needs the wide dtype") pointed
+at the component that turns out to be sensitive.
+
+**Rejected 3 (earlier, same session): spatial tiling.** See the previous entry —
+MLX's functional array API makes assembling tiled output cost a `concatenate`,
+so a tiled op costs its input, its tiles and its output.
+
+**What that leaves.** The remaining levers are not code: keeping the model
+resident between upscales (the pane's "Keep loaded", off by default, otherwise
+every restore re-reads 6.3 GB of weights — measured as the difference between a
+4.80 s and a 4.41 s DiT stage), and the canvas size itself.
+
+## SeedVR2's 7B is a second configuration, not a bigger 3B
+
+Adding the 7B looked like a preset change and was four forward-path branches.
+The two sizes share tensor NAMES, the VAE, the pos-emb conditioning and the
+one-step sampler, which is exactly what makes the differences easy to miss:
+
+| | 3B | 7B |
+| --- | --- | --- |
+| MLP | gated SwiGLU, 3 linears, no biases, hidden `ceil256(2·d·4/3)` = 8192 | plain GELU, 2 linears **with biases**, hidden `d·expand_ratio` = 12288 |
+| layers | 32, first 10 multimodal | 36, **all** multimodal — no `.all` weight set exists |
+| rope | dim 128, 21 stored freqs, applied to both streams | dim **64**, 10 freqs, **video only**, positions on `linspace(-1,1,extent)` |
+| head | `vid_out_norm` + `out_shift`/`out_scale` | `use_output_ada: false` — none of the three ship |
+
+The geometry is not guessed: every pack states it in `transformer_overrides`,
+which is the reference transformer's constructor argument list verbatim
+(mflux does `SeedVR2Transformer(**cfg["transformer_overrides"])`, and the
+packs are exported against that). So the parser reads that block, ignores
+keys it does not model — a constructor signature grows, and a future field
+must not make an existing pack unloadable — and treats an ABSENT block as
+the 3B, which is what keeps both 3B packs loading unchanged.
+
+Two things worth keeping:
+
+**The output norm and its modulation are ONE switch.** The reference builds
+`vid_out_norm`, `out_shift` and `out_scale` inside a single `if
+use_output_ada`. Treating the norm as unconditional (it looks like plumbing,
+not modulation) means reaching for a tensor a complete 7B pack does not
+contain.
+
+**The temporal rope offset belongs to `rope_on_text`, not to the frequency
+basis.** Video positions continue the text's coordinate space only on the
+multimodal rope path; the video-only path starts every axis at the origin.
+The first cut keyed that offset on `freqs_for == "pixel"`, which gives the
+right answer for both shipped configs — the 7B is the only one that is
+`pixel`, and it is also the only one that skips text rope — and the wrong
+one for any `lang` pack that does not rotate its text. A branch that is
+correct by coincidence reads exactly like a branch that is correct.
+
+Verified end to end on the int8 pack: the geometry line reports
+`dim=3072 heads=24 layers=36 mm=36 rope=64 mlp=normal out_ada=false`, the
+restore correlates 0.9922 with its source (the 3B manages 0.9851 on the same
+photo), and the 3B's own output is BYTE-IDENTICAL across the change — which
+is the check that matters, since all four branches sit in code both sizes
+run.
+
 ---
 
 ## A renamed vision tower, and a Conv3d read in the wrong axis order (Alis, 2026-08-19)

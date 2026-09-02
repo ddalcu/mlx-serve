@@ -898,4 +898,59 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(q4.bundle.id, "minimax-h3:ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit")
     }
 
+    func testSeedVr2EightBitPresetReadsTheMlxCommunityMirrorsOwnFilename() {
+        let all = RestoreModelPreset.all
+        XCTAssertTrue(all.contains(where: { $0.id == RestoreModelPreset.seedvr2_3b.id }))
+        guard let int8 = all.first(where: { $0.id == RestoreModelPreset.seedvr2_3b_int8.id }) else {
+            return XCTFail("no 8-bit SeedVR2 preset in RestoreModelPreset.all")
+        }
+        XCTAssertEqual(int8.repo, "mlx-community/SeedVR2-3B-mlx-int8")
+        XCTAssertNotEqual(int8.id, RestoreModelPreset.seedvr2_3b.id)
+        // The point of the pack: it's the smaller download. The DiT stays
+        // quantized at rest (never dequantized to bf16), so its resident RAM
+        // is well under the fp16 sibling's too, not just its download size.
+        XCTAssertLessThan(int8.approxDownloadGB, RestoreModelPreset.seedvr2_3b.approxDownloadGB)
+        XCTAssertLessThan(int8.approxRAMGB, RestoreModelPreset.seedvr2_3b.approxRAMGB)
+        // The completeness marker follows the mlx-community mirror's OWN
+        // filename (`transformer.safetensors`), never this project's own
+        // `dit.safetensors` — the two converters ship different names for
+        // the same NaDiT weights (`model_discovery.requiredMediaMarkers`).
+        let markers = int8.bundle.components[0].readyMarkers
+        XCTAssertTrue(markers.contains("transformer.safetensors"))
+        XCTAssertFalse(markers.contains("dit.safetensors"))
+        let fp16Markers = RestoreModelPreset.seedvr2_3b.bundle.components[0].readyMarkers
+        XCTAssertTrue(fp16Markers.contains("dit.safetensors"))
+        XCTAssertFalse(fp16Markers.contains("transformer.safetensors"))
+    }
+
+    func testSeedVr2SevenBPresetsAreRegisteredAndCostMoreThanTheThreeB() {
+        let all = RestoreModelPreset.all
+        let sevenB: [RestoreModelPreset] = [
+            .seedvr2_7b_int8, .seedvr2_7b, .seedvr2_7b_sharp_int8, .seedvr2_7b_sharp,
+        ]
+        for p in sevenB {
+            XCTAssertTrue(all.contains(where: { $0.id == p.id }),
+                          "\(p.id) must be in `all` or it never reaches the picker")
+            // Every 7B pack is an mflux-shaped export, so its completeness
+            // marker is the mirror's filename, never our converter's.
+            let markers = p.bundle.components[0].readyMarkers
+            XCTAssertTrue(markers.contains("transformer.safetensors"), "\(p.id) marker")
+            XCTAssertFalse(markers.contains("dit.safetensors"), "\(p.id) marker")
+            // A bigger model cannot be cheaper than the 3B it sits beside —
+            // the numbers are what the pane budgets and refuses against.
+            XCTAssertGreaterThan(p.approxDownloadGB, RestoreModelPreset.seedvr2_3b_int8.approxDownloadGB)
+            XCTAssertGreaterThan(p.approxRAMGB, RestoreModelPreset.seedvr2_3b_int8.approxRAMGB)
+        }
+        // 8-bit is the smaller half of each pair, in both dimensions.
+        XCTAssertLessThan(RestoreModelPreset.seedvr2_7b_int8.approxDownloadGB, RestoreModelPreset.seedvr2_7b.approxDownloadGB)
+        XCTAssertLessThan(RestoreModelPreset.seedvr2_7b_int8.approxRAMGB, RestoreModelPreset.seedvr2_7b.approxRAMGB)
+        // The sharp finetune is the same architecture, so it costs the same.
+        XCTAssertEqual(RestoreModelPreset.seedvr2_7b_sharp.approxRAMGB, RestoreModelPreset.seedvr2_7b.approxRAMGB)
+        XCTAssertEqual(RestoreModelPreset.seedvr2_7b_sharp_int8.approxDownloadGB, RestoreModelPreset.seedvr2_7b_int8.approxDownloadGB)
+        // Ids and repos are unique across the whole catalog — a duplicate id
+        // silently shadows a preset in every `first(where:)` lookup.
+        XCTAssertEqual(Set(all.map(\.id)).count, all.count)
+        XCTAssertEqual(Set(all.map(\.repo)).count, all.count)
+    }
+
 }

@@ -87,3 +87,7 @@ extension MusicModelPreset {
 extension Model3DModelPreset {
     var capabilityLabel: String { "Best for turning a photo into a 3D model" }
 }
+
+extension RestoreModelPreset {
+    var capabilityLabel: String { "Best for restoring and upscaling photos" }
+}

@@ -258,6 +258,30 @@ pub fn build(b: *std.Build) void {
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
     }
+    // SeedVR2 live parity. Same shape as the Qwen fixture above and for the
+    // same reason: these tests read their inputs through getenv at RUNTIME, so
+    // the run step's cache key knows nothing about them and a changed env
+    // silently replays a cached PASS. Declaring the fixture as a file input is
+    // what makes "I re-dumped the reference" actually re-run the comparison.
+    const seedvr2_fixtures = b.option(
+        []const u8,
+        "seedvr2-fixtures",
+        "Directory of SeedVR2 reference fixtures (tests/dump_seedvr2_fixtures.py)",
+    );
+    const seedvr2_vae = b.option(
+        []const u8,
+        "seedvr2-vae",
+        "Path to the SeedVR2 VAE safetensors for the gated parity test",
+    );
+    if (seedvr2_fixtures) |fixture| {
+        run_unit_tests.setEnvironmentVariable("SEEDVR2_FIXTURES", fixture);
+        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/vae_fixture.safetensors", .{fixture}) });
+    }
+    if (seedvr2_vae) |vae| {
+        run_unit_tests.setEnvironmentVariable("SEEDVR2_VAE", vae);
+        run_unit_tests.addFileInput(.{ .cwd_relative = vae });
+    }
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 

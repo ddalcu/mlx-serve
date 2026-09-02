@@ -41,6 +41,11 @@ const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
 const multipart = @import("multipart.zig");
 const discovery = @import("model_discovery.zig");
+const seedvr2_vae = @import("seedvr2_vae.zig");
+const seedvr2_dit = @import("seedvr2_dit.zig");
+const seedvr2_manifest = @import("seedvr2_manifest.zig");
+const seedvr2_pipe = @import("seedvr2_pipeline.zig");
+const seedvr2_shape = @import("seedvr2_vae_shape.zig");
 const stb = @import("stb");
 
 const Conn = server_mod.Conn;
@@ -53,6 +58,14 @@ pub const Modality = enum {
     audio,
     video,
     mesh,
+    /// Restoration / upscaling: pixels in, better pixels out.
+    ///
+    /// Deliberately NOT an `ImageBackend` arm. A restorer cannot serve
+    /// `/v1/images/generations` — there is no text-to-image path — and sharing
+    /// the `.image` slot would mean loading one EVICTS a resident FLUX in order
+    /// to upscale that FLUX's own output, which is the single most common thing
+    /// anyone will want to do with it.
+    restore,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
@@ -60,6 +73,7 @@ pub const Modality = enum {
             .audio => "audio",
             .video => "video",
             .mesh => "3d",
+            .restore => "restore",
         };
     }
 
@@ -72,6 +86,7 @@ pub const Modality = enum {
             .audio => "qwen3_tts",
             .video => "AudioVideo",
             .mesh => "hunyuan3d_2_1",
+            .restore => "seedvr2",
         };
     }
 };
@@ -93,7 +108,7 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "seedvr2",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -107,6 +122,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.startsWith(u8, model_type, "seedvr2")) return .restore;
     return null;
 }
 
@@ -119,6 +135,13 @@ pub const GenRoute = enum {
     music,
     video,
     mesh,
+    /// `POST /v1/images/upscales` and `POST /v1/video/upscales` — two paths,
+    /// two handlers, ONE `.restore` slot, exactly as `.speech` and `.music`
+    /// share `.audio`. They are separate arms because they differ in what they
+    /// ACCEPT (one image vs a clip's frames) and what they answer with (a PNG
+    /// vs packed rgb8), not merely in their URL.
+    upscale_image,
+    upscale_video,
 
     pub fn modality(self: GenRoute) Modality {
         return switch (self) {
@@ -126,6 +149,7 @@ pub const GenRoute = enum {
             .speech, .music => .audio,
             .video => .video,
             .mesh => .mesh,
+            .upscale_image, .upscale_video => .restore,
         };
     }
 };
@@ -243,17 +267,30 @@ pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
     return discovery.requiredMediaMarker(model_type);
 }
 
+/// True when ANY of `model_type`'s required marker filenames exists under
+/// `model_dir` (`discovery.requiredMediaMarkers` — plural only for SeedVR2,
+/// which ships as either `dit.safetensors` or the mlx-community mirror's
+/// `transformer.safetensors`). No markers declared for the type ⇒ vacuously
+/// present, matching the old single-marker call sites' `orelse` fallthrough.
+fn mediaMarkerPresent(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, model_type: []const u8) bool {
+    var marker_buf: [2][]const u8 = undefined;
+    const markers = discovery.requiredMediaMarkers(model_type, &marker_buf);
+    if (markers.len == 0) return true;
+    for (markers) |marker| {
+        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch continue;
+        defer allocator.free(p);
+        if (fileExists(io, p)) return true;
+    }
+    return false;
+}
+
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (requiredMarkerFor(mt)) |marker| {
-        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
-        defer allocator.free(p);
-        if (!fileExists(io, p)) {
-            log.warn("[gen] {s} at {s} is missing {s}; not treating it as a media model\n", .{ mt, model_dir, marker });
-            return null;
-        }
+    if (!mediaMarkerPresent(io, allocator, model_dir, mt)) {
+        log.warn("[gen] {s} at {s} is missing its required marker; not treating it as a media model\n", .{ mt, model_dir });
+        return null;
     }
     return modality;
 }
@@ -268,10 +305,18 @@ pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     const mt = peekModelType(io, allocator, model_dir) orelse return false;
     defer allocator.free(mt);
     if (modalityFromType(mt) == null) return false;
-    const marker = requiredMarkerFor(mt) orelse return false;
-    const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return false;
-    defer allocator.free(p);
-    return !fileExists(io, p);
+    return !mediaMarkerPresent(io, allocator, model_dir, mt);
+}
+
+/// The DiT/transformer filename actually present in `model_dir` — this
+/// project's own `dit.safetensors`, or (falling back) the mlx-community
+/// 8-bit mirror's `transformer.safetensors`. `RestoreEngine.load` is the one
+/// reader; `discovery.requiredMediaMarkers` is the one table both filenames
+/// live in.
+fn seedvr2DitFilename(io: std.Io, model_dir: []const u8) []const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&buf, "{s}/dit.safetensors", .{model_dir}, 0) catch return "dit.safetensors";
+    return if (fileExists(io, p)) "dit.safetensors" else "transformer.safetensors";
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -776,6 +821,100 @@ pub const AudioEngine = struct {
 /// engine — the DINO conditioner, DiT, and ShapeVAE decoder live in
 /// `src/hunyuan3d.zig` (mirrors `AudioEngine` over `tts.Synthesizer`). When a
 /// second 3D arch arrives this becomes an `ImageBackend`-style tagged union.
+/// SeedVR2 restoration engine: causal 3D video VAE + NaDiT.
+///
+/// Both halves stay resident — unlike the mesh/H3 staged loaders, this pipeline
+/// runs encode -> ONE denoise step -> decode in a single pass, so there is no
+/// stage boundary at which the DiT could be freed and reloaded profitably.
+/// Read a SeedVR2 pack's `config.json` into the DiT geometry.
+///
+/// A missing or unreadable file is the 3B default, which is exactly right for
+/// our own converter's packs — the geometry only became a question when a
+/// second SIZE appeared.
+fn readSeedvr2Config(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) seedvr2_manifest.Config {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return .{};
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return .{};
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return .{};
+    defer allocator.free(bytes);
+    return seedvr2_manifest.configFromJson(allocator, bytes);
+}
+
+pub const RestoreEngine = struct {
+    allocator: std.mem.Allocator,
+    encoder: seedvr2_vae.Encoder,
+    decoder: seedvr2_vae.Decoder,
+    dit: seedvr2_dit.Model,
+    /// Precomputed positive text embedding, `[L, 5120]`. SeedVR2 ships this
+    /// instead of a text encoder; the negative one is only read when
+    /// `cfg_scale != 1.0`, which the one-step recipe never does.
+    pos_emb: mlx.mlx_array,
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*RestoreEngine {
+        const self = try allocator.create(RestoreEngine);
+        errdefer allocator.destroy(self);
+        const s = mlx.gpuStream();
+
+        const vae_path = try std.fmt.allocPrint(allocator, "{s}/vae.safetensors", .{model_dir});
+        defer allocator.free(vae_path);
+        var vw = try model_mod.loadWeightsSingleFile(allocator, vae_path);
+        defer vw.deinit();
+
+        // Our own converter ships `dit.safetensors`; the mlx-community 8-bit
+        // mirror ships `transformer.safetensors` (same NaDiT, quantized) —
+        // `discovery.requiredMediaMarkers` is the one place BOTH spellings
+        // are enumerated, so a third convention only has to be taught there.
+        const dit_name = seedvr2DitFilename(io, model_dir);
+        const dit_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, dit_name });
+        defer allocator.free(dit_path);
+        var dw = try model_mod.loadWeightsSingleFile(allocator, dit_path);
+        defer dw.deinit();
+
+        // The DiT's geometry is the pack's to state. The 3B packs either say
+        // nothing or repeat the defaults; the 7B states it in the
+        // `transformer_overrides` block its exporter passes to the reference
+        // constructor. Reading it is what makes a 7B pack a different model
+        // rather than a 3B that cannot find its weights.
+        const dit_cfg = readSeedvr2Config(io, allocator, model_dir);
+        log.info("[seedvr2] geometry: dim={d} heads={d} layers={d} mm={d} rope={d} mlp={s} out_ada={}\n", .{
+            dit_cfg.vid_dim,   dit_cfg.heads,    dit_cfg.num_layers,
+            dit_cfg.mm_layers, dit_cfg.rope_dim, @tagName(dit_cfg.mlp_type),
+            dit_cfg.use_output_ada,
+        });
+
+        const emb_path = try std.fmt.allocPrint(allocator, "{s}/pos_emb.safetensors", .{model_dir});
+        defer allocator.free(emb_path);
+        var ew = try model_mod.loadWeightsSingleFile(allocator, emb_path);
+        defer ew.deinit();
+        // Ours stores the tensor as "pos_emb" (F32); the mlx-community mirror
+        // stores the SAME [58, 5120] table as "embedding" (F16) — `forward`
+        // casts it to the compute dtype regardless, so only the key differs.
+        const pe = ew.get("pos_emb") orelse ew.get("embedding") orelse return error.MissingSeedVr2PosEmb;
+        var pos = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&pos, pe));
+
+        self.* = .{
+            .allocator = allocator,
+            .encoder = try seedvr2_vae.loadEncoder(allocator, &vw, s),
+            .decoder = try seedvr2_vae.loadDecoder(allocator, &vw, s),
+            .dit = try seedvr2_dit.load(allocator, &dw, dit_cfg, s),
+            .pos_emb = pos,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *RestoreEngine) void {
+        self.encoder.deinit();
+        self.decoder.deinit();
+        self.dit.deinit();
+        _ = mlx.mlx_array_free(self.pos_emb);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const MeshEngine = struct {
     allocator: std.mem.Allocator,
     engine: *hy3d.Engine,
@@ -3575,6 +3714,401 @@ fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u
 /// The engine takes straight-alpha RGBA8 (its preprocess recenters the subject
 /// via the alpha bbox and composites on white — so an app-side cutout with real
 /// alpha conditions best, and an opaque photo still works as a fallback).
+
+// ════════════════════════════════════════════════════════════════════════
+// SeedVR2 restoration — `/v1/images/upscales` + `/v1/video/upscales`
+// ════════════════════════════════════════════════════════════════════════
+
+/// The temporal ladder SeedVR2 was trained on: 17-frame clips, `4k+1` shaped
+/// because the VAE's causal head replication leaves frame 0 standing alone and
+/// folds the rest in groups of 4.
+///
+/// Longer clips are REFUSED BY NAME rather than chunked: a chunked restoration
+/// is a different algorithm (each chunk re-noises from its own seed and the
+/// seams do not agree), and shipping one under this endpoint's name would make
+/// "SeedVR2 restored it" mean two different things depending on length.
+pub const RESTORE_MAX_FRAMES: u32 = 17;
+
+/// Why this geometry cannot be restored, as a sentence, or null when it can.
+///
+/// One function for both routes so the image arm and the video arm cannot
+/// drift into refusing different things — the pixel rule is a property of the
+/// VAE and the patchifier, not of the endpoint.
+pub fn restoreGeometryRefusal(buf: []u8, frames: u32, w: u32, h: u32) ?[]const u8 {
+    if (frames == 0) return std.fmt.bufPrint(buf, "no frames to restore", .{}) catch "no frames to restore";
+    if (w == 0 or h == 0) return std.fmt.bufPrint(buf, "frame is {d}x{d}", .{ w, h }) catch "empty frame";
+    // The VAE takes /8 and patchify another /2, so an 8-divisible-but-not-16
+    // input clears the VAE and dies at the patch layer. Refuse by NAME rather
+    // than silently cropping the picture.
+    if (w % 16 != 0 or h % 16 != 0)
+        return std.fmt.bufPrint(buf, "frame is {d}x{d}; SeedVR2 needs both dimensions divisible by 16 (VAE /8 then patchify /2)", .{ w, h }) catch
+            "frame dimensions must both be divisible by 16";
+    if ((frames - 1) % seedvr2_pipe.TEMPORAL_DOWNSAMPLE != 0)
+        return std.fmt.bufPrint(buf, "{d} frames; SeedVR2's causal VAE takes 4k+1 frames (1, 5, 9, 13, 17)", .{frames}) catch
+            "frame count must be 4k+1";
+    if (frames > RESTORE_MAX_FRAMES)
+        return std.fmt.bufPrint(buf, "{d} frames exceeds the {d}-frame clip SeedVR2 was trained on; send shorter segments", .{ frames, RESTORE_MAX_FRAMES }) catch
+            "too many frames";
+    return null;
+}
+
+/// What ONE output pixel costs in transient GPU memory, on top of the resident
+/// weights, for a whole-frame SeedVR2 pass.
+///
+/// MEASURED, not derived (M4 Max, 24 GB, 3B checkpoint, 2026-08-21): peak
+/// minus resident over 512, 768, 1024 and 1280 px squares came to 3.82, 3.84,
+/// 3.84 and 3.84 KB per pixel — flat, because the VAE runs the whole frame at
+/// f32 and every stage of it is proportional to area.
+///
+/// RE-MEASURE THIS WHENEVER THE VAE'S EVALUATION BOUNDARIES MOVE. It was 4.79
+/// KB/px before the `evalA` boundaries went in: MLX batches an unevaluated
+/// graph into one command buffer and holds every array in it until the buffer
+/// completes, so where the graph is cut IS the residency. A stale constant
+/// here refuses sizes that now fit.
+///
+/// The value carries ~7% over the measurement: under-billing does not produce
+/// an error, it produces a flat rectangle.
+pub const RESTORE_TRANSIENT_BYTES_PER_PIXEL: u64 = 4100;
+
+/// Why this restore will not fit in memory, as a sentence, or null when it
+/// will. `available` is free system RAM; 0 means "could not measure", which
+/// must NOT refuse — a gate that cannot see has nothing to say.
+///
+/// This exists because the failure it replaces is a 200 with a ruined picture
+/// in it: MLX at the Metal working-set edge returns zeros rather than raising,
+/// so the restore comes back a flat colour with nothing anywhere saying why.
+pub fn restoreMemoryRefusal(buf: []u8, frames: u32, w: u32, h: u32, available: u64) ?[]const u8 {
+    if (available == 0) return null;
+    const pixels: u64 = @as(u64, frames) * @as(u64, w) * @as(u64, h);
+    const need = pixels * RESTORE_TRANSIENT_BYTES_PER_PIXEL;
+    if (need <= available) return null;
+    const gb = 1024.0 * 1024.0 * 1024.0;
+    return std.fmt.bufPrint(
+        buf,
+        "restoring {d}x{d} ({d} frame(s)) needs about {d:.1} GB of free memory beyond the loaded model, but only {d:.1} GB is free; use a smaller scale or source, or close other apps",
+        .{ w, h, frames, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(available)) / gb },
+    ) catch "not enough free memory to restore an image this large";
+}
+
+/// The whole SeedVR2 recipe, shared by both routes.
+///
+/// `x_in` is `[1, T, H, W, 3]` f32 in [-1, 1]; the return is the decoded
+/// pixels in the same layout, evaluated and materialised so the caller can
+/// read it. In order: encode the low-res input, scale by the VAE's
+/// `scaling_factor`, build the 33-channel input as
+/// `[noise(16), cond_latent(16), ones(1)]`, ONE DiT forward at `t = T`,
+/// `x_0 = noise - pred`, unscale, decode.
+///
+/// There is no per-step cancellation to offer — the sampler is literally one
+/// forward — so the caller probes the socket around this call instead.
+fn restorePass(
+    allocator: std.mem.Allocator,
+    engine: *RestoreEngine,
+    x_in: mlx.mlx_array,
+    lat: [3]u32,
+    seed: u64,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    const cfg: seedvr2_shape.Config = .{};
+
+    // 1. Encode, take the posterior MEAN (never a sample — a restorer has no
+    //    business adding VAE noise on top of the diffusion noise), and scale.
+    seedvr2_vae.memProbe("== restore start");
+    const moments = try seedvr2_vae.encode(&engine.encoder, x_in, s);
+    defer _ = mlx.mlx_array_free(moments);
+    const mean = try seedvr2_vae.latentMean(moments, @intCast(cfg.latent_channels), s);
+    defer _ = mlx.mlx_array_free(mean);
+    const sf = mlx.mlx_array_new_float(cfg.scaling_factor);
+    defer _ = mlx.mlx_array_free(sf);
+    var cond_lat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cond_lat);
+    try mlx.check(mlx.mlx_multiply(&cond_lat, mean, sf, s));
+
+    const zt: c_int = @intCast(lat[0]);
+    const zh: c_int = @intCast(lat[1]);
+    const zw: c_int = @intCast(lat[2]);
+    const ltok: c_int = zt * zh * zw;
+    const lc: c_int = @intCast(cfg.latent_channels);
+
+    // 2. Noise. Seeded so a request is reproducible.
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    const nshape = [_]c_int{ 1, zt, zh, zw, lc };
+    var noise = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(noise);
+    try mlx.check(mlx.mlx_random_normal(&noise, &nshape, nshape.len, mlx.mlx_dtype.float32, 0.0, 1.0, key, s));
+
+    // 3. [noise(16), cond(16), ones(1)] = 33 channels, flattened to tokens.
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, zt, zh, zw, 1 }, 5, mlx.mlx_dtype.float32, s));
+    const vin5 = blk: {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, noise);
+        _ = mlx.mlx_vector_array_append_value(vec, cond_lat);
+        _ = mlx.mlx_vector_array_append_value(vec, ones);
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 4, s));
+        break :blk o;
+    };
+    defer _ = mlx.mlx_array_free(vin5);
+    var vin = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vin);
+    try mlx.check(mlx.mlx_reshape(&vin, vin5, &[_]c_int{ ltok, @intCast(seedvr2_pipe.VID_IN_CHANNELS) }, 2, s));
+
+    // 4. ONE forward at t = T. The resolution-dependent timestep transform is
+    //    the identity at T, so it is deliberately not applied here.
+    // The stage probes force an eval so the timing means something — MLX is
+    // lazy, so without it every stage would report ~0 and the decode would
+    // report the whole restoration. Gated ON THE PROBE, never unconditional:
+    // an extra sync per stage is exactly the kind of thing that quietly
+    // becomes the measurement.
+    if (seedvr2_vae.memProbeEnabled()) try mlx.check(mlx.mlx_array_eval(vin));
+    seedvr2_vae.memProbe("== encode done");
+    const pred = try seedvr2_dit.forward(&engine.dit, allocator, vin, engine.pos_emb, lat, seedvr2_pipe.OneStep.timestep(), s);
+    if (seedvr2_vae.memProbeEnabled()) try mlx.check(mlx.mlx_array_eval(pred));
+    seedvr2_vae.memProbe("== dit done");
+    defer _ = mlx.mlx_array_free(pred);
+
+    // 5. x_0 = noise - pred, then undo the scaling_factor.
+    var noise_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(noise_flat);
+    try mlx.check(mlx.mlx_reshape(&noise_flat, noise, &[_]c_int{ ltok, lc }, 2, s));
+    var x0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x0);
+    try mlx.check(mlx.mlx_subtract(&x0, noise_flat, pred, s));
+    const inv_sf = mlx.mlx_array_new_float(1.0 / cfg.scaling_factor);
+    defer _ = mlx.mlx_array_free(inv_sf);
+    var x0s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x0s);
+    try mlx.check(mlx.mlx_multiply(&x0s, x0, inv_sf, s));
+    var z5 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(z5);
+    try mlx.check(mlx.mlx_reshape(&z5, x0s, &[_]c_int{ 1, zt, zh, zw, lc }, 5, s));
+
+    // 6. Decode. The result is `mlx_contiguous`-materialised before it is
+    //    evaluated: `decode` ends in a transpose/reshape chain, and a raw
+    //    `mlx_array_data_float32` read on a strided view is the class of bug
+    //    that produces a plausible, scrambled picture.
+    const decoded = try seedvr2_vae.decode(&engine.decoder, z5, s);
+    if (seedvr2_vae.memProbeEnabled()) try mlx.check(mlx.mlx_array_eval(decoded));
+    seedvr2_vae.memProbe("== decode done");
+    defer _ = mlx.mlx_array_free(decoded);
+    var out_px = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out_px);
+    try mlx.check(mlx.mlx_contiguous(&out_px, decoded, false, s));
+    try mlx.check(mlx.mlx_array_eval(out_px));
+    // A restoration allocates transients whose sizes never repeat (every
+    // window extent is its own shape), so the pool grows for the whole job and
+    // is still held when the next request arrives.
+    _ = mlx.mlx_clear_cache();
+    return out_px;
+}
+
+/// `[-1,1]` floats -> interleaved RGB8. The reference's transform is
+/// `Normalize(0.5, 0.5)` on a `[0,1]` tensor, so the inverse is `(x+1)/2`.
+fn restoreFloatsToRgb(dst: []u8, src: [*]const f32) void {
+    for (dst, 0..) |*d, i| {
+        const v = (src[i] + 1.0) * 0.5;
+        d.* = @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
+    }
+}
+
+/// `POST /v1/images/upscales` — one image in, one restored image out.
+///
+/// Body: `image` (base64 PNG/JPEG). Optional `seed`.
+pub fn handleUpscale(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *RestoreEngine) !void {
+    const raw_img = extractJsonString(body, "image") orelse
+        return sendError(conn, 400, "missing 'image' (base64 PNG/JPEG to restore)");
+    const b64_in = try jsonUnescape(allocator, raw_img);
+    defer allocator.free(b64_in);
+    if (b64_in.len == 0) return sendError(conn, 400, "empty 'image'");
+    const img_bytes = base64DecodeAlloc(allocator, b64_in) catch
+        return sendError(conn, 400, "invalid base64 in 'image'");
+    defer allocator.free(img_bytes);
+    const seed: u64 = extractJsonInt(body, "seed") orelse 0;
+
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const px = stb.stbi_load_from_memory(img_bytes.ptr, @intCast(img_bytes.len), &w, &h, &comp, 3) orelse
+        return sendError(conn, 400, "could not decode 'image' (expected PNG or JPEG)");
+    defer stb.stbi_image_free(px);
+
+    const uw: u32 = @intCast(w);
+    const uh: u32 = @intCast(h);
+    var rbuf: [220]u8 = undefined;
+    if (restoreGeometryRefusal(&rbuf, 1, uw, uh)) |msg| return sendError(conn, 400, msg);
+    const lat = seedvr2_shape.latentShape(.{}, 1, uh, uw) orelse
+        return sendError(conn, 400, "unsupported image geometry");
+    if (restoreMemoryRefusal(&rbuf, 1, uw, uh, metrics.getAvailableMemBytes())) |msg|
+        return sendError(conn, 400, msg);
+
+    const s = mlx.gpuStream();
+    const npix: usize = @as(usize, uw) * uh * 3;
+
+    const host = try allocator.alloc(f32, npix);
+    defer allocator.free(host);
+    for (0..npix) |i| host[i] = (@as(f32, @floatFromInt(px[i])) / 255.0) * 2.0 - 1.0;
+    const in_shape = [_]c_int{ 1, 1, @intCast(uh), @intCast(uw), 3 };
+    const x_in = mlx.mlx_array_new_data(host.ptr, &in_shape, in_shape.len, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x_in);
+
+    // A restoration is minutes of GPU on a big image. The socket is the only
+    // honest abort signal — a write failure arrives seconds late — so it is
+    // probed before committing to the forward and again before encoding the
+    // answer nobody is waiting for.
+    if (conn.peerClosed()) return error.Cancelled;
+    const out_px = try restorePass(allocator, engine, x_in, lat, seed, s);
+    defer _ = mlx.mlx_array_free(out_px);
+    if (conn.peerClosed()) return error.Cancelled;
+
+    const osh = mlx.getShape(out_px);
+    const oh: u32 = @intCast(osh[2]);
+    const ow: u32 = @intCast(osh[3]);
+    const data = mlx.mlx_array_data_float32(out_px) orelse
+        return sendError(conn, 500, "restoration produced no data");
+
+    const rgb = try allocator.alloc(u8, @as(usize, ow) * oh * 3);
+    defer allocator.free(rgb);
+    restoreFloatsToRgb(rgb, data);
+
+    const png_bytes = try png_mod.encodeRgb(allocator, rgb, ow, oh);
+    defer allocator.free(png_bytes);
+    const b64_len = std.base64.standard.Encoder.calcSize(png_bytes.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, png_bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"created\":0,\"data\":[{\"b64_json\":\"");
+    try out.appendSlice(allocator, b64);
+    try out.appendSlice(allocator, "\"}]}");
+    log.info("[restore] image {d}x{d} -> {d}x{d}, {d} PNG bytes\n", .{ uw, uh, ow, oh, png_bytes.len });
+    return sendBytesJson(conn, allocator, out.items);
+}
+
+/// `POST /v1/video/upscales` — a clip in, the restored clip out.
+///
+/// Body: `frames`, an array of base64 PNG/JPEG frames in play order (the
+/// shape `/v1/video/generations`' own reference videos already use, and the
+/// shape the app builds from a movie with `AVAssetImageGenerator`). Optional
+/// `seed` and `fps` (echoed only — SeedVR2 does not resample time).
+///
+/// The response is the PACKED `rgb8` form `/v1/video/generations` answers in,
+/// so a client that can already render a generated clip renders a restored one
+/// with no new decoding path.
+///
+/// This is ONE pass over the whole clip, not a per-frame loop: the VAE is
+/// causal 3D and the DiT's windows span time, which is the entire reason a
+/// video restorer is not just an image restorer run N times — frame-by-frame
+/// would flicker.
+pub fn handleUpscaleVideo(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *RestoreEngine) !void {
+    var it = iterJsonStringArray(body, "frames") orelse
+        return sendError(conn, 400, "missing 'frames' (array of base64 PNG/JPEG frames in play order)");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 0;
+    const fps: u32 = if (extractJsonInt(body, "fps")) |f| @intCast(@min(@max(f, 1), 240)) else 24;
+
+    // Decode every frame FIRST. The geometry rule is per-clip (all frames
+    // share one tensor), so a mismatch has to be found before any of it
+    // reaches the GPU — and the refusal names WHICH frame disagrees.
+    var frames: std.ArrayList([]u8) = .empty;
+    defer {
+        for (frames.items) |f| allocator.free(f);
+        frames.deinit(allocator);
+    }
+    var fw: u32 = 0;
+    var fh: u32 = 0;
+    while (it.next()) |raw| {
+        const b64 = try jsonUnescape(allocator, raw);
+        defer allocator.free(b64);
+        const bytes = base64DecodeAlloc(allocator, b64) catch {
+            var b: [96]u8 = undefined;
+            return sendError(conn, 400, std.fmt.bufPrint(&b, "invalid base64 in 'frames'[{d}]", .{frames.items.len}) catch "invalid base64 in 'frames'");
+        };
+        defer allocator.free(bytes);
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var comp: c_int = 0;
+        const px = stb.stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 3) orelse {
+            var b: [112]u8 = undefined;
+            return sendError(conn, 400, std.fmt.bufPrint(&b, "could not decode 'frames'[{d}] (expected PNG or JPEG)", .{frames.items.len}) catch "could not decode a frame");
+        };
+        defer stb.stbi_image_free(px);
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        if (frames.items.len == 0) {
+            fw = uw;
+            fh = uh;
+        } else if (uw != fw or uh != fh) {
+            var b: [176]u8 = undefined;
+            return sendError(conn, 400, std.fmt.bufPrint(&b, "'frames'[{d}] is {d}x{d} but frame 0 is {d}x{d}; every frame must be the same size", .{ frames.items.len, uw, uh, fw, fh }) catch "frames must all be the same size");
+        }
+        const n: usize = @as(usize, uw) * uh * 3;
+        const copy = try allocator.alloc(u8, n);
+        errdefer allocator.free(copy);
+        @memcpy(copy, px[0..n]);
+        try frames.append(allocator, copy);
+    }
+    if (it.bad) return sendError(conn, 400, "'frames' must be an array of base64 strings");
+
+    const nf: u32 = @intCast(frames.items.len);
+    var rbuf: [220]u8 = undefined;
+    if (restoreGeometryRefusal(&rbuf, nf, fw, fh)) |msg| return sendError(conn, 400, msg);
+    // Same gate as the image route: the VAE is whole-frame, so a clip bills
+    // every frame and runs out of memory long before a still of the same size.
+    if (restoreMemoryRefusal(&rbuf, nf, fw, fh, metrics.getAvailableMemBytes())) |msg|
+        return sendError(conn, 400, msg);
+    const lat = seedvr2_shape.latentShape(.{}, nf, fh, fw) orelse
+        return sendError(conn, 400, "unsupported clip geometry");
+
+    const s = mlx.gpuStream();
+    const per: usize = @as(usize, fw) * fh * 3;
+    const host = try allocator.alloc(f32, per * nf);
+    defer allocator.free(host);
+    for (frames.items, 0..) |f, fi| {
+        const base = fi * per;
+        for (0..per) |i| host[base + i] = (@as(f32, @floatFromInt(f[i])) / 255.0) * 2.0 - 1.0;
+    }
+    const in_shape = [_]c_int{ 1, @intCast(nf), @intCast(fh), @intCast(fw), 3 };
+    const x_in = mlx.mlx_array_new_data(host.ptr, &in_shape, in_shape.len, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x_in);
+
+    if (conn.peerClosed()) return error.Cancelled;
+    const out_px = try restorePass(allocator, engine, x_in, lat, seed, s);
+    defer _ = mlx.mlx_array_free(out_px);
+    if (conn.peerClosed()) return error.Cancelled;
+
+    const osh = mlx.getShape(out_px);
+    const ot: u32 = @intCast(osh[1]);
+    const oh: u32 = @intCast(osh[2]);
+    const ow: u32 = @intCast(osh[3]);
+    const data = mlx.mlx_array_data_float32(out_px) orelse
+        return sendError(conn, 500, "restoration produced no data");
+
+    const rgb = try allocator.alloc(u8, @as(usize, ow) * oh * 3 * ot);
+    defer allocator.free(rgb);
+    restoreFloatsToRgb(rgb, data);
+
+    const b64_len = std.base64.standard.Encoder.calcSize(rgb.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, rgb);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const head = try std.fmt.allocPrint(allocator, "{{\"created\":0,\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":{d},\"format\":\"rgb8\",\"data\":\"", .{ ot, oh, ow, fps });
+    defer allocator.free(head);
+    try out.appendSlice(allocator, head);
+    try out.appendSlice(allocator, b64);
+    try out.appendSlice(allocator, "\"}");
+    log.info("[restore] clip {d}x{d}x{d} -> {d}x{d}x{d}, {d} rgb8 bytes\n", .{ nf, fw, fh, ot, ow, oh, rgb.len });
+    return sendBytesJson(conn, allocator, out.items);
+}
+
 pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *MeshEngine) !void {
     const raw_img = extractJsonString(body, "image") orelse return sendError(conn, 400, "missing 'image' (base64 PNG/JPEG of the subject)");
     const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
@@ -3914,8 +4448,36 @@ pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []co
         );
         return ltxPeakBytes(sumSafetensorsIn(io, dir), spare, 0);
     }
+    if (std.mem.startsWith(u8, model_type, "seedvr2")) return seedvr2PeakBytes(sumSafetensorsIn(io, dir));
     return sumSafetensorsIn(io, dir);
 }
+
+/// SeedVR2's residency bill.
+///
+/// THE SUM-OF-DIRECTORY DEFAULT UNDER-BILLS THIS PACK BY THE LOAD DTYPE. The
+/// checkpoint ships fp16 and `seedvr2_dit.load` / `seedvr2_vae.load*` widen
+/// every weight to the compute dtype at load, so what lands in memory is the
+/// file size times `seedvr2_dit.dtypeWidthRatio()` — 2x under the f32 compute
+/// path, 1x under bf16. Billing the files alone waved a 7 GB pack through a
+/// preflight it then doubled past, which is the class the gate exists to catch
+/// (a gate that runs before the estimator that knows better IS the estimator).
+///
+/// Nothing here is staged: encode -> ONE denoise step -> decode is a single
+/// pass with no boundary at which the DiT could be freed and reloaded, so both
+/// halves are resident together and the bill is a plain sum.
+pub fn seedvr2PeakBytes(dir_sum: u64) u64 {
+    if (dir_sum == 0) return 0; // unknown dir → never block
+    return dir_sum * seedvr2_dit.dtypeWidthRatio() + SEEDVR2_ACTIVATION_BYTES;
+}
+
+/// Headroom for one restoration's activations, over and above the weights.
+///
+/// Windowed attention holds `[window_tokens + txt_len, heads, head_dim]` per
+/// window plus the full `[T*H*W, dim]` stream, and the VAE decoder's first
+/// upsampled feature map is the single biggest tensor in the job. Measured at
+/// the 17-frame 720p ceiling this endpoint accepts; a fixed number rather than
+/// a per-request one because the gate is per-MODEL, not per-request.
+pub const SEEDVR2_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
 /// readable — 0 means "unknown", which every caller treats as "do not block".
@@ -4364,6 +4926,115 @@ fn jsonUnescape(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 const testing = std.testing;
 
+test "restore is a first-class modality, not an image backend" {
+    // A restorer cannot serve /v1/images/generations (there is no text-to-image
+    // path) and must not share the .image slot: loading one would EVICT a
+    // resident FLUX in order to upscale that FLUX's own output.
+    try testing.expectEqual(Modality.restore, modalityFromType("seedvr2").?);
+    try testing.expectEqual(Modality.restore, modalityFromType("seedvr2-3b").?);
+    try testing.expect(modalityFromType("seedvr2") != Modality.image);
+    try testing.expectEqualStrings("restore", Modality.restore.capability());
+    // The marker round-trips, like every other modality.
+    try testing.expectEqual(Modality.restore, modalityFromType(Modality.restore.modelType()).?);
+}
+
+test "both upscale routes share one modality and one engine slot" {
+    // Same shape as speech/music sharing .audio: two endpoints, one slot.
+    try testing.expectEqual(Modality.restore, GenRoute.upscale_image.modality());
+    try testing.expectEqual(Modality.restore, GenRoute.upscale_video.modality());
+}
+
+test "the restore geometry rule is ONE rule, and it names what it refused" {
+    // Both routes read `restoreGeometryRefusal`, so the image arm and the clip
+    // arm cannot drift into refusing different things — the pixel rule belongs
+    // to the VAE and the patchifier, not to a URL.
+    var buf: [220]u8 = undefined;
+
+    // Divisible by 16 on both sides, 4k+1 frames: allowed.
+    for ([_][3]u32{ .{ 1, 512, 512 }, .{ 1, 1920, 1072 }, .{ 5, 64, 64 }, .{ 17, 320, 176 } }) |c|
+        try testing.expect(restoreGeometryRefusal(&buf, c[0], c[1], c[2]) == null);
+
+    // THE trap: /8 clears the VAE and dies at the patch layer, so "divisible
+    // by 8" is the plausible wrong rule. 1080 is the case it exists for.
+    const eight = restoreGeometryRefusal(&buf, 1, 1920, 1080).?;
+    try testing.expect(std.mem.indexOf(u8, eight, "1080") != null);
+    try testing.expect(std.mem.indexOf(u8, eight, "16") != null);
+
+    // A refusal that does not name the number it compared reads as "this
+    // should have worked" (the context-overflow-400 class).
+    const odd_frames = restoreGeometryRefusal(&buf, 3, 512, 512).?;
+    try testing.expect(std.mem.indexOf(u8, odd_frames, "4k+1") != null);
+    const too_many = restoreGeometryRefusal(&buf, 21, 512, 512).?;
+    try testing.expect(std.mem.indexOf(u8, too_many, "21") != null);
+    try testing.expect(std.mem.indexOf(u8, too_many, "17") != null);
+    try testing.expect(restoreGeometryRefusal(&buf, 0, 512, 512) != null);
+}
+
+test "a restore too big for free memory is refused, not silently ruined" {
+    // THE FAILURE THIS PREVENTS IS A GOOD-LOOKING 200. MLX at the Metal
+    // working-set edge returns ZEROS rather than erroring (root `## Rules`),
+    // so a restore that does not fit comes back as a FLAT RECTANGLE with a
+    // 200 and no log line — measured live 2026-08-21 at 1536x1536 on a 24 GB
+    // Mac (a brown frame one run, a green one the next, which is how a
+    // memory-edge symptom announces itself) — or, once past Metal's max
+    // buffer size, kills the process outright at 2048x2048.
+    //
+    // The bill is LINEAR IN OUTPUT PIXELS and was measured, not derived:
+    // peak-minus-resident over 512/768/1024/1280/1536 px squares came to
+    // 4.77, 4.80, 4.79, 4.79 and 5.27 KB per pixel.
+    var buf: [256]u8 = undefined;
+    const gb: u64 = 1024 * 1024 * 1024;
+
+    // A 512x512 still needs ~1.3 GB. It fits in 8 GB and is not refused.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 512, 512, 8 * gb) == null);
+    // 2048x2048 needs ~21 GB and does not.
+    const msg = restoreMemoryRefusal(&buf, 1, 2048, 2048, 8 * gb) orelse {
+        std.debug.print("2048x2048 with 8 GB free was NOT refused\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    // A refusal quotes the numbers it COMPARED, or it reads as "this should
+    // have worked" and the user has nothing to act on.
+    try testing.expect(std.mem.indexOf(u8, msg, "GB") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "2048") != null);
+
+    // The SAME geometry passes when the memory is actually there, so the gate
+    // tracks the machine rather than banning a size outright.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 2048, 2048, 64 * gb) == null);
+
+    // Frames multiply: a 17-frame clip bills seventeen frames' worth, so a
+    // video that fits as a still can still be refused.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 512, 512, 2 * gb) == null);
+    try testing.expect(restoreMemoryRefusal(&buf, 17, 512, 512, 2 * gb) != null);
+
+    // Unknown free memory (the sysctl failed) must not refuse everything —
+    // a gate that cannot measure has nothing to say.
+    try testing.expect(restoreMemoryRefusal(&buf, 1, 2048, 2048, 0) == null);
+}
+
+test "seedvr2's residency bill follows the LOAD dtype, not the file sizes" {
+    // THE GATE THAT RUNS BEFORE THE ESTIMATOR THAT KNOWS BETTER IS THE
+    // ESTIMATOR. The pack ships fp16 and the DiT widens every weight to the
+    // compute dtype at load, so billing the directory alone under-reports by
+    // exactly `dtypeWidthRatio` — under f32 that waves a 7 GB pack through a
+    // preflight it then doubles past.
+    const GB = 1024 * 1024 * 1024;
+    const files: u64 = 7 * GB;
+    const want = files * seedvr2_dit.dtypeWidthRatio() + SEEDVR2_ACTIVATION_BYTES;
+    try testing.expectEqual(want, seedvr2PeakBytes(files));
+    // Activations are billed on top of the weights, never instead of them.
+    try testing.expect(seedvr2PeakBytes(files) > files);
+    // An unreadable dir is "unknown", and unknown must never block a load.
+    try testing.expectEqual(@as(u64, 0), seedvr2PeakBytes(0));
+}
+
+test "an incomplete SeedVR2 pack is invisible to discovery" {
+    // The DiT is the marker because it is the LARGEST file and lands LAST. A
+    // pack holding only config.json + vae.safetensors is a download in flight;
+    // registering it would shadow a complete copy in a later root and then die
+    // in the TEXT loader on the first missing weight.
+    try testing.expectEqualStrings("dit.safetensors", requiredMarkerFor("seedvr2").?);
+    try testing.expect(discovery.isMediaModelType("seedvr2"));
+}
 test "modalityFromType classifies the media archs + markers (incl. krea + hunyuan3d)" {
     try testing.expectEqual(Modality.image, modalityFromType("flux2-klein-4b").?);
     try testing.expectEqual(Modality.image, modalityFromType("flux2").?);

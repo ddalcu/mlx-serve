@@ -1235,6 +1235,133 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
 }
 
+/// Restoration/upscaling checkpoints (`.restore` capability — SeedVR2 today).
+/// One-step diffusion image/video restoration, served through
+/// `POST /v1/images/upscales` and `POST /v1/video/upscales` rather than the
+/// generation endpoints, so it carries no prompt/quality/resolution knobs —
+/// the model runs at the source's own geometry. Same `local/`-prefix
+/// convention as `Model3DModelPreset` for a not-yet-published conversion.
+struct RestoreModelPreset: Identifiable, Hashable {
+    var id: String
+    var name: String
+    /// Model directory under `~/.mlx-serve/models`.
+    var repo: String
+    /// Peak unified-memory footprint, GB — the DiT's compute dtype can widen
+    /// past its on-disk fp16 size (`seedvr2_dit.dtypeWidthRatio`), so this is
+    /// not just the download size.
+    let approxRAMGB: Int
+    /// Full bundle download size, GB (DiT + VAE + text-conditioning tensor).
+    let approxDownloadGB: Double
+    /// Plain-English explanation shown under the model in the Media pane.
+    let description: String
+    /// The DiT/transformer weight file this pack ships — `dit.safetensors`
+    /// for this project's own converter, `transformer.safetensors` for the
+    /// mlx-community 8-bit mirror (same NaDiT, quantized; the server's
+    /// `seedvr2_dit.KeyScheme` reads the naming difference off the
+    /// checkpoint itself). Feeds the bundle's ready-marker so the app's own
+    /// completeness check agrees with the server's `requiredMediaMarkers`.
+    var ditFilename: String = "dit.safetensors"
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    var isLocalOnly: Bool { repo.hasPrefix("local/") }
+
+    /// SeedVR2-3B, fp16 — a straight repack of ByteDance-Seed/SeedVR2-3B, no
+    /// requantization.
+    static let seedvr2_3b = RestoreModelPreset(
+        id: "seedvr2-3b",
+        name: "SeedVR2 3B (fp16)",
+        repo: "justintime47/SeedVR2-3B-MLX-Serve",
+        // 7.3 GB weights (bf16 compute, the server default) + a fixed 6 GB
+        // activation headroom the server bills for windowed attention + the
+        // VAE decoder's first upsampled feature map (`SEEDVR2_ACTIVATION_BYTES`
+        // in src/gen.zig) + the eviction gate's own 10% margin.
+        approxRAMGB: 18,
+        approxDownloadGB: 7.3,
+        description: "One-step diffusion restoration for photos and video clips — sharpens detail and removes compression artifacts, and can enlarge the image up to 4× while filling in real detail rather than just resizing."
+    )
+
+    /// SeedVR2-3B, 8-bit affine — the mlx-community mirror. The DiT stays
+    /// QUANTIZED at rest (`mlx_quantized_matmul`, never dequantized to bf16
+    /// at load), so unlike the fp16 sibling its resident weight bytes track
+    /// the download almost 1:1 rather than doubling under `--seedvr2-f32`.
+    /// Sizes are the repo's own reported bytes (`transformer.safetensors`
+    /// 4217529094 + `vae.safetensors`/`pos_emb.safetensors` ~502 MB): dir sum
+    /// ~4.72 GB + the same fixed 6 GiB activation headroom + the eviction
+    /// gate's 10% margin ≈ 12.3 GB, rounded up.
+    static let seedvr2_3b_int8 = RestoreModelPreset(
+        id: "seedvr2-3b-8bit",
+        name: "SeedVR2 3B (8-bit)",
+        repo: "mlx-community/SeedVR2-3B-mlx-int8",
+        approxRAMGB: 13,
+        approxDownloadGB: 4.7,
+        description: "One-step diffusion restoration for photos and video clips — sharpens detail and removes compression artifacts, and can enlarge the image up to 4× while filling in real detail rather than just resizing. This 8-bit build halves the download and memory footprint of the fp16 original.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    /// SeedVR2 7B — the larger checkpoint of the same family, and a different
+    /// CONFIGURATION rather than a scaled-up 3B: every layer is multimodal
+    /// (36 of 36, against the 3B's first 10), the MLP is a plain GELU instead
+    /// of gated SwiGLU, rope is half as wide and rotates video only, and the
+    /// output modulation the 3B closes with does not exist. The server reads
+    /// all of that from the pack's own `transformer_overrides` block.
+    static let seedvr2_7b_int8 = RestoreModelPreset(
+        id: "seedvr2-7b-8bit",
+        name: "SeedVR2 7B (8-bit)",
+        repo: "benc0/SeedVR2-7B-mlx-int8",
+        approxRAMGB: 16,
+        approxDownloadGB: 9.3,
+        description: "The larger SeedVR2. Holds fine texture and small faces better than the 3B, and takes about twice as long. This 8-bit build is the one to pick unless you have memory to spare.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    static let seedvr2_7b = RestoreModelPreset(
+        id: "seedvr2-7b",
+        name: "SeedVR2 7B (fp16)",
+        repo: "benc0/SeedVR2-7B-mlx",
+        approxRAMGB: 24,
+        approxDownloadGB: 17.0,
+        description: "The larger SeedVR2 at full precision. Needs a lot of memory — 32 GB or more — and is otherwise the same model as the 8-bit build.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    /// The `sharp` finetune — ByteDance's own second 7B checkpoint, tuned for
+    /// stronger detail sharpening. Identical architecture, different weights,
+    /// so it costs exactly what the standard 7B costs.
+    static let seedvr2_7b_sharp_int8 = RestoreModelPreset(
+        id: "seedvr2-7b-sharp-8bit",
+        name: "SeedVR2 7B Sharp (8-bit)",
+        repo: "benc0/SeedVR2-7B-sharp-mlx-int8",
+        approxRAMGB: 16,
+        approxDownloadGB: 9.3,
+        description: "The 7B tuned to sharpen harder. Worth trying on soft or heavily compressed sources; on already-clean photos it can look overdone.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    static let seedvr2_7b_sharp = RestoreModelPreset(
+        id: "seedvr2-7b-sharp",
+        name: "SeedVR2 7B Sharp (fp16)",
+        repo: "benc0/SeedVR2-7B-sharp-mlx",
+        approxRAMGB: 24,
+        approxDownloadGB: 17.0,
+        description: "The sharpening-tuned 7B at full precision. Needs 32 GB or more.",
+        ditFilename: "transformer.safetensors"
+    )
+
+    /// Catalog, smallest first — the 3B 8-bit build is the one most Macs
+    /// should reach for, and the fp16 7B entries sit last because they are the
+    /// only ones that will not fit in 16 GB.
+    static let all: [RestoreModelPreset] = [
+        .seedvr2_3b_int8,       // ~13 GB
+        .seedvr2_3b,            // ~18 GB
+        .seedvr2_7b_int8,       // ~16 GB
+        .seedvr2_7b_sharp_int8, // ~16 GB
+        .seedvr2_7b,            // ~24 GB
+        .seedvr2_7b_sharp,      // ~24 GB
+    ]
+}
+
 /// Which music ENGINE a checkpoint drives. The two families share the
 /// endpoint and nothing else: ACE-Step reads the whole musical-metadata knob
 /// set, MiniMax Music 3 rejects every one of those fields BY NAME and
