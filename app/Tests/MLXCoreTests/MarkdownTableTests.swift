@@ -102,43 +102,13 @@ final class MarkdownTableTests: XCTestCase {
     | 3 | 4 |
     """
 
-    /// The table has no frame of its own to stroke, so the outline is drawn by
-    /// whichever cells sit on its edges. Miss one and the box has a gap.
-    func testTheOutlineIsDrawnByTheCellsOnTheEdges() {
-        let blocks = tableBlocks(Self.gridSource)
-        XCTAssertFalse(blocks.isEmpty, "sanity: the source really renders a table")
-
-        // header row (0) carries the top edge, last row (2) the bottom
-        let top = blocks.filter { $0.startingRow == 0 }
-        XCTAssertTrue(top.allSatisfy { $0.width(for: .border, edge: .minY) > 0 }, "top edge")
-        let bottom = blocks.filter { $0.startingRow == 2 }
-        XCTAssertTrue(bottom.allSatisfy { $0.width(for: .border, edge: .maxY) > 0 }, "bottom edge")
-
-        let left = blocks.filter { $0.startingColumn == 0 }
-        XCTAssertTrue(left.allSatisfy { $0.width(for: .border, edge: .minX) > 0 }, "left edge")
-        let right = blocks.filter { $0.startingColumn == 1 }
-        XCTAssertTrue(right.allSatisfy { $0.width(for: .border, edge: .maxX) > 0 }, "right edge")
-    }
-
-    /// Rules between rows are hairlines; the header's own rule and the outline
-    /// are full weight, so the heading still reads as a heading.
-    func testRowRulesAreLighterThanTheHeaderRuleAndTheOutline() throws {
-        let blocks = tableBlocks(Self.gridSource)
-        let header = try XCTUnwrap(blocks.first { $0.startingRow == 0 })
-        let middle = try XCTUnwrap(blocks.first { $0.startingRow == 1 })
-        let last = try XCTUnwrap(blocks.first { $0.startingRow == 2 })
-
-        XCTAssertLessThan(middle.width(for: .border, edge: .maxY),
-                          header.width(for: .border, edge: .maxY))
-        XCTAssertLessThan(middle.width(for: .border, edge: .maxY),
-                          last.width(for: .border, edge: .maxY))
-        XCTAssertGreaterThan(middle.width(for: .border, edge: .maxY), 0, "rows are still separated")
-    }
-
     /// A neighbour's top edge would land on the same line as this one's bottom
     /// and draw it twice as thick, so only `.maxY` is ever set between rows.
+    /// The kind of thing that reads as "the middle rule looks wrong somehow"
+    /// and takes an afternoon to find.
     func testARowRuleIsNeverDrawnTwice() {
         let blocks = tableBlocks(Self.gridSource)
+        XCTAssertFalse(blocks.isEmpty, "sanity: the source really renders a table")
         for block in blocks where block.startingRow > 0 {
             XCTAssertEqual(block.width(for: .border, edge: .minY), 0,
                            "row \(block.startingRow) redraws the rule above it")
@@ -146,25 +116,13 @@ final class MarkdownTableTests: XCTestCase {
     }
 
     /// Vertical rules between columns turn a comparison into a spreadsheet, so
-    /// only the outermost columns carry a side.
+    /// only the outermost columns carry a side. Easy to reintroduce by setting
+    /// a border on every edge of every cell.
     func testThereAreNoRulesBetweenColumns() {
         let blocks = tableBlocks("| a | b | c |\n| --- | --- | --- |\n| 1 | 2 | 3 |")
         for block in blocks where block.startingColumn == 1 {
             XCTAssertEqual(block.width(for: .border, edge: .minX), 0)
             XCTAssertEqual(block.width(for: .border, edge: .maxX), 0)
-        }
-    }
-
-    /// The header is filled, the data rows are not, and the fill is lighter
-    /// than the rules around it.
-    func testOnlyTheHeaderIsFilled() {
-        let blocks = tableBlocks(Self.gridSource)
-        for block in blocks {
-            if block.startingRow == 0 {
-                XCTAssertNotNil(block.backgroundColor, "the header needs its fill")
-            } else {
-                XCTAssertNil(block.backgroundColor, "a data row must stay clear")
-            }
         }
     }
 

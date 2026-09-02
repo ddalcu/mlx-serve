@@ -48,6 +48,34 @@ enum ChatColumnWidth: String, CaseIterable, Identifiable {
         }
     }
 
+    /// How wide your own turn may get before it wraps.
+    ///
+    /// Narrower than the column it sits in, because a right-aligned bubble that
+    /// reaches the same left edge as the reply below it stops reading as one
+    /// side of a conversation. It stops growing at Medium: past that the
+    /// question is already a paragraph, and a wider one only makes the ragged
+    /// left edge harder to follow back to.
+    var userBubbleWidth: CGFloat {
+        switch self {
+        case .narrow: return 700
+        case .medium, .wide: return 900
+        }
+    }
+
+    /// F1 / F2 / F3, narrowest first, in View ▸ Interface.
+    ///
+    /// Spelled as the raw function-key scalars because `KeyEquivalent` has no
+    /// named cases for them; these are AppKit's `NSF1FunctionKey` and its two
+    /// successors. Unmodified, since the menu is where they are discoverable
+    /// and nothing else in the app claims a bare function key.
+    var menuShortcut: KeyEquivalent {
+        switch self {
+        case .narrow: return KeyEquivalent("\u{F704}")
+        case .medium: return KeyEquivalent("\u{F705}")
+        case .wide: return KeyEquivalent("\u{F706}")
+        }
+    }
+
     static var current: ChatColumnWidth {
         ChatColumnWidth(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.chatColumn) ?? "") ?? .wide
     }

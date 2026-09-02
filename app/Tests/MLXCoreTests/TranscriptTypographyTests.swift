@@ -169,6 +169,66 @@ final class TranscriptTypographyTests: XCTestCase {
         }
     }
 
+    /// Compact tightens your own turn, and never to nothing. The exact ratio is
+    /// a judgement call and belongs to the eye, not to an assert.
+    func testCompactTightensTheUsersOwnLeading() {
+        UserDefaults.standard.set(false, forKey: InterfacePrefKey.compactMode)
+        let roomy = ChatMetrics.userLineSpacing
+        UserDefaults.standard.set(true, forKey: InterfacePrefKey.compactMode)
+        let tight = ChatMetrics.userLineSpacing
+        UserDefaults.standard.removeObject(forKey: InterfacePrefKey.compactMode)
+
+        XCTAssertLessThan(tight, roomy)
+        XCTAssertGreaterThan(tight, 0, "lines still need to breathe")
+    }
+
+    /// Your own turn is always narrower than the column it sits in, or a long
+    /// question reaches the same left edge as the reply below it and the two
+    /// sides of the conversation stop being distinguishable.
+    func testYourOwnTurnStaysNarrowerThanTheColumn() {
+        withColumn(.narrow) {
+            XCTAssertLessThan(ChatMetrics.userBubbleMaxWidth,
+                              ChatMetrics.proseWidth(panelWidth: 2000))
+        }
+        withColumn(.medium) {
+            XCTAssertLessThan(ChatMetrics.userBubbleMaxWidth,
+                              ChatMetrics.proseWidth(panelWidth: 2000))
+        }
+    }
+
+    /// It stops growing at Medium: past that the question is already a
+    /// paragraph, and a wider one only lengthens the ragged left edge.
+    func testTheBubbleStopsGrowingPastMedium() {
+        XCTAssertEqual(ChatColumnWidth.medium.userBubbleWidth, ChatColumnWidth.wide.userBubbleWidth)
+        XCTAssertLessThan(ChatColumnWidth.narrow.userBubbleWidth,
+                          ChatColumnWidth.medium.userBubbleWidth)
+    }
+
+    // MARK: - The two doors onto one setting
+
+    /// Every width needs its own key, or one of them is unreachable and the
+    /// menu silently does the wrong thing.
+    func testEachWidthHasItsOwnShortcut() {
+        let keys = ChatColumnWidth.allCases.map { $0.menuShortcut.character }
+        XCTAssertEqual(Set(keys).count, ChatColumnWidth.allCases.count)
+    }
+
+    /// The menu and the Settings row are two doors onto ONE setting. Reading a
+    /// different key in either place gives the app two states that disagree,
+    /// and the one you can see is not always the one that draws.
+    func testTheMenuAndSettingsWriteTheSameKey() throws {
+        for path in ["Sources/MLXServe/MLXServeApp.swift",
+                     "Sources/MLXServe/Views/SettingsView.swift"] {
+            let url = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent(path)
+            let source = try String(contentsOf: url, encoding: .utf8)
+            XCTAssertTrue(source.contains("InterfacePrefKey.chatColumn"),
+                          "\(path) must go through the shared key, never a literal")
+        }
+    }
+
     func testAnUnknownStoredColumnFallsBackToWide() {
         UserDefaults.standard.set("gigantic", forKey: InterfacePrefKey.chatColumn)
         defer { UserDefaults.standard.removeObject(forKey: InterfacePrefKey.chatColumn) }

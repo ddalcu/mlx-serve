@@ -3624,6 +3624,10 @@ struct MessageBubble: View {
     /// new chat and this one is left alone. nil when there would be nothing to
     /// fork (`ChatFork.isForkable`) or on a read-only surface.
     var onFork: (() -> Void)?
+    /// Drives the action row on your own turn. Tracked on the whole row, not on
+    /// the buttons: they start invisible, and a hover target you cannot see is
+    /// one you cannot aim at.
+    @State private var isHovered = false
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
@@ -3644,31 +3648,61 @@ struct MessageBubble: View {
         }
     }
 
-    /// Reasoning accordion. The WHOLE header toggles, not just the chevron:
-    /// macOS only hit-tests the disclosure triangle on a DisclosureGroup's
-    /// label, so the "Thinking" text was a dead click target — same fix as the
-    /// Agents editor's Advanced row (the label holds no buttons of its own, so
-    /// a tap gesture here can't swallow child clicks).
+    /// Still working on the reasoning itself: the reply has not started, so the
+    /// brain is what the model is currently doing rather than a record of what
+    /// it did.
+    private var isThinkingNow: Bool {
+        message.isStreaming && message.content.isEmpty
+    }
+
+    /// Reasoning accordion. Hand-built rather than a `DisclosureGroup`, which
+    /// puts its chevron on the LEADING edge and offers no way to move it.
+    /// Everything else follows from that: the header is a plain button spanning
+    /// the full width, so the WHOLE strip toggles rather than just the words —
+    /// macOS hit-tests only the disclosure triangle on a `DisclosureGroup`'s
+    /// label, which left "Thinking" a dead click target.
     @ViewBuilder
     private var thinkingBlock: some View {
         if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-            DisclosureGroup(isExpanded: $thinkingExpanded) {
-                Text(reasoning)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label("Thinking", systemImage: "brain")
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "brain")
+                            .symbolEffect(.pulse, isActive: isThinkingNow)
+                        // Just "Thinking" while it happens; the duration
+                        // arrives with the answer.
+                        Text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds))
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
+                    }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
+                    // The strip is mostly empty space, and empty space in a
+                    // stack has nothing to hit-test against.
                     .contentShape(Rectangle())
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
-                    }
+                }
+                .buttonStyle(.plain)
+
+                if thinkingExpanded {
+                    Text(reasoning)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .padding(8)
-            .background(.quaternary.opacity(0.5))
+            // Padding and fill arrive WITH the content. Collapsed, this is one
+            // grey line of type in the transcript rather than a container, so
+            // the chevron sits at the column's own edge instead of one padding
+            // short of it.
+            .padding(.horizontal, thinkingExpanded ? ChatMetrics.bubblePaddingH : 0)
+            .padding(.vertical, thinkingExpanded ? ChatMetrics.bubblePaddingV : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(thinkingExpanded ? AnyShapeStyle(.quaternary.opacity(0.5))
+                                         : AnyShapeStyle(Color.clear))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
@@ -3678,7 +3712,6 @@ struct MessageBubble: View {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                // Reasoning (collapsible)
                 thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
@@ -3690,7 +3723,7 @@ struct MessageBubble: View {
                 // it is the original the generator wrote, not a re-encode.
                 if let images = message.images, !images.isEmpty,
                    message.media?.contains(where: { $0.kind == .image }) != true {
-                    HStack(spacing: 4) {
+                    AttachmentFlowLayout(spacing: ChatMetrics.attachmentSpacing) {
                         ForEach(images) { img in
                             // No bytes: the file under `attachments/` is gone,
                             // or this message predates attachments on disk and
@@ -3705,16 +3738,27 @@ struct MessageBubble: View {
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
                             } else if let nsImage = NSImage(data: img.data) {
+                                // One height, width from the picture's own
+                                // ratio, and `.fill` so the frame is covered
+                                // rather than letterboxed — the rounded corners
+                                // clip the FRAME, so a letterboxed picture
+                                // would leave them cutting empty space and the
+                                // photo itself square.
                                 Image(nsImage: nsImage)
                                     .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 400, maxHeight: 300)
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
+                                           height: ChatMetrics.attachmentHeight)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                                     .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
                                     .help("Double-click to open in Preview")
                             }
                         }
                     }
+                    // The whole column, not the bubble's reading measure: how
+                    // many photos fit on a line has nothing to do with how long
+                    // a line of text should be.
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
 
                 // Generated tracks / clips, attached by path (see ChatMediaRef).
@@ -3799,7 +3843,13 @@ struct MessageBubble: View {
                     .background(bubbleBackground)
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: isBare ? 0 : ChatMetrics.bubbleCornerRadius))
-                    .frame(maxWidth: .infinity, alignment: isBare ? .leading : .trailing)
+                    // The bubble's OWN cap, so its text wraps at a reading
+                    // measure while a row of attachments above it may be wider.
+                    // Applied here rather than to the text: the bubble hugs its
+                    // content, and a frame on the text itself would stretch a
+                    // one-line question across the whole width.
+                    .frame(maxWidth: message.role == .user ? ChatMetrics.userBubbleMaxWidth : .infinity,
+                           alignment: isBare ? .leading : .trailing)
                 }
 
                 // A cut reply's notice: DATA on the message, drawn as a footnote
@@ -3823,10 +3873,37 @@ struct MessageBubble: View {
                 }
 
                 if showsFooter { footer }
+                if showsUserActions { userActions }
             }
+            // Compact draws no action row, so the space it would have taken is
+            // partly given back explicitly — without it your question sits
+            // flush against the reply to it.
+            .padding(.bottom, message.role == .user ? ChatMetrics.userBubbleBottomPadding : 0)
+            .frame(maxWidth: .infinity,
+                   alignment: message.role == .user ? .trailing : .leading)
+            // The column, not a cap: the two things inside a user turn take
+            // their own widths (the bubble a reading measure, a row of
+            // attachments as much as it can use), and capping here would put
+            // the narrower of the two in charge of both.
+            .frame(maxWidth: .infinity,
+                   alignment: message.role == .user ? .trailing : .leading)
 
-            if message.role == .assistant { Spacer(minLength: 60) }
+            // No spacer on the assistant's side. A reply IS the column: the
+            // user picks its width in Settings ▸ Interface, so an extra 60pt
+            // inside it was a margin on top of a margin — and it was what kept
+            // the reasoning block's chevron short of the edge. Generated media
+            // and the progress card carry their own fixed widths (400/420 in
+            // `ChatMediaAttachmentView`), so nothing here was relying on it.
+            //
+            // Your own turn keeps its spacer: that one separates the two sides
+            // of the conversation rather than trimming an edge.
         }
+        // A stack with no background has nothing to hit-test against, so the
+        // hover ended wherever the bubble did — including over the action row,
+        // which is transparent until hovered. Moving towards the buttons made
+        // them vanish.
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
             if onEdit != nil {
@@ -3925,6 +4002,7 @@ struct MessageBubble: View {
     /// bubble.
     private var isBare: Bool { message.role == .assistant && !message.isAgentSummary }
 
+
     private var bubbleBackground: Color {
         if isBare { return .clear }
         return message.role == .user ? Color.accentColor : Color(.controlBackgroundColor)
@@ -4017,11 +4095,54 @@ struct MessageBubble: View {
         .padding(.top, 2)
     }
 
-    private func footerButton(_ icon: String, help: String,
+    /// Your own turn had these four only in a context menu, which is a place
+    /// nobody looks unless they already suspect something is there. The reply
+    /// below has carried the same actions on its face all along.
+    ///
+    /// Hidden in compact mode rather than faded: compact exists to fit more
+    /// conversation on screen, and a row that is invisible but still occupies
+    /// its height would take that back. The context menu keeps working, so
+    /// nothing becomes unreachable.
+    private var showsUserActions: Bool {
+        message.role == .user && !message.isStreaming && !ChatMetrics.compactMode
+    }
+
+    /// Revealed on hover over the whole turn - bubble, attachments and this row
+    /// together - because a control that appears only once the pointer is
+    /// already on top of it cannot be discovered by moving towards it.
+    private var userActions: some View {
+        HStack(spacing: 2) {
+            footerButton("square.on.square", help: "Copy this message") { copyMessage() }
+            if onEdit != nil {
+                footerButton("pencil", help: "Edit this message and send it again") { startEditing() }
+            }
+            if let onFork {
+                // Flipped: the built-in glyph branches downward, and this
+                // branches BACK from a message already above you.
+                footerButton("arrow.trianglehead.branch",
+                             help: "Start a new chat from this message",
+                             flipped: true, action: onFork)
+            }
+            if let onDelete {
+                footerButton("trash", help: "Delete this message from the conversation",
+                             action: onDelete)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.top, 2)
+        .opacity(isHovered ? 1 : 0)
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+        // Nothing to click while invisible: a fully faded row would otherwise
+        // still swallow clicks meant for the transcript behind it.
+        .allowsHitTesting(isHovered)
+    }
+
+    private func footerButton(_ icon: String, help: String, flipped: Bool = false,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11))
+                .scaleEffect(y: flipped ? -1 : 1)
                 .foregroundStyle(.secondary)
                 .frame(width: 20, height: 18)
                 .contentShape(Rectangle())

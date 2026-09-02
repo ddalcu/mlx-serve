@@ -1857,7 +1857,7 @@ private struct InterfaceSectionContent: View {
             .frame(width: 140)
         }
         SettingsRow(title: "Chat Column",
-                    explainer: "How much of the window a conversation fills. Tables always keep the full width.") {
+                    explainer: "How wide a conversation reads. Narrow and Medium are fixed widths, so resizing the window moves the margins rather than the text; Wide follows the window. Also on F1-F3, under View ▸ Interface.") {
             Picker("", selection: $chatColumnRaw) {
                 ForEach(ChatColumnWidth.allCases) { width in
                     Text(width.label).tag(width.rawValue)
@@ -1867,7 +1867,7 @@ private struct InterfaceSectionContent: View {
             .pickerStyle(.segmented)
             .frame(width: 220)
         }
-        SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen.") {
+        SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen. Also on ⌃C, under View ▸ Interface.") {
             Toggle("", isOn: $compactMode)
                 .labelsHidden()
                 .toggleStyle(.switch)
