@@ -119,6 +119,11 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
+    /// The verbatim `model_type` from config.json BEFORE family-specific
+    /// branches remap `model_type` to the trunk family (e.g. qwen3_vl →
+    /// qwen3). Used by `useChatTemplateEmbeddings()` to decide whether
+    /// /v1/embeddings should render the chat template.
+    original_model_type: []const u8 = "",
     weight_prefix: []const u8 = "language_model.model",
 
     // Core dimensions
@@ -852,6 +857,20 @@ pub const ModelConfig = struct {
     /// (Qwen3-Embedding). Drives capability advertising, never dispatch.
     pub fn hasEmbeddingCapability(self: *const ModelConfig) bool {
         return self.is_encoder_only or self.pooling_mode != null;
+    }
+
+    /// Whether the /v1/embeddings tokenizer path renders the model's chat
+    /// template before pooling. Mirrors mlx-embeddings' dispatch, which routes
+    /// to a chat-template Processor strictly by model_type — only the
+    /// qwen3_vl embedding family does (its processor always constructs a
+    /// system+user conversation). Everything else — including text-only
+    /// qwen3 checkpoints that SHIP a ChatML template in tokenizer_config
+    /// (Qwen/Qwen3-Embedding) and generative trunks like WeMM's qwen3_5 —
+    /// embeds via raw tokenization plus the tokenizer post-processor's
+    /// trailing special token.
+    pub fn useChatTemplateEmbeddings(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.original_model_type, "qwen3_vl") or
+            std.mem.eql(u8, self.original_model_type, "qwen3_vl_text");
     }
 
     pub fn isInkling(self: *const ModelConfig) bool {
@@ -1639,6 +1658,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
+    // The JSON arena is freed on return; dupe so original_model_type survives.
+    config.original_model_type = try allocator.dupe(u8, model_type);
 
     // Determine which object to read config from: text_config (nested) or root (flat)
     const cfg_obj = if (root.get("text_config")) |tc_val| tc_val.object else root;
