@@ -7447,14 +7447,25 @@ fn handleEmbeddings(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' entries must be non-empty strings", null);
             return;
         }
-        // Models with a chat template (e.g. Qwen3-VL-Embedding) produce
-        // reference embeddings via the FULL chat-template pipeline: system
-        // prompt + user text + add_generation_prompt, then the tokenizer's
-        // TemplateProcessing post-processor appends <EOS> (151643). Zig's
-        // tokenizer has no post-processor, so we render the template via
-        // formatChat and manually append bos_token_id (which is <EOS> for
-        // Qwen3-VL) to match the reference's token sequence exactly.
-        const ids = if (lm.chat_config) |cc| blk: {
+        // Models whose REFERENCE pipeline renders a chat template for
+        // embeddings (e.g. Qwen3-VL-Embedding via mlx-embeddings' Processor)
+        // produce reference embeddings through the FULL chat-template path:
+        // system prompt + user text + add_generation_prompt, then the
+        // tokenizer's TemplateProcessing post-processor appends <EOS>
+        // (151643). Zig's tokenizer has no post-processor, so we render the
+        // template via formatChat and manually append bos_token_id (which is
+        // <EOS> for Qwen3-VL) to match the reference's token sequence exactly.
+        //
+        // Gated on the model family, NOT on template availability alone:
+        // mlx-embeddings only routes models to its chat pipeline by
+        // model_type (qwen3_vl), and text-only Qwen3-Embedding checkpoints
+        // embed via RAW tokenization there. Broad gating would also ensnare
+        // generative checkpoints that merely SHIP a chat_template.jinja
+        // (e.g. WeMM-Embedding's Qwen3.5 trunk), rendering its generation
+        // template — assistant prompt + think block — into an embedding
+        // request. useChatTemplateEmbeddings() keeps those on the raw path.
+        const ids = if (lm.chat_config != null and config.useChatTemplateEmbeddings()) blk: {
+            const cc = lm.chat_config.?;
             if (cc.chat_template.len == 0) break :blk null;
 
             // Construct messages: [{role: "user", content: text}].
