@@ -5720,6 +5720,13 @@ pub const ForwardCtx = struct {
     mrope_delta: i32 = 0,
     mrope_cos_cur: ?mlx.mlx_array = null,
     mrope_sin_cur: ?mlx.mlx_array = null,
+    /// Qwen3-VL-Embedding DeepStack streams ([N_merged, out_hidden] each),
+    /// ADDED to the decoder outputs of layers 0..n after each layer's residual
+    /// write (mlx_vlm language.py:245-247 — `h[visual_pos] += stream[layer]`,
+    /// NOT the generate-path row REPLACE). Borrowed: the producer keeps the
+    /// arrays alive for the whole forward and frees them. Null/empty for text
+    /// and generate-path vision forwards.
+    deepstack_embeds: []const mlx.mlx_array = &.{},
     /// qwen4_exp QSA: the bool `[B, 1, S, kv]` mask (indexer-selected blocks
     /// ∧ causal) `gatedFullAttnWith` must apply this layer. Null-ctx = dense.
     qsa_mask: mlx.mlx_array = .{ .ctx = null },
@@ -10264,6 +10271,14 @@ pub const Transformer = struct {
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
 
+        // Qwen3-VL interleaved M-RoPE: the per-prefill-chunk cos/sin, shared by
+        // every layer this forward (same contract as forwardMoeWith). The rope
+        // call sites below consume `ctx.mrope_cos_cur` when set; decode leans
+        // on the scalar `offset + mrope_delta` arm. beginMropeChunk no-ops for
+        // non-M-RoPE forwards (no table, seq_len 1, chunk past the table).
+        try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), mlx.mlx_array_dtype(h));
+        defer endMropeChunk(ctx);
+
         // Shapes for sliding-window layers (default)
         const q_shape = [_]c_int{ batch, seq_len, @intCast(h_count), @intCast(hd) };
         const kv_shape = [_]c_int{ batch, seq_len, @intCast(kv_h), @intCast(hd) };
@@ -10377,6 +10392,29 @@ pub const Transformer = struct {
 
         var dt = mlx.DtypeTrace.begin("standard", h, if (self.layers.len > 0) self.layers[0].q_w else null);
 
+        // DeepStack (Qwen3-VL-Embedding): additive streams for layers 0..n.
+        // Zeroed at image positions so text tokens never receive the stream;
+        // the int mask is built lazily on the first tapped layer. Owned here.
+        var ds_mask_int: ?mlx.mlx_array = null;
+        defer {
+            if (ds_mask_int) |m| _ = mlx.mlx_array_free(m);
+        }
+        var ds_mask_built = false;
+        var one_i: ?mlx.mlx_array = null; // int32 scalar 1 (cumsum-1 indexing)
+        defer {
+            if (one_i) |o| _ = mlx.mlx_array_free(o);
+        }
+
+        if (std.c.getenv("MLX_SERVE_MM_DEBUG_DUMP") != null) {
+            if (ctx.mrope_cos_cur) |cs| {
+                const dump_io0 = std.Io.Threaded.global_single_threaded.io();
+                mmDebugDumpOne(dump_io0, "mrope_cos", cs);
+                mmDebugDumpOne(dump_io0, "mrope_sin", ctx.mrope_sin_cur.?);
+                // layer-0 post-embedding input for splice verification
+                mmDebugDumpOne(dump_io0, "h0", h);
+            }
+        }
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &self.layers[layer_idx];
@@ -10431,8 +10469,19 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(q_rope);
             if (skip_rope) {
                 _ = mlx.mlx_array_set(&q_rope, q_t);
+            } else if (ctx.mrope_cos_cur) |cos| {
+                // Interleaved M-RoPE: per-token angles (3-D t/h/w at image
+                // tokens), full head_dim — the chunk table IS sized to the
+                // rotary dims, the passthrough tail is handled inside.
+                _ = mlx.mlx_array_free(q_rope);
+                q_rope = try self.applyMrope(q_t, cos, ctx.mrope_sin_cur.?, @intCast(cur_hd));
             } else {
-                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
+                const eff_offset_q: c_int = @as(c_int, @intCast(offset)) + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, eff_offset_q, rope_freqs, self.s));
+            }
+            if (std.c.getenv("MLX_SERVE_MM_DEBUG_QK") != null and layer_idx == 0) {
+                const dlio = std.Io.Threaded.global_single_threaded.io();
+                mmDebugDumpOne(dlio, "zig_q_rope", q_rope);
             }
 
             // K, V and cache — either compute or read from shared source.
@@ -10496,18 +10545,30 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(own_v_t);
                 try mlx.check(mlx.mlx_transpose_axes(&own_k_t, k_for_rope, &perm, 4, self.s));
                 try mlx.check(mlx.mlx_transpose_axes(&own_v_t, v_after_norm, &perm, 4, self.s));
+                if (std.c.getenv("MLX_SERVE_MM_DEBUG_QK") != null and layer_idx == 0) {
+                    const dvio = std.Io.Threaded.global_single_threaded.io();
+                    mmDebugDumpOne(dvio, "zig_v_t", own_v_t);
+                }
 
                 // RoPE on K (NoPE layers store K un-rotated)
                 var own_k_rope = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(own_k_rope);
                 if (skip_rope) {
                     _ = mlx.mlx_array_set(&own_k_rope, own_k_t);
+                } else if (ctx.mrope_cos_cur) |cos| {
+                    _ = mlx.mlx_array_free(own_k_rope);
+                    own_k_rope = try self.applyMrope(own_k_t, cos, ctx.mrope_sin_cur.?, @intCast(cur_hd));
                 } else {
-                    try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
+                    const eff_offset_k: c_int = @as(c_int, @intCast(offset)) + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+                    try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, eff_offset_k, rope_freqs, self.s));
                 }
 
                 // Update KV cache
                 const max_kv: u32 = if (is_global) 0 else sliding_span;
+                if (std.c.getenv("MLX_SERVE_MM_DEBUG_QK") != null and layer_idx == 0) {
+                    const dkio = std.Io.Threaded.global_single_threaded.io();
+                    mmDebugDumpOne(dkio, "zig_k_rope", own_k_rope);
+                }
                 kv_view = try ctx.cache.update(li, own_k_rope, own_v_t, self.s, max_kv);
                 full_k = kv_view.k;
                 full_v = kv_view.v;
@@ -10642,6 +10703,11 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
             }
 
+            if (std.c.getenv("MLX_SERVE_MM_DEBUG_QK") != null and layer_idx == 0) {
+                const daio = std.Io.Threaded.global_single_threaded.io();
+                mmDebugDumpOne(daio, "zig_sdpa_out", attn_out);
+            }
+
             // Reshape attention output
             var attn_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_t);
@@ -10731,12 +10797,119 @@ pub const Transformer = struct {
                 h = h_scaled;
             }
 
+            // DeepStack (Qwen3-VL-Embedding): AFTER the layer's residual write,
+            // BEFORE the next layer reads h — h[visual_pos] += stream[i]
+            // (mlx_vlm language.py:245-247). Prefill + streams only.
+            if (ctx.deepstack_embeds.len > 0 and is_prefill and layer_idx < ctx.deepstack_embeds.len) {
+                if (!ds_mask_built) {
+                    // One-time: int mask of image-token positions, flat [B*S].
+                    const img_id_arr = mlx.mlx_array_new_int(@intCast(cfg.image_token_id));
+                    defer _ = mlx.mlx_array_free(img_id_arr);
+                    var mask2d = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(mask2d);
+                    try mlx.check(mlx.mlx_equal(&mask2d, token_ids, img_id_arr, self.s));
+                    const mask_shape = [_]c_int{ batch * seq_len };
+                    var mflat = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_reshape(&mflat, mask2d, &mask_shape, 1, self.s));
+                    defer _ = mlx.mlx_array_free(mflat);
+                    ds_mask_int = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_astype(&ds_mask_int.?, mflat, .int32, self.s));
+                    one_i = mlx.mlx_array_new_int(1);
+                    ds_mask_built = true;
+                }
+                if (ds_mask_int) |_| {
+                    const stream = ctx.deepstack_embeds[layer_idx];
+                    // Streams arrive as image-only rows [N_merged, H] (vision
+                    // tower output); scatter them to the image-token positions
+                    // of the flat [B*S] sequence. Row r of the stream lands at
+                    // the r-th image token: cumsum(mask)-1 gives that row index
+                    // per position, gathered per row via take_axis(0); text
+                    // positions pull row 0 of a rotated stream and are zeroed
+                    // by the mask multiply before the result can reach h. The
+                    // row-order scatter matches the reference
+                    // `hidden_states[layer+1][:, visual_pos] += feature`
+                    // (mlx_vlm language.py:245-247).
+                    // NOTE: query the CURRENT h's shape — a stale shape slice
+                    // captured before an earlier layer's free-and-replace of
+                    // h would dangle (x_shape reads freed memory).
+                    const h_now_shape = mlx.getShape(h);
+                    const h_cols: c_int = h_now_shape[2];
+
+                    const stream_shape = mlx.getShape(stream);
+                    var n_src_rows: usize = 1;
+                    for (stream_shape[0 .. stream_shape.len - 1]) |d| n_src_rows *= @intCast(d);
+
+                    const src_shape = [_]c_int{ @intCast(n_src_rows), h_cols };
+                    var source_flat = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(source_flat);
+                    try mlx.check(mlx.mlx_reshape(&source_flat, stream, &src_shape, 2, self.s));
+
+                    // src_idx[pos] = cumsum(mask)[pos]-1 for image positions
+                    // (the r-th image token pulls row r of the stream); text
+                    // positions hold negative values that roll over into the
+                    // stream via modulo (a valid but discarded row). int64
+                    // indices per take_axis requirements.
+                    const n_rows_arr = mlx.mlx_array_new_int(@intCast(n_src_rows));
+                    defer _ = mlx.mlx_array_free(n_rows_arr);
+                    var cumsum_idx = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(cumsum_idx);
+                    // inclusive cumsum over the flat [B*S] int mask, axis 0,
+                    // then subtract 1 → row index per image position.
+                    try mlx.check(mlx.mlx_cumsum(&cumsum_idx, ds_mask_int.?, 0, false, true, self.s));
+                    var sub_idx = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(sub_idx);
+                    try mlx.check(mlx.mlx_subtract(&sub_idx, cumsum_idx, one_i.?, self.s));
+                    var src_idx_i32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(src_idx_i32);
+                    try mlx.check(mlx.mlx_remainder(&src_idx_i32, sub_idx, n_rows_arr, self.s));
+                    var src_idx = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(src_idx);
+                    try mlx.check(mlx.mlx_astype(&src_idx, src_idx_i32, .int64, self.s));
+
+                    // Gather the [B*S, H] contribution: row r of the stream
+                    // lands on the r-th image token; text rows pull a rolled
+                    // row that the mask zeroes before it reaches h.
+                    var contribution = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(contribution);
+                    try mlx.check(mlx.mlx_take_axis(&contribution, source_flat, src_idx, 0, self.s));
+
+                    // Zero out text positions (mask as [B*S, 1] broadcasts the
+                    // zero across each row), cast to h's dtype (h may be bf16
+                    // while the tower streams are float16/float32 — the add
+                    // requires matching dtypes), reshape to [B, S, H].
+                    const mask_col_shape = [_]c_int{ batch * seq_len, 1 };
+                    var mask_col = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(mask_col);
+                    try mlx.check(mlx.mlx_reshape(&mask_col, ds_mask_int.?, &mask_col_shape, 2, self.s));
+                    var masked = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(masked);
+                    try mlx.check(mlx.mlx_multiply(&masked, mask_col, contribution, self.s));
+                    var masked_dt = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(masked_dt);
+                    try mlx.check(mlx.mlx_astype(&masked_dt, masked, mlx.mlx_array_dtype(h), self.s));
+                    const c_shape = [_]c_int{ batch, seq_len, h_cols };
+                    var contribution4 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(contribution4);
+                    try mlx.check(mlx.mlx_reshape(&contribution4, masked_dt, &c_shape, 3, self.s));
+                    var h_add = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&h_add, h, contribution4, self.s));
+                    _ = mlx.mlx_array_free(h);
+                    h = h_add;
+                }
+            }
+
             // DFlash capture: this h IS `hidden_states[li+1]` — the layer's
             // final output (post layer_scalar / PLE on archs that have them).
             if (ctx.capture_layers) |cl| {
                 for (cl.ids, cl.out) |cid, *slot| {
                     if (cid == li) _ = mlx.mlx_array_set(slot, h);
                 }
+            }
+
+            if (std.c.getenv("MLX_SERVE_MM_DEBUG_LAYERS") != null and layer_idx < 5) {
+                const lio = std.Io.Threaded.global_single_threaded.io();
+                const lname = layerNameSlice("h_out", layer_idx);
+                mmDebugDumpOne(lio, lname[0..std.mem.indexOfScalar(u8, &lname, 0).?], h);
             }
 
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % std_eval_cadence == 0) {
@@ -12881,8 +13054,10 @@ pub const Transformer = struct {
         });
 
         // Qwen3-VL interleaved M-RoPE: the per-prefill-chunk cos/sin, shared
-        // by every full-attn layer this forward.
-        try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), .bfloat16);
+        // by every full-attn layer this forward. Match the tables to h's dtype
+        // (same contract as forwardStandardWith) — a fixed .bfloat16 demoted
+        // fp16 checkpoints' q/k via applyMrope's multiply.
+        try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), mlx.mlx_array_dtype(h));
         defer endMropeChunk(ctx);
 
         // Precompute sliding window masks (Gemma 4 + Laguna + gpt_oss sliding
@@ -14175,6 +14350,144 @@ pub const Transformer = struct {
         return self.forwardWith(&ctx, token_ids);
     }
 
+    /// Single-image embedding forward for the DeepStack/M-RoPE trunk path
+    /// (Qwen3-VL-Embedding): B=1 unmasked [1, T] tokens; the caller supplies
+    /// the pre-spliced vision embedding (owned by the CALLER — set only for
+    /// this forward, never stored on self), the flat [3 × total] M-RoPE
+    /// position table (axis-major t/h/w), its delta, and the DeepStack streams
+    /// ([N_merged, out_hidden] each; layers 0..n-1, borrowed). Returns the
+    /// post-final-norm hidden [1, T, hidden] (caller frees).
+    pub const VisionEmbedInputs = struct {
+        vision_emb: ?mlx.mlx_array = null,
+        mrope_pos: ?[]const i32 = null,
+        mrope_total: usize = 0,
+        mrope_delta: i32 = 0,
+        deepstack: []const mlx.mlx_array = &.{},
+    };
+
+    pub fn forwardEmbeddingVision(self: *Transformer, token_ids: mlx.mlx_array, vin: VisionEmbedInputs) !mlx.mlx_array {
+        self.embedding_mode = true;
+        defer self.embedding_mode = false;
+        if (vin.vision_emb) |ve| self.vision_embeddings = ve;
+        defer if (vin.vision_emb != null) {
+            self.vision_embeddings = null;
+        };
+        var ctx = self.defaultCtx();
+        ctx.mrope_pos = vin.mrope_pos;
+        ctx.mrope_total = vin.mrope_total;
+        ctx.mrope_delta = vin.mrope_delta;
+        ctx.deepstack_embeds = vin.deepstack;
+        const hidden = try self.forwardWith(&ctx, token_ids);
+        if (std.c.getenv("MLX_SERVE_MM_DEBUG_DUMP") != null) {
+            const dump_io = std.Io.Threaded.global_single_threaded.io();
+            const mrope_pos_arr: ?mlx.mlx_array = if (vin.mrope_pos) |p|
+                mlx.mlx_array_new_data(p.ptr, &[_]c_int{@intCast(vin.mrope_total * 3)}, 1, .int32)
+            else
+                null;
+            defer {
+                if (mrope_pos_arr) |m| _ = mlx.mlx_array_free(m);
+            }
+            const D = struct { name: []const u8, arr: ?mlx.mlx_array };
+            const dumps = [_]D{
+                .{ .name = "token_ids", .arr = token_ids },
+                .{ .name = "mrope_pos", .arr = mrope_pos_arr },
+                .{ .name = "vision_emb", .arr = vin.vision_emb },
+                .{ .name = "deepstack0", .arr = if (vin.deepstack.len > 0) vin.deepstack[0] else null },
+                .{ .name = "hidden", .arr = hidden },
+            };
+            dumpMany(dump_io, &dumps);
+        }
+        return hidden;
+    }
+
+    /// [MMDBG] One-shot binary dump of multimodal-forward boundary tensors,
+    /// enabled with MLX_SERVE_MM_DEBUG_DUMP=1. Writes a little-endian header
+    /// (int32 ndim, int32 dims...) plus an f32 payload to /tmp/mmdbg_*.f32
+    /// next to the Python fixture values for offline parity diffs. Borrowed
+    /// handles are NOT freed here. Best-effort: failures are logged, never
+    /// propagated.
+    /// [MMDBG] Single-array variant for ad-hoc boundary probes inside trunks.
+    fn mmDebugDumpOne(io: std.Io, name: []const u8, src: mlx.mlx_array) void {
+        const D = struct { name: []const u8, arr: ?mlx.mlx_array };
+        const dumps = [_]D{
+            .{ .name = name, .arr = src },
+        };
+        dumpMany(io, &dumps);
+    }
+
+    fn layerName(comptime prefix: []const u8, idx: usize) [16]u8 {
+        var buf: [16]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, idx }) catch unreachable;
+        var out = std.mem.zeroes([16]u8);
+        @memcpy(out[0..s.len], s);
+        // zero-terminated layout; callers pass out[0..s.len]
+        return out;
+    }
+
+    fn layerNameSlice(comptime prefix: []const u8, idx: usize) [16]u8 {
+        var buf: [16]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, idx }) catch unreachable;
+        var out: [16]u8 = undefined;
+        @memcpy(out[0..s.len], s);
+        out[s.len] = 0;
+        return out;
+    }
+
+    fn dumpMany(io: std.Io, dumps: anytype) void {
+        const s = mlx.gpuStream();
+        for (dumps) |d| {
+            // Cast non-f32 payloads (ids, bf16 hidden) to f32 for a uniform
+            // format; the cast arrays are owned here and freed after write.
+            var casted: ?mlx.mlx_array = null;
+            defer {
+                if (casted) |c| {
+                    _ = mlx.mlx_array_free(c);
+                }
+            }
+            const src: mlx.mlx_array = if (d.arr) |a| a else continue;
+            if (mlx.mlx_array_dtype(src) != .float32) {
+                var tmp: mlx.mlx_array = mlx.mlx_array_new();
+                if (mlx.mlx_astype(&tmp, src, .float32, s) == 0) {
+                    casted = tmp;
+                } else {
+                    _ = mlx.mlx_array_free(tmp);
+                    log.err("[mmdbg] astype failed for {s}\n", .{d.name});
+                    continue;
+                }
+            }
+            const arr = casted orelse src;
+            _ = mlx.mlx_array_eval(arr);
+            _ = mlx.mlx_synchronize(s);
+            const shape = mlx.getShape(arr);
+            var n_elem: usize = 1;
+            for (shape) |dim| n_elem *= @intCast(dim);
+            const p = mlx.mlx_array_data_float32(arr) orelse {
+                log.err("[mmdbg] no f32 data ptr for {s}\n", .{d.name});
+                continue;
+            };
+            const bytes = @as([*]const u8, @ptrCast(p))[0 .. n_elem * 4];
+
+            // header: int32 ndim, int32 dims..., then f32 payload
+            var hdr: [4]u8 = undefined;
+            std.mem.writeInt(i32, hdr[0..4], @intCast(shape.len), .little);
+            var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+            defer buf.deinit();
+            buf.writer.writeAll(&hdr) catch continue;
+            for (shape) |dim| {
+                std.mem.writeInt(i32, hdr[0..4], dim, .little);
+                buf.writer.writeAll(hdr[0..4]) catch continue;
+            }
+            buf.writer.writeAll(bytes) catch continue;
+            const path = std.fmt.allocPrint(std.heap.page_allocator, "/tmp/mmdbg_{s}.f32", .{d.name}) catch continue;
+            defer std.heap.page_allocator.free(path);
+            std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = buf.written() }) catch |err| {
+                log.err("[mmdbg] write {s}: {s}\n", .{ path, @errorName(err) });
+                continue;
+            };
+            log.info("[mmdbg] wrote {s} shape={any}\n", .{ path, shape });
+        }
+    }
+
     /// True when the checkpoint ships a sentence-transformers Dense head
     /// (EmbeddingGemma dense.0/dense.1), applied between pool and normalize.
     pub fn hasEmbedProjection(self: *const Transformer) bool {
@@ -14484,7 +14797,9 @@ pub const Transformer = struct {
 
         if (hd == rope_dims) {
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out, out_rot, .bfloat16, self.s));
+            // Preserve the input dtype (was hardcoded .bfloat16, which demoted
+            // fp16 checkpoints' q/k). bf16 models are unchanged.
+            try mlx.check(mlx.mlx_astype(&out, out_rot, mlx.mlx_array_dtype(arr), self.s));
             return out;
         }
         var pass = mlx.mlx_array_new();
@@ -14887,7 +15202,6 @@ pub const Transformer = struct {
         } else {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
         }
-
         return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer);
     }
 
