@@ -31,7 +31,7 @@ final class ChatRowBuilderTests: XCTestCase {
     func testCallAndResultFoldIntoOneRow() {
         let rows = ChatRowBuilder.rows(from: [call(), result()])
         XCTAssertEqual(rows.count, 1)
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertEqual(results.count, 1)
     }
 
@@ -40,7 +40,7 @@ final class ChatRowBuilderTests: XCTestCase {
         // must be filtered out, and the call+result-summary still fold together.
         let rows = ChatRowBuilder.rows(from: [call(), hiddenToolMsg(), result()])
         XCTAssertEqual(rows.count, 1, "the hidden raw tool message must not produce a row")
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertEqual(results.count, 1)
     }
 
@@ -51,7 +51,7 @@ final class ChatRowBuilderTests: XCTestCase {
         twoCalls.isAgentSummary = true
         let rows = ChatRowBuilder.rows(from: [twoCalls, result("a"), result("b")])
         XCTAssertEqual(rows.count, 1)
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertEqual(results.count, 2)
     }
 
@@ -77,7 +77,7 @@ final class ChatRowBuilderTests: XCTestCase {
         streaming.isStreaming = true
         let rows = ChatRowBuilder.rows(from: [streaming])
         XCTAssertEqual(rows.count, 1)
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertTrue(results.isEmpty)
     }
 

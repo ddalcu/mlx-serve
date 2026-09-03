@@ -2166,8 +2166,8 @@ struct ChatDetailView: View {
                                         ? { appState.forkSession(sessionId, from: m.id) }
                                         : nil)
                                 .id(m.id)
-                            case .toolCall(let call, let results):
-                                ToolCallRow(call: call, results: results).id(call.id)
+                            case .toolCall(let call, let results, let calls):
+                                ToolCallRow(call: call, results: results, calls: calls).id(call.id)
                             }
                         }
                         // Live media generation, under the tool-call row that
@@ -4163,11 +4163,15 @@ struct MessageBubble: View {
 /// result(s) so they show as a single collapsible row instead of two bubbles.
 enum ChatRow: Identifiable, Equatable {
     case message(ChatMessage)
-    case toolCall(call: ChatMessage, results: [ChatMessage])
+    /// `calls` is the STRUCTURED record from the assistant message that made
+    /// the call — it lives one message earlier than the summary this row is
+    /// keyed on, so the builder carries it across. Empty for a history written
+    /// before the calls were recorded; the card falls back to the summary text.
+    case toolCall(call: ChatMessage, results: [ChatMessage], calls: [SerializedToolCall])
     var id: UUID {
         switch self {
         case .message(let m): return m.id
-        case .toolCall(let c, _): return c.id
+        case .toolCall(let c, _, _): return c.id
         }
     }
 }
@@ -4239,15 +4243,22 @@ enum ChatRowBuilder {
         let visible = messages.filter { $0.toolCallId == nil }
         var rows: [ChatRow] = []
         var i = 0
+        // The structured calls ride the assistant message that MADE them, which
+        // is the one before the summary. Held here so the card can show the
+        // arguments as the model sent them instead of re-reading the string the
+        // engine flattened them into.
+        var pendingCalls: [SerializedToolCall] = []
         while i < visible.count {
             let m = visible[i]
+            if let calls = m.toolCalls, !calls.isEmpty { pendingCalls = calls }
             if isCallSummary(m) {
                 var results: [ChatMessage] = []
                 var j = i + 1
                 while j < visible.count, isResultSummary(visible[j]) {
                     results.append(visible[j]); j += 1
                 }
-                rows.append(.toolCall(call: m, results: results))
+                rows.append(.toolCall(call: m, results: results, calls: pendingCalls))
+                pendingCalls = []
                 i = j
             } else {
                 rows.append(.message(m))
@@ -4263,9 +4274,75 @@ enum ChatRowBuilder {
 private struct ToolCallRow: View {
     let call: ChatMessage
     let results: [ChatMessage]
+    /// The structured record, from the message that made the call. Empty on an
+    /// older history, where the summary text is all there is.
+    var calls: [SerializedToolCall] = []
     @State private var expanded = false
-    @State private var hovering = false
     @EnvironmentObject var processRegistry: ProcessRegistry
+
+    /// Still working: the summary streams until the tools return.
+    private var isRunning: Bool { call.isStreaming }
+
+    private var title: String {
+        ToolCallDisplay.title(calls: calls, summary: call.content)
+    }
+
+    /// One flat list across every call in the round. Used only for the header's
+    /// headline, which describes the FIRST call.
+    private var argumentRows: [ToolCallDisplay.Argument] {
+        calls.flatMap { ToolCallDisplay.arguments(fromJSON: $0.arguments) }
+    }
+
+    /// One call with its own arguments and its own result.
+    ///
+    /// A model can ask for several tools in one answer (`tool_calls` is an
+    /// array and the engine runs them in order), and flattening them put two
+    /// `query` rows under each other with nothing saying which result belonged
+    /// to which. The summaries arrive in call order, so index is the pairing —
+    /// the result messages carry no id of their own.
+    private struct CallGroup: Identifiable {
+        let id: String
+        let name: String
+        /// The argument that chooses this tool's behaviour (`browse`'s action),
+        /// shown as part of its name.
+        let variant: String?
+        let arguments: [ToolCallDisplay.Argument]
+        let result: String?
+        /// Set when this call started a background process, read out of its own
+        /// result text — the only place the association exists.
+        let handle: String?
+    }
+
+    private var groups: [CallGroup] {
+        let bodies = results.map { ToolCallDisplay.resultBody($0.content) }
+        // No structured record (an older history): fall back to one group per
+        // result, named from the summary, so the card still draws.
+        guard !calls.isEmpty else {
+            return bodies.enumerated().map { i, body in
+                CallGroup(id: "legacy-\(i)", name: title, variant: nil, arguments: [], result: body,
+                          handle: ToolCallDisplay.backgroundHandle(inResult: body))
+            }
+        }
+        return calls.enumerated().map { i, call in
+            let body = i < bodies.count ? bodies[i] : nil
+            let args = ToolCallDisplay.arguments(fromJSON: call.arguments)
+            return CallGroup(
+                id: call.id.isEmpty ? "call-\(i)" : call.id,
+                name: call.name,
+                variant: ToolCallDisplay.variant(toolName: call.name, arguments: args),
+                arguments: args,
+                result: body,
+                handle: body.flatMap { ToolCallDisplay.backgroundHandle(inResult: $0) })
+        }
+    }
+
+    /// Handles no group claimed — a process whose result text did not name it,
+    /// or one from a history with no structured calls. They keep their button
+    /// in the header rather than disappearing.
+    private var unclaimedHandles: [String] {
+        let claimed = Set(groups.compactMap(\.handle))
+        return killableHandles.filter { !claimed.contains($0) }
+    }
 
     /// Live background-process handles this card started — drives the kill X.
     /// Independent of `call.isStreaming` so the X stays after the tool returns,
@@ -4279,29 +4356,25 @@ private struct ToolCallRow: View {
     /// one dead (e.g. you click its X), so border + kill X disappear together.
     private var isRunningBackground: Bool { !killableHandles.isEmpty }
 
+    /// Built like the reasoning block, for the same reasons: the chevron
+    /// belongs at the column's trailing edge (a `DisclosureGroup` cannot put it
+    /// there), the whole strip toggles, and the padding and fill arrive WITH
+    /// the content so a settled call is one tinted line rather than a card.
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                headerRow
-                if expanded { expandedResults }
-            }
-            .padding(.horizontal, ChatMetrics.bubblePaddingH)
-            .padding(.vertical, ChatMetrics.bubblePaddingV)
-            .background(Color(.controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius)
-                    .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
-            )
-            .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
-            // Recede a settled tool call so the assistant's prose carries the
-            // conversation; full opacity while it's running, hovered, or expanded.
-            .opacity(call.isStreaming || hovering || expanded ? 1.0 : 0.35)
-            .animation(.easeInOut(duration: 0.15), value: hovering)
-            .onHover { hovering = $0 }
-
-            Spacer(minLength: 60)
+        VStack(alignment: .leading, spacing: 10) {
+            headerRow
+            if expanded { expandedBody }
         }
+        .padding(.horizontal, expanded ? ChatMetrics.bubblePaddingH : 0)
+        .padding(.vertical, expanded ? ChatMetrics.bubblePaddingV : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(expanded ? AnyShapeStyle(.quaternary.opacity(0.5)) : AnyShapeStyle(Color.clear))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
+        )
+        .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
     }
 
     // Broken out into separately type-checked pieces — a single deeply nested
@@ -4316,47 +4389,201 @@ private struct ToolCallRow: View {
                 headerLabel
             }
             .buttonStyle(.plain)
-            .disabled(results.isEmpty)
 
-            ProcessKillButtons(handles: killableHandles) { processRegistry.kill(handle: $0) }
+            // Only the ones no call claimed; the rest sit beside the result
+            // that started them.
+            ProcessKillButtons(handles: unclaimedHandles) { processRegistry.kill(handle: $0) }
         }
     }
 
+    /// Tinted rather than grey: a tool call is the model ACTING, and the accent
+    /// is what the user's own turn is drawn in. Softened, because it is
+    /// machinery beside the prose rather than part of it.
     @ViewBuilder private var headerLabel: some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(Self.stripBold(call.content))
-                .font(.caption.monospaced())
-                .multilineTextAlignment(.leading)
-                .foregroundStyle(.primary)
-            Spacer(minLength: 6)
-            if call.isStreaming {
-                GeneratingIndicator()
-            } else if !results.isEmpty {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                .symbolEffect(.pulse, isActive: isRunning)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
+            if calls.count > 1 {
+                multiToolTitle
+            } else {
+                singleToolTitle
             }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(expanded ? 90 : 0))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
         }
         .contentShape(Rectangle())
     }
 
-    @ViewBuilder private var expandedResults: some View {
-        ForEach(results) { r in
-            Text(Self.stripBold(r.content))
+    /// A tool's name, with the argument that chooses its behaviour attached to
+    /// it: `browse:click`. The tool is its identity (monospaced, tinted), the
+    /// variant is a value (grey, reading face) — but they read as one name,
+    /// which is what they are.
+    @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
+        Text(name)
+            .font(.caption.monospaced())
+            .foregroundStyle(Color.accentColor.opacity(0.7))
+        if let variant {
+            Text(":" + variant)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                // Belongs to the name beside it, not to the gap after it.
+                .padding(.leading, -4)
+        }
+    }
+
+    /// One call: the tool, what it was about, and what came of it.
+    @ViewBuilder private var singleToolTitle: some View {
+        toolLabel(name: title,
+                  variant: calls.first.map {
+                      ToolCallDisplay.variant(toolName: $0.name, arguments: argumentRows)
+                  } ?? nil)
+        // What the call was ABOUT, so a settled row says what it did without
+        // being opened. Grey and in the reading face: it is a VALUE, not part
+        // of the tool's identity.
+        if let headline {
+            Text("· " + headline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                // A path's tail is the useful half, so a long one loses its
+                // middle rather than its filename.
+                .truncationMode(.middle)
+        }
+        // What came of it — arrives with the result, so it is absent while the
+        // call is still running.
+        if let resultHeadline {
+            Text("· " + resultHeadline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+    }
+
+    /// Several calls in one answer: the tools themselves, and nothing about
+    /// their arguments — with two `webSearch` calls in a row, one query in the
+    /// header would look like the only one.
+    ///
+    /// Past three, the tail becomes a count. Four monospaced names fill the
+    /// strip and stop being readable as a list.
+    @ViewBuilder private var multiToolTitle: some View {
+        let shown = groups.count > 3 ? Array(groups.prefix(2)) : groups
+        let hidden = groups.count - shown.count
+
+        ForEach(Array(shown.enumerated()), id: \.offset) { index, group in
+            if index > 0 { middot }
+            toolLabel(name: group.name, variant: group.variant)
+        }
+        if hidden > 0 {
+            middot
+            Text("+\(hidden) other tool\(hidden == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    /// The separator between names: grey and in the reading face, so the
+    /// monospaced tool names read as the list and it reads as punctuation.
+    private var middot: some View {
+        Text("·")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var headline: String? {
+        guard let name = calls.first?.name else { return nil }
+        return ToolCallDisplay.headline(toolName: name, arguments: argumentRows)
+    }
+
+    private var resultHeadline: String? {
+        guard let name = calls.first?.name, let first = results.first else { return nil }
+        return ToolCallDisplay.resultHeadline(toolName: name,
+                                              result: ToolCallDisplay.resultBody(first.content))
+    }
+
+    /// Arguments and the result in two columns, split by a rule.
+    ///
+    /// A `Grid` rather than stacked paragraphs: the names are short and the
+    /// values are not, so putting the values on a shared left edge is what
+    /// makes four arguments scannable instead of four sentences. The name
+    /// column takes only what it needs — `Grid` sizes a column to its widest
+    /// cell, and the names are the narrow half by construction.
+    @ViewBuilder private var expandedBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                // Only worth naming when there is more than one: with a single
+                // call the name is already in the header above.
+                if groups.count > 1 {
+                    HStack(spacing: 0) {
+                        toolLabel(name: group.name, variant: group.variant)
+                    }
+                    .padding(.top, index == 0 ? 0 : 4)
+                }
+                callGrid(group)
+            }
+        }
+    }
+
+    @ViewBuilder private func callGrid(_ group: CallGroup) -> some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 10, verticalSpacing: 6) {
+            ForEach(group.arguments) { arg in
+                gridRow(name: arg.name, value: arg.value)
+            }
+
+            if let result = group.result {
+                if !group.arguments.isEmpty {
+                    // Separates what was ASKED from what came BACK. Spans both
+                    // columns, so it reads as one break across the panel rather
+                    // than as a rule under the names.
+                    GridRow { Divider().gridCellColumns(2) }
+                }
+                GridRow {
+                    Text("result")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(result)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        // The process THIS call started, beside the result that
+                        // announced it — with two parallel shells, two buttons
+                        // in the header said nothing about which was which.
+                        if let handle = group.handle, killableHandles.contains(handle) {
+                            ProcessKillButtons(handles: [handle]) { processRegistry.kill(handle: $0) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Name in the tool's own monospaced face (it IS an identifier), value in
+    /// the reading face beside it.
+    @ViewBuilder private func gridRow(name: String, value: String) -> some View {
+        GridRow {
+            Text(name)
                 .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.leading)
+                // Never wrapped: a broken key turns the column into prose and
+                // the values lose the edge they are lined up against.
+                .fixedSize(horizontal: true, vertical: false)
+            Text(value)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-    }
-
-    /// The summary strings use `**name**` markdown bold; the compact mono header
-    /// and body render as plain text, so strip the `**` markers.
-    static func stripBold(_ s: String) -> String {
-        s.replacingOccurrences(of: "**", with: "")
     }
 }
 
