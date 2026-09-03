@@ -1473,9 +1473,12 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
             if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
         }
     }
-    // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
-    // partial_rotary_factor already parsed in the generic rope block above.
-    if (cfg_obj.get("rope_parameters")) |rp| {
+    // Interleaved M-RoPE sections (text_config.rope_parameters or
+    // text_config.rope_scaling — Qwen3-VL-Embedding uses rope_scaling).
+    // rope_theta / partial_rotary_factor already parsed in the generic rope
+    // block above.
+    const rp_val = cfg_obj.get("rope_parameters") orelse cfg_obj.get("rope_scaling");
+    if (rp_val) |rp| {
         if (rp == .object) {
             if (rp.object.get("mrope_interleaved")) |v| {
                 if (v == .bool) config.mrope_interleaved = v.bool;
@@ -3038,6 +3041,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "qwen3_vl") or
+        std.mem.eql(u8, model_type, "qwen3_vl_text"))
+    {
+        // Qwen3-VL family (Qwen3-VL-Embedding, Qwen3-VL chat models). Dense
+        // QK-norm trunk with M-RoPE and the Qwen3-VL ViT tower. Same weight
+        // layout as qwen3_5 (language_model.model prefix, QK-norm, silu), but
+        // without the GDN attn_output_gate — this is a plain dense Qwen3 trunk.
+        config.model_type = "qwen3";
+        config.weight_prefix = if (root.get("text_config") != null) "language_model.model" else "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("head_dim") == null) {
+            config.head_dim = config.hidden_size / config.num_attention_heads;
+        }
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        parseQwenVisionFields(&config, root, cfg_obj);
     } else if (std.mem.eql(u8, model_type, "lfm2") or std.mem.startsWith(u8, model_type, "lfm2")) {
         config.model_type = "lfm2";
         // VL variant nests text weights under language_model.model (like Gemma 4)

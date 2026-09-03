@@ -4519,34 +4519,73 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
-        const raw_ids = try tok.encode(allocator, text);
-        // Bidirectional embedding models (EmbeddingGemma) declare
-        // add_bos_token + add_eos_token; the SentencePiece encode path adds
-        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
-        const ids = if (config.use_bidirectional_attention) blk: {
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
+        // Models with a chat template (e.g. Qwen3-VL-Embedding) produce
+        // reference embeddings via the FULL chat-template pipeline: system
+        // prompt + user text + add_generation_prompt, then the tokenizer's
+        // TemplateProcessing post-processor appends <EOS> (151643). Zig's
+        // tokenizer has no post-processor, so we render the template via
+        // formatChat and manually append bos_token_id (which is <EOS> for
+        // Qwen3-VL) to match the reference's token sequence exactly.
+        const ids = if (lm.chat_config) |cc| blk: {
+            if (cc.chat_template.len == 0) break :blk null;
+
+            // Construct messages: [{role: "user", content: text}].
+            // The Jinja template will auto-insert default_system_message
+            // when no system message is present — matching mlx-embeddings'
+            // format_embedding_input behavior.
+            const msgs = [_]chat_mod.Message{
+                .{ .role = "user", .content = text },
+            };
+            const rendered_ids = chat_mod.formatChat(
                 allocator,
-                raw_ids,
-                config.bos_token_id,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else if (config.effectivePooling() == .last_token) blk: {
-            // Last-token pooling models pool an APPENDED terminator: the
-            // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
-            // adds <|endoftext|> (the config's eos_token_id) to every encode,
-            // and the reference pools THAT position — without it, we'd pool
-            // the final text token and quietly diverge from the model card.
+                tok,
+                &msgs,
+                cc,
+                null, // tools_json
+                null, // tool_choice_instruction
+                false, // enable_thinking
+                null, // effort
+                false, // continue_final
+            ) catch break :blk null;
+            defer allocator.free(rendered_ids);
+
+            // Append bos_token_id (<EOS> = 151643 for Qwen3-VL) to emulate
+            // the tokenizer's TemplateProcessing post-processor that Python's
+            // apply_chat_template(tokenize=True) runs automatically.
+            const bos_id = config.bos_token_id orelse {
+                break :blk try allocator.dupe(u32, rendered_ids);
+            };
+            const combined = try allocator.alloc(u32, rendered_ids.len + 1);
+            @memcpy(combined[0..rendered_ids.len], rendered_ids);
+            combined[rendered_ids.len] = bos_id;
+            break :blk combined;
+        } else null;
+
+        const final_ids = if (ids) |chat_ids| chat_ids else blk2: {
+            // Fall back to raw tokenization for models without chat templates.
+            const raw_ids = try tok.encode(allocator, text);
             defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                null,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else raw_ids;
-        total_tokens += ids.len;
-        try seqs.append(allocator, ids);
+            break :blk2 if (config.use_bidirectional_attention) blk3: {
+                break :blk3 try wrapEncoderIds(
+                    allocator,
+                    raw_ids,
+                    config.bos_token_id,
+                    if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+                );
+            } else if (config.effectivePooling() == .last_token) blk3: {
+                // Last-token pooling without a chat template: append the
+                // model's EOS token so pooling picks up the terminator
+                // position, matching the reference implementation's behavior.
+                break :blk3 try wrapEncoderIds(
+                    allocator,
+                    raw_ids,
+                    null,
+                    if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+                );
+            } else raw_ids;
+        };
+        total_tokens += final_ids.len;
+        try seqs.append(allocator, final_ids);
     }
 
     // Issue #117: enforce the effective per-input token ceiling BEFORE the
