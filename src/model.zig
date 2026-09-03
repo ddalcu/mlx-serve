@@ -3506,6 +3506,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
             s,
             false,
             "language_model.mtp",
+            true,
         );
     }
 
@@ -3593,7 +3594,28 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
-    return loadSafetensorsFileWithPrefix(allocator, weights, path, s, load_vision, null);
+    return loadSafetensorsFileWithPrefix(allocator, weights, path, s, load_vision, null, false);
+}
+
+fn qwen4MtpNormNeedsFold(key: []const u8) bool {
+    return std.mem.indexOf(u8, key, "norm") != null and std.mem.endsWith(u8, key, ".weight");
+}
+
+fn foldQwen4MtpNormPlusOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const dtype = mlx.mlx_array_dtype(arr);
+    var float_arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(float_arr);
+    try mlx.check(mlx.mlx_astype(&float_arr, arr, .float32, s));
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, float_arr, one, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, sum, dtype, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
 }
 
 fn loadSafetensorsFileWithPrefix(
@@ -3603,6 +3625,7 @@ fn loadSafetensorsFileWithPrefix(
     s: mlx.mlx_stream,
     load_vision: bool,
     key_prefix: ?[]const u8,
+    fold_qwen4_mtp_norms: bool,
 ) !void {
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
@@ -3644,6 +3667,14 @@ fn loadSafetensorsFileWithPrefix(
             _ = mlx.mlx_array_free(value);
             final_value = cast;
             if (ndim == 1) narrowed_1d += 1;
+        }
+        if (fold_qwen4_mtp_norms and qwen4MtpNormNeedsFold(key_str)) {
+            const folded = foldQwen4MtpNormPlusOne(final_value, s) catch |err| {
+                _ = mlx.mlx_array_free(final_value);
+                return err;
+            };
+            _ = mlx.mlx_array_free(final_value);
+            final_value = folded;
         }
 
         const mapped_key_owned = if (key_prefix) |prefix|
@@ -3761,8 +3792,9 @@ test "loadWeights maps a standalone Qwen4 MTP sidecar when the checkpoint has no
 
     const mtp_hdr =
         "{\"fc_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}," ++
-        "\"layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}}";
-    var mtp_st: [8 + mtp_hdr.len + 12]u8 = undefined;
+        "\"layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}," ++
+        "\"pre_fc_norm_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[12,16]}}";
+    var mtp_st: [8 + mtp_hdr.len + 16]u8 = undefined;
     std.mem.writeInt(u64, mtp_st[0..8], mtp_hdr.len, .little);
     @memcpy(mtp_st[8 .. 8 + mtp_hdr.len], mtp_hdr);
     @memset(mtp_st[8 + mtp_hdr.len ..], 0);
@@ -3773,13 +3805,18 @@ test "loadWeights maps a standalone Qwen4 MTP sidecar when the checkpoint has no
     var weights = try loadWeightsFromOpenDir(io, allocator, tmp.dir, path_buf[0..path_len], false);
     defer weights.deinit();
 
-    try testing.expectEqual(@as(u32, 3), weights.count());
+    try testing.expectEqual(@as(u32, 4), weights.count());
     try testing.expectEqual(
         @as(usize, 2),
         mlx.mlx_array_size(weights.get("language_model.mtp.fc_hidden.weight").?),
     );
     try testing.expect(weights.get("language_model.mtp.layers.0.self_attn.q_proj.weight") != null);
     try testing.expect(weights.get("fc_hidden.weight") == null);
+    const norm = weights.get("language_model.mtp.pre_fc_norm_hidden.weight").?;
+    try mlx.check(mlx.mlx_array_eval(norm));
+    var norm_value: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&norm_value, norm));
+    try testing.expectApproxEqAbs(@as(f32, 1), norm_value, 0.0001);
 }
 
 test "loadWeights preserves an embedded Qwen4 MTP head over a standalone sidecar" {
