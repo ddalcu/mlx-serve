@@ -3377,25 +3377,6 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
     return false;
 }
 
-fn removeWeightsUnder(weights: *Weights, prefix: []const u8) !u32 {
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer keys.deinit(weights.allocator);
-    var it = weights.map.keyIterator();
-    while (it.next()) |key_ptr| {
-        const key = key_ptr.*;
-        if (key.len > prefix.len and key[prefix.len] == '.' and std.mem.startsWith(u8, key, prefix)) {
-            try keys.append(weights.allocator, key);
-        }
-    }
-    for (keys.items) |key| {
-        if (weights.map.fetchRemove(key)) |entry| {
-            _ = mlx.mlx_array_free(entry.value);
-            weights.allocator.free(entry.key);
-        }
-    }
-    return @intCast(keys.items.len);
-}
-
 /// Re-point `config.weight_prefix` at the nesting the CHECKPOINT actually uses.
 ///
 /// Which of the two a converter emits is not reliably declared in config.json,
@@ -3509,14 +3490,15 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     }
 
     const qwen4_mtp_path = "mtp/model.safetensors";
-    if (safetensorsHeaderHasQwen4Mtp(io, allocator, dir, qwen4_mtp_path)) {
+    if (weights.get("language_model.mtp.fc_hidden.weight") == null and
+        safetensorsHeaderHasQwen4Mtp(io, allocator, dir, qwen4_mtp_path))
+    {
         const path_slice = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, qwen4_mtp_path });
         defer allocator.free(path_slice);
         const path = try allocator.dupeSentinel(u8, path_slice, 0);
         defer allocator.free(path);
 
-        const replaced = try removeWeightsUnder(&weights, "language_model.mtp");
-        log.info("Loading standalone Qwen4 MTP sidecar {s} (replacing {d} embedded tensors)...\n", .{ qwen4_mtp_path, replaced });
+        log.info("Loading standalone Qwen4 MTP sidecar {s}...\n", .{qwen4_mtp_path});
         try loadSafetensorsFileWithPrefix(
             allocator,
             &weights,
@@ -3762,7 +3744,45 @@ test "ModelConfig defaults" {
     try testing.expect(!config.tie_word_embeddings);
 }
 
-test "loadWeights maps a standalone Qwen4 MTP sidecar and gives it precedence" {
+test "loadWeights maps a standalone Qwen4 MTP sidecar when the checkpoint has no head" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mtp");
+
+    const main_hdr =
+        "{\"model.keep.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var main_st: [8 + main_hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, main_st[0..8], main_hdr.len, .little);
+    @memcpy(main_st[8 .. 8 + main_hdr.len], main_hdr);
+    @memset(main_st[8 + main_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &main_st });
+
+    const mtp_hdr =
+        "{\"fc_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}," ++
+        "\"layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}}";
+    var mtp_st: [8 + mtp_hdr.len + 12]u8 = undefined;
+    std.mem.writeInt(u64, mtp_st[0..8], mtp_hdr.len, .little);
+    @memcpy(mtp_st[8 .. 8 + mtp_hdr.len], mtp_hdr);
+    @memset(mtp_st[8 + mtp_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/model.safetensors", .data = &mtp_st });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var weights = try loadWeightsFromOpenDir(io, allocator, tmp.dir, path_buf[0..path_len], false);
+    defer weights.deinit();
+
+    try testing.expectEqual(@as(u32, 3), weights.count());
+    try testing.expectEqual(
+        @as(usize, 2),
+        mlx.mlx_array_size(weights.get("language_model.mtp.fc_hidden.weight").?),
+    );
+    try testing.expect(weights.get("language_model.mtp.layers.0.self_attn.q_proj.weight") != null);
+    try testing.expect(weights.get("fc_hidden.weight") == null);
+}
+
+test "loadWeights preserves an embedded Qwen4 MTP head over a standalone sidecar" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -3795,12 +3815,11 @@ test "loadWeights maps a standalone Qwen4 MTP sidecar and gives it precedence" {
 
     try testing.expectEqual(@as(u32, 3), weights.count());
     try testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 1),
         mlx.mlx_array_size(weights.get("language_model.mtp.fc_hidden.weight").?),
     );
-    try testing.expect(weights.get("language_model.mtp.layers.0.self_attn.q_proj.weight") != null);
-    try testing.expect(weights.get("language_model.mtp.fc_hidden.scales") == null);
-    try testing.expect(weights.get("fc_hidden.weight") == null);
+    try testing.expect(weights.get("language_model.mtp.fc_hidden.scales") != null);
+    try testing.expect(weights.get("language_model.mtp.layers.0.self_attn.q_proj.weight") == null);
 }
 
 test "loadWeights ignores an unrelated file at the Qwen4 MTP sidecar path" {

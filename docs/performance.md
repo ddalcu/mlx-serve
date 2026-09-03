@@ -11,7 +11,8 @@ Apple M4 Max, identical weights per engine. [benchmarks.md](../benchmarks.md) tr
 Four flavors, all greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):
 
 - **Native MTP** (Qwen 3.5/3.6/3.8) — checkpoints with a trained multi-token-prediction head (sidecar or baked in, like the Qwen 3.8 27B build) draft with the model's *own* head, with a controller that self-tunes depth per request. MoE sidecars supported. Auto-loads, zero setup.
-  A standalone Qwen3.8/Qwen4 MLX MTP checkpoint can be linked at `<target-model>/mtp/model.safetensors`; its unprefixed tensor names are mapped automatically and it replaces any MTP head embedded in the target.
+  A standalone Qwen3.8/Qwen4 MLX MTP checkpoint can be linked at `<target-model>/mtp/model.safetensors`; its unprefixed tensor names are mapped automatically when the target has no embedded MTP head.
+  Dense sidecars load independently of the backbone quantization, while an embedded head keeps precedence.
   Qwen3.8 MoE targets require `--mtp` at launch or `"enable_mtp": true` on the request.
 - **DFlash draft companions** — a model folder can ship its own `drafter/` block-draft companion (the Muse-Glimmer builds do); the server loads it with the model, switching models keeps the speedup, and the draft size adapts to the Mac. About 2x on Muse-Glimmer. `--no-drafter` turns it off.
 - **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on, no per-model setup. Wins on agent loops, RAG and code editing, anywhere the answer echoes the prompt.
