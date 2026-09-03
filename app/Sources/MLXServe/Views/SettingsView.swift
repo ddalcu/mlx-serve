@@ -718,7 +718,7 @@ private struct ModelFoldersSectionContent: View {
     }
 
     private func chooseDownloadFolder() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -786,7 +786,7 @@ private struct ModelFoldersSectionContent: View {
     }
 
     private func choose() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -1825,6 +1825,8 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.accentColor) private var accentColorRaw = AppAccentColor.system.rawValue
     @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
+    @AppStorage(InterfacePrefKey.terminalTheme) private var terminalThemeId = TerminalTheme.defaultId
+    @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
 
     var body: some View {
         SettingsRow(title: "Appearance", explainer: "Follow the system setting, or force light/dark for this app only.") {
@@ -1860,10 +1862,49 @@ private struct InterfaceSectionContent: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
         }
+        SettingsRow(title: "Terminal Theme",
+                    explainer: "Colors for new sandbox terminals. Right-click a terminal in the sidebar to give one session a different theme.") {
+            Picker("", selection: $terminalThemeId) {
+                ForEach(TerminalTheme.all) { theme in
+                    Text(theme.name).tag(theme.id)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 160)
+        }
+        SettingsRow(title: "Terminal Background",
+                    explainer: "Ground under the default theme. Reset to use the theme's own.") {
+            HStack(spacing: 8) {
+                ColorPicker("", selection: terminalBackground, supportsOpacity: false)
+                    .labelsHidden()
+                if !terminalBackgroundHex.isEmpty {
+                    Button("Reset") { terminalBackgroundHex = "" }
+                        .controlSize(.small)
+                }
+            }
+        }
         SettingsRow(title: "Quick Launcher Shortcut",
                     explainer: "The global combo that summons the Quick Launcher (⌃Space by default) from any app. Must include at least one modifier key.") {
             HotKeyRecorderControl(onChange: { appState.quickLauncher.updateHotKey() })
         }
+    }
+}
+
+extension InterfaceSectionContent {
+    /// The color well ↔ the stored "#RRGGBB" (empty = the theme's ground).
+    fileprivate var terminalBackground: Binding<Color> {
+        Binding(
+            get: {
+                let rgb = TerminalTheme.RGB(hex: terminalBackgroundHex)
+                    ?? (TerminalTheme.theme(terminalThemeId) ?? TerminalTheme.theme(TerminalTheme.defaultId)!).background
+                return Color(.sRGB, red: Double(rgb.r) / 255, green: Double(rgb.g) / 255, blue: Double(rgb.b) / 255)
+            },
+            set: { color in
+                guard let c = NSColor(color).usingColorSpace(.sRGB) else { return }
+                terminalBackgroundHex = TerminalTheme.RGB(UInt8((c.redComponent * 255).rounded()),
+                                                          UInt8((c.greenComponent * 255).rounded()),
+                                                          UInt8((c.blueComponent * 255).rounded())).hex
+            })
     }
 }
 

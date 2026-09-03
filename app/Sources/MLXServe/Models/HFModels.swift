@@ -427,23 +427,47 @@ struct HFModel: Identifiable, Codable {
     /// Estimated on-disk / in-memory size in bytes.
     /// Prefers safetensors parameter dtype math; falls back to tree API file sizes.
     var estimatedSizeBytes: Int64 {
-        if let params = safetensors?.parameters, !params.isEmpty {
-            var total: Int64 = 0
-            for (dtype, count) in params {
-                let bytesPerParam: Double
-                switch dtype.uppercased() {
-                case "F64": bytesPerParam = 8
-                case "F32", "U32", "I32": bytesPerParam = 4
-                case "F16", "BF16", "U16", "I16": bytesPerParam = 2
-                case "I8", "U8": bytesPerParam = 1
-                case let d where d.contains("4"): bytesPerParam = 0.5
-                default: bytesPerParam = 2
-                }
-                total += Int64(Double(count) * bytesPerParam)
+        Self.estimateWeightBytes(parameters: safetensors?.parameters, id: id) ?? fallbackSizeBytes ?? 0
+    }
+
+    /// Weight bytes from HF's `safetensors.parameters` dtype histogram. HF
+    /// counts packed U32/I32 as the LOGICAL element count (a 4-bit and an
+    /// 8-bit pack of one model report identical histograms), so those are
+    /// priced by the width in the repo id plus the group scale/bias overhead
+    /// (`(bits + 0.5) / 8` bytes each reproduces the real repo sizes). Nil
+    /// when packed elements are present but the id names no width: the
+    /// caller falls to the tree-API size instead of a 4x-wrong number.
+    static func estimateWeightBytes(parameters: [String: Int64]?, id: String) -> Int64? {
+        guard let params = parameters, !params.isEmpty else { return nil }
+        var total: Double = 0
+        for (dtype, count) in params {
+            let bytesPerParam: Double
+            switch dtype.uppercased() {
+            case "F64": bytesPerParam = 8
+            case "F32": bytesPerParam = 4
+            case "U32", "I32":
+                guard let bits = packedBitWidth(forId: id) else { return nil }
+                bytesPerParam = (bits + 0.5) / 8
+            case "F16", "BF16", "U16", "I16": bytesPerParam = 2
+            case "I8", "U8": bytesPerParam = 1
+            case let d where d.contains("4"): bytesPerParam = 0.5
+            default: bytesPerParam = 2
             }
-            return total
+            total += Double(count) * bytesPerParam
         }
-        return fallbackSizeBytes ?? 0
+        return Int64(total)
+    }
+
+    /// Bit width of a quantized repo's packed weights, read from its id
+    /// ("4bit", "8-bit", "3.5bit", NVFP4/MXFP4 = 4, MXFP8 = 8).
+    static func packedBitWidth(forId id: String) -> Double? {
+        guard let label = quantizationLabel(forId: id) else { return nil }
+        switch label {
+        case "NVFP4", "MXFP4": return 4
+        case "MXFP8": return 8
+        case "FP16", "BF16": return 16
+        default: return Double(label.replacingOccurrences(of: "-bit", with: ""))
+        }
     }
 
     /// Model size parsed from the name (e.g. "31B", "82M", "0.6B").

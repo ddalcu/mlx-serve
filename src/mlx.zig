@@ -126,6 +126,7 @@ pub extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_data_bool(arr: mlx_array) ?[*]const bool;
 pub extern "c" fn mlx_array_data_float32(arr: mlx_array) ?[*]const f32;
 pub extern "c" fn mlx_array_data_float16(arr: mlx_array) ?[*]const f16;
+pub extern "c" fn mlx_array_data_bfloat16(arr: mlx_array) ?[*]const u16;
 pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
 pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
 pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;

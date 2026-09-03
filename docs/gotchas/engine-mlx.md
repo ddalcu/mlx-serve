@@ -4355,7 +4355,7 @@ Ours built the dense `[1,1,S,kv]` bool mask (`qsaMaskFromQk`: block expand → t
 What shipped:
 
 - `msv_attn_qsa256` (`gatherQsa256`, kill switch `MLX_SERVE_QSA_GATHER=0`): one threadgroup per (query token, kv head, batch); the token's 12 GQA heads are the tile rows (NSG = ceil(gqa/8) simdgroups), keys are gathered by the token's sorted block list (`blocks[b, s, :]`, RATIO tokens each, INT_MAX past the row's count) followed by its own incomplete tail. Same fragment math, transposed K staging and fp32 online softmax as p256. BK is a template arg; 16 and 32 measured identical (~75 ms per 4096-row chunk-layer), 32 is the default.
-- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Decode/verify widths (S < 16) and batched decode keep the dense mask path; a declined gather expands the selection with `qsaMaskFromBlocks` (also the fixture trace's mask at layer 3).
+- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Verify widths (S 2..15) keep the dense mask path; decode S==1 is `qsaDecodeGatherAttn` (next story); batched decode expands per-slot selections with `qsaMaskFromBlocks`. A declined gather expands the same way (also the fixture trace's mask at layer 3).
 - `server.qsaMaskBytes` bills the bounded sheet at prefill widths, the old `4 B x rows x keys` below 16 rows.
 
 Measured (M4 Max, 4-bit pack, warm, same boot type, natural 38k prompt): gather 55.1 s (692 tok/s) vs mask arm 67.0 s (568 tok/s). Same-session llmprobe ladder, 26.8.11 app binary vs the tree (prefill tok/s): 512 545/532, 4k 784/742, 8k 753/728, 16k 681/707, 32k 589/699, 64k 479/681; single-prompt 128k 395/654, 256k 267/551 (the app needed 954 s for 254k tokens). The 4-8k dip is structural (the gather reads 2051 rows per token with no sharing; the mask arm at kv ≤ 8k reads ≤ kv rows per 64-row tile), so chunks at kv ≤ 8192 keep the mask arm (`QSA_GATHER_MIN_KV_DEFAULT`, `MLX_SERVE_QSA_GATHER_MIN_KV`); a 38k prompt is unchanged by the threshold (55.3 s). The comparison chart that prompted this (mlx 1210 @ 8k) is from ANOTHER machine: no bench artifact or llmprobe card on this box ever exceeded ~800 prefill on flash-next, and our own Aug-28 26.8.11 column reads 685 @ 8k — today's app run (753) was FASTER. Cross-machine charts set the shape of the curve, never the absolute bar. With attention stood in (`QWEN4_STANDIN=attn_sdpa`) the prompt takes 46.8 s, so attention went from ~20 s to 8.9 s (`QWEN4_PROFILE_QSA=1`: gather 53 ms at kv 4k, 71 ms at 8k, 75-79 ms flat to 37k per chunk-layer; selection 1.4 s per prompt). What is left past the flat attention term is the trunk itself (GDN + MoE + PLE + MTP-head history), not QSA.
@@ -4367,6 +4367,33 @@ Two traps met on the way:
 
 Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask` (gqa 12, rows straddling the every-block-fits boundary, sentinel rows, both tiles, the expansion helper equal to the host-built mask). The qwen4 text + vision fixtures run T=20/T=28 prefills through the gather path (layer-3 mask EXACT, cos > 0.9999).
 
+## qwen4 QSA decode: dense mask + full-KV SDPA, O(kv) per step (2026-09-03)
+
+Prefill gather flattened the prompt curve; decode still collapsed 47.5 → 10.7 tok/s from 16k → 384k. At S==1 `qsaMaskFromQk` built a dense bool mask and `gatedFullAttnWith` ran full-KV SDPA. The QSA branch (`qsa_mask`/`qsa_blocks` set) also skipped `qkvAttnDecodeKernel` entirely — so even `--kv-quant 8 --kv-attn-mode auto` dequantized every cache row every step.
+
+`qsaDecodeGatherAttn` (default on, `MLX_SERVE_QSA_DECODE_GATHER=0` restores the mask arm) reuses the same sorted top-k (`qsaSelectBlocks`, same `QSA_GATHER_MIN_KV` floor as prefill) and expands selection + incomplete tail to ascending token indices, gathers those rows from the affine 4/8-bit triples (dequantizing ONLY the ~2k subset) or dense rows, then dense SDPA under an additive validity mask. Prefill, verify widths, MTP verify, and below-budget dense are untouched. Batched slots still expand to masks (`qsaMaskBatched`) — the stacked path has no per-slot gather.
+
+Locked serial ladder (`--kv-quant 8 --kv-attn-mode auto --no-mtp --no-pld --no-drafter`, temp 0, 32 tokens; only the env gate differs):
+
+| ctx | ON | OFF | speedup |
+|---|---|---|---|
+| 32k | 51.3 | 40.8 | 1.26× |
+| 64k | 48.7 | 32.9 | 1.48× |
+| 128k | 46.1 | 23.5 | 1.96× |
+| 256k | 40.9 | 14.6 | 2.80× |
+
+ON is ~flat (51→41); OFF collapses (41→15). Residual ON slope is the indexer (still O(kv/ratio) over pooled blocks), not attention. Parity: unit subset-SDPA vs masked-full-SDPA max diff 0.000000 (quant and dense); take-then-dequant bit-exact. Live 32k logprobs: top-1 32/32, identical completions, max|dlogprob| 0.24 — inside the pre-existing prefill gather-vs-mask envelope (17/32, dlogprob 1.16).
+
+Two footguns: `mlx_take_axis` needs unsigned indices (int32 aborts); quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, not `+0`).
+
+## qwen4 QSA history in every SSM checkpoint OOM'd 400k prefills (2026-09-03)
+
+Prefix-cache snapshots copied `aux_state`/`qsa_pooled` (the growing indexer key history) at every stride. 32 copies of a ~273k-row buffer is ~30 GB on top of 70 GB weights — Metal OOM at 400k while auto-context advertised 700k–1M (`--kv-quant 8` made it worse: billed KV shrank, QSA bytes did not).
+
+Fix: stride captures keep GDN/PLE only. `attachQsaHistoryToLatest` puts ONE copy on the latest snap; restore slices it to `cp.pos` (`applyQsaHistoryAt`). A byte-budget trim that would drop that snap first slices the history onto the last kept checkpoint (`sliceQsaHistoryOntoCheckpoint`) — otherwise a 122k trimmed hit left aux empty and the next prefill aborted on `reshape 4096 → (1, nb, 4, 128)` at 77% RAM (not an OOM). `qsaMaskFromQk` returns `error.QsaHistoryGap` if `keys` is shorter than `kv`. Sizer/guard bill live aux once (`qsaHistoryBytesPerToken`). PLE windows stay per-position (they are not a prefix).
+
+Three holes closed on review before merge (2026-09-03): (1) the cancel handoff attached the LIVE history (`pos` rows) to a stride snap at an earlier position, and the restore of that snap installed rows the cache did not hold — silent wrong block selection, because the guard only caught `key_rows < kv`; attach now slices to the snap's `pos` and the guard is `!=`. (2) The prefix-extend merge inherited the previous turn's latest snap with its full copy while this turn's latest got another: one copy per committed turn, the stride leak through another door; `keepOnlyLatestQsaHistory` runs on the merged list. (3) A snap with no history (attach failed on the cancel path, an old on-disk entry) restored aux-less and every request on that prefix died in `QsaHistoryGap` until eviction; on a QSA arch (`HotPrefixCache.qsa_history_required`) no history after restore is a miss on both tiers. Bars: the two `HotPrefixCache` tests named for them, the attach-slices assertion in the transformer test, `[qsa-decode-gather] engaged` in `test_qwen4_exp.sh` [5], and a 400k cache-on prefill + extend turn on the M4 Max.
+
 ## QSA scalar RoPE skipped YaRN mscale; partial rotary ranking can flip (2026-09-01)
 
 `--config-overrides` with `rope_type: yarn` stretches Qwen3.8-Flash-Next to 1M. M-RoPE tables already fold mscale into cos/sin via `fillCosSin(..., yarnMscale)`. The QSA indexer's scalar arm (`mlx_fast_rope` when `mrope_cos_cur == null`) did not: a comment claimed mscale "multiplies every relu(q·k) by one positive constant, which cannot change a top-k." That is true of a FULL-head scale. The indexer is 128-wide and only 64 dims rotate, so score = ms²·A + B, and two synthetic blocks whose unscaled winner is the B-heavy one flip under factor-4 mscale (`YaRN mscale on a 128-wide indexer with 64 rotary dims CAN change top-k`).
@@ -4374,3 +4401,34 @@ Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA 
 Image decode is the mixed-arm case: `beginMropeChunk` at `seq_len <= 1` leaves `mrope_cos_cur` null (unchanged — do not "fix" that), so decode queries take the scalar path while prefill queries and pooled keys ride the already-scaled M-RoPE tables. Prefill and decode then ranked different blocks. Never `yarnScaleQK` on the indexer (`[head_dim]` is 256, not 128); never `mlx_fast_rope` scale as mscale (would also scale the pass-through tail); never `mlx_array_new_float` on bf16. Scalar mscale is `yarnScaleRotated` (queries) and `ropeAtFreqs` × `scalarOf` (pooled keys).
 
 `--config-overrides` now rides `modelFingerprint`, so a YaRN boot cannot restore an unscaled SSD prefix. Wipe `~/.mlx-serve/kv-cache` once after this change if you already served with overrides (old entries were fingerprinted without the JSON). DiskTier version and hash seed stay put.
+
+## qwen4 decode: the n-gram gather synced on the token inside the graph build (2026-09-02)
+
+Flash-Next served 63 tok/s short / 55 at 8.5k while the in-situ ubench put the forward at 13.5 ms GPU + 1.3 ms CPU build (74 tok/s if the build overlapped). The pipelined decode (`Generator.next`: build step N+1 on the lazy sample of step N, `async_eval`, then resolve token N) overlaps the build with the GPU on every other arch. On qwen4 the n-gram PLE needs the token ids on the HOST (hash → `ngram_table.bin` rows), and `pleEmbedding` did `mlx_array_eval(ids)` at layer 1 — so the build blocked there until forward N finished, and layers 1..47 (most of the 1.3 ms) plus the gather ran with the GPU idle. Serving was forward + build + gather, every token.
+
+Fix: `ForwardCtx.ple_defer` (set only by `generate.lazyForward`). `pleEmbedding` then hands the graph a zero-filled bf16 leaf and records `PlePending` (leaf + token-id ref + entry); after `forwardWith` returns, `Transformer.flushDeferredPle` evals the ids (the ONE sync — it waits for forward N, which is unavoidable), gathers the rows straight into the leaf's buffer (`mlx_array_data_bfloat16` + `@constCast`; a `new_data` leaf is an evaluated shared-mode buffer nobody reads until the graph runs) and advances the per-entry n-gram history. Batched decode (`batch_slots`), MTP verify and the concrete-token slow path keep the synchronous arm. Short 63.0 → 69.0 tok/s, 8.5k 55.1 → 60.6, greedy bytes identical on both prompts.
+
+Measured null and removed: `mlx_async_eval` of the post-layer-0 stream before the sync (so the GPU would run layer 0 + the sample while the host gathers). First pass 68.8 / 60.6 vs 69.0 / 60.6 while the user watched video on the box (same binary re-booted 67.3 / 59.2); idle interleaved pairs L0-B-B-L0: 68.9, 68.5 vs 68.4, 68.5 short, long 60.3 / 60.2 everywhere — null. Idle same-boot-order pairs read ±0.03 ms on the ubench; a busy desktop widens that to ±2.5%, so sub-2% calls are only worth making on an idle box.
+
+Bar: `qwen4 deferred PLE` (tiny pack, `QWEN4_TEST_MODEL`): two `ple_defer` + flush decode steps == the direct forward bit for bit (the second step proves the history advanced at flush time), and an UNFLUSHED leaf differs — the leaf is load-bearing.
+
+Where the rest of the qwen4 decode goes (same day, stand-in ubench, 14.8 ms GPU): MoE 5.8 ms vs a ~2.7 ms byte floor, GDN 3.3 vs 1.9 (projections 2.8 of it), attention 0.85, hyper-connection read/write + norms ~3.0, lm_head 1.4. Roughly 13 dependent kernels per layer at ~10–20 µs each; the next levers are kernel-count ones (single-kernel hc read via a last-threadgroup reduction, MoE kernel latency), not bytes. 27B for comparison: 33.7 ms/forward vs a 31 ms byte floor (roofline); verify widths S=2/3/4/5/6/8 = 34.9/36.0/39.5/44.8/49.9/89.6 ms, long KV adds ~1 ms at S=2 — its MTP round is the verify forward, so the 27B's only decode lever is the vqmm lane's compute rate at 4–7 rows.
+
+### Leftovers round, same day: five nulls and one loss, all measured in-situ
+
+Stand-ins added for the meter (`QWEN4_STANDIN=hc,moe_shared,moe_router,moe_gateup,moe_down`; a stand-in whose output nothing consumes lets MLX drop the whole block as dead code — the first `hc` arm read 2.8 ms because every block became unreachable; the shipped one keeps the writes live). Decode, GPU ms/forward, base 14.5–14.8:
+
+| arm | result | reading |
+|---|---|---|
+| `moe_gateup` stand-in | −1.7 ms | 16.4 MB/forward → the fused gate+up kernel is at ~450 GB/s: bandwidth |
+| `moe_down` stand-in | −0.6 ms | 8 MB: bandwidth |
+| `moe_shared` stand-in | −0.86 ms | 7.4 MB: bandwidth (the chain overlaps the routed path) |
+| `moe_router` stand-in | −0.88 ms | 2.6 MB in 18 µs/layer: ~13 µs/layer of two-kernel latency (qmv + topk) |
+| `hc` stand-in (view + unit gates, chain writes kept) | −1.65 ms | the three read kernels are ~17 µs per read |
+| `MLX_SERVE_MOE_GATHER_QMV_OFF=1` (stock gather_qmm) | +1.3 ms | ours stays |
+| gate+up with a template pack count + register-preloaded words (the hc-read unroll) | −0.7% (idle pairs 14.88/14.91 vs 14.99/14.99) — SHIPPED, bit-identical | at bandwidth already; the preload only trims issue latency |
+| `MLX_MAX_OPS_PER_BUFFER=64` + `MLX_MAX_MB_PER_BUFFER=1024` (fewer command buffers; ~111/token at the default) | null (idle pairs 14.99/15.06 vs 14.99/14.99) | Metal pipelines buffer commits fine |
+| hc read N folded into D and U (every threadgroup recomputes the 4 stream RMS stats with the stats kernel's exact reduction order; −96 dependent kernels/forward; bytes identical) | **+1.3 ms, serving 69 → 62.6** | 644 threadgroups × 20 KB + a barrier before any weight load: the redundant reduction costs more than the kernel it removes. Reverted |
+| prefill: dense causal instead of the QSA mask arm at the 4096-row chunk over kv 4096–8192 (`attn_qsa` stand-in) | 8.35 s vs 6.33 s per chunk | the masked `msv_attn_p256` arm already beats dense by 2 s; nothing to win there |
+
+Reading of the whole: ~6.4 ms of the 14.5 are weight bytes at 546 GB/s, every big block (experts, GDN projections, shared expert, lm_head) is at bandwidth, and the other ~8 ms is ~840 dependent kernels at roughly 10 µs of turnaround each. The only levers left are kernel-COUNT cuts that do not redistribute work (GDN prework + recurrence + norm-gate as one per-head kernel, −72; router matvec + top-k via a last-threadgroup reduce, −48), each a kernel project worth ≤ 5%. Metal System Trace via `xctrace` gives command-buffer intervals only; the shader-profiler table stays empty without the GUI template, so the stand-in ubench remains the per-kernel meter.

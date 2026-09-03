@@ -246,6 +246,65 @@ pub fn conv3d(input: mlx.mlx_array, weight: mlx.mlx_array, stride: [3]c_int, pad
     return out;
 }
 
+/// Output elements one conv3d call may produce (frames x H x W x max(C,O)).
+/// MLX >= 0.32.2 runs a temporal-pad-0, stride-1, N=1 3D conv as kD per-tap
+/// 2D convs, keeps every tap's FULL output alive until the op completes and
+/// budgets the Winograd working set against the whole GPU, blind to what is
+/// already resident. Over a full-resolution 193-frame VAE tensor that was a
+/// Metal command-buffer OOM at "Decoding video" (#321). 64M elements bounds
+/// the per-call transient to a few hundred MB at the decoder's widest stage.
+pub const CONV3D_CHUNK_ELEMS: u64 = 64 << 20;
+
+/// Output frames per conv3d call under `CONV3D_CHUNK_ELEMS`; never 0.
+pub fn conv3dChunkFrames(h: u64, w: u64, c: u64, o: u64, budget: u64) u32 {
+    const per_frame = h * w * @max(c, o);
+    if (per_frame == 0) return 1;
+    return @intCast(@max(1, @min(budget / per_frame, std.math.maxInt(c_int))));
+}
+
+var conv3d_chunk_logged = false;
+
+/// `conv3d(x, w, stride 1, pad 0)` over depth windows of `max_frames` output
+/// frames (input overlap `k - 1`), each evaluated before the next so the
+/// transient is one window's. Exact: an output frame reads only its `k`
+/// input frames. Whole-depth when it already fits.
+pub fn conv3dDepthChunked(x: mlx.mlx_array, weight: mlx.mlx_array, k: u32, max_frames: u32, s: S) !mlx.mlx_array {
+    const D: c_int = mlx.getShape(x)[1];
+    const kk: c_int = @intCast(k);
+    const od: c_int = D - kk + 1;
+    const step: c_int = @intCast(max_frames);
+    if (od <= step) return conv3d(x, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    if (!conv3d_chunk_logged) {
+        conv3d_chunk_logged = true;
+        log.info("[ltx] conv3d depth-chunked: {d} output frames in windows of {d}\n", .{ od, step });
+    }
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var start: c_int = 0;
+    while (start < od) : (start += step) {
+        const n = @min(step, od - start);
+        const win = try sliceAxis1(x, start, start + n + kk - 1, s);
+        defer _ = mlx.mlx_array_free(win);
+        var wc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wc);
+        try mlx.check(mlx.mlx_contiguous(&wc, win, false, s));
+        const part = try conv3d(wc, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+        defer _ = mlx.mlx_array_free(part);
+        _ = mlx.mlx_array_eval(part); // bound the transient to this window
+        _ = mlx.mlx_vector_array_append_value(vec, part);
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+/// Frames per call for `decoderConv3d` on padded input `t` and weight `w`.
+fn decoderChunkFrames(t: mlx.mlx_array, weight: mlx.mlx_array) u32 {
+    const ts = mlx.getShape(t);
+    const ws = mlx.getShape(weight);
+    return conv3dChunkFrames(@intCast(ts[2]), @intCast(ts[3]), @intCast(ts[4]), @intCast(ws[0]), CONV3D_CHUNK_ELEMS);
+}
+
 /// Slice frames `[start, stop)` along the depth axis (axis 1) of an NDHWC array.
 fn sliceAxis1(x: mlx.mlx_array, start: c_int, stop: c_int, s: S) !mlx.mlx_array {
     const sh = mlx.getShape(x);
@@ -306,7 +365,7 @@ pub fn decoderConv3d(x: mlx.mlx_array, weight: mlx.mlx_array, bias: ?mlx.mlx_arr
     try mlx.check(mlx.mlx_contiguous(&tc, t, false, s));
     _ = mlx.mlx_array_free(t);
 
-    const out = try conv3d(tc, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    const out = try conv3dDepthChunked(tc, weight, k, decoderChunkFrames(tc, weight), s);
     if (bias) |b| {
         var wb = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&wb, out, b, s));
@@ -4822,6 +4881,43 @@ test "ltx loader: connector + vae_decoder key map" {
         try testing.expectEqual(@as(c_int, 1024), sh[0]);
         try testing.expectEqual(@as(c_int, 128), sh[4]);
     }
+}
+
+test "ltx conv3dDepthChunked is exact against the whole-depth conv3d" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    // C % 16 == 0, N == 1, kD == 3, temporal pad 0: the shape MLX >= 0.32.2
+    // decomposes into per-tap 2D convs (#321).
+    const xs = [_]c_int{ 1, 11, 8, 8, 16 };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_normal(&x, &xs, xs.len, .float32, 0.0, 1.0, key, s));
+    const ws = [_]c_int{ 32, 3, 3, 3, 16 };
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_normal(&w, &ws, ws.len, .float32, 0.0, 1.0, key, s));
+
+    const whole = try conv3d(x, w, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    defer _ = mlx.mlx_array_free(whole);
+    // 9 output frames in windows of 4 → 4 + 4 + 1.
+    const chunked = try conv3dDepthChunked(x, w, 3, 4, s);
+    defer _ = mlx.mlx_array_free(chunked);
+    try testing.expectEqualSlices(c_int, mlx.getShape(whole), mlx.getShape(chunked));
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, whole, chunked, s));
+    var ad = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ad);
+    try mlx.check(mlx.mlx_abs(&ad, diff, s));
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    try mlx.check(mlx.mlx_max(&mx, ad, false, s));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mx));
+    try testing.expectEqual(@as(f32, 0), v);
 }
 
 // Stage-5 keystone: validate decoderConv3d (the VAE's causal=False Conv3dBlock)

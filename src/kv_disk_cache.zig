@@ -297,6 +297,18 @@ pub const DiskTier = struct {
         defer cp.deinit(self.allocator);
         try self.restoreKvInto(cache, e, cp_pos, s);
         try transformer_mod.restoreSsmCheckpoint(ssm_entries, &cp);
+        // QSA history lives on the latest snap only. Intermediate files have
+        // GDN/PLE state; overlay the sliced indexer keys from the last file.
+        if (e.ssm_positions.len > 0) {
+            const latest = e.ssm_positions[e.ssm_positions.len - 1];
+            if (latest != cp_pos) {
+                if (self.loadSsmFile(e.id, latest, ssm_entries.len)) |qsa_cp_val| {
+                    var qsa_cp = qsa_cp_val;
+                    defer qsa_cp.deinit(self.allocator);
+                    transformer_mod.applyQsaHistoryAt(ssm_entries, &qsa_cp, cp_pos, s) catch {};
+                } else |_| {}
+            }
+        }
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp_pos;
@@ -2384,6 +2396,7 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
         try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());

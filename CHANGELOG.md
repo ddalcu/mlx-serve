@@ -4,15 +4,33 @@
 
 ### Highlights
 
-- **Watch a video take shape while it renders.** Video Generation has a "Show live preview while generating" toggle: with it on, each denoise step sends back a small still (or a filmstrip of several frames) so you can tell early whether a 6-minute render is going where you wanted. It reads the latent directly — no second decode — using the published colour projection for each model's latent space, so the picture actually resembles the finished clip on both LTX and MiniMax H3. Off by default, and off costs nothing.
-- **`--config-overrides` stretches a checkpoint's context** (vLLM's `--hf-overrides`): YaRN factor 4 turns Qwen 3.8 Flash Next's 262k window into 1M without editing the model dir.
+- **Terminals live in the chat sidebar.** The separate Sandbox window is gone. Sandbox sessions and host CLIs (Claude Code, opencode, codex, ...) are rows in the Sessions list next to your chats: drag to reorder, Cmd+1..9 jumps across the whole panel, rename, per-terminal theme, "Move Tab to New Window". Closing a window no longer kills the ssh session behind it. Starting a terminal asks for a folder and hot-mounts it at `/projects/<name>`, so several folders coexist. Terminal themes and background live in Settings > Interface.
+- **Qwen 3.8 Flash Next at 1M context.** YaRN rope scaling to 1,048,576 tokens, HF/vLLM-compatible, verified against the reference past the trained window (#323, thanks @beamivalice). `--config-overrides` (vLLM's `--hf-overrides`) applies it without editing the model dir.
+- **Flash Next is faster.** +10% decode from building the graph before the n-gram lookup (63 -> 69 tok/s short, 55 -> 61 at 8.5k on an M4 Max). Long-prompt prefill gathers sparse-attention blocks directly instead of masking the whole cache: 32k 589 -> 699, 128k 395 -> 654, 256k 267 -> 551 tok/s. The n-gram table is warmed at boot, so the first long prompt after a restart no longer takes 3x longer (38k: 174 s -> 55 s). Direct-index idea from Jonathan Spangler's oMLX (jundot/omlx #3244).
+- **Long agent sessions keep their cache.** Four prefix-cache fixes that together stop hybrid models (Qwen 3.5/3.8, Flash Next) from cold-prefilling a 200k prompt every turn: SSM checkpoints are bounded on the extend path and kept spread across the prompt instead of bunched at the end (#307, #310, thanks @kartalbas); hybrid entries rank by restorable state, not raw match length (#312, thanks @IridiumMaster); an entry that outgrows the budget is trimmed to the longest prefix that fits instead of dropped (#330, thanks @d-b); and the memory accounting no longer double-counts a restore (#326, thanks @ViRb3).
+- **Image chats stay fast.** Only the current turn's image is decoded; historical ones ride the prefix cache, and swapping the image keeps the text before it (#318, #320, #314, thanks @IridiumMaster).
+- **Watch a video take shape while it renders.** Video Generation has a "Show live preview while generating" toggle: each denoise step sends back a small still or filmstrip read straight from the latent using the published colour projection for LTX and MiniMax H3. Off by default, and off costs nothing (#208, thanks @Rhystic1).
+- **Your Mac stays awake during generation** (#251, thanks @JustasMonkev). Off with `--no-prevent-sleep`.
+- **Settings > Interface**: light/dark/system, accent colour, chat text size, compact mode, and a configurable global shortcut for the quick launcher (#143, thanks @deanputney).
+- **Chat images are stored on disk**, not base64 in the history file: a typical history shrinks from 1.5 MB to 80 KB, and HEIC/TIFF/raw attachments are converted so the model actually sees them (#313, thanks @lojza3d).
+- **MiniCPM5 V3 tool calls** (`<function name=...><param name=...>`) are parsed natively, including truncated ones (#315, thanks @uncle9x9).
+- **Long-context decode on Qwen 3.8 Flash Next stays fast.** Sparse attention at decode reads only the selected ~2k KV rows instead of the whole cache: a 128k prompt decodes 47 tok/s instead of 40 on an M4 Max, and the gap widens with context (thanks @beamivalice).
 
 ### Fixes
 
-- Long cached Pi/agent conversations are no longer refused by a phantom second KV-cache copy. RAM prefix restores share MLX buffers, and the cache memory limit now remains a hard cap even when one entry alone is oversized.
-- Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
-- QSA scalar RoPE omitted YaRN mscale (partial-rotary ranking can change which blocks win); SSD prefix-cache fingerprint now includes `--config-overrides`.
+- Chat templates using `|min` or `|max` on a real array failed to render and silently fell back to the wrong prompt format, so the model lost its stop token. Hit every MiniCPM5 multi-turn tool conversation (#335, thanks @uncle9x9).
 - JSON-schema output with thinking enabled returned the JSON as `reasoning_content` with empty `content` on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now forces thinking off on every surface, matching `/v1/messages`.
+- Qwen 3.8 Flash Next packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). 2/4/8-bit packs are unchanged.
+- A large `--prefix-cache-mem` beside a big pack could pass the load and then die in an uncatchable GPU OOM on a long prompt. The cache budget is now clamped to what the weights leave at load.
+- Image turns after a tool response placed the image at the wrong position in the prompt on ChatML models.
+- QSA scalar RoPE omitted YaRN mscale; the SSD prefix-cache fingerprint now includes `--config-overrides`.
+- An LTX download whose `.partial` file vanished could never finish until its sidecar was deleted by hand.
+- Prose that merely mentions `<function name="...">` is no longer promoted into a tool call, and no longer truncates the rest of the reply.
+- Failed sandbox/terminal rows offer Start Server / Retry instead of an alert; every file picker shows hidden files.
+- Chat: attachments the server cannot decode (HEIC, TIFF, camera raw) no longer drop out of the prompt silently.
+- Model Browser: sizes and RAM fit for quantized MLX repos were 4x too high after Hugging Face changed how it counts packed weights. Sizes are now priced by the repo's bit width and match the real download.
+- Qwen 3.8 Flash Next long prefills no longer die around 400k tokens: prefix-cache snapshots were cloning the growing sparse-attention key history at every stride (tens of GB). History is stored once per cached prompt, a cancelled prefill's snapshot lines up with its cache, and a snapshot without history is a cache miss instead of a request that fails every turn (thanks @beamivalice).
+- LTX video generation crashed the server at "Decoding video" on 26.8.11 (#321, thanks @hermitdave, @jedisct1). MLX 0.32.2 changed how 3D convolutions run, and the VAE decoder's per-convolution working set grew to tens of GB at full resolution (67 GB peak at 97 frames 1024x576, now 36 GB, same speed). The decoder now runs its convolutions in bounded frame windows.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 

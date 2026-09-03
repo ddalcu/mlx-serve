@@ -799,6 +799,19 @@ pub const ModelConfig = struct {
         return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
     }
 
+    /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
+    /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
+    /// layer. Not kv-quantized. Zero on archs without an indexer. The
+    /// auto-context sizer and the prefill guard add this ONCE — stride
+    /// checkpoints no longer clone it.
+    pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
+        return n * hd * 2 + n * hd * 2 / ratio;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }
@@ -6554,6 +6567,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 12 * 128 * 2 + 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);

@@ -9145,6 +9145,91 @@ test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(
     try testing.expect(std.mem.indexOf(u8, rendered, "<k>count</k><v>2</v>") != null);
 }
 
+test "renderChatTemplate: REAL MiniCPM5 chat_template.jinja multi-turn tool history renders without fallback (MINICPM5_MODEL_DIR)" {
+    // Env-gated: MINICPM5_MODEL_DIR=<dir containing chat_template.jinja>.
+    //
+    // MiniCPM5-1B's template line 59 does
+    //     {%- set min_count = [tool_calls_count, tool_sep_count]|min %}
+    // inside the `{%- if message.tool_calls %}` history branch — reached ONLY
+    // when a prior assistant tool call is replayed into history, i.e. the
+    // SECOND turn of any tool conversation. jinja_cpp registered `min`/`max`
+    // only in the EMPTY-sequence table, so a 2-element array threw
+    //   "Unknown (built-in) filter 'min' for type Array"
+    // and renderChatTemplate silently downgraded to fallbackFormatChat, which
+    // emits Gemma-family <start_of_turn>/<end_of_turn> that MiniCPM5 never saw
+    // in training — it loses its stop token and degenerates into unrelated
+    // text. Single-turn requests never enter the branch, which is why the
+    // MiniCPM5 V3 parser corpus (all single-turn) never caught it.
+    // Same wrong-family prompt-format class as the Hy3 str.format test above.
+    const dir = std.c.getenv("MINICPM5_MODEL_DIR") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
+    defer allocator.free(path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tpl = blk: {
+        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.SkipZigTest;
+        defer f.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = f.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    };
+    defer allocator.free(tpl);
+    // Only meaningful against a template that actually uses the filter.
+    if (std.mem.indexOf(u8, tpl, "|min") == null) return error.SkipZigTest;
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "read_file", .arguments = "{\"path\": \"/tmp/marker.txt\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Read /tmp/marker.txt" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "ALPHA-7719", .tool_call_id = "tc_0" },
+    };
+
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
+    defer allocator.free(rendered);
+
+    // MiniCPM5's own family tokens survived => the Jinja render succeeded.
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_end|>") != null);
+    // The tool round made it through the |min branch.
+    try testing.expect(std.mem.indexOf(u8, rendered, "<function name=\"read_file\">") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>") != null);
+    // The decisive assertion: NO silent downgrade to the generic fallback.
+    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<end_of_turn>") == null);
+}
+
+test "renderChatTemplate: |min picks the smaller element, |max the larger" {
+    // Guards against a min/max implementation that just returns first/last.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- for message in messages -%}
+        \\{{ [3, 1, 2]|min }}/{{ [3, 1, 2]|max }}
+        \\{%- endfor -%}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
+}
+
 test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {
     // Env-gated: HY3_MODEL_DIR=<dir containing chat_template.jinja>. Renders
     // the actual shipped template with system + tools + a tool round and

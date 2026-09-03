@@ -912,7 +912,7 @@ struct VideoGenView: View {
     }
 
     private func chooseAudioFile() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1206,7 +1206,7 @@ struct VideoGenView: View {
 
     private func chooseLora() {
         guard loras.count < maxLoras else { return }
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }
@@ -1230,7 +1230,7 @@ struct VideoGenView: View {
     /// than earning a 400 at generate time.
     private func chooseRefFiles(types: [UTType], limit room: Int, into urls: Binding<[URL]>) {
         guard room > 0 else { return }
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = types
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1246,7 +1246,7 @@ struct VideoGenView: View {
     }
 
     private func chooseKeyframeImage(into slot: Binding<URL?>) {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

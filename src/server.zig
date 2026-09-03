@@ -2920,7 +2920,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
     const chunk: u64 = pinPrefillChunk(config);
-    const ctx_kv: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *|
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken()) *|
         getEffectiveContextLength(config);
     const clamped = clampedPrefixCacheMem(
         requested,
@@ -2964,7 +2964,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     //   an unconditional fp16. A `--kv-quant 4` server otherwise reports (and
     //   serves) under a third of the context it can actually hold.
     const kv_bits: u64 = defaultKvBits();
-    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + config.qsaHistoryBytesPerToken();
 
     // `total_ctx = 0` asks boundedPrefillChunk for the UNSHRUNK cap: every
     // branch that narrows the chunk does so for longer contexts, so this is the
@@ -3240,7 +3240,8 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
+            seq * config.qsaHistoryBytesPerToken();
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static

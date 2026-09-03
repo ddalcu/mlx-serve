@@ -13,6 +13,12 @@ enum InterfacePrefKey {
     static let accentColor = "accentColorName"
     static let textSize = "chatTextSize"
     static let compactMode = "compactMode"
+    /// Default `TerminalTheme` id for new sandbox terminals; a session can
+    /// override it from its row's context menu.
+    static let terminalTheme = "terminalTheme"
+    /// "#RRGGBB" ground painted under the default terminal theme; "" = the
+    /// theme's own.
+    static let terminalBackground = "terminalBackground"
 }
 
 enum AppAppearanceMode: String, CaseIterable, Identifiable {

@@ -329,7 +329,7 @@ struct Model3DGenView: View {
     // MARK: - Photo picker
 
     private func choosePhoto() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

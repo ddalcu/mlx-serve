@@ -75,6 +75,9 @@ final class ChunkedDownloadTests: XCTestCase {
         ])
         st.chunks[1].done = 40
         st.save(forPartial: partial)
+        // The sidecar is only honoured beside its `.partial` — chunk 1 wrote
+        // through byte 139, so that is how long the file is.
+        try Data(count: 140).write(to: URL(fileURLWithPath: partial))
 
         let back = ChunkedResumeState.load(forPartial: partial, expectedSize: 300)
         XCTAssertEqual(back, st)
@@ -220,6 +223,35 @@ final class ChunkedDownloadTests: XCTestCase {
 
         XCTAssertEqual(RangeStubProtocol.requestedRanges, [], "nothing left to fetch")
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: partial)), blob)
+    }
+
+    func testASidecarWhosePartialIsGoneIsRefetchedNotCommitted() async throws {
+        // A `.parts` sidecar describing a COMPLETE file, with no `.partial`
+        // beside it (issue: LTX-2.5 `audio_vae.safetensors`). The plan read
+        // "every byte is on disk", `run()` returned success, and the caller's
+        // `moveItem` threw NSFileNoSuchFileError — a download that can never
+        // finish until the sidecar is deleted by hand. The sidecar describes
+        // bytes in a file; no file, no bytes.
+        let blob = Self.pseudoRandom(bytes: 1 << 20)
+        let partial = tmp("orphan.partial")
+        ChunkedResumeState.planAdopting(prefix: Int64(blob.count), fileSize: Int64(blob.count), connections: 4)
+            .save(forPartial: partial)
+        RangeStubProtocol.configure(blob: blob)
+
+        try await downloader(partial: partial, size: Int64(blob.count), connections: 4, minChunk: 64 << 10).run()
+
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: partial)), blob)
+    }
+
+    func testASidecarIsNotTrustedPastWhatThePartialHolds() throws {
+        // Same class, truncated instead of deleted: the banked total must never
+        // exceed the bytes actually on disk.
+        let partial = tmp("short.partial")
+        try Data(count: 4 << 10).write(to: URL(fileURLWithPath: partial))
+        ChunkedResumeState.planAdopting(prefix: 1 << 20, fileSize: 1 << 20, connections: 4)
+            .save(forPartial: partial)
+
+        XCTAssertNil(ChunkedResumeState.load(forPartial: partial, expectedSize: 1 << 20))
     }
 
     func testAPartialFromTheOldSingleStreamPathKeepsItsBytes() async throws {

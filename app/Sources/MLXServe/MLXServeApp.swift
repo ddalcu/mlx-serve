@@ -88,7 +88,6 @@ struct MLXCoreApp: App {
                 openServerLog: { openAndFocus("serverLog") },
                 openTasks: { appState.showTasks() },
                 openAgents: { openAndFocus("agents") },
-                openSandboxTerminal: { openAndFocus("sandboxTerminal") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -138,6 +137,7 @@ struct MLXCoreApp: App {
                 // Settings, Tasks and Agents render here as modes too, so their
                 // objects ride this scene (`ChatWorkspace`).
                 .environmentObject(appState.taskScheduler)
+                .environmentObject(appState.terminals)
                 .environmentObject(appState.agents)
                 .environmentObject(appState.server)
                 .environmentObject(appState.toolExecutor)
@@ -190,17 +190,22 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 560)
 
-        // The Sandbox window: an embedded terminal for agent CLI sessions
-        // (pi / hermes / shell over ssh) inside the guest, plus the Activity
-        // transcript of everything running in it. Title tracks the live
-        // session via .navigationTitle ("pi — MLX Sandbox").
-        Window("MLX Sandbox", id: "sandboxTerminal") {
-            SandboxTerminalView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
-                .appAppearance()
+        // A sandbox terminal moved out of the chat window ("Move Tab to New
+        // Window", 2026-09-02). One window per session id; the session itself
+        // stays in `appState.terminals` — the window only hosts its view, so
+        // closing the window puts the terminal back in the sidebar's detail
+        // column and ends nothing.
+        WindowGroup("Terminal", id: "terminalWindow", for: UUID.self) { $sessionId in
+            if let sessionId {
+                TerminalWindowView(sessionId: sessionId)
+                    .environmentObject(appState)
+                    .environmentObject(appState.server)
+                    .environmentObject(appState.terminals)
+                    .frame(minWidth: 560, minHeight: 360)
+                    .appAppearance()
+            }
         }
-        .defaultSize(width: 780, height: 560)
+        .defaultSize(width: 900, height: 600)
 
         // Agents (personas): who you're talking to, and the settings that
         // conversation runs under. Configuration only — chatting with an agent

@@ -475,6 +475,8 @@ struct ChatView: View {
                     set: { appState.selectModelSection($0) }))
             } else if appState.chatWorkspace.isSettings {
                 SettingsView()
+            } else if case .terminal(let id) = appState.chatWorkspace {
+                TerminalPane(sessionId: id)
             } else if case .create(let experiment) = appState.chatWorkspace {
                 // The four generators were four Window scenes; they are pages
                 // of this window now. Each keeps its own view untouched — only
@@ -560,6 +562,42 @@ struct ChatView: View {
     private func cancelGate() {
         gateCancelled = true
         DispatchQueue.main.async { dismissWindow(id: "chat") }
+    }
+}
+
+/// Drag-to-reorder for one sidebar row: the row is a drag source carrying its
+/// id, and a drop target that takes the dragged row into its slot the moment
+/// the drag ENTERS it. `onDrag`/`onDrop` rather than `.draggable`, because the
+/// live reorder needs `dropEntered`, which only a `DropDelegate` gets.
+struct SidebarReorder: ViewModifier {
+    let id: UUID
+    @Binding var dragging: UUID?
+    let move: (UUID, UUID) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onDrag {
+                dragging = id
+                return NSItemProvider(object: id.uuidString as NSString)
+            }
+            .onDrop(of: [.text], delegate: Delegate(id: id, dragging: $dragging, move: move))
+    }
+
+    private struct Delegate: DropDelegate {
+        let id: UUID
+        @Binding var dragging: UUID?
+        let move: (UUID, UUID) -> Void
+
+        func dropEntered(info: DropInfo) {
+            guard let moved = dragging, moved != id else { return }
+            move(moved, id)
+        }
+        func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+        func performDrop(info: DropInfo) -> Bool {
+            dragging = nil
+            return true
+        }
+        func dropExited(info: DropInfo) {}
     }
 }
 
@@ -820,8 +858,14 @@ struct ChatSidebar: View {
     /// server and the agent store, so a badge reading `appState.downloads`
     /// never repainted while a transfer started, progressed or finished.
     @EnvironmentObject var downloads: DownloadManager
+    /// Sandbox terminals share the Chats section with the conversations.
+    @EnvironmentObject var terminals: TerminalSessionStore
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// The row being dragged to a new slot, nil outside a drag.
+    @State private var draggingRowId: UUID?
+    /// The rename dialog's text.
+    @State private var renameDraft = ""
     /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
     /// alone by shift itself so dragging a range up and down keeps re-ranging
     /// from the same origin instead of walking away from it.
@@ -893,16 +937,40 @@ struct ChatSidebar: View {
     /// instead of going to it. The flags are stated explicitly instead, and the
     /// decision itself is `ChatQuickSwitch.outcome`.
     private func quickSwitch(to slot: Int, extend: Bool) {
-        guard let outcome = ChatQuickSwitch.outcome(
+        let rows = panelRows
+        switch ChatQuickSwitch.target(
             slot: slot,
-            sessions: appState.visibleChatSessions,
+            visible: rows.visible,
+            chats: rows.chats,
             numbering: numberedRows,
             selection: appState.sidebarSelection,
             anchor: selectionAnchor,
             active: appState.activeChatId,
-            extend: extend)
-        else { return }
-        apply(outcome)
+            extend: extend) {
+        case .chat(let outcome)?: apply(outcome)
+        case .terminal(let id)?: showTerminal(id)
+        case nil: break
+        }
+    }
+
+    /// The panel top to bottom: Agents rows, then Sessions rows (chats and
+    /// terminals interleaved), both in the ONE dragged order. `visible` is
+    /// what the ⌘ numbers and a drop read; `chats` is the conversation subset
+    /// a shift-range runs over — the split is a heading, not a wall.
+    private var panelRows: (agents: [SidebarChatRows.Row], sessions: [SidebarChatRows.Row],
+                            visible: [UUID], chats: [UUID]) {
+        let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+        let agents = SidebarChatRows.merge(chats: groups.agents, terminals: [],
+                                           order: appState.sidebarOrder)
+        let sessions = SidebarChatRows.merge(chats: groups.chats,
+                                             terminals: terminals.sessions.sessions,
+                                             order: appState.sidebarOrder)
+        let all = agents + sessions
+        let chats = all.compactMap { row -> UUID? in
+            if case .chat(let s) = row { return s.id }
+            return nil
+        }
+        return (agents, sessions, all.map(\.id), chats)
     }
 
     /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
@@ -939,21 +1007,31 @@ struct ChatSidebar: View {
             // Two sections, one row builder. Agent threads sit above the plain
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
-            let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
-            // The panel's visual order, both sections flattened — a shift-click
-            // ranges across the Agents/Chats boundary, because the split is a
-            // heading, not a wall.
-            let ordered = groups.agents.map(\.id) + groups.chats.map(\.id)
+            // Conversations and sandbox terminals, one list (`panelRows`).
+            // Terminals take no part in multi-select; they do wear ⌘ numbers.
+            let rows = panelRows
+            let agentRows = rows.agents, sessionRows = rows.sessions
+            let visible = rows.visible, ordered = rows.chats
             LazyVStack(alignment: .leading, spacing: 2) {
-                if !groups.agents.isEmpty {
+                if !agentRows.isEmpty {
                     sectionHeader("Agents")
-                    ForEach(groups.agents) { session in
-                        sessionRow(session, ordered: ordered)
+                    ForEach(agentRows) { row in
+                        if case .chat(let session) = row {
+                            sessionRow(session, ordered: ordered)
+                                .modifier(reorderable(session.id, visible: visible))
+                        }
                     }
                 }
-                sectionHeader("Chats")
-                ForEach(groups.chats) { session in
-                    sessionRow(session, ordered: ordered)
+                sectionHeader("Sessions") { newSessionMenu }
+                ForEach(sessionRows) { row in
+                    switch row {
+                    case .chat(let session):
+                        sessionRow(session, ordered: ordered)
+                            .modifier(reorderable(session.id, visible: visible))
+                    case .terminal(let t):
+                        terminalRow(t)
+                            .modifier(reorderable(t.id, visible: visible))
+                    }
                 }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
@@ -1041,6 +1119,7 @@ struct ChatSidebar: View {
         // they address THIS view's conversation list; hidden in a background so
         // they cost no layout.
         .background(quickSwitchShortcuts)
+        .background(renameDialog)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -1064,12 +1143,9 @@ struct ChatSidebar: View {
         // list of places stays where the eye learned it.
         .safeAreaInset(edge: .top) {
             VStack(spacing: 2) {
-                // New Chat, and beside it the choice of WHO the chat is with.
-                destinationRow("New Chat", icon: "square.and.pencil",
-                               selected: false) {
-                    appState.showConversation()
-                    _ = appState.newChatSession()
-                }
+                // Starting something new (a chat, a coding CLI) is the +
+                // beside the Sessions heading — one place, next to the list
+                // it adds to — rather than two destination rows up here.
                 destinationRow("Models", icon: "square.stack.3d.up",
                                selected: appState.chatWorkspace.isModels,
                                badge: activeDownloadCount) {
@@ -1107,13 +1183,8 @@ struct ChatSidebar: View {
                                selected: appState.chatWorkspace.isTasks) {
                     appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
                 }
-                // A launcher is a CHOICE of CLI, so the row is the menu it has
-                // always been (the tray's own list, shared) rather than an
-                // invented pane with one list in it.
-                codeLauncherRow
-
                 // No "Chats" heading here: the list carries its own section
-                // headers ("Agents", "Chats"), and one of them appears only
+                // headers ("Agents", "Sessions"), and one of them appears only
                 // when it has rows. A heading pinned in this inset could not
                 // do that — it would sit above an empty list announcing a
                 // section that isn't there.
@@ -1253,15 +1324,60 @@ struct ChatSidebar: View {
 
     /// A section heading, sitting on the same left edge as the rows under it.
     private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // The stack owns the gutter; the heading owes only the row's inner
-            // inset, so it sits on the same left line as the labels under it.
-            .padding(.horizontal, ChatMetrics.sidebarRowInset)
-            .padding(.top, 10)
-            .padding(.bottom, 2)
+        sectionHeader(title) { EmptyView() }
+    }
+
+    /// A heading with an optional trailing control (the Sessions +).
+    private func sectionHeader<T: View>(_ title: String,
+                                        @ViewBuilder trailing: () -> T) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            trailing()
+        }
+        // The stack owns the gutter; the heading owes only the row's inner
+        // inset, so it sits on the same left line as the labels under it.
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    /// The + beside Sessions: a new chat first, then the coding CLIs (the
+    /// tray's own list, shared, so the two cannot drift; DMG-only — the App
+    /// Store build can't detect or launch other apps' CLIs).
+    private var newSessionMenu: some View {
+        Menu {
+            Button {
+                appState.showConversation()
+                _ = appState.newChatSession()
+            } label: {
+                Label("New Chat", systemImage: "square.and.pencil")
+            }
+            if BuildFeatures.current.cliLauncher {
+                Divider()
+                CLILauncherMenuItems(
+                    detector: cliDetector,
+                    baseURL: appState.server.baseURL,
+                    servedModelId: appState.server.chatModelId ?? "mlx-serve",
+                    serverContextLength: appState.server.chatModelInfo?.contextLength,
+                    models: appState.server.allModels,
+                    openSandboxAgent: { appState.startTerminal(agentId: $0) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("New chat, or a coding agent in a terminal")
     }
 
     /// One conversation row, shared by both sections. `ordered` is the panel's
@@ -1300,6 +1416,12 @@ struct ChatSidebar: View {
                         Image(systemName: agent.symbol)
                             .font(.system(size: 10))
                             .foregroundStyle(Color.accentColor)
+                    } else if !session.isExternalBridge {
+                        // Every row in this column carries a glyph saying what
+                        // it is — a terminal, an agent, a plain conversation.
+                        Image(systemName: "bubble.left")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
                     }
                     Text(ChatSessionTitle.display(title: session.title,
                                                   agentName: agent?.name))
@@ -1342,16 +1464,7 @@ struct ChatSidebar: View {
         // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
         // a preference write per row per scroll frame, and outside this
         // transient mode nothing reads the answer.
-        .background {
-            if modifiers.commandHeld {
-                GeometryReader { proxy in
-                    let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
-                    Color.clear.preference(
-                        key: SidebarRowSpansKey.self,
-                        value: [session.id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
-                }
-            }
-        }
+        .background(rowSpanProbe(session.id))
         // One meaning for gray in this panel, and one SHAPE: the fill rides the
         // row's own content inside the stack's gutter, exactly as a
         // destination's `.background` does. (It was a `listRowBackground` once,
@@ -1373,27 +1486,8 @@ struct ChatSidebar: View {
         // joins the selection, so the pointer is regularly here with ⌘ held —
         // and the ✕ is one pixel away from a click meaning "delete this".
         .overlay(alignment: .trailing) {
-            if modifiers.commandHeld, let slot = ChatQuickSwitch.slot(for: session.id,
-                                                                      in: appState.visibleChatSessions,
-                                                                      numbering: numberedRows) {
-                Text("\(slot)")
-                    .font(.caption2.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.primary.opacity(0.08))
-                    )
-                    .padding(.trailing, ChatMetrics.sidebarRowInset)
-                    // Decoration: it must never eat the click that selects the
-                    // row it is drawn on.
-                    .allowsHitTesting(false)
-                    .transition(AnyTransition.asymmetric(
-                        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
-                        removal: .opacity.animation(.easeOut(duration: 0.15))
-                     ))
-                    .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
+            if let badge = quickSwitchBadge(for: session.id) {
+                badge
             } else if hoveredSessionId == session.id {
                 Button {
                     requestDeleteChats([session.id], keyboard: false)
@@ -1412,6 +1506,7 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
+            Button("Rename…") { beginRename(session.id, current: session.title) }
             // Right-clicking INSIDE a multi-selection acts on all of it, and
             // says how many; right-clicking outside one is a single delete.
             if appState.sidebarSelection.count > 1,
@@ -1424,6 +1519,213 @@ struct ChatSidebar: View {
                     requestDeleteChats([session.id], keyboard: false)
                 }
             }
+        }
+    }
+
+    /// One sandbox terminal row: the same chrome as a conversation row, a
+    /// terminal glyph tinted by phase, the workspace's folder as the caption.
+    @ViewBuilder
+    private func terminalRow(_ t: TerminalSessionList.Session) -> some View {
+        let isSelected = appState.chatWorkspace == .terminal(t.id)
+        Button {
+            KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
+            showTerminal(t.id)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: t.isInOwnWindow ? "macwindow" : "terminal")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(terminalTint(t.phase))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(t.displayName)
+                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                    Text((t.workspace as NSString).lastPathComponent)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.leading, ChatMetrics.sidebarRowInset)
+            .padding(.trailing, ChatMetrics.sidebarRowInset + 18)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+                   alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(rowSpanProbe(t.id))
+        .background(
+            RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                .fill(SidebarRowStyle.fill(selected: isSelected,
+                                           hovering: hoveredSessionId == t.id))
+        )
+        .overlay(alignment: .trailing) {
+            if let badge = quickSwitchBadge(for: t.id) {
+                badge
+            } else if hoveredSessionId == t.id {
+                Button {
+                    requestCloseTerminal(t.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                .help(t.isActive ? "End session" : "Close")
+            }
+        }
+        .onHover { isHovered in
+            hoveredSessionId = isHovered ? t.id : nil
+        }
+        .contextMenu {
+            Button("Rename…") { beginRename(t.id, current: t.displayName) }
+            if t.isInOwnWindow {
+                Button("Show Window") { showTerminal(t.id) }
+            } else {
+                Button("Move Tab to New Window") { moveToNewWindow(t.id) }
+            }
+            Menu("Theme") {
+                Toggle("App Default", isOn: Binding(
+                    get: { t.themeId == nil },
+                    set: { _ in terminals.setTheme(t.id, themeId: nil) }))
+                Divider()
+                ForEach(TerminalTheme.all) { theme in
+                    Toggle(theme.name, isOn: Binding(
+                        get: { t.themeId == theme.id },
+                        set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
+                }
+            }
+            Button(t.isActive ? "End Session" : "Close", role: .destructive) {
+                requestCloseTerminal(t.id)
+            }
+        }
+        // Per row, so only the row asked presents; a live session's ✕ is a
+        // small target and a misclick must not kill a TUI.
+        .confirmationDialog(
+            "End the \(t.displayName) session?",
+            isPresented: Binding(get: { appState.pendingTerminalClose == t.id },
+                                 set: { if !$0 { appState.pendingTerminalClose = nil } })
+        ) {
+            Button("End Session", role: .destructive) { appState.closeTerminal(t.id) }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { appState.pendingTerminalClose = nil }
+        } message: {
+            Text("The session running inside the sandbox will be terminated. Files it wrote are kept.")
+        }
+    }
+
+    /// Drag a row onto another to take its slot. Reorders LIVE as the drag
+    /// passes over rows (the `dropEntered` idiom), so the list shows where the
+    /// row will land; the drop itself only ends the drag.
+    private func reorderable(_ id: UUID, visible: [UUID]) -> SidebarReorder {
+        SidebarReorder(id: id, dragging: $draggingRowId) { moved, target in
+            appState.moveSidebarRow(moved, onto: target, visible: visible)
+        }
+    }
+
+    /// Where a row sits, so the numbering can skip whatever is under the
+    /// frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+    /// a preference write per row per scroll frame, and outside this
+    /// transient mode nothing reads the answer.
+    @ViewBuilder
+    private func rowSpanProbe(_ id: UUID) -> some View {
+        if modifiers.commandHeld {
+            GeometryReader { proxy in
+                let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
+                Color.clear.preference(
+                    key: SidebarRowSpansKey.self,
+                    value: [id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
+            }
+        }
+    }
+
+    /// The ⌘-digit badge for a row, nil when it wears none (⌘ up, or the row
+    /// is under the frost). Shared by chat and terminal rows — one panel, one
+    /// numbering.
+    private func quickSwitchBadge(for id: UUID) -> AnyView? {
+        guard modifiers.commandHeld,
+              let slot = ChatQuickSwitch.slot(for: id, visible: panelRows.visible,
+                                              numbering: numberedRows) else { return nil }
+        return AnyView(
+            Text("\(slot)")
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.primary.opacity(0.08))
+                )
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                // Decoration: it must never eat the click that selects the
+                // row it is drawn on.
+                .allowsHitTesting(false)
+                .transition(AnyTransition.asymmetric(
+                    insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
+                    removal: .opacity.animation(.easeOut(duration: 0.15))
+                 ))
+                .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld))
+    }
+
+    private func beginRename(_ id: UUID, current: String) {
+        renameDraft = ChatSessionTitle.isPlaceholder(current) ? "" : current
+        appState.pendingRename = id
+    }
+
+    /// The one rename dialog, for chats and terminals alike.
+    private var renameDialog: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .alert("Rename Session",
+                   isPresented: Binding(get: { appState.pendingRename != nil },
+                                        set: { if !$0 { appState.pendingRename = nil } }),
+                   presenting: appState.pendingRename) { id in
+                TextField("Name", text: $renameDraft)
+                Button("Rename") {
+                    appState.renameSession(id, to: renameDraft)
+                    appState.pendingRename = nil
+                }
+                .keyboardShortcut(.defaultAction)
+                Button("Cancel", role: .cancel) { appState.pendingRename = nil }
+            } message: { _ in
+                Text("Leave it empty to go back to the automatic name.")
+            }
+    }
+
+    /// A terminal shows in the detail column, or — once moved out — in its
+    /// own window, which a repeat open only raises.
+    private func showTerminal(_ id: UUID) {
+        if terminals.sessions.session(id)?.isInOwnWindow == true {
+            AppActivation.openWindow(id: "terminalWindow", value: id, using: openWindow)
+        } else {
+            appState.showTerminal(id)
+        }
+    }
+
+    private func moveToNewWindow(_ id: UUID) {
+        if appState.chatWorkspace == .terminal(id) { appState.showConversation() }
+        terminals.setInOwnWindow(id, true)
+        AppActivation.openWindow(id: "terminalWindow", value: id, using: openWindow)
+    }
+
+    private func terminalTint(_ phase: TerminalSessionList.Session.Phase) -> Color {
+        switch phase {
+        case .preparing: return .orange
+        case .live: return .green
+        case .exited: return .secondary
+        case .failed: return .red
+        }
+    }
+
+    /// Instant for exited/failed rows, confirmed while a session is alive.
+    private func requestCloseTerminal(_ id: UUID) {
+        if terminals.sessions.closeNeedsConfirmation(id) {
+            appState.pendingTerminalClose = id
+        } else {
+            appState.closeTerminal(id)
         }
     }
 
@@ -1469,34 +1771,6 @@ struct ChatSidebar: View {
         destinationRow("Agents", icon: "person.2",
                        selected: appState.chatWorkspace.isAgents) {
             appState.chatWorkspace.isAgents ? appState.showConversation() : appState.showAgents()
-        }
-    }
-
-    /// The Code Launcher row: the tray's own CLI list, so the two can't drift.
-    /// DMG-only — the App Store build can't detect or launch other apps' CLIs,
-    /// and a row that can only fail is the dead-control class.
-    @ViewBuilder
-    private var codeLauncherRow: some View {
-        if BuildFeatures.current.cliLauncher {
-            Menu {
-                CLILauncherMenuItems(
-                    detector: cliDetector,
-                    baseURL: appState.server.baseURL,
-                    servedModelId: appState.server.chatModelId ?? "mlx-serve",
-                    serverContextLength: appState.server.chatModelInfo?.contextLength,
-                    models: appState.server.allModels,
-                    openSandboxAgent: { agentId in
-                        appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
-                        AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
-                    })
-            } label: {
-                // "Code", matching the tray's own Code button over the same menu.
-                destinationLabel("Code", icon: "terminal", selected: false)
-            }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .frame(height: ChatMetrics.sidebarButtonHeight)
         }
     }
 
@@ -2045,6 +2319,30 @@ struct ChatDetailView: View {
         session?.messages.last { $0.role == .assistant }?.id
     }
 
+    private static let wordmark: NSImage? = {
+        let image = BundledAsset.image("mlx-serve-wordmark.png")
+        image?.isTemplate = true
+        return image
+    }()
+
+    /// The wordmark, anchored just under the toolbar on an empty plain chat:
+    /// a TEMPLATE image (alpha only), tinted with the label colour so it reads
+    /// in both modes — the source art is white on black and would vanish in
+    /// light mode.
+    @ViewBuilder
+    private var wordmarkHeader: some View {
+        if activeAgent == nil, let mark = Self.wordmark {
+            Image(nsImage: mark)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 240)
+                .foregroundStyle(.primary)
+                .padding(.top, 24)
+                .accessibilityLabel("MLX-Serve")
+        }
+    }
+
     /// Greeting + discovery chips, one fixed-height block. The vertical slack
     /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
     /// nested in here shares space unevenly with the body's own trailing one,
@@ -2093,6 +2391,7 @@ struct ChatDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             if isEmptyConversation {
+                wordmarkHeader
                 // Two SIBLING spacers (this one + the trailing one below the
                 // composer) split the slack evenly, so greeting + chips +
                 // composer sit as one group in the middle of the window.
@@ -2721,7 +3020,7 @@ struct ChatDetailView: View {
 
     /// Pick a folder of mixed documents to index in-memory for this session.
     private func pickDocumentFolder() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -2832,7 +3131,7 @@ struct ChatDetailView: View {
     // MARK: - Image Helpers
 
     private func pickAttachment() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         // Only offer audio/video on models that can use them.
         var types: [UTType] = [.image, .pdf]
         if videoSupported { types.append(.movie) }

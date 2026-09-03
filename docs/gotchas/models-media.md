@@ -1669,3 +1669,25 @@ Three things the oracle needed before it could fail for the right reason:
 Each test SKIPS on a missing pack and needs only the VAE, not the transformer: `MINIMAX_H3_MODEL=<pack>` (probes `video_vae.safetensors`) and `LTX_TEST_MODEL=<dir with vae_encoder + vae_decoder>` — 1.45 GB of the LTX pack is enough to run it. `tests/test_video_preview.sh` drives both and FAILS when a named pack produced no correlation line, because in a test summary a skipped arm looks exactly like a passing one.
 
 The second half of the review was cost. The app sent `preview: true` on every video generation, so every user paid an x0 solve plus a host copy per step whether or not anyone was watching — and on LTX the copy was the WHOLE `[1,128,F,H,W]` volume, ~25 MB of f32 per step for a 480p 121-frame clip when the strip shows one 0.8 MB frame. The temporal pick moved onto the GPU (`unpatchifyVideoFrames` gathers the wanted frames before the transpose, so the materialized array is n frames wide, not F — H3 already sliced per frame), and the pane owns a toggle that defaults OFF.
+
+## A pinned library's per-op transient is invisible to every residency bill (#321, 2026-09-03)
+
+Two users reported 26.8.11 dying at "Decoding video" on LTX-2.5: an M3 Max 64 GB with the 4-bit pack at 193 frames 1024x576, and a 128 GB Mac with the 8-bit pack at 97 frames 896x1600 beside a resident 27B. Both had a green preflight (33 GB peak against 56 GB available; 40.5 against 92), both kept answering `/health` for minutes, no `.ips`, and the unified log carried the only line that mattered: `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Both worked on 26.8.10. Reverting was the workaround.
+
+The first question was whether the LLM gets evicted for a media gen. It does not, and it is irrelevant: eviction is a LOAD-time decision against `max_resident_models` / `max_resident_mem`, the LTX bill is weights only (`ltxPeakBytes` has no activation term), and the 64 GB report had no LLM loaded at all. Nothing bills a VAE decode per request, and the transient that killed the process is not ours to bill.
+
+The 26.8.10 → 26.8.11 diff to `ltx_video.zig` is three `sdpa` signature bumps. The real diff is the submodule: mlx v0.32.0 → v0.32.2, and in it `Decompose small kernel-depth 3D convs into 2D convs` (mlx #3785, `small_kd_conv_3D_gpu`). Its gate is `N == 1 && kD <= 7 && temporal stride 1 && temporal pad 0 && C % 16 == 0` — every conv in `vaeDecode`, because `decoderConv3d` replicate-pads the depth axis itself and calls `mlx_conv3d` with pad 0. Two things follow at full pixel resolution:
+
+- Each of the `kD` taps allocates a FULL `[F, H, W, O]` output and parks it in `copies` until the op completes, so three outputs plus the accumulator coexist where `implicit_gemm_conv_3D_gpu` used to write straight into `out`.
+- Each tap is a 3x3 stride-1 2D conv with `C, O % 32 == 0`, so it takes Winograd, and `winograd_batch_step` budgets its working set at 75% of `recommendedMaxWorkingSetSize` PER CALL — blind to the engine's weights, the DiT's activations and any resident LLM.
+
+Measured on an M4 Max 128 GB, 4-bit pack (18 GB resident), 97 frames 1024x576, 8 steps, same seed: whole-depth decode peaks at **66.8 GB**, the fix at **36.3 GB**, 235 s vs 239 s wall. A 30 GB transient on top of a 33 GB engine is the 64 GB crash; 193 frames doubles it.
+
+The fix is `conv3dDepthChunked`: the padded input is sliced into overlapping depth windows (`k − 1` frames of overlap), each window convolved with pad 0 and EVALUATED before the next, outputs concatenated on the depth axis. An output frame reads only its `k` input frames, so this is exact per window; the window is sized by `CONV3D_CHUNK_ELEMS` (64M output elements, ~5–13 frames at the decoder's widest stage). The hermetic test pins chunked == whole to the bit on a shape the decomposition gate accepts; live, the two arms differ by at most 1 u8 LSB on a vanishing fraction of pixels — Winograd's batch step and the implicit-gemm fallback are different kernels with different rounding, and the pre-0.32.2 3D kernel was a third one.
+
+Two things learned on the way:
+
+- **No env var for an obvious win.** The first cut shipped a `MLX_SERVE_CONV3D_CHUNK=0` kill switch out of habit. It bought one A/B (the 67 GB number above) and one bug: `maxInt(u32)` handed to a `c_int` is `-1`, and the "off" arm ran a window of −1 frames and killed the server with an MLX shape error. Chunking is exact and free, so nobody ever wants the other arm; the switch is gone. Levers are for paths with two arms worth comparing (lossy or tradeoff perf), not for fixes.
+- **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
+
+H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
