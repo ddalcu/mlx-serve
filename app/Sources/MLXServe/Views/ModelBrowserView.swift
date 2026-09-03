@@ -723,7 +723,6 @@ private struct MyModelsPane: View {
 
     private var total: Int { groups.reduce(0) { $0 + $1.models.count } }
 
-
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
@@ -805,24 +804,15 @@ private struct MyModelsPane: View {
         }
         .navigationTitle("My Models")
         .onAppear {
-             updateDiskSpace()
-         }
+            updateDiskSpace()
+        }
     }
 
-    // Internal handler to pull clean Foundation storage metrics
     private func updateDiskSpace() {
-        let fileURL = URL(fileURLWithPath: NSHomeDirectory())
-        do {
-            let values = try fileURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            if let freeSpace = values.volumeAvailableCapacityForImportantUsage {
-                let formatter = ByteCountFormatter()
-                formatter.allowedUnits = [.useAll]
-                formatter.countStyle = .file
-                freeDiskSpace = formatter.string(fromByteCount: freeSpace)
-            }
-        } catch {
-            print("Failed to get storage metadata: \(error.localizedDescription)")
-        }
+        guard let values = try? URL(fileURLWithPath: NSHomeDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+            let freeSpace = values.volumeAvailableCapacityForImportantUsage else { return }
+        freeDiskSpace = MemoryInfo.format(freeSpace)
     }
 }
 
