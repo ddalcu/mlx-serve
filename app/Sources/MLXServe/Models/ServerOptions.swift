@@ -195,6 +195,10 @@ struct ServerOptions: Codable, Equatable {
     /// oldest gets evicted. Set to 1 to keep exactly one model loaded at a
     /// time — every switch unloads the previous model first.
     var maxResidentModels: Int = 3
+    /// Unload a model this many minutes after its last request finishes.
+    /// 0 = Off, matching the server default. Stored in user-facing minutes
+    /// and converted to `--idle-evict-secs` at launch.
+    var idleEvictMinutes: Int = 0
     /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
     /// free-RAM pre-flight that would otherwise refuse a model whose weights +
     /// warmup headroom look too big for current free memory. The check is
@@ -513,6 +517,7 @@ struct ServerOptions: Codable, Equatable {
         prefixCacheDisk == other.prefixCacheDisk &&
         maxResidentMemGB == other.maxResidentMemGB &&
         maxResidentModels == other.maxResidentModels &&
+        idleEvictMinutes == other.idleEvictMinutes &&
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
@@ -707,6 +712,9 @@ struct ServerOptions: Codable, Equatable {
         if maxResidentModels != 3 {
             args += ["--max-resident-models", "\(maxResidentModels)"]
         }
+        if idleEvictMinutes > 0 && idleEvictMinutes <= Int(UInt32.max) / 60 {
+            args += ["--idle-evict-secs", "\(idleEvictMinutes * 60)"]
+        }
         // GGUF-only performance knobs. Emitted unconditionally when not
         // the default — the server silently ignores them on the MLX path
         // (it never opens an llama session). Keeping them in argv for
@@ -857,6 +865,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictMinutes) { idleEvictMinutes = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
@@ -1088,6 +1097,10 @@ extension ServerOptions {
         "maxResidentModels": .init(
             title: "Max models loaded at once",
             explainer: "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models.",
+            needsRestart: true),
+        "idleEvictMinutes": .init(
+            title: "Unload idle models",
+            explainer: "Release a loaded model's MLX/Metal memory this long after its last request finishes. The next request automatically loads it again. Off keeps models resident until another load needs the memory. Passes --idle-evict-secs.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

@@ -1052,8 +1052,8 @@ pub const LoadRequest = struct {
     /// Victims to evict before the load (LRU-selected by the planner). Each is
     /// already marked `.evicting` with refcount == 0 by the conn thread under
     /// registry.mutex. The inference thread calls `unloadResident()` on each to
-    /// free GPU memory, drops its resident-bytes accounting via
-    /// `registry.accountEvictedLocked`, then `registry.finalizeEvictionLocked`.
+    /// free GPU memory, then calls `registry.finalizeEvictionLocked` to publish
+    /// the accounting and lifecycle transition atomically.
     /// Borrows the conn thread's stack buffer; valid until `done`.
     evict_entries: []*LoadedModel = &.{},
 
@@ -1209,6 +1209,9 @@ pub const Scheduler = struct {
 
     queue_mu: std.Io.Mutex,
     queue_cond: std.Io.Condition,
+    /// Guarded by `queue_mu`. Set when a release may change the next idle
+    /// deadline; the inference thread clears it before rescanning the registry.
+    idle_deadline_dirty: bool,
     pending: std.ArrayList(*Slot),
     decoding: std.ArrayList(*Slot),
     /// Phase A4: pending vision-encode requests. The inference thread drains
@@ -1364,6 +1367,7 @@ pub const Scheduler = struct {
             .force_batched = force_batched,
             .queue_mu = .init,
             .queue_cond = .init,
+            .idle_deadline_dirty = params.registry.idleEvictionEnabled(),
             .pending = std.ArrayList(*Slot).empty,
             .decoding = std.ArrayList(*Slot).empty,
             .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
@@ -1414,7 +1418,7 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.shutdown.store(true, .release);
-        // Wake inference thread if it's waiting on queue_cond.
+        // Wake inference thread if it's waiting for work or an idle deadline.
         self.queue_mu.lockUncancelable(self.io);
         self.queue_cond.broadcast(self.io);
         self.submit_cond.broadcast(self.io);
@@ -1883,6 +1887,26 @@ pub const Scheduler = struct {
     /// under registry.mutex.
     pub fn release(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.release(lm);
+        self.notifyIdleDeadlineChanged();
+    }
+
+    /// Release a status-only borrow without moving its idle deadline. When
+    /// idle eviction is enabled this still wakes the inference thread: the
+    /// borrow may have covered the deadline, making the model evictable as
+    /// soon as this reference is dropped.
+    pub fn releaseWithoutTouch(self: *Scheduler, lm: *LoadedModel) void {
+        self.registry.releaseWithoutTouch(lm);
+        self.notifyIdleDeadlineChanged();
+    }
+
+    fn notifyIdleDeadlineChanged(self: *Scheduler) void {
+        // Keep the default (disabled) path completely passive: request
+        // completion must not wake an otherwise parked inference thread.
+        if (!self.registry.idleEvictionEnabled()) return;
+        self.queue_mu.lockUncancelable(self.io);
+        self.idle_deadline_dirty = true;
+        self.queue_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
     }
 
     /// Duped stored failure name for the id `ensureLoaded` just refused with
@@ -3884,6 +3908,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
     }
 
+    var next_idle_deadline_ns: ?i96 = null;
     while (!sch.shutdown.load(.acquire)) {
         // 0a. Drain slots queued for cleanup. Conn threads hand finished
         //     slots here in `complete()` — we own the mlx stream binding,
@@ -3910,9 +3935,12 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // synchronously, blocking decode for its duration.
         var gen_req: ?*GenRequest = null;
         var unload_req: ?*UnloadRequest = null;
+        var idle_deadline_changed = false;
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
+            idle_deadline_changed = sch.idle_deadline_dirty;
+            sch.idle_deadline_dirty = false;
             while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
                 cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
                 cleanup_n += 1;
@@ -3963,6 +3991,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (gen_req) |req| runGenRequest(sch, req);
 
+        // Idle eviction is per model, not per server: an unused model must
+        // still expire while a different model is continuously decoding.
+        // Cache the next deadline so the token-hot path only reads the boot
+        // clock; registry scans happen after a relevant release or at expiry.
+        if (sch.registry.idleEvictionEnabled()) {
+            const now = std.Io.Timestamp.now(sch.io, .boot).nanoseconds;
+            const deadline_due = if (next_idle_deadline_ns) |deadline| now >= deadline else false;
+            if (idle_deadline_changed or deadline_due) {
+                if (sch.registry.beginIdleEviction()) |entry| runIdleEviction(sch, entry);
+                next_idle_deadline_ns = if (sch.registry.idleEvictWaitNs()) |wait_ns|
+                    std.Io.Timestamp.now(sch.io, .boot).nanoseconds + wait_ns
+                else
+                    null;
+            }
+        }
+
         // 1. Wait for work. Drain pending slots into a local list under lock,
         //    run prefills outside the lock.
         var to_prefill: [16]*Slot = undefined;
@@ -3970,10 +4014,26 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+            while (!hasWorkPendingLocked(sch) and
+                !sch.idle_deadline_dirty and
+                !sch.shutdown.load(.acquire))
+            {
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
-                sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                const wait_ns = if (next_idle_deadline_ns) |deadline| blk: {
+                    const now = std.Io.Timestamp.now(sch.io, .boot).nanoseconds;
+                    break :blk if (now >= deadline) 0 else deadline - now;
+                } else null;
+                if (wait_ns) |ns| {
+                    if (ns == 0) break;
+                    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
+                        .raw = .fromNanoseconds(ns),
+                        .clock = .boot,
+                    } }) catch {};
+                    break;
+                } else {
+                    sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                }
             }
             if (sch.shutdown.load(.acquire)) break;
             // Hold until the loop parks again.
@@ -4327,14 +4387,13 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // never holds the old + new model at once. unloadResident() drops
     // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
     for (req.evict_entries) |victim| {
-        const victim_bytes = victim.bytes_resident; // unloadResident zeroes it
+        const victim_bytes = victim.bytes_resident;
         log.info("[registry] evicting model id={s} ({d:.2} GB resident)\n", .{
             victim.id,
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
         victim.unloadResident();
         sch.registry.mutex.lockUncancelable(sch.io);
-        sch.registry.accountEvictedLocked(victim_bytes);
         sch.registry.finalizeEvictionLocked(victim);
         sch.registry.mutex.unlock(sch.io);
     }
@@ -4425,43 +4484,56 @@ fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
     req.done_mu.unlock(sch.io);
 }
 
+fn clearCurrentModelViews(sch: *Scheduler, entry: *LoadedModel) void {
+    if (sch.current_model != entry) return;
+    sch.current_model = null;
+    sch.xfm = null;
+    sch.weights = null;
+    sch.vision_encoder = null;
+    sch.drafter = null;
+    sch.dflash = null;
+    sch.hot_prefix_cache = null;
+}
+
+/// Free one already-claimed, zero-refcount model and finalize its registry
+/// state. All callers run on the inference thread.
+fn unloadClaimedModel(sch: *Scheduler, entry: *LoadedModel) void {
+    entry.unloadResident();
+    _ = mlx.mlx_clear_cache();
+    clearCurrentModelViews(sch, entry);
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.finalizeEvictionLocked(entry);
+    sch.registry.mutex.unlock(sch.io);
+
+    logWiredPolicy(mlx.applyWiredPolicy());
+}
+
+/// Complete an idle eviction claimed by `ModelRegistry.beginIdleEviction`.
+/// This runs on the inference thread so MLX/Metal objects are released on the
+/// same stream-owning thread that created and used them.
+fn runIdleEviction(sch: *Scheduler, entry: *LoadedModel) void {
+    const now = std.Io.Timestamp.now(sch.io, .boot).nanoseconds;
+    const elapsed = if (now >= entry.last_used_at_ns) now - entry.last_used_at_ns else 0;
+    log.info("[registry] idle eviction: model={s} (last used {d}s ago)\n", .{
+        entry.id,
+        @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(std.time.ns_per_s)),
+    });
+    unloadClaimedModel(sch, entry);
+}
+
 /// Free a model's resident mlx state on the inference thread (stream-bound,
 /// same invariant as the cleanup-queue drain) and finalize the eviction
 /// accounting. The conn thread already marked the entry `.evicting` and
 /// drained its refcount in `unloadModel`.
 fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     const entry = req.entry;
-    const bytes = entry.bytes_resident; // unloadResident zeroes it
+    const bytes = entry.bytes_resident;
     log.info("[registry] unloading model id={s} ({d:.2} GB resident)\n", .{
         entry.id,
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
-    entry.unloadResident();
-    // unloadResident freed the arrays into MLX's allocator cache — clear it
-    // so the unload actually returns the memory to the OS (the whole point
-    // of the load→generate→unload flow).
-    _ = mlx.mlx_clear_cache();
-    // Drop any borrowed views that pointed at this entry so post-unload reads
-    // don't dangle (gen entries leave xfm null already, but an LLM unload
-    // must clear them).
-    if (sch.current_model == entry) {
-        sch.current_model = null;
-        sch.xfm = null;
-        sch.weights = null;
-        sch.vision_encoder = null;
-        sch.drafter = null;
-        sch.dflash = null;
-        sch.hot_prefix_cache = null;
-    }
-    sch.registry.mutex.lockUncancelable(sch.io);
-    sch.registry.accountEvictedLocked(bytes);
-    sch.registry.finalizeEvictionLocked(entry);
-    sch.registry.mutex.unlock(sch.io);
-
-    // Shrink `fit` capacity back to the surviving live set — leaving the
-    // freed model's headroom in place is exactly the per-transient-commit
-    // configuration the policy exists to avoid.
-    logWiredPolicy(mlx.applyWiredPolicy());
+    unloadClaimedModel(sch, entry);
 
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
@@ -5902,17 +5974,26 @@ test "the cleanup drain commits a cancelled slot before deinit" {
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {
-    // Pin release < park < acquire and startup acquire < load.
+    // Pin release < each park mode < acquire and startup acquire < load.
     const source = @embedFile("scheduler.zig");
     const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
     const body = source[start..end];
     const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
-    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
-    const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
-    try testing.expect(drop < park);
-    try testing.expect(park < hold);
+    const timed_park = std.mem.indexOf(u8, body, "sch.queue_cond.waitTimeout(") orelse return error.MissingTimedPark;
+    const indefinite_park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingIndefinitePark;
+    const hold = std.mem.indexOfPos(u8, body, indefinite_park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(drop < timed_park);
+    try testing.expect(drop < indefinite_park);
+    try testing.expect(timed_park < hold);
+    try testing.expect(indefinite_park < hold);
     try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
+    // The mutex-protected dirty bit is part of the condition predicate, so a
+    // release cannot leave the inference thread waiting on a stale deadline.
+    try testing.expect(std.mem.indexOf(u8, body, "!sch.idle_deadline_dirty") != null);
+    // Eviction is per model: unrelated decode work must not gate the check.
+    try testing.expect(std.mem.indexOf(u8, body, "idle_deadline_changed or deadline_due") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "const no_work") == null);
     const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
     const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
     try testing.expect(boot_arm < boot_load);

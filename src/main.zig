@@ -823,8 +823,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
-            // whose last_used_ns is older than this. Default off — eviction
-            // is on-demand only.
+            // whose last request finished before this window. Default off —
+            // eviction is on-demand only.
             i += 1;
             const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
             idle_evict_secs = if (n > 0) n else null;

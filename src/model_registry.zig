@@ -229,10 +229,14 @@ pub const LoadedModel = struct {
     /// while refcount > 0. Atomic so the inference thread can observe it
     /// without re-acquiring the registry mutex inside a tick.
     refcount: std.atomic.Value(u32),
-    /// Monotonic clock — bumped on every `release`. Higher = more recent.
+    /// Logical monotonic clock — bumped on every `release`. Higher = more recent.
     /// LRU eviction picks the lowest among `.ready` entries with
     /// refcount == 0.
     last_used_ns: i64,
+    /// Boot-clock timestamp of the most recent load or release. Kept
+    /// separate from `last_used_ns`, which is an ordering counter rather
+    /// than elapsed time. Idle eviction compares this value to its timeout.
+    last_used_at_ns: i96 = 0,
     /// Resident GPU bytes for this entry (weights + vision + drafter),
     /// summed at load time. Zero for non-`.ready` entries.
     bytes_resident: u64,
@@ -382,9 +386,11 @@ pub const LoadedModel = struct {
     /// Free only the mlx-allocating state (weights/transformer/vision/
     /// drafter/prefix_cache), leaving CPU-only fields (config/tokenizer/
     /// chat_config) AND the discovery stub (id/path/bytes_on_disk) intact.
-    /// Used by eviction so the registry keeps the entry around as
-    /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
-    /// mlx frees happen on the inference thread.
+    /// Used by eviction so the registry keeps the entry around for later
+    /// reload, AND by `Scheduler.deinit` so mlx frees happen on the inference
+    /// thread. The registry owns lifecycle transitions: eviction callers keep
+    /// the entry `.evicting` until `finalizeEvictionLocked` publishes
+    /// `.unloaded` under the registry mutex.
     pub fn unloadResident(self: *LoadedModel) void {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.clearRetainingCapacity();
@@ -461,7 +467,6 @@ pub const LoadedModel = struct {
             self.drafter_path = "";
         }
         self.drafter_block_size = 0;
-        self.bytes_resident = 0;
         // The prefill-chunk pin was resolved from LIVE memory at load, so it
         // can be stale-narrow (pinned while a since-evicted model was
         // resident). Widening a RESIDENT model's pin would let a prefill run
@@ -470,7 +475,6 @@ pub const LoadedModel = struct {
         // re-pins from then-current memory. `pinned_context` stays — clients
         // budget against it for the whole session.
         if (self.config) |c| c.pinned_prefill_chunk = 0;
-        self.state = .unloaded;
     }
 };
 
@@ -895,16 +899,17 @@ pub const ModelRegistry = struct {
         }
     }
 
-    /// Phase D: finalize an eviction after `unloadResident()` has been
-    /// called on the inference thread. Caller holds `mutex`. Updates the
-    /// summed-bytes accounting and flips state to `.unloaded`.
+    /// Phase D: finalize an eviction after `unloadResident()` has been called.
+    /// Caller holds `mutex`; byte accounting, the per-entry resident count,
+    /// and the lifecycle state are published together under that lock.
     pub fn finalizeEvictionLocked(self: *ModelRegistry, entry: *LoadedModel) void {
-        // bytes_resident was zeroed by unloadResident already; we still
-        // subtract its previous accounting here. Because we already
-        // synced `current_resident_bytes` at markReady time, just clear.
-        // Defensive: cap subtraction at zero in case of double-call.
-        // (unloadResident sets bytes_resident=0 itself, so we tracked the
-        // pre-eviction value externally — pass-through here is a no-op.)
+        std.debug.assert(entry.state == .evicting);
+        if (self.current_resident_bytes >= entry.bytes_resident) {
+            self.current_resident_bytes -= entry.bytes_resident;
+        } else {
+            self.current_resident_bytes = 0;
+        }
+        entry.bytes_resident = 0;
         entry.state = .unloaded;
         entry.error_name = null;
         self.state_cond.broadcast(self.io);
@@ -922,25 +927,41 @@ pub const ModelRegistry = struct {
         return n;
     }
 
-    /// Phase D: subtract `bytes` from the resident accounting. Caller holds
-    /// `mutex`. Used after `unloadResident()` to keep `current_resident_bytes`
-    /// in sync with the actual GPU footprint.
-    pub fn accountEvictedLocked(self: *ModelRegistry, bytes: u64) void {
-        if (self.current_resident_bytes >= bytes) {
-            self.current_resident_bytes -= bytes;
-        } else {
-            self.current_resident_bytes = 0;
-        }
-    }
-
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
-    /// the refcount and bumps `last_used_ns` so LRU picks an older entry
-    /// over this one next. Wakes anyone waiting on eviction.
+    /// the refcount and records this request's completion for LRU and idle
+    /// eviction. Wakes anyone waiting on eviction.
     pub fn release(self: *ModelRegistry, lm: *LoadedModel) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.lru_clock += 1;
         lm.last_used_ns = self.lru_clock;
+        lm.last_used_at_ns = std.Io.Timestamp.now(self.io, .boot).nanoseconds;
+        self.releaseRefLocked(lm);
+    }
+
+    /// Release an observational borrow without treating it as model activity.
+    /// Status endpoints use this so their polling neither cold-loads a model
+    /// nor postpones its configured idle eviction deadline.
+    pub fn releaseWithoutTouch(self: *ModelRegistry, lm: *LoadedModel) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.releaseRefLocked(lm);
+    }
+
+    /// Non-blocking observational borrow. Returns only an already-ready entry;
+    /// never waits for or initiates a load, and pairs with releaseWithoutTouch.
+    pub fn borrowReady(self: *ModelRegistry, id_or_empty: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const id = if (id_or_empty.len == 0) self.default_id else id_or_empty;
+        if (id.len == 0) return null;
+        const lm = self.entries.get(id) orelse return null;
+        if (lm.state != .ready) return null;
+        _ = lm.refcount.fetchAdd(1, .acq_rel);
+        return lm;
+    }
+
+    fn releaseRefLocked(self: *ModelRegistry, lm: *LoadedModel) void {
         const prev = lm.refcount.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
         // Broadcast so an evictor waiting for refcount == 0 wakes.
@@ -980,6 +1001,7 @@ pub const ModelRegistry = struct {
         entry.error_name = null;
         self.lru_clock += 1;
         entry.last_used_ns = self.lru_clock;
+        entry.last_used_at_ns = std.Io.Timestamp.now(self.io, .boot).nanoseconds;
         self.current_resident_bytes += bytes_resident;
         // Headless default promotion: a server started without --model has no
         // default, so requests addressing the "mlx-serve" alias (the app's
@@ -1168,6 +1190,70 @@ pub const ModelRegistry = struct {
         return out;
     }
 
+    /// Duration until the next idle model reaches its eviction deadline.
+    /// Null means idle eviction is disabled or no ready model currently has a
+    /// zero refcount. The inference thread uses this to sleep without polling
+    /// while still waking at the exact next deadline.
+    pub fn idleEvictWaitNs(self: *ModelRegistry) ?i96 {
+        const idle_evict = self.idle_evict_secs orelse return null;
+        const window_ns = @as(i96, idle_evict) * std.time.ns_per_s;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const now = std.Io.Timestamp.now(self.io, .boot).nanoseconds;
+
+        var shortest: ?i96 = null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) continue;
+            const elapsed = if (now >= entry.last_used_at_ns) now - entry.last_used_at_ns else 0;
+            const remaining = if (elapsed >= window_ns) 0 else window_ns - elapsed;
+            if (shortest == null or remaining < shortest.?) shortest = remaining;
+        }
+        return shortest;
+    }
+
+    /// Configuration is immutable after registry creation, so the scheduler
+    /// can avoid all idle-deadline bookkeeping (and release-time wakeups) when
+    /// eviction is disabled.
+    pub fn idleEvictionEnabled(self: *const ModelRegistry) bool {
+        return self.idle_evict_secs != null;
+    }
+
+    /// Claim the oldest idle `.ready` entry for eviction. The transition to
+    /// `.evicting` happens under the registry mutex, so a concurrent request
+    /// will wait instead of borrowing an entry whose resident state is about
+    /// to be freed. The inference thread owns the returned entry and must
+    /// unload it, update resident-byte accounting, and finalize the eviction.
+    pub fn beginIdleEviction(self: *ModelRegistry) ?*LoadedModel {
+        const idle_evict = self.idle_evict_secs orelse return null;
+        const window_ns = @as(i96, idle_evict) * std.time.ns_per_s;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const now = std.Io.Timestamp.now(self.io, .boot).nanoseconds;
+
+        var best: ?*LoadedModel = null;
+        var best_used: i96 = std.math.maxInt(i96);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready) continue;
+            if (entry.refcount.load(.acquire) != 0) continue;
+            const elapsed = if (now >= entry.last_used_at_ns) now - entry.last_used_at_ns else 0;
+            if (elapsed < window_ns) continue;
+            if (entry.last_used_at_ns < best_used) {
+                best_used = entry.last_used_at_ns;
+                best = entry;
+            }
+        }
+
+        const entry = best orelse return null;
+        self.markEvictingLocked(entry);
+        return entry;
+    }
+
     fn lessThanByDefaultThenRecent(default_id: []const u8, a: ModelStatus, b: ModelStatus) bool {
         const a_def = std.mem.eql(u8, a.id, default_id);
         const b_def = std.mem.eql(u8, b.id, default_id);
@@ -1192,6 +1278,14 @@ fn makeReadyStub(reg: *ModelRegistry, id: []const u8, bytes: u64) !*LoadedModel 
     defer reg.mutex.unlock(reg.io);
     reg.markReadyLocked(stub, bytes);
     return stub;
+}
+
+fn finishClaimedEviction(reg: *ModelRegistry, entry: *LoadedModel) !void {
+    entry.unloadResident();
+    try testing.expectEqual(LoadState.evicting, entry.state);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    reg.finalizeEvictionLocked(entry);
 }
 
 test "ModelRegistry: init/deinit empty" {
@@ -1725,4 +1819,118 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescan());
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: beginIdleEviction claims the oldest expired model" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Create a registry with a 2-second idle window.
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, 2);
+    defer reg.deinit();
+    try testing.expect(reg.idleEvictionEnabled());
+
+    const a = try makeReadyStub(reg, "a", 100);
+    const b = try makeReadyStub(reg, "b", 200);
+
+    // Manually set "a" to be very old (10 seconds in the past) so it's
+    // definitely the oldest; "b" is also expired but less old.
+    const now = std.Io.Timestamp.now(io, .boot).nanoseconds;
+    {
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        a.last_used_at_ns = now - 10 * std.time.ns_per_s;
+        b.last_used_at_ns = now - 5 * std.time.ns_per_s;
+    }
+
+    try testing.expectEqual(@as(i96, 0), reg.idleEvictWaitNs().?);
+
+    // Only the oldest expired model is claimed per pass.
+    const victim = reg.beginIdleEviction() orelse return error.TestExpectedEqual;
+    try testing.expectEqual(a, victim);
+    try testing.expectEqual(LoadState.evicting, a.state);
+    try finishClaimedEviction(reg, victim);
+
+    // Verify model "a" is now unloaded.
+    {
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expectEqual(LoadState.unloaded, a.state);
+        // bytes_resident is cleared by unloadResident.
+        try testing.expectEqual(@as(u64, 0), a.bytes_resident);
+        try testing.expectEqual(@as(u64, 200), reg.current_resident_bytes);
+        // Model "b" should still be ready (we only claim one per pass).
+        try testing.expectEqual(LoadState.ready, b.state);
+    }
+}
+
+test "ModelRegistry: beginIdleEviction is a no-op when idle eviction is disabled" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+
+    _ = try makeReadyStub(reg, "a", 100);
+    _ = try makeReadyStub(reg, "b", 200);
+
+    try testing.expect(!reg.idleEvictionEnabled());
+    try testing.expect(reg.beginIdleEviction() == null);
+    try testing.expect(reg.idleEvictWaitNs() == null);
+}
+
+test "ModelRegistry: beginIdleEviction skips refcounted models" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, 1);
+    defer reg.deinit();
+
+    const a = try makeReadyStub(reg, "a", 100);
+    const b_stub = try makeReadyStub(reg, "b", 200);
+
+    // Manually set "a" to be very old (10 seconds in the past) so it's
+    // past the 1-second idle window, and "b" to be recent.
+    const now = std.Io.Timestamp.now(io, .boot).nanoseconds;
+    {
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        a.last_used_at_ns = now - 10 * std.time.ns_per_s;
+        // Keep the control model comfortably inside the window even when the
+        // full GPU-heavy suite delays this test thread.
+        b_stub.last_used_at_ns = now + 60 * std.time.ns_per_s;
+    }
+
+    // Hold a reference on "a" — it should NOT be evicted (refcount > 0).
+    _ = try reg.ensureLoaded("a");
+
+    // "b" is recent, "a" is old but refcounted — no eviction.
+    try testing.expect(reg.beginIdleEviction() == null);
+    try testing.expect(reg.idleEvictWaitNs().? > 0);
+
+    // Release "a" — that starts a fresh idle window, so it is not immediately
+    // evictable. Age it again to exercise the zero-refcount path.
+    reg.release(a);
+    try testing.expect(reg.beginIdleEviction() == null);
+    {
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        a.last_used_at_ns = now - 10 * std.time.ns_per_s;
+    }
+    const victim = reg.beginIdleEviction() orelse return error.TestExpectedEqual;
+    try testing.expectEqual(a, victim);
+    try finishClaimedEviction(reg, victim);
+}
+
+test "ModelRegistry: observational borrow does not refresh idle time" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, 1);
+    defer reg.deinit();
+
+    const a = try makeReadyStub(reg, "a", 100);
+    reg.default_id = a.id;
+    const old = std.Io.Timestamp.now(io, .boot).nanoseconds - 10 * std.time.ns_per_s;
+    a.last_used_at_ns = old;
+
+    const observed = reg.borrowReady("") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(a, observed);
+    try testing.expect(reg.beginIdleEviction() == null); // protected by the borrow
+    reg.releaseWithoutTouch(observed);
+    try testing.expectEqual(old, a.last_used_at_ns);
+    const victim = reg.beginIdleEviction() orelse return error.TestExpectedEqual;
+    try testing.expectEqual(a, victim);
+    try finishClaimedEviction(reg, victim);
 }

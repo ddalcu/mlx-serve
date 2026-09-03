@@ -1712,6 +1712,22 @@ fn handleConnection(
         }
         return;
     }
+    // The app polls /props every couple seconds. It must observe an already-
+    // ready default model without cold-loading it or refreshing its last-used
+    // timestamp; otherwise the poll itself defeats --idle-evict-secs forever.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+        log.debug("GET  /props -> 200\n", .{});
+        if (registry.borrowReady("")) |lm| {
+            defer if (global_scheduler) |scheduler|
+                scheduler.releaseWithoutTouch(lm)
+            else
+                registry.releaseWithoutTouch(lm);
+            try handleProps(allocator, stream, lm);
+        } else {
+            try handlePropsNoModel(allocator, stream);
+        }
+        return;
+    }
     if (std.mem.eql(u8, method, "OPTIONS")) {
         log.debug("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
@@ -1878,13 +1894,6 @@ fn handleConnection(
             return;
         },
         error.NoDefaultModel => {
-            // Headless gen-only boot (media models resident, no default chat
-            // model): /props keeps answering with the live memory counters —
-            // the app's tray polls it, and a 503 here read as "0 MB".
-            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
-                try handlePropsNoModel(allocator, stream);
-                return;
-            }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
@@ -1949,10 +1958,7 @@ fn handleConnection(
         return;
     }
 
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
-        log.debug("GET  /props -> 200\n", .{});
-        try handleProps(allocator, stream, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
@@ -8676,6 +8682,21 @@ test "the route-existence 404 is answered BEFORE the model is resolved" {
     // Exactly one gate — a second copy in an error arm is a second answer to
     // a question that has one.
     try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
+}
+
+test "/props observes model state without loading or refreshing it" {
+    // The app polls this route continuously. Keep it ahead of model resolution
+    // and pair its ready-only borrow with the scheduler's no-touch release;
+    // either regression would prevent idle eviction in normal GUI use.
+    const src = @embedFile("server.zig");
+    const props = "path, \"/props\")) {";
+    const resolve = "scheduler.ensureLoaded(" ++ "requested_model_id)";
+    const props_at = std.mem.indexOf(u8, src, props) orelse return error.PropsRouteMissing;
+    const resolve_at = std.mem.indexOf(u8, src, resolve) orelse return error.ResolveMissing;
+    try std.testing.expect(props_at < resolve_at);
+    const route = src[props_at..resolve_at];
+    try std.testing.expect(std.mem.indexOf(u8, route, "registry.borrowReady(\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, route, "scheduler.releaseWithoutTouch(lm)") != null);
 }
 
 test "each connection thread handle is detached after spawn" {
