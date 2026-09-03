@@ -100,6 +100,26 @@ pub const Metrics = struct {
     // Slots currently in prefill. Flips as soon as prefill starts, so the panel
     // can name the phase without waiting for the first chunk's token count.
     requests_prefilling: Gauge,
+    // The DENOMINATOR for `prefill_tokens_live`: tokens the running prefill
+    // will actually forward — `slot.full_prompt` AFTER the hot prefix cache
+    // trimmed the reused head off it. Same base as the numerator, so
+    // live/target is a true percentage.
+    //
+    // 0 means EITHER no prefill is running OR one is running but has not yet
+    // reached the trim point (the cache restore happens first and can take
+    // seconds on a long prompt). Disambiguate with `requests_prefilling`.
+    prefill_target_tokens: Gauge,
+    // The UNTRIMMED prompt length of the running prefill, published at entry.
+    // Paired with `prefill_target_tokens` it makes the hot prefix cache's
+    // contribution to THIS request observable while it happens:
+    //
+    //     reused_now = prefill_prompt_tokens - prefill_target_tokens
+    //
+    // The existing `prefix_cache_*_total` counters only give lifetime sums;
+    // they cannot answer "what did the request I am watching reuse?". That
+    // question is what a live panel — and anyone validating a prefix-cache
+    // change — actually asks. 0 when no prefill is running.
+    prefill_prompt_tokens: Gauge,
     // MLX allocator split. `memory_mb` above is the whole process footprint;
     // these two say where it went. `mlx_active_bytes` is memory in USE,
     // `mlx_cache_bytes` is MLX's reclaimable buffer pool — memory the process
@@ -139,6 +159,8 @@ pub const Metrics = struct {
             .generation_tokens_live = Gauge.init(),
             .prefill_tokens_live = Gauge.init(),
             .requests_prefilling = Gauge.init(),
+            .prefill_target_tokens = Gauge.init(),
+            .prefill_prompt_tokens = Gauge.init(),
             .mlx_active_bytes = Gauge.init(),
             .mlx_cache_bytes = Gauge.init(),
             .ane_int8_bytes = Gauge.init(),
@@ -251,6 +273,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "mlx_serve:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
     try writeGauge(w, "mlx_serve:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
+    try writeGauge(w, "mlx_serve:prefill_target_tokens", "Tokens the in-flight prefill will forward, after prefix-cache trim (denominator for prefill_tokens_live; 0 when idle or before the trim point - see requests_prefilling)", m.prefill_target_tokens.load());
+    try writeGauge(w, "mlx_serve:prefill_prompt_tokens", "Untrimmed prompt length of the in-flight prefill; minus prefill_target_tokens gives the tokens the hot prefix cache restored for this request (0 when idle)", m.prefill_prompt_tokens.load());
     try writeGauge(w, "mlx_serve:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
     try writeGauge(w, "mlx_serve:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
     try writeGauge(w, "mlx_serve:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
@@ -294,6 +318,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"generation_tokens_live\":{d}," ++
             "\"prefill_tokens_live\":{d}," ++
             "\"requests_prefilling\":{d}," ++
+            "\"prefill_target_tokens\":{d}," ++
+            "\"prefill_prompt_tokens\":{d}," ++
             "\"mlx_active_bytes\":{d}," ++
             "\"mlx_cache_bytes\":{d}," ++
             "\"ane_int8_bytes\":{d}," ++
@@ -315,6 +341,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.generation_tokens_live.load(),
             m.prefill_tokens_live.load(),
             m.requests_prefilling.load(),
+            m.prefill_target_tokens.load(),
+            m.prefill_prompt_tokens.load(),
             m.mlx_active_bytes.load(),
             m.mlx_cache_bytes.load(),
             m.ane_int8_bytes.load(),
