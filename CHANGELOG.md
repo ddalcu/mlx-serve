@@ -8,6 +8,10 @@
 - **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
 - **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.
 
+### Fixes
+
+- "Auto-start on launch" loaded a model at login. The checkbox passed `--model`, which the server treats as an eager, blocking load, so a setting that promised a running server read the whole selected checkpoint — tens of gigabytes — off disk before anything was asked of it (#214, thanks @Fe2-O3). Auto-start now brings the server up with no model resident and the first message loads one on demand. Loading at start is its own setting in Settings > Server, off by default including for upgrading users, with a choice between the last model used (resolved at start, so it keeps up as you switch) and one you pin. A pinned model that has since been uninstalled starts headless rather than substituting one you did not choose.
+
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 
 ### Highlights
