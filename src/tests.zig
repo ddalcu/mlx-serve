@@ -37,6 +37,8 @@ test {
     _ = @import("sdxl_tokenizer.zig");
     _ = @import("sdxl_pipeline.zig");
     _ = @import("sdxl_single_file.zig");
+    _ = @import("sd3.zig");
+    _ = @import("sd3_vae.zig"); // LANE-B-TEMP
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");
