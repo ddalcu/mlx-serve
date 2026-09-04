@@ -2059,7 +2059,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // never looks at them, same as `cond_weights` is only meaningful with a
     // matching `condWeightCount()`. `guidance_scale` is diffusers' own
     // spelling, accepted so a pasted script works unmodified.
-    const negative_prompt: ?[]const u8 = extractJsonString(body, "negative_prompt");
+    const negative_prompt: ?[]const u8 = if (extractJsonString(body, "negative_prompt")) |np| try jsonUnescape(allocator, np) else null;
+    defer if (negative_prompt) |np| allocator.free(np);
     var guidance: ?f32 = null;
     if (extractJsonFloat(body, "guidance")) |gv| {
         if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance' must be in [1,30]");

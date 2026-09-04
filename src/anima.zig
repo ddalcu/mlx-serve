@@ -2321,7 +2321,11 @@ pub const Engine = struct {
             // segfaults inside RMSNorm::eval_gpu. Never let the TE see L=0.
             allocator.free(qwen_ids);
             qwen_ids = try allocator.alloc(u32, 1);
-            qwen_ids[0] = self.qwen_tok.eos_id orelse 0;
+            // The pack's tokenizer/ is vocab.json+merges.txt only (no
+            // tokenizer.json / added_tokens), so `eos_id` is always null here
+            // via the slow-loader path. ComfyUI's Qwen3Tokenizer pads the
+            // empty string to <|endoftext|> (151643), not token 0 ("!").
+            qwen_ids[0] = self.qwen_tok.eos_id orelse 151643;
         }
         const qwen_arr = try idsToMlxArray(qwen_ids);
         defer _ = mlx.mlx_array_free(qwen_arr);
