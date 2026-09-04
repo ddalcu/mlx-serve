@@ -439,6 +439,16 @@ pub const VisionEncoder = struct {
         return error.NoVideoEncoder;
     }
 
+    /// Encode one image AND tap the DeepStack streams (Qwen3-VL embedding
+    /// checkpoints like Qwen3-VL-Embedding-2B ship
+    /// `deepstack_merger_list.*`). Returns both output streams; owns nothing —
+    /// the caller frees via `VisionTowerOutput.deinit`. Non-qwen towers have
+    /// no DeepStack path.
+    pub fn forwardPatchesDeepstack(self: *VisionEncoder, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !qwen_vision.VisionTowerOutput {
+        if (self.qwen) |*qv| return qv.forwardWithDeepstack(patches, grid_h, grid_w);
+        return error.NoPatchGridEncoder;
+    }
+
     /// Apply a quantized (or dense) Linear y = x · Wᵀ (+ optional bias). `sc`
     /// non-empty (ndim>0) selects the quantized path; otherwise a plain matmul.
     fn quantLinear(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, qb: mlx.mlx_array, bits: u32, bias: ?mlx.mlx_array) !mlx.mlx_array {
