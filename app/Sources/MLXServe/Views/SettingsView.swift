@@ -921,22 +921,28 @@ private struct ServerSectionContent: View {
         return "\(label) · \(model.engine.shortLabel)"
     }
 
-    /// What "Last model used" resolves to RIGHT NOW, worded for the quiet line
-    /// under the disabled dropdown. Asks `StartupModelChoice.resolved` — the
-    /// same question the launch gate asks — so this line cannot promise a model
-    /// that start would decline to load.
-    private var lastUsedResolution: String {
-        guard let path = StartupModelChoice.resolved(mode: .lastUsed,
-                                                     pinnedPath: nil,
-                                                     lastUsed: StartupModelChoice.lastUsed(),
-                                                     installedPaths: pickable.map(\.path)) else {
-            return "Nothing loaded yet — the server will start with no model."
-        }
-        let dupNames = LocalModel.duplicateNames(in: pickable)
-        guard let model = pickable.first(where: { $0.path == path }) else {
-            return "Nothing loaded yet — the server will start with no model."
-        }
-        return "Currently: \(startupModelLabel(model, dupNames: dupNames))"
+    /// What the dropdown SHOWS, which under "Last model used" is not what it
+    /// stores: the rule's answer today, asked of `StartupModelChoice.resolved`
+    /// — the same question the launch gate asks, so the control cannot name a
+    /// model start would decline to load. A picker whose selection matches no
+    /// row renders BLANK, and blank is what an empty pin looked like while the
+    /// rule beside it had a perfectly good answer.
+    ///
+    /// The setter only ever runs in `.pinned` mode; the control is disabled in
+    /// the other, which is the mode where the stored value is not the answer.
+    private var startupModelDisplay: Binding<String> {
+        Binding(
+            get: {
+                guard appState.startupModelMode == .lastUsed else {
+                    return appState.startupModelPinnedPath
+                }
+                return StartupModelChoice.resolved(mode: .lastUsed,
+                                                   pinnedPath: nil,
+                                                   lastUsed: StartupModelChoice.lastUsed(),
+                                                   installedPaths: pickable.map(\.path)) ?? ""
+            },
+            set: { appState.startupModelPinnedPath = $0 }
+        )
     }
 
     var body: some View {
@@ -973,10 +979,16 @@ private struct ServerSectionContent: View {
             explainer: "If the pinned model is removed later — or nothing has been loaded yet — the server simply starts with nothing resident, rather than substituting a model you did not choose."
         ) {
             VStack(alignment: .trailing, spacing: 4) {
-                Picker("", selection: $appState.startupModelPinnedPath) {
+                Picker("", selection: startupModelDisplay) {
                     let dupNames = LocalModel.duplicateNames(in: pickable)
                     ForEach(pickable) { model in
                         Text(startupModelLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                    // Nothing to name — no model on this Mac, or nothing
+                    // chatted with yet. Empty matches no row and would render
+                    // blank, so the absence says itself.
+                    if startupModelDisplay.wrappedValue.isEmpty {
+                        Text("None — starts with no model").tag("")
                     }
                     // A pin that has since been uninstalled matches no row, and
                     // a Picker whose selection matches no row renders BLANK —
@@ -998,10 +1010,10 @@ private struct ServerSectionContent: View {
                 // worse than one that is visibly not in play.
                 .disabled(!appState.loadModelAtStart || appState.startupModelMode == .lastUsed)
 
-                // Which model that rule resolves to today, so the answer is
-                // visible rather than something you find out at the next login.
+                // The control above says WHICH; this says WHEN — otherwise a
+                // reader has no way to tell a live rule from a stale pin.
                 if appState.startupModelMode == .lastUsed {
-                    Text(lastUsedResolution)
+                    Text("Resolved each time the app starts, so it keeps up as you switch models.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.trailing)
