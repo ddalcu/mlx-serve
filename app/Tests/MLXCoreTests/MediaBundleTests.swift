@@ -676,13 +676,35 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(Model3DModelPreset.all.contains(.hunyuan3d21_8bit))
     }
 
-    /// Class guard: the image catalog is FLUX.2 + Krea only. FLUX.1
-    /// (schnell/dev) was dropped as a picker option — a future preset must
-    /// not reintroduce the `.flux1` variant tag or a "FLUX.1" name.
-    func testImageCatalogHasNoFlux1Entries() {
-        for p in ImageModelPreset.all {
-            XCTAssertNotEqual(p.variant.rawValue, "flux1", p.id)
-            XCTAssertFalse(p.name.contains("FLUX.1"), p.id)
+    /// FLUX.1 dev + schnell are catalog entries now that the `flux1` backend
+    /// exists (T5-XXL + CLIP-L MMDiT). Each declares only the capabilities the
+    /// server actually has — the `supportsX` mirror rule — so the pane never
+    /// offers a dead control.
+    func testFlux1DevAndSchnellAreInTheCatalogWithHonestCapabilities() {
+        XCTAssertTrue(ImageModelPreset.all.contains(.flux1Dev_Q4))
+        XCTAssertTrue(ImageModelPreset.all.contains(.flux1Schnell_Q4))
+
+        let dev = ImageModelPreset.flux1Dev_Q4
+        XCTAssertEqual(dev.variant, .flux1Dev)
+        XCTAssertFalse(dev.stepsAreFixed)                 // dev has a real step schedule
+        XCTAssertFalse(dev.supportsReferenceEdit)         // no edit training
+        XCTAssertFalse(dev.supportsImg2Img)               // img2img not wired
+        XCTAssertEqual(dev.condWeightCount, 0)            // single hidden state, no rebalance
+        XCTAssertEqual(dev.resolutionGrid.alignment, 16)  // clampFlux1Dim
+
+        let sch = ImageModelPreset.flux1Schnell_Q4
+        XCTAssertEqual(sch.variant, .flux1Schnell)
+        XCTAssertTrue(sch.stepsAreFixed)                  // 4-step distilled
+        XCTAssertEqual(sch.settings(.good).steps, 4)
+        XCTAssertFalse(sch.supportsReferenceEdit)
+
+        // Both mflux packs ship NO root config.json, so readiness is the weight
+        // subdirs — including the T5-XXL text_encoder_2 — never config.json.
+        for p in [dev, sch] {
+            let markers = p.bundle.components[0].readyMarkers
+            XCTAssertFalse(markers.contains("config.json"), p.id)
+            XCTAssertTrue(markers.contains("text_encoder_2"), p.id)
+            XCTAssertTrue(markers.contains("transformer"), p.id)
         }
     }
 

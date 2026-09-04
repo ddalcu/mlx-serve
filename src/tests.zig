@@ -50,6 +50,12 @@ test {
     _ = @import("wav.zig");
     _ = @import("tts.zig");
     _ = @import("flux.zig");
+    _ = @import("flux_common.zig");
+    _ = @import("t5_tokenizer.zig");
+    _ = @import("t5.zig");
+    _ = @import("flux1_clip.zig");
+    _ = @import("flux1_vae.zig");
+    _ = @import("flux1.zig");
     _ = @import("krea.zig");
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");

@@ -39,6 +39,10 @@ enum CustomMediaModels {
         if arch.hasPrefix("flux2") {
             return arch.contains("9b") ? .flux2Klein9B_Q4 : .flux2Klein4B_Q4
         }
+        // FLUX.1 reports `model_type` "flux1" for both dev and schnell (the
+        // guidance-embed discriminator is a weight, not in /v1/models), so a
+        // custom pack maps to the dev family — the server auto-detects schnell.
+        if arch.hasPrefix("flux1") { return .flux1Dev_Q4 }
         if arch.hasPrefix("krea") { return .krea2Turbo }
         if arch.hasPrefix("mage_flow") || arch == "mageflow" {
             return isEditDir(id) ? .mageFlowEditTurbo : .mageFlowTurbo

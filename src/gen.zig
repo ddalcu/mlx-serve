@@ -16,6 +16,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
+const flux1_mod = @import("flux1.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
@@ -91,13 +92,14 @@ pub const Modality = enum {
 /// "unsupported model_type" while the engine that serves it was ready and
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
-    "flux2",     "krea",       "mage_flow",      "mageflow",
+    "flux2",     "flux1",      "krea",           "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
+    if (std.mem.startsWith(u8, model_type, "flux1")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
@@ -172,8 +174,20 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
     // the loader end up disagreeing about whether a dir is a model.
+    // FLUX.1 (dev/schnell) mflux packs also ship no root config.json — keyed on
+    // the FLUX.1 DiT marker, checked BEFORE the FLUX.2 predicate. Same fs-only
+    // predicate discovery uses, so `list` and the loader agree.
+    if (isFlux1Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux1") catch null;
     if (isMfluxFlux2Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux2-klein") catch null;
     return null;
+}
+
+/// True when `model_dir` holds FLUX.1 MMDiT weights but no config.json to say
+/// so. Thin path→Dir wrapper over `model_discovery.peekMfluxFlux1`.
+fn isFlux1Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekMfluxFlux1(io, allocator, dir);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -441,6 +455,7 @@ const FluxImpl = struct {
 /// second arch, at which point the same union pattern applies.
 const ImageBackend = union(enum) {
     flux: FluxImpl,
+    flux1: flux1_mod.Flux1,
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
 };
@@ -521,6 +536,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.startsWith(u8, mt, "flux1")) {
+                self.backend = .{ .flux1 = try flux1_mod.Flux1.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -530,6 +549,7 @@ pub const ImageEngine = struct {
         self.clearLora();
         switch (self.backend) {
             .flux => |*f| f.deinit(),
+            .flux1 => |*f| f.deinit(),
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
         }
@@ -539,6 +559,7 @@ pub const ImageEngine = struct {
     fn stream(self: *ImageEngine) mlx.mlx_stream {
         return switch (self.backend) {
             .flux => |*f| f.s,
+            .flux1 => |*f| f.s,
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
         };
@@ -548,6 +569,7 @@ pub const ImageEngine = struct {
     pub fn condWeightCount(self: *const ImageEngine) usize {
         return switch (self.backend) {
             .flux => 3,
+            .flux1 => 0, // conditioning-rebalance not wired for FLUX.1
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
         };
@@ -557,6 +579,7 @@ pub const ImageEngine = struct {
     pub fn supportsImg2Img(self: *const ImageEngine) bool {
         return switch (self.backend) {
             .flux => |*f| f.vae_enc != null,
+            .flux1 => false, // img2img not wired for FLUX.1 yet
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
         };
@@ -567,6 +590,7 @@ pub const ImageEngine = struct {
     pub fn supportsEdit(self: *const ImageEngine) bool {
         return switch (self.backend) {
             .flux => |*f| f.vae_enc != null,
+            .flux1 => false, // no edit training for FLUX.1
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
         };
@@ -602,6 +626,7 @@ pub const ImageEngine = struct {
             errdefer self.allocator.free(dup_p);
             const arch: lora_mod.Arch = switch (self.backend) {
                 .flux => .flux2,
+                .flux1 => .flux1,
                 .krea => .krea2,
                 .mage_flow => .generic,
             };
@@ -613,6 +638,7 @@ pub const ImageEngine = struct {
         }
         const matched = switch (self.backend) {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
+            .flux1 => |*f| flux1_mod.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
         };
@@ -628,6 +654,7 @@ pub const ImageEngine = struct {
     fn clearLora(self: *ImageEngine) void {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
+            .flux1 => |*f| flux1_mod.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
         }
@@ -647,6 +674,10 @@ pub const ImageEngine = struct {
     pub fn generateImage(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
         return switch (self.backend) {
             .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, opts, progress),
+            .flux1 => |*f| blk: {
+                if (opts.edit_images.len != 0 or opts.init_image != null) break :blk error.EditUnsupported;
+                break :blk f.generateImage(allocator, prompt, width, height, seed, steps, progress);
+            },
             .krea => |k| blk: {
                 if (opts.edit_images.len != 0) break :blk error.EditUnsupported;
                 const kopts = krea.GenOpts{
@@ -679,6 +710,7 @@ pub const ImageEngine = struct {
     pub fn normalizeSize(self: *const ImageEngine, req_w: u32, req_h: u32) struct { w: u32, h: u32 } {
         return switch (self.backend) {
             .flux => .{ .w = clampFluxDim(req_w), .h = clampFluxDim(req_h) },
+            .flux1 => .{ .w = clampFlux1Dim(req_w), .h = clampFlux1Dim(req_h) },
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
@@ -692,6 +724,7 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
+            .flux1 => 1536,
             .krea, .mage_flow => 2048,
         };
     }
@@ -707,6 +740,15 @@ pub const ImageEngine = struct {
 pub fn clampFluxDim(v: u32) u32 {
     if (v == 0) return 1024;
     const rounded = ((v + 31) / 32) * 32;
+    return std.math.clamp(rounded, 256, 1536);
+}
+
+/// Round a requested dimension to a multiple of 16 in [256, 1536] (FLUX.1's
+/// VAE ×8 + DiT patch ×2 = 16 alignment; 1536 caps 1MP-scale generation to
+/// stay within an ~18 GB budget). 0/omitted → the 1024 default.
+pub fn clampFlux1Dim(v: u32) u32 {
+    if (v == 0) return 1024;
+    const rounded = ((v + 15) / 16) * 16;
     return std.math.clamp(rounded, 256, 1536);
 }
 
@@ -4430,6 +4472,34 @@ test "flux2 detects from an mflux conversion with no root config.json" {
     const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
     defer allocator.free(mt);
     try testing.expectEqualStrings("flux2-klein", mt);
+    try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
+}
+
+test "flux1 detects from an mflux conversion and is not confused with flux2" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // FLUX.1 (dev/schnell) mflux packs ship no root config.json; the FLUX.1
+    // MMDiT's per-block `norm1_context` modulation is the discriminator (FLUX.2
+    // uses shared `double_stream_modulation_*`). Keyed on the same predicate
+    // discovery uses so the picker and loader agree.
+    try tmp.dir.createDirPath(io, "f1/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "f1/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"transformer_blocks.0.norm1_context.linear.weight\":\"0.safetensors\"}}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "f1" });
+    defer allocator.free(model_dir);
+
+    const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("flux1", mt);
+    try testing.expectEqual(Modality.image, modalityFromType(mt).?);
     try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
 }
 

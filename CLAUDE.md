@@ -37,6 +37,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
 | `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |
 | `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear` infers quant geometry |
+| `flux1.zig` (+ `t5.zig`, `t5_tokenizer.zig`, `flux1_clip.zig`, `flux1_vae.zig`, `flux_common.zig`) | FLUX.1 dev/schnell: T5-XXL + CLIP-L TE, per-block-modulated MMDiT (19 double + 38 single), RoPE axes [16,56,56], FlowMatch (dev dyn-shift), 16-ch VAE. dev vs schnell = `guidance_embedder` present. mflux packs, diffusers DiT naming + mflux T5 (`t5_blocks.*`) naming; `flux_common` = shared QLinear/helpers with `t5`/`clip`. T5 tokenizer is Unigram (NOT the BPE in `tokenizer.zig`) |
 | `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (only non-JSON shape: `POST /v1/images/edits`) |
 | `mage_flow.zig` | MageFlow Turbo/Edit: flow DiT + DiCo VAE + Qwen3-VL TE; `MfLinear` shared with H3; DiT/TE bf16, VAE f32 (load-bearing) |
 | `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
@@ -131,7 +132,7 @@ Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by
 | `bailing_hybrid` | Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA = naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok, turbo refused); `noaux_tc` routing. Thinking ON; GLM tool tags. Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit` |
 | `*.gguf` | ds4/llama.cpp; GGUF presence WINS over stray config.json. ds4 DSpark: `--dspark` arms when a `-DSpark-` GGUF sits beside the model (gate keys on `mtpDraftTokens()>1` NOT `hasMtp()`); ~0 net on 0731 |
 | `minimax_h3` | MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on |
-| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` has NO root config.json — classified from `model_index.json` by `gen.peekModelType` + `model_discovery.peekMageFlowIndex`, kept in sync) |
+| media types | `flux2*`/`flux1*`/`krea*`/`mage_flow*`/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` + both flux have NO root config.json — flux1 classified by the FLUX.1 DiT marker `norm1_context` via `gen.peekModelType`/`model_discovery.peekMfluxFlux1` checked BEFORE the flux2 predicate, kept in sync) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 

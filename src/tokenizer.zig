@@ -62,7 +62,10 @@ pub fn reservedOutputIds(
 }
 
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
-pub const PretokStyle = enum { gpt2, llama3 };
+/// `.clip` is OpenAI CLIP's byte-level BPE (FLUX/SDXL text encoders' `tokenizer/`):
+/// lowercased input, no leading-space attachment, single-codepoint digits, and
+/// every word's final symbol carries `end_of_word_suffix` (`</w>`) into the merge.
+pub const PretokStyle = enum { gpt2, llama3, clip };
 
 pub const Tokenizer = struct {
     /// Token string -> id
@@ -84,6 +87,12 @@ pub const Tokenizer = struct {
     /// (?i) contractions, {1,3} digit groups, `/` in the punct tail).
     /// Parsed from the tokenizer.json Split regex.
     pretok_style: PretokStyle = .gpt2,
+    /// `model.end_of_word_suffix` from tokenizer.json (CLIP: `</w>`, appended
+    /// to a word's last symbol before BPE merging). Borrowed from
+    /// `parsed_json`'s arena like the vocab/merge strings. Also the signal
+    /// that selects `.clip` pretokenization + lowercasing — no non-CLIP
+    /// tokenizer in this codebase sets it.
+    end_of_word_suffix: ?[]const u8 = null,
     /// Byte-to-unicode mapping for byte-level BPE (256 entries, index = byte value)
     byte_to_unicode: [256]u21,
     /// Unicode-to-byte reverse mapping
@@ -334,7 +343,7 @@ pub const Tokenizer = struct {
             }
         }
 
-        return self.bpeMerge(allocator, normalized.items);
+        return self.bpeMerge(allocator, normalized.items, "");
     }
 
     fn decodeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, ids: []const u32, strip_leading_space: bool) ![]u8 {
@@ -385,12 +394,18 @@ pub const Tokenizer = struct {
         switch (self.pretok_style) {
             .gpt2 => try gpt2PreTokenize(allocator, text, self.digit_group, &words),
             .llama3 => try llama3PreTokenize(allocator, text, &words),
+            .clip => {
+                const lowered = try toLowerAscii(allocator, text);
+                defer allocator.free(lowered);
+                try clipPreTokenize(allocator, lowered, &words);
+            },
         }
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
         var all_ids = std.ArrayList(u32).empty;
         errdefer all_ids.deinit(allocator);
 
+        const eow_suffix = self.end_of_word_suffix orelse "";
         for (words.items) |word| {
             // Map each byte to its unicode character
             var unicode_str = std.ArrayList(u8).empty;
@@ -404,7 +419,7 @@ pub const Tokenizer = struct {
             }
 
             // BPE merge on the unicode string
-            const ids = try self.bpeMerge(allocator, unicode_str.items);
+            const ids = try self.bpeMerge(allocator, unicode_str.items, eow_suffix);
             defer allocator.free(ids);
             try all_ids.appendSlice(allocator, ids);
         }
@@ -595,7 +610,23 @@ pub const Tokenizer = struct {
     /// O(n log n); `encodeSentencePiece` feeds entire prompts through here
     /// with no pre-tokenization, so the previous rescan-all-pairs loop was
     /// O(n²) and cost seconds on agent-sized (tens-of-KB) system prompts.
-    fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
+    ///
+    /// `end_of_word_suffix` (CLIP: `</w>`) is glued onto the WORD's initial
+    /// last-character node before any merging, exactly like the reference
+    /// `word = tuple(token[:-1]) + (token[-1] + '</w>',)` — so a merge that
+    /// consumes the final character carries the suffix into the vocab lookup
+    /// (`cat` → nodes `c`,`a`,`t</w>`, which merges toward `cat</w>` if the
+    /// checkpoint learned that pair). Empty for every non-CLIP caller.
+    fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, word_in: []const u8, end_of_word_suffix: []const u8) ![]u32 {
+        // Glue `end_of_word_suffix` onto the word before splitting, so the
+        // last character's node spans it too (see doc comment above).
+        var owned_buf: []u8 = &.{};
+        defer if (owned_buf.len > 0) allocator.free(owned_buf);
+        const input: []const u8 = if (end_of_word_suffix.len > 0 and word_in.len > 0) blk: {
+            owned_buf = try std.fmt.allocPrint(allocator, "{s}{s}", .{ word_in, end_of_word_suffix });
+            break :blk owned_buf;
+        } else word_in;
+
         // Split into individual UTF-8 characters.
         var nodes: std.ArrayList(BpeNode) = .empty;
         defer nodes.deinit(allocator);
@@ -603,7 +634,11 @@ pub const Tokenizer = struct {
         var idx: usize = 0;
         while (idx < input.len) {
             const char_len = std.unicode.utf8ByteSequenceLength(input[idx]) catch 1;
-            const end = @min(idx + char_len, input.len);
+            var end = @min(idx + char_len, input.len);
+            // The last original character absorbs the appended suffix into
+            // ONE node (not split into its own utf8 chars), matching the
+            // reference's `token[-1] + '</w>'`.
+            if (end_of_word_suffix.len > 0 and end == word_in.len) end = input.len;
             const i: i32 = @intCast(nodes.items.len);
             try nodes.append(allocator, .{
                 .start = @intCast(idx),
@@ -928,6 +963,89 @@ fn llama3MatchPunct(text: []const u8, start: usize) ?usize {
     }
     while (i < text.len and (text[i] == '\r' or text[i] == '\n' or text[i] == '/')) i += 1;
     return i;
+}
+
+/// ASCII-fold `text` to lowercase (CLIP's `Lowercase` normalizer runs before
+/// its Split pretokenizer). Non-ASCII bytes pass through unchanged — CLIP-L
+/// prompts are overwhelmingly ASCII and the checkpoint's vocab is itself
+/// ASCII-cased, so this covers the traffic that matters without pulling in
+/// full Unicode case folding.
+fn toLowerAscii(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, text.len);
+    for (text, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
+}
+
+/// OpenAI CLIP's BPE pretokenizer (FLUX/SDXL text encoders' `tokenizer/`).
+/// Reference (`CLIPTokenizer`/`CLIPTokenizerFast`'s `pat`, case-insensitive —
+/// callers lowercase first, see `toLowerAscii`):
+///
+///     's|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+
+///
+/// Unlike `gpt2PreTokenize`: whitespace matches NO alternative and is simply
+/// dropped between words (no leading-space attachment, no `Ġ`), digits are
+/// ALWAYS single-codepoint pre-tokens, and letter/punct runs have no leading
+/// optional character.
+fn clipPreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const start = i;
+
+        // ── `'s|'t|'re|'ve|'m|'ll|'d` ──
+        if (text[i] == '\'' and i + 1 < text.len) {
+            const n1 = text[i + 1]; // already lowercased by the caller
+            if (n1 == 's' or n1 == 't' or n1 == 'm' or n1 == 'd') {
+                i += 2;
+                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                continue;
+            }
+            if (i + 2 < text.len) {
+                const n2 = text[i + 2];
+                if ((n1 == 'r' and n2 == 'e') or (n1 == 'v' and n2 == 'e') or (n1 == 'l' and n2 == 'l')) {
+                    i += 3;
+                    try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                    continue;
+                }
+            }
+        }
+
+        const cp = decodeCodepoint(text, i) orelse {
+            i += 1;
+            continue;
+        };
+
+        // ── `[\p{L}]+` ──
+        if (isLetter(cp.cp)) {
+            i += cp.len;
+            while (decodeCodepoint(text, i)) |c| {
+                if (!isLetter(c.cp)) break;
+                i += c.len;
+            }
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        // ── `[\p{N}]` — exactly one digit ──
+        if (isDigit(cp.cp)) {
+            i += cp.len;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        // ── `[^\s\p{L}\p{N}]+` ──
+        if (!isWhitespaceCp(cp.cp)) {
+            i += cp.len;
+            while (decodeCodepoint(text, i)) |c| {
+                if (isWhitespaceCp(c.cp) or isLetter(c.cp) or isDigit(c.cp)) break;
+                i += c.len;
+            }
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        // Whitespace: not matched by any alternative — drop it.
+        i += cp.len;
+    }
 }
 
 /// Pattern 2: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`. Returns end position of
@@ -1293,6 +1411,22 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
     bos_id = special_tokens.get("<bos>") orelse special_tokens.get("<|startoftext|>") orelse special_tokens.get("[CLS]");
     eos_id = special_tokens.get("<eos>") orelse special_tokens.get("<|im_end|>") orelse special_tokens.get("<|endoftext|>") orelse special_tokens.get("[SEP]");
 
+    // `end_of_word_suffix` (CLIP: "</w>") is a signature of OpenAI CLIP's BPE
+    // model — no other tokenizer in this codebase's vocabulary sets it — so
+    // it alone selects `.clip` pretokenization, ahead of the Split-regex
+    // detection below (CLIP's Split pretokenizer pattern varies by export).
+    const end_of_word_suffix: ?[]const u8 = blk: {
+        const v = model_obj.get("end_of_word_suffix") orelse break :blk null;
+        if (v != .string or v.string.len == 0) break :blk null;
+        break :blk v.string;
+    };
+    const pretok_style: PretokStyle = if (end_of_word_suffix != null)
+        .clip
+    else if (root.get("pre_tokenizer")) |pt|
+        pretokStyleFromPreTokenizer(pt)
+    else
+        .gpt2;
+
     // Build byte-to-unicode mapping
     const byte_to_unicode = buildBytesToUnicode();
     var unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator);
@@ -1320,7 +1454,8 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .flagged_specials = try flagged.toOwnedSlice(allocator),
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
-        .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
+        .pretok_style = pretok_style,
+        .end_of_word_suffix = end_of_word_suffix,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
@@ -1991,7 +2126,8 @@ test "gpt2PreTokenize: full Python snippet matches HF reference" {
     // Note: `):\n` joins because pattern 4 allows trailing `[\r\n]*` after
     // the punct run. The byte-level encode + BPE merge stage downstream
     // turns this into exactly the same token-ids HF produces.
-    try expectPreTokens(testing.allocator,
+    try expectPreTokens(
+        testing.allocator,
         "def total(items):\n    total = 0",
         &.{ "def", " total", "(items", "):\n", "   ", " total", " =", " ", "0" },
     );
@@ -2065,7 +2201,7 @@ test "bpeMerge: lowest rank merges first regardless of position" {
     var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
     defer tok.unicode_to_byte.deinit();
 
-    const ids = try tok.bpeMerge(allocator, "abcd");
+    const ids = try tok.bpeMerge(allocator, "abcd", "");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{7}, ids);
 }
@@ -2090,7 +2226,7 @@ test "bpeMerge: leftmost pair wins rank ties" {
     defer tok.unicode_to_byte.deinit();
 
     // "aaa": leftmost (a,a) merges first -> [aa, a]; (aa,a) has no rank.
-    const ids = try tok.bpeMerge(allocator, "aaa");
+    const ids = try tok.bpeMerge(allocator, "aaa", "");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 2, 1 }, ids);
 }
@@ -2123,7 +2259,7 @@ test "bpeMerge: cascading merges across merge sites" {
     var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
     defer tok.unicode_to_byte.deinit();
 
-    const ids = try tok.bpeMerge(allocator, "hellohello");
+    const ids = try tok.bpeMerge(allocator, "hellohello", "");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 8, 8 }, ids);
 }
@@ -2150,9 +2286,125 @@ test "bpeMerge: symbols missing from vocab fall back to byte pieces" {
     var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
     defer tok.unicode_to_byte.deinit();
 
-    const ids = try tok.bpeMerge(allocator, "az");
+    const ids = try tok.bpeMerge(allocator, "az", "");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 99 }, ids);
+}
+
+test "clipPreTokenize: matches the CLIP regex, unlike gpt2's leading-space attachment" {
+    const allocator = testing.allocator;
+    var words: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (words.items) |w| allocator.free(w);
+        words.deinit(allocator);
+    }
+    // Lowercased by the caller before this runs, like the real pipeline.
+    try clipPreTokenize(allocator, "a cat, 100 dogs", &words);
+    // No leading-space attachment (unlike gpt2PreTokenize's " total"):
+    // whitespace matches no alternative and is simply dropped between words.
+    // Digits are ALWAYS single-codepoint pre-tokens: "100" -> "1","0","0".
+    try testing.expectEqual(@as(usize, 7), words.items.len);
+    try testing.expectEqualStrings("a", words.items[0]);
+    try testing.expectEqualStrings("cat", words.items[1]);
+    try testing.expectEqualStrings(",", words.items[2]);
+    try testing.expectEqualStrings("1", words.items[3]);
+    try testing.expectEqualStrings("0", words.items[4]);
+    try testing.expectEqualStrings("0", words.items[5]);
+    try testing.expectEqualStrings("dogs", words.items[6]);
+}
+
+test "clipPreTokenize: contractions split like the reference pattern" {
+    const allocator = testing.allocator;
+    var words: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (words.items) |w| allocator.free(w);
+        words.deinit(allocator);
+    }
+    try clipPreTokenize(allocator, "it's", &words);
+    try testing.expectEqual(@as(usize, 2), words.items.len);
+    try testing.expectEqualStrings("it", words.items[0]);
+    try testing.expectEqualStrings("'s", words.items[1]);
+}
+
+test "bpeMerge: end_of_word_suffix glues onto the last symbol before merging" {
+    // Mirrors CLIP's `word = tuple(token[:-1]) + (token[-1] + '</w>',)`: a
+    // vocab entry for the whole word only exists WITH the suffix attached.
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("c", 1);
+    try vocab.put("a", 2);
+    try vocab.put("t</w>", 3);
+    try vocab.put("ca", 4);
+    try vocab.put("cat</w>", 5);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "c", .right = "a" }, 0);
+    try merge_ranks.put(.{ .left = "ca", .right = "t</w>" }, 1);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    // Without the suffix, "cat" would merge toward a DIFFERENT (non-existent)
+    // "cat" entry — with it, the last node is "t</w>" from the start.
+    const ids = try tok.bpeMerge(allocator, "cat", "</w>");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{5}, ids);
+}
+
+/// Encode one ASCII byte through the byte-to-unicode table, as a heap string.
+fn encodeOneByte(allocator: std.mem.Allocator, table: [256]u21, byte: u8) ![]u8 {
+    var buf: [4]u8 = undefined;
+    const len = try std.unicode.utf8Encode(table[byte], &buf);
+    return allocator.dupe(u8, buf[0..len]);
+}
+
+test "clip tokenizer.json: end_of_word_suffix selects .clip pretokenization end to end" {
+    // A minimal CLIP-shaped tokenizer.json: Lowercase-sensitive vocab (only
+    // the lowercased spellings exist) and an end_of_word_suffix model field —
+    // the ONE signal that must flip pretok_style away from the default gpt2
+    // byte-level path (the bug this test pins: pre-fix, "A cat" tokenized
+    // through the generic byte-level BPE and never hit these entries).
+    const allocator = testing.allocator;
+    const io = std.testing.io;
+    const bu = buildBytesToUnicode();
+
+    // Byte-level BPE maps ASCII bytes to their (mostly identical) unicode
+    // codepoints via `buildBytesToUnicode`; the vocab/merges below are keyed
+    // on those mapped strings, same as a real tokenizer.json.
+    const A = try encodeOneByte(allocator, bu, 'a');
+    defer allocator.free(A);
+    const C = try encodeOneByte(allocator, bu, 'c');
+    defer allocator.free(C);
+    const T = try encodeOneByte(allocator, bu, 't');
+    defer allocator.free(T);
+    const CA = try std.fmt.allocPrint(allocator, "{s}{s}", .{ C, A });
+    defer allocator.free(CA);
+    const CAT_EOW = try std.fmt.allocPrint(allocator, "{s}{s}{s}</w>", .{ C, A, T });
+    defer allocator.free(CAT_EOW);
+
+    const content = try std.fmt.allocPrint(allocator,
+        \\{{"pre_tokenizer":{{"type":"ByteLevel"}},"model":{{"type":"BPE","end_of_word_suffix":"</w>","vocab":{{"{s}":0,"{s}":1,"{s}</w>":2,"{s}":3,"{s}":4}},"merges":[["{s}","{s}"],["{s}","{s}</w>"]]}}}}
+    , .{ A, C, T, CA, CAT_EOW, C, A, CA, T });
+    defer allocator.free(content);
+
+    var tok = try parseTokenizerContent(io, allocator, content);
+    defer tok.deinit();
+
+    try testing.expectEqual(PretokStyle.clip, tok.pretok_style);
+    try testing.expectEqualStrings("</w>", tok.end_of_word_suffix.?);
+
+    // Uppercase input must be lowercased before pretokenization, since only
+    // the lowercased spellings exist in this vocab.
+    const ids = try tok.encode(allocator, "Cat");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{4}, ids);
 }
 
 test "parseMergePair handles both array and space-joined-string formats" {
