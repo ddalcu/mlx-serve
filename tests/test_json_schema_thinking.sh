@@ -62,7 +62,7 @@ fi
 echo "=== /v1/chat/completions: same request, stream ==="
 STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "{
     \"model\": \"mlx-serve\", \"max_tokens\": 512, \"temperature\": 0, \"stream\": true,
-    \"reasoning_effort\": \"medium\",
+    \"reasoning_effort\": \"low\",
     \"response_format\": {\"type\": \"json_schema\", \"json_schema\": {\"name\": \"answer\", \"strict\": true, \"schema\": $SCHEMA}},
     \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}]
 }")
