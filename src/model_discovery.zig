@@ -74,6 +74,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
     // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
+    // Anima: our converted pack writes the DiT (transformer + llm_adapter) last.
+    if (std.mem.eql(u8, model_type, "anima")) return "transformer.safetensors";
     return null;
 }
 
@@ -88,6 +90,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "anima") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -470,7 +473,8 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
-        std.mem.eql(u8, model_type, "mageflow")) return .image;
+        std.mem.eql(u8, model_type, "mageflow") or
+        std.mem.eql(u8, model_type, "anima")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -1209,6 +1213,17 @@ test "minimax_music3 classifies as audio media with the vocoder marker" {
     try testing.expect(isMediaModelType("minimax_music3"));
     try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
     try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
+}
+
+test "anima classifies as image media with the transformer marker" {
+    // Anima ships as a converted pack with config.json model_type "anima"
+    // (Cosmos-Predict2 DiT + LLMAdapter, Qwen3-0.6B TE, Qwen-Image VAE).
+    try testing.expect(isMediaModelType("anima"));
+    try testing.expect(isSupportedModelType("anima"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("anima"));
+    // The DiT is the big last-written file the converter drops in; an
+    // in-flight download without it must not shadow a complete copy.
+    try testing.expectEqualStrings("transformer.safetensors", requiredMediaMarker("anima").?);
 }
 
 test "discoverModels finds flat and org/repo model dirs" {

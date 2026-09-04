@@ -29,6 +29,8 @@ test {
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");
     _ = @import("diffusion.zig");
+    _ = @import("anima.zig");
+    _ = @import("t5_tokenizer.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");

@@ -134,6 +134,7 @@ enum FluxVariant: String, Hashable, Codable {
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
+    case anima            // circlestone-labs/Anima Cosmos-style DiT — served by the native `anima` backend
 }
 
 struct ImageQualitySettings: Hashable {
@@ -401,10 +402,92 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
+    /// circlestone-labs/Anima (Cosmos-style DiT + Qwen3-0.6B/T5 dual text
+    /// encoding + Qwen-Image VAE), served by the native `anima` backend
+    /// (`config.json` `model_type: "anima"`). This is the template
+    /// `CustomMediaModels.imageFamily` clones for an already-discovered pack
+    /// (e.g. converted by hand via `scripts/convert_anima_weights.py`) — its
+    /// `id`/`name`/`repo` are meaningless until `.asCustom` rewrites them.
+    /// NOT in `.all` itself; `.animaTurbo`/`.animaBase` below are the real,
+    /// downloadable catalog entries.
+    static let animaBase = ImageModelPreset(
+        id: "anima/local",
+        name: "Anima",
+        variant: .anima,
+        configName: "anima",
+        repo: "anima/local",
+        approxDownloadGB: 0,
+        approxRAMGB: 12,
+        resolutions: kreaResolutions,
+        defaultResolution: kreaResolutions[0],
+        qualityProfiles: [
+            // The pack's own recommended_steps (turbo ~8-12, base/aesthetic
+            // ~30-50) is what actually runs when steps==0; these are just the
+            // Advanced panel's adjustable defaults, spanning both.
+            .fast:         .init(steps: 8),
+            .good:         .init(steps: 16),
+            .quality:      .init(steps: 24),
+            .superQuality: .init(steps: 32),
+        ],
+        defaultQuality: .good,
+        description: "A locally-converted Anima checkpoint — Cosmos-style DiT image generation with img2img support."
+    )
+
+    /// Anima Turbo — our own mlx-serve mirror of circlestone-labs/Anima's
+    /// turbo-v1.1 variant. Distilled: 10 steps, CFG 1.0 (no unconditional
+    /// forward, matching comfy's `disable_cfg1_optimization`). f32
+    /// end-to-end, no quantization yet.
+    static let animaTurbo = ImageModelPreset(
+        id: "justintime47/Anima-Turbo-MLX-Serve",
+        name: "Anima Turbo (~5 GB)",
+        variant: .anima,
+        configName: "anima",
+        repo: "justintime47/Anima-Turbo-MLX-Serve",
+        approxDownloadGB: 5,
+        approxRAMGB: 12,
+        resolutions: kreaResolutions,
+        defaultResolution: kreaResolutions[0],
+        qualityProfiles: [
+            // Distilled at 10 steps; the pack's own recommended_steps is what
+            // actually runs when steps==0 — these are the Advanced panel's
+            // adjustable range.
+            .fast:         .init(steps: 8),
+            .good:         .init(steps: 10),
+            .quality:      .init(steps: 14),
+            .superQuality: .init(steps: 20),
+        ],
+        defaultQuality: .good,
+        description: "Anime/illustration image generation — a fast, distilled Cosmos-style DiT with img2img and LoRA support. Non-commercial license."
+    )
+
+    /// Anima Base — our own mlx-serve mirror of circlestone-labs/Anima's
+    /// base-v1.0 variant. Full schedule: 32 steps, CFG 4.5 (classifier-free
+    /// guidance engaged every step, unlike Turbo's single-forward shortcut).
+    static let animaBaseCatalog = ImageModelPreset(
+        id: "justintime47/Anima-Base-MLX-Serve",
+        name: "Anima Base (~5 GB)",
+        variant: .anima,
+        configName: "anima",
+        repo: "justintime47/Anima-Base-MLX-Serve",
+        approxDownloadGB: 5,
+        approxRAMGB: 12,
+        resolutions: kreaResolutions,
+        defaultResolution: kreaResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 16),
+            .good:         .init(steps: 32),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "Anime/illustration image generation — the full-quality Cosmos-style DiT (stronger, slower than Turbo) with img2img and LoRA support. Non-commercial license."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
         .flux2Klein4B_Q4,                              // 5
+        .animaTurbo, .animaBaseCatalog,                // 5, 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
         .krea2Turbo,                                   // 15
@@ -1790,7 +1873,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .anima: return 0
         default: return 3
         }
     }
@@ -1802,7 +1885,7 @@ extension ImageModelPreset {
         switch variant {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
-        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo:
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .anima:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -1835,6 +1918,11 @@ extension ImageModelPreset {
 
     /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLora`).
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
+    /// Anima's DiT linears are LoRA attachment points too now (`anima.zig`
+    /// `attachLora`/`LoraW`) — live-validated against the real turbo-v1.1
+    /// pack (synthetic adapter, byte-transparent at zero-B, real delta at
+    /// nonzero); no PUBLISHED community adapter checked against yet. A
+    /// non-matching file still 400s via `LoraNoMatch`, same as every backend.
     var supportsLoRA: Bool {
         switch variant {
         case .mageFlowTurbo, .mageFlowEditTurbo: return false

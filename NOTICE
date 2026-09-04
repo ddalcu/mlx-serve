@@ -404,6 +404,15 @@ and they are listed because they made that work possible.
     delta-sigma at low step counts (`minimax_h3.audioStepFactor`). The Turbo
     LoRA weights it loads (larryvrh/MiniMax-H3-Turbo-Lora, Apache-2.0) are
     downloaded at runtime and not redistributed here.
+  * ComfyUI's `comfy/ldm/cosmos/predict2.py` + `position_embedding.py`,
+    `comfy/ldm/anima/model.py`, `comfy/text_encoders/anima.py` + `llama.py`,
+    and `comfy/model_sampling.py` + `samplers.py` (GPL-3.0), the reference for
+    the `anima` architecture: the Cosmos-Predict2 `MiniTrainDIT`, the
+    Anima-specific `LLMAdapter`, its Qwen3-0.6B/T5 dual-tokenizer text
+    pipeline, and its rectified-flow sampling schedule (`ModelType.FLOW`,
+    `time_snr_shift`, the "simple" scheduler). Parity oracles transcribe its
+    math into plain torch (`tests/dump_anima_*_fixtures.py`); the fixtures
+    they produce are golden values, not source.
   * filipstrand/mflux (MIT), the reference for stacking several LoRA adapters
     at once — summing per-adapter deltas at forward time rather than merging
     them into the base weight, the `lora_paths`/`lora_scales` request shape,

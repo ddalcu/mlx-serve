@@ -272,6 +272,23 @@ if have "ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8"; then
     "\"prompt\":\"a red apple\",\"size\":\"512x512\",\"steps\":2"
 else skip "krea2-turbo" "not downloaded"; fi
 
+# ── IMAGE: Anima (env-gated — no public download; only exists after running
+# scripts/convert_anima_weights.py by hand against a raw ComfyUI checkpoint,
+# so it can't sit under $MODELS/<org>/<repo> like the catalog backends above.
+# Loaded by absolute PATH first, same as test_anima_gen.sh, then referenced
+# by its basename id like every other backend in this matrix.
+if [ -n "${ANIMA_MODEL:-}" ] && [ -f "$ANIMA_MODEL/config.json" ]; then
+  ANIMA_ID="$(basename "$ANIMA_MODEL")"
+  code=$(post "v1/load-model" "$TMP/anima-load.json" "{\"model\":\"$ANIMA_MODEL\"}")
+  if [ "$code" = "200" ]; then
+    run_matrix "anima" "v1/images/generations" "$ANIMA_ID" \
+      "diffusion_model.blocks.0.self_attn.q_proj" 2048 2048 \
+      "\"prompt\":\"a red apple\",\"size\":\"512x512\",\"steps\":4"
+  else
+    bad "anima" "load-model by path failed (http $code)"
+  fi
+else skip "anima" "ANIMA_MODEL not set (or missing config.json)"; fi
+
 # ── VIDEO: LTX-2.3 (8N+1 ladder → 9 frames is its floor) ──────────────────
 if have "dgrauet/ltx-2.3-mlx-q4"; then
   run_matrix "ltx-2.3" "v1/video/generations" "dgrauet/ltx-2.3-mlx-q4" \
