@@ -122,6 +122,67 @@ export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "
 opencode --model mlx/MODEL_ID
 ```
 
+#### Local orchestrator + remote specialist (plugin pattern)
+
+If your day-to-day model is small and fast (a laptop-friendly local model via
+Ollama or LM Studio) but you want it to delegate coding or reasoning to a
+bigger model on mlx-serve, wiring mlx-serve up as a second *provider* and
+hoping the orchestrator's subagent tooling picks the right one across
+providers is not reliable in practice — cross-provider subagent calls
+routinely failed to connect for us, and a hand-rolled OpenAI `tool_calls`
+relay looped forever because the relay didn't forward the model's own prior
+tool call and result back to itself (see OpenAI's [function calling
+guide](https://developers.openai.com/api/docs/guides/function-calling) on why
+that context is required to terminate the loop).
+
+What worked reliably: an [OpenCode plugin](https://opencode.ai/docs/plugins/)
+that registers real, first-class tools calling mlx-serve directly, so the
+orchestrator picks a tool the same way it picks any built-in one (Bash, Edit)
+instead of us guessing at an undocumented schema:
+
+```typescript
+// ~/.config/opencode/plugins/remote-coder.ts
+import { type Plugin, tool } from "@opencode-ai/plugin"
+
+const MLX_SERVE_URL = "http://127.0.0.1:11234/v1/chat/completions"
+const CODE_MODEL = "MODEL_ID" // an id from GET /v1/models
+
+async function callRemote(model: string, task: string): Promise<string> {
+  const resp = await fetch(MLX_SERVE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages: [{ role: "user", content: task }] }),
+  })
+  const data = await resp.json()
+  return data.choices[0].message.content as string
+}
+
+export const RemoteCoderPlugin: Plugin = async ({ directory }) => ({
+  tool: {
+    remote_code: tool({
+      description: "Delegate a coding task to a powerful remote model.",
+      args: { task: tool.schema.string(), filePath: tool.schema.string().optional() },
+      async execute(args) {
+        const content = await callRemote(CODE_MODEL, args.task)
+        if (args.filePath) {
+          const code = (content.match(/```(?:\w+\n)?([\s\S]*?)```/) ?? [, content])[1].trim()
+          await Bun.write(`${directory}/${args.filePath}`, code + "\n")
+          return `Wrote ${args.filePath}:\n\n${content}`
+        }
+        return content
+      },
+    }),
+  },
+})
+```
+
+The key property: the tool's `execute()` is plain, deterministic code, not
+something the model has to get right on every call — the only judgment call
+left to the orchestrator is *when* to reach for `remote_code`, which is a much
+easier ask than reproducing a multi-step protocol from a system-prompt
+instruction. In testing, a 7B local model (`qwen2.5:7b-instruct`) picked the
+tool correctly and consistently; smaller/other local models we tried did not.
+
 ### Codex
 
 Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. `CODEX_HOME` relocates its whole config tree (the folder must exist before codex runs). No key setup: with no `env_key` configured, codex skips the login screen.
