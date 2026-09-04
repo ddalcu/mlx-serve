@@ -152,6 +152,12 @@ class ServerManager: ObservableObject {
                                            selectedModelPath: selectedModelPath) else { return }
         if (try? await loadModel(id: selectedModelPath)) != nil {
             chatDefaultEnsured = true
+            // The first-turn hot-load onto a headless server — this is the
+            // common way a model becomes resident now that auto-start no longer
+            // loads one, so without it "Last model used" would stay empty for
+            // anyone who never touches the tray picker. Recorded here rather
+            // than inside `loadModel` because this call passes no `setDefault`.
+            StartupModelChoice.recordLoaded(path: selectedModelPath)
         }
     }
 
@@ -301,11 +307,14 @@ class ServerManager: ObservableObject {
         prefillTPSNow = nil
     }
 
-    func toggle(modelPath: String, options: ServerOptions) {
+    /// Stop a running server, or start one headless. Button starts go through
+    /// `AppState.startServer`, which decides whether to hot-load afterwards —
+    /// no button launches with `--model`, so this takes no model path.
+    func toggleHeadless(options: ServerOptions) {
         if status == .running || status == .starting {
             stop()
         } else {
-            start(modelPath: modelPath, options: options)
+            startHeadless(modelsDir: Self.modelsRoot, options: options)
         }
     }
 
@@ -578,6 +587,11 @@ class ServerManager: ObservableObject {
     private func transitionToRunning() {
         guard status != .running else { return }
         status = .running
+        // An eager `--model` launch that reached `.running` really did finish
+        // loading — a start that dies mid-load never gets here. Headless
+        // launches leave `currentModelPath` empty and `recordLoaded` ignores
+        // them (absolute paths only), so nothing needs a second guard.
+        StartupModelChoice.recordLoaded(path: currentModelPath)
         Task { await self.refreshModels() }
         // If the user has the menu open at the exact moment the server comes
         // up, start the live /props ticker now so the GPU-memory bar fills in
@@ -666,7 +680,15 @@ class ServerManager: ObservableObject {
         // A switch moves what the process is serving without restarting it;
         // keep `currentModelPath` honest for the readers that gate on it
         // (TaskScheduler's pinned-model check, TestServer's status).
-        if setDefault, id.hasPrefix("/") { currentModelPath = id }
+        if setDefault, id.hasPrefix("/") {
+            currentModelPath = id
+            // A completed chat-model switch — `api.loadModel` returned, so the
+            // checkpoint is resident. Only the `setDefault` branch records:
+            // `loadModel` is also the media path (`prepareGenModel` hot-loads
+            // FLUX / LTX / Kokoro by directory), and a video model is not the
+            // "last model used" a chat startup should reach for.
+            StartupModelChoice.recordLoaded(path: id)
+        }
         await refreshModels()
         return info
     }

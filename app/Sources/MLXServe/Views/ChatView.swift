@@ -1978,11 +1978,13 @@ struct ChatDetailView: View {
         )
         if control != .hidden {
             Button {
-                // ONE start path, shared with the LAN toggle: it loads the
-                // selected checkpoint, or boots headless when the model
-                // answering is on another Mac. A second `server.start` call
-                // site here is how the two would drift.
-                appState.ensureServerForLan()
+                // Headless, then hot-load the selection (`startServerForChat`):
+                // the same resident model as `--model` would give, but as an
+                // ordinary registry entry rather than the launch default — one
+                // the user can eject and have stay ejected. The pill spins
+                // meanwhile. A second `server.start` call site here is how the
+                // start paths would drift.
+                appState.startServer(loadingSelection: true)
             } label: {
                 HStack(spacing: 4) {
                     if control == .starting {

@@ -226,6 +226,46 @@ class AppState: ObservableObject {
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
     }
+    /// Should the launch gate pass `--model` (an EAGER, BLOCKING load) instead
+    /// of starting headless? Separate from `autoStartServer` on purpose:
+    /// "run the server" and "resident a checkpoint" are different decisions,
+    /// and folding them into one checkbox made "Auto-start on launch" read tens
+    /// of gigabytes off disk at login with nothing in the UI saying so
+    /// (issue #214). Default OFF, including for existing users — that IS the
+    /// fix. The server still comes up, and the first chat turn hot-loads the
+    /// selected model via `ServerManager.ensureDefaultChatModel`.
+    @Published var loadModelAtStart: Bool {
+        didSet { UserDefaults.standard.set(loadModelAtStart, forKey: "loadModelAtStart") }
+    }
+    /// WHICH model `loadModelAtStart` loads — follow the last one used, or
+    /// always `startupModelPinnedPath`. Stored as its own key rather than as a
+    /// magic value inside a path field, so no reader has to know a secret
+    /// string to tell a rule from a filename.
+    @Published var startupModelMode: StartupModelChoice.Mode {
+        didSet {
+            UserDefaults.standard.set(startupModelMode.rawValue, forKey: "startupModelMode")
+            // Switching to "Always this model" having never pinned one would
+            // leave the dropdown matching no row and rendering blank — the
+            // dead-control class. Seed it with the answer the other mode was
+            // already giving, so the control opens on what is about to happen.
+            guard startupModelMode == .pinned, startupModelPinnedPath.isEmpty else { return }
+            startupModelPinnedPath = StartupModelChoice.seedPin(
+                lastUsed: StartupModelChoice.lastUsed(),
+                installedPaths: localModels.filter(\.isChatPickable).map(\.path)
+            )
+        }
+    }
+    /// The model pinned by `startupModelMode == .pinned`. Empty means nothing
+    /// has been pinned yet — an absent optional, never a sentinel.
+    ///
+    /// Deliberately NOT `selectedModelPath`. That property is the model
+    /// answering chats right now, so its `didSet` hot-switches or restarts a
+    /// running server — editing a *startup* preference must not swap the model
+    /// out from under a conversation in progress. `selectedModelPath` and its
+    /// stored key are left exactly as they were.
+    @Published var startupModelPinnedPath: String {
+        didSet { UserDefaults.standard.set(startupModelPinnedPath, forKey: "startupModelPinnedPath") }
+    }
     /// All server-launch flags + per-request defaults, mirrored to UserDefaults.
     /// Auto-saves on every mutation. Prefer this over the legacy single-key
     /// `maxTokens`/`contextSize` defaults — those forward into here.
@@ -513,12 +553,19 @@ class AppState: ObservableObject {
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
         // read a never-set key as false, which is why a fresh install used to
         // download a model and then sit there with the server stopped. The
-        // launch gate below is `autoStartServer && !selectedModelPath.isEmpty`,
-        // so this stays a no-op until a model exists; the first download's
-        // completion hook is what actually starts it. No migration: existing
-        // users who never touched the toggle get it turned on, which is the
-        // intent.
+        // launch gate below now starts the server HEADLESS on its own, so this
+        // no longer waits for a model to exist; what it starts is a server, not
+        // a load. No migration: existing users who never touched the toggle get
+        // it turned on, which is the intent.
         self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
+        // Both default OFF / "Last model used" via the absent-key reads, and
+        // deliberately WITHOUT a migration from the old behaviour: an upgrading
+        // user whose "Auto-start on launch" used to eagerly load 26 GB must stop
+        // doing that on the next launch. That is the whole point of the change.
+        self.loadModelAtStart = UserDefaults.standard.bool(forKey: "loadModelAtStart")
+        self.startupModelMode = UserDefaults.standard.string(forKey: "startupModelMode")
+            .flatMap(StartupModelChoice.Mode.init(rawValue:)) ?? .default
+        self.startupModelPinnedPath = UserDefaults.standard.string(forKey: "startupModelPinnedPath") ?? ""
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated
@@ -616,15 +663,35 @@ class AppState: ObservableObject {
             }
         }
 
-        // Auto-start server if enabled and a model is available
-        if autoStartServer, !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, options: serverOptions)
+        // Auto-start. "Start the server" and "load a model" are two decisions
+        // (`StartupModelChoice.launch`): auto-start on its own brings the server
+        // up HEADLESS, and only Settings ▸ Server ▸ "Load a model at start" —
+        // default OFF — makes launch pay for a checkpoint. `refreshModels()`
+        // above is what makes the installed-library check below meaningful.
+        let launchPlan = StartupModelChoice.launch(
+            autoStart: autoStartServer,
+            loadModelAtStart: loadModelAtStart,
+            mode: startupModelMode,
+            pinnedPath: startupModelPinnedPath,
+            lastUsed: StartupModelChoice.lastUsed(),
+            installedPaths: localModels.filter(\.isChatPickable).map(\.path)
+        )
+        switch launchPlan {
+        case .doNothing:
+            break
+        case .headless:
+            server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        case .load(let path):
+            server.start(modelPath: path, options: serverOptions)
         }
         // LAN sharing/discovery lives in the server process — with either
         // enabled the server should be up (headless when nothing was
-        // auto-started) so this Mac shares and sees network models.
+        // auto-started) so this Mac shares and sees network models. It loads
+        // what the launch plan asked for and nothing else: passing the
+        // selection here would reinstate the eager login load for anyone whose
+        // auto-start is off and whose LAN sharing is on.
         if serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled {
-            ensureServerForLan()
+            ensureServerForLan(modelPath: StartupModelChoice.lanStartPath(plan: launchPlan))
         }
 
         // Fallback health detection — runs detached to avoid blocking MainActor
@@ -655,12 +722,54 @@ class AppState: ObservableObject {
     /// Start the server for LAN duty if it isn't running: with the selected
     /// local model when there is one (it keeps serving chat AND the LAN),
     /// else headless over the models root.
-    func ensureServerForLan() {
+    ///
+    /// `modelPath` overrides what goes resident, and an EMPTY override means
+    /// headless. Only launch passes one — it has already decided whether this
+    /// login pays for a checkpoint (`StartupModelChoice.lanStartPath`). Every
+    /// other caller is a user who just asked for a server to talk to, so the
+    /// default keeps loading the selection.
+    func ensureServerForLan(modelPath: String? = nil) {
         guard server.status != .running, server.status != .starting else { return }
-        if !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, options: serverOptions)
+        let path = modelPath ?? selectedModelPath
+        if !path.isEmpty {
+            server.start(modelPath: path, options: serverOptions)
         } else {
             server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        }
+    }
+
+    /// Every Start BUTTON in the app: bring the server up, and put the
+    /// selection resident WITHOUT making it the launch default.
+    ///
+    /// `--model` is now only ever passed by an auto-start the user configured.
+    /// A button start is always headless plus, when it should load, a hot-load
+    /// through the registry — so ejecting a model always sticks, which a
+    /// `--model` entry cannot do (it is the registry's DEFAULT and comes back
+    /// on the next request). The chat window's Start always loads: you are
+    /// looking at a dead composer and about to type. The tray's asks
+    /// `loadModelAtStart`, the same setting the auto-start gate asks.
+    ///
+    /// The load is kicked HERE rather than left to the first turn because the
+    /// user just pressed a button and is owed a spinner: `loadingModelPath`
+    /// is what makes the pill name the model and spin while it loads. Same
+    /// generation guard as a hot-switch — a stale task must not clear a newer
+    /// switch's flag.
+    ///
+    /// Nothing local selected means the model answering is on another Mac, and
+    /// a headless server is all the proxy needs.
+    func startServer(loadingSelection: Bool) {
+        guard server.status != .running, server.status != .starting else { return }
+        server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        guard loadingSelection, !selectedModelPath.isEmpty else { return }
+        let path = selectedModelPath
+        let mgr = server
+        modelSwitchGeneration += 1
+        let generation = modelSwitchGeneration
+        loadingModelPath = path
+        pendingModelLoadTask = Task { @MainActor in
+            defer { if self.modelSwitchGeneration == generation { self.loadingModelPath = nil } }
+            try? await mgr.waitUntilRunning(timeout: 240)
+            await mgr.ensureDefaultChatModel(selectedModelPath: path)
         }
     }
 

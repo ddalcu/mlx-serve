@@ -360,7 +360,17 @@ struct StatusMenuView: View {
 
     /// The one state-driven action, plus the log window.
     private var serverControls: some View {
-        let control = ServerControlButtonPresentation(status: server.status)
+        // A hot-load leaves the server RUNNING while the checkpoint reads, so
+        // the tray — which has no per-model spinner of its own — would go
+        // straight to "Stop Server" and say nothing for the minute that
+        // follows. `loadingModelPath` is what the chat pill spins on; the
+        // button reports the same fact.
+        let control = ServerControlButtonPresentation(
+            status: server.status,
+            loadsModel: StartupModelChoice.trayStartLoadsModel(
+                loadModelAtStart: appState.loadModelAtStart,
+                selectedModelPath: appState.selectedModelPath),
+            isLoadingModel: appState.loadingModelPath != nil)
         return HStack(spacing: 6) {
             serverPrimaryButton(control)
 
@@ -378,7 +388,14 @@ struct StatusMenuView: View {
     @ViewBuilder
     private func serverPrimaryButton(_ control: ServerControlButtonPresentation) -> some View {
         let button = Button {
-            server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
+            if server.status == .running || server.status == .starting {
+                server.stop()
+            } else {
+                // Headless, then a hot-load if the setting asks — the same one
+                // path every Start button in the app takes. Nothing here
+                // launches with `--model`, so an eject always sticks.
+                appState.startServer(loadingSelection: appState.loadModelAtStart)
+            }
         } label: {
             HStack(spacing: 8) {
                 if control.showsProgress {
@@ -392,7 +409,6 @@ struct StatusMenuView: View {
             .frame(maxWidth: .infinity)
         }
         .tint(control.tint.color)
-        .disabled(appState.selectedModelPath.isEmpty)
         .controlSize(.regular)
         .help(control.help)
 
@@ -408,6 +424,10 @@ struct StatusMenuView: View {
             Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+                // Says what this checkbox does NOW: it starts a server, not a
+                // multi-gigabyte load. Whether a model comes with it moved to
+                // its own setting, so the tooltip names where it went.
+                .help("Start the server when the app launches. It comes up with no model resident — models load on demand. To load one at start instead, see Settings ▸ Server.")
             Spacer()
             // Which embedded engine the selected model routes to (MLX
             // safetensors, llama.cpp GGUF, or ds4 GGUF).
@@ -866,14 +886,30 @@ struct ServerControlButtonPresentation: Equatable {
     /// than a full-width slab that dominates the state the app lives in.
     let isProminent: Bool
 
-    init(status: ServerStatus) {
-        switch status {
-        case .starting:
+    /// `loadsModel` is what THIS start does, not what the app can do: a
+    /// headless start is up in a second and puts nothing resident, so calling
+    /// it "Loading Model..." describes work that is not happening.
+    init(status: ServerStatus, loadsModel: Bool = true, isLoadingModel: Bool = false) {
+        // A model reading into memory outranks "running": the server is up, but
+        // it cannot answer yet, and the button is the only thing in the tray
+        // that can say so. Clicking still stops the server, as it does for any
+        // start in progress.
+        if isLoadingModel, status == .running {
             title = "Loading Model..."
             systemImageName = nil
             showsProgress = true
             tint = .loading
-            help = "Loading model. Click to stop."
+            help = "Loading model. Click to stop the server."
+            isProminent = true
+            return
+        }
+        switch status {
+        case .starting:
+            title = loadsModel ? "Loading Model..." : "Starting Server..."
+            systemImageName = nil
+            showsProgress = true
+            tint = .loading
+            help = loadsModel ? "Loading model. Click to stop." : "Starting the server. Click to stop."
             isProminent = true
         case .running:
             title = "Stop Server"
@@ -887,7 +923,9 @@ struct ServerControlButtonPresentation: Equatable {
             systemImageName = "play.fill"
             showsProgress = false
             tint = .accent
-            help = "Start the selected model."
+            help = loadsModel
+                ? "Start the server and load the selected model."
+                : "Start the server with no model resident — it loads one on demand at your first message. Settings ▸ Server ▸ \"Load a model at start\" changes this."
             isProminent = true
         }
     }
