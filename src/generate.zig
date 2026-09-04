@@ -9199,6 +9199,43 @@ pub fn computeEmbeddingsBatch(
     return results;
 }
 
+/// Compute ONE multimodal embedding (batch=1): B=1 unmasked [1, T] token ids
+/// carrying image placeholders; `vin.vision_emb` ([1, N_merged, hidden]) is
+/// spliced, the M-RoPE table drives interleaved 3-D positions, and DeepStack
+/// streams add at layers 0..n. Everything downstream of the trunk matches the
+/// text pipeline exactly — pool per the checkpoint's mode (VL-Embedding =
+/// last_token), dense head (n/a here), L2-normalize. `vin` fields are
+/// borrowed (owned by the caller for this call). Caller frees the row.
+pub fn computeEmbeddingsVision(
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    token_ids: []const u32,
+    vin: transformer_mod.Transformer.VisionEmbedInputs,
+) ![]f32 {
+    const shape = [_]c_int{ 1, @intCast(token_ids.len) };
+    const input = mlx.mlx_array_new_data(token_ids.ptr, &shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(input);
+
+    const hidden = try xfm.forwardEmbeddingVision(input, vin);
+    defer _ = mlx.mlx_array_free(hidden);
+
+    const lengths = [_]usize{token_ids.len};
+    const pooled = switch (xfm.config.effectivePooling()) {
+        .mean => try maskedMeanPool(allocator, hidden, &lengths, xfm.s),
+        .cls, .last_token => |m| try gatherTokenPool(allocator, hidden, &lengths, m, xfm.s),
+    };
+    defer _ = mlx.mlx_array_free(pooled);
+    const rows = if (xfm.hasEmbedProjection()) blk: {
+        const projected = try xfm.embedProjection(pooled);
+        defer _ = mlx.mlx_array_free(projected);
+        break :blk try l2NormalizeRows(allocator, projected, xfm.s);
+    } else try l2NormalizeRows(allocator, pooled, xfm.s);
+    defer allocator.free(rows);
+    const row = try allocator.alloc(f32, rows[0].len);
+    @memcpy(row, rows[0]);
+    return row;
+}
+
 const SampleResult = struct {
     token_id: u32,
     logprob_result: ?LogprobResult = null,

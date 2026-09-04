@@ -4432,6 +4432,65 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
 }
 
+test "expandImagePadTokens expands the pad run and appends bos" {
+    const a = testing.allocator;
+    // Chat-template shape: [system…, vision_start, pad, vision_end, text…];
+    // 2×2 merge over a 4×4 patch grid → 4 merged tokens replace the ONE pad.
+    const rendered = [_]u32{ 1, 2, 151665, 215404, 151666, 42 };
+    const out = try expandImagePadTokens(a, &rendered, 215404, 4, 151643);
+    defer a.free(out);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 151665, 215404, 215404, 215404, 215404, 151666, 42, 151643 }, out);
+
+    // No bos configured → no trailing token.
+    const no_bos = try expandImagePadTokens(a, &.{ 7, 215404, 8 }, 215404, 2, null);
+    defer a.free(no_bos);
+    try testing.expectEqualSlices(u32, &.{ 7, 215404, 215404, 8 }, no_bos);
+
+    // A template that rendered NO pad is an error, not a silent pass-through.
+    try testing.expectError(error.NoImagePad, expandImagePadTokens(a, &.{ 1, 2, 3 }, 215404, 4, null));
+}
+
+test "ParsedEmbeddingInput.parse: content parts, chat wrapper and rejection" {
+    const a = testing.allocator;
+
+    // OpenAI shape: text + image_url parts join into one Part.
+    var parsed_val = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]
+    , .{});
+    defer parsed_val.deinit();
+    var p1 = try ParsedEmbeddingInput.parse(a, parsed_val.value, "test");
+    defer p1.deinit();
+    try testing.expectEqual(@as(usize, 1), p1.items.len);
+    try testing.expectEqualStrings("hello", p1.items[0].text);
+    try testing.expectEqual(@as(usize, 1), p1.items[0].images.len);
+    try testing.expectEqualStrings("data:image/png;base64,AAAA", p1.items[0].images[0]);
+    try testing.expectEqualSlices(usize, &.{5}, p1.items[0].token_counts);
+
+    // Chat shape: [ {content: [parts]} ] unwraps the content array.
+    var chat_val = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]
+    , .{});
+    defer chat_val.deinit();
+    var p2 = try ParsedEmbeddingInput.parse(a, chat_val.value, "test");
+    defer p2.deinit();
+    try testing.expectEqualStrings("a\nb", p2.items[0].text);
+    try testing.expectEqual(@as(usize, 0), p2.items[0].images.len);
+    try testing.expectEqualSlices(usize, &.{ 1, 1 }, p2.items[0].token_counts);
+
+    // Bare string elements are text.
+    var bare_val = try std.json.parseFromSlice(std.json.Value, a, "\"just a string\"", .{});
+    defer bare_val.deinit();
+    // (a bare string is NOT an array — parse must reject it)
+    try testing.expectError(error.InvalidInput, ParsedEmbeddingInput.parse(a, bare_val.value, "test"));
+
+    // Unknown part type → InvalidInput.
+    var bad_val = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"audio","data":"x"}]
+    , .{});
+    defer bad_val.deinit();
+    try testing.expectError(error.InvalidInput, ParsedEmbeddingInput.parse(a, bad_val.value, "test"));
+}
+
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -4477,6 +4536,44 @@ fn handleEmbeddings(
         break :blk @intCast(v.integer);
     } else null;
 
+    // ── Multimodal pre-scan (Qwen3-VL-Embedding class) ─────────────────────────
+    // An OpenAI-style content-parts array — [{type:"text"...},{type:"image_url"
+    // ...}] — or any input item carrying an image routes the WHOLE request to
+    // the vision path: vision-tower encode (DeepStack streams) + pad-spliced
+    // tokens + interleaved M-RoPE + DeepStack injection. The pure-text batch
+    // machinery below cannot express any of that, so mm requests are fixed
+    // batch=1 and this scan never sees them again.
+    {
+        var has_image = false;
+        switch (input_val) {
+            .array => |arr| for (arr.items) |item| {
+                switch (item) {
+                    // [{type:"text"...},{type:"image_url"...}] parts directly.
+                    .array => |sub| {
+                        if (inputItemHasImage(sub)) has_image = true;
+                    },
+                    // A single {content:[...parts...]} wrapper (chat shape),
+                    // or (defensively) a bare {type:"image_url"} element.
+                    .object => |obj| {
+                        if (obj.get("content")) |c| {
+                            if (c == .array and inputItemHasImage(c.array)) has_image = true;
+                        }
+                        if (obj.get("type")) |t| {
+                            if (t == .string and std.mem.eql(u8, t.string, "image_url")) has_image = true;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+        if (has_image) {
+            try handleMultimodalEmbedding(allocator, stream, input_val, lm, model_name, req_dims);
+            return;
+        }
+    }
+
+
     // Collect input texts
     var texts = std.ArrayList([]const u8).empty;
     defer texts.deinit(allocator);
@@ -4520,34 +4617,92 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
-        const raw_ids = try tok.encode(allocator, text);
-        // Bidirectional embedding models (EmbeddingGemma) declare
-        // add_bos_token + add_eos_token; the SentencePiece encode path adds
-        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
-        const ids = if (config.use_bidirectional_attention) blk: {
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
+        // Models whose REFERENCE pipeline renders a chat template for
+        // embeddings (e.g. Qwen3-VL-Embedding via mlx-embeddings' Processor)
+        // produce reference embeddings through the FULL chat-template path:
+        // system prompt + user text + add_generation_prompt, then the
+        // tokenizer's TemplateProcessing post-processor appends <EOS>
+        // (151643). Zig's tokenizer has no post-processor, so we render the
+        // template via formatChat and manually append bos_token_id (which is
+        // <EOS> for Qwen3-VL) to match the reference's token sequence exactly.
+        //
+        // Gated on the model family, NOT on template availability alone:
+        // mlx-embeddings only routes models to its chat pipeline by
+        // model_type (qwen3_vl), and text-only Qwen3-Embedding checkpoints
+        // embed via RAW tokenization there. Broad gating would also ensnare
+        // generative checkpoints that merely SHIP a chat_template.jinja
+        // (e.g. WeMM-Embedding's Qwen3.5 trunk), rendering its generation
+        // template — assistant prompt + think block — into an embedding
+        // request. useChatTemplateEmbeddings() keeps those on the raw path.
+        const ids = if (lm.chat_config != null and config.useChatTemplateEmbeddings()) blk: {
+            const cc = lm.chat_config.?;
+            if (cc.chat_template.len == 0) break :blk null;
+
+            // Construct messages: [{role: "user", content: text}].
+            // The Jinja template will auto-insert default_system_message
+            // when no system message is present — matching mlx-embeddings'
+            // format_embedding_input behavior.
+            const msgs = [_]chat_mod.Message{
+                .{ .role = "user", .content = text },
+            };
+            const rendered_ids = chat_mod.formatChat(
                 allocator,
-                raw_ids,
-                config.bos_token_id,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else if (config.effectivePooling() == .last_token) blk: {
-            // Last-token pooling models pool an APPENDED terminator: the
-            // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
-            // adds <|endoftext|> (the config's eos_token_id) to every encode,
-            // and the reference pools THAT position — without it, we'd pool
-            // the final text token and quietly diverge from the model card.
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                null,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else raw_ids;
-        total_tokens += ids.len;
-        try seqs.append(allocator, ids);
+                tok,
+                &msgs,
+                cc,
+                null, // tools_json
+                null, // tool_choice_instruction
+                false, // enable_thinking
+                null, // effort
+                false, // continue_final
+            ) catch break :blk null;
+            defer allocator.free(rendered_ids);
+
+            // Append bos_token_id (<EOS> = 151643 for Qwen3-VL) to emulate
+            // the tokenizer's TemplateProcessing post-processor that Python's
+            // apply_chat_template(tokenize=True) runs automatically.
+            const bos_id = config.bos_token_id orelse {
+                break :blk try allocator.dupe(u32, rendered_ids);
+            };
+            const combined = try allocator.alloc(u32, rendered_ids.len + 1);
+            @memcpy(combined[0..rendered_ids.len], rendered_ids);
+            combined[rendered_ids.len] = bos_id;
+            break :blk combined;
+        } else null;
+
+        const final_ids = if (ids) |chat_ids| chat_ids else blk2: {
+            // Fall back to raw tokenization for models without chat templates.
+            const raw_ids = try tok.encode(allocator, text);
+            // raw_ids ownership: wrapEncoderIds arms free it inside their
+            // blocks; the else arm hands the slice to `seqs` (freed by the
+            // seqs cleanup defer). A block-level defer here would double-free
+            // the else arm (caught by PR review).
+            break :blk2 if (config.use_bidirectional_attention) blk3: {
+                break :blk3 try wrapEncoderIds(
+                    allocator,
+                    raw_ids,
+                    config.bos_token_id,
+                    if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+                );
+            } else if (config.effectivePooling() == .last_token) blk3: {
+                // Last-token pooling without a chat template: append the
+                // model's EOS token so pooling picks up the terminator
+                // position, matching the reference implementation's behavior.
+                defer allocator.free(raw_ids);
+                break :blk3 try wrapEncoderIds(
+                    allocator,
+                    raw_ids,
+                    null,
+                    if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+                );
+            } else blk3: {
+                // mean pooling / generative fallback: hand raw_ids to seqs
+                // (freed by the seqs cleanup defer); no wrap.
+                break :blk3 raw_ids;
+            };
+        };
+        total_tokens += final_ids.len;
+        try seqs.append(allocator, final_ids);
     }
 
     // Issue #117: enforce the effective per-input token ceiling BEFORE the
@@ -4651,6 +4806,498 @@ fn handleEmbeddings(
 
     try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
     log.info("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
+}
+
+/// Emit the OpenAI embeddings response for `rows` (one vector per input) and
+/// log it. Shared tail of handleEmbeddings (text batch) and
+/// handleMultimodalEmbedding (single mm input): response shape, `dimensions`
+/// truncation and usage accounting are identical for both.
+fn sendEmbeddingsResponse(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    rows: []const []f32,
+    model_name: []const u8,
+    total_tokens: usize,
+    req_dims: ?usize,
+) !void {
+    var resp_buf = std.ArrayList(u8).empty;
+    defer resp_buf.deinit(allocator);
+
+    try resp_buf.appendSlice(allocator, "{\"object\":\"list\",\"data\":[");
+
+    if (req_dims) |d| {
+        const native = if (rows.len > 0) rows[0].len else 0;
+        if (d > native) {
+            const msg = try std.fmt.allocPrint(allocator, "'dimensions' must be between 1 and {d} for this model", .{native});
+            defer allocator.free(msg);
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
+            return;
+        }
+    }
+
+    for (rows, 0..) |full_embedding, idx| {
+        const embedding = if (req_dims) |d| truncateEmbeddingDims(full_embedding, d) else full_embedding;
+        if (idx > 0) try resp_buf.appendSlice(allocator, ",");
+
+        // Format: {"object":"embedding","embedding":[...floats...],"index":N}
+        const idx_str = try std.fmt.allocPrint(allocator, "{d}", .{idx});
+        defer allocator.free(idx_str);
+        try resp_buf.appendSlice(allocator, "{\"object\":\"embedding\",\"embedding\":[");
+
+        for (embedding, 0..) |val, i| {
+            if (i > 0) try resp_buf.appendSlice(allocator, ",");
+            var buf: [32]u8 = undefined;
+            const float_str = std.fmt.bufPrint(&buf, "{d:.8}", .{val}) catch "0";
+            try resp_buf.appendSlice(allocator, float_str);
+        }
+
+        try resp_buf.appendSlice(allocator, "],\"index\":");
+        try resp_buf.appendSlice(allocator, idx_str);
+        try resp_buf.appendSlice(allocator, "}");
+    }
+
+    const total_str = try std.fmt.allocPrint(allocator, "{d}", .{total_tokens});
+    defer allocator.free(total_str);
+    const model_escaped = try jsonEscape(allocator, model_name);
+    defer allocator.free(model_escaped);
+
+    try resp_buf.appendSlice(allocator, "],\"model\":");
+    try resp_buf.appendSlice(allocator, model_escaped);
+    try resp_buf.appendSlice(allocator, ",\"usage\":{\"prompt_tokens\":");
+    try resp_buf.appendSlice(allocator, total_str);
+    try resp_buf.appendSlice(allocator, ",\"total_tokens\":");
+    try resp_buf.appendSlice(allocator, total_str);
+    try resp_buf.appendSlice(allocator, "}}");
+
+    try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
+    log.info("  <- {d} embeddings ({d} tokens)\n", .{ rows.len, total_tokens });
+}
+
+/// Expand the ONE `<|image_pad|>` the chat template rendered into the
+/// image's merged patch-token count (`n_merged` copies of `pad_id`), then
+/// append the trailing bos (`TemplateProcessing` post-processor emulation,
+/// identical to the text path). Caller owns the returned slice.
+/// `error.NoImagePad` — the template rendered no pad token at all (a text
+/// shape that must be rejected, not silently passed through).
+fn expandImagePadTokens(
+    allocator: std.mem.Allocator,
+    rendered_ids: []const u32,
+    pad_id: u32,
+    n_merged: usize,
+    bos: ?u32,
+) error{ NoImagePad, OutOfMemory }![]u32 {
+    std.debug.assert(pad_id != 0);
+    var ids_list = std.ArrayList(u32).empty;
+    errdefer ids_list.deinit(allocator);
+    var saw_pad = false;
+    for (rendered_ids) |id| {
+        if (id == pad_id) {
+            saw_pad = true;
+            try ids_list.appendNTimes(allocator, pad_id, n_merged);
+        } else {
+            try ids_list.append(allocator, id);
+        }
+    }
+    if (!saw_pad) return error.NoImagePad;
+    if (bos) |b| try ids_list.append(allocator, b);
+    return ids_list.toOwnedSlice(allocator);
+}
+
+/// ── Multimodal embeddings (Qwen3-VL-Embedding class, fixed batch=1) ────────
+///
+/// Serves one image+text (or text-only) input routed here by handleEmbeddings'
+/// pre-scan. Pipeline on the conn thread:
+///   1. Decode the data-URL image into merge-order pixel_values (CPU only).
+///   2. Render the chat template over [system-default, user(<vision_start> pads
+///      <vision_end> + text)] WITHOUT the pads actually present (formatChat
+///      emits ONE pad token per `<|image_pad|>`), expand to the image's merged
+///      token count, then append bos (<EOS>) — byte-exact vs the Python
+///      fixture's 222-token sequence.
+///   3. Vision tower: scheduler `encodeVisionDeepstack` returns merged
+///      [1, N_merged, hidden] + per-depth DeepStack streams.
+///   4. `computeQwenMrope` over the FINAL ids builds the flat interleaved
+///      position table from the same FINAL sequence getRopeIndex scans.
+///   5. `EmbedRequest{vision_emb, mrope_pos_alloc, deepstack_alloc}` rides the
+///      scheduler to `computeEmbeddingsVision` (splice + M-RoPE + DeepStack
+///      injection + last-token pool + Dense head + L2).
+///
+/// OWNERSHIP (load-bearing): `encodeVisionDeepstack` returns a heap
+/// VisionTowerOutput the caller must dispose of. Its arrays are MOVED into the
+/// EmbedRequest (which hands them to runEmbedRequest's defer), so the tower
+/// struct itself is only `destroy`ed here — NEVER `deinit`ed — after the
+/// scheduler call returns, or the arrays would double-free.
+fn handleMultimodalEmbedding(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    input_val: std.json.Value,
+    lm: *LoadedModel,
+    model_name: []const u8,
+    req_dims: ?usize,
+) !void {
+    const tok = lm.tokenizer.?;
+    const config = lm.config.?;
+
+    // Requires the chat-template embedding path (mlx-embeddings routes only
+    // the qwen3_vl family there) and a patch-grid Qwen tower.
+    if (!(config.useChatTemplateEmbeddings() and config.qwen_vision)) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings are not supported for this model", null);
+        return;
+    }
+    const cc = lm.chat_config orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings require a chat template", null);
+        return;
+    };
+    if (cc.chat_template.len == 0) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings require a chat template", null);
+        return;
+    }
+    // The deepstack trunk path has no offline fallback: without a scheduler
+    // there is no inference thread to run the encode + forward on.
+    const sch = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings require the scheduler (serve mode)", null);
+        return;
+    };
+    const vp = visionPreprocFromConfig(config);
+    if (vp.mode != .qwen) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings require a Qwen3-VL vision tower", null);
+        return;
+    }
+
+    // Parse the image+text content parts. Exactly ONE group of inputs.
+    var parts = ParsedEmbeddingInput.parse(allocator, input_val, "input[0]") catch |err| switch (err) {
+        error.InvalidInput => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal 'input' must be one content-parts array (or an array containing exactly one)", null);
+            return;
+        },
+        else => return err,
+    };
+    defer parts.deinit();
+    if (parts.items.len != 1) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings accept exactly one input per request", null);
+        return;
+    }
+    const first = parts.items[0];
+    if (first.images.len > 1) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings accept at most one image per input", null);
+        return;
+    }
+
+    const text = first.text;
+    const total_tokens: usize = blk: {
+        var t: usize = 0;
+        for (first.token_counts) |c| t += c;
+        break :blk t;
+    };
+    _ = total_tokens;
+
+    // ── 1. Image decode (conn thread, CPU) ──
+    var img_opt: ?chat_mod.ImageData = null;
+    if (first.images.len == 1) {
+        const url = first.images[0];
+        const img = parseImageUrlContent(allocator, url, vp) orelse {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to decode image (expected a data:image/*;base64,... URL)", null);
+            return;
+        };
+        if (img.grid_h == 0 or img.grid_w == 0) {
+            allocator.free(img.pixels);
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Image did not decode to a patch grid", null);
+            return;
+        }
+        img_opt = img;
+    }
+    defer if (img_opt) |im| allocator.free(im.pixels);
+
+    // ── 2. Tokens: chat template over vision_start + ONE pad + vision_end +
+    // text, expand the pad to the merged count, append bos (<EOS>) ──
+    const img = img_opt orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Multimodal embeddings require an image", null);
+        return;
+    };
+    const merge: u32 = if (vp.merge > 0) vp.merge else 2;
+    const n_merged: usize = @as(usize, img.grid_h / merge) * (img.grid_w / merge);
+
+    // Text content is "<|vision_start|><|image_pad|><|vision_end|>" + user
+    // text; formatChat then renders [default-system, user] exactly like the
+    // text path above (mlx-embeddings' format_embedding_input shape).
+    var content_buf = std.ArrayList(u8).empty;
+    defer content_buf.deinit(allocator);
+    try content_buf.appendSlice(allocator, "<|vision_start|><|image_pad|><|vision_end|>");
+    try content_buf.appendSlice(allocator, text);
+
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = content_buf.items },
+    };
+    const rendered_ids = chat_mod.formatChat(
+        allocator,
+        tok,
+        &msgs,
+        cc,
+        null,
+        null,
+        false,
+        null,
+        false,
+    ) catch {
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to render chat template", null);
+        return;
+    };
+    defer allocator.free(rendered_ids);
+
+    // Expand the single <|image_pad|> the template rendered into the merged
+    // patch-token count (the engine's single-pass tokenizer cannot express a
+    // data-dependent token run).
+    const pad_id = config.image_token_id;
+    if (pad_id == 0) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model has no image_token_id", null);
+        return;
+    }
+    const expanded = expandImagePadTokens(allocator, rendered_ids, pad_id, n_merged, config.bos_token_id) catch |err| switch (err) {
+        error.NoImagePad => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Chat template did not render an image_pad token", null);
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(expanded);
+    const final_ids = expanded;
+
+    const seqs = [_][]const u32{final_ids};
+
+    // ── 3. Vision tower (inference thread): merged + DeepStack streams ──
+    const tower_out: ?*qwen_vision.VisionTowerOutput = if (first.images.len == 1) tower_blk: {
+        const im = img_opt.?;
+        const pix = [_]scheduler_mod.VisionImagePixels{.{
+            .pixels = im.pixels,
+            .width = im.width,
+            .height = im.height,
+            .grid_h = im.grid_h,
+            .grid_w = im.grid_w,
+        }};
+        var vreq = scheduler_mod.VisionEncodeRequest{
+            .model = lm,
+            .images = &pix,
+            .want_deepstack = true,
+            .allocator = allocator,
+        };
+        const tower = sch.encodeVisionDeepstack(&vreq) catch |err| {
+            if (vreq.error_name) |e| {
+                log.err("  mm embedding: vision encode failed: {s}\n", .{e});
+                allocator.free(e);
+            } else {
+                log.err("  mm embedding: vision encode failed: {}\n", .{err});
+            }
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to encode image", null);
+            return;
+        };
+        break :tower_blk tower;
+    } else null;
+
+    // ── 4. M-RoPE table over the FINAL ids (conn thread, CPU) ──
+    var media_msg = chat_mod.Message{
+        .role = "user",
+        .content = content_buf.items,
+        .images = &[_]chat_mod.ImageData{img},
+    };
+    const md = computeQwenMrope(allocator, final_ids, &media_msg, config) catch {
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute M-RoPE positions", null);
+        // Error path: arrays have NOT moved yet — deinit frees merged +
+        // deepstack streams (caught by PR review: plain destroy leaked them).
+        if (tower_out) |t| {
+            t.deinit();
+            allocator.destroy(t);
+        }
+        return;
+    };
+
+    // ── 5. Embed (inference thread) ──
+    // Ownership: tower arrays MOVE into the request; mrope_pos is recast
+    // const→mutable (computeQwenMrope heap-allocated it with `allocator`,
+    // and runEmbedRequest frees it with the same allocator). The tower
+    // struct is destroyed WITHOUT deinit once the scheduler call returns —
+    // runEmbedRequest's defer now owns the arrays.
+    const mrope_pos_alloc: ?[]i32 = if (md.pos) |p| @constCast(p) else null;
+    var deepstack_alloc: ?[]mlx.mlx_array = null;
+    if (tower_out) |t| {
+        if (t.deepstack_count > 0) {
+            deepstack_alloc = allocator.dupe(mlx.mlx_array, t.deepstack[0..t.deepstack_count]) catch {
+                // Error path: arrays have NOT moved yet — free everything.
+                // mrope_pos_alloc was cast from md.pos but ownership has not
+                // transferred yet (runEmbedRequest never saw the request).
+                if (mrope_pos_alloc) |p| allocator.free(p);
+                t.deinit();
+                allocator.destroy(t);
+                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Out of memory assembling multimodal embedding request", null);
+                return;
+            };
+        }
+    }
+    defer {
+        //tower arrays moved into req (freed by runEmbedRequest's defer)
+        if (tower_out) |t| allocator.destroy(t);
+    }
+
+    var req = scheduler_mod.EmbedRequest{
+        .model = lm,
+        .token_seqs = &seqs,
+        .vision_emb = if (tower_out) |t| t.merged else null,
+        .mrope_pos_alloc = mrope_pos_alloc,
+        .mrope_total = md.total,
+        .mrope_delta = md.delta,
+        .deepstack_alloc = deepstack_alloc,
+        .allocator = allocator,
+    };
+    const embeddings = sch.computeEmbeddings(&req) catch |err| {
+        if (req.error_name) |e| {
+            log.err("  mm embedding error: {s}\n", .{e});
+            allocator.free(e);
+        } else {
+            log.err("  mm embedding error: {}\n", .{err});
+        }
+        // Ownership: `error.EmbedFailed` means the inference thread RAN the
+        // request — its own cleanup (resetCache-failure arm + the mm defer on
+        // every exit) has freed or will free the mm buffers, and
+        // finishEmbedRequest has already woken us, so touching them here
+        // races and double-frees (caught by PR review round 2). Only an
+        // ENQUEUE failure leaves the request unseen by the inference thread;
+        // in that case the buffers are still ours.
+        if (err != error.EmbedFailed) {
+            if (req.vision_emb) |ve| _ = mlx.mlx_array_free(ve);
+            if (req.mrope_pos_alloc) |p| allocator.free(p);
+            if (req.deepstack_alloc) |d| {
+                for (d) |a| _ = mlx.mlx_array_free(a);
+                allocator.free(d);
+            }
+        }
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
+        return;
+    };
+    defer {
+        for (embeddings) |e| allocator.free(e);
+        allocator.free(embeddings);
+    }
+
+    try sendEmbeddingsResponse(allocator, stream, embeddings, model_name, final_ids.len, req_dims);
+    log.info("  mm embedding: {d} tokens, image {d}x{d} grid, {d} merged tokens\n", .{ final_ids.len, img.grid_h, img.grid_w, n_merged });
+}
+
+/// One multimodal embedding input, extracted from an OpenAI-style content
+/// parts array. Either `[{type:"text",text:...},{type:"image_url",...}]`
+/// directly, or nested inside a single `{content: [...]}` wrapper (chat shape).
+/// String elements inside the parts array join the text with newlines;
+/// non-data-URL image parts are collected anyway and rejected later by
+/// parseImageUrlContent with a precise 400.
+const ParsedEmbeddingInput = struct {
+    const Part = struct {
+        text: []const u8,
+        images: []const []const u8,
+        /// Token counts of every text piece joined (usage accounting).
+        token_counts: []const usize,
+    };
+    items: []Part,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ParsedEmbeddingInput) void {
+        for (self.items) |p| {
+            self.allocator.free(p.text);
+            self.allocator.free(p.images);
+            self.allocator.free(p.token_counts);
+        }
+        self.allocator.free(self.items);
+    }
+
+    const ParseError = error{ InvalidInput, OutOfMemory };
+
+    fn parse(allocator: std.mem.Allocator, input_val: std.json.Value, name: []const u8) ParseError!ParsedEmbeddingInput {
+        // Accept a bare content-parts array, or [ {content: [...parts...]} ].
+        var arr = switch (input_val) {
+            .array => |a| a,
+            else => return error.InvalidInput,
+        };
+        if (arr.items.len == 1 and arr.items[0] == .object) {
+            if (arr.items[0].object.get("content")) |c| {
+                if (c == .array) arr = c.array;
+            }
+        }
+
+        var text = std.ArrayList(u8).empty;
+        errdefer text.deinit(allocator);
+        var images = std.ArrayList([]const u8).empty;
+        errdefer images.deinit(allocator);
+        var counts = std.ArrayList(usize).empty;
+        errdefer counts.deinit(allocator);
+
+        var n_text_parts: usize = 0;
+        for (arr.items) |item| {
+            switch (item) {
+                .string => |s| {
+                    if (n_text_parts > 0) try text.append(allocator, '\n');
+                    try text.appendSlice(allocator, s);
+                    try counts.append(allocator, s.len);
+                    n_text_parts += 1;
+                },
+                .object => |obj| {
+                    const ty = obj.get("type") orelse return error.InvalidInput;
+                    if (ty != .string) return error.InvalidInput;
+                    if (std.mem.eql(u8, ty.string, "text")) {
+                        const t = obj.get("text") orelse return error.InvalidInput;
+                        if (t != .string) return error.InvalidInput;
+                        if (n_text_parts > 0) try text.append(allocator, '\n');
+                        try text.appendSlice(allocator, t.string);
+                        try counts.append(allocator, t.string.len);
+                        n_text_parts += 1;
+                    } else if (std.mem.eql(u8, ty.string, "image_url")) {
+                        const iu = obj.get("image_url") orelse return error.InvalidInput;
+                        const url: []const u8 = switch (iu) {
+                            .string => |s| s,
+                            .object => |o2| blk: {
+                                const u = o2.get("url") orelse return error.InvalidInput;
+                                if (u != .string) return error.InvalidInput;
+                                break :blk u.string;
+                            },
+                            else => return error.InvalidInput,
+                        };
+                        try images.append(allocator, url);
+                    } else {
+                        return error.InvalidInput;
+                    }
+                },
+                else => return error.InvalidInput,
+            }
+        }
+
+        var items = try allocator.alloc(Part, 1);
+        errdefer allocator.free(items);
+        items[0] = .{
+            .text = try text.toOwnedSlice(allocator),
+            .images = try images.toOwnedSlice(allocator),
+            .token_counts = try counts.toOwnedSlice(allocator),
+        };
+        _ = name;
+        return .{ .items = items, .allocator = allocator };
+    }
+};
+
+/// Does this JSON value (an input array element) contain an image_url content
+/// part? Content parts may nest inside a `content` field (OpenAI chat shape)
+/// or sit at the element's top level. A bare string is never an image.
+fn inputItemHasImage(item: std.json.Array) bool {
+    // Direct content-parts array.
+    for (item.items) |part| {
+        if (part == .object) {
+            if (part.object.get("type")) |t| {
+                if (t == .string and std.mem.eql(u8, t.string, "image_url")) return true;
+            }
+        }
+    }
+    // {role/content} wrapper: parts live under "content".
+    for (item.items) |wrapper| {
+        if (wrapper == .object) {
+            if (wrapper.object.get("content")) |c| {
+                if (c == .array and inputItemHasImage(c.array)) return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// OpenAI `dimensions` semantics (text-embedding-3 class): keep the first

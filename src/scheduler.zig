@@ -43,6 +43,7 @@ const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
+const qwen_vision_mod = @import("qwen_vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("metrics.zig");
@@ -922,6 +923,13 @@ pub const VisionEncodeRequest = struct {
     /// axis (matches the prompt's image/video/audio block insertion order).
     /// Ownership transfers to the caller.
     result: ?mlx.mlx_array = null,
+    /// Output: when `want_deepstack` is set, the full tower output (merged
+    /// + DeepStack streams) lands here instead of `result`. Transfers to the
+    /// caller — free via `VisionTowerOutput.deinit`.
+    tower: ?*qwen_vision_mod.VisionTowerOutput = null,
+    /// Ask `runVisionEncode` to capture the DeepStack streams (Qwen3-VL
+    /// embedding checkpoints). Batch of images must be exactly 1.
+    want_deepstack: bool = false,
     /// Output: number of vision / video / audio soft tokens in `result` (in
     /// that order). The caller inserts exactly this many image / video / audio
     /// placeholders.
@@ -944,12 +952,30 @@ pub const VisionEncodeRequest = struct {
 /// padded, key-masked GPU forward per EMBED_MAX_BATCH chunk — and writes
 /// the float vectors into `results` (caller frees). Mirrors the
 /// VisionEncodeRequest pattern.
+///
+/// Multimodal embedding (Qwen3-VL-Embedding class, fixed batch=1): when
+/// `vision_emb` is set the inference thread routes the single sequence
+/// through `generate.computeEmbeddingsVision` instead — splice + interleaved
+/// M-RoPE + DeepStack streams. OWNERSHIP: the conn thread allocates every
+/// mlx handle below (vision_emb, mrope_pos table, deepstack streams) and
+/// `runEmbedRequest` frees them after the forward — in both the success and
+/// the error path (the conn thread only reads results/error_name).
 pub const EmbedRequest = struct {
     /// Plan 05 Phase D: target model whose `transformer` services this
     /// request. The conn thread holds a refcount for the duration.
     model: *model_registry_mod.LoadedModel,
     /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
     token_seqs: []const []const u32,
+    /// Multimodal inputs. Null (default) = plain text batch.
+    vision_emb: ?mlx.mlx_array = null,
+    /// Flat [3 × mrope_total] i32 positions (axis-major t/h/w); allocated
+    /// with `allocator` — freed here when non-null.
+    mrope_pos_alloc: ?[]i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
+    /// DeepStack streams [N_merged, out_hidden] each (layers 0..n);
+    /// allocated with `allocator` — freed here.
+    deepstack_alloc: ?[]mlx.mlx_array = null,
     /// Output: one pooled L2-normalized embedding per input on success.
     /// Rows + outer slice owned by `allocator`; caller frees.
     results: ?[][]f32 = null,
@@ -2006,6 +2032,28 @@ pub const Scheduler = struct {
         }
         if (req.error_name) |_| return error.VisionEncodeFailed;
         return req.result orelse error.VisionEncodeFailed;
+    }
+
+    /// Synchronously encode one image AND its DeepStack streams (Qwen3-VL
+    /// embedding checkpoints). Same lifecycle as `encodeVision`; on success
+    /// `req.tower` holds the tower output — the caller consumes `merged`
+    /// (and the deepstack streams) then frees via `VisionTowerOutput.deinit`.
+    pub fn encodeVisionDeepstack(self: *Scheduler, req: *VisionEncodeRequest) !*qwen_vision_mod.VisionTowerOutput {
+        self.queue_mu.lockUncancelable(self.io);
+        self.vision_queue.append(self.allocator, req) catch |err| {
+            self.queue_mu.unlock(self.io);
+            return err;
+        };
+        self.queue_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
+
+        req.done_mu.lockUncancelable(self.io);
+        defer req.done_mu.unlock(self.io);
+        while (!req.done) {
+            req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        }
+        if (req.error_name) |_| return error.VisionEncodeFailed;
+        return req.tower orelse error.VisionEncodeFailed;
     }
 
     /// Does this slot's next decode tick actually run the regular (non-speculative)
@@ -4139,6 +4187,36 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
+    // DeepStack capture: exactly one patch-grid image, no other media.
+    if (req.want_deepstack) {
+        if (req.images.len != 1 or req.videos.len != 0 or req.audio.len != 0 or req.images[0].grid_h == 0) {
+            finishVisionRequest(sch, req, "DeepstackNeedsOnePatchImage");
+            return;
+        }
+        const img = req.images[0];
+        const n: usize = @as(usize, img.grid_h) * img.grid_w;
+        const feat: usize = (img.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const tower = vision_enc.forwardPatchesDeepstack(pixel_arr, img.grid_h, img.grid_w) catch |err| {
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
+        const tower_ptr = req.allocator.create(qwen_vision_mod.VisionTowerOutput) catch |err| {
+            var t = tower;
+            t.deinit();
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
+        tower_ptr.* = tower;
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.tower = tower_ptr;
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
 
     // Encode all soft tokens into `emb_parts`: vision, then video, then audio,
     // so the single splice channel scatters them in the same order as the
@@ -4291,9 +4369,56 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
     xfm_ptr.resetCache() catch |err| {
+        // Error before the mm defer below is registered: the caller already
+        // handed over vision_emb / mrope_pos_alloc / deepstack_alloc, so they
+        // must be freed HERE or they leak (caught by PR review).
+        if (req.vision_emb) |ve| _ = mlx.mlx_array_free(ve);
+        if (req.mrope_pos_alloc) |p| req.allocator.free(p);
+        if (req.deepstack_alloc) |d| {
+            for (d) |a| _ = mlx.mlx_array_free(a);
+            req.allocator.free(d);
+        }
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
+    // Multimodal path (batch=1): the borrowed mlx handles live exactly for
+    // this forward; they are freed on EVERY exit below.
+    if (req.vision_emb) |ve| {
+        var ds: []const mlx.mlx_array = &.{};
+        if (req.deepstack_alloc) |d| ds = d;
+        const vin = transformer_mod.Transformer.VisionEmbedInputs{
+            .vision_emb = ve,
+            .mrope_pos = if (req.mrope_pos_alloc) |p| p else null,
+            .mrope_total = req.mrope_total,
+            .mrope_delta = req.mrope_delta,
+            .deepstack = ds,
+        };
+        defer {
+            _ = mlx.mlx_array_free(ve);
+            if (req.mrope_pos_alloc) |p| req.allocator.free(p);
+            if (req.deepstack_alloc) |d| {
+                for (d) |a| _ = mlx.mlx_array_free(a);
+                req.allocator.free(d);
+            }
+        }
+        const one = req.token_seqs[0];
+        const row = generate_mod.computeEmbeddingsVision(req.allocator, xfm_ptr, one, vin) catch |err| {
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+        const rows = req.allocator.alloc([]f32, 1) catch |err| {
+            req.allocator.free(row);
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+        rows[0] = row;
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.results = rows;
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
     const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
@@ -7007,6 +7132,293 @@ test "the ANE build resolves its chunk through effectivePrefillChunk, never the 
     const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
     const window_start = call_at -| 1200;
     try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
+}
+
+test "computeEmbeddings: enqueue failure leaves the request unseen (conn owns the mm buffers)" {
+    // OWNERSHIP CONTRACT (PR #351 review round 2): on enqueue failure the
+    // inference thread never sees the request, so the conn thread frees the
+    // multimodal buffers (`err != error.EmbedFailed` in handleMultimodalEmbedding).
+    // This test pins the scheduler side of that contract: an OOM at
+    // `embed_queue.append` surfaces as a NON-EmbedFailed error, and the
+    // request fields are untouched (no inference-thread ownership transfer).
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var reg = try ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const lm = try a.create(LoadedModel);
+    defer a.destroy(lm);
+    lm.* = .{
+        .allocator = a,
+        .id = @constCast("test-model"),
+        .path = @constCast("/nonexistent"),
+        .bytes_on_disk = 0,
+        .arch_hint = @constCast(""),
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .state = .ready,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .error_name = null,
+    };
+    // `id`/`path`/`arch_hint` are static string literals in this shell —
+    // nothing to free (only `error_name` is allocator-owned).
+    defer {
+        if (lm.error_name) |en| a.free(en);
+    }
+
+    // FailingAllocator drives the Scheduler's OWN allocator: computeEmbeddings
+    // appends with `self.allocator` (scheduler.zig:1989), so an OOM injected
+    // into the shell's allocator is the only way to make the enqueue fail.
+    // fail_index 0: the very first allocation — the embed_queue growth — fails.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    // Minimal scheduler shell: computeEmbeddings only touches allocator, io
+    // and embed_queue before the enqueue point.
+    var sch = Scheduler{
+        .allocator = failing.allocator(),
+        .io = io,
+        .registry = reg,
+        .current_model = null,
+        .xfm = null,
+        .weights = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .dflash = null,
+        .config = undefined,
+        .tok = undefined,
+        .chat_config = undefined,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .kv_quant_config = .dense,
+        .gguf_ctx_size = 0,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        .prefix_cache_mem_resolver = null,
+        .prefix_cache_disk_bytes = 0,
+        .ssm_checkpoint_stride = 0,
+        .ssm_checkpoint_max = 0,
+        .mtp_enabled = false,
+        .mtp_depth = 0,
+        .llama_cache_entries = 0,
+        .llama_kv_type_k = 0,
+        .llama_kv_type_v = 0,
+        .ds4_mtp = false,
+        .ds4_dspark = false,
+        .ds4_ssd_streaming = false,
+        .ane_prefill = false,
+        .ane_chunk_resolver = null,
+        .ane_headroom_resolver = null,
+        .no_drafter = true,
+        .drafter_dir = "",
+        .primary_model_dir = "",
+        .draft_block_size = 0,
+        .draft_block_size_explicit = false,
+        .hot_prefix_cache = null,
+        .max_concurrent = 1,
+        .force_batched = false,
+        .queue_mu = .init,
+        .queue_cond = .init,
+        .pending = std.ArrayList(*Slot).empty,
+        .decoding = std.ArrayList(*Slot).empty,
+        .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
+        .embed_queue = std.ArrayList(*EmbedRequest).empty,
+        .load_queue = std.ArrayList(*LoadRequest).empty,
+        .gen_queue = std.ArrayList(*GenRequest).empty,
+        .unload_queue = std.ArrayList(*UnloadRequest).empty,
+        .cleanup_queue = std.ArrayList(*Slot).empty,
+        .metrics = null,
+        .inflight_generated_tokens = std.atomic.Value(u64).init(0),
+        .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+        .requests_prefilling = std.atomic.Value(u64).init(0),
+        .in_flight = 0,
+        .queue_cap = 33,
+        .submit_cond = .init,
+        .session_cond = .init,
+        .inference_thread = null,
+        .shutdown = std.atomic.Value(bool).init(false),
+        .started = std.atomic.Value(bool).init(false),
+        .started_mu = .init,
+        .started_cond = .init,
+        .load_failed = std.atomic.Value(bool).init(false),
+        .load_error_name = null,
+    };
+    // deinit with the SAME allocator the queue grew with (the failing one)
+    // so the testing.allocator bookkeeping stays balanced.
+    defer sch.embed_queue.deinit(failing.allocator());
+
+    var token_row = [_]u32{1};
+    const seqs = [_][]const u32{&token_row};
+    var req = EmbedRequest{
+        .model = lm,
+        .token_seqs = &seqs,
+        // A fake non-null mm buffer handle, as the conn thread would have
+        // forged before posting. `mlx_array` is an extern struct, not an
+        // enum, so there is no @enumFromInt sentinel — we wrap the fake
+        // pointer directly. Nothing ever dereferences it.
+        .vision_emb = .{ .ctx = @ptrFromInt(0xdeadbeef) },
+        .mrope_pos_alloc = null,
+        .mrope_total = 1,
+        .mrope_delta = 0,
+        .deepstack_alloc = null,
+        .allocator = a,
+    };
+
+    // First allocation = queue growth → fails.
+    try testing.expectError(error.OutOfMemory, sch.computeEmbeddings(&req));
+    // Request is untouched: no results/error were produced by an inference
+    // thread, so nothing was freed here either — the mm buffer handle the
+    // conn thread "allocated" is still exactly where it left it.
+    try testing.expect(req.vision_emb != null);
+    try testing.expectEqual(@as(usize, 0xdeadbeef), @intFromPtr(req.vision_emb.?.ctx.?));
+    try testing.expect(req.results == null and req.error_name == null);
+    try testing.expect(!req.done);
+    // The queue must not have grown (the failed append left no entry).
+    try testing.expectEqual(@as(usize, 0), sch.embed_queue.items.len);
+}
+
+test "computeEmbeddings: done+error_name contract maps to error.EmbedFailed" {
+    // When the inference thread RAN the request (done=true, error_name set),
+    // computeEmbeddings MUST return error.EmbedFailed — the conn thread keys
+    // its "who frees the mm buffers" decision on exactly this error.
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var reg = try ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const lm = try a.create(LoadedModel);
+    defer a.destroy(lm);
+    lm.* = .{
+        .allocator = a,
+        .id = @constCast("test-model"),
+        .path = @constCast("/nonexistent"),
+        .bytes_on_disk = 0,
+        .arch_hint = @constCast(""),
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .dflash = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .state = .ready,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .error_name = null,
+    };
+    // `id`/`path`/`arch_hint` are static string literals in this shell —
+    // nothing to free (only `error_name` is allocator-owned).
+    defer {
+        if (lm.error_name) |en| a.free(en);
+    }
+
+    var sch = Scheduler{
+        .allocator = a,
+        .io = io,
+        .registry = reg,
+        .current_model = null,
+        .xfm = null,
+        .weights = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .config = undefined,
+        .tok = undefined,
+        .chat_config = undefined,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .kv_quant_config = .dense,
+        .gguf_ctx_size = 0,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        .prefix_cache_mem_resolver = null,
+        .prefix_cache_disk_bytes = 0,
+        .ssm_checkpoint_stride = 0,
+        .ssm_checkpoint_max = 0,
+        .mtp_enabled = false,
+        .mtp_depth = 0,
+        .llama_cache_entries = 0,
+        .llama_kv_type_k = 0,
+        .llama_kv_type_v = 0,
+        .ds4_mtp = false,
+        .ds4_dspark = false,
+        .ds4_ssd_streaming = false,
+        .ane_prefill = false,
+        .ane_chunk_resolver = null,
+        .ane_headroom_resolver = null,
+        .no_drafter = true,
+        .drafter_dir = "",
+        .primary_model_dir = "",
+        .draft_block_size = 0,
+        .draft_block_size_explicit = false,
+        .hot_prefix_cache = null,
+        .max_concurrent = 1,
+        .force_batched = false,
+        .queue_mu = .init,
+        .queue_cond = .init,
+        .pending = std.ArrayList(*Slot).empty,
+        .decoding = std.ArrayList(*Slot).empty,
+        .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
+        .embed_queue = std.ArrayList(*EmbedRequest).empty,
+        .load_queue = std.ArrayList(*LoadRequest).empty,
+        .gen_queue = std.ArrayList(*GenRequest).empty,
+        .unload_queue = std.ArrayList(*UnloadRequest).empty,
+        .cleanup_queue = std.ArrayList(*Slot).empty,
+        .metrics = null,
+        .inflight_generated_tokens = std.atomic.Value(u64).init(0),
+        .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+        .requests_prefilling = std.atomic.Value(u64).init(0),
+        .in_flight = 0,
+        .queue_cap = 33,
+        .submit_cond = .init,
+        .session_cond = .init,
+        .inference_thread = null,
+        .shutdown = std.atomic.Value(bool).init(false),
+        .started = std.atomic.Value(bool).init(false),
+        .started_mu = .init,
+        .started_cond = .init,
+        .load_failed = std.atomic.Value(bool).init(false),
+        .load_error_name = null,
+    };
+    defer sch.embed_queue.deinit(a);
+
+    // Simulate a request that was enqueued and RAN to completion on the
+    // (fake) inference thread, failing there: it is marked done with an
+    // error name before computeEmbeddings is called. computeEmbeddings
+    // re-enqueues it, observes done + error_name, and maps that state to
+    // error.EmbedFailed — the exact error the conn thread keys its
+    // "who frees the mm buffers" decision on.
+    var token_row = [_]u32{1};
+    const seqs = [_][]const u32{&token_row};
+    var req = EmbedRequest{
+        .model = lm,
+        .token_seqs = &seqs,
+        .allocator = a,
+    };
+    req.error_name = try a.dupe(u8, "ResetCacheFailed");
+    defer a.free(req.error_name.?);
+    req.done = true;
+
+    const result = sch.computeEmbeddings(&req);
+    try testing.expectError(error.EmbedFailed, result);
+    // The enqueue SUCCEEDED here (the shell's allocator is healthy), so the
+    // request is parked in the embed_queue for the inference thread — that
+    // queue ownership is precisely what EmbedFailed encodes: the inference
+    // thread already ran (or will run) the request, so it owns the mm buffers.
+    try testing.expectEqual(@as(usize, 1), sch.embed_queue.items.len);
+    try testing.expectEqual(&req, sch.embed_queue.items[0]);
 }
 
 test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
