@@ -4614,7 +4614,10 @@ fn handleEmbeddings(
         const final_ids = if (ids) |chat_ids| chat_ids else blk2: {
             // Fall back to raw tokenization for models without chat templates.
             const raw_ids = try tok.encode(allocator, text);
-            defer allocator.free(raw_ids);
+            // raw_ids ownership: wrapEncoderIds arms free it inside their
+            // blocks; the else arm hands the slice to `seqs` (freed by the
+            // seqs cleanup defer). A block-level defer here would double-free
+            // the else arm (caught by PR review).
             break :blk2 if (config.use_bidirectional_attention) blk3: {
                 break :blk3 try wrapEncoderIds(
                     allocator,
@@ -4626,13 +4629,18 @@ fn handleEmbeddings(
                 // Last-token pooling without a chat template: append the
                 // model's EOS token so pooling picks up the terminator
                 // position, matching the reference implementation's behavior.
+                defer allocator.free(raw_ids);
                 break :blk3 try wrapEncoderIds(
                     allocator,
                     raw_ids,
                     null,
                     if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
                 );
-            } else raw_ids;
+            } else blk3: {
+                // mean pooling / generative fallback: hand raw_ids to seqs
+                // (freed by the seqs cleanup defer); no wrap.
+                break :blk3 raw_ids;
+            };
         };
         total_tokens += final_ids.len;
         try seqs.append(allocator, final_ids);
@@ -5014,7 +5022,12 @@ fn handleMultimodalEmbedding(
     };
     const md = computeQwenMrope(allocator, final_ids, &media_msg, config) catch {
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute M-RoPE positions", null);
-        if (tower_out) |t| allocator.destroy(t); // arrays move out below — plain destroy
+        // Error path: arrays have NOT moved yet — deinit frees merged +
+        // deepstack streams (caught by PR review: plain destroy leaked them).
+        if (tower_out) |t| {
+            t.deinit();
+            allocator.destroy(t);
+        }
         return;
     };
 
@@ -5025,15 +5038,15 @@ fn handleMultimodalEmbedding(
     // struct is destroyed WITHOUT deinit once the scheduler call returns —
     // runEmbedRequest's defer now owns the arrays.
     const mrope_pos_alloc: ?[]i32 = if (md.pos) |p| @constCast(p) else null;
-    if (md.pos != null and mrope_pos_alloc == null) {
-        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "M-RoPE position allocation failed", null);
-        if (tower_out) |t| allocator.destroy(t);
-        return;
-    }
     var deepstack_alloc: ?[]mlx.mlx_array = null;
     if (tower_out) |t| {
         if (t.deepstack_count > 0) {
             deepstack_alloc = allocator.dupe(mlx.mlx_array, t.deepstack[0..t.deepstack_count]) catch {
+                // Error path: arrays have NOT moved yet — free everything.
+                // mrope_pos_alloc was cast from md.pos but ownership has not
+                // transferred yet (runEmbedRequest never saw the request).
+                if (mrope_pos_alloc) |p| allocator.free(p);
+                t.deinit();
                 allocator.destroy(t);
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Out of memory assembling multimodal embedding request", null);
                 return;
@@ -5061,6 +5074,15 @@ fn handleMultimodalEmbedding(
             allocator.free(e);
         } else {
             log.err("  mm embedding error: {}\n", .{err});
+        }
+        // EmbedFailed (or enqueue failure): the request never reached the mm
+        // defer inside runEmbedRequest, so the multimodal buffers are still
+        // ours — free them here or they leak (caught by PR review).
+        if (req.vision_emb) |ve| _ = mlx.mlx_array_free(ve);
+        if (req.mrope_pos_alloc) |p| allocator.free(p);
+        if (req.deepstack_alloc) |d| {
+            for (d) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(d);
         }
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
         return;

@@ -122,8 +122,13 @@ pub const ModelConfig = struct {
     /// The verbatim `model_type` from config.json BEFORE family-specific
     /// branches remap `model_type` to the trunk family (e.g. qwen3_vl →
     /// qwen3). Used by `useChatTemplateEmbeddings()` to decide whether
-    /// /v1/embeddings should render the chat template.
-    original_model_type: []const u8 = "",
+    /// /v1/embeddings should render the chat template. Stored by value in a
+    /// fixed buffer: ModelConfig stays free of allocator-owned fields (the
+    /// registry relies on plain destroy, and testing.allocator would flag a
+    /// dupe as a leak — caught by PR review). Oversized types simply fail
+    /// the family match, which is the desired outcome for unknown names.
+    original_model_type_buf: [64]u8 = undefined,
+    original_model_type_len: usize = 0,
     weight_prefix: []const u8 = "language_model.model",
 
     // Core dimensions
@@ -888,8 +893,9 @@ pub const ModelConfig = struct {
     /// embeds via raw tokenization plus the tokenizer post-processor's
     /// trailing special token.
     pub fn useChatTemplateEmbeddings(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.original_model_type, "qwen3_vl") or
-            std.mem.eql(u8, self.original_model_type, "qwen3_vl_text");
+        const orig = self.original_model_type_buf[0..self.original_model_type_len];
+        return std.mem.eql(u8, orig, "qwen3_vl") or
+            std.mem.eql(u8, orig, "qwen3_vl_text");
     }
 
     pub fn isInkling(self: *const ModelConfig) bool {
@@ -1688,8 +1694,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
-    // The JSON arena is freed on return; dupe so original_model_type survives.
-    config.original_model_type = try allocator.dupe(u8, model_type);
+    // The JSON arena is freed on return; copy the verbatim model_type into
+    // the fixed by-value buffer (no allocator-owned fields — see the field
+    // comment above).
+    if (model_type.len <= config.original_model_type_buf.len) {
+        @memcpy(config.original_model_type_buf[0..model_type.len], model_type);
+        config.original_model_type_len = model_type.len;
+    }
 
     // Determine which object to read config from: text_config (nested) or root (flat)
     const cfg_obj = if (root.get("text_config")) |tc_val| tc_val.object else root;

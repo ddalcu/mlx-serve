@@ -4359,6 +4359,15 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
     xfm_ptr.resetCache() catch |err| {
+        // Error before the mm defer below is registered: the caller already
+        // handed over vision_emb / mrope_pos_alloc / deepstack_alloc, so they
+        // must be freed HERE or they leak (caught by PR review).
+        if (req.vision_emb) |ve| _ = mlx.mlx_array_free(ve);
+        if (req.mrope_pos_alloc) |p| req.allocator.free(p);
+        if (req.deepstack_alloc) |d| {
+            for (d) |a| _ = mlx.mlx_array_free(a);
+            req.allocator.free(d);
+        }
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
