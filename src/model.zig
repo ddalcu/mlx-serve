@@ -554,6 +554,12 @@ pub const ModelConfig = struct {
     pv_spatial_merge: u32 = 2, // patch-merger downsample factor (2×2 patches → 1 token)
     pv_projector_bias: bool = false, // multimodal_projector_bias
     pv_image_size: u32 = 1024, // longest-edge resize cap in pixels (vision_config.image_size)
+    // `[IMG_BREAK]`/`[IMG_END]` row delimiters (Mistral3Processor's
+    // `([IMG]*W + [IMG_BREAK])*H` with the trailing break swapped for
+    // `[IMG_END]`). Not in config.json — resolved by string from the
+    // tokenizer's added tokens, like populateLfm2ImageTokens.
+    pv_break_token_id: u32 = 0,
+    pv_end_token_id: u32 = 0,
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -1199,6 +1205,20 @@ pub const ModelConfig = struct {
         }
         log.info("LFM2-VL image tokens: <image>={d} start={d} end={d} thumbnail={d} row_col_base={d}\n", .{
             self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
+        });
+    }
+
+    /// Mistral3's tekken tokenizer carries `[IMG_BREAK]`/`[IMG_END]` as added
+    /// tokens, not config.json fields — resolve them the same way the LFM2-VL
+    /// markers are resolved above. A missing marker leaves its id 0, which
+    /// `pixtralImageSegment` reads as "this checkpoint has no such token" and
+    /// falls back to the flat pad run.
+    pub fn populatePixtralImageTokens(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (!self.pixtral_vision) return;
+        if (tok.special_tokens.get("[IMG_BREAK]")) |id| self.pv_break_token_id = id;
+        if (tok.special_tokens.get("[IMG_END]")) |id| self.pv_end_token_id = id;
+        log.info("Pixtral image tokens: [IMG]={d} break={d} end={d}\n", .{
+            self.image_token_id, self.pv_break_token_id, self.pv_end_token_id,
         });
     }
 };

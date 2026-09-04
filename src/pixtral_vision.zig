@@ -355,15 +355,42 @@ pub const PixtralVision = struct {
     /// `c*(k*k)+kh*k+kw` (channel-major, then within-block row-major
     /// position), confirmed from the reference `unfold` helper. Getting this
     /// axis order wrong silently scrambles the image.
+    ///
+    /// `resizePixtral` only rounds the grid up to a multiple of `patch`, not
+    /// `patch*merge`, so an odd grid (e.g. 110×83) is routine. `unfold`
+    /// silently drops a trailing row/col that doesn't fill a full `k×k`
+    /// block — crop to `(bh*k, bw*k)` before the reshape to match.
     fn patchMerge(self: *PixtralVision, x: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         const k = self.merge;
         const bh = grid_h / k;
         const bw = grid_w / k;
         const C: c_int = @intCast(self.hidden);
 
+        var src = x;
+        var cropped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cropped);
+        if (bh * k != grid_h or bw * k != grid_w) {
+            var g = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g);
+            try mlx.check(mlx.mlx_reshape(&g, x, &[_]c_int{ @intCast(grid_h), @intCast(grid_w), C }, 3, self.s));
+
+            var sl = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sl);
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ @intCast(bh * k), @intCast(bw * k), C };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&sl, g, &start, 3, &stop, 3, &strides, 3, self.s));
+
+            var contiguous = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(contiguous);
+            try mlx.check(mlx.mlx_contiguous(&contiguous, sl, false, self.s));
+            try mlx.check(mlx.mlx_reshape(&cropped, contiguous, &[_]c_int{ @intCast(bh * k * bw * k), C }, 2, self.s));
+            src = cropped;
+        }
+
         var r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(r);
-        try mlx.check(mlx.mlx_reshape(&r, x, &[_]c_int{ @intCast(bh), @intCast(k), @intCast(bw), @intCast(k), C }, 5, self.s));
+        try mlx.check(mlx.mlx_reshape(&r, src, &[_]c_int{ @intCast(bh), @intCast(k), @intCast(bw), @intCast(k), C }, 5, self.s));
 
         var t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(t);
@@ -738,6 +765,50 @@ test "patchMerge: 2x2 merge orders features channel-major then within-block row-
     const ptr = mlx.mlx_array_data_float32(f32_out).?;
     const got = ptr[0..8];
     const want = [_]f32{ 1, 2, 3, 4, 10, 20, 30, 40 };
+    for (want, 0..) |w, i| {
+        try testing.expectApproxEqAbs(w, got[i], 1e-2);
+    }
+}
+
+test "patchMerge: an odd grid crops the trailing row/col before merging" {
+    // resizePixtral(2000, 1500, 1540, 14) yields a 110x83-patch grid — 83 is
+    // odd, so merge=2 must drop the trailing column exactly like PyTorch's
+    // F.unfold(kernel=2,stride=2) would. Minimal repro: gh=2, gw=3 (only the
+    // width is odd), C=1, values = h*10+w so the dropped column is visible.
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0,  1,  2,
+        10, 11, 12,
+    };
+    const shape = [_]c_int{ 6, 1 };
+    const raw = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&x, raw, .bfloat16, s));
+    _ = mlx.mlx_array_free(raw);
+    defer _ = mlx.mlx_array_free(x);
+
+    var pv: PixtralVision = undefined;
+    pv.s = s;
+    pv.allocator = testing.allocator;
+    pv.hidden = 1;
+    pv.merge = 2;
+
+    // gh=2 (already a multiple of 2), gw=3 (bw = 3/2 = 1, drops column 2).
+    const merged = try pv.patchMerge(x, 2, 3);
+    defer _ = mlx.mlx_array_free(merged);
+
+    var f32_out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&f32_out, merged, .float32, s));
+    defer _ = mlx.mlx_array_free(f32_out);
+    _ = mlx.mlx_eval(mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{f32_out}, 1));
+    const out_shape = mlx.getShape(f32_out);
+    try testing.expectEqual(@as(c_int, 1), out_shape[0]);
+    try testing.expectEqual(@as(c_int, 4), out_shape[1]);
+
+    const ptr = mlx.mlx_array_data_float32(f32_out).?;
+    const got = ptr[0..4];
+    // c*(k*k)+kh*k+kw with C=1: [patch(0,0), patch(0,1), patch(1,0), patch(1,1)].
+    const want = [_]f32{ 0, 1, 10, 11 };
     for (want, 0..) |w, i| {
         try testing.expectApproxEqAbs(w, got[i], 1e-2);
     }
