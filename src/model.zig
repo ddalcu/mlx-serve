@@ -3502,6 +3502,27 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         file_count += 1;
     }
 
+    const qwen4_mtp_path = "mtp/model.safetensors";
+    if (weights.get("language_model.mtp.fc_hidden.weight") == null and
+        safetensorsHeaderHasQwen4Mtp(io, allocator, dir, qwen4_mtp_path))
+    {
+        const path_slice = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, qwen4_mtp_path });
+        defer allocator.free(path_slice);
+        const path = try allocator.dupeSentinel(u8, path_slice, 0);
+        defer allocator.free(path);
+
+        log.info("Loading standalone Qwen4 MTP sidecar {s}...\n", .{qwen4_mtp_path});
+        try loadSafetensorsFileWithPrefix(
+            allocator,
+            &weights,
+            path,
+            s,
+            false,
+            "language_model.mtp",
+            true,
+        );
+    }
+
     // Incomplete-checkpoint guard. A dir with config/tokenizer but no (or no
     // usable) *.safetensors is the classic interrupted-download shape: the
     // small files land first, the multi-GB weight shards never finalize. Before
@@ -3586,6 +3607,39 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
+    return loadSafetensorsFileWithPrefix(allocator, weights, path, s, load_vision, null, false);
+}
+
+fn qwen4MtpNormNeedsFold(key: []const u8) bool {
+    return std.mem.indexOf(u8, key, "norm") != null and std.mem.endsWith(u8, key, ".weight");
+}
+
+fn foldQwen4MtpNormPlusOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const dtype = mlx.mlx_array_dtype(arr);
+    var float_arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(float_arr);
+    try mlx.check(mlx.mlx_astype(&float_arr, arr, .float32, s));
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, float_arr, one, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, sum, dtype, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+fn loadSafetensorsFileWithPrefix(
+    allocator: std.mem.Allocator,
+    weights: *Weights,
+    path: [*:0]const u8,
+    s: mlx.mlx_stream,
+    load_vision: bool,
+    key_prefix: ?[]const u8,
+    fold_qwen4_mtp_norms: bool,
+) !void {
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -3627,10 +3681,53 @@ pub fn loadSafetensorsFile(
             final_value = cast;
             if (ndim == 1) narrowed_1d += 1;
         }
+        if (fold_qwen4_mtp_norms and qwen4MtpNormNeedsFold(key_str)) {
+            const folded = foldQwen4MtpNormPlusOne(final_value, s) catch |err| {
+                _ = mlx.mlx_array_free(final_value);
+                return err;
+            };
+            _ = mlx.mlx_array_free(final_value);
+            final_value = folded;
+        }
 
-        const owned_key = try allocator.dupe(u8, key_str);
-        try weights.map.put(owned_key, final_value);
+        const mapped_key_owned = if (key_prefix) |prefix|
+            try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, key_str })
+        else
+            null;
+        defer if (mapped_key_owned) |mapped| allocator.free(mapped);
+        const mapped_key = mapped_key_owned orelse key_str;
+
+        if (weights.map.getPtr(mapped_key)) |old_value| {
+            _ = mlx.mlx_array_free(old_value.*);
+            old_value.* = final_value;
+        } else {
+            const owned_key = try allocator.dupe(u8, mapped_key);
+            weights.map.put(owned_key, final_value) catch |err| {
+                allocator.free(owned_key);
+                _ = mlx.mlx_array_free(final_value);
+                return err;
+            };
+        }
     }
+}
+
+fn safetensorsHeaderHasQwen4Mtp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+) bool {
+    const f = dir.openFile(io, sub_path, .{}) catch return false;
+    defer f.close(io);
+    var read_buf: [8192]u8 = undefined;
+    var reader = f.reader(io, &read_buf);
+    const header_len = reader.interface.takeInt(u64, .little) catch return false;
+    if (header_len == 0 or header_len > 16 * 1024 * 1024) return false;
+    const header = allocator.alloc(u8, @intCast(header_len)) catch return false;
+    defer allocator.free(header);
+    reader.interface.readSliceAll(header) catch return false;
+    return std.mem.indexOf(u8, header, "\"fc_hidden.weight\"") != null and
+        std.mem.indexOf(u8, header, "\"layers.0.self_attn.q_proj.weight\"") != null;
 }
 
 /// True if the safetensors weight `key` should be retained for the text
@@ -3689,6 +3786,121 @@ test "ModelConfig defaults" {
     try testing.expectEqual(@as(u32, 0), config.quant_bits); // 0 = dense bf16 (no "quantization" key)
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expect(!config.tie_word_embeddings);
+}
+
+test "loadWeights maps a standalone Qwen4 MTP sidecar when the checkpoint has no head" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mtp");
+
+    const main_hdr =
+        "{\"model.keep.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var main_st: [8 + main_hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, main_st[0..8], main_hdr.len, .little);
+    @memcpy(main_st[8 .. 8 + main_hdr.len], main_hdr);
+    @memset(main_st[8 + main_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &main_st });
+
+    const mtp_hdr =
+        "{\"fc_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}," ++
+        "\"layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}," ++
+        "\"pre_fc_norm_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[12,16]}}";
+    var mtp_st: [8 + mtp_hdr.len + 16]u8 = undefined;
+    std.mem.writeInt(u64, mtp_st[0..8], mtp_hdr.len, .little);
+    @memcpy(mtp_st[8 .. 8 + mtp_hdr.len], mtp_hdr);
+    @memset(mtp_st[8 + mtp_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/model.safetensors", .data = &mtp_st });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var weights = try loadWeightsFromOpenDir(io, allocator, tmp.dir, path_buf[0..path_len], false);
+    defer weights.deinit();
+
+    try testing.expectEqual(@as(u32, 4), weights.count());
+    try testing.expectEqual(
+        @as(usize, 2),
+        mlx.mlx_array_size(weights.get("language_model.mtp.fc_hidden.weight").?),
+    );
+    try testing.expect(weights.get("language_model.mtp.layers.0.self_attn.q_proj.weight") != null);
+    try testing.expect(weights.get("fc_hidden.weight") == null);
+    const norm = weights.get("language_model.mtp.pre_fc_norm_hidden.weight").?;
+    try mlx.check(mlx.mlx_array_eval(norm));
+    var norm_value: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&norm_value, norm));
+    try testing.expectApproxEqAbs(@as(f32, 1), norm_value, 0.0001);
+}
+
+test "loadWeights preserves an embedded Qwen4 MTP head over a standalone sidecar" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mtp");
+
+    const main_hdr =
+        "{\"model.keep.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}," ++
+        "\"language_model.mtp.fc_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}," ++
+        "\"language_model.mtp.fc_hidden.scales\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}}";
+    var main_st: [8 + main_hdr.len + 12]u8 = undefined;
+    std.mem.writeInt(u64, main_st[0..8], main_hdr.len, .little);
+    @memcpy(main_st[8 .. 8 + main_hdr.len], main_hdr);
+    @memset(main_st[8 + main_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &main_st });
+
+    const mtp_hdr =
+        "{\"fc_hidden.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}," ++
+        "\"layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}}";
+    var mtp_st: [8 + mtp_hdr.len + 12]u8 = undefined;
+    std.mem.writeInt(u64, mtp_st[0..8], mtp_hdr.len, .little);
+    @memcpy(mtp_st[8 .. 8 + mtp_hdr.len], mtp_hdr);
+    @memset(mtp_st[8 + mtp_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/model.safetensors", .data = &mtp_st });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var weights = try loadWeightsFromOpenDir(io, allocator, tmp.dir, path_buf[0..path_len], false);
+    defer weights.deinit();
+
+    try testing.expectEqual(@as(u32, 3), weights.count());
+    try testing.expectEqual(
+        @as(usize, 1),
+        mlx.mlx_array_size(weights.get("language_model.mtp.fc_hidden.weight").?),
+    );
+    try testing.expect(weights.get("language_model.mtp.fc_hidden.scales") != null);
+    try testing.expect(weights.get("language_model.mtp.layers.0.self_attn.q_proj.weight") == null);
+}
+
+test "loadWeights ignores an unrelated file at the Qwen4 MTP sidecar path" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mtp");
+
+    const main_hdr = "{\"model.keep.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var main_st: [8 + main_hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, main_st[0..8], main_hdr.len, .little);
+    @memcpy(main_st[8 .. 8 + main_hdr.len], main_hdr);
+    @memset(main_st[8 + main_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &main_st });
+
+    const unrelated_hdr = "{\"not_mtp.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var unrelated_st: [8 + unrelated_hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, unrelated_st[0..8], unrelated_hdr.len, .little);
+    @memcpy(unrelated_st[8 .. 8 + unrelated_hdr.len], unrelated_hdr);
+    @memset(unrelated_st[8 + unrelated_hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/model.safetensors", .data = &unrelated_st });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var weights = try loadWeightsFromOpenDir(io, allocator, tmp.dir, path_buf[0..path_len], false);
+    defer weights.deinit();
+
+    try testing.expectEqual(@as(u32, 1), weights.count());
+    try testing.expect(weights.get("model.keep.weight") != null);
+    try testing.expect(weights.get("language_model.mtp.not_mtp.weight") == null);
 }
 
 test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-path class)" {

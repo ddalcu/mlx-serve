@@ -13730,15 +13730,39 @@ pub const Transformer = struct {
     }
 
     /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
-    fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
-        const mtp_prefix = "language_model.mtp";
-        if (weights.get(mtp_prefix ++ ".fc_hidden.weight") == null) return null;
+    fn qwen4MtpLayerConfig(config: ModelConfig, has_quant_scales: bool) ModelConfig {
         var mcfg = config;
-        mcfg.weight_prefix = mtp_prefix;
+        mcfg.weight_prefix = "language_model.mtp";
         mcfg.num_hidden_layers = 1;
         mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer
         mcfg.linear_attn_tail_from = 0;
         mcfg.ple_layer_idx = -1;
+        // A standalone BF16 head has no quantization metadata of its own.
+        // Do not inherit the backbone's quantization contract and demand
+        // nonexistent `.scales`/`.biases` tensors from that dense sidecar.
+        if (!has_quant_scales) mcfg.quant_bits = 0;
+        return mcfg;
+    }
+
+    test "Qwen4 dense MTP sidecar does not inherit backbone quantization" {
+        const trunk = ModelConfig{ .quant_bits = 4, .quant_group_size = 64 };
+
+        const dense = qwen4MtpLayerConfig(trunk, false);
+        try std.testing.expectEqual(@as(u32, 0), dense.quant_bits);
+        try std.testing.expectEqualStrings("language_model.mtp", dense.weight_prefix);
+        try std.testing.expectEqual(@as(u32, 1), dense.num_hidden_layers);
+
+        const quantized = qwen4MtpLayerConfig(trunk, true);
+        try std.testing.expectEqual(@as(u32, 4), quantized.quant_bits);
+        try std.testing.expectEqual(@as(u32, 64), quantized.quant_group_size);
+    }
+
+    fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
+        const mtp_prefix = "language_model.mtp";
+        if (weights.get(mtp_prefix ++ ".fc_hidden.weight") == null) return null;
+        const has_quant_scales = weights.get(mtp_prefix ++ ".fc_hidden.scales") != null;
+        const mcfg = qwen4MtpLayerConfig(config, has_quant_scales);
+        if (!has_quant_scales) log.info("[qwen4] standalone MTP head is dense; ignoring backbone quantization metadata\n", .{});
         const ml = try initMoeLayers(allocator, mcfg, weights, name_buf, s);
         var owned: std.ArrayList(mlx.mlx_array) = .empty;
         errdefer owned.deinit(allocator);
