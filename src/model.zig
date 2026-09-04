@@ -517,6 +517,12 @@ pub const ModelConfig = struct {
     qv_merge: u32 = 2, // spatial merge: merge×merge patches → one LLM token
     qv_num_pos_emb: u32 = 0, // learned pos table entries (e.g. 2304 = 48×48)
     qv_out_hidden: u32 = 0, // merger output dim (= text hidden_size)
+    // Qwen3-VL DeepStack (mlx_vlm): ViT block outputs at these depths go through
+    // their own postshuffle-norm patch mergers and are ADDED onto the LLM's
+    // first N decoder-layer outputs at image-token positions. Empty = absent
+    // (most checkpoints); the embedding model ships [5,11,17].
+    qv_deepstack_indexes: [MAX_VISION_LAYERS]u32 = @splat(0),
+    qv_deepstack_count: u32 = 0, // valid entries in qv_deepstack_indexes
     // Image-area bounds from processor_config.json / preprocessor_config.json.
     // 0 means absent: the Qwen processor defaults remain the fallback.
     qv_min_pixels: u32 = 0,
@@ -1500,6 +1506,17 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
             }
             if (vc.get("out_hidden_size")) |v| {
                 if (v == .integer) config.qv_out_hidden = @intCast(v.integer);
+            }
+            if (vc.get("deepstack_visual_indexes")) |v| {
+                if (v == .array) {
+                    for (v.array.items, 0..) |item, i| {
+                        if (i >= MAX_VISION_LAYERS) break;
+                        if (item == .integer and item.integer >= 0) {
+                            config.qv_deepstack_indexes[i] = @intCast(item.integer);
+                            config.qv_deepstack_count = @intCast(i + 1);
+                        }
+                    }
+                }
             }
             if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
             if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;

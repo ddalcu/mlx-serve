@@ -43,6 +43,7 @@ const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
+const qwen_vision_mod = @import("qwen_vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("metrics.zig");
@@ -922,6 +923,13 @@ pub const VisionEncodeRequest = struct {
     /// axis (matches the prompt's image/video/audio block insertion order).
     /// Ownership transfers to the caller.
     result: ?mlx.mlx_array = null,
+    /// Output: when `want_deepstack` is set, the full tower output (merged
+    /// + DeepStack streams) lands here instead of `result`. Transfers to the
+    /// caller — free via `VisionTowerOutput.deinit`.
+    tower: ?*qwen_vision_mod.VisionTowerOutput = null,
+    /// Ask `runVisionEncode` to capture the DeepStack streams (Qwen3-VL
+    /// embedding checkpoints). Batch of images must be exactly 1.
+    want_deepstack: bool = false,
     /// Output: number of vision / video / audio soft tokens in `result` (in
     /// that order). The caller inserts exactly this many image / video / audio
     /// placeholders.
@@ -944,12 +952,30 @@ pub const VisionEncodeRequest = struct {
 /// padded, key-masked GPU forward per EMBED_MAX_BATCH chunk — and writes
 /// the float vectors into `results` (caller frees). Mirrors the
 /// VisionEncodeRequest pattern.
+///
+/// Multimodal embedding (Qwen3-VL-Embedding class, fixed batch=1): when
+/// `vision_emb` is set the inference thread routes the single sequence
+/// through `generate.computeEmbeddingsVision` instead — splice + interleaved
+/// M-RoPE + DeepStack streams. OWNERSHIP: the conn thread allocates every
+/// mlx handle below (vision_emb, mrope_pos table, deepstack streams) and
+/// `runEmbedRequest` frees them after the forward — in both the success and
+/// the error path (the conn thread only reads results/error_name).
 pub const EmbedRequest = struct {
     /// Plan 05 Phase D: target model whose `transformer` services this
     /// request. The conn thread holds a refcount for the duration.
     model: *model_registry_mod.LoadedModel,
     /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
     token_seqs: []const []const u32,
+    /// Multimodal inputs. Null (default) = plain text batch.
+    vision_emb: ?mlx.mlx_array = null,
+    /// Flat [3 × mrope_total] i32 positions (axis-major t/h/w); allocated
+    /// with `allocator` — freed here when non-null.
+    mrope_pos_alloc: ?[]i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
+    /// DeepStack streams [N_merged, out_hidden] each (layers 0..n);
+    /// allocated with `allocator` — freed here.
+    deepstack_alloc: ?[]mlx.mlx_array = null,
     /// Output: one pooled L2-normalized embedding per input on success.
     /// Rows + outer slice owned by `allocator`; caller frees.
     results: ?[][]f32 = null,
@@ -2006,6 +2032,28 @@ pub const Scheduler = struct {
         }
         if (req.error_name) |_| return error.VisionEncodeFailed;
         return req.result orelse error.VisionEncodeFailed;
+    }
+
+    /// Synchronously encode one image AND its DeepStack streams (Qwen3-VL
+    /// embedding checkpoints). Same lifecycle as `encodeVision`; on success
+    /// `req.tower` holds the tower output — the caller consumes `merged`
+    /// (and the deepstack streams) then frees via `VisionTowerOutput.deinit`.
+    pub fn encodeVisionDeepstack(self: *Scheduler, req: *VisionEncodeRequest) !*qwen_vision_mod.VisionTowerOutput {
+        self.queue_mu.lockUncancelable(self.io);
+        self.vision_queue.append(self.allocator, req) catch |err| {
+            self.queue_mu.unlock(self.io);
+            return err;
+        };
+        self.queue_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
+
+        req.done_mu.lockUncancelable(self.io);
+        defer req.done_mu.unlock(self.io);
+        while (!req.done) {
+            req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        }
+        if (req.error_name) |_| return error.VisionEncodeFailed;
+        return req.tower orelse error.VisionEncodeFailed;
     }
 
     /// Does this slot's next decode tick actually run the regular (non-speculative)
@@ -4129,6 +4177,36 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
+    // DeepStack capture: exactly one patch-grid image, no other media.
+    if (req.want_deepstack) {
+        if (req.images.len != 1 or req.videos.len != 0 or req.audio.len != 0 or req.images[0].grid_h == 0) {
+            finishVisionRequest(sch, req, "DeepstackNeedsOnePatchImage");
+            return;
+        }
+        const img = req.images[0];
+        const n: usize = @as(usize, img.grid_h) * img.grid_w;
+        const feat: usize = (img.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const tower = vision_enc.forwardPatchesDeepstack(pixel_arr, img.grid_h, img.grid_w) catch |err| {
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
+        const tower_ptr = req.allocator.create(qwen_vision_mod.VisionTowerOutput) catch |err| {
+            var t = tower;
+            t.deinit();
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
+        tower_ptr.* = tower;
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.tower = tower_ptr;
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
 
     // Encode all soft tokens into `emb_parts`: vision, then video, then audio,
     // so the single splice channel scatters them in the same order as the
@@ -4284,6 +4362,44 @@ fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
+    // Multimodal path (batch=1): the borrowed mlx handles live exactly for
+    // this forward; they are freed on EVERY exit below.
+    if (req.vision_emb) |ve| {
+        var ds: []const mlx.mlx_array = &.{};
+        if (req.deepstack_alloc) |d| ds = d;
+        const vin = transformer_mod.Transformer.VisionEmbedInputs{
+            .vision_emb = ve,
+            .mrope_pos = if (req.mrope_pos_alloc) |p| p else null,
+            .mrope_total = req.mrope_total,
+            .mrope_delta = req.mrope_delta,
+            .deepstack = ds,
+        };
+        defer {
+            _ = mlx.mlx_array_free(ve);
+            if (req.mrope_pos_alloc) |p| req.allocator.free(p);
+            if (req.deepstack_alloc) |d| {
+                for (d) |a| _ = mlx.mlx_array_free(a);
+                req.allocator.free(d);
+            }
+        }
+        const one = req.token_seqs[0];
+        const row = generate_mod.computeEmbeddingsVision(req.allocator, xfm_ptr, one, vin) catch |err| {
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+        const rows = req.allocator.alloc([]f32, 1) catch |err| {
+            req.allocator.free(row);
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+        rows[0] = row;
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.results = rows;
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
     const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
