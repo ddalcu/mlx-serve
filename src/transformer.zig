@@ -4119,9 +4119,10 @@ fn sdpaSplitEnabled() bool {
 var sdpa_split_logged: [4]bool = .{ false, false, false, false };
 
 /// Width-wall query split for dense causal spec-verify blocks (B==1, hd 256,
-/// q_len 6..9). MLX's sdpa has no full-kernel arm at hd 256 and its vector
-/// kernel serves q_len * gqa <= 32, so a 6..9-row verify block otherwise runs
-/// the slow internal fallback on every machine. Splitting the queries at row
+/// q_len 6..9). MLX's vector kernel serves q_len * gqa <= 32. On NAX the
+/// stock full-attention kernel owns q_len 9; the split owns q_len 6..8.
+/// Off NAX it owns q_len 6..9, avoiding the slow internal fallback. Splitting
+/// the queries at row
 /// 5 keeps both halves on the vector path with windows byte-identical to two
 /// consecutive <= 5-row rounds at the same offsets (bottom-right causal
 /// alignment): chunk A (rows 0..<5) over keys[0 .. kL-(qL-5)], chunk B
@@ -4147,6 +4148,9 @@ pub fn splitCausalSdpa(
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1]) return null;
 
     const qL = qs[2];
+    // Keep the explicit test/benchmark override authoritative so the old
+    // split path remains forceable while production Q=9 yields to stock NAX.
+    if (qL == 9 and sdpa_split_override == null and naxSdpaPreferred()) return null;
     const kL = ks[2];
     const split: c_int = 5;
     const k_split: c_int = kL - (qL - split);
@@ -16264,8 +16268,8 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
-                // Verify-width (6..9) dense blocks: two vector-path halves
-                // beat MLX's internal hd-256 fallback.
+                // Dense verify widths still owned by the split use two
+                // vector-path halves; NAX qL=9 declines to the arm below.
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = split_out;
             } else {
@@ -37981,6 +37985,60 @@ test "splitCausalSdpa: declines outside its envelope" {
     // Kill switch -> null even for a conforming call.
     sdpa_split_override = false;
     try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
+}
+
+test "splitCausalSdpa: NAX owns q 9 unless split is explicitly forced" {
+    const old_split_override = sdpa_split_override;
+    const old_split_env = sdpa_split_env_cached;
+    const old_nax_override = nax_sdpa_override;
+    defer {
+        sdpa_split_override = old_split_override;
+        sdpa_split_env_cached = old_split_env;
+        nax_sdpa_override = old_nax_override;
+    }
+
+    // Pin the production split switch on without activating its force seam.
+    sdpa_split_override = null;
+    sdpa_split_env_cached = true;
+    nax_sdpa_override = true;
+
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x5D9B);
+    const rnd = prng.random();
+    const kv_shape = [_]c_int{ 1, 1, 64, 256 };
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    const q8_shape = [_]c_int{ 1, 6, 8, 256 };
+    const q8 = try attn256RandBf16(rnd, &q8_shape, s);
+    defer _ = mlx.mlx_array_free(q8);
+    const q9_shape = [_]c_int{ 1, 6, 9, 256 };
+    const q9 = try attn256RandBf16(rnd, &q9_shape, s);
+    defer _ = mlx.mlx_array_free(q9);
+
+    // NAX still leaves width 8 on the split-vector path.
+    {
+        const out = (try splitCausalSdpa(s, q8, k, v, 1.0)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(out);
+    }
+    // Width 9 yields to the caller's stock force_fused NAX arm.
+    try std.testing.expect((try splitCausalSdpa(s, q9, k, v, 1.0)) == null);
+
+    // The explicit seam can force the control path for parity/A-B work.
+    sdpa_split_override = true;
+    {
+        const out = (try splitCausalSdpa(s, q9, k, v, 1.0)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(out);
+    }
+
+    // Without NAX, width 9 remains on the split path by default.
+    sdpa_split_override = null;
+    nax_sdpa_override = false;
+    {
+        const out = (try splitCausalSdpa(s, q9, k, v, 1.0)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(out);
+    }
 }
 
 // ── KV cache growth policy (issue #110) ──────────────────────────────────────
