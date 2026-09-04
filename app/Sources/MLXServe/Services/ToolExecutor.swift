@@ -165,7 +165,12 @@ struct ShellHandler: ToolHandler {
             return try await AgentSandbox.shared.runForeground(
                 command: command, workingDirectory: workingDirectory, timeout: timeoutSeconds)
         case .hostForeground:
-            return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
+            let result = try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
+            if let fallback = Self.pythonNotFoundFallback(command: command, result: result) {
+                let retry = try await runForeground(command: fallback, cwd: cwd, workingDirectory: workingDirectory)
+                return "[bare `python` is not on PATH on stock macOS — auto-retried as `\(fallback)`]\n" + retry
+            }
+            return result
         }
     }
 
@@ -294,6 +299,41 @@ struct ShellHandler: ToolHandler {
         guard hasTrailingBackgroundOperator(command) else { return command }
         let trimmed = command.trimmingCharacters(in: .whitespaces)
         return String(trimmed.dropLast()).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The rewritten command to retry with, when a foreground command failed
+    /// because bare `python` isn't on PATH — nil otherwise. Stock macOS ships
+    /// no `python` binary (only `python3`, via the Xcode CLT stub), and even
+    /// that stub refuses to run when invoked through a `python` alias/symlink
+    /// (it dispatches on argv[0] and looks for a CLT tool literally named
+    /// `python`). Small models write `python foo.py` anyway (see mlx-serve
+    /// python-not-found issue), so every fresh Mac hits `command not found`
+    /// on the very first script.
+    ///
+    /// This is a RETRY, deliberately not a rewrite-on-sight of every `python`
+    /// call to `python3`: `python` is the name a venv/conda environment's
+    /// `activate` script re-points at whatever interpreter version that
+    /// environment wants, so it changes per-project. `python3` has no such
+    /// convention — it is normally left pinned to one system/Homebrew
+    /// install. Always substituting `python3` up front would silently pull
+    /// commands out of an activated environment's chosen interpreter even
+    /// when plain `python` would have worked correctly. Trying the model's
+    /// original `python` command FIRST preserves that dynamic resolution;
+    /// only a genuine `command not found` falls back to the static `python3`,
+    /// which is the correct behavior on a bare Mac with no environment active.
+    /// Two guards keep this from ever rewriting a command it shouldn't: the
+    /// command's FIRST token must be exactly `python` (never `python3`/
+    /// `pythonX`, so an already-correct invocation or an unrelated tool is
+    /// untouched), and the failure must be a real exit-127 zsh "command not
+    /// found: python" line — a script that merely prints that phrase, or
+    /// fails for any other reason, is left alone.
+    static func pythonNotFoundFallback(command: String, result: String) -> String? {
+        let trimmed = command.trimmingCharacters(in: .whitespaces)
+        guard trimmed == "python" || trimmed.hasPrefix("python ") else { return nil }
+        guard result.contains("[exit code: 127]") else { return nil }
+        guard result.contains("command not found: python\n") || result.hasSuffix("command not found: python")
+        else { return nil }
+        return "python3" + trimmed.dropFirst("python".count)
     }
 
     /// Foreground execution with the timeout backstop. A command still alive at
