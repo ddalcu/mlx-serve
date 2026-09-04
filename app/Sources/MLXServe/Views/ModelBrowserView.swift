@@ -714,6 +714,7 @@ private struct DiscoverPane: View {
 private struct MyModelsPane: View {
     @Binding var filter: String
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var downloads: DownloadManager
 
     @State private var freeDiskSpace: String = ""
 
@@ -806,13 +807,20 @@ private struct MyModelsPane: View {
         .onAppear {
             updateDiskSpace()
         }
+        .onChange(of: appState.localModels.count) { _, _ in
+            updateDiskSpace()
+        }
+        .onChange(of: downloads.modelsDir) { _, _ in
+            updateDiskSpace()
+        }
     }
 
     private func updateDiskSpace() {
-        guard let values = try? URL(fileURLWithPath: NSHomeDirectory())
-            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-            let freeSpace = values.volumeAvailableCapacityForImportantUsage else { return }
-        freeDiskSpace = MemoryInfo.format(freeSpace)
+        let values = try? URL(fileURLWithPath: downloads.modelsDir)
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        freeDiskSpace = ModelBrowserMetrics.freeSpaceLabel(
+            availableBytes: values?.volumeAvailableCapacityForImportantUsage
+        )
     }
 }
 
