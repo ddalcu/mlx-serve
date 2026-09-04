@@ -277,4 +277,31 @@ final class StartupModelChoiceTests: XCTestCase {
         XCTAssertTrue(call.contains("StartupModelChoice.lanStartPath(plan:"),
                       "launch-time LAN duty must start the server the startup plan asked for")
     }
+
+    // MARK: - The tray's Start button
+
+    /// "Start Server" is the same sentence the auto-start checkbox makes, so it
+    /// answers to the same setting. It used to pass the selection
+    /// unconditionally: a tray-started server always had a checkpoint resident,
+    /// and ejecting it brought it straight back, because `--model` makes that
+    /// entry the registry's default.
+    func testTrayStartLoadsNothingUnlessTheSettingAsksForIt() {
+        XCTAssertEqual(
+            StartupModelChoice.trayStartPath(loadModelAtStart: false,
+                                             selectedModelPath: "/models/qwen"),
+            "")
+        XCTAssertEqual(
+            StartupModelChoice.trayStartPath(loadModelAtStart: true,
+                                             selectedModelPath: "/models/qwen"),
+            "/models/qwen")
+    }
+
+    /// The picker sits directly above the button, so a loading Start serves
+    /// what the picker names — and with nothing picked there is nothing to
+    /// load, which is a headless start rather than a broken `--model`.
+    func testTrayStartWithNothingSelectedIsHeadless() {
+        XCTAssertEqual(
+            StartupModelChoice.trayStartPath(loadModelAtStart: true, selectedModelPath: ""),
+            "")
+    }
 }
