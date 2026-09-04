@@ -69,6 +69,190 @@ Voice mode's turn endpointing is a hand-rolled energy VAD: a turn finalizes afte
 ### WebSearch + Browse
 `webSearch` navigates DuckDuckGo HTML, extracts results via JS. `browse.readText` navigates first then extracts — ensures correct page (not previous).
 
+### Inline HTML artifacts: the content rule list is the whole security story, and it does not take a regex
+
+A closed ```html/```svg fence in an assistant reply renders as a live page
+(`HTMLArtifactView`), the way Gemini renders one. Three things bit, in order.
+
+**A half-streamed document must not run.** The first shape mounted the web view
+from the segmenter's ordinary `.code` fence, which meant every html reply
+executed a `<script>` whose function bodies were still arriving and reloaded the
+page on every token after that. `MarkdownSegmenter` now emits `.html` ONLY for a
+fence the model closed; until then the block is a code block, exactly as before.
+Nothing about that is visible from the view, which is why the rule lives in the
+segmenter and is pinned by `testUnterminatedHtmlFenceStaysCode`.
+
+**`WKContentRuleList`'s `url-filter` is not full regex.** The shipped-first rule
+was `^(https?|wss?|ftp|file)://`, and WebKit answers
+`Disjunctions are not supported yet` — the engine has no alternation. That
+failure is completely silent from the app's side: compilation is asynchronous,
+the error goes to a callback nobody was reading, `withNetworkBlocker` hands back
+nil, and every artifact in the app quietly renders the refusal page instead of
+the model's work. Found by a throwaway `swift` script that stood a real
+`WKWebView` up around the same scaffold and script, not by a unit test — no
+type checker can see inside a JSON string literal. The guard that exists now
+(`HTMLArtifactTests.testTheNetworkBlockerCompiles`) compiles the real constant
+into a temp store and is red-on-revert against the disjunction.
+
+**`.*` compiles, and over-blocks.** The obvious fix — block every URL — was
+measured in the same probe: it blocks remote subresources and `fetch` as
+intended, but ALSO `blob:` URLs and Web Workers, so a chart that exports its
+canvas or any worker-backed library silently breaks. Filtering per scheme
+(`^https?://`, `^wss?://`, `^ftp://`, `^file://`, plus a generic
+`^[a-z][a-z0-9+.-]*://`) was measured to block remote loads and `fetch` while
+leaving `data:` (how a model embeds an image), `blob:`, workers and `srcdoc`
+frames working. A nil base URL is NOT a substitute for any of it: it stops
+relative URLs and cross-origin `fetch`, but a `<script src="https://…">` is a
+subresource load and no navigation delegate is ever asked about one.
+
+Two consequences shaped the code. Compilation being async means the LOAD has to
+happen inside the callback — a rule list added after a load does not apply to
+it — which is why `load` is callback-shaped rather than a straight
+`loadHTMLString`. And a blocker that cannot be compiled must refuse: the payload
+decision is `HTMLArtifact.payload(for:networkBlocked:)`, so "render the model's
+HTML with no blocker installed" is not reachable by forgetting a branch at a
+call site.
+
+The rest of the containment is ordinary but worth listing because each item is a
+thing a model's page tried or could try: navigation is cancelled except the
+initial about:blank (a clicked link opens in the user's own browser instead),
+`window.open` returns nil, alert/confirm/prompt and `<input type=file>` all
+complete unshown, autoplay needs a user action, and the data store is
+non-persistent — shared across artifacts so a long transcript shares content
+processes rather than spawning one per block.
+
+Height is the page's own answer, posted back over a script message handler. It
+is measured from `body` (`scrollHeight` plus computed margins), never
+`documentElement`, which never reports less than the viewport and so gives a
+block that can grow and never shrink; the default 8px body margin a
+model-written document keeps is why the margins are added back. Swift clamps the
+result, because a page with `height: 1e9` or a NaN measurement does not break one
+block — a NaN frame breaks the whole chat column.
+
+The Settings toggle that picks which half opens (Settings ▸ Chat) reads through
+a SwiftUI environment key, not `@EnvironmentObject var appState`. `MarkdownText`
+renders inside `ModelDetailSheet` as well as the transcript, and a sheet does not
+inherit the environment of the view it hangs on — an object read there traps at
+first render, which is the crash `SheetEnvironmentAuditTests` exists for. An
+environment key has a default, so a surface that publishes nothing gets previews
+and no surface can crash for staying quiet.
+
+`Package.swift` says SwaTex was chosen to avoid "a WebView/JavaScript renderer
+and the security, selection, and streaming seams that would come with one". That
+is still true and still the right call for math. Streaming and security are
+answered above; selection is the seam genuinely given up — text inside an
+artifact selects within the page, not as part of a drag across the whole reply —
+which is why the block keeps a Code toggle showing the same `CodeBlockBody`
+every other fence renders.
+
+### Refining it: an artifact is a surface, not a page in a box
+
+The first shape was faithful and looked it. A model writes a page — and a page
+written by a model is written for a browser window: `body { min-height: 100vh;
+display: flex; align-items: center; background: #0f172a; color: #e2e8f0 }`.
+Loaded verbatim into a `CodeBlockView` card that is a dark rectangle inside a
+light rounded rectangle with a grey header strip on top, and a hairline between
+them. Three surfaces where the reader sees one object, and every one of them
+technically correct.
+
+Three things fixed it, and each is a different kind of problem.
+
+**The stage.** The page is still loaded verbatim; nothing rewrites the model's
+markup, which is what kept the "a complete document loads VERBATIM" rule true.
+The defaults arrive instead as a `WKUserScript` at document START — a stylesheet
+inserted ahead of everything the page declares, so it is a floor the page
+overrides rather than a costume fighting its CSS. That is also where the app's
+palette is handed over (`--mlx-fg`, `--mlx-bg`, `--mlx-accent`): a model that
+knows about the custom properties can write a widget that matches the chat
+exactly, and one that doesn't still lands on the app's type and accent colour
+instead of Times New Roman on white. Document start is load-bearing a second
+time for a reason that has nothing to do with CSS: the error listeners have to
+be installed before the page's own inline scripts execute, or a script that
+throws has already thrown by the time anything is watching.
+
+**The clamp, and the measurement that was circular.** `min-height: 100vh` inside
+a transcript is a self-fulfilling measurement — `100vh` resolves to the frame
+height, which is whatever we guessed, so the page reports our guess back and can
+never say anything else however long it settles. Measured, with a 90pt card in a
+400pt frame: 428pt reported, i.e. 300-odd points of the model's background
+colour with a two-line widget floating in the middle of it. That is the "crappy
+background" complaint in its exact form. The clamp is the one rule allowed to
+shout (`!important`), and it needs two halves: a stylesheet rule for html/body,
+and a bounded JS pass for descendants, because `.wrap { min-height: 100vh }`
+locks a page just as hard and a rule on html/body cannot reach it. Both halves
+were verified red-on-revert, each reporting the same 428. It removes a FLOOR
+only — nothing is ever made shorter than its own content, or Expand would reveal
+a page cut off at the knee.
+
+Worth recording what was NOT the bug, since the first version of the guard
+tested for it and passed vacuously: a viewport-locked page with content TALLER
+than the frame measures fine, because `scrollHeight` is content-driven and
+`min-height` is a floor. The failure is entirely on short content.
+
+**The hoist.** Once the page collapses to its own content, the remaining
+mismatch is colour: a dark page still sits inside a light card. So the probe
+reports the page's own computed background and the card wears it. An opaque
+colour (alpha ≥ 0.9) becomes the card's fill; a gradient cannot be reduced to
+one fill, so the page keeps painting it edge to edge and only lends its mood —
+which way the floating controls should read, answered by the page's own text
+colour, since light text means a dark surface under it. The fill goes through
+`CodeBlockChrome(fill:)`, a parameter on the shared modifier rather than a
+second modifier, because an artifact with a different corner radius than the
+code block beside it reads as a different app.
+
+**The transparency that isn't available.** The obvious version of all this is to
+make the page transparent and let the card show through. WebKit paints an opaque
+backdrop under a transparent page, and on macOS the public switch does not turn
+it off: `underPageBackgroundColor = .clear` was measured NOT to composite (a
+pixel read off a red backdrop came back dark), and the answer every search result
+gives — `setValue(false, forKey: "drawsBackground")` — is KVC into a private
+property, which this app cannot ship because it also goes to the App Store. So
+the stage gives the page the transcript card's own colour as its DEFAULT
+background instead. There is no seam to hide because both sides paint the same
+thing, and the failure mode is unbuildable rather than fixed.
+
+That has one consequence worth naming: "unpainted" stops being "transparent" and
+has to be RECOGNISED. The probe resolves `--mlx-bg` through a scratch element —
+the same engine that computed the page's colours — and reports anything equal to
+it as unpainted. Without that, every artifact including a plain fragment comes
+back claiming a surface and the "follow the app's appearance" branch is dead
+code.
+
+**Chrome that isn't there until you reach for it.** The header strip is gone from
+the preview half; the controls are a translucent capsule that fades in on hover,
+in the corner, over the page. Material is the only background that reads over
+colours we do not choose, and its light/dark is pointed at what the page
+actually painted rather than at what the app is wearing. The source half keeps
+the ordinary `CodeBlockHeader` + `CodeBlockBody`, because in that half it IS a
+code block and should be indistinguishable from every other one.
+
+**Saying what the page did not get.** Artifacts run offline by design, so a model
+reaching for a charting library on a CDN produces an empty box — the worst
+possible outcome, because it reads as a broken feature rather than a stated
+limitation. Blocked remote loads are counted (a subresource failure fires its
+error event on the ELEMENT and never bubbles, so a capture-phase listener on
+window is the only place that sees one) and named in a strip under the block,
+along with the first uncaught script error. The user's next move — "make it
+self-contained" — is one a local model can actually act on.
+
+Two smaller ones. A collapsed block hands its scroll back to the transcript
+(`documentElement.style.overflow = 'hidden'`, so the wheel event goes unhandled
+and continues up the responder chain) — a tall artifact is exactly what the
+pointer is over while you read past it. And an appearance change REPLACES the
+stage's stylesheet in place rather than reloading the page: a reload restarts a
+running widget from zero, animations and all, for a colour change.
+
+The guards split the same way the code does. `HTMLArtifactRuntimeTests` holds
+everything pure — colour parsing, the surface decision, the report, the
+diagnostic wording, and two structural rules about the stylesheet itself (the
+defaults must never contain `!important`, the clamp must). `HTMLArtifactLiveTests`
+(`MLX_SERVE_LIVE_ARTIFACT=1`) stands a real `WKWebView` up around the real stage
+and probe, because the clamp, the hoist, the blocked-load count and the
+regrow-on-late-layout are all behaviours of strings inside strings — the same
+class of thing that made the content rule list's missing disjunction findable
+only by hand.
+
+
 ### WKWebView main thread
 `BrowserManager` is `@MainActor`. All WKWebView ops (navigate, readText, evaluateJS) on main thread. Created eagerly at app launch so tools work without Browser window open.
 

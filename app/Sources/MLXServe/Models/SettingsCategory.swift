@@ -24,6 +24,9 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case ds4
     case requestDefaults
     case interface
+    /// How the transcript RENDERS a reply, as opposed to what is sent to
+    /// the model — the one thing `requestDefaults` next door is not.
+    case chat
     case voice
     case sandbox
     case messaging
@@ -48,6 +51,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .ds4:               return "DeepSeek-V4 (ds4 engine)"
         case .requestDefaults:   return "Per-Request Defaults"
         case .interface:         return "Interface"
+        case .chat:              return "Chat"
         case .voice:             return "Voice"
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
@@ -80,6 +84,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .ds4:               return "cube"
         case .requestDefaults:   return "slider.horizontal.3"
         case .interface:         return "paintbrush"
+        case .chat:              return "bubble.left.and.bubble.right"
         case .voice:             return "waveform"
         case .sandbox:           return "shield.lefthalf.filled"
         case .messaging:         return "paperplane"

@@ -125,6 +125,11 @@ enum SettingsReset {
                 f("perRequestEnableDrafter") { $0.perRequestEnableDrafter = $1.perRequestEnableDrafter },
             ]
 
+        case .chat:
+            return [
+                f("htmlPreviewsByDefault") { $0.htmlPreviewsByDefault = $1.htmlPreviewsByDefault },
+            ]
+
         case .voice:
             return [
                 f("voiceClonePath") { $0.voiceClonePath = $1.voiceClonePath },

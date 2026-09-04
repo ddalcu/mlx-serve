@@ -13,11 +13,28 @@ import Foundation
 /// prose blocks (including tables) must stay in one segment or selection
 /// breaks at every boundary. Block-level parsing belongs to `MarkdownText`,
 /// which each prose run is handed verbatim.
+///
+/// A third surface joins them: an `html`/`svg` fence the model has CLOSED
+/// becomes `.html` and is mounted as a live document (`HTMLArtifactView`), so
+/// a reply can answer with a chart or a small widget rather than describing
+/// one. What qualifies is `HTMLArtifact.rendersLive` — asked, never restated
+/// here, because a second copy of that rule is how a web view ends up mounted
+/// over source the predicate had already declined.
 enum MarkdownSegmenter {
 
     enum Segment: Equatable {
         case prose(String)
         case code(language: String, code: String)
+        /// A CLOSED fence whose language renders as a live document
+        /// (`HTMLArtifact.rendersLive`) — mounted as a web view rather than
+        /// coloured as source.
+        ///
+        /// Closed is the load-bearing word. Every html reply passes through a
+        /// half-written document on its way to a closed fence, and mounting one
+        /// executes a script whose function bodies are still arriving, then
+        /// reloads it on the next token. Until the closing fence lands the
+        /// block is `.code`, exactly as it was before this existed.
+        case html(language: String, code: String)
     }
 
     /// Fences are matched exactly as `MarkdownText.parseBlocks` matches them —
@@ -52,8 +69,16 @@ enum MarkdownSegmenter {
                     body.append(lines[i])
                     i += 1
                 }
-                if i < lines.count { i += 1 }
-                out.append(.code(language: language, code: body.joined(separator: "\n")))
+                // Only a fence the model actually closed can render; running
+                // out of lines means the reply is still streaming.
+                let closed = i < lines.count
+                if closed { i += 1 }
+                let code = body.joined(separator: "\n")
+                if closed, HTMLArtifact.rendersLive(language: language, code: code) {
+                    out.append(.html(language: language, code: code))
+                } else {
+                    out.append(.code(language: language, code: code))
+                }
                 continue
             }
 

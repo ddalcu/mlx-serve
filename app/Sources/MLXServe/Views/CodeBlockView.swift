@@ -194,80 +194,150 @@ struct CodeBlockView: View {
     let language: String
     let code: String
 
-    @State private var copied = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider().opacity(0.5)
+            CodeBlockBody(language: language, code: code)
+        }
+        .modifier(CodeBlockChrome())
+    }
+
+    private var header: some View {
+        CodeBlockHeader(label: CodeBlockLabel.text(for: language)) {
+            CodeBlockCopyButton(code: code)
+        }
+    }
+
+}
+
+/// The code itself — coloured, horizontally scrollable, no chrome.
+///
+/// Split out of `CodeBlockView` because the inline HTML block's Code toggle has
+/// to show the SAME surface a plain code block shows, not a second rendering of
+/// the same idea: identical font, identical lexer, identical no-wrap scrolling.
+/// `CodeNSText` is fileprivate, so anything that wants this comes through here.
+struct CodeBlockBody: View {
+    let language: String
+    let code: String
 
     private var resolved: SyntaxLanguage? { SyntaxLanguage(fence: language) }
 
-    /// Header label: the fence the model wrote, else nothing to claim.
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            // ONE text view for the whole block. This was a `ForEach`
+            // building a `Text` per line, so a 300-line block carried
+            // hundreds of nodes in SwiftUI's attribute graph and a streaming
+            // reply rebuilt every one of them per token.
+            CodeNSText(attributed: CodeBlockText.code(code, language: resolved), selectable: true,
+                       computed: CodeBlockText.measuredSize(of: code))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+        }
+    }
+}
+
+/// Card background, corner radius and hairline every transcript block wears.
+///
+/// One modifier rather than a copy per block type — an HTML preview sitting
+/// beside a code block with a different radius reads as a different app.
+struct CodeBlockChrome: ViewModifier {
+    /// The surface to paint. `nil` is the transcript's own.
+    ///
+    /// The parameter exists for one caller: an HTML artifact whose page paints
+    /// itself hands its OWN background up here, so the block reads as one
+    /// surface in the model's palette instead of as a coloured rectangle inside
+    /// a grey card. It stays a parameter on the shared modifier rather than a
+    /// second modifier, because the radius and the hairline must not drift
+    /// between a code block and the artifact sitting beside it.
+    var fill: Color?
+
+    func body(content: Content) -> some View {
+        content
+            .background(fill ?? CodeTheme.background)
+            .clipShape(RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius)
+                    .stroke(CodeTheme.border, lineWidth: 1)
+            )
+    }
+}
+
+/// The label a block's header shows for a fence.
+///
+/// Its own type because `CodeBlockHeader` is generic over its controls, and a
+/// static member of a generic type cannot be named while that generic argument
+/// is still being inferred from the trailing closure calling it.
+enum CodeBlockLabel {
+    /// The fence the model wrote, else nothing to claim.
     ///
     /// Deliberately NOT the lexer's name. Several fences share one lexer, so
     /// naming it labelled a `tsx` block "JavaScript", a `java` block "C", and
     /// `svg` / `vue` / `svelte` all "HTML" — describing the highlighter rather
     /// than the code in front of you.
-    private var label: String {
+    static func text(for language: String) -> String {
         let trimmed = language.trimmingCharacters(in: .whitespaces)
         return trimmed.isEmpty ? "Code" : trimmed
     }
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider().opacity(0.5)
-            ScrollView(.horizontal, showsIndicators: false) {
-                // ONE text view for the whole block. This was a `ForEach`
-                // building a `Text` per line, so a 300-line block carried
-                // hundreds of nodes in SwiftUI's attribute graph and a streaming
-                // reply rebuilt every one of them per token.
-                CodeNSText(attributed: CodeBlockText.code(code, language: resolved), selectable: true,
-                           computed: CodeBlockText.measuredSize(of: code))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-            }
-        }
-        .background(CodeTheme.background)
-        .clipShape(RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius)
-                .stroke(CodeTheme.border, lineWidth: 1)
-        )
+/// A block's header strip: the fence label on the left, controls on the right.
+struct CodeBlockHeader<Controls: View>: View {
+    let label: String
+    let controls: Controls
+
+    init(label: String, @ViewBuilder controls: () -> Controls) {
+        self.label = label
+        self.controls = controls()
     }
 
-    private var header: some View {
+    var body: some View {
         HStack(spacing: 6) {
             Text(label)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
-            Spacer()
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(code, forType: .string)
-                copied = true
-                // The tick is the whole confirmation — a copy with no feedback
-                // reads as a dead button and gets clicked again.
-                Task {
-                    try? await Task.sleep(nanoseconds: 1_400_000_000)
-                    copied = false
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 10, weight: .medium))
-                    Text(copied ? "Copied" : "Copy")
-                        .font(.system(size: 10, weight: .medium))
-                }
-                .foregroundStyle(copied ? Color.green : Color.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Copy this code block")
+            Spacer(minLength: 8)
+            controls
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(CodeTheme.header)
     }
+}
 
+/// Copy-to-pasteboard control, shared by every block header.
+struct CodeBlockCopyButton: View {
+    let code: String
+    var help: String = "Copy this code block"
+
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(code, forType: .string)
+            copied = true
+            // The tick is the whole confirmation — a copy with no feedback
+            // reads as a dead button and gets clicked again.
+            Task {
+                try? await Task.sleep(nanoseconds: 1_400_000_000)
+                copied = false
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium))
+                Text(copied ? "Copied" : "Copy")
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundStyle(copied ? Color.green : Color.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
 }
 
 /// A code block's text, drawn by the text system rather than by a stack of

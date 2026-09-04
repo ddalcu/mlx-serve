@@ -2497,6 +2497,11 @@ struct ChatDetailView: View {
                 // drawn by the scroll view itself so nothing new can intercept
                 // a click.
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                // Which half a `.html` block opens on. Published HERE, on the
+                // transcript, rather than read from `appState` inside the
+                // block: the same markdown renderer draws inside a sheet,
+                // where an `@EnvironmentObject` read would trap.
+                .environment(\.htmlPreviewsEnabled, appState.serverOptions.htmlPreviewsByDefault)
                 // The transcript is moved from exactly one place — `applyScroll`
                 // — and only ever by a decision `ChatScrollState` made.
                 .scrollPosition($scrollPosition)
@@ -4615,6 +4620,12 @@ struct MarkdownText: View {
                     }
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
+                case .html(let language, let code):
+                    // A closed html/svg fence renders as a live page, with its
+                    // source one click away. Only CLOSED ones reach here — see
+                    // `MarkdownSegmenter.Segment.html` for why a streaming
+                    // block must stay a code block.
+                    HTMLArtifactView(language: language, code: code)
                 }
             }
         }
