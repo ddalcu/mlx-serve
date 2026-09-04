@@ -1225,6 +1225,7 @@ pub fn main(init: std.process.Init) !void {
     // latest user turn at request time, regardless of architecture.
     try config.populateUserTurnMarker(allocator, tok, chat_config.chat_template);
     config.populateLfm2ImageTokens(tok);
+    config.populatePixtralImageTokens(tok);
 
     const load_vision = config.has_vision and !no_vision;
 

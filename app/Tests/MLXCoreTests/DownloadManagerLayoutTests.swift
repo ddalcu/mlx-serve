@@ -325,6 +325,22 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
+    func testMistral3IsSupportedArchitecture() {
+        // Mistral Small 3.1/3.2 (Mistral3ForConditionalGeneration) ships
+        // model_type "mistral3" — a multimodal container wrapping the
+        // already-supported flat "mistral" text backbone plus a Pixtral
+        // vision tower the server doesn't implement yet. A locally
+        // discovered checkpoint must NOT be flagged "Unsupported
+        // architecture" (mirrors the gemma3_text / qwen3_moe_text tags).
+        for mt in ["mistral", "mistral3"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/Mistral-Small-3.1-24B-Instruct-2503-4bit",
+                sizeFormatted: "13 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isSupportedArchitecture, "\"\(mt)\" must be in supportedModelTypes")
+        }
+    }
+
     // MARK: - mmproj sidecar filtering
 
     /// `mmproj-*.gguf` files are CLIP / audio encoders, not language models —

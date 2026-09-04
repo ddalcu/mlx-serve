@@ -45,6 +45,7 @@ let supportedModelTypes: Set<String> = [
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
+    "mistral3", // Mistral Small 3.1/3.2; text via the flat "mistral" arch + Pixtral vision
     "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)

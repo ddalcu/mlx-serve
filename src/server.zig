@@ -11,6 +11,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const pixtral_vision = @import("pixtral_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -10443,6 +10444,45 @@ fn lfm2ImageSegment(
     return try seg.toOwnedSlice(allocator);
 }
 
+/// Mistral3's Pixtral processor lays each image out row-major with an
+/// `[IMG_BREAK]` after every row except the last, whose break is replaced by
+/// `[IMG_END]`: `([IMG]*W + [IMG_BREAK])*H` then swap the final break — not
+/// a flat pad run wrapped in BOI/EOI like the generic path below assumes.
+/// `patchMerge` (src/pixtral_vision.zig) crops the merged grid down to
+/// `(grid_h/merge)*merge` × `(grid_w/merge)*merge` on an odd patch grid, so
+/// the row/col counts here are derived the same way (floor division) to keep
+/// the pad count matching the tower's own token count.
+///
+/// Returns null when the model isn't pixtral, the turn carries no images, or
+/// the tokenizer never resolved the break/end markers — in which case the
+/// caller falls back to the flat BOI/pads/EOI run.
+fn pixtralImageSegment(
+    allocator: std.mem.Allocator,
+    media_msg: ?*const chat_mod.Message,
+    config: *const model_mod.ModelConfig,
+) !?[]u32 {
+    if (!config.pixtral_vision) return null;
+    if (config.pv_break_token_id == 0 or config.pv_end_token_id == 0) return null;
+    const msg = media_msg orelse return null;
+    const images: []const chat_mod.ImageData = msg.images orelse &.{};
+    if (images.len == 0) return null;
+
+    const merge = if (config.pv_spatial_merge > 0) config.pv_spatial_merge else 1;
+    var seg = std.ArrayList(u32).empty;
+    errdefer seg.deinit(allocator);
+    for (images) |img| {
+        const bh = img.grid_h / merge;
+        const bw = img.grid_w / merge;
+        if (bh == 0 or bw == 0) continue;
+        var row: u32 = 0;
+        while (row < bh) : (row += 1) {
+            try seg.appendNTimes(allocator, config.image_token_id, bw);
+            try seg.append(allocator, if (row + 1 == bh) config.pv_end_token_id else config.pv_break_token_id);
+        }
+    }
+    return try seg.toOwnedSlice(allocator);
+}
+
 fn insertMultimodalTokens(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
@@ -10472,12 +10512,16 @@ fn insertMultimodalTokens(
 
     const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
     defer if (lfm2_seg) |ls| allocator.free(ls);
+    const pixtral_seg: ?[]u32 = if (want_image and lfm2_seg == null) try pixtralImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
+    defer if (pixtral_seg) |ps| allocator.free(ps);
 
     var seg = std.ArrayList(u32).empty;
     defer seg.deinit(allocator);
     if (want_image) {
         if (lfm2_seg) |ls| {
             try seg.appendSlice(allocator, ls);
+        } else if (pixtral_seg) |ps| {
+            try seg.appendSlice(allocator, ps);
         } else {
             if (boi > 0) try seg.append(allocator, boi);
             try seg.appendNTimes(allocator, image_token_id, n_image);
@@ -10530,6 +10574,14 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.pixtral_vision) {
+        return .{
+            .mode = .pixtral,
+            .patch = config.vision_patch_size,
+            .merge = config.pv_spatial_merge,
+            .max_pixels = config.pv_image_size,
+        };
+    }
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -11003,6 +11055,36 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
+
+    // Pixtral (mistral3): its own resize algorithm (caps the LONGEST EDGE in
+    // pixels, floor-then-ceil-div to patch multiples — no merge-factor area
+    // bound like Qwen/Muse) and its own CLIP mean/std normalization (not the
+    // 0.5/0.5 every other tower shares), so it gets its own branch rather
+    // than folding into the generic factor/min/max-pixels block below.
+    if (vp.mode == .pixtral) {
+        const rs = pixtral_vision.resizePixtral(src_h, src_w, if (vp.max_pixels > 0) vp.max_pixels else 1024, vp.patch);
+        const rh = rs.h;
+        const rw = rs.w;
+        const C: u32 = 3;
+        const gh = rh / vp.patch;
+        const gw = rw / vp.patch;
+        const n: usize = @as(usize, gh) * gw;
+        const feat: usize = @as(usize, C) * vp.patch * vp.patch;
+        const plane: usize = @as(usize, rh) * rw;
+
+        const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
+        defer allocator.free(chw);
+        const source_len: usize = @as(usize, src_h) * src_w * C;
+        pixtral_vision.resizeRgbBicubicClipNormalizedChw(allocator, chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
+
+        const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
+        const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
+        pixtral_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch);
+        log.info("  Decoded {d}x{d} image → pixtral grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+            src_w, src_h, gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh,
+        });
+        return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
+    }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
@@ -16275,6 +16357,55 @@ test "lfm2ImageSegment wraps an untiled image and declines every other arch" {
     // Not LFM2-VL ⇒ null, so every other arch keeps the flat BOI/pads/EOI run.
     config.lfm2_vision = false;
     try testing.expect((try lfm2ImageSegment(testing.allocator, &msgs[0], &config)) == null);
+}
+
+test "pixtralImageSegment breaks every row and swaps the final break for IMG_END" {
+    // Mistral3's processor emits ([IMG]*W + [IMG_BREAK])*H then swaps the
+    // LAST break for [IMG_END] — a flat pad run drops every row delimiter
+    // the checkpoint was trained on.
+    var config = model_mod.ModelConfig{ .model_type = "mistral" };
+    config.pixtral_vision = true;
+    config.image_token_id = 10;
+    config.pv_break_token_id = 12;
+    config.pv_end_token_id = 13;
+    config.pv_spatial_merge = 2;
+
+    // A 110x83-patch grid (resizePixtral(2000, 1500, 1540, 14)) merges to
+    // bh=55, bw=41 after patchMerge crops the odd 83 down to 82 — keep this
+    // test's grid small but still exercise the odd-width crop.
+    const imgs = [_]chat_mod.ImageData{
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 4, .grid_w = 6 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
+    const seg = (try pixtralImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
+    defer testing.allocator.free(seg);
+
+    // bh=2, bw=3: two rows of 3 pads each, first row ends in a break, second
+    // (last) row ends in IMG_END.
+    const want = [_]u32{
+        10, 10, 10, 12,
+        10, 10, 10, 13,
+    };
+    try testing.expectEqualSlices(u32, &want, seg);
+}
+
+test "pixtralImageSegment declines without resolved break/end markers or on other archs" {
+    var config = model_mod.ModelConfig{ .model_type = "mistral" };
+    config.pixtral_vision = true;
+    config.image_token_id = 10;
+    config.pv_spatial_merge = 2;
+
+    const imgs = [_]chat_mod.ImageData{
+        .{ .pixels = "", .width = 0, .height = 0, .grid_h = 4, .grid_w = 6 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
+    // Markers never resolved (tokenizer lacked them) ⇒ null, flat pad run stays.
+    try testing.expect((try pixtralImageSegment(testing.allocator, &msgs[0], &config)) == null);
+
+    config.pv_break_token_id = 12;
+    config.pv_end_token_id = 13;
+    config.pixtral_vision = false;
+    try testing.expect((try pixtralImageSegment(testing.allocator, &msgs[0], &config)) == null);
 }
 
 test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
