@@ -5405,6 +5405,85 @@ test "ModelConfig parses Qwen3.5 vision tower + interleaved M-RoPE" {
     try testing.expectApproxEqAbs(@as(f32, 0.25), config.partial_rotary_factor, 1e-6);
 }
 
+test "parseConfigFromJson: qwen3_vl remaps the family and captures the original type" {
+    // The Qwen3-VL-Embedding shape: model_type qwen3_vl must (a) remap to the
+    // dense qwen3 trunk, (b) keep the verbatim original type in the by-value
+    // buffer so useChatTemplateEmbeddings() gates the chat-template path,
+    // (c) land vision_config keys in qv_* (the embedding model ships
+    // num_position_embeddings), and (d) read M-RoPE sections from
+    // text_config.rope_scaling. No allocator-owned fields — the
+    // testing.allocator would flag a leak at test end if parse dupe'd anything.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_vl",
+        \\  "image_token_id": 215404,
+        \\  "video_token_id": 215405,
+        \\  "vision_start_token_id": 215402,
+        \\  "vision_end_token_id": 215403,
+        \\  "text_config": {
+        \\    "hidden_size": 2048,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "head_dim": 128,
+        \\    "rope_scaling": {
+        \\      "rope_theta": 5000000,
+        \\      "mrope_section": [24, 20, 20],
+        \\      "mrope_interleaved": true
+        \\    }
+        \\  },
+        \\  "vision_config": {
+        \\    "model_type": "qwen3_vl",
+        \\    "depth": 24,
+        \\    "hidden_size": 1152,
+        \\    "num_heads": 16,
+        \\    "intermediate_size": 4304,
+        \\    "patch_size": 14,
+        \\    "temporal_patch_size": 2,
+        \\    "spatial_merge_size": 2,
+        \\    "num_position_embeddings": 2304,
+        \\    "out_hidden_size": 2048
+        \\  },
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    // (a) family remap: trunk is plain qwen3, weights under language_model.
+    try testing.expectEqualStrings("qwen3", config.model_type);
+    try testing.expect(config.has_qk_norm and !config.norm_has_offset);
+    // (b) original type captured by value — gates /v1/embeddings onto the
+    // chat-template path. qwen3_vl_text must match the same family.
+    try testing.expect(config.useChatTemplateEmbeddings());
+    try testing.expectEqualStrings("qwen3_vl", config.original_model_type_buf[0..config.original_model_type_len]);
+    const json_text = try std.fmt.allocPrint(testing.allocator, "{s}", .{json});
+    defer testing.allocator.free(json_text);
+    const config2 = blk: {
+        const swapped = std.mem.replaceOwned(u8, testing.allocator, json_text, "\"qwen3_vl\"", "\"qwen3_vl_text\"") catch unreachable;
+        defer testing.allocator.free(swapped);
+        break :blk try parseConfigFromJson(testing.allocator, swapped);
+    };
+    try testing.expect(config2.useChatTemplateEmbeddings());
+    // A trunk-family type must NOT take the chat-template embedding path.
+    const config3 = blk: {
+        const swapped = std.mem.replaceOwned(u8, testing.allocator, json_text, "\"qwen3_vl\"", "\"qwen3_5\"") catch unreachable;
+        defer testing.allocator.free(swapped);
+        break :blk try parseConfigFromJson(testing.allocator, swapped);
+    };
+    try testing.expect(!config3.useChatTemplateEmbeddings());
+    // (c) vision tower geometry.
+    try testing.expect(config.has_vision);
+    try testing.expect(config.qwen_vision);
+    try testing.expectEqual(@as(u32, 24), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1152), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), config.qv_heads);
+    try testing.expectEqual(@as(u32, 72), config.qv_head_dim); // 1152 / 16
+    try testing.expectEqual(@as(u32, 2048), config.qv_out_hidden);
+    try testing.expectEqual(@as(u32, 2304), config.qv_num_pos_emb);
+    // (d) M-RoPE from rope_scaling.
+    try testing.expect(config.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 24, 20, 20 }, config.mrope_section);
+    try testing.expectEqual(@as(u32, 215404), config.image_token_id);
+}
+
 test "parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts" {
     const current = parseVisionProcessorDefaultsFromJson(
         \\{"image_processor":{"min_pixels":65536,"max_pixels":16777216}}
