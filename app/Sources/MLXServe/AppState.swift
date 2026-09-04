@@ -738,6 +738,40 @@ class AppState: ObservableObject {
         }
     }
 
+    /// The chat window's Start button: bring the server up and get this chat
+    /// answerable, WITHOUT making the model the launch default.
+    ///
+    /// It used to call `ensureServerForLan()`, which passes `--model` — and a
+    /// `--model` entry is the registry's default, so ejecting it brings it back
+    /// on the next request (the tray-Start trap, issue #214). Starting headless
+    /// and then hot-loading through `ServerManager.ensureDefaultChatModel`
+    /// reaches the same resident model as an ordinary registry entry, one the
+    /// user can eject and have stay ejected.
+    ///
+    /// The load is kicked HERE rather than left to the first turn because the
+    /// user just pressed a button and is owed a spinner: `loadingModelPath`
+    /// is what makes the pill name the model and spin while it loads. Same
+    /// generation guard as a hot-switch — a stale task must not clear a newer
+    /// switch's flag.
+    ///
+    /// Nothing local selected means the model answering is on another Mac, and
+    /// a headless server is all the proxy needs.
+    func startServerForChat() {
+        guard server.status != .running, server.status != .starting else { return }
+        server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        guard !selectedModelPath.isEmpty else { return }
+        let path = selectedModelPath
+        let mgr = server
+        modelSwitchGeneration += 1
+        let generation = modelSwitchGeneration
+        loadingModelPath = path
+        pendingModelLoadTask = Task { @MainActor in
+            defer { if self.modelSwitchGeneration == generation { self.loadingModelPath = nil } }
+            try? await mgr.waitUntilRunning(timeout: 240)
+            await mgr.ensureDefaultChatModel(selectedModelPath: path)
+        }
+    }
+
     /// Freshen the network-model list for a picker that is about to show it.
     /// No-op when discovery is off; boots the server (headless) when needed.
     func refreshLanModels() async {
