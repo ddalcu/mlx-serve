@@ -8272,6 +8272,8 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // prefill chunk and returns to 0 the moment the prefill ends.
     ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
+    ctx.metrics.prefill_target_tokens.set(ctx.scheduler.inflight_prefill_target_tokens.load(.monotonic));
+    ctx.metrics.prefill_prompt_tokens.set(ctx.scheduler.inflight_prefill_prompt_tokens.load(.monotonic));
 }
 
 fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {

@@ -100,6 +100,26 @@ pub const Metrics = struct {
     // Slots currently in prefill. Flips as soon as prefill starts, so the panel
     // can name the phase without waiting for the first chunk's token count.
     requests_prefilling: Gauge,
+    // The DENOMINATOR for `prefill_tokens_live`: tokens the running prefill
+    // will actually forward — `slot.full_prompt` AFTER the hot prefix cache
+    // trimmed the reused head off it. Same base as the numerator, so
+    // live/target is a true percentage.
+    //
+    // 0 means EITHER no prefill is running OR one is running but has not yet
+    // reached the trim point (the cache restore happens first and can take
+    // seconds on a long prompt). Disambiguate with `requests_prefilling`.
+    prefill_target_tokens: Gauge,
+    // The UNTRIMMED prompt length of the running prefill, published at entry.
+    // Paired with `prefill_target_tokens` it makes the hot prefix cache's
+    // contribution to THIS request observable while it happens:
+    //
+    //     reused_now = prefill_prompt_tokens - prefill_target_tokens
+    //
+    // The existing `prefix_cache_*_total` counters only give lifetime sums;
+    // they cannot answer "what did the request I am watching reuse?". That
+    // question is what a live panel — and anyone validating a prefix-cache
+    // change — actually asks. 0 when no prefill is running.
+    prefill_prompt_tokens: Gauge,
     // MLX allocator split. `memory_mb` above is the whole process footprint;
     // these two say where it went. `mlx_active_bytes` is memory in USE,
     // `mlx_cache_bytes` is MLX's reclaimable buffer pool — memory the process
@@ -139,6 +159,8 @@ pub const Metrics = struct {
             .generation_tokens_live = Gauge.init(),
             .prefill_tokens_live = Gauge.init(),
             .requests_prefilling = Gauge.init(),
+            .prefill_target_tokens = Gauge.init(),
+            .prefill_prompt_tokens = Gauge.init(),
             .mlx_active_bytes = Gauge.init(),
             .mlx_cache_bytes = Gauge.init(),
             .ane_int8_bytes = Gauge.init(),
@@ -251,6 +273,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "mlx_serve:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
     try writeGauge(w, "mlx_serve:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
+    try writeGauge(w, "mlx_serve:prefill_target_tokens", "Tokens the in-flight prefill will forward, after prefix-cache trim (denominator for prefill_tokens_live; 0 when idle or before the trim point - see requests_prefilling)", m.prefill_target_tokens.load());
+    try writeGauge(w, "mlx_serve:prefill_prompt_tokens", "Untrimmed prompt length of the in-flight prefill; minus prefill_target_tokens gives the tokens the hot prefix cache restored for this request (0 when idle)", m.prefill_prompt_tokens.load());
     try writeGauge(w, "mlx_serve:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
     try writeGauge(w, "mlx_serve:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
     try writeGauge(w, "mlx_serve:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
@@ -294,6 +318,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"generation_tokens_live\":{d}," ++
             "\"prefill_tokens_live\":{d}," ++
             "\"requests_prefilling\":{d}," ++
+            "\"prefill_target_tokens\":{d}," ++
+            "\"prefill_prompt_tokens\":{d}," ++
             "\"mlx_active_bytes\":{d}," ++
             "\"mlx_cache_bytes\":{d}," ++
             "\"ane_int8_bytes\":{d}," ++
@@ -315,6 +341,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.generation_tokens_live.load(),
             m.prefill_tokens_live.load(),
             m.requests_prefilling.load(),
+            m.prefill_target_tokens.load(),
+            m.prefill_prompt_tokens.load(),
             m.mlx_active_bytes.load(),
             m.mlx_cache_bytes.load(),
             m.ane_int8_bytes.load(),
@@ -607,6 +635,60 @@ test "prefill progress is exposed live, not only at request completion" {
     var jw2 = std.Io.Writer.fixed(&j2);
     try renderJson(&m, &jw2);
     try testing.expect(std.mem.indexOf(u8, jw2.buffered(), "\"requests_prefilling\":1") != null);
+}
+
+test "prefill target/prompt pair exposes live prefix-cache reuse" {
+    const testing = std.testing;
+    // `prefill_tokens_live` had no denominator: "12288 tokens done" out of
+    // WHAT? And the `prefix_cache_*_total` counters are lifetime sums, so
+    // nothing answered "what did the request I am watching reuse?".
+    //
+    // The pair does both. `prompt` is the untrimmed length, `target` is what
+    // the chunk loop will really forward after the hot cache trimmed the
+    // reused head, so:
+    //     progress = live / target        reused_now = prompt - target
+    var m = Metrics.init();
+
+    // The measured warm request from the commit message (M4 Max,
+    // Qwen3.5-4B-4bit): a 27399-token prompt whose head the cache restored,
+    // 3111 tokens left to compute, 24288 tokens' worth of head reused.
+    m.prefill_prompt_tokens.set(27399);
+    m.prefill_target_tokens.set(3111);
+    m.prefill_tokens_live.set(1024);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "# TYPE mlx_serve:prefill_prompt_tokens gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "# TYPE mlx_serve:prefill_target_tokens gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_prompt_tokens 27399") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_target_tokens 3111") != null);
+
+    var jbuf: [8192]u8 = undefined;
+    var jw = std.Io.Writer.fixed(&jbuf);
+    try renderJson(&m, &jw);
+    const jout = jw.buffered();
+    try testing.expect(std.mem.indexOf(u8, jout, "\"prefill_prompt_tokens\":27399") != null);
+    try testing.expect(std.mem.indexOf(u8, jout, "\"prefill_target_tokens\":3111") != null);
+
+    // The contract a consumer relies on: target never exceeds prompt, and the
+    // difference is the reuse. A target published BEFORE the hot-cache trim
+    // would make these equal and the reuse invisible — which is the whole
+    // point of the pair.
+    const prompt = m.prefill_prompt_tokens.load();
+    const target = m.prefill_target_tokens.load();
+    try testing.expect(target <= prompt);
+    try testing.expectEqual(@as(u64, 24288), prompt - target);
+
+    // At rest all three read 0 together. ds4/llama/diffusion prefills never
+    // move any of them, so a consumer must not see prompt > 0 next to
+    // target == 0 and read it as "nothing left to compute".
+    m.prefill_prompt_tokens.set(0);
+    m.prefill_target_tokens.set(0);
+    m.prefill_tokens_live.set(0);
+    try testing.expectEqual(@as(u64, 0), m.prefill_prompt_tokens.load());
+    try testing.expectEqual(@as(u64, 0), m.prefill_target_tokens.load());
 }
 
 test "renderPrometheus emits well-formed Prometheus text" {

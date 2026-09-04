@@ -1259,6 +1259,23 @@ pub const Scheduler = struct {
     /// prompt-token counters and prefill-time histograms only advance when the
     /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
     inflight_prefill_tokens: std.atomic.Value(u64),
+    /// Denominator for `inflight_prefill_tokens`: how many tokens the running
+    /// prefill will forward, measured AFTER the hot prefix cache trimmed the
+    /// reused prefix away. Same base as the progress counter, so a panel can
+    /// render live/target directly. Written once the hot cache has trimmed
+    /// the prompt — NOT at entry, or a 34K prompt that restores 33K would
+    /// report a bar jumping straight to 97%. Cleared on every exit path.
+    /// Gated on `--metrics` like the rest of this block.
+    inflight_prefill_target_tokens: std.atomic.Value(u64),
+    /// Untrimmed prompt length of the running prefill, published at ENTRY —
+    /// before the hot prefix cache restore, which is itself slow enough to be
+    /// visible. Two things fall out of it:
+    ///   1. a panel can name the size of the work the instant prefill starts,
+    ///      instead of showing 0/0 until the trim point;
+    ///   2. `full - target` is what the cache restored FOR THIS REQUEST, live.
+    ///      The `prefix_cache_*_total` counters only give lifetime sums.
+    /// Cleared on every exit path with the rest. Gated on `--metrics`.
+    inflight_prefill_prompt_tokens: std.atomic.Value(u64),
     /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
     /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
     /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
@@ -1375,6 +1392,8 @@ pub const Scheduler = struct {
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_target_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_prompt_tokens = std.atomic.Value(u64).init(0),
             .requests_prefilling = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
@@ -5150,6 +5169,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
+        sch.inflight_prefill_target_tokens.store(0, .monotonic);
+        sch.inflight_prefill_prompt_tokens.store(0, .monotonic);
     };
 
     // ds4-backed model: bypass the MLX prefill path entirely. The ds4
@@ -5168,6 +5189,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (slot.model.transformer.?.config.isDiffusion()) {
         return runPrefillDiffusion(sch, slot);
     }
+    // Publish the untrimmed size now that the alternate engines have been
+    // ruled out. The hot-cache restore below runs before the trim point and
+    // can take seconds on a long prompt; a panel that shows 0/0 for that
+    // whole window looks stalled.
+    //
+    // BELOW the ds4/llama/diffusion returns on purpose: those paths never
+    // move `inflight_prefill_tokens` either, so publishing at entry would
+    // leave prompt>0 next to target=0 and live=0 for the whole of such a
+    // prefill — a consumer reads that as "nothing left to compute", or
+    // divides by zero. All three gauges stay 0 together on those paths, as
+    // they did before this change.
+    if (observe) sch.inflight_prefill_prompt_tokens.store(slot.full_prompt.len, .monotonic);
+
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
     // but cheap).
@@ -5340,6 +5374,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     dflash_restored = null;
     const mtp_pass = mtp_restored;
     mtp_restored = null;
+    // Publish the prefill denominator now that the hot cache has trimmed
+    // `prefill_tokens` to what the chunk loop will really forward. Set here
+    // rather than at entry so a 34K prompt that restores 33K from the prefix
+    // cache reports the 1K it actually computes, not a bar that jumps to 97%.
+    if (observe) sch.inflight_prefill_target_tokens.store(prefill_tokens.len, .monotonic);
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,

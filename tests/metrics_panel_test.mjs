@@ -21,8 +21,9 @@ const src = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
 // The file guards its IIFE on `typeof document`, so in node only the top-level
 // helpers evaluate. It hands them back through `globalThis.__mlxPanel`.
 new Function(src)();
-const { computeRates } = globalThis.__mlxPanel ?? {};
+const { computeRates, prefillPhaseLabel } = globalThis.__mlxPanel ?? {};
 assert.ok(computeRates, 'metrics.js must expose computeRates for tests');
+assert.ok(prefillPhaseLabel, 'metrics.js must expose prefillPhaseLabel for tests');
 
 const counters = (over = {}) => ({
   prompt_tokens_total: 10000,
@@ -43,6 +44,8 @@ const gauges = (over = {}) => ({
   generation_tokens_live: 500,
   prefill_tokens_live: 0,
   requests_prefilling: 0,
+  prefill_target_tokens: 0,
+  prefill_prompt_tokens: 0,
   ...over,
 });
 
@@ -131,6 +134,73 @@ test('decode tok/s is 0 when nothing is running', () => {
   ];
   const r = computeRates(now, samples, counters(), gauges({ requests_running: 0 }), 5.0);
   assert.equal(r.decodeTps, 0);
+});
+
+
+// ── Prefill progress: a numerator needs a denominator on the same base ───────
+//
+// Live numbers from tests/test_metrics.sh Phase 6 (Qwen3.5-4B-4bit, M4 Max):
+// cold prompt=target=16512; warm prompt=22518 target=6037 reused=16481.
+
+test('prefill progress renders live/target with the reuse, on real Phase 6 numbers', () => {
+  const label = prefillPhaseLabel(gauges({
+    prefill_tokens_live: 2048, prefill_target_tokens: 6037, prefill_prompt_tokens: 22518,
+  }));
+  assert.equal(label, 'prefilling · 2.0K / 6.0K (34%) · 16.5K reused');
+});
+
+test('a cold prefill shows no reuse clause (target == prompt)', () => {
+  const label = prefillPhaseLabel(gauges({
+    prefill_tokens_live: 8192, prefill_target_tokens: 16512, prefill_prompt_tokens: 16512,
+  }));
+  assert.equal(label, 'prefilling · 8.2K / 16.5K (50%)');
+});
+
+// This is the panel-side statement of what Phase 6 pins on the server side: a
+// target published ABOVE the hot-cache trim equals the prompt, so the bar jumps
+// to the reuse fraction on the first chunk and the reuse vanishes. Same live
+// count, same prompt — only the target moves.
+test('a pre-trim target would hide the reuse and inflate the bar', () => {
+  const g = { prefill_tokens_live: 2048, prefill_prompt_tokens: 22518 };
+  const correct = prefillPhaseLabel(gauges({ ...g, prefill_target_tokens: 6037 }));
+  const broken  = prefillPhaseLabel(gauges({ ...g, prefill_target_tokens: 22518 }));
+  assert.match(correct, /16\.5K reused/);
+  assert.doesNotMatch(broken, /reused/);
+  assert.match(correct, /\(34%\)/);
+  assert.match(broken, /\(9%\)/);
+});
+
+// target == 0 is "the size is not known yet", NOT "0% done". It happens for the
+// whole of the hot-cache restore (seconds on a long prompt) and for every
+// ds4/llama/diffusion prefill, which never move any of the three gauges.
+test('no denominator yet renders the phase word, never 0%', () => {
+  assert.equal(prefillPhaseLabel(gauges({ prefill_prompt_tokens: 22518 })), 'prefilling');
+  assert.equal(prefillPhaseLabel(gauges()), 'prefilling');
+});
+
+// An older server (or a ds4 path that moved only the live counter) must keep the
+// pre-pair behaviour rather than dividing by zero.
+test('a feed without the pair falls back to the bare token count', () => {
+  const g = gauges({ prefill_tokens_live: 4096 });
+  delete g.prefill_target_tokens;
+  delete g.prefill_prompt_tokens;
+  assert.equal(prefillPhaseLabel(g), 'prefilling · 4.1K tok');
+});
+
+// The chunk loop stops one token (plus the SSM snapshot backoff) short of the
+// target, and a sampler tick can pair a new request's live count with the
+// previous target. Neither may render as more than 100%.
+test('the percentage is clamped at 100', () => {
+  const label = prefillPhaseLabel(gauges({
+    prefill_tokens_live: 30000, prefill_target_tokens: 6037, prefill_prompt_tokens: 22518,
+  }));
+  assert.match(label, /\(100%\)/);
+});
+
+// Same discipline as every other tile: derived from the current feed, nothing
+// carried between ticks. Once the prefill ends all three read 0 together.
+test('the pair returns to rest together, so the label carries nothing forward', () => {
+  assert.equal(prefillPhaseLabel(gauges()), 'prefilling');
 });
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
