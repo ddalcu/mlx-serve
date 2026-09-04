@@ -4432,6 +4432,65 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
 }
 
+test "expandImagePadTokens expands the pad run and appends bos" {
+    const a = testing.allocator;
+    // Chat-template shape: [system…, vision_start, pad, vision_end, text…];
+    // 2×2 merge over a 4×4 patch grid → 4 merged tokens replace the ONE pad.
+    const rendered = [_]u32{ 1, 2, 151665, 215404, 151666, 42 };
+    const out = try expandImagePadTokens(a, &rendered, 215404, 4, 151643);
+    defer a.free(out);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 151665, 215404, 215404, 215404, 215404, 151666, 42, 151643 }, out);
+
+    // No bos configured → no trailing token.
+    const no_bos = try expandImagePadTokens(a, &.{ 7, 215404, 8 }, 215404, 2, null);
+    defer a.free(no_bos);
+    try testing.expectEqualSlices(u32, &.{ 7, 215404, 215404, 8 }, no_bos);
+
+    // A template that rendered NO pad is an error, not a silent pass-through.
+    try testing.expectError(error.NoImagePad, expandImagePadTokens(a, &.{ 1, 2, 3 }, 215404, 4, null));
+}
+
+test "ParsedEmbeddingInput.parse: content parts, chat wrapper and rejection" {
+    const a = testing.allocator;
+
+    // OpenAI shape: text + image_url parts join into one Part.
+    var parsed_val = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]
+    , .{});
+    defer parsed_val.deinit();
+    var p1 = try ParsedEmbeddingInput.parse(a, parsed_val.value, "test");
+    defer p1.deinit();
+    try testing.expectEqual(@as(usize, 1), p1.items.len);
+    try testing.expectEqualStrings("hello", p1.items[0].text);
+    try testing.expectEqual(@as(usize, 1), p1.items[0].images.len);
+    try testing.expectEqualStrings("data:image/png;base64,AAAA", p1.items[0].images[0]);
+    try testing.expectEqualSlices(usize, &.{5}, p1.items[0].token_counts);
+
+    // Chat shape: [ {content: [parts]} ] unwraps the content array.
+    var chat_val = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]
+    , .{});
+    defer chat_val.deinit();
+    var p2 = try ParsedEmbeddingInput.parse(a, chat_val.value, "test");
+    defer p2.deinit();
+    try testing.expectEqualStrings("a\nb", p2.items[0].text);
+    try testing.expectEqual(@as(usize, 0), p2.items[0].images.len);
+    try testing.expectEqualSlices(usize, &.{ 1, 1 }, p2.items[0].token_counts);
+
+    // Bare string elements are text.
+    var bare_val = try std.json.parseFromSlice(std.json.Value, a, "\"just a string\"", .{});
+    defer bare_val.deinit();
+    // (a bare string is NOT an array — parse must reject it)
+    try testing.expectError(error.InvalidInput, ParsedEmbeddingInput.parse(a, bare_val.value, "test"));
+
+    // Unknown part type → InvalidInput.
+    var bad_val = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"audio","data":"x"}]
+    , .{});
+    defer bad_val.deinit();
+    try testing.expectError(error.InvalidInput, ParsedEmbeddingInput.parse(a, bad_val.value, "test"));
+}
+
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -4814,6 +4873,36 @@ fn sendEmbeddingsResponse(
     log.info("  <- {d} embeddings ({d} tokens)\n", .{ rows.len, total_tokens });
 }
 
+/// Expand the ONE `<|image_pad|>` the chat template rendered into the
+/// image's merged patch-token count (`n_merged` copies of `pad_id`), then
+/// append the trailing bos (`TemplateProcessing` post-processor emulation,
+/// identical to the text path). Caller owns the returned slice.
+/// `error.NoImagePad` — the template rendered no pad token at all (a text
+/// shape that must be rejected, not silently passed through).
+fn expandImagePadTokens(
+    allocator: std.mem.Allocator,
+    rendered_ids: []const u32,
+    pad_id: u32,
+    n_merged: usize,
+    bos: ?u32,
+) error{ NoImagePad, OutOfMemory }![]u32 {
+    std.debug.assert(pad_id != 0);
+    var ids_list = std.ArrayList(u32).empty;
+    errdefer ids_list.deinit(allocator);
+    var saw_pad = false;
+    for (rendered_ids) |id| {
+        if (id == pad_id) {
+            saw_pad = true;
+            try ids_list.appendNTimes(allocator, pad_id, n_merged);
+        } else {
+            try ids_list.append(allocator, id);
+        }
+    }
+    if (!saw_pad) return error.NoImagePad;
+    if (bos) |b| try ids_list.append(allocator, b);
+    return ids_list.toOwnedSlice(allocator);
+}
+
 /// ── Multimodal embeddings (Qwen3-VL-Embedding class, fixed batch=1) ────────
 ///
 /// Serves one image+text (or text-only) input routed here by handleEmbeddings'
@@ -4962,26 +5051,15 @@ fn handleMultimodalEmbedding(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model has no image_token_id", null);
         return;
     }
-    var ids_list = std.ArrayList(u32).empty;
-    defer ids_list.deinit(allocator);
-    var saw_pad = false;
-    for (rendered_ids) |id| {
-        if (id == pad_id) {
-            saw_pad = true;
-            try ids_list.appendNTimes(allocator, pad_id, n_merged);
-        } else {
-            try ids_list.append(allocator, id);
-        }
-    }
-    if (!saw_pad) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Chat template did not render an image_pad token", null);
-        return;
-    }
-    // TemplateProcessing post-processor: trailing <EOS> (bos_token_id for
-    // Qwen3-VL) — same emulation as the text path.
-    if (config.bos_token_id) |bos| try ids_list.append(allocator, bos);
-    const final_ids = try allocator.dupe(u32, ids_list.items);
-    defer allocator.free(final_ids);
+    const expanded = expandImagePadTokens(allocator, rendered_ids, pad_id, n_merged, config.bos_token_id) catch |err| switch (err) {
+        error.NoImagePad => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Chat template did not render an image_pad token", null);
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(expanded);
+    const final_ids = expanded;
 
     const seqs = [_][]const u32{final_ids};
 
