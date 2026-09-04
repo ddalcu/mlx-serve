@@ -434,11 +434,10 @@ pub const ConstraintPhase = struct {
     }
 };
 
-pub const FINAL_ANSWER_RESERVE_TOKENS: u32 = 64;
-
-pub fn answerReserveReached(completion_tokens: u32, max_tokens: u32) bool {
-    const remaining = max_tokens -| completion_tokens;
-    return remaining <= FINAL_ANSWER_RESERVE_TOKENS + 1;
+/// Recovery must leave one token for constrained output. At the ordinary
+/// completion cap, the caller keeps the existing length-stop behavior.
+fn forcedBoundaryCanContinue(completion_tokens: u32, max_tokens: u32) bool {
+    return completion_tokens +| 1 < max_tokens;
 }
 
 /// RAII bundle for grammar-constrained sampling. Owns the parsed schema,
@@ -510,12 +509,11 @@ test "ConstraintPhase defers the final-answer grammar through reasoning" {
     try std.testing.expectEqual(@as(?u32, null), forced.force());
 }
 
-test "deferred final-answer reserve stays inside the completion cap" {
-    try std.testing.expect(answerReserveReached(0, 64));
-    try std.testing.expect(answerReserveReached(0, 65));
-    try std.testing.expect(!answerReserveReached(0, 66));
-    try std.testing.expect(answerReserveReached(35, 100));
-    try std.testing.expect(!answerReserveReached(34, 100));
+test "forced reasoning boundary leaves room for constrained output" {
+    try std.testing.expect(forcedBoundaryCanContinue(0, 2));
+    try std.testing.expect(forcedBoundaryCanContinue(8, 10));
+    try std.testing.expect(!forcedBoundaryCanContinue(0, 1));
+    try std.testing.expect(!forcedBoundaryCanContinue(9, 10));
 }
 
 test "forced reasoning boundary is committed and counted exactly once" {
@@ -528,6 +526,7 @@ test "forced reasoning boundary is committed and counted exactly once" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "advanceStep(1)"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "constraint.phase.force()"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "xfm.forwardWith(&self.ctx, tok_input)"));
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (!self.canForceDeferredConstraintBoundary()) return null;") != null);
 }
 
 /// Per-token logprob info (OpenAI format).
@@ -2683,14 +2682,13 @@ pub const Generator = struct {
         return !constraint.phase.active and constraint.phase.activate_after_token != null;
     }
 
-    pub fn loopGuardStart(self: *const Generator) usize {
-        return @min(self.loop_guard_start, self.generated_ids.items.len);
+    pub fn canForceDeferredConstraintBoundary(self: *const Generator) bool {
+        return self.hasDeferredConstraint() and
+            forcedBoundaryCanContinue(self.completion_tokens, self.max_tokens);
     }
 
-    pub fn deferredAnswerReserveReached(self: *const Generator) bool {
-        return self.hasDeferredConstraint() and
-            @as(u32, self.completion_tokens) < self.max_tokens and
-            answerReserveReached(@intCast(self.completion_tokens), self.max_tokens);
+    pub fn loopGuardStart(self: *const Generator) usize {
+        return @min(self.loop_guard_start, self.generated_ids.items.len);
     }
 
     /// Commit the configured reasoning close token through the live model
@@ -2701,7 +2699,10 @@ pub const Generator = struct {
         const constraint = self.sampling.constraint orelse return null;
         if (constraint.phase.active) return null;
         const boundary = constraint.phase.activate_after_token orelse return null;
-        if (self.completion_tokens >= self.max_tokens) return null;
+        // A forced close is recovery, not a way to consume the final completion
+        // token. Leave room to sample at least one constrained answer token;
+        // ordinary max_tokens exhaustion otherwise keeps its normal length stop.
+        if (!self.canForceDeferredConstraintBoundary()) return null;
 
         if (self.has_pending_logits) {
             _ = mlx.mlx_array_free(self.pending_logits);
@@ -7591,11 +7592,87 @@ pub const Generator = struct {
         return token;
     }
 
-    /// Synchronous sampling step for a request carrying a grammar. A deferred
-    /// final-answer grammar uses this same path without a mask until its
-    /// reasoning boundary; unlike the ordinary lazy path, no token is sampled
-    /// one step ahead of that transition. Once active, this builds the mask,
-    /// samples, advances the grammar, and pre-launches the next forward pass.
+    /// Sample one unconstrained reasoning token while a final-answer grammar is
+    /// deferred. Keeping this separate leaves the established active-grammar
+    /// path below unchanged.
+    fn nextDeferredConstraint(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint) !?u32 {
+        const step_logits = self.pending_logits;
+        self.has_pending_logits = false;
+        var owns_step_logits = true;
+        defer {
+            if (owns_step_logits) _ = mlx.mlx_array_free(step_logits);
+        }
+
+        const lazy = self.sampleLazy(step_logits);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+        _ = mlx.mlx_array_free(lazy);
+        const token: u32 = @intCast(val);
+        self.next_token_id = token;
+        const natural_boundary = constraint.phase.activate_after_token == token;
+
+        for (self.eos_token_ids) |eos_id| {
+            if (token == eos_id and !natural_boundary) {
+                _ = mlx.mlx_array_free(step_logits);
+                owns_step_logits = false;
+                if (try self.forceDeferredConstraintBoundary(allocator)) |forced| {
+                    log.info("[grammar] reasoning boundary forced after premature EOS\n", .{});
+                    return forced;
+                }
+                self.done = true;
+                self.finish_reason = "stop";
+                return null;
+            }
+        }
+        if (token == 0) {
+            self.consecutive_pad += 1;
+            if (self.consecutive_pad >= 3) {
+                _ = mlx.mlx_array_free(step_logits);
+                owns_step_logits = false;
+                if (try self.forceDeferredConstraintBoundary(allocator)) |forced| {
+                    log.info("[grammar] reasoning boundary forced after terminal padding\n", .{});
+                    return forced;
+                }
+                self.done = true;
+                self.finish_reason = "stop";
+                return null;
+            }
+        } else {
+            self.consecutive_pad = 0;
+        }
+
+        const activated = constraint.phase.observe(token);
+        if (activated) log.info("[grammar] reasoning boundary reached; enforcing final-answer schema\n", .{});
+
+        self.advanceStep(1);
+        try self.generated_ids.append(allocator, token);
+        if (activated) self.loop_guard_start = self.generated_ids.items.len;
+
+        if (self.step < self.max_tokens) {
+            const tok_i32: i32 = @intCast(token);
+            const tok_shape = [_]c_int{ 1, 1 };
+            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(tok_input);
+            const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+            const arr = [_]mlx.mlx_array{next_logits};
+            const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+            _ = mlx.mlx_async_eval(vec);
+            _ = mlx.mlx_vector_array_free(vec);
+            self.pending_logits = next_logits;
+            self.has_pending_logits = true;
+        } else {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return token;
+    }
+
+    /// Synchronous, grammar-constrained sampling step. Used whenever
+    /// `sampling.constraint` is non-null. Builds a token mask from the grammar's
+    /// current state, applies it to the pending logits, samples, advances the
+    /// grammar by the sampled token's bytes, and pre-launches the next forward
+    /// pass to overlap with the next mask build.
     fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (!self.has_pending_logits) {
             self.done = true;
@@ -7611,83 +7688,52 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return null;
         }
-        if (self.deferredAnswerReserveReached()) {
-            const forced = try self.forceDeferredConstraintBoundary(allocator);
-            if (forced != null) {
-                log.info("[grammar] reasoning boundary forced to preserve {d} final-answer tokens\n", .{FINAL_ANSWER_RESERVE_TOKENS});
-                return forced;
-            }
-        }
-
         const constraint = self.sampling.constraint.?;
-        const enforcing = constraint.phase.active;
+        if (!constraint.phase.active) return self.nextDeferredConstraint(allocator, constraint);
         const s = self.xfm.s;
 
-        var natural_activation = false;
-        if (enforcing) {
-            const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
-            if (allowed == 0) {
-                // No legal token: every logit would be -inf and argmax over that
-                // row returns id 0, whose bytes then fail `acceptByte` and switch
-                // enforcement off anyway — one garbage token later, and with the
-                // grammar bug reported as model output. Say so and degrade here.
-                log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
-                constraint.grammar.dead = true;
-                @memset(constraint.mask_buf, true);
-            }
+        const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        if (allowed == 0) {
+            // No legal token: every logit would be -inf and argmax over that
+            // row returns id 0, whose bytes then fail `acceptByte` and switch
+            // enforcement off anyway — one garbage token later, and with the
+            // grammar bug reported as model output. Say so and degrade here.
+            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+            constraint.grammar.dead = true;
+            @memset(constraint.mask_buf, true);
+        }
 
-            // Also allow every stop-id the generator recognises once the grammar is
-            // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
-            // but models often have additional stop tokens (e.g. `<|im_end|>` for
-            // Qwen, `<end_of_turn>` for Gemma 4) registered via the config — without
-            // this, the model can never stop.
-            if (constraint.grammar.isComplete()) {
-                for (self.eos_token_ids) |eos_id| {
-                    if (eos_id < constraint.mask_buf.len) constraint.mask_buf[eos_id] = true;
-                }
+        // Also allow every stop-id the generator recognises once the grammar is
+        // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
+        // but models often have additional stop tokens (e.g. `<|im_end|>` for
+        // Qwen, `<end_of_turn>` for Gemma 4) registered via the config — without
+        // this, the model can never stop.
+        if (constraint.grammar.isComplete()) {
+            for (self.eos_token_ids) |eos_id| {
+                if (eos_id < constraint.mask_buf.len) constraint.mask_buf[eos_id] = true;
             }
         }
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        var owns_step_logits = true;
-        defer {
-            if (owns_step_logits) _ = mlx.mlx_array_free(step_logits);
-        }
+        defer _ = mlx.mlx_array_free(step_logits);
 
-        var masked_logits: mlx.mlx_array = .{ .ctx = null };
-        defer if (masked_logits.ctx != null) {
-            _ = mlx.mlx_array_free(masked_logits);
-        };
-        const sample_logits = if (enforcing) blk: {
-            masked_logits = mlx.mlx_array_new();
-            try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
-            break :blk masked_logits;
-        } else step_logits;
+        var masked_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked_logits);
+        try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
 
         // Synchronous sample: we need the realized token id to advance the grammar.
-        const lazy = self.sampleLazy(sample_logits);
+        const lazy = self.sampleLazy(masked_logits);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
         _ = mlx.mlx_array_free(lazy);
         const token: u32 = @intCast(val);
         self.next_token_id = token;
-        const natural_boundary = self.hasDeferredConstraint() and
-            self.sampling.constraint.?.phase.activate_after_token == token;
 
         // Stop on EOS — do not advance grammar or include in output.
         for (self.eos_token_ids) |eos_id| {
-            if (token == eos_id and !natural_boundary) {
-                if (self.hasDeferredConstraint()) {
-                    _ = mlx.mlx_array_free(step_logits);
-                    owns_step_logits = false;
-                    const forced = try self.forceDeferredConstraintBoundary(allocator);
-                    if (forced != null) {
-                        log.info("[grammar] reasoning boundary forced after premature EOS\n", .{});
-                        return forced;
-                    }
-                }
+            if (token == eos_id) {
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -7696,15 +7742,6 @@ pub const Generator = struct {
         if (token == 0) {
             self.consecutive_pad += 1;
             if (self.consecutive_pad >= 3) {
-                if (self.hasDeferredConstraint()) {
-                    _ = mlx.mlx_array_free(step_logits);
-                    owns_step_logits = false;
-                    const forced = try self.forceDeferredConstraintBoundary(allocator);
-                    if (forced != null) {
-                        log.info("[grammar] reasoning boundary forced after terminal padding\n", .{});
-                        return forced;
-                    }
-                }
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -7713,30 +7750,24 @@ pub const Generator = struct {
             self.consecutive_pad = 0;
         }
 
-        if (enforcing) {
-            // Advance the grammar by the sampled token's byte sequence. The
-            // mask guarantees every byte is accepted (or the token has no byte
-            // form, e.g. a special tag).
-            if (token < constraint.token_bytes.bytes.len) {
-                if (constraint.token_bytes.bytes[token]) |bytes| {
-                    for (bytes) |b| {
-                        const ok = try constraint.grammar.acceptByte(b);
-                        if (!ok) {
-                            log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
-                            constraint.grammar.dead = true;
-                            break;
-                        }
+        // Advance the grammar by the sampled token's byte sequence. The mask
+        // guarantees every byte is accepted (or the token has no byte form, e.g. a
+        // special tag) — so a rejection here means a bug we want to surface.
+        if (token < constraint.token_bytes.bytes.len) {
+            if (constraint.token_bytes.bytes[token]) |bytes| {
+                for (bytes) |b| {
+                    const ok = try constraint.grammar.acceptByte(b);
+                    if (!ok) {
+                        log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
+                        constraint.grammar.dead = true;
+                        break;
                     }
                 }
             }
-        } else if (constraint.phase.observe(token)) {
-            natural_activation = true;
-            log.info("[grammar] reasoning boundary reached; enforcing final-answer schema\n", .{});
         }
 
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (natural_activation) self.loop_guard_start = self.generated_ids.items.len;
 
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);

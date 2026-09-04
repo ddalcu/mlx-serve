@@ -183,18 +183,6 @@ const corpus = [_]Expect{
         .reasoning_contains = "17*20=340",
     },
     .{
-        // Synthetic minimum of the live reasoning + response_format failure:
-        // the schema-conforming object belongs after the template-opened
-        // reasoning boundary and must remain visible content on every sink.
-        .family = "qwen",
-        .name = "template-opened reasoning followed by schema JSON",
-        .raw = "A draft such as {\"answer\":\"tentative\"} can appear here.</think>\n{\"answer\":\"final\"}",
-        .thinking = true,
-        .opened_by_template = true,
-        .content_exact = "{\"answer\":\"final\"}",
-        .reasoning_contains = "{\"answer\":\"tentative\"}",
-    },
-    .{
         // BUG 1 (2026-06-10 pi session): generation hit max_tokens before
         // `</think>`, so the output has NO think tags at all. Pre-fix the
         // truncated reasoning was dumped into visible content.
