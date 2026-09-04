@@ -249,13 +249,10 @@ class AppState: ObservableObject {
             // dead-control class. Seed it with the answer the other mode was
             // already giving, so the control opens on what is about to happen.
             guard startupModelMode == .pinned, startupModelPinnedPath.isEmpty else { return }
-            let pickable = localModels.filter(\.isChatPickable)
-            startupModelPinnedPath = StartupModelChoice.resolved(
-                mode: .lastUsed,
-                pinnedPath: nil,
+            startupModelPinnedPath = StartupModelChoice.seedPin(
                 lastUsed: StartupModelChoice.lastUsed(),
-                installedPaths: pickable.map(\.path)
-            ) ?? pickable.first?.path ?? ""
+                installedPaths: localModels.filter(\.isChatPickable).map(\.path)
+            )
         }
     }
     /// The model pinned by `startupModelMode == .pinned`. Empty means nothing
