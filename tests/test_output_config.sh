@@ -13,9 +13,9 @@
 #     turns it ON
 #   - `format: {type: "json_schema", schema: ...}` is enforced by the grammar
 #     mask: the reply's `text` content is valid JSON carrying the schema's
-#     required keys — and it lands in CONTENT. A supported bare-`<think>`
-#     prompt may also carry a separate thinking block; other formats fall back
-#     to thinking off.
+#     required keys — and it lands in CONTENT, not inside a thinking block
+#     (a token-0 mask cannot express "think first, then JSON", so a schema
+#     request forces thinking off)
 #
 # Greedy throughout. Usage: ./tests/test_output_config.sh [model_dir] [port]
 
@@ -103,6 +103,12 @@ if echo "$TEXT" | jq -e 'has("title") and has("summary")' >/dev/null 2>&1; then
     run_test "schema-conforming JSON in content" PASS ""
 else
     run_test "schema-conforming JSON in content" FAIL "text: $(echo "$TEXT" | head -c 160)"
+fi
+if echo "$BODY" | jq -r '[.content[].type] | join(",")' | grep -q "thinking"; then
+    run_test "schema request forces thinking off (mask is content-only)" FAIL \
+        "thinking block present beside a masked generation"
+else
+    run_test "schema request forces thinking off (mask is content-only)" PASS ""
 fi
 
 echo
