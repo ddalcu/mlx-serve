@@ -138,12 +138,33 @@ pub fn rescaleZeroTerminalSnr(acp: []f64) void {
     acp[acp.len - 1] = ZERO_SNR_TERMINAL_ACP;
 }
 
+/// numpy's rounding — half-to-EVEN, not half-away-from-zero like Zig's
+/// `@round`. Every spacing rule below is a transcription of a numpy expression
+/// diffusers evaluates, and the two disagree on exact halves: a 16-step
+/// `trailing` ladder puts 812.5 at 812 (numpy) or 813 (`@round`), which is a
+/// whole training timestep of drift on a distill that only takes four.
+/// `v` must be non-negative (every schedule value is).
+fn roundHalfEven(v: f64) usize {
+    std.debug.assert(v >= 0.0);
+    const fl = @floor(v);
+    const frac = v - fl;
+    const up = frac > 0.5 or (frac == 0.5 and @mod(fl, 2.0) != 0.0);
+    return @intFromFloat(if (up) fl + 1.0 else fl);
+}
+
 /// The training timestep indices for `steps` inference steps.
 ///
 /// "leading" walks 0, ratio, 2*ratio, … with `ratio = num_train // steps`, then
 /// REVERSES so sampling runs high-noise → low-noise. diffusers adds
 /// `steps_offset` (1 for SDXL) to each; that offset is the caller's, kept out of
 /// here so the spacing rule stays one idea.
+///
+/// "trailing" and "linspace" are FLOAT ladders. `trailing` in particular is
+/// `round(arange(1000, 0, -1000/steps)) - 1`, and the stride is the real ratio,
+/// NOT `num_train // steps`: at 6 steps the integer stride gives
+/// `[999, 833, 667, 501, 335, 169]` against diffusers' `[999, 832, 666, 499,
+/// 332, 166]`, drifting further at every step. The two agree only where `steps`
+/// divides 1000, which is exactly the set the schedule tests used to cover.
 pub fn timestepIndices(spacing: TimestepSpacing, steps: usize, out: []usize) void {
     std.debug.assert(out.len == steps);
     if (steps == 0) return;
@@ -154,9 +175,13 @@ pub fn timestepIndices(spacing: TimestepSpacing, steps: usize, out: []usize) voi
             for (out, 0..) |*t, i| t.* = (steps - 1 - i) * ratio;
         },
         .trailing => {
-            const ratio = n / steps;
-            // n - 1, n - 1 - ratio, … (already descending)
-            for (out, 0..) |*t, i| t.* = (n - 1) -| (i * ratio);
+            // `round(arange(n, 0, -n/steps)) - 1` — already descending.
+            const top = @as(f64, @floatFromInt(n));
+            const stride = top / @as(f64, @floatFromInt(steps));
+            for (out, 0..) |*t, i| {
+                const v = top - stride * @as(f64, @floatFromInt(i));
+                t.* = roundHalfEven(v) -| 1;
+            }
         },
         .linspace => {
             if (steps == 1) {
@@ -167,7 +192,7 @@ pub fn timestepIndices(spacing: TimestepSpacing, steps: usize, out: []usize) voi
             const denom = @as(f64, @floatFromInt(steps - 1));
             for (out, 0..) |*t, i| {
                 const asc = span * @as(f64, @floatFromInt(steps - 1 - i)) / denom;
-                t.* = @intFromFloat(@round(asc));
+                t.* = roundHalfEven(asc);
             }
         },
     }
@@ -1169,6 +1194,46 @@ test "sdxl distilled: trailing spacing starts at the noisiest timestep" {
     var lead: [4]usize = undefined;
     timestepIndices(.leading, 4, &lead);
     try testing.expectEqual(@as(usize, 750), lead[0]);
+}
+
+test "sdxl distilled: trailing is a FLOAT stride, matching diffusers off the divisors" {
+    // Regression (PR #301 review): the stride was the integer `1000 / steps`,
+    // which agrees with diffusers only when `steps` divides 1000. Every ladder
+    // below is `round(arange(1000, 0, -1000/steps)) - 1` evaluated with numpy's
+    // half-to-even rounding, transcribed from diffusers `EulerDiscreteScheduler`.
+    const Case = struct { steps: usize, want: []const usize };
+    const cases = [_]Case{
+        // Non-divisors: where the integer stride drifted. 6 steps read
+        // `[999, 833, 667, 501, 335, 169]` before this fix.
+        .{ .steps = 3, .want = &.{ 999, 666, 332 } },
+        .{ .steps = 6, .want = &.{ 999, 832, 666, 499, 332, 166 } },
+        .{ .steps = 7, .want = &.{ 999, 856, 713, 570, 428, 285, 142 } },
+        // Half-to-even, not half-away-from-zero: 812.5 rounds DOWN to 812,
+        // so index 3 is 811 and not 812. `@round` gets this one wrong.
+        .{ .steps = 16, .want = &.{ 999, 937, 874, 811, 749, 687, 624, 561, 499, 437, 374, 311, 249, 187, 124, 61 } },
+        // Divisors still land where they always did.
+        .{ .steps = 1, .want = &.{999} },
+        .{ .steps = 4, .want = &.{ 999, 749, 499, 249 } },
+        .{ .steps = 25, .want = &.{ 999, 959, 919, 879, 839, 799, 759, 719, 679, 639, 599, 559, 519, 479, 439, 399, 359, 319, 279, 239, 199, 159, 119, 79, 39 } },
+    };
+    var buf: [64]usize = undefined;
+    for (cases) |c| {
+        const out = buf[0..c.steps];
+        timestepIndices(.trailing, c.steps, out);
+        try testing.expectEqualSlices(usize, c.want, out);
+    }
+}
+
+test "sdxl distilled: linspace rounds half-to-even like numpy" {
+    // Same rounding rule, same reference expression
+    // (`linspace(0, 999, steps)[::-1]`): 832.5 at 7 steps goes DOWN.
+    var seven: [7]usize = undefined;
+    timestepIndices(.linspace, 7, &seven);
+    try testing.expectEqualSlices(usize, &[_]usize{ 999, 832, 666, 500, 333, 166, 0 }, &seven);
+
+    var sixteen: [16]usize = undefined;
+    timestepIndices(.linspace, 16, &sixteen);
+    try testing.expectEqualSlices(usize, &[_]usize{ 999, 932, 866, 799, 733, 666, 599, 533, 466, 400, 333, 266, 200, 133, 67, 0 }, &sixteen);
 }
 
 test "sdxl distilled: the derivative reduces to the model output for epsilon" {

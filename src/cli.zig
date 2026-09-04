@@ -85,6 +85,27 @@ pub const Alias = struct {
     /// id. Lets `illustrious:q4` and `illustrious:q8` (same repo, different
     /// subdir) land in distinct dirs that discovery finds as separate models.
     dest_name: []const u8 = "",
+    /// Non-empty: pull exactly this ONE root file and nothing else — the
+    /// single-file LDM distribution `sdxl_single_file` reads. Twins the app's
+    /// `ImageModelPreset.singleFileCheckpoint`, and is a REQUIREMENT rather
+    /// than an optimisation on a repo that ships a diffusers folder beside the
+    /// checkpoint (NoobAI): a downloaded `model_index.json` sends
+    /// `Engine.loadAuto` down the folder path, and NoobAI V-Pred's own
+    /// `scheduler/scheduler_config.json` declares `"prediction_type":
+    /// "epsilon"` — wrong for it. Only the checkpoint carries the `v_pred` /
+    /// `ztsnr` marker tensors that say otherwise.
+    single_file: []const u8 = "",
+
+    /// The alias' download shape, as `pullRepo` reads it.
+    pub fn resolve(self: Alias) Resolved {
+        return .{
+            .repo = self.repo,
+            .gguf_file = self.gguf_file,
+            .subdir = self.subdir,
+            .dest_name = self.dest_name,
+            .single_file = self.single_file,
+        };
+    }
 };
 
 /// Mirrors the app catalog (`gemmaModelOptions` in ChatModels.swift) for chat
@@ -128,14 +149,18 @@ pub const aliases = [_]Alias{
     // SDXL Turbo — adversarially distilled, guidance-free, 1-4 steps.
     .{ .name = "sdxl", .tag = "turbo", .repo = "stabilityai/sdxl-turbo" },
     // Pony Diffusion V6 XL — a single-file LDM checkpoint (Civitai), served by
-    // `sdxl_single_file`. The repo also carries a standalone VAE + sample
-    // images; the loader picks the LDM checkpoint by its header markers.
-    .{ .name = "pony", .tag = "v6", .repo = "LyliaEngine/Pony_Diffusion_V6_XL", .is_default = true },
+    // `sdxl_single_file`. The repo also carries a standalone `sdxl_vae`
+    // checkpoint; `single_file` names the one we want rather than landing both
+    // and leaving the loader's header markers to tell them apart.
+    .{ .name = "pony", .tag = "v6", .repo = "LyliaEngine/Pony_Diffusion_V6_XL", .is_default = true, .single_file = "ponyDiffusionV6XL_v6StartWithThisOne.safetensors" },
     // NoobAI-XL — single-file LDM checkpoints, same `sdxl_single_file` path.
     // `v1.1` is epsilon-prediction; `vpred` ships the v-prediction +
-    // zero-terminal-SNR marker tensors `sdxl_single_file` reads at load.
-    .{ .name = "noobai", .tag = "v1.1", .repo = "Laxhar/noobai-XL-1.1", .is_default = true },
-    .{ .name = "noobai", .tag = "vpred", .repo = "Laxhar/noobai-XL-Vpred-1.0" },
+    // zero-terminal-SNR marker tensors `sdxl_single_file` reads at load. Both
+    // repos ALSO carry a complete diffusers folder, so `single_file` is what
+    // keeps `model_index.json` off disk — see `Alias.single_file` for why
+    // taking that folder would silently sample V-Pred on an epsilon ladder.
+    .{ .name = "noobai", .tag = "v1.1", .repo = "Laxhar/noobai-XL-1.1", .is_default = true, .single_file = "NoobAI-XL-v1.1.safetensors" },
+    .{ .name = "noobai", .tag = "vpred", .repo = "Laxhar/noobai-XL-Vpred-1.0", .single_file = "NoobAI-XL-Vpred-v1.0.safetensors" },
     // Illustrious XL v2 — one repo, three diffusers variants in subfolders. Each
     // `subdir` is pulled flat into its own dest so they coexist as separate
     // models. q4/q8 need the SDXL affine-quant path (`sdxl_nn` QLinear); bf16 is
@@ -165,6 +190,8 @@ pub const Resolved = struct {
     gguf_file: []const u8 = "",
     subdir: []const u8 = "",
     dest_name: []const u8 = "",
+    /// See `Alias.single_file`.
+    single_file: []const u8 = "",
 
     /// The `<org>/<name>` to store under — `dest_name` when set, else the repo.
     pub fn destRepo(self: Resolved) []const u8 {
@@ -203,9 +230,9 @@ pub fn resolveShortName(name: []const u8) ?Resolved {
     for (aliases) |a| {
         if (!std.ascii.eqlIgnoreCase(a.name, base)) continue;
         if (tag.len == 0) {
-            if (a.is_default) return .{ .repo = a.repo, .gguf_file = a.gguf_file, .subdir = a.subdir, .dest_name = a.dest_name };
+            if (a.is_default) return a.resolve();
         } else if (std.ascii.eqlIgnoreCase(a.tag, tag)) {
-            return .{ .repo = a.repo, .gguf_file = a.gguf_file, .subdir = a.subdir, .dest_name = a.dest_name };
+            return a.resolve();
         }
     }
     return null;
@@ -496,10 +523,21 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
+    // The repo SHAPE is a property of the whole listing, not of any one path
+    // (`layoutFor`): whether this is a diffusers multifolder repo, and which
+    // components publish an fp16 weight variant.
+    const paths = allocator.alloc([]const u8, files.len) catch {
+        reporter.say("error: out of memory listing {s}", .{resolved.repo});
+        return error.PullFailed;
+    };
+    defer allocator.free(paths);
+    for (files, 0..) |f, i| paths[i] = f.path;
+    const layout = layoutFor(resolved, paths);
+
     var wanted: usize = 0;
     var total_bytes: u64 = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (!wantedFile(resolved, layout, f.path)) continue;
         wanted += 1;
         total_bytes += f.size;
     }
@@ -511,7 +549,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
 
     var idx: usize = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (!wantedFile(resolved, layout, f.path)) continue;
         idx += 1;
         // A subdir alias strips its prefix so the variant lands as a flat model
         // dir (`q4/unet/…` -> `unet/…`); the download URL still uses the full
@@ -538,10 +576,111 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     reporter.say("success: {s} ready", .{resolved.repo});
 }
 
-fn wantedFile(resolved: Resolved, path: []const u8) bool {
+/// The diffusers component dirs the SDXL / SD 1.x backends read, in the order
+/// `sdxl_pipeline.Engine.load` binds them. Everything else a stability repo
+/// ships under a subfolder — `vae_1_0/`, `vae_decoder/`, `vae_encoder/`,
+/// `safety_checker/`, `feature_extractor/`, `onnx/`, `openvino/` — is an export
+/// for another runtime or a component we never load.
+const DIFFUSERS_COMPONENTS = [_][]const u8{
+    "scheduler", "tokenizer", "tokenizer_2", "text_encoder", "text_encoder_2", "unet", "vae",
+};
+
+fn diffusersComponentIndex(dir: []const u8) ?usize {
+    for (DIFFUSERS_COMPONENTS, 0..) |c, i| {
+        if (std.mem.eql(u8, c, dir)) return i;
+    }
+    return null;
+}
+
+/// What the repo's LISTING says about its shape — the part of "is this file
+/// wanted?" that a single path cannot answer.
+///
+/// `model.loadWeights` sweeps EVERY `*.safetensors` in a component dir into one
+/// map, so exactly one weight variant may land per dir: two is both a doubled
+/// download and a key-for-key collision. Which one is right depends on what the
+/// rest of the dir holds, hence the per-component bits.
+pub const RepoLayout = struct {
+    /// Root `model_index.json` — a diffusers multifolder repo.
+    diffusers: bool = false,
+    /// Bit i: component i publishes a `.fp16.safetensors` weight file.
+    fp16: u16 = 0,
+
+    fn has(self: RepoLayout, ci: usize) bool {
+        return self.fp16 & (@as(u16, 1) << @intCast(ci)) != 0;
+    }
+};
+
+/// Read the shape off the repo listing. `paths` is every file in the tree.
+pub fn layoutFor(resolved: Resolved, paths: []const []const u8) RepoLayout {
+    // A single-artifact pull never consults the layout, and a `subdir` variant
+    // has its own (already flat, already one-variant) rule.
+    if (resolved.gguf_file.len > 0 or resolved.single_file.len > 0 or resolved.subdir.len > 0) return .{};
+    var out: RepoLayout = .{};
+    for (paths) |path| {
+        if (std.mem.eql(u8, path, "model_index.json")) {
+            out.diffusers = true;
+            continue;
+        }
+        const slash = std.mem.indexOfScalar(u8, path, '/') orelse continue;
+        const ci = diffusersComponentIndex(path[0..slash]) orelse continue;
+        const rel = path[slash + 1 ..];
+        if (!std.mem.endsWith(u8, rel, ".safetensors")) continue;
+        if (std.mem.indexOf(u8, rel, ".non_ema.") != null) continue;
+        if (std.mem.indexOf(u8, rel, ".fp16.") != null) out.fp16 |= @as(u16, 1) << @intCast(ci);
+    }
+    return out;
+}
+
+/// Keep a file from a diffusers multifolder repo (`sdxl`, `sdxl:turbo`,
+/// `sd1`, `sd1:turbo`).
+///
+/// `shouldDownload`'s flat-repo rule rejects every nested path except `mtp/`,
+/// which for these repos means the ENTIRE model: `unet/`, `vae/`,
+/// `text_encoder*/`, `tokenizer*/` and `scheduler/` all live one level down.
+/// What survived was `model_index.json` plus the root single-file checkpoints —
+/// so `mlx-serve pull sdxl` fetched 13.9 GB of merged checkpoint, and
+/// `Engine.loadAuto`, seeing the index, took the folder path and failed on the
+/// missing `text_encoder/`.
+///
+/// Mirrors the app's `MediaBundle.sdxlDiffusers` / `.sd1Diffusers` selection:
+/// component dirs only, `.safetensors`/`.json`/`.txt` only (which drops the
+/// `.bin`, `.msgpack`, `.onnx`/`.onnx_data` and openvino `.xml` exports these
+/// repos carry a full copy of the model in), and the fp16 weight variant. fp16
+/// is not a compromise here — `sdxl_unet` and both CLIP towers are SERVED at
+/// fp16, so those bytes are exactly what reaches the GPU either way, and the
+/// VAE's f32 compute (`force_upcast`) reads upcast fp16 weights, which is what
+/// diffusers' own `variant="fp16"` distribution does. It halves SDXL base from
+/// ~13.9 GB to ~7 GB. A repo publishing no fp16 variant (NoobAI's folder) keeps
+/// the plain name.
+fn wantedInDiffusers(layout: RepoLayout, path: []const u8) bool {
+    if (path.len == 0 or path[0] == '.') return false;
+    const slash = std.mem.indexOfScalar(u8, path, '/') orelse {
+        // Root: the index and nothing else. The merged single-file checkpoints
+        // beside it are a SECOND copy of the whole model that the folder path
+        // will never open.
+        return std.mem.eql(u8, path, "model_index.json");
+    };
+    const ci = diffusersComponentIndex(path[0..slash]) orelse return false;
+    const rel = path[slash + 1 ..];
+    // Components are flat; anything deeper is an export tree.
+    if (rel.len == 0 or rel[0] == '.') return false;
+    if (std.mem.indexOfScalar(u8, rel, '/') != null) return false;
+    if (std.mem.endsWith(u8, rel, ".json") or std.mem.endsWith(u8, rel, ".txt")) return true;
+    if (!std.mem.endsWith(u8, rel, ".safetensors")) return false;
+    // The non-EMA training checkpoint: diffusers loads it only on request.
+    if (std.mem.indexOf(u8, rel, ".non_ema.") != null) return false;
+    return (std.mem.indexOf(u8, rel, ".fp16.") != null) == layout.has(ci);
+}
+
+fn wantedFile(resolved: Resolved, layout: RepoLayout, path: []const u8) bool {
     if (resolved.gguf_file.len > 0) {
         // Single-artifact GGUF repos: just that file (plus nothing else).
         return std.mem.eql(u8, path, resolved.gguf_file);
+    }
+    if (resolved.single_file.len > 0) {
+        // Single-file LDM checkpoint: that file and nothing else — in
+        // particular NOT a `model_index.json` sitting beside it.
+        return std.mem.eql(u8, path, resolved.single_file);
     }
     if (resolved.subdir.len > 0) {
         // A diffusers variant is inherently nested (unet/, vae/, …), so the
@@ -550,6 +689,7 @@ fn wantedFile(resolved: Resolved, path: []const u8) bool {
         if (!pathInSubdir(resolved.subdir, path)) return false;
         return wantedInVariant(subdirRelPath(resolved, path));
     }
+    if (layout.diffusers) return wantedInDiffusers(layout, path);
     return shouldDownload(path);
 }
 
@@ -1006,19 +1146,215 @@ test "cli: SDXL bundles — pony single-file + illustrious subdir variants" {
     try testing.expectEqualStrings("bf16", resolveShortName("illustrious:bf16").?.subdir);
 
     // Subdir filtering keeps the variant's nested files, strips the prefix, and
-    // rejects the OTHER variants + assets.
-    try testing.expect(wantedFile(ill, "q4/unet/diffusion_pytorch_model.safetensors"));
-    try testing.expect(wantedFile(ill, "q4/model_index.json"));
-    try testing.expect(!wantedFile(ill, "q8/unet/diffusion_pytorch_model.safetensors"));
-    try testing.expect(!wantedFile(ill, "bf16/vae/config.json"));
-    try testing.expect(!wantedFile(ill, "q4/images/sample.jpeg"));
-    try testing.expect(!wantedFile(ill, "README.md"));
+    // rejects the OTHER variants + assets. A subdir alias never reads a layout —
+    // its own `q4/model_index.json` must not be mistaken for a root one.
+    const ill_layout = layoutFor(ill, &.{ "q4/model_index.json", "q4/unet/diffusion_pytorch_model.safetensors" });
+    try testing.expect(!ill_layout.diffusers);
+    try testing.expect(wantedFile(ill, ill_layout, "q4/unet/diffusion_pytorch_model.safetensors"));
+    try testing.expect(wantedFile(ill, ill_layout, "q4/model_index.json"));
+    try testing.expect(!wantedFile(ill, ill_layout, "q8/unet/diffusion_pytorch_model.safetensors"));
+    try testing.expect(!wantedFile(ill, ill_layout, "bf16/vae/config.json"));
+    try testing.expect(!wantedFile(ill, ill_layout, "q4/images/sample.jpeg"));
+    try testing.expect(!wantedFile(ill, ill_layout, "README.md"));
     try testing.expectEqualStrings("unet/diffusion_pytorch_model.safetensors", subdirRelPath(ill, "q4/unet/diffusion_pytorch_model.safetensors"));
 
     // pathInSubdir is boundary-exact (q4 must not match q40).
     try testing.expect(pathInSubdir("q4", "q4/x"));
     try testing.expect(!pathInSubdir("q4", "q40/x"));
     try testing.expect(!pathInSubdir("q4", "q4"));
+}
+
+test "cli: a diffusers multifolder repo pulls its COMPONENTS, not the merged checkpoint" {
+    // Regression (PR #301 review): `sdxl`, `sdxl:turbo`, `sd1` and `sd1:turbo`
+    // have no `subdir`, so `wantedFile` fell through to `shouldDownload`, whose
+    // flat-repo rule rejects every nested path except `mtp/`. Nothing under
+    // `unet/`, `vae/`, `text_encoder*/`, `tokenizer*/` or `scheduler/` was ever
+    // fetched — `mlx-serve pull sdxl` downloaded `model_index.json` plus 13.9 GB
+    // of root single-file checkpoint, and `Engine.loadAuto` then took the folder
+    // path (the index is present) and failed on the missing `text_encoder/`.
+    //
+    // The listing is `stabilityai/stable-diffusion-xl-base-1.0`, trimmed to one
+    // entry per shape it ships.
+    const sdxl = resolveShortName("sdxl").?;
+    const listing = [_][]const u8{
+        ".gitattributes",
+        "01.png",
+        "LICENSE.md",
+        "README.md",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "sd_xl_base_1.0.safetensors",
+        "sd_xl_base_1.0_0.9vae.safetensors",
+        "sd_xl_offset_example-lora_1.0.safetensors",
+        "text_encoder/config.json",
+        "text_encoder/flax_model.msgpack",
+        "text_encoder/model.fp16.safetensors",
+        "text_encoder/model.onnx",
+        "text_encoder/model.safetensors",
+        "text_encoder/openvino_model.bin",
+        "text_encoder/openvino_model.xml",
+        "text_encoder_2/config.json",
+        "text_encoder_2/model.fp16.safetensors",
+        "text_encoder_2/model.onnx_data",
+        "text_encoder_2/model.safetensors",
+        "tokenizer/merges.txt",
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "tokenizer_2/merges.txt",
+        "tokenizer_2/vocab.json",
+        "unet/config.json",
+        "unet/diffusion_flax_model.msgpack",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "unet/diffusion_pytorch_model.safetensors",
+        "unet/model.onnx",
+        "unet/openvino_model.xml",
+        "vae/config.json",
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+        "vae/diffusion_pytorch_model.safetensors",
+        "vae_1_0/config.json",
+        "vae_1_0/diffusion_pytorch_model.safetensors",
+        "vae_decoder/model.onnx",
+        "vae_encoder/model.onnx",
+    };
+    const layout = layoutFor(sdxl, &listing);
+    try testing.expect(layout.diffusers);
+
+    const want = [_][]const u8{
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "text_encoder/config.json",
+        "text_encoder/model.fp16.safetensors",
+        "text_encoder_2/config.json",
+        "text_encoder_2/model.fp16.safetensors",
+        "tokenizer/merges.txt",
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "tokenizer_2/merges.txt",
+        "tokenizer_2/vocab.json",
+        "unet/config.json",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "vae/config.json",
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+    };
+    var kept: usize = 0;
+    for (listing) |path| {
+        const keep = wantedFile(sdxl, layout, path);
+        var expected = false;
+        for (want) |w| {
+            if (std.mem.eql(u8, w, path)) expected = true;
+        }
+        if (keep != expected) {
+            std.debug.print("wantedFile mismatch: {s} kept={} want={}\n", .{ path, keep, expected });
+            return error.TestUnexpectedResult;
+        }
+        if (keep) kept += 1;
+    }
+    // Every component the engine binds is covered, so the load cannot fail on a
+    // missing dir the way it did before.
+    try testing.expectEqual(want.len, kept);
+    for (DIFFUSERS_COMPONENTS) |c| {
+        var seen = false;
+        for (want) |w| {
+            if (std.mem.startsWith(u8, w, c) and w[c.len] == '/') seen = true;
+        }
+        try testing.expect(seen);
+    }
+}
+
+test "cli: exactly ONE weight variant lands per component dir" {
+    // `model.loadWeights` sweeps EVERY `*.safetensors` in a component dir into
+    // one map, so a second variant is a doubled download AND a key-for-key
+    // collision. fp16 wins where the repo publishes it (the UNet and both CLIP
+    // towers are SERVED at fp16); the plain name wins where it does not.
+    const sd1 = resolveShortName("sd1").?;
+    // `stable-diffusion-v1-5`: fp16 siblings everywhere, plus a `non_ema`
+    // training checkpoint and torch `.bin` copies of the whole model.
+    const with_fp16 = [_][]const u8{
+        "model_index.json",
+        "unet/diffusion_pytorch_model.bin",
+        "unet/diffusion_pytorch_model.fp16.bin",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "unet/diffusion_pytorch_model.non_ema.safetensors",
+        "unet/diffusion_pytorch_model.safetensors",
+        "safety_checker/model.safetensors",
+        "v1-5-pruned-emaonly.safetensors",
+        "v1-inference.yaml",
+    };
+    var l = layoutFor(sd1, &with_fp16);
+    try testing.expect(wantedFile(sd1, l, "unet/diffusion_pytorch_model.fp16.safetensors"));
+    try testing.expect(!wantedFile(sd1, l, "unet/diffusion_pytorch_model.safetensors"));
+    try testing.expect(!wantedFile(sd1, l, "unet/diffusion_pytorch_model.non_ema.safetensors"));
+    try testing.expect(!wantedFile(sd1, l, "unet/diffusion_pytorch_model.bin"));
+    // A component we never load, and the root LDM checkpoint the folder path
+    // will never open.
+    try testing.expect(!wantedFile(sd1, l, "safety_checker/model.safetensors"));
+    try testing.expect(!wantedFile(sd1, l, "v1-5-pruned-emaonly.safetensors"));
+    try testing.expect(!wantedFile(sd1, l, "v1-inference.yaml"));
+
+    // No fp16 sibling: the plain name is the only weight file, so it is kept.
+    const no_fp16 = [_][]const u8{
+        "model_index.json",
+        "unet/config.json",
+        "unet/diffusion_pytorch_model.safetensors",
+    };
+    l = layoutFor(sd1, &no_fp16);
+    try testing.expect(wantedFile(sd1, l, "unet/diffusion_pytorch_model.safetensors"));
+}
+
+test "cli: a single-file alias leaves model_index.json on the server" {
+    // NoobAI ships a COMPLETE diffusers folder beside its LDM checkpoint, and
+    // the V-Pred repo's own `scheduler_config.json` declares epsilon — wrong for
+    // it. Only the checkpoint carries the `v_pred`/`ztsnr` markers, so pulling
+    // the index would silently sample V-Pred on an epsilon ladder: a plausible,
+    // systematically washed-out image with nothing to error on. Twins
+    // `SdxlFinetuneCatalogTests`.
+    const noobai = resolveShortName("noobai:vpred").?;
+    const listing = [_][]const u8{
+        "NoobAI-XL-Vpred-v1.0.safetensors",
+        "README.md",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "unet/diffusion_pytorch_model.safetensors",
+    };
+    const l = layoutFor(noobai, &listing);
+    try testing.expect(!l.diffusers);
+    var kept: usize = 0;
+    for (listing) |path| {
+        if (wantedFile(noobai, l, path)) {
+            try testing.expectEqualStrings("NoobAI-XL-Vpred-v1.0.safetensors", path);
+            kept += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), kept);
+
+    // Pony's repo carries a standalone `sdxl_vae` checkpoint beside the model.
+    const pony = resolveShortName("pony").?;
+    const pl = layoutFor(pony, &.{});
+    try testing.expect(wantedFile(pony, pl, "ponyDiffusionV6XL_v6StartWithThisOne.safetensors"));
+    try testing.expect(!wantedFile(pony, pl, "sdxl_vae.safetensors"));
+}
+
+test "cli: every image alias resolves to a shape `pull` can actually fetch" {
+    // Class guard for the bug above: the three image repo shapes (single-file,
+    // subdir variant, diffusers multifolder) each need their own arm, and an
+    // alias that matches none falls through to the flat-repo rule, which drops
+    // every nested path. A new image alias with no declared shape trips here
+    // rather than at the first `pull`.
+    for (aliases) |a| {
+        const image = std.mem.eql(u8, a.name, "sdxl") or std.mem.eql(u8, a.name, "sd1") or
+            std.mem.eql(u8, a.name, "pony") or std.mem.eql(u8, a.name, "noobai") or
+            std.mem.eql(u8, a.name, "illustrious");
+        if (!image) continue;
+        const r = a.resolve();
+        if (r.single_file.len > 0 or r.subdir.len > 0) continue;
+        // The remainder must be diffusers repos — proven by the fact that a
+        // listing WITHOUT a root index keeps nothing usable under a component.
+        const l = layoutFor(r, &.{"model_index.json"});
+        try testing.expect(l.diffusers);
+        try testing.expect(wantedFile(r, l, "unet/config.json"));
+    }
 }
 
 test "cli: shouldDownload chat-default selection" {

@@ -2165,7 +2165,18 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // this null (zeroed unconditional branch), while `"negative_prompt": ""`
     // arrives as an empty slice and gets ENCODED. Collapsing the two is worth
     // cos 0.975 vs 0.997 against diffusers — see sdxl_pipeline.GenOpts.
-    const negative_prompt: ?[]const u8 = extractJsonString(body, "negative_prompt");
+    //
+    // Unescaped like `prompt` above: `extractJsonString` hands back the RAW
+    // span between the quotes, so `"neg": "text, \"watermark\", caf\u00e9"`
+    // would otherwise reach the CLIP tokenizer with literal backslash-escapes
+    // and encode an unconditional branch the client never asked for. The
+    // optional is preserved THROUGH the unescape — absent stays null.
+    const negative_prompt_owned: ?[]u8 = if (extractJsonString(body, "negative_prompt")) |raw|
+        try jsonUnescape(allocator, raw)
+    else
+        null;
+    defer if (negative_prompt_owned) |np| allocator.free(np);
+    const negative_prompt: ?[]const u8 = negative_prompt_owned;
     const spacing: ?sdxl_mod.TimestepSpacing = blk: {
         const sp = extractJsonString(body, "timestep_spacing") orelse break :blk null;
         break :blk sdxl_mod.spacingFromString(sp) orelse
@@ -5636,6 +5647,61 @@ test "instrumental is parsed off the body only when spelled true" {
     try testing.expect(sse.bodyWantsTrue("{\"instrumental\": true}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"instrumental\":false}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"prompt\":\"x\"}", "instrumental"));
+}
+
+test "negative_prompt reaches the tokenizer UNESCAPED, and absent still differs from empty" {
+    // Regression (PR #301 review): `negative_prompt` was passed straight from
+    // `extractJsonString`, which returns the RAW span between the quotes, while
+    // `prompt` three lines above was unescaped. A client sending
+    // `"text, \"watermark\""` encoded the backslashes as CLIP tokens.
+    //
+    // The pair is what the handler does, so the pair is what is asserted — and
+    // the ABSENT/EMPTY distinction (a zeroed unconditional branch vs. an encoded
+    // empty string, cos 0.997 vs 0.975 against diffusers) must survive it.
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"prompt\":\"a cat\"}", .want = null },
+        .{ .body = "{\"negative_prompt\":\"\"}", .want = "" },
+        .{ .body = "{\"negative_prompt\":\"text, \\\"watermark\\\", caf\\u00e9\"}", .want = "text, \"watermark\", café" },
+        .{ .body = "{\"negative_prompt\":\"blurry\\nlowres\"}", .want = "blurry\nlowres" },
+    };
+    for (cases) |c| {
+        const owned: ?[]u8 = if (extractJsonString(c.body, "negative_prompt")) |raw|
+            try jsonUnescape(a, raw)
+        else
+            null;
+        defer if (owned) |o| a.free(o);
+        if (c.want) |w| {
+            try std.testing.expect(owned != null);
+            try std.testing.expectEqualStrings(w, owned.?);
+        } else {
+            try std.testing.expect(owned == null);
+        }
+    }
+}
+
+test "every image-request text field the tokenizer sees is unescaped" {
+    // Class guard for the bug above: `prompt` was unescaped and
+    // `negative_prompt` was not, and nothing said the two had to agree. Any new
+    // free-text field that reaches a text encoder gets the same treatment, so
+    // the scan is over the extraction spelling rather than over one field.
+    const src = @embedFile("gen.zig");
+    for ([_][]const u8{ "prompt", "negative_prompt" }) |field| {
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "extractJsonString(body, \"{s}\")", .{field});
+        var i: usize = 0;
+        var seen: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, needle)) |at| : (i = at + needle.len) {
+            seen += 1;
+            // The extraction and its `jsonUnescape` sit within a few lines of
+            // each other in every correct spelling (`orelse`-guarded or
+            // `if`-captured); a raw hand-off has neither.
+            const window_end = @min(src.len, at + 240);
+            try std.testing.expect(std.mem.indexOf(u8, src[at..window_end], "jsonUnescape") != null);
+        }
+        try std.testing.expect(seen > 0);
+    }
 }
 
 test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
