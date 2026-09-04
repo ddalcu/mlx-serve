@@ -4574,9 +4574,14 @@ fn handleEmbeddings(
 
         const final_ids = if (ids) |chat_ids| chat_ids else blk2: {
             // Fall back to raw tokenization for models without chat templates.
+            // OWNERSHIP (load-bearing): `raw_ids` is owned by this loop
+            // iteration. The wrapEncoderIds branches free it after wrapping;
+            // in the plain `else raw_ids` case the slice itself is handed to
+            // `seqs` below, so freeing it here would be a use-after-free /
+            // double-free once the batch is disposed of.
             const raw_ids = try tok.encode(allocator, text);
-            defer allocator.free(raw_ids);
             break :blk2 if (config.use_bidirectional_attention) blk3: {
+                defer allocator.free(raw_ids);
                 break :blk3 try wrapEncoderIds(
                     allocator,
                     raw_ids,
@@ -4587,6 +4592,7 @@ fn handleEmbeddings(
                 // Last-token pooling without a chat template: append the
                 // model's EOS token so pooling picks up the terminator
                 // position, matching the reference implementation's behavior.
+                defer allocator.free(raw_ids);
                 break :blk3 try wrapEncoderIds(
                     allocator,
                     raw_ids,
