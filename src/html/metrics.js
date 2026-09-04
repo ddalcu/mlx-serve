@@ -78,9 +78,46 @@ function computeRates(now, samples, c, g, psum) {
   return { decodeTps, prefillTps, avgPrefillTps, reqRate, prefilling, liveTok, livePre };
 }
 
+function fmt(v, d) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return v.toFixed(d === undefined ? 1 : d);
+}
+
+// The Prefill sub-line while a prefill is in flight. Pure, so every state below
+// is testable without a DOM.
+//
+// `prefill_tokens_live` is a numerator with no denominator on its own: "6.0K
+// tokens done" out of WHAT? `prefill_target_tokens` is that denominator, and it
+// is on the SAME base — the post-prefix-cache-trim length the chunk loop will
+// really forward — so live/target is a true percentage rather than a fraction of
+// a prompt most of which was never computed. `prompt - target` is what the hot
+// cache restored for THIS request, which the lifetime `prefix_cache_*_total`
+// counters cannot answer.
+//
+// target == 0 is NOT 0%. It means either the cache restore is still running (the
+// target is published after the trim, and the restore takes seconds on a long
+// prompt) or this is a ds4/llama/diffusion prefill, which never moves any of the
+// three gauges. Rendering "0%" there would claim the work has a known size and
+// has not started; both are false. Fall back to the bare phase word instead.
+function prefillPhaseLabel(g) {
+  const live = (g.prefill_tokens_live != null) ? g.prefill_tokens_live : 0;
+  const target = g.prefill_target_tokens || 0;
+  const prompt = g.prefill_prompt_tokens || 0;
+  if (target <= 0) return 'prefilling' + (live > 0 ? ' · ' + fmt(live, 0) + ' tok' : '');
+  // Clamped: the chunk loop stops a token (plus the SSM snapshot backoff) short
+  // of the target, and a sampler tick can pair a new request's live count with
+  // the previous target. Neither should ever render as 101%.
+  const pct = Math.min(100, Math.max(0, Math.round((live / target) * 100)));
+  const reused = prompt > target ? prompt - target : 0;
+  return 'prefilling · ' + fmt(live, 0) + ' / ' + fmt(target, 0) + ' (' + pct + '%)' +
+         (reused > 0 ? ' · ' + fmt(reused, 0) + ' reused' : '');
+}
+
 // Node (tests) sees no `document`; the browser sees no `globalThis.__mlxPanel`
 // consumer. Either way the IIFE below only runs in a real page.
-if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt };
+if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt, prefillPhaseLabel, fmt };
 
 if (typeof document !== 'undefined') (function () {
   // Panel markup, injected into the page. A template literal, so the CSS/HTML
@@ -137,13 +174,6 @@ if (typeof document !== 'undefined') (function () {
   const SPARK_N = 60;              // sparkline points (≈60s at 1 Hz)
   const decodeHist = [], prefillHist = [];
   const hover = { decode: null, prefill: null };  // hovered point index per chart
-
-  function fmt(v, d) {
-    if (v === null || v === undefined || isNaN(v)) return '—';
-    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-    return v.toFixed(d === undefined ? 1 : d);
-  }
 
   function setStatus(cls, txt) {
     const e = $('m-status');
@@ -261,7 +291,7 @@ if (typeof document !== 'undefined') (function () {
     // The phase flag flips at prefill START; the token count appears once the
     // first chunk lands (and never for ds4/llama, which prefill elsewhere).
     $('m-prefill-ms').textContent = prefilling
-      ? ('prefilling' + (r.livePre > 0 ? ' · ' + fmt(r.livePre, 0) + ' tok' : ''))
+      ? prefillPhaseLabel(g)
       : (avgPrefillTps !== null
           ? (fmt(avgPrefillTps, 0) + ' tok/s avg · ' + (prefillMs !== null ? fmt(prefillMs, 0) : '—') + ' ms')
           : '— ms avg');
