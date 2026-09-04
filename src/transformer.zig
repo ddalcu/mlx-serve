@@ -9657,6 +9657,79 @@ pub const Transformer = struct {
         return result;
     }
 
+    /// DeepStack additive streams (Qwen3-VL-Embedding): h[image_pos] +=
+    /// stream_row. `mask` is the flat [B*S] int32 image-token mask, `stream`
+    /// the [N_merged, H] (or higher-rank, flattened) vision-tower output for
+    /// ONE layer. Row r of the stream lands at the r-th image token:
+    /// `cumsum(mask)-1` is that row index per position (was `mask-1`, which
+    /// made every image token read row 0 — the cos-0.82 symptom in PR #351).
+    /// Text positions hold negative cumsum values that roll over into the
+    /// stream via modulo (a valid but discarded row: the mask multiply below
+    /// zeroes them before they reach h). int64 indices per take_axis
+    /// requirements. Frees `h`, returns the augmented replacement.
+    pub fn deepstackScatter(h: mlx.mlx_array, mask: mlx.mlx_array, stream: mlx.mlx_array, batch: c_int, seq_len: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+        const h_shape = mlx.getShape(h);
+        const h_cols: c_int = h_shape[2];
+
+        const stream_shape = mlx.getShape(stream);
+        var n_src_rows: usize = 1;
+        for (stream_shape[0 .. stream_shape.len - 1]) |d| n_src_rows *= @intCast(d);
+
+        const src_shape = [_]c_int{ @intCast(n_src_rows), h_cols };
+        var source_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(source_flat);
+        try mlx.check(mlx.mlx_reshape(&source_flat, stream, &src_shape, 2, s));
+
+        const n_rows_arr = mlx.mlx_array_new_int(@intCast(n_src_rows));
+        defer _ = mlx.mlx_array_free(n_rows_arr);
+        var cumsum_idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cumsum_idx);
+        // inclusive cumsum over the flat [B*S] int mask, axis 0,
+        // then subtract 1 → row index per image position.
+        try mlx.check(mlx.mlx_cumsum(&cumsum_idx, mask, 0, false, true, s));
+        const one_i = mlx.mlx_array_new_int(1);
+        defer _ = mlx.mlx_array_free(one_i);
+        var sub_idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sub_idx);
+        try mlx.check(mlx.mlx_subtract(&sub_idx, cumsum_idx, one_i, s));
+        var src_idx_i32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(src_idx_i32);
+        try mlx.check(mlx.mlx_remainder(&src_idx_i32, sub_idx, n_rows_arr, s));
+        var src_idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(src_idx);
+        try mlx.check(mlx.mlx_astype(&src_idx, src_idx_i32, .int64, s));
+
+        // Gather the [B*S, H] contribution: row r of the stream
+        // lands on the r-th image token; text rows pull a rolled
+        // row that the mask zeroes before it reaches h.
+        var contribution = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(contribution);
+        try mlx.check(mlx.mlx_take_axis(&contribution, source_flat, src_idx, 0, s));
+
+        // Zero out text positions (mask as [B*S, 1] broadcasts the
+        // zero across each row), cast to h's dtype (h may be bf16
+        // while the tower streams are float16/float32 — the add
+        // requires matching dtypes), reshape to [B, S, H].
+        const mask_col_shape = [_]c_int{ batch * seq_len, 1 };
+        var mask_col = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_col);
+        try mlx.check(mlx.mlx_reshape(&mask_col, mask, &mask_col_shape, 2, s));
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        try mlx.check(mlx.mlx_multiply(&masked, mask_col, contribution, s));
+        var masked_dt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked_dt);
+        try mlx.check(mlx.mlx_astype(&masked_dt, masked, mlx.mlx_array_dtype(h), s));
+        const c_shape = [_]c_int{ batch, seq_len, h_cols };
+        var contribution4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(contribution4);
+        try mlx.check(mlx.mlx_reshape(&contribution4, masked_dt, &c_shape, 3, s));
+        var h_add = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&h_add, h, contribution4, s));
+        _ = mlx.mlx_array_free(h);
+        return h_add;
+    }
+
     /// Apply vision embeddings to text embeddings during prefill.
     /// Handles scaling and splicing at image_token_id positions.
     /// Returns the (potentially modified) h; caller should replace their h with the result.
@@ -10818,10 +10891,6 @@ pub const Transformer = struct {
             if (ds_mask_int) |m| _ = mlx.mlx_array_free(m);
         }
         var ds_mask_built = false;
-        var one_i: ?mlx.mlx_array = null; // int32 scalar 1 (cumsum-1 indexing)
-        defer {
-            if (one_i) |o| _ = mlx.mlx_array_free(o);
-        }
 
         if (std.c.getenv("MLX_SERVE_MM_DEBUG_DUMP") != null) {
             if (ctx.mrope_cos_cur) |cs| {
@@ -11232,7 +11301,6 @@ pub const Transformer = struct {
                     defer _ = mlx.mlx_array_free(mflat);
                     ds_mask_int = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_astype(&ds_mask_int.?, mflat, .int32, self.s));
-                    one_i = mlx.mlx_array_new_int(1);
                     ds_mask_built = true;
                 }
                 if (ds_mask_int) |_| {
@@ -11242,77 +11310,10 @@ pub const Transformer = struct {
                     // of the flat [B*S] sequence. Row r of the stream lands at
                     // the r-th image token: cumsum(mask)-1 gives that row index
                     // per position, gathered per row via take_axis(0); text
-                    // positions pull row 0 of a rotated stream and are zeroed
-                    // by the mask multiply before the result can reach h. The
-                    // row-order scatter matches the reference
-                    // `hidden_states[layer+1][:, visual_pos] += feature`
-                    // (mlx_vlm language.py:245-247).
-                    // NOTE: query the CURRENT h's shape — a stale shape slice
-                    // captured before an earlier layer's free-and-replace of
-                    // h would dangle (x_shape reads freed memory).
-                    const h_now_shape = mlx.getShape(h);
-                    const h_cols: c_int = h_now_shape[2];
-
-                    const stream_shape = mlx.getShape(stream);
-                    var n_src_rows: usize = 1;
-                    for (stream_shape[0 .. stream_shape.len - 1]) |d| n_src_rows *= @intCast(d);
-
-                    const src_shape = [_]c_int{ @intCast(n_src_rows), h_cols };
-                    var source_flat = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(source_flat);
-                    try mlx.check(mlx.mlx_reshape(&source_flat, stream, &src_shape, 2, self.s));
-
-                    // src_idx[pos] = cumsum(mask)[pos]-1 for image positions
-                    // (the r-th image token pulls row r of the stream); text
                     // positions hold negative values that roll over into the
                     // stream via modulo (a valid but discarded row). int64
                     // indices per take_axis requirements.
-                    const n_rows_arr = mlx.mlx_array_new_int(@intCast(n_src_rows));
-                    defer _ = mlx.mlx_array_free(n_rows_arr);
-                    var cumsum_idx = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(cumsum_idx);
-                    // inclusive cumsum over the flat [B*S] int mask, axis 0,
-                    // then subtract 1 → row index per image position.
-                    try mlx.check(mlx.mlx_cumsum(&cumsum_idx, ds_mask_int.?, 0, false, true, self.s));
-                    var sub_idx = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(sub_idx);
-                    try mlx.check(mlx.mlx_subtract(&sub_idx, cumsum_idx, one_i.?, self.s));
-                    var src_idx_i32 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(src_idx_i32);
-                    try mlx.check(mlx.mlx_remainder(&src_idx_i32, sub_idx, n_rows_arr, self.s));
-                    var src_idx = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(src_idx);
-                    try mlx.check(mlx.mlx_astype(&src_idx, src_idx_i32, .int64, self.s));
-
-                    // Gather the [B*S, H] contribution: row r of the stream
-                    // lands on the r-th image token; text rows pull a rolled
-                    // row that the mask zeroes before it reaches h.
-                    var contribution = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(contribution);
-                    try mlx.check(mlx.mlx_take_axis(&contribution, source_flat, src_idx, 0, self.s));
-
-                    // Zero out text positions (mask as [B*S, 1] broadcasts the
-                    // zero across each row), cast to h's dtype (h may be bf16
-                    // while the tower streams are float16/float32 — the add
-                    // requires matching dtypes), reshape to [B, S, H].
-                    const mask_col_shape = [_]c_int{ batch * seq_len, 1 };
-                    var mask_col = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(mask_col);
-                    try mlx.check(mlx.mlx_reshape(&mask_col, ds_mask_int.?, &mask_col_shape, 2, self.s));
-                    var masked = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(masked);
-                    try mlx.check(mlx.mlx_multiply(&masked, mask_col, contribution, self.s));
-                    var masked_dt = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(masked_dt);
-                    try mlx.check(mlx.mlx_astype(&masked_dt, masked, mlx.mlx_array_dtype(h), self.s));
-                    const c_shape = [_]c_int{ batch, seq_len, h_cols };
-                    var contribution4 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(contribution4);
-                    try mlx.check(mlx.mlx_reshape(&contribution4, masked_dt, &c_shape, 3, self.s));
-                    var h_add = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&h_add, h, contribution4, self.s));
-                    _ = mlx.mlx_array_free(h);
-                    h = h_add;
+                    h = try deepstackScatter(h, ds_mask_int.?, stream, batch, seq_len, self.s);
                 }
             }
 
@@ -15256,60 +15257,68 @@ pub const Transformer = struct {
     /// dims through. Equivalent to `mlx_fast_rope(traditional=false)` but with
     /// per-token (M-RoPE) angles instead of a scalar offset.
     pub fn applyMrope(self: *Transformer, arr: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, rope_dims: c_int) !mlx.mlx_array {
+        return applyMropeCore(arr, cos, sin, rope_dims, self.s);
+    }
+
+    /// File-level core of `applyMrope` (`self` only carries the GPU stream)
+    /// so the rotation contract is unit-testable without a Transformer shell:
+    /// rope'd = x*cos + rotate_half(x)*sin, dtype preserved (was hardcoded
+    /// .bfloat16, which demoted fp16 checkpoints' q/k — PR #351 review).
+    pub fn applyMropeCore(arr: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, rope_dims: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
         const sh = mlx.getShape(arr);
         const b = sh[0];
         const h = sh[1];
-        const s = sh[2];
+        const s_ = sh[2];
         const hd = sh[3];
         const half = @divExact(rope_dims, 2);
         const st = [_]c_int{ 1, 1, 1, 1 };
 
         var rot = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rot);
-        try mlx.check(mlx.mlx_slice(&rot, arr, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, h, s, rope_dims }, 4, &st, 4, self.s));
+        try mlx.check(mlx.mlx_slice(&rot, arr, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, h, s_, rope_dims }, 4, &st, 4, s));
 
         // rotate_half(rot) = concat(-rot[..,half:], rot[..,:half])
         var r2 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(r2);
-        try mlx.check(mlx.mlx_slice(&r2, rot, &[_]c_int{ 0, 0, 0, half }, 4, &[_]c_int{ b, h, s, rope_dims }, 4, &st, 4, self.s));
+        try mlx.check(mlx.mlx_slice(&r2, rot, &[_]c_int{ 0, 0, 0, half }, 4, &[_]c_int{ b, h, s_, rope_dims }, 4, &st, 4, s));
         var r1 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(r1);
-        try mlx.check(mlx.mlx_slice(&r1, rot, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, h, s, half }, 4, &st, 4, self.s));
+        try mlx.check(mlx.mlx_slice(&r1, rot, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, h, s_, half }, 4, &st, 4, s));
         var neg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(neg);
-        try mlx.check(mlx.mlx_negative(&neg, r2, self.s));
+        try mlx.check(mlx.mlx_negative(&neg, r2, s));
         const rh_arrs = [_]mlx.mlx_array{ neg, r1 };
         const rh_vec = mlx.mlx_vector_array_new_data(&rh_arrs, 2);
         defer _ = mlx.mlx_vector_array_free(rh_vec);
         var rh = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rh);
-        try mlx.check(mlx.mlx_concatenate_axis(&rh, rh_vec, -1, self.s));
+        try mlx.check(mlx.mlx_concatenate_axis(&rh, rh_vec, -1, s));
 
         var xcos = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xcos);
-        try mlx.check(mlx.mlx_multiply(&xcos, rot, cos, self.s));
+        try mlx.check(mlx.mlx_multiply(&xcos, rot, cos, s));
         var rsin = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rsin);
-        try mlx.check(mlx.mlx_multiply(&rsin, rh, sin, self.s));
+        try mlx.check(mlx.mlx_multiply(&rsin, rh, sin, s));
         var out_rot = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(out_rot);
-        try mlx.check(mlx.mlx_add(&out_rot, xcos, rsin, self.s));
+        try mlx.check(mlx.mlx_add(&out_rot, xcos, rsin, s));
 
         if (hd == rope_dims) {
             var out = mlx.mlx_array_new();
             // Preserve the input dtype (was hardcoded .bfloat16, which demoted
             // fp16 checkpoints' q/k). bf16 models are unchanged.
-            try mlx.check(mlx.mlx_astype(&out, out_rot, mlx.mlx_array_dtype(arr), self.s));
+            try mlx.check(mlx.mlx_astype(&out, out_rot, mlx.mlx_array_dtype(arr), s));
             return out;
         }
         var pass = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pass);
-        try mlx.check(mlx.mlx_slice(&pass, arr, &[_]c_int{ 0, 0, 0, rope_dims }, 4, &[_]c_int{ b, h, s, hd }, 4, &st, 4, self.s));
+        try mlx.check(mlx.mlx_slice(&pass, arr, &[_]c_int{ 0, 0, 0, rope_dims }, 4, &[_]c_int{ b, h, s_, hd }, 4, &st, 4, s));
         const cat_arrs = [_]mlx.mlx_array{ out_rot, pass };
         const cat_vec = mlx.mlx_vector_array_new_data(&cat_arrs, 2);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
         var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, -1, self.s));
+        try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, -1, s));
         return out;
     }
 
@@ -39172,6 +39181,110 @@ test "spliceVisionRows: audio placeholders share the row stream in prompt order"
     try std.testing.expectEqual(@as(f32, 50), ptr[0]); // image row 0
     try std.testing.expectEqual(@as(f32, 0), ptr[4]); // text untouched
     try std.testing.expectEqual(@as(f32, 51), ptr[8]); // audio row 1
+}
+
+test "deepstackScatter: the r-th image token reads row r of the stream (cumsum-1 indexing)" {
+    // Regression for PR #351 review: the row index was `mask-1` (constant 0 on
+    // every image token → every image token read stream row 0, the cos-0.82
+    // symptom in the PR body). The fix is `cumsum(mask)-1`. Distinct stream
+    // rows make the reverted bug visible: with mask-1, positions 2 and 4 would
+    // read row 0 (10) instead of rows 1 and 2 (11, 12) and these expects fail.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const hidden: c_int = 4;
+    const batch: c_int = 1;
+    const seq: c_int = 5;
+    // Image positions 1, 2, 4 → image tokens #0, #1, #2 of the stream.
+    const mask_data = [_]i32{ 0, 1, 1, 0, 1 };
+    const mask_shape = [_]c_int{batch * seq};
+    const mask = mlx.mlx_array_new_data(&mask_data, &mask_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(mask);
+    // h all zeros: the result at image positions IS the scattered row.
+    var h_data: [5 * 4]f32 = @splat(0);
+    // Stream row k filled with 10+k — distinct per row.
+    var st_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        st_data[r * 4 + c] = @floatFromInt(10 + r);
+    };
+    const h_shape = [_]c_int{ batch, seq, hidden };
+    const h = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const st_shape = [_]c_int{ 3, hidden };
+    const stream = mlx.mlx_array_new_data(&st_data, &st_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(stream);
+
+    const out = try Transformer.deepstackScatter(h, mask, stream, batch, seq, s);
+    defer _ = mlx.mlx_array_free(out);
+    var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
+    try mlx.check(mlx.mlx_astype(&f32arr, out, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32arr));
+    const ptr = mlx.mlx_array_data_float32(f32arr).?;
+    // Row r of the stream lands at the r-th image token; text rows stay 0.
+    // (Stream rows are constant: row k is all (10+k), so every column asserts
+    // the same base. With the reverted `mask-1` indexing pos2 and pos4 would
+    // both read row 0 (10) and these expects fail.)
+    const want = [_]f32{ 0, 10, 11, 0, 12 };
+    for (0..5) |pos| {
+        for (0..4) |c| try std.testing.expectEqual(want[pos], ptr[pos * 4 + c]);
+    }
+}
+
+test "applyMropeCore: identity rotation preserves fp16 values and dtype" {
+    // Regression for PR #351 review: the fully-rotated path hardcoded
+    // .bfloat16, demoting fp16 checkpoints' q/k. With cos=1/sin=0 the output
+    // must equal the input value-for-value AND keep the input dtype; the
+    // dtype expect is the red-on-revert tripwire. The cos=0/sin=1 case pins
+    // rotate_half = concat(-x[..,half:], x[..,:half]) exactly.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rope_dims: c_int = 8; // == head_dim → the astype branch
+    const shape = [_]c_int{ 1, 1, 2, 8 };
+    var q_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const qf = mlx.mlx_array_new_data(&q_data, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(qf);
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_astype(&q, qf, .float16, s));
+
+    var ones_f = [_]f32{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var zeros_f = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const cs_shape = [_]c_int{ 1, 1, 2, 8 };
+    const ones32 = mlx.mlx_array_new_data(&ones_f, &cs_shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(ones32);
+    const zeros32 = mlx.mlx_array_new_data(&zeros_f, &cs_shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(zeros32);
+    var cos = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cos);
+    try mlx.check(mlx.mlx_astype(&cos, ones32, .float16, s));
+    var sin = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sin);
+    try mlx.check(mlx.mlx_astype(&sin, zeros32, .float16, s));
+
+    // Identity rotation: values unchanged, dtype preserved.
+    {
+        const out = try Transformer.applyMropeCore(q, cos, sin, rope_dims, s);
+        defer _ = mlx.mlx_array_free(out);
+        try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(out));
+        try mlx.check(mlx.mlx_array_eval(out));
+        const ptr = mlx.mlx_array_data_float16(out).?;
+        for (0..16) |i| try std.testing.expectEqual(@as(f16, @floatFromInt(i + 1)), ptr[i]);
+    }
+    // cos=0 / sin=1: pure rotate_half, exactly concat(-tail, head).
+    {
+        var cos0 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cos0);
+        try mlx.check(mlx.mlx_astype(&cos0, zeros32, .float16, s));
+        var sin1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sin1);
+        try mlx.check(mlx.mlx_astype(&sin1, ones32, .float16, s));
+        const out = try Transformer.applyMropeCore(q, cos0, sin1, rope_dims, s);
+        defer _ = mlx.mlx_array_free(out);
+        try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(out));
+        try mlx.check(mlx.mlx_array_eval(out));
+        const ptr = mlx.mlx_array_data_float16(out).?;
+        const want = [_]f16{ -5, -6, -7, -8, 1, 2, 3, 4, -13, -14, -15, -16, 9, 10, 11, 12 };
+        for (0..16) |i| try std.testing.expectEqual(want[i], ptr[i]);
+    }
 }
 
 test "ane channel-split GPU complement: axis-0 slice VIEW of a packed weight through qmm vs its materialized copy" {
