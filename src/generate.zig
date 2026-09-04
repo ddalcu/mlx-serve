@@ -8521,10 +8521,10 @@ pub fn isEosId(id: u32, eos: []const u32) bool {
 
 /// Max cycle length (in tokens) scanned by `isDegenerateTailLoop`, and how many
 /// identical repetitions of that cycle count as "stuck". A real answer — prose,
-/// code, a markdown table — essentially never repeats an identical ≤8-token
-/// cycle 16 times in a row, so these won't fire on legitimate output, while a
-/// model that has collapsed into spamming one short phrase is caught within a
-/// few dozen tokens instead of running all the way to `max_tokens`.
+/// code, a markdown table — usually does not repeat an identical ≤8-token
+/// cycle 16 times in a row, so this catches a collapsed model within a few
+/// dozen tokens instead of running all the way to `max_tokens`. The exact
+/// threshold is configurable for legitimate repetitive output.
 pub const degenerate_loop_max_period: usize = 8;
 pub const degenerate_loop_reps: usize = 16;
 // Tier 2 (2026-08-02 shooter wrap-up class): a two-sentence cycle of ~58
@@ -8730,8 +8730,8 @@ fn trailingCycleStart(tokens: []const u32, p: usize) usize {
 /// Convict a degenerate tail and say where it starts. Tier order matches
 /// `scheduler.loopStopReason`: the exact tiers speak first, and the fuzzy
 /// near-repeat tier only ever judges spans they have already declined.
-pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
-    if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps)) |p| {
+pub fn degenerateTailWithExactReps(tokens: []const u32, exact_reps: usize) ?DegenerateTail {
+    if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, exact_reps)) |p| {
         return .{ .tier = .exact_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (exactCyclePeriod(
@@ -8759,6 +8759,12 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         start = cand;
     }
     return .{ .tier = .near_repeat, .start = start };
+}
+
+/// Default detector used by direct callers and tests. The scheduler calls the
+/// configurable form so `--loop-repetitions` can raise the short-cycle bar.
+pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
+    return degenerateTailWithExactReps(tokens, degenerate_loop_reps);
 }
 
 /// Stall clock for the request timeout: the deadline measures time since the
@@ -10321,6 +10327,23 @@ test "degenerateTail: the exact tier reports its tier and keeps ONE cycle" {
     try testing.expectEqual(@as(usize, 7), d.start);
     // What survives is the honest prefix plus exactly one cycle.
     try testing.expectEqualSlices(u32, &[_]u32{ 7, 8, 9, 10, 101, 102, 103 }, ids.items[0..d.start]);
+}
+
+test "degenerateTail: a higher exact threshold permits a finite repeated pattern" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    try ids.appendSlice(al, &[_]u32{ 7, 8, 9 });
+
+    // A finite repeated pattern can cross the default threshold without being
+    // an unbounded generation loop.
+    for (0..20) |_| try ids.append(al, 404);
+    try testing.expect(degenerateTail(ids.items) != null);
+    try testing.expect(degenerateTailWithExactReps(ids.items, 32) == null);
+
+    for (20..32) |_| try ids.append(al, 404);
+    const d = degenerateTailWithExactReps(ids.items, 32) orelse return error.TestExpectedLoop;
+    try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
 }
 
 test "degenerateTail: the trim start walks back PAST the near-repeat window" {
