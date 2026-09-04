@@ -127,6 +127,24 @@ enum StartupModelChoice {
         }
     }
 
+    /// The model the tray's Start button should put resident.
+    ///
+    /// "Start Server" is the same sentence the auto-start checkbox makes, so it
+    /// answers to the same setting: with "Load a model at start" off the server
+    /// comes up HEADLESS and the first chat turn hot-loads on demand, exactly
+    /// like a launch start. It used to pass `selectedModelPath` unconditionally,
+    /// which is why a tray-started server always had a checkpoint resident —
+    /// and why ejecting it brought it back: `--model` makes that entry the
+    /// registry's default, so the next request reloads it.
+    ///
+    /// The path is the tray's OWN selection rather than the startup mode's
+    /// answer: the picker sits directly above the button, and a Start that
+    /// serves something other than what the picker names is a lie about the
+    /// control the user just used. Empty = headless.
+    static func trayStartPath(loadModelAtStart: Bool, selectedModelPath: String) -> String {
+        loadModelAtStart ? selectedModelPath : ""
+    }
+
     /// The model a server started for LAN duty AT LAUNCH should load.
     ///
     /// LAN sharing and discovery live in the server process, so with either on

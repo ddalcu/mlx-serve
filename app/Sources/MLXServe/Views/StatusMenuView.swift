@@ -360,7 +360,11 @@ struct StatusMenuView: View {
 
     /// The one state-driven action, plus the log window.
     private var serverControls: some View {
-        let control = ServerControlButtonPresentation(status: server.status)
+        let control = ServerControlButtonPresentation(
+            status: server.status,
+            loadsModel: !StartupModelChoice.trayStartPath(
+                loadModelAtStart: appState.loadModelAtStart,
+                selectedModelPath: appState.selectedModelPath).isEmpty)
         return HStack(spacing: 6) {
             serverPrimaryButton(control)
 
@@ -378,7 +382,11 @@ struct StatusMenuView: View {
     @ViewBuilder
     private func serverPrimaryButton(_ control: ServerControlButtonPresentation) -> some View {
         let button = Button {
-            server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
+            server.toggle(
+                modelPath: StartupModelChoice.trayStartPath(
+                    loadModelAtStart: appState.loadModelAtStart,
+                    selectedModelPath: appState.selectedModelPath),
+                options: appState.serverOptions)
         } label: {
             HStack(spacing: 8) {
                 if control.showsProgress {
@@ -392,7 +400,10 @@ struct StatusMenuView: View {
             .frame(maxWidth: .infinity)
         }
         .tint(control.tint.color)
-        .disabled(appState.selectedModelPath.isEmpty)
+        // Only a start that LOADS needs something to load: with "Load a model
+        // at start" off this brings up a headless server, which is exactly what
+        // a Mac with no model yet (media-only, or LAN-only) wants.
+        .disabled(appState.loadModelAtStart && appState.selectedModelPath.isEmpty)
         .controlSize(.regular)
         .help(control.help)
 
@@ -870,14 +881,17 @@ struct ServerControlButtonPresentation: Equatable {
     /// than a full-width slab that dominates the state the app lives in.
     let isProminent: Bool
 
-    init(status: ServerStatus) {
+    /// `loadsModel` is what THIS start does, not what the app can do: a
+    /// headless start is up in a second and puts nothing resident, so calling
+    /// it "Loading Model..." describes work that is not happening.
+    init(status: ServerStatus, loadsModel: Bool = true) {
         switch status {
         case .starting:
-            title = "Loading Model..."
+            title = loadsModel ? "Loading Model..." : "Starting Server..."
             systemImageName = nil
             showsProgress = true
             tint = .loading
-            help = "Loading model. Click to stop."
+            help = loadsModel ? "Loading model. Click to stop." : "Starting the server. Click to stop."
             isProminent = true
         case .running:
             title = "Stop Server"
@@ -891,7 +905,9 @@ struct ServerControlButtonPresentation: Equatable {
             systemImageName = "play.fill"
             showsProgress = false
             tint = .accent
-            help = "Start the selected model."
+            help = loadsModel
+                ? "Start the server and load the selected model."
+                : "Start the server with no model resident — it loads one on demand at your first message. Settings ▸ Server ▸ \"Load a model at start\" changes this."
             isProminent = true
         }
     }

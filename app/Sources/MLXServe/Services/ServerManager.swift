@@ -307,9 +307,15 @@ class ServerManager: ObservableObject {
         prefillTPSNow = nil
     }
 
+    /// Start/stop from a button. An EMPTY `modelPath` starts headless — the
+    /// caller has decided this start puts nothing resident (the tray's Start
+    /// obeys "Load a model at start", `StartupModelChoice.trayStartPath`), and
+    /// `start(modelPath: "")` would otherwise launch a `--model` with no model.
     func toggle(modelPath: String, options: ServerOptions) {
         if status == .running || status == .starting {
             stop()
+        } else if modelPath.isEmpty {
+            startHeadless(modelsDir: Self.modelsRoot, options: options)
         } else {
             start(modelPath: modelPath, options: options)
         }

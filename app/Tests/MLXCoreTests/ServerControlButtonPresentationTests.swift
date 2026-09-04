@@ -29,4 +29,14 @@ final class ServerControlButtonPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.systemImageName, "play.fill")
         XCTAssertEqual(presentation.tint, .accent)
     }
+
+    /// A headless start is up in a second and puts nothing resident, so the
+    /// button must not describe work that is not happening.
+    func testAHeadlessStartDoesNotClaimToBeLoadingAModel() {
+        let starting = ServerControlButtonPresentation(status: .starting, loadsModel: false)
+        XCTAssertEqual(starting.title, "Starting Server...")
+        let stopped = ServerControlButtonPresentation(status: .stopped, loadsModel: false)
+        XCTAssertTrue(stopped.help.contains("no model resident"))
+        XCTAssertTrue(ServerControlButtonPresentation(status: .stopped).help.contains("load the selected model"))
+    }
 }
