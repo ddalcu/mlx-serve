@@ -304,4 +304,46 @@ final class StartupModelChoiceTests: XCTestCase {
             StartupModelChoice.trayStartPath(loadModelAtStart: true, selectedModelPath: ""),
             "")
     }
+
+    // MARK: - The chat window's Start button
+
+    /// Every start path now puts a model resident only ON DEMAND, never as the
+    /// launch default: a `--model` entry is the registry's default and comes
+    /// back on the next request after an eject. The chat toolbar's Start is the
+    /// last one that did that, and no unit test of a pure function can see
+    /// which method a button calls, so the call site is scanned.
+    func testTheChatStartButtonDoesNotLaunchWithAModel() throws {
+        let view = try appSource("Views/ChatView.swift")
+        let button = try XCTUnwrap(view.range(of: "@ViewBuilder private var serverStartControl"),
+                                   "the chat Start control moved — re-point this scan")
+        let body = view[button.upperBound...].prefix(1200)
+        XCTAssertTrue(body.contains("appState.startServerForChat()"),
+                      "chat Start must go through startServerForChat")
+        XCTAssertFalse(body.contains("appState.ensureServerForLan()"),
+                       "ensureServerForLan passes --model, which pins the model as the launch default")
+    }
+
+    /// And that method is headless-then-hot-load, with the pill spinning: a
+    /// start the user pressed owes them a spinner, and `ensureDefaultChatModel`
+    /// is the ONE hot-load path (it also records the last model used).
+    func testStartServerForChatIsHeadlessThenAnOnDemandLoad() throws {
+        let state = try appSource("AppState.swift")
+        let fn = try XCTUnwrap(state.range(of: "func startServerForChat()"),
+                               "startServerForChat moved — re-point this scan")
+        let body = state[fn.upperBound...].prefix(900)
+        XCTAssertTrue(body.contains("server.startHeadless("), "the start itself must be headless")
+        XCTAssertTrue(body.contains("ensureDefaultChatModel("), "the load must go through the one hot-load path")
+        XCTAssertTrue(body.contains("loadingModelPath = path"), "the pill must name and spin on the loading model")
+        XCTAssertFalse(body.contains("server.start(modelPath:"), "a --model start pins the launch default")
+    }
+
+    private func appSource(_ relativePath: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // MLXCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // app
+            .appendingPathComponent("Sources/MLXServe")
+            .appendingPathComponent(relativePath)
+        return try String(contentsOf: url, encoding: .utf8)
+    }
 }
