@@ -714,6 +714,9 @@ private struct DiscoverPane: View {
 private struct MyModelsPane: View {
     @Binding var filter: String
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var downloads: DownloadManager
+
+    @State private var freeDiskSpace: String = ""
 
     private var groups: [LocalModelGroup] {
         ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
@@ -791,11 +794,33 @@ private struct MyModelsPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if !freeDiskSpace.isEmpty {
+                    Text("\(freeDiskSpace) available")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
         }
         .navigationTitle("My Models")
+        .onAppear {
+            updateDiskSpace()
+        }
+        .onChange(of: appState.localModels.count) { _, _ in
+            updateDiskSpace()
+        }
+        .onChange(of: downloads.modelsDir) { _, _ in
+            updateDiskSpace()
+        }
+    }
+
+    private func updateDiskSpace() {
+        let values = try? URL(fileURLWithPath: downloads.modelsDir)
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        freeDiskSpace = ModelBrowserMetrics.freeSpaceLabel(
+            availableBytes: values?.volumeAvailableCapacityForImportantUsage
+        )
     }
 }
 

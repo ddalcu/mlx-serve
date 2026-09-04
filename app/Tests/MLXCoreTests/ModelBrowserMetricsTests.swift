@@ -96,6 +96,22 @@ final class ModelBrowserMetricsTests: XCTestCase {
         XCTAssertGreaterThan(medium, compact)
     }
 
+    /// The My Models footer's free-space label: `nil` (an unreadable volume)
+    /// renders as "" so the row is hidden entirely rather than showing a
+    /// blank/zero figure, and a real byte count renders through the same
+    /// `MemoryInfo.format` every other memory readout in the app uses.
+    func testFreeSpaceLabelIsEmptyWhenUnreadable() {
+        XCTAssertEqual(ModelBrowserMetrics.freeSpaceLabel(availableBytes: nil), "")
+    }
+
+    func testFreeSpaceLabelFormatsBytesLikeMemoryInfo() {
+        let bytes: Int64 = 20 * 1024 * 1024 * 1024
+        XCTAssertEqual(
+            ModelBrowserMetrics.freeSpaceLabel(availableBytes: bytes),
+            MemoryInfo.format(bytes)
+        )
+    }
+
     /// The Model Browser window must OPEN wide enough for the full tier:
     /// sidebar ideal width + full-tier detail. The old 900×600 default gave
     /// the detail ~695pt — born squeezed, which is the "initial window seems
