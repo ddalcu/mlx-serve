@@ -54,6 +54,8 @@ check() {
 }
 
 SERVER_PID=""
+MM_OUT=/tmp/test_embeddings_mm.out
+MM_LOG=/tmp/test_embeddings_mm_server.log
 start_server() {
     local logfile="$1"; shift
     "$BINARY" --serve --port "$PORT" "$@" > "$logfile" 2>&1 &
@@ -68,11 +70,16 @@ stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/nu
 trap 'stop_server' EXIT
 
 echo "=== /v1/embeddings multimodal: $MM_MODEL ==="
-start_server /tmp/test_embeddings_mm_server.log --model "$MM_MODEL" --log-level info
+start_server "$MM_LOG" --model "$MM_MODEL" --log-level info
 
-# --- 1 + 2 + 3. vision-path contract, one python block over the HTTP API ---
-python3 - "$BASE" > /tmp/test_embeddings_mm.out <<'EOF'
-import base64, json, math, struct, sys, urllib.request, zlib
+# --- 1-5. vision-path contract, one python block over the HTTP API ---
+# The block ALWAYS exits 0 and reports each check as a parseable `TAG 0|1`
+# line, plus a `DIAG` line (last traceback line) when a request itself blows
+# up — the tests/ convention (cf. tests/test_embeddings.sh). Under `set -e`
+# a non-zero exit here would abort the script before any failure could be
+# reported (review finding on 8208b27), leaving only the === header.
+python3 - "$BASE" > "$MM_OUT" <<'EOF'
+import base64, json, math, struct, sys, traceback, urllib.request, zlib
 
 base = sys.argv[1]
 
@@ -108,47 +115,64 @@ def cos(a, b):
 def shape_ok(vec):
     return len(vec) > 0 and abs(math.sqrt(sum(x*x for x in vec)) - 1.0) < 1e-3
 
+def emit(tag, ok, detail=""):
+    print(f"{tag} {1 if ok else 0}" + (f" {detail}" if detail else ""))
+
 image_part = {"type": "image_url", "image_url": {"url": data_uri}}
 text_part = {"type": "text", "text": "A red square."}
 
-results = {}
-checks = []
+try:
+    # 1. image-only input (was: silent drop / 400 before the PR)
+    img_only = post({"model": "mlx-serve", "input": [image_part]})
+    emit("IMGONLY", len(img_only) == 1 and shape_ok(img_only[0]))
 
-# 1. image-only input (was: silent drop / 400 before the PR)
-img_only = post({"model": "mlx-serve", "input": [image_part]})
-checks.append(("image-only returns a vector", len(img_only) == 1 and shape_ok(img_only[0])))
-results["img_only"] = img_only[0]
+    # 2. text+image parts (OpenAI shape: ONE flat content-parts array — the
+    #    nested [[parts]] multi-item form is intentionally rejected with a 400)
+    txt_img = post({"model": "mlx-serve", "input": [text_part, image_part]})
+    emit("TXTIMG", len(txt_img) == 1 and shape_ok(txt_img[0]))
 
-# 2. text+image parts (OpenAI shape: ONE flat content-parts array — the
-#    nested [[parts]] multi-item form is intentionally rejected with a 400)
-txt_img = post({"model": "mlx-serve", "input": [text_part, image_part]})
-checks.append(("text+image parts return a vector", len(txt_img) == 1 and shape_ok(txt_img[0])))
-results["txt_img"] = txt_img[0]
+    # 3. self-consistency: same request twice → identical vector
+    img_only_2 = post({"model": "mlx-serve", "input": [image_part]})
+    d_self = cos(img_only[0], img_only_2[0])
+    emit("SELFCONS", d_self > 0.9999, f"cos={d_self:.6f}")
 
-# 3. self-consistency: same request twice → identical vector
-img_only_2 = post({"model": "mlx-serve", "input": [image_part]})
-checks.append(("repeated image-only request is self-consistent (cos=1)", cos(img_only[0], img_only_2[0]) > 0.9999))
+    # 4. the image actually contributes: text+image vs the same text alone
+    #    (a silently dropped image would land at cos ≈ 1.0)
+    txt_alone = post({"model": "mlx-serve", "input": "A red square."})
+    d = cos(txt_alone[0], txt_img[0])
+    emit("CONTRIB", d < 0.999, f"cos={d:.4f}")
 
-# 4. the image actually contributes: text+image vs the same text alone
-txt_alone = post({"model": "mlx-serve", "input": "A red square."})
-d = cos(txt_alone[0], txt_img[0])
-checks.append(("text+image differs from text alone (cos=%.4f < 0.999)" % d, d < 0.999))
-
-# 5. pure-text still works on the same server (no regression on the text path)
-checks.append(("pure-text request still unit-norm", shape_ok(txt_alone[0])))
-
-for desc, ok in checks:
-    print(("PASS\t" if ok else "FAIL\t") + desc)
-sys.exit(0 if all(ok for _, ok in checks) else 1)
+    # 5. pure-text still works on the same server (no regression on the text path)
+    emit("TXTOK", shape_ok(txt_alone[0]))
+except Exception:
+    emit("DIAG", 0, traceback.format_exc().splitlines()[-1])
 EOF
 
-PY_RC=$?
-if [ $PY_RC -eq 0 ]; then
-    sed 's/^/  /' /tmp/test_embeddings_mm.out | sed "s/PASS/$(printf '%b' "${GREEN}PASS${NC}")/"
-else
-    cat /tmp/test_embeddings_mm.out
-fi
-FAILURES=$((FAILURES + PY_RC))
+# Each check parses its `TAG` line; a missing line (the request died before a
+# check could run) falls back to the DIAG line + the server log tail, so the
+# reason is always visible in the output.
+mm_check() { # mm_check <tag> <desc>
+    local tag="$1" desc="$2" line ok detail diag logtail
+    line=$(awk -v t="^$tag " '$0 ~ t {print; exit}' "$MM_OUT")
+    if [ -n "$line" ]; then
+        ok=$(printf '%s\n' "$line" | awk '{print $2}')
+        detail="$line"
+    else
+        ok=0
+        detail="no '$tag' line — the request failed before a check could run"
+        diag=$(grep '^DIAG ' "$MM_OUT" 2>/dev/null || true)
+        [ -n "$diag" ] && detail="$detail; $diag"
+        logtail=$(tail -5 "$MM_LOG" 2>/dev/null || true)
+        [ -n "$logtail" ] && detail="$detail | server log: $logtail"
+    fi
+    check "$desc" "$ok" "$detail"
+}
+
+mm_check IMGONLY "image-only input returns an OpenAI-shaped unit-norm vector"
+mm_check TXTIMG "text+image parts return an OpenAI-shaped unit-norm vector"
+mm_check SELFCONS "repeated image-only request is self-consistent (cos=1)"
+mm_check CONTRIB "text+image differs from text alone (image contributes)"
+mm_check TXTOK "pure-text request still unit-norm on the same server"
 
 if [ $FAILURES -eq 0 ]; then
     echo -e "${GREEN}ALL PASS${NC} test_embeddings_mm"
