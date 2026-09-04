@@ -5075,14 +5075,20 @@ fn handleMultimodalEmbedding(
         } else {
             log.err("  mm embedding error: {}\n", .{err});
         }
-        // EmbedFailed (or enqueue failure): the request never reached the mm
-        // defer inside runEmbedRequest, so the multimodal buffers are still
-        // ours — free them here or they leak (caught by PR review).
-        if (req.vision_emb) |ve| _ = mlx.mlx_array_free(ve);
-        if (req.mrope_pos_alloc) |p| allocator.free(p);
-        if (req.deepstack_alloc) |d| {
-            for (d) |a| _ = mlx.mlx_array_free(a);
-            allocator.free(d);
+        // Ownership: `error.EmbedFailed` means the inference thread RAN the
+        // request — its own cleanup (resetCache-failure arm + the mm defer on
+        // every exit) has freed or will free the mm buffers, and
+        // finishEmbedRequest has already woken us, so touching them here
+        // races and double-frees (caught by PR review round 2). Only an
+        // ENQUEUE failure leaves the request unseen by the inference thread;
+        // in that case the buffers are still ours.
+        if (err != error.EmbedFailed) {
+            if (req.vision_emb) |ve| _ = mlx.mlx_array_free(ve);
+            if (req.mrope_pos_alloc) |p| allocator.free(p);
+            if (req.deepstack_alloc) |d| {
+                for (d) |a| _ = mlx.mlx_array_free(a);
+                allocator.free(d);
+            }
         }
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
         return;
