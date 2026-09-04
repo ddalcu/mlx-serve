@@ -119,6 +119,16 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
+    /// The verbatim `model_type` from config.json BEFORE family-specific
+    /// branches remap `model_type` to the trunk family (e.g. qwen3_vl →
+    /// qwen3). Used by `useChatTemplateEmbeddings()` to decide whether
+    /// /v1/embeddings should render the chat template. Stored by value in a
+    /// fixed buffer: ModelConfig stays free of allocator-owned fields (the
+    /// registry relies on plain destroy, and testing.allocator would flag a
+    /// dupe as a leak — caught by PR review). Oversized types simply fail
+    /// the family match, which is the desired outcome for unknown names.
+    original_model_type_buf: [64]u8 = undefined,
+    original_model_type_len: usize = 0,
     weight_prefix: []const u8 = "language_model.model",
 
     // Core dimensions
@@ -867,6 +877,21 @@ pub const ModelConfig = struct {
         return self.is_encoder_only or self.pooling_mode != null;
     }
 
+    /// Whether the /v1/embeddings tokenizer path renders the model's chat
+    /// template before pooling. Mirrors mlx-embeddings' dispatch, which routes
+    /// to a chat-template Processor strictly by model_type — only the
+    /// qwen3_vl embedding family does (its processor always constructs a
+    /// system+user conversation). Everything else — including text-only
+    /// qwen3 checkpoints that SHIP a ChatML template in tokenizer_config
+    /// (Qwen/Qwen3-Embedding) and generative trunks like WeMM's qwen3_5 —
+    /// embeds via raw tokenization plus the tokenizer post-processor's
+    /// trailing special token.
+    pub fn useChatTemplateEmbeddings(self: *const ModelConfig) bool {
+        const orig = self.original_model_type_buf[0..self.original_model_type_len];
+        return std.mem.eql(u8, orig, "qwen3_vl") or
+            std.mem.eql(u8, orig, "qwen3_vl_text");
+    }
+
     pub fn isInkling(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "inkling_mm_model");
     }
@@ -1486,9 +1511,12 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
             if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
         }
     }
-    // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
-    // partial_rotary_factor already parsed in the generic rope block above.
-    if (cfg_obj.get("rope_parameters")) |rp| {
+    // Interleaved M-RoPE sections (text_config.rope_parameters or
+    // text_config.rope_scaling — Qwen3-VL-Embedding uses rope_scaling).
+    // rope_theta / partial_rotary_factor already parsed in the generic rope
+    // block above.
+    const rp_val = cfg_obj.get("rope_parameters") orelse cfg_obj.get("rope_scaling");
+    if (rp_val) |rp| {
         if (rp == .object) {
             if (rp.object.get("mrope_interleaved")) |v| {
                 if (v == .bool) config.mrope_interleaved = v.bool;
@@ -1649,6 +1677,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
+    // The JSON arena is freed on return; copy the verbatim model_type into
+    // the fixed by-value buffer (no allocator-owned fields — see the field
+    // comment above).
+    if (model_type.len <= config.original_model_type_buf.len) {
+        @memcpy(config.original_model_type_buf[0..model_type.len], model_type);
+        config.original_model_type_len = model_type.len;
+    }
 
     // Determine which object to read config from: text_config (nested) or root (flat)
     const cfg_obj = if (root.get("text_config")) |tc_val| tc_val.object else root;
@@ -3051,6 +3086,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "qwen3_vl") or
+        std.mem.eql(u8, model_type, "qwen3_vl_text"))
+    {
+        // Qwen3-VL family (Qwen3-VL-Embedding, Qwen3-VL chat models). Dense
+        // QK-norm trunk with M-RoPE and the Qwen3-VL ViT tower. Same weight
+        // layout as qwen3_5 (language_model.model prefix, QK-norm, silu), but
+        // without the GDN attn_output_gate — this is a plain dense Qwen3 trunk.
+        config.model_type = "qwen3";
+        config.weight_prefix = if (root.get("text_config") != null) "language_model.model" else "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("head_dim") == null) {
+            config.head_dim = config.hidden_size / config.num_attention_heads;
+        }
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        parseQwenVisionFields(&config, root, cfg_obj);
     } else if (std.mem.eql(u8, model_type, "lfm2") or std.mem.startsWith(u8, model_type, "lfm2")) {
         config.model_type = "lfm2";
         // VL variant nests text weights under language_model.model (like Gemma 4)
@@ -5357,6 +5416,85 @@ test "ModelConfig parses Qwen3.5 vision tower + interleaved M-RoPE" {
     try testing.expectEqual(@as(u32, 248054), config.vision_end_token_id);
     // partial_rotary_factor → rotary_dim = 256*0.25 = 64.
     try testing.expectApproxEqAbs(@as(f32, 0.25), config.partial_rotary_factor, 1e-6);
+}
+
+test "parseConfigFromJson: qwen3_vl remaps the family and captures the original type" {
+    // The Qwen3-VL-Embedding shape: model_type qwen3_vl must (a) remap to the
+    // dense qwen3 trunk, (b) keep the verbatim original type in the by-value
+    // buffer so useChatTemplateEmbeddings() gates the chat-template path,
+    // (c) land vision_config keys in qv_* (the embedding model ships
+    // num_position_embeddings), and (d) read M-RoPE sections from
+    // text_config.rope_scaling. No allocator-owned fields — the
+    // testing.allocator would flag a leak at test end if parse dupe'd anything.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_vl",
+        \\  "image_token_id": 215404,
+        \\  "video_token_id": 215405,
+        \\  "vision_start_token_id": 215402,
+        \\  "vision_end_token_id": 215403,
+        \\  "text_config": {
+        \\    "hidden_size": 2048,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "head_dim": 128,
+        \\    "rope_scaling": {
+        \\      "rope_theta": 5000000,
+        \\      "mrope_section": [24, 20, 20],
+        \\      "mrope_interleaved": true
+        \\    }
+        \\  },
+        \\  "vision_config": {
+        \\    "model_type": "qwen3_vl",
+        \\    "depth": 24,
+        \\    "hidden_size": 1152,
+        \\    "num_heads": 16,
+        \\    "intermediate_size": 4304,
+        \\    "patch_size": 14,
+        \\    "temporal_patch_size": 2,
+        \\    "spatial_merge_size": 2,
+        \\    "num_position_embeddings": 2304,
+        \\    "out_hidden_size": 2048
+        \\  },
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    // (a) family remap: trunk is plain qwen3, weights under language_model.
+    try testing.expectEqualStrings("qwen3", config.model_type);
+    try testing.expect(config.has_qk_norm and !config.norm_has_offset);
+    // (b) original type captured by value — gates /v1/embeddings onto the
+    // chat-template path. qwen3_vl_text must match the same family.
+    try testing.expect(config.useChatTemplateEmbeddings());
+    try testing.expectEqualStrings("qwen3_vl", config.original_model_type_buf[0..config.original_model_type_len]);
+    const json_text = try std.fmt.allocPrint(testing.allocator, "{s}", .{json});
+    defer testing.allocator.free(json_text);
+    const config2 = blk: {
+        const swapped = std.mem.replaceOwned(u8, testing.allocator, json_text, "\"qwen3_vl\"", "\"qwen3_vl_text\"") catch unreachable;
+        defer testing.allocator.free(swapped);
+        break :blk try parseConfigFromJson(testing.allocator, swapped);
+    };
+    try testing.expect(config2.useChatTemplateEmbeddings());
+    // A trunk-family type must NOT take the chat-template embedding path.
+    const config3 = blk: {
+        const swapped = std.mem.replaceOwned(u8, testing.allocator, json_text, "\"qwen3_vl\"", "\"qwen3_5\"") catch unreachable;
+        defer testing.allocator.free(swapped);
+        break :blk try parseConfigFromJson(testing.allocator, swapped);
+    };
+    try testing.expect(!config3.useChatTemplateEmbeddings());
+    // (c) vision tower geometry.
+    try testing.expect(config.has_vision);
+    try testing.expect(config.qwen_vision);
+    try testing.expectEqual(@as(u32, 24), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1152), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), config.qv_heads);
+    try testing.expectEqual(@as(u32, 72), config.qv_head_dim); // 1152 / 16
+    try testing.expectEqual(@as(u32, 2048), config.qv_out_hidden);
+    try testing.expectEqual(@as(u32, 2304), config.qv_num_pos_emb);
+    // (d) M-RoPE from rope_scaling.
+    try testing.expect(config.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 24, 20, 20 }, config.mrope_section);
+    try testing.expectEqual(@as(u32, 215404), config.image_token_id);
 }
 
 test "parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts" {

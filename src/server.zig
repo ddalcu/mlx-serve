@@ -4432,6 +4432,76 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
 }
 
+/// Token ids for ONE /v1/embeddings input on a chat-template embedding model
+/// (Qwen3-VL-Embedding family). Extracted verbatim from the inline arm it
+/// replaces so the reference-matching contract is unit-testable without a
+/// loaded model.
+///
+/// The reference pipeline (mlx-embeddings' Processor) renders a FULL chat
+/// template — system prompt + user text + add_generation_prompt — and the
+/// tokenizer's TemplateProcessing post-processor then appends <EOS> (151643).
+/// Zig's tokenizer has no post-processor, so we render via formatChat and
+/// manually append bos_token_id (which IS <EOS> for Qwen3-VL) to match the
+/// reference token sequence exactly.
+///
+/// Gated on the model family, NOT on template availability alone:
+/// mlx-embeddings routes models to its chat pipeline by model_type
+/// (qwen3_vl) only, and text-only Qwen3-Embedding checkpoints embed via RAW
+/// tokenization there. Broad gating would also ensnare generative
+/// checkpoints that merely SHIP a chat_template.jinja (e.g. WeMM-Embedding's
+/// qwen3_5 trunk), rendering its generation template — assistant prompt +
+/// think block — into an embedding request.
+///
+/// Returns null when the caller must fall back to raw tokenization: family
+/// gate off, no chat config, an empty template, or a Jinja render failure.
+/// Allocation errors propagate (the handler fails the request, exactly like
+/// the inline `try` this was extracted from).
+fn renderEmbeddingInputIds(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    text: []const u8,
+    chat_config: ?*chat_mod.ChatConfig,
+    family_gate: bool,
+    bos_token_id: ?u32,
+) !?[]u32 {
+    if (!family_gate) return null;
+    const cc = chat_config orelse return null;
+    if (cc.chat_template.len == 0) return null;
+
+    // Construct messages: [{role: "user", content: text}].
+    // The Jinja template will auto-insert default_system_message
+    // when no system message is present — matching mlx-embeddings'
+    // format_embedding_input behavior.
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = text },
+    };
+    const rendered_ids = chat_mod.formatChat(
+        allocator,
+        tok,
+        &msgs,
+        cc,
+        null, // tools_json
+        null, // tool_choice_instruction
+        false, // enable_thinking
+        null, // effort
+        false, // continue_final
+    ) catch return null;
+    // Append bos_token_id (<EOS> = 151643 for Qwen3-VL) to emulate the
+    // tokenizer's TemplateProcessing post-processor that Python's
+    // apply_chat_template(tokenize=True) runs automatically.
+    //
+    // Ownership: on the no-bos path the `orelse return` fires BEFORE this
+    // defer is declared, so ownership of rendered_ids transfers to the
+    // caller untouched; on the bos path rendered_ids is copied into
+    // combined and freed here.
+    const bos_id = bos_token_id orelse return rendered_ids;
+    defer allocator.free(rendered_ids);
+    const combined = try allocator.alloc(u32, rendered_ids.len + 1);
+    @memcpy(combined[0..rendered_ids.len], rendered_ids);
+    combined[rendered_ids.len] = bos_id;
+    return combined;
+}
+
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -4520,34 +4590,52 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
-        const raw_ids = try tok.encode(allocator, text);
-        // Bidirectional embedding models (EmbeddingGemma) declare
-        // add_bos_token + add_eos_token; the SentencePiece encode path adds
-        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
-        const ids = if (config.use_bidirectional_attention) blk: {
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                config.bos_token_id,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else if (config.effectivePooling() == .last_token) blk: {
-            // Last-token pooling models pool an APPENDED terminator: the
-            // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
-            // adds <|endoftext|> (the config's eos_token_id) to every encode,
-            // and the reference pools THAT position — without it, we'd pool
-            // the final text token and quietly diverge from the model card.
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                null,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else raw_ids;
-        total_tokens += ids.len;
-        try seqs.append(allocator, ids);
+        // Models whose REFERENCE pipeline renders a chat template for
+        // embeddings (e.g. Qwen3-VL-Embedding via mlx-embeddings' Processor)
+        // produce reference embeddings through the FULL chat-template path.
+        // Gated on the model family, NOT on template availability alone: see
+        // renderEmbeddingInputIds for the full rationale and the reference
+        // token-sequence contract.
+        const ids = renderEmbeddingInputIds(
+            allocator,
+            tok,
+            text,
+            lm.chat_config,
+            config.useChatTemplateEmbeddings(),
+            config.bos_token_id,
+        ) catch null;
+
+        const final_ids = if (ids) |chat_ids| chat_ids else blk2: {
+            // Fall back to raw tokenization for models without chat templates.
+            // OWNERSHIP (load-bearing): `raw_ids` is owned by this loop
+            // iteration. The wrapEncoderIds branches free it after wrapping;
+            // in the plain `else raw_ids` case the slice itself is handed to
+            // `seqs` below, so freeing it here would be a use-after-free /
+            // double-free once the batch is disposed of.
+            const raw_ids = try tok.encode(allocator, text);
+            break :blk2 if (config.use_bidirectional_attention) blk3: {
+                defer allocator.free(raw_ids);
+                break :blk3 try wrapEncoderIds(
+                    allocator,
+                    raw_ids,
+                    config.bos_token_id,
+                    if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+                );
+            } else if (config.effectivePooling() == .last_token) blk3: {
+                // Last-token pooling without a chat template: append the
+                // model's EOS token so pooling picks up the terminator
+                // position, matching the reference implementation's behavior.
+                defer allocator.free(raw_ids);
+                break :blk3 try wrapEncoderIds(
+                    allocator,
+                    raw_ids,
+                    null,
+                    if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+                );
+            } else raw_ids;
+        };
+        total_tokens += final_ids.len;
+        try seqs.append(allocator, final_ids);
     }
 
     // Issue #117: enforce the effective per-input token ceiling BEFORE the
@@ -18662,4 +18750,79 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "renderEmbeddingInputIds: Qwen3-VL reference token sequence, family gate and fallbacks" {
+    // Pins the ENTIRE chat-template embedding contract on a hermetic
+    // tokenizer — the same sequence mlx-embeddings' Processor produces for
+    // Qwen3-VL-Embedding: <system prompt><user text><assistant turn>
+    // + the TemplateProcessing <EOS> (rendered here as the manual
+    // bos_token_id append). A drift here is a silent embedding-quality
+    // regression (cosine vs the reference drops), not a crash — so it must
+    // be pinned, not discovered.
+    const a = testing.allocator;
+
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    // Byte-fallback pieces cover every byte the template can render, so the
+    // BPE fallthrough encodes deterministically without a real 151k vocab.
+    var byte_id: u32 = 0;
+    while (byte_id < 256) : (byte_id += 1) {
+        const cp = tok.byte_to_unicode[byte_id];
+        var utf8_buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch unreachable;
+        const piece = try a.dupe(u8, utf8_buf[0..len]);
+        try tok.vocab.put(piece, byte_id);
+        try tok.id_to_token.put(byte_id, piece);
+    }
+    // The control markers the template emits, as atomic special tokens.
+    const marker_ids = [_]u32{ 1000, 1001, 1002, 1003, 1004 };
+    const markers = [_][]const u8{ "<|im_start|>", "<|im_end|>", "\n", "<|endoftext|>", "You are a helpful assistant." };
+    for (markers, marker_ids) |m, id| {
+        const piece = try a.dupe(u8, m);
+        try tok.special_tokens.put(piece, id);
+        try tok.id_to_token.put(id, piece);
+    }
+
+    // A minimal template (no Jinja markers the renderer would substitute) so
+    // the render is a FIXED string: encode(text) is then a pinned constant,
+    // and the appended bos id pins the post-processor emulation.
+    var cc_fixed = chat_mod.ChatConfig{
+        .chat_template = "hi",
+        .bos_token = null,
+        .eos_token = "<|endoftext|>",
+        .add_bos_token = false,
+        .allocator = a,
+    };
+
+    // (1) The reference contract: rendered ids + trailing bos_token_id
+    //     (<EOS> 151643 for Qwen3-VL) — not just "non-empty", the EXACT
+    //     sequence, including the append ORDER (template content first).
+    const text_ids = try tok.encode(a, "hi");
+    defer a.free(text_ids);
+    const want = try a.alloc(u32, text_ids.len + 1);
+    defer a.free(want);
+    @memcpy(want[0..text_ids.len], text_ids);
+    want[text_ids.len] = 151643;
+
+    const ids = (try renderEmbeddingInputIds(a, &tok, "hi", &cc_fixed, true, 151643)).?;
+    defer a.free(ids);
+    try testing.expectEqualSlices(u32, want, ids);
+
+    // (2) Family gate OFF (trunk qwen3/WeMM class) → null → raw tokenization.
+    try testing.expectEqual(@as(?[]u32, null), try renderEmbeddingInputIds(a, &tok, "hi", &cc_fixed, false, 151643));
+
+    // (3) Family on but no chat config → null.
+    try testing.expectEqual(@as(?[]u32, null), try renderEmbeddingInputIds(a, &tok, "hi", null, true, 151643));
+
+    // (4) Family on, config present, EMPTY template → null.
+    var cc_empty = cc_fixed;
+    cc_empty.chat_template = "";
+    try testing.expectEqual(@as(?[]u32, null), try renderEmbeddingInputIds(a, &tok, "hi", &cc_empty, true, 151643));
+
+    // (5) No bos_token_id in config → rendered ids WITHOUT an append (the
+    //     orelse arm), still preferred over raw tokenization.
+    const ids_no_bos = (try renderEmbeddingInputIds(a, &tok, "hi", &cc_fixed, true, null)).?;
+    defer a.free(ids_no_bos);
+    try testing.expectEqualSlices(u32, text_ids, ids_no_bos);
 }
