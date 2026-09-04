@@ -360,11 +360,17 @@ struct StatusMenuView: View {
 
     /// The one state-driven action, plus the log window.
     private var serverControls: some View {
+        // A hot-load leaves the server RUNNING while the checkpoint reads, so
+        // the tray — which has no per-model spinner of its own — would go
+        // straight to "Stop Server" and say nothing for the minute that
+        // follows. `loadingModelPath` is what the chat pill spins on; the
+        // button reports the same fact.
         let control = ServerControlButtonPresentation(
             status: server.status,
-            loadsModel: !StartupModelChoice.trayStartPath(
+            loadsModel: StartupModelChoice.trayStartLoadsModel(
                 loadModelAtStart: appState.loadModelAtStart,
-                selectedModelPath: appState.selectedModelPath).isEmpty)
+                selectedModelPath: appState.selectedModelPath),
+            isLoadingModel: appState.loadingModelPath != nil)
         return HStack(spacing: 6) {
             serverPrimaryButton(control)
 
@@ -382,11 +388,14 @@ struct StatusMenuView: View {
     @ViewBuilder
     private func serverPrimaryButton(_ control: ServerControlButtonPresentation) -> some View {
         let button = Button {
-            server.toggle(
-                modelPath: StartupModelChoice.trayStartPath(
-                    loadModelAtStart: appState.loadModelAtStart,
-                    selectedModelPath: appState.selectedModelPath),
-                options: appState.serverOptions)
+            if server.status == .running || server.status == .starting {
+                server.stop()
+            } else {
+                // Headless, then a hot-load if the setting asks — the same one
+                // path every Start button in the app takes. Nothing here
+                // launches with `--model`, so an eject always sticks.
+                appState.startServer(loadingSelection: appState.loadModelAtStart)
+            }
         } label: {
             HStack(spacing: 8) {
                 if control.showsProgress {
@@ -400,10 +409,6 @@ struct StatusMenuView: View {
             .frame(maxWidth: .infinity)
         }
         .tint(control.tint.color)
-        // Only a start that LOADS needs something to load: with "Load a model
-        // at start" off this brings up a headless server, which is exactly what
-        // a Mac with no model yet (media-only, or LAN-only) wants.
-        .disabled(appState.loadModelAtStart && appState.selectedModelPath.isEmpty)
         .controlSize(.regular)
         .help(control.help)
 
@@ -884,7 +889,20 @@ struct ServerControlButtonPresentation: Equatable {
     /// `loadsModel` is what THIS start does, not what the app can do: a
     /// headless start is up in a second and puts nothing resident, so calling
     /// it "Loading Model..." describes work that is not happening.
-    init(status: ServerStatus, loadsModel: Bool = true) {
+    init(status: ServerStatus, loadsModel: Bool = true, isLoadingModel: Bool = false) {
+        // A model reading into memory outranks "running": the server is up, but
+        // it cannot answer yet, and the button is the only thing in the tray
+        // that can say so. Clicking still stops the server, as it does for any
+        // start in progress.
+        if isLoadingModel, status == .running {
+            title = "Loading Model..."
+            systemImageName = nil
+            showsProgress = true
+            tint = .loading
+            help = "Loading model. Click to stop the server."
+            isProminent = true
+            return
+        }
         switch status {
         case .starting:
             title = loadsModel ? "Loading Model..." : "Starting Server..."

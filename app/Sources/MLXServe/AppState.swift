@@ -738,15 +738,16 @@ class AppState: ObservableObject {
         }
     }
 
-    /// The chat window's Start button: bring the server up and get this chat
-    /// answerable, WITHOUT making the model the launch default.
+    /// Every Start BUTTON in the app: bring the server up, and put the
+    /// selection resident WITHOUT making it the launch default.
     ///
-    /// It used to call `ensureServerForLan()`, which passes `--model` — and a
-    /// `--model` entry is the registry's default, so ejecting it brings it back
-    /// on the next request (the tray-Start trap, issue #214). Starting headless
-    /// and then hot-loading through `ServerManager.ensureDefaultChatModel`
-    /// reaches the same resident model as an ordinary registry entry, one the
-    /// user can eject and have stay ejected.
+    /// `--model` is now only ever passed by an auto-start the user configured.
+    /// A button start is always headless plus, when it should load, a hot-load
+    /// through the registry — so ejecting a model always sticks, which a
+    /// `--model` entry cannot do (it is the registry's DEFAULT and comes back
+    /// on the next request). The chat window's Start always loads: you are
+    /// looking at a dead composer and about to type. The tray's asks
+    /// `loadModelAtStart`, the same setting the auto-start gate asks.
     ///
     /// The load is kicked HERE rather than left to the first turn because the
     /// user just pressed a button and is owed a spinner: `loadingModelPath`
@@ -756,10 +757,10 @@ class AppState: ObservableObject {
     ///
     /// Nothing local selected means the model answering is on another Mac, and
     /// a headless server is all the proxy needs.
-    func startServerForChat() {
+    func startServer(loadingSelection: Bool) {
         guard server.status != .running, server.status != .starting else { return }
         server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
-        guard !selectedModelPath.isEmpty else { return }
+        guard loadingSelection, !selectedModelPath.isEmpty else { return }
         let path = selectedModelPath
         let mgr = server
         modelSwitchGeneration += 1

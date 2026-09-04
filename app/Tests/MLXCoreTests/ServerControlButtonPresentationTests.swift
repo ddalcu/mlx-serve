@@ -39,4 +39,14 @@ final class ServerControlButtonPresentationTests: XCTestCase {
         XCTAssertTrue(stopped.help.contains("no model resident"))
         XCTAssertTrue(ServerControlButtonPresentation(status: .stopped).help.contains("load the selected model"))
     }
+
+    /// A hot-load leaves the server RUNNING while the checkpoint reads. The
+    /// tray has no per-model spinner, so without this the button would flip to
+    /// "Stop Server" and say nothing for the minute that follows.
+    func testALoadingModelOutranksRunning() {
+        let loading = ServerControlButtonPresentation(status: .running, isLoadingModel: true)
+        XCTAssertEqual(loading.title, "Loading Model...")
+        XCTAssertTrue(loading.showsProgress)
+        XCTAssertEqual(ServerControlButtonPresentation(status: .running).title, "Stop Server")
+    }
 }

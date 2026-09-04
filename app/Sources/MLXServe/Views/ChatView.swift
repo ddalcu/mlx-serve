@@ -1984,7 +1984,7 @@ struct ChatDetailView: View {
                 // the user can eject and have stay ejected. The pill spins
                 // meanwhile. A second `server.start` call site here is how the
                 // start paths would drift.
-                appState.startServerForChat()
+                appState.startServer(loadingSelection: true)
             } label: {
                 HStack(spacing: 4) {
                     if control == .starting {

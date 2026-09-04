@@ -286,23 +286,20 @@ final class StartupModelChoiceTests: XCTestCase {
     /// and ejecting it brought it straight back, because `--model` makes that
     /// entry the registry's default.
     func testTrayStartLoadsNothingUnlessTheSettingAsksForIt() {
-        XCTAssertEqual(
-            StartupModelChoice.trayStartPath(loadModelAtStart: false,
-                                             selectedModelPath: "/models/qwen"),
-            "")
-        XCTAssertEqual(
-            StartupModelChoice.trayStartPath(loadModelAtStart: true,
-                                             selectedModelPath: "/models/qwen"),
-            "/models/qwen")
+        XCTAssertFalse(
+            StartupModelChoice.trayStartLoadsModel(loadModelAtStart: false,
+                                                   selectedModelPath: "/models/qwen"))
+        XCTAssertTrue(
+            StartupModelChoice.trayStartLoadsModel(loadModelAtStart: true,
+                                                   selectedModelPath: "/models/qwen"))
     }
 
-    /// The picker sits directly above the button, so a loading Start serves
-    /// what the picker names — and with nothing picked there is nothing to
-    /// load, which is a headless start rather than a broken `--model`.
+    /// Nothing picked means nothing to load, so the start is plain headless —
+    /// never a `--model` with no model, and never a disabled button on a Mac
+    /// that has every reason to want a server (media-only, or LAN-only).
     func testTrayStartWithNothingSelectedIsHeadless() {
-        XCTAssertEqual(
-            StartupModelChoice.trayStartPath(loadModelAtStart: true, selectedModelPath: ""),
-            "")
+        XCTAssertFalse(
+            StartupModelChoice.trayStartLoadsModel(loadModelAtStart: true, selectedModelPath: ""))
     }
 
     // MARK: - The chat window's Start button
@@ -317,19 +314,19 @@ final class StartupModelChoiceTests: XCTestCase {
         let button = try XCTUnwrap(view.range(of: "@ViewBuilder private var serverStartControl"),
                                    "the chat Start control moved — re-point this scan")
         let body = view[button.upperBound...].prefix(1200)
-        XCTAssertTrue(body.contains("appState.startServerForChat()"),
-                      "chat Start must go through startServerForChat")
+        XCTAssertTrue(body.contains("appState.startServer(loadingSelection: true)"),
+                      "chat Start must go through the one button-start path")
         XCTAssertFalse(body.contains("appState.ensureServerForLan()"),
                        "ensureServerForLan passes --model, which pins the model as the launch default")
     }
 
-    /// And that method is headless-then-hot-load, with the pill spinning: a
-    /// start the user pressed owes them a spinner, and `ensureDefaultChatModel`
+    /// And that one method is headless-then-hot-load, with the pill spinning:
+    /// a start the user pressed owes them a spinner, and `ensureDefaultChatModel`
     /// is the ONE hot-load path (it also records the last model used).
-    func testStartServerForChatIsHeadlessThenAnOnDemandLoad() throws {
+    func testEveryButtonStartIsHeadlessThenAnOnDemandLoad() throws {
         let state = try appSource("AppState.swift")
-        let fn = try XCTUnwrap(state.range(of: "func startServerForChat()"),
-                               "startServerForChat moved — re-point this scan")
+        let fn = try XCTUnwrap(state.range(of: "func startServer(loadingSelection: Bool)"),
+                               "startServer moved — re-point this scan")
         let body = state[fn.upperBound...].prefix(900)
         XCTAssertTrue(body.contains("server.startHeadless("), "the start itself must be headless")
         XCTAssertTrue(body.contains("ensureDefaultChatModel("), "the load must go through the one hot-load path")
