@@ -668,14 +668,15 @@ class AppState: ObservableObject {
         // up HEADLESS, and only Settings ▸ Server ▸ "Load a model at start" —
         // default OFF — makes launch pay for a checkpoint. `refreshModels()`
         // above is what makes the installed-library check below meaningful.
-        switch StartupModelChoice.launch(
+        let launchPlan = StartupModelChoice.launch(
             autoStart: autoStartServer,
             loadModelAtStart: loadModelAtStart,
             mode: startupModelMode,
             pinnedPath: startupModelPinnedPath,
             lastUsed: StartupModelChoice.lastUsed(),
             installedPaths: localModels.filter(\.isChatPickable).map(\.path)
-        ) {
+        )
+        switch launchPlan {
         case .doNothing:
             break
         case .headless:
@@ -685,9 +686,12 @@ class AppState: ObservableObject {
         }
         // LAN sharing/discovery lives in the server process — with either
         // enabled the server should be up (headless when nothing was
-        // auto-started) so this Mac shares and sees network models.
+        // auto-started) so this Mac shares and sees network models. It loads
+        // what the launch plan asked for and nothing else: passing the
+        // selection here would reinstate the eager login load for anyone whose
+        // auto-start is off and whose LAN sharing is on.
         if serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled {
-            ensureServerForLan()
+            ensureServerForLan(modelPath: StartupModelChoice.lanStartPath(plan: launchPlan))
         }
 
         // Fallback health detection — runs detached to avoid blocking MainActor
@@ -718,10 +722,17 @@ class AppState: ObservableObject {
     /// Start the server for LAN duty if it isn't running: with the selected
     /// local model when there is one (it keeps serving chat AND the LAN),
     /// else headless over the models root.
-    func ensureServerForLan() {
+    ///
+    /// `modelPath` overrides what goes resident, and an EMPTY override means
+    /// headless. Only launch passes one — it has already decided whether this
+    /// login pays for a checkpoint (`StartupModelChoice.lanStartPath`). Every
+    /// other caller is a user who just asked for a server to talk to, so the
+    /// default keeps loading the selection.
+    func ensureServerForLan(modelPath: String? = nil) {
         guard server.status != .running, server.status != .starting else { return }
-        if !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, options: serverOptions)
+        let path = modelPath ?? selectedModelPath
+        if !path.isEmpty {
+            server.start(modelPath: path, options: serverOptions)
         } else {
             server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
         }

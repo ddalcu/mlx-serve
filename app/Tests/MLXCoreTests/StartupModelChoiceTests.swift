@@ -11,6 +11,8 @@ import XCTest
 /// single branch in `AppState.init` that nobody can watch run.
 final class StartupModelChoiceTests: XCTestCase {
 
+    private typealias Launch = StartupModelChoice.Launch
+
     private let installed = ["/models/qwen", "/models/gemma"]
 
     private func scratchDefaults(_ name: String = #function) -> UserDefaults {
@@ -237,5 +239,42 @@ final class StartupModelChoiceTests: XCTestCase {
                                                  pinnedPath: "",
                                                  lastUsed: nil,
                                                  installedPaths: []))
+    }
+
+    // MARK: - LAN duty at launch
+
+    /// LAN sharing brings a server up even with auto-start off, and that start
+    /// must not be the back door this split closed: it loads what the launch
+    /// plan asked for, which for a plan that asked for nothing is nothing.
+    func testLanDutyAtLaunchLoadsNothingUnlessTheStartupChoiceAskedFor() {
+        XCTAssertEqual(StartupModelChoice.lanStartPath(plan: .doNothing), "")
+        XCTAssertEqual(StartupModelChoice.lanStartPath(plan: .headless), "")
+        XCTAssertEqual(StartupModelChoice.lanStartPath(plan: .load(path: "/models/qwen")),
+                       "/models/qwen")
+    }
+
+    func testAPlanNamesTheModelItLoads() {
+        XCTAssertNil(Launch.doNothing.modelPath)
+        XCTAssertNil(Launch.headless.modelPath)
+        XCTAssertEqual(Launch.load(path: "/models/gemma").modelPath, "/models/gemma")
+    }
+
+    /// The rule above is only worth anything if the launch path asks it. A
+    /// bare `ensureServerForLan()` there loads `selectedModelPath` — the eager
+    /// login load, reached by a Mac that merely shares its models — and no
+    /// unit test of a pure function can see that, so the call site is scanned.
+    func testTheLaunchTimeLanStartGoesThroughTheStartupPlan() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // MLXCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // app
+            .appendingPathComponent("Sources/MLXServe/AppState.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let launchBlock = try XCTUnwrap(
+            source.range(of: "if serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled {"),
+            "the launch-time LAN block moved — re-point this scan")
+        let call = source[launchBlock.upperBound...].prefix(200)
+        XCTAssertTrue(call.contains("StartupModelChoice.lanStartPath(plan:"),
+                      "launch-time LAN duty must start the server the startup plan asked for")
     }
 }
