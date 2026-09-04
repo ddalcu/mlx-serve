@@ -91,6 +91,22 @@ enum StartupModelChoice {
         return wanted
     }
 
+    /// The pin a FIRST switch to "Always this model" opens on.
+    ///
+    /// Switching to `.pinned` having never pinned anything would leave the
+    /// dropdown matching no row and rendering blank — the dead-control class —
+    /// so it is seeded with the answer the other mode was already giving, and
+    /// only with the library's first model when that mode had no answer either.
+    /// Empty means the Mac has no chat model to pin at all.
+    static func seedPin(lastUsed: String?, installedPaths: [String]) -> String {
+        resolved(mode: .lastUsed,
+                 pinnedPath: nil,
+                 lastUsed: lastUsed,
+                 installedPaths: installedPaths)
+            ?? installedPaths.first
+            ?? ""
+    }
+
     // MARK: - The launch gate
 
     /// What `AppState.init` should do with the server.

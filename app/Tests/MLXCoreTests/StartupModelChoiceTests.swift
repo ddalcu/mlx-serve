@@ -206,4 +206,36 @@ final class StartupModelChoiceTests: XCTestCase {
         StartupModelChoice.recordLoaded(path: "", defaults: d)
         XCTAssertEqual(StartupModelChoice.lastUsed(defaults: d), "/models/qwen")
     }
+
+    // MARK: - Seeding the pin
+
+    /// Switching to "Always this model" for the first time opens on what the
+    /// other mode was already going to load — the control shows what is about
+    /// to happen rather than a blank row.
+    func testTheFirstPinSeedsFromTheLastModelUsed() {
+        XCTAssertEqual(
+            StartupModelChoice.seedPin(lastUsed: "/models/gemma", installedPaths: installed),
+            "/models/gemma")
+    }
+
+    /// Nothing used yet, or used and since uninstalled: the seed falls to the
+    /// library's first model, never to a path that is no longer there.
+    func testAPinWithNoAnswerToInheritSeedsFromTheLibrary() {
+        XCTAssertEqual(
+            StartupModelChoice.seedPin(lastUsed: nil, installedPaths: installed),
+            "/models/qwen")
+        XCTAssertEqual(
+            StartupModelChoice.seedPin(lastUsed: "/models/deleted", installedPaths: installed),
+            "/models/qwen")
+    }
+
+    /// No chat model on the Mac: empty, which `resolved` reads back as
+    /// "nothing pinned" and start reads as headless.
+    func testAnEmptyLibrarySeedsNothing() {
+        XCTAssertEqual(StartupModelChoice.seedPin(lastUsed: "/models/qwen", installedPaths: []), "")
+        XCTAssertNil(StartupModelChoice.resolved(mode: .pinned,
+                                                 pinnedPath: "",
+                                                 lastUsed: nil,
+                                                 installedPaths: []))
+    }
 }
