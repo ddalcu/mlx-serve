@@ -61,6 +61,13 @@ enum ChatMetrics {
     /// top padding.
     static var userBubbleBottomPadding: CGFloat { compactMode ? 10 : 0 }
 
+    /// Extra air under a REPLY, on top of `transcriptSpacing`.
+    ///
+    /// The turn boundary that matters is the one between an answer and the next
+    /// question; between your question and its answer the two belong together.
+    /// Totals 10 in compact (what standard used to have) and 20 in standard.
+    static var assistantTurnBottomPadding: CGFloat { compactMode ? 4 : 10 }
+
     /// Single-line height of the composer's input pill — also the frame of
     /// every round control beside it (attach / mic / send), so a
     /// bottom-aligned HStack lines their centers up with the resting pill
@@ -88,7 +95,15 @@ enum ChatMetrics {
     /// read as a wall next to every web chat (~1.6–1.75 of the font size);
     /// 1.4 × natural lands in that zone. Code gets less — a listing wants
     /// rows, not air.
-    static let proseLineHeightMultiple: CGFloat = 1.4
+    ///
+    /// Compact tightens it, the way it tightens your own turn
+    /// (`userLineSpacing`): 1.15 is roughly the same bite out of a 14pt line as
+    /// the 3.5 points taken there. Only the leading INSIDE a paragraph — the
+    /// gap BETWEEN paragraphs is `paragraphSpacing` and stays put.
+    ///
+    /// Read by the renderer, whose output is cached: `MarkdownText`'s cache key
+    /// carries the density for this reason.
+    static var proseLineHeightMultiple: CGFloat { compactMode ? 1.15 : 1.4 }
     static let codeLineHeightMultiple: CGFloat = 1.2
 
     /// The user's bubble is plain SwiftUI `Text`, where leading is EXTRA
@@ -123,6 +138,20 @@ enum ChatMetrics {
     static var attachmentHeight: CGFloat { compactMode ? 140 : 200 }
     /// Between attachments, both ways.
     static let attachmentSpacing: CGFloat = 6
+
+    /// Height cap for a GENERATED picture or clip in the transcript. The width
+    /// follows the picture's own ratio (`ChatImagePreview.displaySize`); a video
+    /// has no ratio to follow before it loads, so its box is fixed.
+    ///
+    /// Bigger than an attachment's: this is the thing that was ASKED for, not
+    /// context attached to a question. Compact takes a bite out of it and, more
+    /// to the point, drops the prompt caption underneath.
+    static var generatedImageHeight: CGFloat { compactMode ? 220 : 300 }
+    static var generatedVideoHeight: CGFloat { compactMode ? 200 : 260 }
+    /// One width for every generated row, so an image, a clip and a track
+    /// stacked under one reply share an edge. Was 400 for pictures and 420 for
+    /// everything else.
+    static let generatedMediaMaxWidth: CGFloat = 420
 
     /// Widest your own turn gets. The reply has no such cap - it is the page's
     /// main content and takes the column.

@@ -50,17 +50,28 @@ enum ToolCallDisplay {
         let text: String
         switch value {
         case let s as String: text = s
-        case let n as NSNumber: text = n.stringValue
+        case let n as NSNumber:
+            // JSON's `true` arrives as an NSNumber whose `stringValue` is "1".
+            // Only its CoreFoundation type tells a boolean from the number one,
+            // and `run_in_background: 1` is not what the model sent.
+            text = CFGetTypeID(n) == CFBooleanGetTypeID()
+                ? (n.boolValue ? "true" : "false")
+                : n.stringValue
         case .none, is NSNull: text = "null"
         default:
             text = (try? JSONSerialization.data(withJSONObject: value as Any, options: [.fragmentsAllowed]))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? String(describing: value ?? "")
         }
 
-        let spaced = text.replacingOccurrences(of: "[\\r\\n\\u{2028}\\u{2029}\\t]+", with: " ",
-                                               options: .regularExpression)
-        let collapsed = spaced.replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespaces)
+        // Split on whitespace rather than matching it: `CharacterSet.newlines`
+        // already covers CR, LF, CRLF and the two Unicode separators, and an
+        // ICU pattern spelling them out needs ` `, not Swift's `\u{2028}` —
+        // which makes the whole pattern invalid, so nothing is replaced at all
+        // and a file body reaches the panel with its newlines intact.
+        let collapsed = text
+            .components(separatedBy: CharacterSet.newlines.union(.whitespaces))
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
         return collapsed.count > valueLimit
             ? String(collapsed.prefix(valueLimit)) + "…"
             : collapsed
@@ -142,7 +153,7 @@ enum ToolCallDisplay {
     /// An MCP tool (`<server>__<tool>`) is looked up under its bare name too,
     /// so a server exposing `readFile` gets the same treatment as the built-in.
     static func headline(toolName: String, arguments: [Argument]) -> String? {
-        let bare = toolName.components(separatedBy: "__").last ?? toolName
+        let bare = MCPManager.parseNamespacedName(toolName)?.tool ?? toolName
         // `browse` has no single interesting argument: its action decides which
         // one matters (a selector for click, a script for executeJS, a URL only
         // for navigate). Take whichever is present, in that order of interest —
@@ -272,6 +283,20 @@ enum ToolCallDisplay {
         return result[range]
             .trimmingCharacters(in: CharacterSet(charactersIn: " ("))
             .replacingOccurrences(of: "as ", with: "")
+    }
+
+    /// The name as a reader should see it: an MCP tool's `<server>__<tool>` is
+    /// a wire format, and `perry-memory/get_context` says the same thing in the
+    /// notation people already read as "this thing, over there".
+    ///
+    /// Split by `MCPManager.parseNamespacedName`, the function dispatch itself
+    /// uses, so the card can never disagree with where the call went: the
+    /// server half cannot contain `__` (`namespacedName` collapses it), and
+    /// everything after the first separator is the tool's own name, `__`
+    /// included. A name that is not of that shape is shown untouched.
+    static func displayName(_ toolName: String) -> String {
+        guard let (server, tool) = MCPManager.parseNamespacedName(toolName) else { return toolName }
+        return "\(server)/\(tool)"
     }
 
     /// The tool's name for the header, from the structured record when there is

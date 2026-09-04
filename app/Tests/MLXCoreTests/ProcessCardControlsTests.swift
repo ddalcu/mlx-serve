@@ -30,4 +30,56 @@ final class ProcessCardControlsTests: XCTestCase {
         let out = ProcessCardControls.killable(handles: ["bg1", "bg2"], isAlive: freshRegistry.isAlive)
         XCTAssertEqual(out, [])
     }
+
+    // MARK: - Which card a reused handle belongs to
+
+    /// Numbering restarts at `bg1` every launch, and the registry knows only the
+    /// name. So a card from an old session asked "is bg1 alive?", got yes about
+    /// a process started today, and offered to kill it. The LAST card to
+    /// announce a handle owns it.
+    func testAReusedHandleBelongsToTheLatestCardOnly() {
+        let owned = ProcessCardControls.handleOwnership([(1, ["bg1"]), (2, ["bg1"])])
+        XCTAssertEqual(owned[1] ?? [], [])
+        XCTAssertEqual(owned[2] ?? [], ["bg1"])
+    }
+
+    /// Handles are independent: losing `bg1` to a later card must not take the
+    /// card's own `bg2` with it.
+    func testOwnershipIsPerHandleNotPerCard() {
+        let owned = ProcessCardControls.handleOwnership([(1, ["bg1", "bg2"]), (2, ["bg1"])])
+        XCTAssertEqual(owned[1] ?? [], ["bg2"])
+        XCTAssertEqual(owned[2] ?? [], ["bg1"])
+    }
+
+    /// One round can start several processes, and one card can announce a
+    /// handle twice — neither may duplicate a pill.
+    func testACardKeepsEveryHandleNobodyElseClaimed() {
+        let owned = ProcessCardControls.handleOwnership([(1, ["bg1", "bg2", "bg1"])])
+        XCTAssertEqual(owned[1] ?? [], ["bg1", "bg2"])
+    }
+
+    // MARK: - Header pill vs pill beside the call
+
+    /// A multi-tool card puts each pill beside the tool that started it, so the
+    /// header shows only what no call claimed — plus, while collapsed, a
+    /// button-less "running" for the claimed ones, which are hidden with the
+    /// panel.
+    func testLiveHandlesSplitIntoClaimedAndUnclaimed() {
+        let split = ProcessCardControls.split(live: ["bg1", "bg2", "bg3"],
+                                              claimedBy: ["bg1", nil, "bg3"])
+        XCTAssertEqual(split.claimed, ["bg1", "bg3"])
+        XCTAssertEqual(split.unclaimed, ["bg2"])
+    }
+
+    /// A call whose result named a handle that has since exited claims nothing:
+    /// the header must not grow a pill for a dead process.
+    func testAClaimOnADeadHandleAddsNothing() {
+        let split = ProcessCardControls.split(live: [], claimedBy: ["bg1"])
+        XCTAssertTrue(split.claimed.isEmpty)
+        XCTAssertTrue(split.unclaimed.isEmpty)
+    }
+
+    func testNoAnnouncementsOwnNothing() {
+        XCTAssertTrue(ProcessCardControls.handleOwnership([(Int, [String])]()).isEmpty)
+    }
 }

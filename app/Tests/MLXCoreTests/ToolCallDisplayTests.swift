@@ -60,8 +60,10 @@ final class ToolCallDisplayTests: XCTestCase {
 
     // MARK: - The name
 
+    /// Qualified: the test target declares its own `SerializedToolCall` (in
+    /// `AgentHarnessTests`), which shadows the app's inside this module.
     func testTheTitleComesFromTheStructuredCall() {
-        let calls = [SerializedToolCall(id: "1", name: "writeFile", arguments: "{}")]
+        let calls = [MLXCore.SerializedToolCall(id: "1", name: "writeFile", arguments: "{}")]
         XCTAssertEqual(ToolCallDisplay.title(calls: calls, summary: "ignored"), "writeFile")
     }
 
@@ -70,6 +72,35 @@ final class ToolCallDisplayTests: XCTestCase {
     func testTheTitleFallsBackToTheSummaryText() {
         XCTAssertEqual(ToolCallDisplay.title(calls: [], summary: "**readFile**(path: a.txt)"),
                        "readFile")
+    }
+
+    // MARK: - How the name reads
+
+    /// `<server>__<tool>` is a wire format, not something to read. The card
+    /// shows it as a path — the same two halves `MCPManager` dispatches on.
+    func testAnMCPToolNameReadsAsAPath() {
+        XCTAssertEqual(ToolCallDisplay.displayName("perry-memory__get_context"),
+                       "perry-memory/get_context")
+    }
+
+    func testABuiltInNameIsUntouched() {
+        XCTAssertEqual(ToolCallDisplay.displayName("writeFile"), "writeFile")
+    }
+
+    /// The split is at the FIRST `__` because that is where dispatch splits:
+    /// `namespacedName` collapses `__` inside the SERVER id, so a later one can
+    /// only belong to the tool. Rendering it any other way would name a tool
+    /// the call never went to.
+    func testOnlyTheFirstSeparatorSplits() {
+        XCTAssertEqual(ToolCallDisplay.displayName("srv__do__thing"), "srv/do__thing")
+    }
+
+    /// Half a name is not a namespace: an empty side means this is not the
+    /// `<server>__<tool>` shape, and inventing a slash would be a lie about
+    /// where it ran.
+    func testAnEmptyHalfIsNotANamespace() {
+        XCTAssertEqual(ToolCallDisplay.displayName("__orphan"), "__orphan")
+        XCTAssertEqual(ToolCallDisplay.displayName("orphan__"), "orphan__")
     }
 
     // MARK: - browse, whose action is really its name

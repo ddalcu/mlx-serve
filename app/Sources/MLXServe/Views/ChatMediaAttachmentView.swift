@@ -77,22 +77,56 @@ private struct ChatImageAttachment: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             if let image {
+                let box = ChatImagePreview.displaySize(
+                    for: image,
+                    maxHeight: ChatMetrics.generatedImageHeight,
+                    maxWidth: ChatMetrics.generatedMediaMaxWidth)
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: 400, maxHeight: 300)
+                    // The picture's own box, so the rounded corners round the
+                    // PICTURE — see `displaySize`.
+                    .frame(width: box.width, height: box.height)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .onTapGesture(count: 2) {
                         NSWorkspace.shared.open(URL(fileURLWithPath: ref.path))
                     }
                     .help("Double-click to open")
             }
-            ChatMediaCaption(ref: ref)
+            // Same shape as the clip below it: the prompt is what makes a
+            // timestamped filename mean anything months later, so compact
+            // tightens it to one line rather than dropping it. A button laid
+            // over the picture read poorly on a light image and was a pattern
+            // this app uses nowhere else.
+            ChatMediaCaption(ref: ref, lines: ChatMetrics.compactMode ? 1 : 2)
         }
-        .frame(maxWidth: 400)
+        // Leading, not the default centre: without it a picture narrower than
+        // the cap sat centred in the cap and read as indented from a left edge
+        // every other row in the transcript shares.
+        .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         .onAppear {
             if image == nil { image = NSImage(contentsOfFile: ref.path) }
         }
+    }
+}
+
+/// Reveal the generated file in Finder. Its own type because it appears both
+/// under a row and beside a track's play button, and they must be the same
+/// control.
+private struct RevealInFinderButton: View {
+    let path: String
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        } label: {
+            Image(systemName: "folder")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Reveal in Finder")
     }
 }
 
@@ -100,24 +134,19 @@ private struct ChatImageAttachment: View {
 /// prompt is what makes a bare timestamped filename mean something months later.
 private struct ChatMediaCaption: View {
     let ref: ChatMediaRef
+    /// One line in compact mode, where the caption survives only because a
+    /// video player has no free corner to put the button in.
+    var lines: Int = 2
 
     var body: some View {
         HStack(spacing: 6) {
             Text(ref.prompt.isEmpty ? ref.filename : ref.prompt)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .lineLimit(lines)
                 .truncationMode(.tail)
             Spacer(minLength: 4)
-            Button {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ref.path)])
-            } label: {
-                Image(systemName: "folder")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Reveal in Finder")
+            RevealInFinderButton(path: ref.path)
         }
     }
 }
@@ -164,11 +193,14 @@ private struct ChatAudioAttachment: View {
                     }
                 }
                 Spacer(minLength: 4)
+                // Compact drops the caption, so the button joins the play row
+                // rather than leaving the track with no way to its file.
+                if ChatMetrics.compactMode { RevealInFinderButton(path: ref.path) }
             }
-            ChatMediaCaption(ref: ref)
+            if !ChatMetrics.compactMode { ChatMediaCaption(ref: ref) }
         }
         .padding(10)
-        .frame(maxWidth: 420, alignment: .leading)
+        .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         .background(Color(.controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .onAppear { if duration == nil { duration = Self.durationText(ref.path) } }
@@ -199,10 +231,19 @@ private struct ChatVideoAttachment: View {
                     Color.black.opacity(0.15)
                 }
             }
-            .frame(maxWidth: 420, minHeight: 220, maxHeight: 260)
+            // A fixed box: the clip's own ratio isn't known until the asset
+            // loads, and a player resizing under the reply as it loads is worse
+            // than letterboxing inside a steady frame.
+            .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth,
+                   minHeight: ChatMetrics.generatedVideoHeight,
+                   maxHeight: ChatMetrics.generatedVideoHeight)
             .clipShape(RoundedRectangle(cornerRadius: 10))
-            ChatMediaCaption(ref: ref)
-                .frame(maxWidth: 420)
+            // Every corner of an AVPlayerView belongs to its own controls
+            // (AirPlay and volume on top, transport below), so the button
+            // stays under the player and the caption tightens to one line
+            // instead.
+            ChatMediaCaption(ref: ref, lines: ChatMetrics.compactMode ? 1 : 2)
+                .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         }
         // Built on appear, not in the initializer: a transcript can hold many
         // clips and an AVPlayer per row would be built during every view update.

@@ -420,4 +420,35 @@ enum ProcessCardControls {
     static func killable(handles: [String]?, isAlive: (String) -> Bool) -> [String] {
         (handles ?? []).filter(isAlive)
     }
+
+    /// Live handles split by whether some call on the card claimed one, which
+    /// decides where its pill goes: a claimed handle's pill sits beside the tool
+    /// that started it (inside the panel), an unclaimed one has nowhere to go
+    /// but the header.
+    static func split(live: [String],
+                      claimedBy callHandles: [String?]) -> (claimed: [String], unclaimed: [String]) {
+        let claims = Set(callHandles.compactMap { $0 })
+        return (live.filter { claims.contains($0) }, live.filter { !claims.contains($0) })
+    }
+
+    /// Which card may still speak for each handle, given the announcements in
+    /// transcript order.
+    ///
+    /// `killable` alone was not enough: numbering restarts at `bg1` on every
+    /// launch and the registry knows only the name, so an old card asking
+    /// "is bg1 alive?" was told yes about a process started today and offered
+    /// to kill it. The LAST announcement of a handle wins; earlier cards drop
+    /// it and show nothing.
+    static func handleOwnership<ID: Hashable>(_ announcements: [(ID, [String])]) -> [ID: [String]] {
+        var owner: [String: ID] = [:]
+        for (id, handles) in announcements {
+            for handle in handles { owner[handle] = id }
+        }
+        var owned: [ID: [String]] = [:]
+        for (id, handles) in announcements {
+            var seen = Set<String>()
+            owned[id] = handles.filter { owner[$0] == id && seen.insert($0).inserted }
+        }
+        return owned
+    }
 }
