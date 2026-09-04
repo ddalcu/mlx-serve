@@ -440,8 +440,7 @@ pub const MtpModel = struct {
     /// re-score them through the trunk head's own rows (`draftSelect`). When
     /// built, the 3-bit draft head is dropped — non-greedy draft paths fall
     /// back to the trunk head.
-    rerank_coarse: ?QLinear = null,
-    rerank_rows: c_int = 0,
+    rerank_coarse: ?RerankCoarse = null,
     rerank_logged: bool = false,
 
     /// Cross-request EV controller seed (inference thread only, like every
@@ -686,7 +685,7 @@ pub const MtpModel = struct {
     /// MLX_SERVE_MTP_DRAFT_RERANK: "0" off, "1" force-on, absent/other →
     /// auto (on where the cost surface is generic; the calibrated G17 NAX
     /// surfaces keep the 3-bit draft head they were measured with).
-    fn draftRerankMode() enum { auto, on, off } {
+    pub fn draftRerankMode() enum { auto, on, off } {
         const p = std.c.getenv("MLX_SERVE_MTP_DRAFT_RERANK") orelse return .auto;
         const raw = std.mem.span(p);
         if (std.mem.eql(u8, raw, "0")) return .off;
@@ -706,35 +705,8 @@ pub const MtpModel = struct {
         const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
         if (head_qp.bits <= 2) return; // nothing coarser to gain
 
-        var rc = requantizeRows(
-            self.s,
-            target.lm_head_w,
-            target.lm_head_s,
-            target.lm_head_b,
-            head_qp.group_size,
-            head_qp.bits,
-            head_qp.mode.cstr(),
-            64,
-            2,
-            32768,
-        ) catch |err| {
-            log.warn("[mtp] draft rerank coarse build failed ({s}) — keeping the draft-head path\n", .{@errorName(err)});
-            return;
-        };
-
-        // Materialize now so the first draft doesn't pay for it.
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, rc.w);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, rc.s);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
-            mlx.check(mlx.mlx_eval(eval_vec)) catch {
-                rc.deinit();
-                log.warn("[mtp] draft rerank coarse eval failed — keeping the draft-head path\n", .{});
-                return;
-            };
-        }
+        // The ONE env read: the built head carries its width from here on.
+        const rc = buildRerankCoarse(self.s, target, rerankCoarseBits()) orelse return;
 
         if (self.draft_head) |*dh| {
             dh.deinit();
@@ -743,8 +715,7 @@ pub const MtpModel = struct {
             self.draft_head_group = 0;
         }
         self.rerank_coarse = rc;
-        self.rerank_rows = w_shape[0];
-        log.info("[mtp] draft rerank: coarse 2-bit/gs64 head built ({d} rows); greedy drafts re-rank through the trunk head\n", .{w_shape[0]});
+        log.info("[mtp] draft rerank: coarse {d}-bit/gs{d} head built ({d} rows); greedy drafts re-rank through the trunk head\n", .{ rc.bits, rc.group_size, rc.rows });
     }
 
     pub fn canRerankDrafts(self: *const MtpModel) bool {
@@ -764,91 +735,14 @@ pub const MtpModel = struct {
         x: mlx.mlx_array,
         suppress_mask: ?mlx.mlx_array,
     ) !mlx.mlx_array {
-        const s = self.s;
-        // A mid-chain kernel failure nulls rerank_coarse; later steps of the
-        // same chain land here and must still answer.
-        const rc = if (self.rerank_coarse) |*p| p else return self.draftFallbackArgmax(target, x, suppress_mask);
-
-        var coarse = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(coarse);
-        try mlx.check(mlx.mlx_quantized_matmul(
-            &coarse,
-            x,
-            rc.w,
-            rc.s,
-            rc.b,
-            true,
-            mlx.mlx_optional_int.some(64),
-            mlx.mlx_optional_int.some(2),
-            "affine",
-            s,
-        ));
-        if (suppress_mask) |m| {
-            const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-            defer _ = mlx.mlx_array_free(neg_inf);
-            var masked = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_where(&masked, m, neg_inf, coarse, s));
-            _ = mlx.mlx_array_free(coarse);
-            coarse = masked;
-        }
-        var flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(flat);
-        const flat_shape = [_]c_int{self.rerank_rows};
-        try mlx.check(mlx.mlx_reshape(&flat, coarse, &flat_shape, 1, s));
-
-        const cands = draftTop32(s, flat, self.rerank_rows) catch |err| {
-            log.warn("[mtp] draft rerank shortlist failed ({s}) — dropping to the trunk-head readout\n", .{@errorName(err)});
-            var dead = self.rerank_coarse.?;
-            dead.deinit();
-            self.rerank_coarse = null;
-            return self.draftFallbackArgmax(target, x, suppress_mask);
-        };
-        defer _ = mlx.mlx_array_free(cands);
-
-        if (!self.rerank_logged) {
-            log.info("[mtp] draft rerank engaged (2-bit coarse → top-32 → trunk re-score)\n", .{});
-            self.rerank_logged = true;
-        }
-
-        // Re-score the shortlist through the trunk head's own rows: gathered
-        // packed rows are self-contained (w [V, K·bits/32], scales/biases
-        // [V, K/gs]), so a 32-row quantized matmul is exact.
-        const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
-        var w32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(w32);
-        var s32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(s32);
-        var b32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(b32);
-        try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
-        try mlx.check(mlx.mlx_take_axis(&s32, target.lm_head_s, cands, 0, s));
-        if (target.lm_head_b.ctx != null)
-            try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
-
-        var exact = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(exact);
-        try mlx.check(mlx.mlx_quantized_matmul(
-            &exact,
-            x,
-            w32,
-            s32,
-            b32,
-            true,
-            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
-            mlx.mlx_optional_int.some(@intCast(qp.bits)),
-            qp.mode.cstr(),
-            s,
-        ));
-
-        var amax = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(amax);
-        try mlx.check(mlx.mlx_argmax_axis(&amax, exact, -1, false, s));
-        var picked = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(picked);
-        try mlx.check(mlx.mlx_take_axis(&picked, cands, amax, 0, s));
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
-        return out;
+        // The scheme itself is head-agnostic (it only ever touches the
+        // TARGET's lm_head), so it lives in `rerankSelect` and the qwen4_exp
+        // in-checkpoint head calls exactly the same code. Null = the coarse
+        // head is gone (never built, or a shortlist failure just dropped it):
+        // this arm's own full readout answers, and it can still use the
+        // low-bit draft head when one is resident.
+        if (try rerankSelect(self.s, target, &self.rerank_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        return self.draftFallbackArgmax(target, x, suppress_mask);
     }
 
     /// Rerank's failure fallback: full trunk-head readout + argmax, same
@@ -860,24 +754,269 @@ pub const MtpModel = struct {
         suppress_mask: ?mlx.mlx_array,
     ) !mlx.mlx_array {
         const s = self.s;
-        var logits = try targetLmHead(self, target, x, s);
+        const logits = try targetLmHead(self, target, x, s);
         defer _ = mlx.mlx_array_free(logits);
-        if (suppress_mask) |m| {
-            const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-            defer _ = mlx.mlx_array_free(neg_inf);
-            var masked = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
-            _ = mlx.mlx_array_free(logits);
-            logits = masked;
-        }
-        var amax = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(amax);
-        try mlx.check(mlx.mlx_argmax_axis(&amax, logits, -1, false, s));
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&out, amax, .int32, s));
-        return out;
+        return maskAndArgmax(s, logits, suppress_mask);
     }
 };
+
+// ── Draft rerank: the head-agnostic half ──
+//
+// Nothing in this scheme is MTP-head-shaped. It reads the TARGET's lm_head
+// and a vector `x` in that head's input space, and answers with a token id —
+// so the qwen3.5/3.6 sidecar (`MtpModel`) and the qwen4_exp in-checkpoint
+// head (`Transformer.qwen4_mtp`) share it verbatim instead of the qwen4 arm
+// growing a second copy that could drift from the measured one.
+//
+// What `x` IS, is per-arm and load-bearing: whatever the lm_head consumes.
+// On the sidecar that is the head's own post-norm hidden; on qwen4_exp it is
+// the MIXER output, NOT the pre-mixer stream the head hands back as
+// `hidden_next`.
+
+/// Coarse-head width AT BUILD TIME. The default is `draftHeadBitsFromEnv` (3),
+/// so MLX_SERVE_MTP_DRAFT_HEAD_BITS retunes it and "0"/"off" disables the build
+/// entirely. 2 is what the sidecar scheme was measured at and is the obvious
+/// second A/B arm; a coarser head is fewer bytes and a longer tail of
+/// shortlist misses, and a miss costs acceptance, never output.
+///
+/// Read exactly ONCE, where a head is built. The width a head is READ at is a
+/// property of its packed weights (`RerankCoarse.bits`), never of the
+/// environment at draft time — packed geometry implies K, so a re-read that
+/// disagrees with the build reads a different vocab entirely.
+pub fn rerankCoarseBits() u32 {
+    return MtpModel.draftHeadBitsFromEnv();
+}
+
+/// Group size every coarse head is packed at.
+pub const RERANK_COARSE_GROUP: u32 = 64;
+
+/// A BUILT coarse readout head: the packed weights plus the geometry they
+/// were packed with. Both live together because `mlx_quantized_matmul` needs
+/// all three and only the build knows them.
+pub const RerankCoarse = struct {
+    q: QLinear,
+    bits: u32,
+    group_size: u32,
+    rows: c_int,
+
+    pub fn deinit(self: *RerankCoarse) void {
+        self.q.deinit();
+    }
+};
+
+/// The coarse readout head: a low-bit/gs64 requantized copy of the target's
+/// lm_head, materialized so the first draft does not pay for it. Infallible —
+/// every refusal returns null and the caller keeps its full-readout path.
+pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?RerankCoarse {
+    if (bits == 0) return null;
+    if (target.lm_head_s.ctx == null) return null; // dense bf16 - row-gather rerank unbuilt/unmeasured
+    const w_shape = mlx.getShape(target.lm_head_w);
+    if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return null;
+    const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
+
+    var rc = requantizeRows(
+        s,
+        target.lm_head_w,
+        target.lm_head_s,
+        target.lm_head_b,
+        head_qp.group_size,
+        head_qp.bits,
+        head_qp.mode.cstr(),
+        RERANK_COARSE_GROUP,
+        bits,
+        32768,
+    ) catch |err| {
+        log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
+        return null;
+    };
+    const eval_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(eval_vec);
+    _ = mlx.mlx_vector_array_append_value(eval_vec, rc.w);
+    _ = mlx.mlx_vector_array_append_value(eval_vec, rc.s);
+    _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
+    mlx.check(mlx.mlx_eval(eval_vec)) catch {
+        rc.deinit();
+        log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
+        return null;
+    };
+    return .{ .q = rc, .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = w_shape[0] };
+}
+
+/// Resident bytes of a coarse head over `rows` x `hidden` at `bits`/gs64:
+/// packed weights plus bf16 scales AND biases. Reported at build so the log
+/// line carries the number the change is claiming.
+pub fn rerankCoarseBytes(rows: c_int, hidden: c_int, bits: u32) u64 {
+    const r: u64 = @intCast(rows);
+    const h: u64 = @intCast(hidden);
+    const packed_bytes = r * h * @as(u64, bits) / 8;
+    const groups = h / 64;
+    return packed_bytes + 2 * (r * groups * 2);
+}
+
+/// `argmax(where(mask, -inf, logits))` as a lazy [.., 1] int32 id - the tail
+/// every full-readout draft path shares.
+pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_set(&logits, logits_in));
+    if (suppress_mask) |m| {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var masked = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+        _ = mlx.mlx_array_free(logits);
+        logits = masked;
+    }
+    var amax = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(amax);
+    try mlx.check(mlx.mlx_argmax_axis(&amax, logits, -1, false, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, amax, .int32, s));
+    return out;
+}
+
+/// Full trunk-lm_head readout + argmax. The qwen4 arm's fallback: unlike the
+/// sidecar's, there is no low-bit draft head to prefer.
+pub fn fullReadoutArgmax(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !mlx.mlx_array {
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    if (target.lm_head_s.ctx == null) {
+        const axes = [_]c_int{ 1, 0 };
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose_axes(&wt, target.lm_head_w, &axes, 2, s));
+        try mlx.check(mlx.mlx_matmul(&logits, x, wt, s));
+    } else {
+        const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &logits,
+            x,
+            target.lm_head_w,
+            target.lm_head_s,
+            target.lm_head_b,
+            true,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            s,
+        ));
+    }
+    return maskAndArgmax(s, logits, suppress_mask);
+}
+
+/// One greedy draft proposal via the rerank scheme: coarse full-vocab readout
+/// -> exact top-32 shortlist (two dispatches) -> the trunk head's own 32 rows
+/// re-score -> argmax. Returns a lazy [1,1] int32 token id, or NULL when the
+/// coarse head is unavailable - never built, or a shortlist-kernel failure
+/// just dropped it (`coarse` is freed and nulled in that case, so every later
+/// step of the same chain lands on the caller's fallback too).
+///
+/// PROPOSAL SIDE ONLY: verification still reads the trunk forward's logits, so
+/// a coarse miss costs acceptance, never output.
+pub fn rerankSelect(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?mlx.mlx_array {
+    const rc = if (coarse.*) |*p| p else return null;
+    // The BUILT width and group, never `rerankCoarseBits()`: the packed
+    // geometry implies K, so a per-step env re-read that disagrees with the
+    // build does not read a coarser vocab — it reads a different one.
+    const coarse_bits = rc.bits;
+    const rows = rc.rows;
+
+    var coarse_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coarse_logits);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &coarse_logits,
+        x,
+        rc.q.w,
+        rc.q.s,
+        rc.q.b,
+        true,
+        mlx.mlx_optional_int.some(@intCast(rc.group_size)),
+        mlx.mlx_optional_int.some(@intCast(coarse_bits)),
+        "affine",
+        s,
+    ));
+    // The mask goes on the COARSE row: a reserved id that never enters the
+    // shortlist cannot be re-scored back into the draft.
+    if (suppress_mask) |m| {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var masked = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, coarse_logits, s));
+        _ = mlx.mlx_array_free(coarse_logits);
+        coarse_logits = masked;
+    }
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const flat_shape = [_]c_int{rows};
+    try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+
+    const cands = draftTop32(s, flat, rows) catch |err| {
+        log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
+        var dead = coarse.*.?;
+        dead.deinit();
+        coarse.* = null;
+        return null;
+    };
+    defer _ = mlx.mlx_array_free(cands);
+
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{coarse_bits});
+        logged.* = true;
+    }
+
+    // Re-score the shortlist through the trunk head's own rows: gathered
+    // packed rows are self-contained (w [V, K*bits/32], scales/biases
+    // [V, K/gs]), so a 32-row quantized matmul is exact.
+    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    var w32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w32);
+    var s32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&s32, target.lm_head_s, cands, 0, s));
+    if (target.lm_head_b.ctx != null)
+        try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
+
+    var exact = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(exact);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &exact,
+        x,
+        w32,
+        s32,
+        b32,
+        true,
+        mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(qp.bits)),
+        qp.mode.cstr(),
+        s,
+    ));
+
+    var amax = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(amax);
+    try mlx.check(mlx.mlx_argmax_axis(&amax, exact, -1, false, s));
+    var picked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked);
+    try mlx.check(mlx.mlx_take_axis(&picked, cands, amax, 0, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
+    return out;
+}
 
 /// Sidecar file layouts we accept, in priority order. The native layout wins
 /// so a repo shipping several keeps loading exactly what it loaded before.
@@ -2240,13 +2379,31 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
 }
 
 pub const StepOut = struct {
-    /// `[1, 1, vocab]` LAST-row logits, or `.ctx == null` when `want_logits`
-    /// was false (multi-row calls never project the history rows — only the
-    /// last row feeds the draft chain).
+    /// `[1, 1, vocab]` LAST-row logits, or `.ctx == null` when the caller did
+    /// not ask for `.logits` (multi-row calls never project the history rows —
+    /// only the last row feeds the draft chain).
     logits: mlx.mlx_array,
     /// MTP post-norm hidden — the next depth's `hidden` input. `[1, 1, H]`
-    /// (last row) when `want_logits`, the full `[1, L, H]` otherwise.
+    /// (last row) under `.logits`, the full `[1, L, H]` otherwise.
     hidden_next: mlx.mlx_array,
+    /// The vector the TARGET's lm_head consumes, for `.mixed` steps. Null on
+    /// every arm where that is just `hidden_next` (the sidecar); non-null on
+    /// qwen4_exp, whose `hidden_next` is the PRE-mixer stream and whose
+    /// lm_head input is the mixer output. Owned by the caller when non-null.
+    rerank_x: mlx.mlx_array = .{ .ctx = null },
+};
+
+/// What a head step owes its caller. `want_logits: bool` could not tell the
+/// two zero-logits cases apart: a history append wants nothing past the
+/// stream, while a rerank draft still needs the vector the lm_head consumes.
+pub const StepWant = enum {
+    /// Last-row logits (and the last-row hidden).
+    logits,
+    /// No logits, but the lm_head's INPUT vector for the last row — the
+    /// rerank draft path.
+    mixed,
+    /// Nothing past the stream: committed-history appends.
+    none,
 };
 
 pub const MropeContext = mrope.PositionContext;
@@ -4421,6 +4578,437 @@ test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible wi
         try testing.expect(m.q.s.ctx == null);
         try testing.expect(m.mlp.dense.gate.s.ctx == null);
     }
+}
+
+/// A bare Transformer carrying nothing but a quantized lm_head + the config
+/// fields `headQuantParams` reads. Every function under test touches exactly
+/// those, which is the property that let the qwen4_exp head reuse the scheme.
+/// A minimal target for the rerank scheme: a Transformer carrying nothing
+/// but a quantized `lm_head`, which is all the scheme ever reads. `pub` so
+/// the qwen4 arm's tests in generate.zig build the same target.
+pub const RerankFixture = struct {
+    xfm: Transformer,
+    dense: mlx.mlx_array,
+    vocab: c_int,
+    hidden: c_int,
+
+    pub fn init(s: mlx.mlx_stream, vocab: c_int, hidden: c_int, bits: u32, gs: u32, seed: u64) !RerankFixture {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        const n: usize = @intCast(vocab * hidden);
+        const buf = try testing.allocator.alloc(f32, n);
+        defer testing.allocator.free(buf);
+        // bf16-exact levels: the dense reference and the requantized source
+        // must not differ by a rounding the test would read as a rerank miss.
+        for (buf) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -128, 127))) * 0.0078125;
+        const shape = [_]c_int{ vocab, hidden };
+        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        var dense = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&dense, f32_arr, .bfloat16, s));
+
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(
+            &qv,
+            dense,
+            mlx.mlx_optional_int.some(@intCast(gs)),
+            mlx.mlx_optional_int.some(@intCast(bits)),
+            "affine",
+            .{ .ctx = null },
+            s,
+        ));
+        var xfm: Transformer = undefined;
+        xfm.config = .{};
+        xfm.config.hidden_size = @intCast(hidden);
+        xfm.config.quant_mode = .affine;
+        xfm.config.quant_bits = bits;
+        xfm.config.quant_group_size = gs;
+        xfm.s = s;
+        xfm.lm_head_w = mlx.mlx_array_new();
+        xfm.lm_head_s = mlx.mlx_array_new();
+        xfm.lm_head_b = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_w, qv, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_s, qv, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_b, qv, 2));
+        return .{ .xfm = xfm, .dense = dense, .vocab = vocab, .hidden = hidden };
+    }
+
+    pub fn deinit(self: *RerankFixture) void {
+        _ = mlx.mlx_array_free(self.dense);
+        _ = mlx.mlx_array_free(self.xfm.lm_head_w);
+        _ = mlx.mlx_array_free(self.xfm.lm_head_s);
+        _ = mlx.mlx_array_free(self.xfm.lm_head_b);
+    }
+
+    /// `[1, 1, hidden]` bf16 activation.
+    fn randomX(self: *const RerankFixture, s: mlx.mlx_stream, seed: u64) !mlx.mlx_array {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        const buf = try testing.allocator.alloc(f32, @intCast(self.hidden));
+        defer testing.allocator.free(buf);
+        for (buf) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -64, 63))) * 0.015625;
+        const shape = [_]c_int{ 1, 1, self.hidden };
+        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
+        return out;
+    }
+
+    /// The full-vocab logits the real head would produce — the exact answer
+    /// the rerank is judged against.
+    fn exactLogits(self: *const RerankFixture, s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
+        const qp = headQuantParams(&self.xfm.config, self.xfm.lm_head_w, self.xfm.lm_head_s);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &out,
+            x,
+            self.xfm.lm_head_w,
+            self.xfm.lm_head_s,
+            self.xfm.lm_head_b,
+            true,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            s,
+        ));
+        return out;
+    }
+};
+
+fn readIdScalar(arr: mlx.mlx_array) !u32 {
+    try mlx.check(mlx.mlx_array_eval(arr));
+    var v: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&v, arr));
+    return @intCast(v);
+}
+
+fn readRow(allocator: std.mem.Allocator, s: mlx.mlx_stream, arr: mlx.mlx_array, n: usize) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const ptr = mlx.mlx_array_data_float32(f) orelse return error.NoData;
+    const out = try allocator.alloc(f32, n);
+    @memcpy(out, ptr[0..n]);
+    return out;
+}
+
+test "mtp: draft rerank returns the exact argmax whenever it is inside the coarse shortlist" {
+    // The scheme's whole contract. The coarse head only SHORTLISTS; the 32
+    // survivors are re-scored through the real head's own rows, so the pick is
+    // exact given the shortlist — and matches the full-vocab argmax exactly
+    // when the coarse pass kept it. A miss costs ACCEPTANCE (the trunk verify
+    // rejects a bad draft), never output, which is why the bar is conditional
+    // rather than an equality on every draw.
+    //
+    // The bar is on the drafted token's exact LOGIT, not its id. A random
+    // small head ties constantly — 256-wide dot products of bf16-exact levels
+    // through an 8-bit quantizer collide, and the tie rate is scale-invariant
+    // — and under a tie the host's first-max and a GPU argmax over the
+    // shortlist's own ordering disagree on the id while agreeing on the value.
+    // Two ids with the same logit are the same draft as far as acceptance is
+    // concerned; convicting on the id would be judging our output against our
+    // output's ordering. Id equality is still demanded wherever the reference's
+    // OWN margin says the winner is unique.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    // Vocab must clear TOP32_MIN_ROWS with a ragged tail, like the top32 test.
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
+    defer fx.deinit();
+
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+
+    // Two different fp paths read the same rows (a full-width qmm vs a 32-row
+    // gathered one), so equality between them is approximate by construction.
+    const eps: f32 = 1e-3;
+    var kept: u32 = 0;
+    var decisive: u32 = 0;
+    var draws: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+
+        const exact = try fx.exactLogits(s, x);
+        defer _ = mlx.mlx_array_free(exact);
+        const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        var want: u32 = 0;
+        for (ex, 0..) |v, i| if (v > ex[want]) {
+            want = @intCast(i);
+        };
+
+        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, null)) orelse
+            return error.RerankDeclined;
+        defer _ = mlx.mlx_array_free(picked_arr);
+        const picked = try readIdScalar(picked_arr);
+        draws += 1;
+
+        // What the coarse pass actually shortlisted, read the same way the
+        // scheme reads it.
+        var coarse_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(coarse_logits);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &coarse_logits,
+            x,
+            slot.?.q.w,
+            slot.?.q.s,
+            slot.?.q.b,
+            true,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(3),
+            "affine",
+            s,
+        ));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const flat_shape = [_]c_int{fx.vocab};
+        try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+        const cands = try draftTop32(s, flat, fx.vocab);
+        defer _ = mlx.mlx_array_free(cands);
+        try mlx.check(mlx.mlx_array_eval(cands));
+        const cand_ptr = mlx.mlx_array_data_uint32(cands) orelse return error.NoData;
+
+        var picked_in_list = false;
+        var best_in_list: u32 = cand_ptr[0];
+        var runner_up: f32 = -std.math.inf(f32);
+        for (cand_ptr[0..32]) |c| {
+            if (c == picked) picked_in_list = true;
+            if (ex[c] > ex[best_in_list]) best_in_list = c;
+        }
+        // The reference's OWN margin: the gap between the shortlist's best and
+        // the best OTHER value in it. Zero means the winner is not unique and
+        // no id assertion is decidable.
+        for (cand_ptr[0..32]) |c| {
+            if (c == best_in_list) continue;
+            if (ex[c] > runner_up) runner_up = ex[c];
+        }
+        const unique = (ex[best_in_list] - runner_up) > eps;
+
+        // Unconditional: the pick is always FROM the shortlist and always
+        // carries the shortlist's best exact logit. That is the re-scoring
+        // step's own bar and it holds whether or not the coarse pass kept the
+        // true argmax.
+        try testing.expect(picked_in_list);
+        try testing.expectApproxEqAbs(ex[best_in_list], ex[picked], eps);
+        // Under a unique winner the id is decidable, so demand it.
+        if (unique) {
+            decisive += 1;
+            try testing.expectEqual(best_in_list, picked);
+        }
+
+        // Conditional: the shortlist kept a row scoring the global max => the
+        // drafted token scores the global max. This is the property acceptance
+        // actually depends on — the trunk verify compares TOKENS, and two rows
+        // with the same logit are the same draft.
+        if (@abs(ex[best_in_list] - ex[want]) <= eps) {
+            try testing.expectApproxEqAbs(ex[want], ex[picked], eps);
+            kept += 1;
+        }
+    }
+    // A coarse head that never keeps the argmax would satisfy every assertion
+    // above while proposing garbage every step — the acceptance collapse this
+    // change would otherwise ship silently.
+    try testing.expect(kept * 2 >= draws);
+    // And a fixture that ties on every draw would make the id bar vacuous.
+    try testing.expect(decisive > 0);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "mtp: the coarse rerank head drafts at its BUILT width, not the env's current one" {
+    // The width a coarse head is READ at is a property of the BUILT weights.
+    // `rerankCoarseBits()` is the env-backed BUILD default; re-reading it per
+    // draft step means a head packed at one width gets dispatched at another
+    // the moment the variable moves — a retune between build and draft, or any
+    // caller passing `buildRerankCoarse` an explicit width, which both the
+    // sidecar and the qwen4 arm do. Packed geometry implies K, so a mismatched
+    // width does not degrade gracefully: it reads a different vocab entirely.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
+    defer fx.deinit();
+
+    // Built at 3 bits...
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    // ...and the head SAYS so, without asking the environment.
+    try testing.expectEqual(@as(u32, 3), slot.?.bits);
+    try testing.expectEqual(@as(u32, 64), slot.?.group_size);
+    try testing.expectEqual(fx.vocab, slot.?.rows);
+
+    // ...while the environment now says 2. Every draft below must still be
+    // dispatched at 3.
+    _ = setenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS", "2", 1);
+    defer _ = unsetenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS");
+    try testing.expectEqual(@as(u32, 2), rerankCoarseBits());
+
+    var logged = false;
+    const eps: f32 = 1e-3;
+    var kept: u32 = 0;
+    var draws: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+
+        const exact = try fx.exactLogits(s, x);
+        defer _ = mlx.mlx_array_free(exact);
+        const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        var want: u32 = 0;
+        for (ex, 0..) |v, i| if (v > ex[want]) {
+            want = @intCast(i);
+        };
+
+        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, null)) orelse
+            return error.RerankDeclined;
+        defer _ = mlx.mlx_array_free(picked_arr);
+        const picked = try readIdScalar(picked_arr);
+        draws += 1;
+
+        // The shortlist the 3-bit head actually produces — read at 3 bits,
+        // which is the whole point.
+        var coarse_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(coarse_logits);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &coarse_logits,
+            x,
+            slot.?.q.w,
+            slot.?.q.s,
+            slot.?.q.b,
+            true,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(3),
+            "affine",
+            s,
+        ));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const flat_shape = [_]c_int{fx.vocab};
+        try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+        const cands = try draftTop32(s, flat, fx.vocab);
+        defer _ = mlx.mlx_array_free(cands);
+        try mlx.check(mlx.mlx_array_eval(cands));
+        const cand_ptr = mlx.mlx_array_data_uint32(cands) orelse return error.NoData;
+
+        var picked_in_list = false;
+        var best_in_list: u32 = cand_ptr[0];
+        for (cand_ptr[0..32]) |c| {
+            if (c == picked) picked_in_list = true;
+            if (ex[c] > ex[best_in_list]) best_in_list = c;
+        }
+        // The draft came from the BUILT head's shortlist and carries its best
+        // exact logit. Dispatched at any other width it comes from somewhere
+        // else entirely.
+        try testing.expect(picked_in_list);
+        try testing.expectApproxEqAbs(ex[best_in_list], ex[picked], eps);
+        if (@abs(ex[best_in_list] - ex[want]) <= eps) kept += 1;
+    }
+    // And the 3-bit head is still a USEFUL shortlister — a mis-dispatched read
+    // that happened to stay in range would not be.
+    try testing.expect(kept * 2 >= draws);
+}
+
+test "mtp: rerankSelect declines without a coarse head, and the full readout is the exact argmax" {
+    // The fallback is not decoration: `canRerankDrafts` false, a build refusal
+    // and a mid-chain shortlist failure all land here, and the answer must
+    // still be a legal draft — the full-vocab argmax, which is what the qwen4
+    // head did before this change.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xA11CE);
+    defer fx.deinit();
+
+    var none: ?RerankCoarse = null;
+    var logged = false;
+    const x = try fx.randomX(s, 7);
+    defer _ = mlx.mlx_array_free(x);
+    try testing.expect((try rerankSelect(s, &fx.xfm, &none, &logged, x, null)) == null);
+    try testing.expect(!logged);
+
+    const exact = try fx.exactLogits(s, x);
+    defer _ = mlx.mlx_array_free(exact);
+    const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+    defer allocator.free(ex);
+    var want: u32 = 0;
+    for (ex, 0..) |v, i| if (v > ex[want]) {
+        want = @intCast(i);
+    };
+
+    const got = try fullReadoutArgmax(s, &fx.xfm, x, null);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqual(want, try readIdScalar(got));
+}
+
+test "mtp: a suppressed id is never drafted, through the coarse shortlist or the full readout" {
+    // The mask goes on the COARSE row, not the re-scored 32: a reserved id
+    // that never enters the shortlist cannot be re-scored back into the draft.
+    // Both paths are checked because a rerank build refusal silently routes
+    // every draft through the other one.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBEEF);
+    defer fx.deinit();
+    const x = try fx.randomX(s, 3);
+    defer _ = mlx.mlx_array_free(x);
+
+    const exact = try fx.exactLogits(s, x);
+    defer _ = mlx.mlx_array_free(exact);
+    const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+    defer allocator.free(ex);
+    var want: u32 = 0;
+    for (ex, 0..) |v, i| if (v > ex[want]) {
+        want = @intCast(i);
+    };
+
+    // Suppress exactly the winner.
+    const mask_buf = try allocator.alloc(bool, @intCast(fx.vocab));
+    defer allocator.free(mask_buf);
+    @memset(mask_buf, false);
+    mask_buf[want] = true;
+    const mask_shape = [_]c_int{fx.vocab};
+    const mask = mlx.mlx_array_new_data(mask_buf.ptr, &mask_shape, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+    const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, mask)) orelse
+        return error.RerankDeclined;
+    defer _ = mlx.mlx_array_free(picked_arr);
+    try testing.expect((try readIdScalar(picked_arr)) != want);
+
+    const full = try fullReadoutArgmax(s, &fx.xfm, x, mask);
+    defer _ = mlx.mlx_array_free(full);
+    try testing.expect((try readIdScalar(full)) != want);
+}
+
+test "mtp: rerankCoarseBytes prices the packed weights AND both bf16 group tables" {
+    // The build log claims a size; a bill that forgot scales+biases would
+    // under-report the qwen4 coarse head by 40 MB.
+    // 248320 x 2560 at 3 bits = 238.4 MiB packed, + 2 x (248320 x 40 x 2 B).
+    const packed_mib: u64 = 248320 * 2560 * 3 / 8;
+    const tables: u64 = 2 * (248320 * (2560 / 64) * 2);
+    try testing.expectEqual(packed_mib + tables, rerankCoarseBytes(248320, 2560, 3));
+    // 2-bit is exactly two thirds of the packed half, tables unchanged.
+    try testing.expectEqual(248320 * 2560 * 2 / 8 + tables, rerankCoarseBytes(248320, 2560, 2));
 }
 
 test "mtp: draftTop32 matches a host top-32 reference (bf16, ties, -inf)" {

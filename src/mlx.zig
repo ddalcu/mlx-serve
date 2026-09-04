@@ -3,6 +3,7 @@
 // potential issues with C++ headers and keep the dependency surface explicit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = @import("log.zig");
 
 // ── Opaque handle types ──
@@ -547,9 +548,50 @@ pub const DtypeTrace = struct {
 /// path that already does an FFI call, so it does not move any benchmark.
 pub var op_count: std.atomic.Value(u64) = .init(0);
 
+/// TEST-ONLY fault injection at the ONE chokepoint every checked mlx-c call
+/// goes through: `fault.arm(k)` makes the k-th SUBSEQUENT call that would have
+/// SUCCEEDED report `error.MlxError` instead, so an ownership audit can walk
+/// every error path of a function without patching the function. Failing calls
+/// are not counted (they already take the error path on their own). The op
+/// itself has already executed when `check` sees its return code — the
+/// argument is evaluated first — so what is injected is a succeeding op
+/// REPORTING failure; the caller's `&out` handle is a valid, freeable array,
+/// which is exactly the state its cleanup must survive. Compiled only under
+/// `builtin.is_test`, so a release build carries neither the branch nor the
+/// symbols.
+pub const fault = struct {
+    var remaining: u64 = 0; // 0 = disarmed
+    var fired: bool = false;
+
+    /// Fail the k-th checked call from here (k >= 1). `arm(0)` is a no-op arm.
+    pub fn arm(k: u64) void {
+        remaining = k;
+        fired = false;
+    }
+    pub fn disarm() void {
+        remaining = 0;
+    }
+    /// Did the armed fault actually fire? False means the call under test
+    /// returned before reaching its k-th checked op — an assertion the test
+    /// needs, or the sweep silently stops covering anything.
+    pub fn didFire() bool {
+        return fired;
+    }
+    fn hit() bool {
+        if (remaining == 0) return false;
+        remaining -= 1;
+        if (remaining != 0) return false;
+        fired = true;
+        return true;
+    }
+};
+
 pub fn check(ret: c_int) !void {
     _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
+    if (comptime builtin.is_test) {
+        if (fault.hit()) return error.MlxError;
+    }
 }
 
 // ---------------------------------------------------------------------------

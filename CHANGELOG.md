@@ -1,5 +1,20 @@
 # Changelog
 
+## v26.9.2 (unreleased)
+
+### Highlights
+
+- **Speculative decoding on Flash Next got cheaper per round.** The speculation step used to stall: the model's n-gram lookup needs its draft tokens on the CPU, so the rest of the 48-layer graph waited for the whole draft chain to finish on the GPU before it was even built. It is now built while the drafts are still running, and the draft head only projects the row it actually uses. Code prompts go 111 -> 117 tok/s and prose 56 -> 59 on an M5 Max at a fixed draft depth, with byte-identical output.
+- **Speculation reaches full speed on the first request, not the fifteenth.** Flash Next's draft-depth controller now inherits what it learned from the previous request instead of re-warming from scratch every time, which used to cost roughly the first 15 rounds of every generation. On llmprobe the speculation ratio goes 1.6-1.7x -> 2.0-2.1x, tokens per decode step 3.3 -> 5.5, and the predictable-workload figure 117 -> 144-149 tok/s. Switching between very different prompts (code then prose) still costs one request while it re-adapts.
+- **Flash Next drafts faster by not reading the whole vocabulary.** Each speculative draft step used to run the model's full 675 MB output layer to pick a single token. It now shortlists on a small low-precision copy and re-scores only those candidates exactly, cutting about 3.4 ms off every draft round: code prompts get about 9% faster and prose about 8.5%, and llmprobe's predictable-workload figure goes 141 -> 153 tok/s. Acceptance is unchanged — the same tokens get drafted.
+
+### Fixes
+
+- A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
+- Models whose output layer is padded past the end of their tokenizer (Qwen 3.8 Flash Next has 243 such rows) could draw one of those rows: the token decoded to nothing, so a reply lost a step and the wasted token stayed in the context. Those rows are now never sampled; reported log-probabilities are unchanged.
+
+---
+
 ## v26.9.1 (unreleased)
 
 ### Highlights

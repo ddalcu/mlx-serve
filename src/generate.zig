@@ -213,26 +213,28 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
-    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
-        const s = t.s;
-        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx);
-        defer _ = mlx.mlx_array_free(out.logits);
-        const hs = mlx.getShape(out.stream);
-        if (!want_logits) return .{ .logits = .{ .ctx = null }, .hidden_next = out.stream };
-        defer _ = mlx.mlx_array_free(out.stream);
-        const last = hs[1] - 1;
-        const strides = [_]c_int{ 1, 1, 1 };
-        var h_last = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(h_last);
-        try mlx.check(mlx.mlx_slice(&h_last, out.stream, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ hs[0], hs[1], hs[2] }, 3, &strides, 3, s));
-        const ls = mlx.getShape(out.logits);
-        var l_last = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&l_last, out.logits, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ ls[0], ls[1], ls[2] }, 3, &strides, 3, s));
-        return .{ .logits = l_last, .hidden_next = h_last };
+    /// The head projects only what the caller consumes: this step wants the
+    /// LAST row (`want_logits`) or no logits at all, never the S-row block —
+    /// the merged history step after a partial accept is `1 + accepted` rows
+    /// wide and a full-block mixer + 248320-wide lm_head over it is thrown
+    /// away but for one row.
+    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
+        // `.mixed` is NOT `.none`: a rerank draft still needs the mixer output,
+        // which is the vector the lm_head consumes. `hidden_next` is the
+        // PRE-mixer stream on this arm and would be a silent shape error there.
+        const project: Transformer.Qwen4MtpProject = switch (want) {
+            .logits => .last_row,
+            .mixed => .mixed_last_row,
+            .none => .none,
+        };
+        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx, project);
+        return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
     }
 
-    /// One head forward over L positions. `want_logits` returns the LAST row
-    /// only, on both arms.
+    /// One head forward over L positions. `.logits` returns the LAST row only,
+    /// on both arms. `.mixed` asks for the lm_head's INPUT vector instead: on
+    /// the sidecar that is `hidden_next` and nothing extra is produced, on
+    /// qwen4_exp it is the mixer output, returned in `rerank_x`.
     pub fn forward(
         self: MtpHeadRef,
         target: *Transformer,
@@ -240,12 +242,12 @@ pub const MtpHeadRef = union(enum) {
         id_arr: mlx.mlx_array,
         hidden: mlx.mlx_array,
         rope_offset: c_int,
-        want_logits: bool,
+        want: mtp_mod.StepWant,
         mrope_ctx: ?mtp_mod.MropeContext,
     ) !mtp_mod.StepOut {
         return switch (self) {
-            .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
-            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
+            .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
+            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx),
         };
     }
 
@@ -269,7 +271,7 @@ pub const MtpHeadRef = union(enum) {
                 const shape = [_]c_int{@intCast(token_ids.len)};
                 const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
                 defer _ = mlx.mlx_array_free(id_arr);
-                const out = try qwen4Step(t, id_arr, hidden, rope_offset, false, mrope_ctx);
+                const out = try qwen4Step(t, id_arr, hidden, rope_offset, .none, mrope_ctx);
                 _ = mlx.mlx_array_free(out.hidden_next);
             },
         }
@@ -281,10 +283,16 @@ pub const MtpHeadRef = union(enum) {
     pub fn canRerankDrafts(self: MtpHeadRef) bool {
         return switch (self) {
             .qwen => |h| h.canRerankDrafts(),
-            .qwen4 => false,
+            // Built lazily on the first ask: `loadQwen4Mtp` runs while the
+            // Transformer is still under construction and its lm_head — the
+            // very weight the coarse head is a copy of — is not assigned yet.
+            .qwen4 => |t| t.qwen4DraftRerankReady(),
         };
     }
 
+    /// `x` is whatever the TARGET's lm_head consumes for this arm — the
+    /// sidecar's post-norm hidden, or qwen4_exp's MIXER output. Never
+    /// `hidden_next` on qwen4_exp: that is the pre-mixer `[B,S,hc*H]` stream.
     pub fn draftSelect(
         self: MtpHeadRef,
         target: *Transformer,
@@ -293,7 +301,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mlx.mlx_array {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
-            .qwen4 => error.NoDraftRerank,
+            .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
         };
     }
 
@@ -309,10 +317,19 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// The head's last healthy acceptance surface, or null when it has never
+    /// published one. BOTH arms store it on the head object itself — the
+    /// sidecar `MtpModel` and the in-checkpoint `Qwen4Mtp` — so a seed dies
+    /// with the head and can never cross models.
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
-            .qwen4 => null,
+            .qwen4 => |t| blk: {
+                if (t.qwen4_mtp) |*m| {
+                    if (m.ev_seed_accept) |a| break :blk .{ .accept = a, .m_lo = m.ev_seed_m_lo };
+                }
+                break :blk null;
+            },
         };
     }
 
@@ -322,7 +339,13 @@ pub const MtpHeadRef = union(enum) {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
-            .qwen4 => {},
+            .qwen4 => |t| {
+                // A model served with `--no-mtp` has no head to seed.
+                if (t.qwen4_mtp) |*m| {
+                    m.ev_seed_accept = accept;
+                    m.ev_seed_m_lo = m_lo;
+                }
+            },
         }
     }
 };
@@ -482,17 +505,38 @@ pub const SamplingParams = struct {
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
 /// host, once per model load. Caller owns the returned array.
-pub fn buildSuppressMask(ids: []const u32, vocab: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+///
+/// Two disjoint sources of "never sample this row":
+///   - `ids`: the reserved specials (`tokenizer.reservedOutputIds`).
+///   - `[defined_vocab, vocab)`: the checkpoint's PADDING rows. A config's
+///     `vocab_size` is a padded matrix dimension, not a vocabulary — the
+///     tokenizer's highest defined id + 1 is. The rows in between decode to
+///     nothing, so a sample from one emits nothing while consuming a step and
+///     poisoning the KV; they were the one class of unsampleable row this
+///     mask never covered.
+/// `defined_vocab == 0` or `>= vocab` means "no padding known" and adds
+/// nothing — a mask that suppressed the whole vocab is `-inf` everywhere,
+/// which argmaxes to id 0 (the all-false-mask class, from the other side).
+pub fn buildSuppressMask(ids: []const u32, defined_vocab: usize, vocab: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     _ = s;
     const alloc = std.heap.page_allocator;
     const buf = try alloc.alloc(bool, vocab);
     defer alloc.free(buf);
-    @memset(buf, false);
-    for (ids) |id| {
-        if (id < vocab) buf[id] = true;
-    }
+    fillSuppressMask(buf, ids, defined_vocab);
     const shape = [_]c_int{@intCast(vocab)};
     return mlx.mlx_array_new_data(buf.ptr, &shape, 1, .bool_);
+}
+
+/// The host half of `buildSuppressMask`, pure so the row set is testable
+/// without a GPU. `buf.len` is the mask's vocab.
+pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) void {
+    @memset(buf, false);
+    for (ids) |id| {
+        if (id < buf.len) buf[id] = true;
+    }
+    if (defined_vocab > 0 and defined_vocab < buf.len) {
+        @memset(buf[defined_vocab..], true);
+    }
 }
 
 /// Derive + install the reserved-token suppression mask on a freshly-built
@@ -514,7 +558,6 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
         return;
     };
     defer xfm.allocator.free(ids);
-    if (ids.len == 0) return;
     // The mask's length is the LOGITS dim, not the embedding table's:
     // inkling slices its lm_head to `unpadded_vocab_size`, and a mask sized
     // to the padded vocab would fail the `where` broadcast on every sample.
@@ -522,11 +565,25 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
         xfm.config.unpadded_vocab_size
     else
         xfm.config.vocab_size;
-    xfm.suppress_mask = buildSuppressMask(ids, logits_dim, xfm.s) catch |err| {
+    // Padding rows past the tokenizer's last defined id. A checkpoint that
+    // DECLARES `unpadded_vocab_size` has already had those rows sliced off the
+    // lm_head, so `logits_dim` IS the real width there — applying the
+    // tokenizer's cut on top would be a second, different trim of a vocab that
+    // is already trimmed. One trim, whichever the checkpoint provides.
+    const defined_vocab: usize = if (xfm.config.unpadded_vocab_size > 0) 0 else tok.definedVocabSize();
+    const pad_rows: usize = if (defined_vocab > 0 and defined_vocab < logits_dim)
+        logits_dim - defined_vocab
+    else
+        0;
+    if (ids.len == 0 and pad_rows == 0) return;
+    xfm.suppress_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.s) catch |err| {
         log.warn("[suppress] mask build failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
         return;
     };
-    log.info("[suppress] {d} of {d} flagged specials masked from sampling (template + eos exempt)\n", .{ ids.len, tok.flagged_specials.len });
+    log.info(
+        "[suppress] {d} of {d} flagged specials masked from sampling (template + eos exempt); {d} padding rows past id {d} of {d}\n",
+        .{ ids.len, tok.flagged_specials.len, pad_rows, defined_vocab, logits_dim },
+    );
 }
 
 /// `out = where(mask, -inf, logits)` — the masked lanes get EXACTLY -inf
@@ -2638,7 +2695,10 @@ pub const Generator = struct {
         // run would poison the next request's plans (inference thread only,
         // same discipline as every other head-state write).
         if (self.mtp) |head| {
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and
+            // A forced-depth run never consulted the EV plan, so its surface
+            // is not one the controller chose — publishing it would hand a
+            // later ordinary request a diagnostic's numbers.
+            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8)
             {
                 head.setEvSeed(self.mtp_ev_accept, self.mtp_ev_m_lo_prev);
@@ -4632,6 +4692,10 @@ pub const Generator = struct {
             const need_logits = chain.q_probs != null or
                 (chain.conf_arrs != null and i < chain.plan.m_lo);
             const use_rerank = rerank_drafts and !need_logits;
+            // `want_logits: bool` could not tell a rerank draft from a history
+            // append: both skip the vocab projection, but the draft still needs
+            // the vector that projection would have consumed.
+            const want: mtp_mod.StepWant = if (use_rerank) .mixed else .logits;
             const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
@@ -4663,10 +4727,18 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), !use_rerank, mtp_mrope_ctx);
-            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), !use_rerank, mtp_mrope_ctx);
+                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx);
+            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx);
+            // A `.mixed` step that publishes `rerank_x` means `hidden_next` is
+            // NOT what the lm_head consumes — on qwen4_exp it is the pre-mixer
+            // `[B,S,hc*H]` stream and the mixer output is the rerank input.
+            // Feeding the wrong one is a shape error, not a wrong answer.
+            defer if (step_out.rerank_x.ctx != null) {
+                _ = mlx.mlx_array_free(step_out.rerank_x);
+            };
             if (use_rerank) {
-                chain.draft_arrs[i] = try head.draftSelect(xfm, step_out.hidden_next, draft_sampling.suppress_mask);
+                const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
+                chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
             } else if (chain.q_probs) |slots| {
                 // Sharp proposal: q = filtered softmax of the draft-head
                 // logits at the FIXED sharpened constants; the draft is
@@ -4948,8 +5020,11 @@ pub const Generator = struct {
         // (~10 legacy rounds + a +1/round base climb — a third of a short
         // generation). Demotion stays instant (EMA decay + sticky disable are
         // per-request), so a workload change costs a few rounds, not the win.
+        // `MLX_SERVE_MTP_FORCE_DEPTH` is a measurement mode: every round drafts
+        // exactly n and the controller never plans, so a seed must not be
+        // applied (nor, at deinit, published).
         if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-            mtpAdaptiveEnabled() and mtpEvSeedEnabled())
+            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null)
         {
             if (head.evSeed()) |seed| {
                 self.mtp_ev_accept = seed.accept;
@@ -5115,7 +5190,21 @@ pub const Generator = struct {
         }
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
-        const verify_logits = try xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all);
+        //
+        // qwen4_exp: the n-gram PLE at trunk layer 1 is a HOST gather keyed on
+        // these ids, and every id past t1 is still a lazy draft — gathering
+        // eagerly parks the build of layers 2..N behind the whole draft chain
+        // finishing on the GPU. Defer the leaf so the graph builds while the
+        // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
+        // 4 evaluates anything. Other arches never set `ple_pending`.
+        self.ctx.ple_defer = true;
+        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+            self.ctx.ple_defer = false;
+            self.ctx.capture_ssm_seq = false;
+            xfm.discardDeferredPle(&self.ctx);
+            return e;
+        };
+        self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
         // Always free the transient capture buffers before returning, however
         // we exit this round (full accept, partial accept, or error).
@@ -5128,6 +5217,11 @@ pub const Generator = struct {
             self.mtp_trace.add(.verify, ph.read());
             ph.reset();
         }
+        // Fill the deferred PLE leaf: the one host read of the verify ids, and
+        // the point at which the entry's n-gram history + `spec_ple_tokens`
+        // advance. Must precede BOTH the first eval of anything downstream of
+        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        try xfm.flushDeferredPle(&self.ctx);
 
         // ── Phase 4: decide longest accepted prefix ──
         // Stochastic path is fully BATCHED: accept probabilities for every
@@ -10888,6 +10982,46 @@ test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(2, 3, 0.30, 5, true));
 }
 
+test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads null" {
+    // The in-checkpoint head stores the seed on `Qwen4Mtp` — per loaded model,
+    // exactly like the sidecar's `MtpModel.ev_seed_*`. Before this it was a
+    // null/no-op stub, so every qwen4 request re-warmed the controller from
+    // scratch. Only the two seed fields are touched here; the rest of the head
+    // (and of the Transformer) is never read on this path.
+    var t: Transformer = undefined;
+    t.qwen4_mtp = null;
+    const ref = MtpHeadRef{ .qwen4 = &t };
+
+    // `--no-mtp`: no head to seed, and setting one must not fault.
+    try testing.expect(ref.evSeed() == null);
+    var zeros: [mtp_mod.MAX_DEPTH]f32 = @splat(0.5);
+    ref.setEvSeed(zeros, 4);
+    try testing.expect(ref.evSeed() == null);
+
+    var head: transformer_mod.Qwen4Mtp = undefined;
+    head.ev_seed_accept = null;
+    head.ev_seed_m_lo = 1;
+    t.qwen4_mtp = head;
+    // A head that has never published reads null — not a zeroed surface.
+    try testing.expect(ref.evSeed() == null);
+
+    var accept: [mtp_mod.MAX_DEPTH]f32 = @splat(0.0);
+    accept[0] = 0.91;
+    accept[1] = 0.80;
+    accept[2] = 0.68;
+    ref.setEvSeed(accept, 5);
+    const got = ref.evSeed() orelse return error.SeedMissing;
+    try testing.expectEqual(@as(u32, 5), got.m_lo);
+    try testing.expectEqualSlices(f32, &accept, &got.accept);
+
+    // Overwrite, not accumulate: the LAST healthy request wins.
+    zeros[0] = 0.10;
+    ref.setEvSeed(zeros, 2);
+    const again = ref.evSeed() orelse return error.SeedMissing;
+    try testing.expectEqual(@as(u32, 2), again.m_lo);
+    try testing.expectEqualSlices(f32, &zeros, &again.accept);
+}
+
 test "MTP EV seed defaults on and explicit zero disables" {
     try testing.expect(Generator.mtpEvSeedEnabledFromEnv(null));
     try testing.expect(Generator.mtpEvSeedEnabledFromEnv(""));
@@ -11065,6 +11199,45 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
     g.updateMtpEvRound(4, 0);
     try testing.expectEqual(@as(u32, 0), g.mtp_window_idx);
     try testing.expect(!g.spec_disabled_runtime);
+}
+
+test "the qwen4 rerank draft feeds the MIXER output, never the pre-mixer stream" {
+    // The one way this change can be wrong without failing to compile. On the
+    // sidecar arm `hidden_next` IS the lm_head's input, so the obvious wiring
+    // (`draftSelect(xfm, step_out.hidden_next, ...)`) is correct there and
+    // silently wrong on qwen4_exp, whose `hidden_next` is the pre-mixer
+    // `[B,S,hc*H]` stream — 4x the width the head consumes. The chain must
+    // therefore prefer `rerank_x` when a step publishes one.
+    const source = @embedFile("generate.zig");
+    const build_at = std.mem.indexOf(u8, source, "fn mtpChainBuild(") orelse return error.MissingChainBuild;
+    const end = std.mem.indexOfPos(u8, source, build_at, "\n    /// Fire the chain's built graphs") orelse source.len;
+    const body = source[build_at..end];
+
+    const sel = std.mem.indexOf(u8, body, "head.draftSelect(") orelse return error.MissingDraftSelect;
+    const line_start = std.mem.lastIndexOfScalar(u8, body[0..sel], '\n') orelse 0;
+    const line_end = std.mem.indexOfScalarPos(u8, body, sel, '\n') orelse body.len;
+    const call = body[line_start..line_end];
+    // The rerank input is the resolved vector, never `hidden_next` directly.
+    try testing.expect(std.mem.indexOf(u8, call, "rerank_x") != null);
+    try testing.expect(std.mem.indexOf(u8, call, "hidden_next") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "step_out.rerank_x.ctx != null") != null);
+
+    // ...and a `.mixed` step is what asks for it: a rerank draft must not
+    // collapse onto `.none` (the history-append mode), which produces no
+    // mixer output at all.
+    try testing.expect(std.mem.indexOf(u8, body, "if (use_rerank) .mixed else .logits") != null);
+
+    // The qwen4 arm maps `.mixed` onto the projection that SKIPS the lm_head
+    // but still runs the mixer. If it ever mapped to `.none`, `rerank_x` would
+    // be null and the chain would silently hand over the pre-mixer stream.
+    const step_at = std.mem.indexOf(u8, source, "fn qwen4Step(") orelse return error.MissingQwen4Step;
+    const step_end = std.mem.indexOfPos(u8, source, step_at, "\n    /// One head forward") orelse source.len;
+    const step_body = source[step_at..step_end];
+    try testing.expect(std.mem.indexOf(u8, step_body, ".mixed => .mixed_last_row") != null);
+    try testing.expect(std.mem.indexOf(u8, step_body, ".rerank_x = out.mixed") != null);
+
+    // And the owned mixer vector is freed by the chain, not leaked per step.
+    try testing.expect(std.mem.indexOf(u8, body, "mlx_array_free(step_out.rerank_x)") != null);
 }
 
 test "mtpEvExpectedTokens: 1 + sum of acceptance chain products" {
@@ -12381,6 +12554,42 @@ fn evalLazyToken(lazy: mlx.mlx_array) !u32 {
     return @intCast(val);
 }
 
+test "fillSuppressMask: padding rows past the tokenizer's last defined id are suppressed" {
+    // A config's `vocab_size` is a padded matrix dimension, not a vocabulary.
+    // qwen4_exp declares 248320 while the tokenizer defines 248044 + 33 =
+    // 248077 ids: 243 rows that decode to NOTHING, carry whatever the
+    // initializer left, and were sampleable — a drawn one emits no text while
+    // consuming a step and entering the KV. Same mask, second row class.
+    var buf: [16]bool = undefined;
+    fillSuppressMask(&buf, &[_]u32{3}, 12);
+    for (buf, 0..) |v, i| {
+        const want = (i == 3) or (i >= 12);
+        try testing.expectEqual(want, v);
+    }
+
+    // No padding known (0) and a fully-defined vocab (== len) both add
+    // nothing: a mask over the WHOLE vocab is -inf everywhere, and argmax
+    // over that row returns id 0 — the all-false-mask class from the other
+    // side. The reserved id must still be the only true.
+    for ([_]usize{ 0, 16, 99 }) |defined| {
+        fillSuppressMask(&buf, &[_]u32{3}, defined);
+        for (buf, 0..) |v, i| try testing.expectEqual(i == 3, v);
+    }
+}
+
+test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defined" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    try testing.expectEqual(@as(usize, 0), tok.definedVocabSize());
+    // Added specials sit ABOVE the base vocab and are not contiguous with it,
+    // so the answer is the maximum key, never the entry count.
+    try tok.id_to_token.put(0, "a");
+    try tok.id_to_token.put(1, "b");
+    try tok.id_to_token.put(11, "<|special|>");
+    try testing.expectEqual(@as(usize, 12), tok.definedVocabSize());
+}
+
 test "suppress_mask: a suppressed id is unreachable from both samplers, everything else stays" {
     // A collapsed distribution can rank `<|fim_hole|>` (a reserved FIM marker) in the
     // top-5 at every degenerate position, and greedy DREW it live. A reserved
@@ -12397,7 +12606,7 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     const allocator = testing.allocator;
 
     const V: usize = 8;
-    const mask = try buildSuppressMask(&[_]u32{3}, V, s);
+    const mask = try buildSuppressMask(&[_]u32{3}, 0, V, s);
     defer _ = mlx.mlx_array_free(mask);
 
     // id 3 (suppressed) dominates, id 5 is the runner-up, the rest are so far
@@ -12712,6 +12921,35 @@ test "vision prefill chunks by default and the splice offset feeds every prefill
     try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
 }
 
+test "MTP verify forward defers the PLE gather" {
+    // Source scan: on qwen4_exp the n-gram PLE at trunk layer 1 is a HOST
+    // gather keyed on the verify ids, and every id past t1 is still a lazy
+    // draft — an eager gather parks the build of layers 2..N behind the whole
+    // draft chain finishing on the GPU. The verify build must therefore run
+    // with `ple_defer` armed, hand the leaf back on the error path, and flush
+    // it (the round's one host sync) before Phase 4 evaluates anything or
+    // Phase 5 rolls the n-gram history back.
+    const src = @embedFile("generate.zig");
+    const build = "xfm.forwardWithCaptureAll(&self.ctx, verify" ++ "_input, &new_hidden, &verify_hidden_all)";
+    const at = std.mem.indexOf(u8, src, build) orelse return error.VerifyBuildMissing;
+
+    // Armed immediately before the build, disarmed right after it.
+    const arm = "self.ctx.ple" ++ "_defer = true;";
+    const arm_at = std.mem.lastIndexOf(u8, src[0..at], arm) orelse return error.PleDeferNotArmed;
+    try testing.expect(at - arm_at < 600); // the comment block, nothing else
+    const disarm = "self.ctx.ple" ++ "_defer = false;";
+    try testing.expect(std.mem.indexOfPos(u8, src, at, disarm) != null);
+    // The build's error path hands the unfilled leaf back.
+    const discard = "xfm.discardDeferred" ++ "Ple(&self.ctx);";
+    const discard_at = std.mem.indexOfPos(u8, src, at, discard) orelse return error.PleDiscardMissing;
+    try testing.expect(discard_at - at < 400);
+    // The flush follows the build and precedes Phase 4 (the first eval).
+    const flush = "try xfm.flushDeferred" ++ "Ple(&self.ctx);";
+    const flush_at = std.mem.indexOfPos(u8, src, at, flush) orelse return error.PleFlushMissing;
+    const phase4 = std.mem.indexOfPos(u8, src, at, "// ── Phase 4:") orelse return error.Phase4Missing;
+    try testing.expect(flush_at < phase4);
+}
+
 test "MtpTrace per-index acceptance: index i counts only rounds that drafted it" {
     var t: Generator.MtpTrace = .{};
     _ = t.endRound(3, 3, false); // all three accepted
@@ -12721,4 +12959,49 @@ test "MtpTrace per-index acceptance: index i counts only rounds that drafted it"
     try std.testing.expectEqualStrings("0.67/0.50/0.50", t.accIdxStr(&buf));
     t.reset();
     try std.testing.expectEqualStrings("", t.accIdxStr(&buf));
+}
+
+test "qwen4: the coarse rerank head is READY before any draft has run" {
+    // The head is a full `requantizeRows` of the trunk lm_head plus a
+    // synchronous eval of its ~240 MB. Built lazily it landed inside the
+    // FIRST request's draft chain — on the inference thread, mid-round,
+    // draining the stream, and paid as first-token latency by whoever
+    // happened to be first after a load. `qwen4BuildDraftRerank` is that
+    // build as a standalone LOAD-time step: no Generator, no chain, no
+    // request. Afterwards `canRerankDrafts()` is a pure read.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+
+    var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
+    defer fx.deinit();
+    // Only the rerank fields are read by the build; the rest of the head is
+    // the trunk's business.
+    var head: transformer_mod.Qwen4Mtp = undefined;
+    head.rerank = null;
+    head.rerank_logged = false;
+    head.rerank_tried = false;
+    fx.xfm.qwen4_mtp = head;
+    defer if (fx.xfm.qwen4_mtp) |*m| {
+        if (m.rerank) |*rc| rc.deinit();
+    };
+
+    // Nothing is built by construction...
+    try testing.expect(fx.xfm.qwen4_mtp.?.rerank == null);
+    // ...the eager build stands on its own...
+    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
+    const built = fx.xfm.qwen4_mtp.?.rerank orelse return error.NoCoarseHead;
+    try testing.expectEqual(fx.vocab, built.rows);
+    try testing.expect(built.bits > 0 and built.bits < 8);
+
+    // ...and the draft path now only READS it. Same mlx handle => the ask
+    // did not rebuild anything (which is what the lazy path did).
+    const head_ctx = built.q.w.ctx;
+    const ref = MtpHeadRef{ .qwen4 = &fx.xfm };
+    try testing.expect(ref.canRerankDrafts());
+    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+
+    // One-shot: a second eager build (both load paths firing, a re-probe)
+    // keeps the head it already has.
+    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
+    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
 }

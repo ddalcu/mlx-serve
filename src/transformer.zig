@@ -1,6 +1,11 @@
 const std = @import("std");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+// The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
+// (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
+// so has no head-shaped state of its own. mtp.zig imports this file back for
+// `Transformer`; neither type closes a comptime loop.
+const mtp_mod = @import("mtp.zig");
 const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
@@ -5423,7 +5428,7 @@ const PleWeights = struct {
 ///   x = fc_hidden(rms_{4H}(stream)) per stream + fc_embedding(rms_H(embed))
 ///   → one full-attention decoder layer (own hc/QSA/MoE) → mixer → lm_head.
 /// Keeps its own KV cache (index `num_hidden_layers`) + indexer key history.
-const Qwen4Mtp = struct {
+pub const Qwen4Mtp = struct {
     layer: MoeLayerWeights,
     pre_norm_emb: mlx.mlx_array,
     pre_norm_hidden: mlx.mlx_array,
@@ -5441,6 +5446,29 @@ const Qwen4Mtp = struct {
     /// Absolute position of the head's key row 0 (the first draft position
     /// after a reset).
     pos_base: c_int = 0,
+    /// Cross-request EV controller seed — the in-checkpoint head's twin of
+    /// `mtp.MtpModel.ev_seed_*`: the last HEALTHY request's per-index
+    /// acceptance EMAs and base depth, written by `Generator.deinit` and read
+    /// by the first `nextMtp` round of the next request. Without it every
+    /// request re-warms the controller (MTP_EV_WARMUP_ROUNDS legacy rounds
+    /// plus a +1/round base climb), which is a sizeable share of a short
+    /// generation. Per-LOADED-MODEL state, exactly like the sidecar's: it
+    /// lives on the head, so it dies with the head and can never reach
+    /// another model. `qwen4MtpReset` deliberately does not clear it — a
+    /// reset starts a new REQUEST, which is precisely who should inherit it.
+    ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32 = null,
+    ev_seed_m_lo: u32 = 1,
+    /// Draft rerank (`mtp.rerankSelect`): a low-bit copy of the TRUNK lm_head
+    /// that shortlists 32 candidates, which the real head then re-scores.
+    /// Built at LOAD by `qwen4BuildDraftRerank` — not in `loadQwen4Mtp`, which
+    /// runs while the Transformer is still under construction and `lm_head_w`
+    /// is not assigned yet, but from the scheduler's load path once it is.
+    /// `tried` makes it (and the refusal) one-shot, so the draft path's own
+    /// ask is a pure read; a null `rerank` after it means the full readout is
+    /// this head's draft path.
+    rerank: ?mtp_mod.RerankCoarse = null,
+    rerank_logged: bool = false,
+    rerank_tried: bool = false,
 };
 
 const LinearAttnWeights = struct {
@@ -6183,8 +6211,10 @@ pub const ForwardCtx = struct {
     /// that is still a lazy sample. With `ple_defer` set, `pleEmbedding` hands
     /// the graph an unfilled leaf and records it here; the caller fills it via
     /// `Transformer.flushDeferredPle` (syncing on the token THEN) right before
-    /// the graph is evaluated. Set only by `generate.lazyForward`; a forward
-    /// evaluated with `ple_pending` still set reads zero rows.
+    /// the graph is evaluated. Set by `generate.lazyForward` (decode) and by
+    /// the MTP verify build in `Generator.nextMtp` (whose `[1, 1+m]` input is
+    /// the still-lazy draft chain); a forward evaluated with `ple_pending`
+    /// still set reads zero rows.
     ple_defer: bool = false,
     ple_pending: ?PlePending = null,
 };
@@ -6195,6 +6225,12 @@ pub const PlePending = struct {
     entry: *SSMCacheEntry,
     layer: usize,
     seq_len: c_int,
+    /// Whether the gather owes `entry.spec_ple_tokens` the verify history.
+    /// Decided (and `spec_ple_len` claimed) at BUILD time: the PLE layer's own
+    /// conv capture, later in the same forward, keys on `spec_ple_len` while
+    /// this gather has not run yet, and `spec_capture_ssm` is already back to
+    /// false by the time the flush happens.
+    capture: bool,
 };
 
 // ── Decode quantized-KV attention kernel (docs/kv-quant-perf.md) ──
@@ -8729,6 +8765,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(m.entry.ssm_state);
             if (m.entry.aux_state.ctx != null) _ = mlx.mlx_array_free(m.entry.aux_state);
             if (m.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(m.entry.qsa_pooled);
+            if (m.rerank) |*rc| rc.deinit();
             self.qwen4_mtp = null;
         }
         if (self.qwen4) |st| {
@@ -12333,6 +12370,8 @@ pub const Transformer = struct {
         // mid-graph eval, no GPU sync inside the layer loop.
         const pk = try self.allocator.alloc(u16, n * emb_dim);
         defer self.allocator.free(pk);
+        // The batched arm keeps its history per SLOT and never captures.
+        const capture = ctx.batch_slots == null and self.pleClaimSpecCapture(entry, n);
         if (ctx.ple_defer and ctx.batch_slots == null) {
             std.debug.assert(ctx.ple_pending == null);
             @memset(pk, 0);
@@ -12341,11 +12380,27 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_array_set(&emb_ref, emb));
             var ids_ref = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_array_set(&ids_ref, token_ids));
-            ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len };
+            ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len, .capture = capture };
             return emb;
         }
-        try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk);
+        try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk, capture);
         return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+    }
+
+    /// Claim (or clear) `entry`'s fixed spec-PLE token slot for a gather of
+    /// `n` ids, reporting whether the verify history fits it. ONE predicate
+    /// for the eager and the deferred arm: with `ple_defer` the gather that
+    /// would set `spec_ple_len` runs AFTER the PLE layer's conv capture, which
+    /// keys on it — so the length is claimed here, at build time, and the
+    /// gather only fills the tokens.
+    fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) bool {
+        const ctx_len: usize = self.qwen4.?.hash.ngram_size - 1;
+        if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
+            entry.spec_ple_len = @intCast(ctx_len + n);
+            return true;
+        }
+        entry.spec_ple_len = 0;
+        return false;
     }
 
     /// Fill the leaf a `ple_defer` forward was built on: the token ids are
@@ -12361,22 +12416,26 @@ pub const Transformer = struct {
         }
         const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
         const out: [*]u16 = @constCast(dst);
-        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)]);
+        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
     }
 
     /// Drop a pending leaf without filling it (the forward that built on it
-    /// is being abandoned).
+    /// is being abandoned). The spec-PLE slot the build claimed is released
+    /// too — no gather ever filled its tokens.
     pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
         const p = ctx.ple_pending orelse return;
         ctx.ple_pending = null;
+        p.entry.spec_ple_len = 0;
         _ = mlx.mlx_array_free(p.emb);
         _ = mlx.mlx_array_free(p.token_ids);
     }
 
     /// The host side of the n-gram PLE embedding: token ids → hashed rows →
     /// gathered + bf16-packed into `pk` (`[n][emb_dim]`), advancing the
-    /// entry's n-gram history.
-    fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16) !void {
+    /// entry's n-gram history. `capture` comes from `pleClaimSpecCapture` at
+    /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
+    /// flush sees already cleared).
+    fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
         const st = self.qwen4.?;
         const ctx_len: usize = st.hash.ngram_size - 1;
         // Draft ids arrive as lazy graphs of whatever dtype the sampler
@@ -12408,7 +12467,8 @@ pub const Transformer = struct {
         } else {
             var prev: [8]u32 = @splat(st.hash.eos);
             if (entry.ple_prev_valid) prev = entry.ple_prev;
-            if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
+            if (capture) {
+                std.debug.assert(ctx_len + n <= entry.spec_ple_tokens.len);
                 for (0..ctx_len) |i| entry.spec_ple_tokens[i] = prev[i];
                 for (0..n) |i| entry.spec_ple_tokens[ctx_len + i] = ids[i];
                 entry.spec_ple_len = @intCast(ctx_len + n);
@@ -13213,7 +13273,39 @@ pub const Transformer = struct {
     /// stream at positions p.., `token_ids` `[B,S]` the tokens at p+1.., and
     /// `pos_offset` = p+1 of the first row (the draft query's own position).
     /// Returns `[B,S,V]` logits for positions p+2... Caller frees.
-    pub const Qwen4MtpOut = struct { logits: mlx.mlx_array, stream: mlx.mlx_array };
+    /// `logits` is the last-row projection (null unless `.all_rows`/`.last_row`),
+    /// `stream` the pre-mixer hyper-connection stream the next chain step reads,
+    /// and `mixed` the MIXER output — the vector the lm_head consumes — which
+    /// only `.mixed_last_row` fills. The three are distinct spaces: `stream` is
+    /// `[B,S,hc*H]`, `mixed` is `[B,1,H]`, and handing the wrong one to the
+    /// lm_head is a silent shape error, not a wrong answer.
+    pub const Qwen4MtpOut = struct {
+        logits: mlx.mlx_array,
+        stream: mlx.mlx_array,
+        mixed: mlx.mlx_array = .{ .ctx = null },
+    };
+
+    /// What `qwen4MtpForward` owes its caller past the head's own layer. The
+    /// mixer read + the 248320-wide lm_head run over whatever rows `stream`
+    /// carries, so a caller that consumes ONE row says so instead of paying
+    /// for `S` of them and slicing (the merged history step after a partial
+    /// accept is `1 + accepted` rows wide, of which the drafter wants the
+    /// last).
+    pub const Qwen4MtpProject = enum {
+        /// Every row's logits + the full `[B,S,hc*H]` stream (fixture oracles).
+        all_rows,
+        /// The LAST row only: `h` is sliced BEFORE the mixer, so `logits` is
+        /// `[B,1,V]` and `stream` is that one row.
+        last_row,
+        /// No logits at all (history append): mixer + lm_head are skipped and
+        /// `logits` comes back null; `stream` is the full `[B,S,hc*H]`.
+        none,
+        /// The LAST row's mixer output in `mixed`, and NO lm_head: the draft
+        /// rerank path shortlists through its own coarse head, so the 248320-
+        /// wide projection — 675 MB, the single biggest read in a draft step —
+        /// never runs. `logits` comes back null; `stream` is the last row.
+        mixed_last_row,
+    };
 
     /// Truncate the head's committed history to `len` rows.
     pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
@@ -13247,7 +13339,7 @@ pub const Transformer = struct {
     /// `pos_base + seq_offset ..`, so its attention + QSA indexer read the
     /// slot's 3-D table there (prompt rows spanning the image) and the
     /// scalar `offset + delta` past it — the same two arms as the trunk.
-    pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext) !Qwen4MtpOut {
+    pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
@@ -13314,12 +13406,93 @@ pub const Transformer = struct {
         h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
         m.seq_offset += @intCast(seq_len);
 
-        const mix = try self.hcRead(h, &m.mixer, batch, seq_len);
-        errdefer _ = mlx.mlx_array_free(h);
+        // History append wants the stream and nothing else: the mixer read and
+        // the vocab-wide projection are pure, so skipping them is free.
+        if (project == .none) return .{ .logits = .{ .ctx = null }, .stream = h };
+        // Last-row-only: cut `h` HERE, so the mixer + lm_head see one row
+        // instead of S. Same values as slicing the outputs afterwards.
+        var out_seq: c_int = seq_len;
+        if ((project == .last_row or project == .mixed_last_row) and seq_len > 1) {
+            const hs = mlx.getShape(h);
+            var h_last = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(h_last);
+            try mlx.check(mlx.mlx_slice(
+                &h_last,
+                h,
+                &[_]c_int{ 0, seq_len - 1, 0 },
+                3,
+                &[_]c_int{ hs[0], seq_len, hs[2] },
+                3,
+                &[_]c_int{ 1, 1, 1 },
+                3,
+                self.s,
+            ));
+            _ = mlx.mlx_array_free(h);
+            h = h_last;
+            out_seq = 1;
+        }
+
+        const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
+        // Rerank draft: the mixer output IS the answer. Skipping
+        // `lmHeadProject` here is the whole point — the 248320-wide 8-bit
+        // projection is 675 MB, more than every other read in a draft step put
+        // together, and a greedy draft only ever needed its argmax.
+        if (project == .mixed_last_row) {
+            return .{ .logits = .{ .ctx = null }, .stream = h, .mixed = mix.mixed };
+        }
         defer _ = mlx.mlx_array_free(mix.mixed);
         const logits = try self.lmHeadProject(mix.mixed, false);
         return .{ .logits = logits, .stream = h };
+    }
+
+    /// Build the qwen4_exp head's coarse rerank head. ONE-SHOT (`rerank_tried`
+    /// caches the refusal too) and infallible — false keeps the full-vocab
+    /// draft projection, which is what MLX_SERVE_MTP_DRAFT_RERANK=0 restores.
+    ///
+    /// Called at LOAD (`scheduler.doLoadOnInferenceThread`, the site both the
+    /// boot load and the `/v1/load` cold load route through), the sidecar
+    /// arm's `maybeBuildDraftRerank`-at-bind twin: a full `requantizeRows` of
+    /// the trunk lm_head plus a synchronous eval of its ~240 MB is a LOAD
+    /// cost, and inside the first request's draft chain it was first-token
+    /// latency on the inference thread with the stream drained mid-round.
+    pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
+        const m = &(self.qwen4_mtp orelse return false);
+        if (m.rerank_tried) return m.rerank != null;
+        m.rerank_tried = true;
+        if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        // The ONE env read: the built head carries its width from here on.
+        const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.rerankCoarseBits()) orelse return false;
+        m.rerank = rc;
+        const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
+        const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
+        log.info(
+            "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring (MLX_SERVE_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
+            .{ rc.bits, bytes / (1024 * 1024), ms },
+        );
+        return true;
+    }
+
+    /// Is the qwen4_exp head's draft rerank available? A pure read once the
+    /// load-time build has run; the build is only reached here when it did
+    /// NOT (an offline path, a directly-constructed Transformer), and it is
+    /// one-shot either way.
+    pub fn qwen4DraftRerankReady(self: *Transformer) bool {
+        const m = &(self.qwen4_mtp orelse return false);
+        if (m.rerank_tried) return m.rerank != null;
+        return self.qwen4BuildDraftRerank();
+    }
+
+    /// One greedy draft id from the mixer output `x` `[B,1,H]`. Shares the
+    /// sidecar head's scheme verbatim; a coarse-head absence or a shortlist
+    /// failure falls through to the full trunk-head readout, which is exactly
+    /// what this path replaced.
+    pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
+        return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
     }
 
     /// Test hook: layer-0 intermediates of the qwen4 forward (fixture bisect).
@@ -40087,7 +40260,7 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     try testing.expect(pooled);
 }
 
-test "qwen4 deferred PLE: a pipelined decode step matches the direct forward (QWEN4_TEST_MODEL)" {
+test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direct forward (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
@@ -40171,6 +40344,62 @@ test "qwen4 deferred PLE: a pipelined decode step matches the direct forward (QW
         const b = try qwen4ReadF32(allocator, ll, s);
         defer allocator.free(b);
         try testing.expectEqualSlices(f32, a, b);
+    }
+
+    // Verify-width arm: an MTP round builds `[1, 1+m]` over a chain of LAZY
+    // drafts with per-position SSM capture on. Deferred must match eager in
+    // logits AND in the rollback state the capture leaves behind — the PLE
+    // layer's own conv capture runs later in the same forward and keys on
+    // `spec_ple_len`, which the deferred gather has not written yet.
+    {
+        const rows = [_]i32{ 13, 6, 27, 3, 19, 40, 12 };
+        for ([_]usize{ 4, 7 }) |w| {
+            const vshape = [_]c_int{ 1, @intCast(w) };
+            const vids = mlx.mlx_array_new_data(&rows, &vshape, 2, .int32);
+            defer _ = mlx.mlx_array_free(vids);
+
+            dctx.capture_ssm_seq = true;
+            const dl = try xfm.forwardWith(&dctx, vids);
+            defer _ = mlx.mlx_array_free(dl);
+            dctx.capture_ssm_seq = false;
+
+            lctx.capture_ssm_seq = true;
+            lctx.ple_defer = true;
+            const ll = try xfm.forwardWith(&lctx, vids);
+            defer _ = mlx.mlx_array_free(ll);
+            lctx.ple_defer = false;
+            lctx.capture_ssm_seq = false;
+            try testing.expect(lctx.ple_pending != null);
+            try xfm.flushDeferredPle(&lctx);
+            try testing.expect(lctx.ple_pending == null);
+
+            const a = try qwen4ReadF32(allocator, dl, s);
+            defer allocator.free(a);
+            const b = try qwen4ReadF32(allocator, ll, s);
+            defer allocator.free(b);
+            try testing.expectEqualSlices(f32, a, b);
+
+            var saw_ple = false;
+            for (direct.entries, deferred.entries) |*de, *le| {
+                try testing.expectEqual(de.spec_ple_len, le.spec_ple_len);
+                try testing.expectEqual(de.ple_prev_valid, le.ple_prev_valid);
+                try testing.expectEqualSlices(u32, &de.ple_prev, &le.ple_prev);
+                // A deferred gather that never claimed the slot leaves this
+                // null while eager holds a capture: `ssmRollbackFromCapture`
+                // would then silently take the non-PLE branch.
+                try testing.expectEqual(de.spec_ple_input.ctx == null, le.spec_ple_input.ctx == null);
+                if (de.spec_ple_len > 0) {
+                    saw_ple = true;
+                    try testing.expect(de.spec_ple_len >= @as(u32, @intCast(w)));
+                    const n: usize = de.spec_ple_len;
+                    try testing.expectEqualSlices(u32, de.spec_ple_tokens[0..n], le.spec_ple_tokens[0..n]);
+                    try testing.expect(de.spec_ple_input.ctx != null);
+                }
+            }
+            try testing.expect(saw_ple);
+            for (direct.entries) |*e| ssmFreeSpecCapture(e);
+            for (deferred.entries) |*e| ssmFreeSpecCapture(e);
+        }
     }
 
     // Load-bearing arm: an unflushed leaf is NOT the direct forward.
@@ -40316,7 +40545,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             const next_ids = mlx.mlx_array_new_data(@ptrCast(ids_src + 1), &tshape, 2, .int32);
             defer _ = mlx.mlx_array_free(next_ids);
             try xfm.qwen4MtpReset();
-            const mo = try xfm.qwen4MtpForward(stream_prev, next_ids, 1, null);
+            const mo = try xfm.qwen4MtpForward(stream_prev, next_ids, 1, null, .all_rows);
             defer _ = mlx.mlx_array_free(mo.logits);
             defer _ = mlx.mlx_array_free(mo.stream);
             const ours_m = try qwen4ReadF32(allocator, mo.logits, s);
@@ -40586,7 +40815,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             defer _ = mlx.mlx_array_free(hp);
             const tp = H.ids(ids_src[1..P]);
             defer _ = mlx.mlx_array_free(tp);
-            const o = try xfm.qwen4MtpForward(hp, tp, 1, null);
+            const o = try xfm.qwen4MtpForward(hp, tp, 1, null, .all_rows);
             _ = mlx.mlx_array_free(o.logits);
             _ = mlx.mlx_array_free(o.stream);
         }
@@ -40638,12 +40867,12 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
                     _ = mlx.mlx_array_free(stash_h.?);
                     stash_h = null;
                     stash_ids.clearRetainingCapacity();
-                    break :blk try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null);
+                    break :blk try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null, .all_rows);
                 } else blk: {
                     const one = [_]i32{prev_tok};
                     const tid = H.ids(&one);
                     defer _ = mlx.mlx_array_free(tid);
-                    break :blk try xfm.qwen4MtpForward(if (i == 0) last_hidden else h_chain.?, tid, @intCast(off0 + i + 1), null);
+                    break :blk try xfm.qwen4MtpForward(if (i == 0) last_hidden else h_chain.?, tid, @intCast(off0 + i + 1), null, .all_rows);
                 };
                 if (h_chain) |a| _ = mlx.mlx_array_free(a);
                 h_chain = try H.rows(s, o.stream, @intCast(mlx.getShape(o.stream)[1] - 1), @intCast(mlx.getShape(o.stream)[1]));
@@ -40701,7 +40930,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             defer _ = mlx.mlx_array_free(mids);
             const mh = try H.cat(s, &.{ stash_h.?, last_hidden });
             defer _ = mlx.mlx_array_free(mh);
-            const o = try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null);
+            const o = try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null, .all_rows);
             _ = mlx.mlx_array_free(o.stream);
             last_logits = o.logits;
         }
@@ -40717,7 +40946,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const fids = H.ids(fresh_ids.items);
         defer _ = mlx.mlx_array_free(fids);
         try testing.expectEqual(@as(c_int, @intCast(fresh_ids.items.len)), mlx.getShape(fh)[1]);
-        const fo = try xfm.qwen4MtpForward(fh, fids, 1, null);
+        const fo = try xfm.qwen4MtpForward(fh, fids, 1, null, .all_rows);
         defer _ = mlx.mlx_array_free(fo.logits);
         defer _ = mlx.mlx_array_free(fo.stream);
         const fresh_x = try qwen4ReadF32(allocator, fo.logits, s);
@@ -40728,6 +40957,414 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         try testing.expect(rx.min_cos > 0.999);
         try testing.expect(rx.argmax_agree == rx.rows);
     }
+}
+
+test "qwen4 MTP head: last-row and no-logits projections match the full block (QWEN4_TEST_MODEL)" {
+    // `MtpHeadRef.qwen4Step` consumes ONE row of logits, and the merged
+    // history step after a partial accept hands the head `1 + accepted` rows —
+    // so the mixer read + the vocab-wide lm_head used to run over the whole
+    // block for a single row. `.last_row` cuts the stream first, `.none`
+    // (appendHistory) skips both stages.
+    //
+    // Bars: the STREAM is a pure slice / a pure skip, so it is bit-identical
+    // on both. The last row's LOGITS are not asserted bit-identical past S=1 —
+    // a quantized projection at M=1 and at M=S are different kernels, and only
+    // the S=1 arm shares one — so the multi-row arm takes the fixture bar.
+    // That is the right bar here: these logits only steer which DRAFTS the
+    // head proposes, and the trunk's verify forward decides every byte that
+    // ships, so a last-ulp difference can move acceptance and never output.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    xfm.compileQwen4Hc();
+    xfm.compileMoeRouting();
+
+    const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
+    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+
+    for ([_]usize{ 1, 5 }) |S| {
+        // Distinct rows: identical rows cannot tell a last-row slice from a
+        // first-row one.
+        const host = try allocator.alloc(f32, S * hcH);
+        defer allocator.free(host);
+        var rs: u64 = 0x9E3779B97F4A7C15;
+        for (host) |*x| {
+            rs = rs *% 6364136223846793005 +% 1442695040888963407;
+            x.* = (@as(f32, @floatFromInt((rs >> 40) & 0xFFFF)) / 32768.0) - 1.0;
+        }
+        const hshape = [_]c_int{ 1, @intCast(S), @intCast(hcH) };
+        const sp_f32 = mlx.mlx_array_new_data(host.ptr, &hshape, 3, .float32);
+        defer _ = mlx.mlx_array_free(sp_f32);
+        var stream_prev = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stream_prev);
+        try mlx.check(mlx.mlx_astype(&stream_prev, sp_f32, dt, s));
+
+        var id_buf: [5]i32 = undefined;
+        for (0..S) |i| id_buf[i] = @intCast(7 + i * 13);
+        const ishape = [_]c_int{ 1, @intCast(S) };
+        const ids = mlx.mlx_array_new_data(&id_buf, &ishape, 2, .int32);
+        defer _ = mlx.mlx_array_free(ids);
+
+        try xfm.qwen4MtpReset();
+        const full = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, .all_rows);
+        defer _ = mlx.mlx_array_free(full.logits);
+        defer _ = mlx.mlx_array_free(full.stream);
+        const full_l = try qwen4ReadF32(allocator, full.logits, s);
+        defer allocator.free(full_l);
+        const full_h = try qwen4ReadF32(allocator, full.stream, s);
+        defer allocator.free(full_h);
+        try testing.expectEqual(S * hcH, full_h.len);
+        const v: usize = full_l.len / S;
+
+        try xfm.qwen4MtpReset();
+        const last = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, .last_row);
+        defer _ = mlx.mlx_array_free(last.logits);
+        defer _ = mlx.mlx_array_free(last.stream);
+        const last_l = try qwen4ReadF32(allocator, last.logits, s);
+        defer allocator.free(last_l);
+        const last_h = try qwen4ReadF32(allocator, last.stream, s);
+        defer allocator.free(last_h);
+        try testing.expectEqual(v, last_l.len);
+        try testing.expectEqualSlices(f32, full_h[(S - 1) * hcH ..], last_h);
+        if (S == 1) {
+            try testing.expectEqualSlices(f32, full_l, last_l);
+        } else {
+            const c = qwen4CompareRows(last_l, full_l[(S - 1) * v ..], 1, v);
+            std.debug.print("[qwen4] MTP last-row projection S={d}: cos {d:.6} argmax {d}/1\n", .{ S, c.min_cos, c.argmax_agree });
+            try testing.expect(c.min_cos > 0.9999);
+            try testing.expect(c.argmax_agree == 1);
+        }
+
+        try xfm.qwen4MtpReset();
+        const bare = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, .none);
+        defer _ = mlx.mlx_array_free(bare.stream);
+        try testing.expect(bare.logits.ctx == null);
+        const bare_h = try qwen4ReadF32(allocator, bare.stream, s);
+        defer allocator.free(bare_h);
+        try testing.expectEqualSlices(f32, full_h, bare_h);
+    }
+}
+
+test "qwen4MtpForward owns its stream once: exactly one errdefer frees `h`" {
+    // `h` is created once and reassigned in place by every hcWrite (and by the
+    // `.last_row` slice, which frees the old handle itself), so ONE errdefer
+    // declared where it is created covers every error path. A second errdefer
+    // on the same variable at the same function scope is not a second guard —
+    // both fire, and an lm_head error then double-frees the array. The head
+    // shipped with exactly that pair for as long as the projection existed;
+    // it never went off because `lmHeadProject` had not failed yet.
+    //
+    // Needle assembled at comptime so this test's own source cannot satisfy
+    // the scan, and the scan is bounded to the function's own body.
+    const src = @embedFile("transformer.zig");
+    const sig = "pub fn qwen4Mtp" ++ "Forward(";
+    const at = std.mem.indexOf(u8, src, sig) orelse return error.MtpForwardMissing;
+    const rest = src[at + sig.len ..];
+    // The next declaration at struct scope ends the body.
+    const end = std.mem.indexOf(u8, rest, "\n    pub ") orelse rest.len;
+    const body = rest[0..end];
+    const needle = "errdefer _ = mlx.mlx_array" ++ "_free(h);";
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, body, i, needle)) |p| : (i = p + needle.len) count += 1;
+    try testing.expectEqual(@as(usize, 1), count);
+    // ...and it is the LINE right after the reshape that creates `h`: an
+    // errdefer declared any later leaves the ops in between unguarded, and a
+    // line bound pins the "created and guarded in one breath" shape that a
+    // byte-distance bound lets a refactor quietly stretch.
+    const born = std.mem.indexOf(u8, body, "try mlx.check(mlx.mlx_reshape(&h, x4,") orelse return error.StreamInitMissing;
+    const born_end = std.mem.indexOfScalarPos(u8, body, born, '\n') orelse return error.StreamInitMissing;
+    const next_end = std.mem.indexOfScalarPos(u8, body, born_end + 1, '\n') orelse body.len;
+    try testing.expectEqualStrings(needle, std.mem.trim(u8, body[born_end + 1 .. next_end], " \t"));
+
+    // Every rebind of `h` inside the body either hands the OLD handle to
+    // `hcWrite` (which consumes it on success and leaves it untouched on
+    // error, so the one errdefer still covers it) or frees the predecessor on
+    // one of the two lines above it (the `.last_row` slice). A third spelling
+    // is a leak or a double free, and neither is visible from the outside.
+    const write_form = "h = try self.hc" ++ "Write(h,";
+    const free_h = "_ = mlx.mlx_array" ++ "_free(h);";
+    var seen_write: usize = 0;
+    var seen_slice: usize = 0;
+    var prev1: []const u8 = "";
+    var prev2: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t");
+        if (std.mem.startsWith(u8, line, "h = ")) {
+            if (std.mem.startsWith(u8, line, write_form)) {
+                seen_write += 1;
+            } else {
+                // prev1 is the line above, prev2 the one above that.
+                try testing.expect(std.mem.eql(u8, prev1, free_h) or std.mem.eql(u8, prev2, free_h));
+                seen_slice += 1;
+            }
+        }
+        prev2 = prev1;
+        prev1 = line;
+    }
+    // Both shapes are actually present — an empty scan proves nothing.
+    try testing.expect(seen_write >= 2);
+    try testing.expect(seen_slice >= 1);
+
+    // And the consuming half of the contract: `hcWrite` frees the stream it
+    // was handed only PAST its last fallible call, so a failing hcWrite never
+    // takes the caller's handle with it and the caller's errdefer stays right.
+    const wsig = "fn hc" ++ "Write(self: *Transformer, stream:";
+    const wat = std.mem.indexOf(u8, src, wsig) orelse return error.HcWriteMissing;
+    const wrest = src[wat + wsig.len ..];
+    // Struct-member indentation closes the function.
+    const wbody = wrest[0 .. std.mem.indexOf(u8, wrest, "\n    }") orelse return error.HcWriteMissing];
+    const free_stream = "mlx.mlx_array" ++ "_free(stream)";
+    const freed_at = std.mem.indexOf(u8, wbody, free_stream) orelse return error.HcWriteFreeMissing;
+    const try_needle = "tr" ++ "y ";
+    var last_try: ?usize = null;
+    var ti: usize = 0;
+    while (std.mem.indexOfPos(u8, wbody, ti, try_needle)) |tp| : (ti = tp + try_needle.len) last_try = tp;
+    try testing.expect(last_try != null);
+    try testing.expect(freed_at > last_try.?);
+}
+
+/// Metal bytes held by LIVE arrays, with the allocator's free list flushed so
+/// the number is a function of ownership alone.
+fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    return active;
+}
+
+test "mlx check fault injection: the ownership shape releases its array on every faulted op" {
+    // The machinery behind the fixture-gated sweep below, exercised on a shape
+    // that holds nothing but the ownership pattern of `qwen4MtpForward`'s `h`:
+    // an array born from an op, guarded by ONE function-scope errdefer,
+    // rebound through a BLOCK-scoped slice that frees its predecessor itself,
+    // then handed to a further fallible op. Every array here is eval'd, so a
+    // leaked handle holds real Metal bytes and the active-memory oracle can
+    // see it. The `leaky` arm is the NEGATIVE CONTROL: the same shape minus
+    // the one errdefer must trip the oracle, or a green sweep means nothing.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    const H = struct {
+        fn guarded(st: mlx.mlx_stream, seed: mlx.mlx_array) !mlx.mlx_array {
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&h, seed, seed, st));
+            errdefer _ = mlx.mlx_array_free(h);
+            try mlx.check(mlx.mlx_array_eval(h));
+            {
+                var h_last = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(h_last);
+                try mlx.check(mlx.mlx_add(&h_last, h, seed, st));
+                try mlx.check(mlx.mlx_array_eval(h_last));
+                _ = mlx.mlx_array_free(h);
+                h = h_last;
+            }
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_multiply(&out, h, seed, st));
+            try mlx.check(mlx.mlx_array_eval(out));
+            _ = mlx.mlx_array_free(h);
+            return out;
+        }
+        /// Same shape, ONE errdefer short. `h` lives in the CALLER's frame, so
+        /// the test can free whatever this function drops after measuring it —
+        /// an mlx op OVERWRITES its destination handle, so a copy taken before
+        /// the op is a stale pointer, not a rescue line.
+        fn leaky(st: mlx.mlx_stream, seed: mlx.mlx_array, h: *mlx.mlx_array) !mlx.mlx_array {
+            try mlx.check(mlx.mlx_multiply(h, seed, seed, st));
+            try mlx.check(mlx.mlx_array_eval(h.*));
+            {
+                var h_last = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(h_last);
+                try mlx.check(mlx.mlx_add(&h_last, h.*, seed, st));
+                try mlx.check(mlx.mlx_array_eval(h_last));
+                _ = mlx.mlx_array_free(h.*);
+                h.* = h_last;
+            }
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_multiply(&out, h.*, seed, st));
+            try mlx.check(mlx.mlx_array_eval(out));
+            _ = mlx.mlx_array_free(h.*);
+            h.* = .{ .ctx = null };
+            return out;
+        }
+    };
+
+    const n_elem: usize = 1 << 20; // 4 MB per array: far above measurement noise
+    const host = try allocator.alloc(f32, n_elem);
+    defer allocator.free(host);
+    @memset(host, 1.5);
+    const shape = [_]c_int{@intCast(n_elem)};
+    const seed = mlx.mlx_array_new_data(host.ptr, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(seed);
+    try mlx.check(mlx.mlx_array_eval(seed));
+
+    // One un-faulted run: warms the allocator and counts the checked ops the
+    // shape issues, which is the sweep's upper bound. Its output is freed here.
+    const c0 = mlx.op_count.load(.monotonic);
+    const warm = try H.guarded(s, seed);
+    const n_ops = mlx.op_count.load(.monotonic) - c0;
+    _ = mlx.mlx_array_free(warm);
+    try testing.expect(n_ops >= 6);
+
+    var fired: usize = 0;
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        const base = mlxSettledActiveBytes(s);
+        mlx.fault.arm(k);
+        const r = H.guarded(s, seed);
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |ok| {
+            _ = mlx.mlx_array_free(ok);
+        } else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            fired += 1;
+        }
+        // A DOUBLE free would abort this binary here rather than fail an
+        // assertion — that abort is the other half of the proof.
+        const after = mlxSettledActiveBytes(s);
+        if (after != base) std.debug.print("[fault] guarded k={d}: base {d} after {d}\n", .{ k, base, after });
+        try testing.expectEqual(base, after);
+    }
+    try testing.expectEqual(n_ops, fired);
+
+    // Negative control: the same sweep without the errdefer must be CAUGHT.
+    var caught: usize = 0;
+    k = 1;
+    while (k <= n_ops) : (k += 1) {
+        var probe = mlx.mlx_array_new();
+        const base = mlxSettledActiveBytes(s);
+        mlx.fault.arm(k);
+        const r = H.leaky(s, seed, &probe);
+        mlx.fault.disarm();
+        if (r) |ok| {
+            _ = mlx.mlx_array_free(ok);
+        } else |_| {}
+        if (mlxSettledActiveBytes(s) > base + (n_elem * @sizeOf(f32)) / 2) caught += 1;
+        if (probe.ctx != null) _ = mlx.mlx_array_free(probe);
+        const after_ctl = mlxSettledActiveBytes(s);
+        if (after_ctl != base) std.debug.print("[fault] leaky k={d}: base {d} after {d}\n", .{ k, base, after_ctl });
+        try testing.expectEqual(base, after_ctl);
+    }
+    std.debug.print("[fault] ownership shape: {d} checked ops, {d} faulted cleanly, leak oracle caught {d}\n", .{ n_ops, fired, caught });
+    try testing.expect(caught >= 1);
+}
+
+test "qwen4MtpForward: every error path of the MTP head forward releases its stream (fault-injected, QWEN4_TEST_MODEL)" {
+    // The claim under proof: `h` is born with ONE function-scope errdefer, and
+    // every later rebind either consumes the old handle (`hcWrite`, which
+    // frees its input only past its last `try`) or frees it itself (the
+    // `.last_row` slice) — so no error path leaks it and none frees it twice.
+    // Argument cannot settle that; a sweep can.
+    //
+    // Method: fault the k-th checked mlx-c call for every k the forward
+    // issues, on every projection, at S > 1 so the slice path is live, and
+    // require live Metal bytes back at the pre-call baseline each time. The
+    // head's own state (KV, aux, seq_offset) is reset on BOTH sides of the
+    // measurement, so only ownership can move the number.
+    //
+    // What the oracle can and cannot see: MLX is lazy, so a handle leaked
+    // before anything downstream of it has been evaluated holds no buffer and
+    // is invisible here — the equality is a NECESSARY condition, sharp for
+    // every k at or past the first evaluation inside the head (the QSA host
+    // reads, the eval cadence, the projection) and weak before it. The static
+    // scan above covers the whole function unconditionally, and the DOUBLE
+    // free half is unconditional at every k: it aborts this binary rather
+    // than failing an assertion.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    xfm.compileQwen4Hc();
+    xfm.compileMoeRouting();
+
+    const S: usize = 5; // > 1: keeps the `.last_row` / `.mixed_last_row` slice live
+    const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
+    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+    const host = try allocator.alloc(f32, S * hcH);
+    defer allocator.free(host);
+    var rs: u64 = 0x243F6A8885A308D3;
+    for (host) |*x| {
+        rs = rs *% 6364136223846793005 +% 1442695040888963407;
+        x.* = (@as(f32, @floatFromInt((rs >> 40) & 0xFFFF)) / 32768.0) - 1.0;
+    }
+    const hshape = [_]c_int{ 1, @intCast(S), @intCast(hcH) };
+    const sp_f32 = mlx.mlx_array_new_data(host.ptr, &hshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(sp_f32);
+    var stream_prev = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stream_prev);
+    try mlx.check(mlx.mlx_astype(&stream_prev, sp_f32, dt, s));
+    var id_buf: [S]i32 = undefined;
+    for (0..S) |i| id_buf[i] = @intCast(7 + i * 13);
+    const ishape = [_]c_int{ 1, @intCast(S) };
+    const ids = mlx.mlx_array_new_data(&id_buf, &ishape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+
+    inline for ([_]Transformer.Qwen4MtpProject{ .all_rows, .last_row, .mixed_last_row, .none }) |proj| {
+        // Un-faulted warm-up: builds every lazy artefact the forward touches
+        // and counts the checked ops it issues. Its outputs are freed HERE, or
+        // every later baseline would carry them and the equality would be a
+        // statement about nothing.
+        try xfm.qwen4MtpReset();
+        const c0 = mlx.op_count.load(.monotonic);
+        const warm = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, proj);
+        const n_ops = mlx.op_count.load(.monotonic) - c0;
+        try testing.expect(warm.stream.ctx != null);
+        if (warm.logits.ctx != null) _ = mlx.mlx_array_free(warm.logits);
+        if (warm.mixed.ctx != null) _ = mlx.mlx_array_free(warm.mixed);
+        _ = mlx.mlx_array_free(warm.stream);
+
+        var errs: usize = 0;
+        var k: u64 = 1;
+        while (k <= n_ops) : (k += 1) {
+            try xfm.qwen4MtpReset();
+            const base = mlxSettledActiveBytes(s);
+            mlx.fault.arm(k);
+            const r = xfm.qwen4MtpForward(stream_prev, ids, 1, null, proj);
+            mlx.fault.disarm();
+            if (r) |o| {
+                // Reachable only where a fallback arm below the head swallowed
+                // the injected error; the outputs are still ours to free.
+                if (o.logits.ctx != null) _ = mlx.mlx_array_free(o.logits);
+                if (o.mixed.ctx != null) _ = mlx.mlx_array_free(o.mixed);
+                if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
+            } else |_| {
+                errs += 1;
+            }
+            try xfm.qwen4MtpReset();
+            try testing.expectEqual(base, mlxSettledActiveBytes(s));
+        }
+        std.debug.print("[qwen4] MTP fault sweep {s}: {d} checked ops, {d} error paths, live bytes back at baseline on all\n", .{ @tagName(proj), n_ops, errs });
+        try testing.expect(errs >= 1);
+    }
+    try xfm.qwen4MtpReset();
 }
 
 test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity probe)" {
@@ -40849,4 +41486,22 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
     _ = mlx.mlx_array_free(src_e[0].aux_state);
     src_e[0].aux_state = .{ .ctx = null };
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
+}
+
+test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" {
+    // The mirrored seed-width constant existed because "transformer.zig
+    // cannot import mtp.zig" — which stopped being true when the draft-rerank
+    // scheme put `const mtp_mod = @import("mtp.zig")` at the top of this file.
+    // A mirror plus a comptime assert in a THIRD file is what a direct
+    // reference is for, and the doc comment claiming the import is impossible
+    // reads as a spec (rule: "a contract COMMENT is read as a spec").
+    //
+    // The needle is split so this test is not its own counter-example.
+    const needle = "MTP_EV_SEED" ++ "_DEPTH";
+    try testing.expect(std.mem.indexOf(u8, @embedFile("transformer.zig"), needle) == null);
+    try testing.expect(std.mem.indexOf(u8, @embedFile("generate.zig"), needle) == null);
+    // The width reads through the import the retired comment said could not exist.
+    const source = @embedFile("transformer.zig");
+    try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"mtp.zig\");") != null);
 }

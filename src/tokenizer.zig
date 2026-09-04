@@ -302,6 +302,23 @@ pub const Tokenizer = struct {
         return reservedOutputIds(allocator, self.flagged_specials, template_source, exempt_ids);
     }
 
+    /// Highest DEFINED id + 1 — the real vocabulary, which is not the config's
+    /// `vocab_size`: checkpoints pad the embedding/lm_head rows out to a
+    /// friendly multiple (qwen4_exp: 248044 base + 33 added = 248077 defined
+    /// against a declared 248320, so 243 rows decode to nothing at all). Those
+    /// rows carry whatever the initializer left and a collapsed distribution
+    /// can rank one top-1; `installSuppressMask` masks them out of sampling.
+    /// 0 when nothing is defined (an `initEmptyForTests` tokenizer) — callers
+    /// treat that as "no padding known", never as "suppress everything".
+    pub fn definedVocabSize(self: *const Tokenizer) usize {
+        var highest: ?u32 = null;
+        var it = self.id_to_token.keyIterator();
+        while (it.next()) |id| {
+            if (highest == null or id.* > highest.?) highest = id.*;
+        }
+        return if (highest) |h| @as(usize, h) + 1 else 0;
+    }
+
     // ── SentencePiece BPE (Gemma-style) ──
 
     fn encodeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
