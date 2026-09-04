@@ -1046,25 +1046,28 @@ fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
 
+/// A repetition-loop cut may land inside an otherwise recognizable tool call.
+/// Never emit that buffer as executable work: unlike a genuine max-token cut,
+/// this intentional stop must not ask clients to recover by compacting/retrying.
+fn shouldParseToolCalls(finish_details: ?[]const u8) bool {
+    const d = finish_details orelse return true;
+    return !std.mem.eql(u8, d, "repetition_loop");
+}
+
 /// The `finish_details` object emitted BESIDE `finish_reason` on a choice,
 /// or "" when there is nothing to say. Comes with its leading comma so call
 /// sites splice it straight into the choice literal.
 ///
-/// Why a sibling and not a new `finish_reason` value: clients key truncation
-/// recovery on "length" (see `toolCallFinishReason` above), so the wire reason
-/// cannot move — but "length" alone makes a server-cut repetition loop
-/// indistinguishable from a max_tokens truncation, which is how a run whose
-/// own status bar read "32.4%/66k" reported hitting an output limit neither
-/// side had set. OpenAI's own (deprecated) `finish_details` is the closest
-/// precedent, and conforming clients ignore keys they don't know.
+/// The loop guard uses `finish_reason: "stop"`; the sibling preserves why the
+/// server stopped without overloading "length" (which makes agents run output-
+/// or context-exhaustion recovery). OpenAI's deprecated `finish_details` is the
+/// closest precedent, and conforming clients ignore keys they don't know.
 fn finishDetailsField(reason: []const u8, details: ?[]const u8) []const u8 {
     const d = details orelse return "";
-    // Every emitter can OVERRIDE the slot's reason after the fact — a matched
-    // client stop sequence and a client-side stop both rewrite it to "stop".
-    // The cause describes a "length" cut and nothing else, so it is gated on
-    // the reason actually being emitted rather than on the slot's flag; a
-    // `finish_details: repetition_loop` next to `"stop"` contradicts itself.
-    if (!std.mem.eql(u8, reason, "length")) return "";
+    // Every emitter can override the slot's reason after the fact. Gate on the
+    // reason actually being emitted so a cause never accompanies a genuine
+    // length exhaustion, tool completion, or client disconnect.
+    if (!std.mem.eql(u8, reason, "stop")) return "";
     // One known value today; a switch here keeps an unknown string from
     // reaching the wire as an unescaped literal.
     if (std.mem.eql(u8, d, "repetition_loop")) return ",\"finish_details\":{\"type\":\"repetition_loop\"}";
@@ -6496,7 +6499,7 @@ fn handleNonStreamingGeneration(
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
 
     // Check for tool calls in the output
-    if (has_tools) {
+    if (has_tools and shouldParseToolCalls(result.finish_details)) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
         const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
@@ -7700,7 +7703,7 @@ fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -12196,7 +12199,7 @@ fn handleAnthropicNonStreaming(
     }
 
     // Check for tool calls
-    if (has_tools) {
+    if (has_tools and shouldParseToolCalls(result.finish_details)) {
         const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
@@ -12940,7 +12943,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -14098,6 +14101,7 @@ fn handleResponses(
             .finish_reason = if (stopped) "stop" else ts.finish_reason,
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
+            .finish_details = ts.finish_details,
         };
     } else {
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
@@ -14147,7 +14151,7 @@ fn handleResponses(
     const visible_text: []const u8 = think_split.content;
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
-    if (active_has_tools) {
+    if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
         tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
     }
     defer if (tool_calls) |tcs| {
@@ -17004,10 +17008,40 @@ test "toolCallFinishReason preserves truncation over parsed tool calls" {
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("client_disconnect"));
 }
 
+test "repetition-loop cuts decline tool-call parsing" {
+    // The loop detector can fire inside a tool argument. The response must
+    // remain a safe terminal stop without emitting an executable fragment.
+    try std.testing.expect(shouldParseToolCalls(null));
+    try std.testing.expect(!shouldParseToolCalls("repetition_loop"));
+    try std.testing.expect(shouldParseToolCalls("unknown_future_detail"));
+}
+
+test "every tool-capable HTTP surface suppresses calls from a repetition-loop cut" {
+    // Wiring class guard: the pure decision is useless if one handler parses
+    // first and turns the cut buffer into executable work. Keep the needles
+    // split so this test's own source does not satisfy its assertions.
+    const src = @embedFile("server.zig");
+    const detail_gate = "shouldParseTool" ++ "Calls";
+    const cases = [_]struct { needle: []const u8, expected: usize }{
+        .{ .needle = "if (has_tools and " ++ detail_gate ++ "(result.finish_details))", .expected = 2 },
+        .{ .needle = "if (has_tools and " ++ detail_gate ++ "(ts.finish_details)) try parseToolCallsForRequest", .expected = 2 },
+        .{ .needle = "if (active_has_tools and " ++ detail_gate ++ "(result.finish_details))", .expected = 1 },
+    };
+    for (cases) |case| {
+        var count: usize = 0;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, case.needle)) |at| : (i = at + case.needle.len) count += 1;
+        try std.testing.expectEqual(case.expected, count);
+    }
+    // The Responses streaming path builds a GenerationResult after finalize;
+    // it must carry the cause into the shared post-generation gate.
+    try std.testing.expect(std.mem.indexOf(u8, src, ".finish_details = ts." ++ "finish_details,") != null);
+}
+
 test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
     // Dispatch-hole class: a surface that reports the reason and drops the
-    // cause is silent — the response still validates, still says "length",
-    // and no output-equality test can see the missing field (the two
+    // cause is silent — the response still validates, and no output-equality
+    // test can see the missing field (the two
     // hardcoded `use_drafter=false` call sites lived for a month this way).
     // Needles are split with `++` so this test's own source can't match them.
     const t = std.testing;
@@ -17041,20 +17075,18 @@ test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
 test "finishDetailsField: the loop cause rides beside finish_reason, and only a known cause reaches the wire" {
     // Absent = the field is not emitted at all, so every ordinary response
     // is byte-identical to what it was before this existed.
-    try std.testing.expectEqualStrings("", finishDetailsField("length", null));
+    try std.testing.expectEqualStrings("", finishDetailsField("stop", null));
     try std.testing.expectEqualStrings(
         ",\"finish_details\":{\"type\":\"repetition_loop\"}",
-        finishDetailsField("length", "repetition_loop"),
+        finishDetailsField("stop", "repetition_loop"),
     );
     // An unknown value is DROPPED rather than interpolated: this string is
     // spliced into a JSON literal, and a literal is arbitrary bytes too (the
     // media-gen `sendError` class). A future cause adds an arm here.
-    try std.testing.expectEqualStrings("", finishDetailsField("length", "something new"));
-    try std.testing.expectEqualStrings("", finishDetailsField("length", "\",\"x\":\""));
-    // The cause describes a "length" cut. Every emitter may rewrite the reason
-    // after the slot set the flag (a matched stop sequence, a client stop), and
-    // a cause next to any other reason contradicts itself.
-    try std.testing.expectEqualStrings("", finishDetailsField("stop", "repetition_loop"));
+    try std.testing.expectEqualStrings("", finishDetailsField("stop", "something new"));
+    try std.testing.expectEqualStrings("", finishDetailsField("stop", "\",\"x\":\""));
+    // The cause belongs only beside the intentional loop stop.
+    try std.testing.expectEqualStrings("", finishDetailsField("length", "repetition_loop"));
     try std.testing.expectEqualStrings("", finishDetailsField("tool_calls", "repetition_loop"));
     try std.testing.expectEqualStrings("", finishDetailsField("client_disconnect", "repetition_loop"));
 }
