@@ -55,22 +55,9 @@ private struct TestHFModel: Identifiable, Codable {
     }
     // Delegates to the real parser so this replica can't drift from it.
     var quantization: String? { HFModel.quantizationLabel(forId: id) }
+    // Delegates to the real estimator so this replica can't drift from it.
     var estimatedSizeBytes: Int64 {
-        guard let params = safetensors?.parameters else { return 0 }
-        var total: Int64 = 0
-        for (dtype, count) in params {
-            let bytesPerParam: Double
-            switch dtype.uppercased() {
-            case "F64": bytesPerParam = 8
-            case "F32", "U32", "I32": bytesPerParam = 4
-            case "F16", "BF16", "U16", "I16": bytesPerParam = 2
-            case "I8", "U8": bytesPerParam = 1
-            case let d where d.contains("4"): bytesPerParam = 0.5
-            default: bytesPerParam = 2
-            }
-            total += Int64(Double(count) * bytesPerParam)
-        }
-        return total
+        HFModel.estimateWeightBytes(parameters: safetensors?.parameters, id: id) ?? 0
     }
     var modelSize: String {
         let name = modelName
@@ -111,18 +98,30 @@ final class HFModelTests: XCTestCase {
         XCTAssertEqual(m.modelName, "gemma-4-e2b-it-4bit")
     }
 
-    func testSizeEstimation_BF16AndU32() {
-        let m = TestHFModel.make(
-            id: "test/model",
-            safetensors: TestHFSafetensors(
-                parameters: ["BF16": 631_148_099, "U32": 579_616_768],
-                total: 1_210_764_867
-            )
-        )
-        // BF16: 631M * 2 = 1.26 GB, U32: 579M * 4 = 2.32 GB → ~3.58 GB
-        let sizeGB = Double(m.estimatedSizeBytes) / (1024 * 1024 * 1024)
-        XCTAssertGreaterThan(sizeGB, 3.0)
-        XCTAssertLessThan(sizeGB, 4.0)
+    // HF reports packed U32 as the LOGICAL element count (a 27B 4-bit and
+    // 8-bit pack carry identical counts), so U32 is priced by the repo's bit
+    // width plus the group scale/bias overhead: (bits + 0.5) / 8 bytes each.
+    // Counts below are the live metadata; the bars are the repos' real sizes.
+    func testSizeEstimation_PackedU32PricedByRepoBits() {
+        let gb = 1024.0 * 1024 * 1024
+        let e2b = TestHFModel.make(
+            id: "mlx-community/gemma-4-e2b-it-4bit",
+            safetensors: TestHFSafetensors(parameters: ["BF16": 472_475_203, "U32": 4_631_822_336], total: nil))
+        XCTAssertEqual(Double(e2b.estimatedSizeBytes) / gb, 3.55 * 1e9 / gb, accuracy: 0.15)
+        let q27 = ["BF16": Int64(1_787_228_912), "U32": Int64(25_994_199_040)]
+        let q4 = TestHFModel.make(id: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        let q8 = TestHFModel.make(id: "ddalcu/Qwen3.8-27B-MLX-Serve-8bit", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        XCTAssertEqual(Double(q4.estimatedSizeBytes) / gb, 18.2 * 1e9 / gb, accuracy: 0.5)
+        XCTAssertEqual(Double(q8.estimatedSizeBytes) / gb, 31.2 * 1e9 / gb, accuracy: 0.5)
+        let fp4 = TestHFModel.make(id: "poolside/Laguna-XS-2.1-NVFP4-mlx", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        XCTAssertEqual(Double(fp4.estimatedSizeBytes) / gb, Double(q4.estimatedSizeBytes) / gb, accuracy: 0.01)
+        // No width in the id: the count is unpriceable, so the row falls to
+        // the tree-API fallback (estimatedSizeBytes 0 = needsFallbackFetch).
+        let unknown = TestHFModel.make(id: "test/model-dwq", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        XCTAssertEqual(unknown.estimatedSizeBytes, 0)
+        // Dense repos are unaffected.
+        let dense = TestHFModel.make(id: "test/model-bf16", safetensors: TestHFSafetensors(parameters: ["BF16": 1_000_000_000], total: nil))
+        XCTAssertEqual(dense.estimatedSizeBytes, 2_000_000_000)
     }
 
     func testSizeEstimation_NoSafetensors() {

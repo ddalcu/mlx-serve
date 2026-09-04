@@ -1353,7 +1353,8 @@ pub fn serve(
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
-        if (config.max_position_embeddings > 0 and pinned >= config.max_position_embeddings) {
+        const rope_ctx = config.contextCap();
+        if (rope_ctx > 0 and pinned >= rope_ctx) {
             // The checkpoint's own maximum binds; memory had room to spare.
             log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
         } else {
@@ -1364,7 +1365,7 @@ pub fn serve(
     if (server_config.request_timeout_sec > 0) {
         log.info("Request timeout: {d}s\n", .{server_config.request_timeout_sec});
     }
-    const model_ctx = config.max_position_embeddings;
+    const model_ctx = config.contextCap();
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
     }
@@ -2509,10 +2510,14 @@ fn safeAutoContext(raw: u32) u32 {
 }
 
 /// This model's auto-context: memory ceiling with headroom, then capped by what
-/// the checkpoint actually supports.
+/// the checkpoint actually supports. `contextCap` is the rope-derived window:
+/// `max_position_embeddings`, or `original_max_position_embeddings × factor` for
+/// a YaRN-scaled checkpoint — the same derivation vLLM applies to
+/// `max_model_len`, because a position past the scaled window aliases back
+/// inside the ramp rather than reading as a longer distance.
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
     const with_headroom = safeAutoContext(computeMemoryContext(config));
-    const max_pos = config.max_position_embeddings;
+    const max_pos = config.contextCap();
     return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
 }
 
@@ -2723,7 +2728,7 @@ fn safeContextForBudget(
 /// which reserves headroom below it.
 fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     const memory_ctx = computeMemoryContext(config);
-    const max_pos = config.max_position_embeddings;
+    const max_pos = config.contextCap();
     return if (max_pos > 0) @min(memory_ctx, max_pos) else memory_ctx;
 }
 
@@ -2915,7 +2920,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
     const chunk: u64 = pinPrefillChunk(config);
-    const ctx_kv: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *|
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken()) *|
         getEffectiveContextLength(config);
     const clamped = clampedPrefixCacheMem(
         requested,
@@ -2959,7 +2964,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     //   an unconditional fp16. A `--kv-quant 4` server otherwise reports (and
     //   serves) under a third of the context it can actually hold.
     const kv_bits: u64 = defaultKvBits();
-    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + config.qsaHistoryBytesPerToken();
 
     // `total_ctx = 0` asks boundedPrefillChunk for the UNSHRUNK cap: every
     // branch that narrows the chunk does so for longer contexts, so this is the
@@ -3235,7 +3240,8 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
+            seq * config.qsaHistoryBytesPerToken();
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static

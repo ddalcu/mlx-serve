@@ -119,13 +119,8 @@ struct EmptyStateChipRow: View {
                             servedModelId: server.chatModelId ?? "mlx-serve",
                             serverContextLength: server.chatModelInfo?.contextLength,
                             models: server.allModels,
-                            openSandboxAgent: { agentId in
-                                // Post the request FIRST — the Sandbox window
-                                // reads it in .onAppear when this click is
-                                // what opens the window (the tray's pattern).
-                                appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
-                                AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
-                            })
+                            openSandboxAgent: { appState.startTerminal(agentId: $0) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
                     }
                 case .models, .create, .tasks, .window:
                     Button { open(item) } label: {

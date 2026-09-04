@@ -112,6 +112,10 @@ final class ChatWorkspaceTests: XCTestCase {
                 \(path) still references the retired "modelBrowser" window id — \
                 the browser is a mode of the chat window now.
                 """)
+            XCTAssertFalse(text.contains("\"sandboxTerminal\""), """
+                \(path) still references the retired "sandboxTerminal" window id — \
+                terminals are rows of the chat window now.
+                """)
         }
     }
 
@@ -137,6 +141,7 @@ final class ChatWorkspaceTests: XCTestCase {
             "Model3DGenService": ".environmentObject(appState.model3dGen)",
             "TaskScheduler": ".environmentObject(appState.taskScheduler)",
             "AgentStore": ".environmentObject(appState.agents)",
+            "TerminalSessionStore": ".environmentObject(appState.terminals)",
         ]
 
         // Every view the chat window hosts as a MODE — the browser, the four
@@ -153,7 +158,8 @@ final class ChatWorkspaceTests: XCTestCase {
                       // the chat scene did not inject — the same first-render
                       // trap the Tasks columns hit, invisible to this audit for
                       // exactly as long as the file was missing from this list.
-                      "Sources/MLXServe/Views/AgentsWindow.swift"]
+                      "Sources/MLXServe/Views/AgentsWindow.swift",
+                      "Sources/MLXServe/Views/TerminalPane.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()
         for path in hosted {
@@ -487,21 +493,33 @@ final class ChatWorkspaceTests: XCTestCase {
     /// notification): they arrive with nothing to have watched.
     func testTheSidebarListsEveryDestinationAboveTheConversations() throws {
         let chat = try source("Sources/MLXServe/Views/ChatView.swift")
-        for row in ["New Chat", "Agents", "Tasks", "Code", "Models", "Settings"] {
+        for row in ["Agents", "Tasks", "Models", "Settings"] {
             XCTAssertTrue(chat.contains("\"\(row)\""), "the sidebar is missing the \(row) destination")
         }
-        XCTAssertFalse(chat.contains("\"Code Launcher\""),
-                       "the sidebar row is called \"Code\" — the launcher menu it opens is unchanged")
+        // New Chat and the coding CLIs moved into the + beside the Sessions
+        // heading (2026-09-02): one menu, New Chat first, the tray's shared
+        // launcher list under it. Neither is a destination row any more.
+        XCTAssertFalse(chat.contains("destinationRow(\"New Chat\""), "New Chat is the Sessions + now")
+        XCTAssertFalse(chat.contains("destinationLabel(\"Code\""), "Code is the Sessions + now")
+        guard let menu = SourceScan.declarationBody(from: "private var newSessionMenu", in: chat) else {
+            return XCTFail("the Sessions + menu is gone")
+        }
+        XCTAssertTrue(menu.contains("\"New Chat\""), "the + offers a new chat first")
+        XCTAssertTrue(menu.contains("CLILauncherMenuItems("), "the + offers the shared CLI list")
+        XCTAssertLessThan(menu.range(of: "\"New Chat\"")!.lowerBound,
+                          menu.range(of: "CLILauncherMenuItems(")!.lowerBound)
+        XCTAssertTrue(chat.contains("sectionHeader(\"Sessions\") { newSessionMenu }"),
+                      "the + sits on the Sessions heading")
         // Two section headings now, and the Agents one renders only when it has
         // rows — a heading with nothing under it promises content that is not
         // there, which is why it can't live in the pinned top inset.
-        XCTAssertTrue(chat.contains("sectionHeader(\"Chats\")"),
+        XCTAssertTrue(chat.contains("sectionHeader(\"Sessions\")"),
                       "the conversation list needs its heading")
         XCTAssertTrue(chat.contains("sectionHeader(\"Agents\")"),
                       "agent threads get their own section above the chats")
         XCTAssertFalse(chat.contains("Text(\"Recent\")"),
-                       "\"Recent\" was renamed to \"Chats\"")
-        XCTAssertTrue(chat.contains("if !groups.agents.isEmpty"),
+                       "\"Recent\" was renamed to \"Sessions\"")
+        XCTAssertTrue(chat.contains("if !agentRows.isEmpty"),
                       "the Agents section must be hidden when empty")
         // Pinned above the list, so no destination scrolls away.
         guard let inset = chat.range(of: "safeAreaInset(edge: .top)"),

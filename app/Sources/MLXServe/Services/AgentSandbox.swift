@@ -1017,14 +1017,22 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// and pin the guest. The caller MUST balance with `endCliSession(_:)`
     /// when the terminal exits. Throws `SandboxError` with an actionable
     /// message on every distinct failure — never a hung terminal.
+    ///
+    /// `workingDirectory` is the host folder the session starts in: the
+    /// Settings default lands at `/workspace`, anything else is hot-mounted at
+    /// `/projects/<slug>` (no VM reboot, so terminals on different folders
+    /// coexist). nil = `/workspace`.
     func startCliSession(agent: SandboxAgentSpec?, model: String?, serverPort: UInt16,
                          budget: AgentBudget.Budget, apiKey: String?,
-                         entries: [AgentModelEntry] = []) async throws -> CliSession {
+                         entries: [AgentModelEntry] = [],
+                         workingDirectory: String? = nil) async throws -> CliSession {
         let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let (g, _) = try self.ensureBooted(image: image, workingDirectory: nil)
+                    let (g, root) = try self.ensureBooted(image: image, workingDirectory: nil)
+                    let cwd = self.resolveAndMountProject(guest: g, hostPath: workingDirectory,
+                                                          defaultRoot: root).path
                     let (port, rootfs): (UInt16?, String?) = {
                         self.bootLock.lock(); defer { self.bootLock.unlock() }
                         return (self.currentSshPort, self.rootfsPath)
@@ -1040,7 +1048,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         throw SandboxError(message: Self.staleImageMessage(image: image))
                     }
 
-                    var remoteCommand: String?
+                    let remoteCommand: String
                     if let agent {
                         guard let model, !model.isEmpty else {
                             throw SandboxError(message: "no model is loaded — start the server before opening a \(agent.displayName) session")
@@ -1048,8 +1056,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         let bootstrap = try SandboxAgentRegistry.materialize(
                             spec: agent, model: model, serverPort: serverPort,
                             budget: budget, apiKey: apiKey, entries: entries,
-                            rootfsDir: rootfsDir)
+                            rootfsDir: rootfsDir, cwd: cwd)
                         remoteCommand = "sh \(bootstrap)"
+                    } else {
+                        // The image's shell is bash (agent-shell-mlxserve Dockerfile).
+                        remoteCommand = "cd \(VzGuest.shellQuote(cwd)) 2>/dev/null; exec bash -l"
                     }
 
                     // The mirror listens once the first net snapshot delivers

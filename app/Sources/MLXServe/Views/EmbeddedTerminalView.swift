@@ -16,63 +16,128 @@ enum EmbeddedTerminalLayout {
     }
 }
 
-/// A real terminal emulator embedded in SwiftUI, spawning one command on a
-/// PTY and reporting its exit.
+/// A real terminal emulator embedded in SwiftUI, hosting one PTY-backed
+/// process that a `Handle` owns.
 ///
 /// THE SwiftTerm SEAM: this is the only file in the app that imports
 /// SwiftTerm. Everything else deals in argv + an exit callback, so a
-/// libghostty-backed implementation can replace this single view later.
+/// libghostty-backed implementation can replace this single file later.
 ///
-/// The view is created once per session (`.id(sessionUUID)` at the call
-/// site) — `updateNSView` never restarts the process.
+/// LIFETIME: the process belongs to the `Handle`, not to the view. The view
+/// only re-parents the handle's terminal into whatever window is showing it,
+/// and dismantling it un-parents — it NEVER terminates (a dismantle used to
+/// SIGTERM the ssh, so closing the window killed every live session).
 struct EmbeddedTerminalView: NSViewRepresentable {
-    /// Absolute executable path (the sandbox sessions spawn `/usr/bin/ssh`).
-    let executable: String
-    let args: [String]
-    /// Chrome-side handle (End Session button) — SwiftTerm never leaks past
-    /// this file, so the button gets a terminate() through this instead.
-    var controller: EmbeddedTerminalController? = nil
-    /// Called on the main thread when the child exits. nil exit code = the
-    /// PTY/IO layer died (e.g. the guest was stopped underneath the session).
-    let onExit: (Int32?) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(onExit: onExit) }
+    let handle: Handle
 
     func makeNSView(context: Context) -> PaddedTerminalContainer {
-        let terminal = LocalProcessTerminalView(frame: .zero)
-        terminal.processDelegate = context.coordinator
-        context.coordinator.view = terminal
-        controller?.coordinator = context.coordinator
-        // Default environment (TERM=xterm-256color etc.) — ssh needs nothing
-        // from the host env; every path it uses arrives via argv.
-        terminal.startProcess(executable: executable, args: args)
-        return PaddedTerminalContainer(terminal: terminal)
+        PaddedTerminalContainer(handle: handle)
     }
 
     func updateNSView(_ view: PaddedTerminalContainer, context: Context) {
-        context.coordinator.onExit = onExit
+        // SwiftUI reuses this view across sibling terminal rows (the detail
+        // column shows `.terminal(a)` then `.terminal(b)` — same view type,
+        // same position), so makeNSView runs once and the container would keep
+        // showing the FIRST session's terminal. Point it at the current handle.
+        view.handle = handle
     }
 
-    static func dismantleNSView(_ view: PaddedTerminalContainer, coordinator: Coordinator) {
-        // The window can close (or the tab re-render) while ssh is live —
-        // never leave an orphaned child on the host.
-        view.terminal.terminate()
+    static func dismantleNSView(_ view: PaddedTerminalContainer, coordinator: ()) {
+        // Only OUR child: SwiftUI dismantles lazily, and by then another host
+        // (a "Move Tab to New Window" pop-out) may already have adopted the
+        // terminal — removing it here left that window showing bare ground.
+        view.release()
+    }
+
+    /// Owns the terminal view and the process it spawned, for as long as the
+    /// session lives — independent of any window.
+    final class Handle {
+        let terminalView: LocalProcessTerminalView
+        private let delegate: ProcessDelegate
+
+        /// - Parameters:
+        ///   - executable: absolute path (sandbox sessions spawn `/usr/bin/ssh`).
+        ///   - onExit: called on the main thread when the child exits. nil exit
+        ///     code = the PTY/IO layer died (e.g. the guest was stopped).
+        init(executable: String, args: [String], onExit: @escaping (Int32?) -> Void) {
+            terminalView = LocalProcessTerminalView(frame: .zero)
+            delegate = ProcessDelegate(onExit: onExit)
+            terminalView.processDelegate = delegate
+            // Default environment (TERM=xterm-256color etc.) — ssh needs nothing
+            // from the host env; every path it uses arrives via argv.
+            terminalView.startProcess(executable: executable, args: args)
+        }
+
+        /// SIGTERM to the spawned process, which drops the PTY and fires onExit.
+        func terminate() { terminalView.terminate() }
+
+        /// Paint a theme (the 16 ANSI slots + text) on `background`. Live:
+        /// SwiftTerm recomputes its palette and redraws.
+        func apply(theme: TerminalTheme, background: TerminalTheme.RGB) {
+            terminalView.installColors(theme.ansi.map(Self.color))
+            terminalView.nativeForegroundColor = Self.nsColor(theme.foreground)
+            terminalView.nativeBackgroundColor = Self.nsColor(background)
+            terminalView.caretColor = Self.nsColor(theme.foreground)
+            terminalView.needsDisplay = true
+            terminalView.superview?.needsLayout = true
+        }
+
+        private static func color(_ c: TerminalTheme.RGB) -> SwiftTerm.Color {
+            SwiftTerm.Color(red: UInt16(c.r) * 257, green: UInt16(c.g) * 257, blue: UInt16(c.b) * 257)
+        }
+
+        private static func nsColor(_ c: TerminalTheme.RGB) -> NSColor {
+            NSColor(srgbRed: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
+        }
     }
 
     /// Hosts the terminal with a left inset mirroring SwiftTerm's right-side
     /// scroller reservation (see EmbeddedTerminalLayout), painted in the
     /// terminal's own background color so the strip reads as margin, not seam.
+    ///
+    /// ONE terminal view, several possible hosts (the chat window's detail
+    /// column, a pop-out window, a stale container SwiftUI has not dismantled
+    /// yet): a host adopts the terminal only while it is IN A WINDOW. A
+    /// detached container updating itself used to steal the view back from
+    /// the pop-out, which then showed bare ground and never repainted.
     final class PaddedTerminalContainer: NSView {
-        let terminal: LocalProcessTerminalView
+        var handle: Handle {
+            didSet { adoptIfVisible() }
+        }
+        private var terminal: LocalProcessTerminalView { handle.terminalView }
 
-        init(terminal: LocalProcessTerminalView) {
-            self.terminal = terminal
+        init(handle: Handle) {
+            self.handle = handle
             super.init(frame: .zero)
             wantsLayer = true
-            addSubview(terminal)
         }
 
         required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            adoptIfVisible()
+        }
+
+        private func adoptIfVisible() {
+            guard window != nil else { return }
+            // Drop whatever we were showing (a previous handle's terminal).
+            for sub in subviews where sub !== terminal { sub.removeFromSuperview() }
+            if terminal.superview !== self {
+                terminal.removeFromSuperview()
+                addSubview(terminal)
+            }
+            needsLayout = true
+            terminal.needsDisplay = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.terminal.superview === self else { return }
+                self.window?.makeFirstResponder(self.terminal)
+            }
+        }
+
+        func release() {
+            if terminal.superview === self { terminal.removeFromSuperview() }
+        }
 
         override func layout() {
             super.layout()
@@ -86,23 +151,11 @@ struct EmbeddedTerminalView: NSViewRepresentable {
         }
     }
 
-    /// Owned by the SwiftUI chrome; bridges its End Session button to the
-    /// live coordinator without exposing SwiftTerm types.
-    final class EmbeddedTerminalController {
-        fileprivate weak var coordinator: Coordinator?
-        func terminate() { coordinator?.terminate() }
-    }
-
-    final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
-        var onExit: (Int32?) -> Void
-        weak var view: LocalProcessTerminalView?
+    private final class ProcessDelegate: NSObject, LocalProcessTerminalViewDelegate {
+        private let onExit: (Int32?) -> Void
         private var exited = false
 
         init(onExit: @escaping (Int32?) -> Void) { self.onExit = onExit }
-
-        /// End the session from UI chrome (the End Session button): SIGTERM
-        /// to the spawned ssh, which drops the PTY and fires processTerminated.
-        func terminate() { view?.terminate() }
 
         func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
         func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}

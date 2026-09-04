@@ -3633,6 +3633,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(h);
     };
 
+    // The qwen4_exp in-checkpoint head's twin of the sidecar's own coarse
+    // rerank build (inside `bind`, above): a `requantizeRows` of the whole
+    // trunk lm_head plus a synchronous eval of ~240 MB. Lazily it ran inside
+    // the FIRST request's draft chain — on this thread, mid-round, with the
+    // stream drained — i.e. first-token latency for whoever loaded the model.
+    // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
+    // drafts, so it never pays. One-shot, so the draft path's ask stays a
+    // pure read; if this ever does not run, that ask still builds.
+    if (mtp_ptr == null and params.mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
     // HERE because the mlx dequant must run on the inference thread (sole
     // MLX caller), with the chunk width resolved through the server's own
@@ -3752,6 +3762,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.prefix_cache_capacity,
             clamped_prefix_mem,
         );
+        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
@@ -4666,6 +4677,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
         g.logSpecStats();
+        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+        // wiring it only beside generate.zig's own logSpecStats() calls (the
+        // legacy/CLI path) makes it dead on every served request.
+        g.logQsaArms();
         g.persistRoundCost();
     }
     commitSlotIfApplicable(sch, slot);
@@ -5989,7 +6004,7 @@ test "Generator.initWithOptions hands off checkpoints on cancel" {
     // abort comment so a decode-loop cancel check can't satisfy it.
     const source = @embedFile("generate.zig");
     const anchor = std.mem.indexOf(u8, source, "Abandoned-request abort") orelse return error.MissingAbortComment;
-    const region = source[anchor..@min(anchor + 1700, source.len)];
+    const region = source[anchor..@min(anchor + 2400, source.len)];
     try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
     try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
 }
@@ -6992,4 +7007,32 @@ test "the ANE build resolves its chunk through effectivePrefillChunk, never the 
     const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
     const window_start = call_at -| 1200;
     try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
+}
+
+test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
+    // Built lazily it landed inside the first request's draft chain: a
+    // 248320-row requantize of the trunk lm_head plus a synchronous eval of
+    // ~240 MB, on the inference thread, mid-round. That is first-token
+    // latency on the first request after a load — the sidecar arm has always
+    // paid it at bind time instead.
+    //
+    // `doLoadOnInferenceThread` is the ONE Transformer construction site, and
+    // the boot load and the `/v1/load` cold load both route through it (the
+    // "a launch flag that shapes a LOAD" class: a hook on only one of them
+    // ships a server where the first cold-loaded model still pays lazily).
+    // This pins all three.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn doLoadOnInferenceThread(") orelse return error.MissingLoadFn;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingLoadFnEnd;
+    const body = source[start..end];
+    const build = std.mem.indexOf(u8, body, "qwen4BuildDraftRerank()") orelse return error.MissingEagerRerankBuild;
+    // Gated exactly like the head it drafts for: `--no-mtp` never drafts, so
+    // it must never pay for the coarse head.
+    const gate = std.mem.lastIndexOf(u8, body[0..build], "params.mtp_enabled") orelse return error.EagerRerankBuildUngated;
+    try testing.expect(build - gate < 200);
+
+    // Boot load (inferenceLoop) and cold load (runLoadRequest) both land there.
+    const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
+    const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
+    try testing.expect(boot != cold);
 }

@@ -88,7 +88,6 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
-
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -97,6 +96,15 @@ fn printUsage(io: std.Io) void {
         \\                      network; a future version will default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
+        \\  --config-overrides <json>   JSON object deep-merged into EVERY
+        \\                      model's config.json this process loads or
+        \\                      discovers (alias: --hf-overrides). Generic keys
+        \\                      like max_position_embeddings hit everything.
+        \\                      HF attention_factor replaces the computed YaRN
+        \\                      mscale; vLLM attn_factor multiplies it.
+        \\                      e.g. '{"text_config":{"rope_parameters":{"rope_type":
+        \\                      "yarn","factor":4.0,"original_max_position_embeddings":
+        \\                      262144},"max_position_embeddings":1048576}}'
         \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
         \\                      (default auto = the model's declared window; over-limit
         \\                      inputs get a 400 naming index/count/limit, never truncation)
@@ -557,6 +565,21 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
+        } else if ((std.mem.eql(u8, args[i], "--config-overrides") or
+            std.mem.eql(u8, args[i], "--hf-overrides")) and i + 1 < args.len)
+        {
+            // vLLM's `--hf-overrides` analogue. Applied the moment the flag is
+            // seen, so no config.json is ever parsed without it — the loaded
+            // model, the registry stubs and `/v1/models` all agree on the
+            // resulting document. Validated here so a typo names the flag
+            // instead of surfacing as a model-load parse error.
+            i += 1;
+            if (!configOverridesJsonValid(args[i])) {
+                log.err("--config-overrides: expected a JSON object; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            model_mod.setConfigOverrides(args[i]);
+            log.info("[args] config-overrides: {s}\n", .{args[i]});
         } else if (std.mem.eql(u8, args[i], "--embedding-max-length") and i + 1 < args.len) {
             i += 1;
             // Module global (like --max-concurrent): every serve path reads it,
@@ -1722,7 +1745,7 @@ fn runGenServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1852,7 +1875,7 @@ fn runHeadlessServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -2364,6 +2387,16 @@ fn runLlamaServe(
 /// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/
 /// `GB` (case-insensitive) multiplies by 1024^N, "0"/"off" = 0. Used by
 /// `--prefix-cache-mem`; returns `error.InvalidSize` on malformed input.
+/// `--config-overrides` takes a JSON OBJECT (every field it names is merged into
+/// config.json). Parsed here purely to fail the launch on a typo; the merge
+/// itself happens per-config in `model.parseConfigFromJson`.
+fn configOverridesJsonValid(raw: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{}) catch return false;
+    return v == .object;
+}
+
 fn parseSizeArg(s: []const u8) !u64 {
     if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return 0;
     var end: usize = s.len;

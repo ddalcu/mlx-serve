@@ -170,14 +170,6 @@ struct StatusMenuView: View {
     let openServerLog: () -> Void
     let openTasks: () -> Void
     var openAgents: () -> Void = {}
-    var openSandboxTerminal: () -> Void = {}
-
-    /// Observes the shared sandbox so the tray badge appears/updates live when
-    /// the Agent Sandbox is turned on and when its guest boots. Safe to observe
-    /// from the tray: the per-command transcript lives in the separate
-    /// `AgentSandbox.transcriptStore` (observed only by the Sandbox Terminal),
-    /// so command churn never re-renders this menu.
-    @ObservedObject private var sandbox = AgentSandbox.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -563,35 +555,6 @@ struct StatusMenuView: View {
             // Spotlight-style ⌃Space prompt panel, summonable from any app
             // while MLX Core runs in the tray.
             QuickLauncherTrayRow()
-
-            // Agent-sandbox badge — visible only while the sandbox is enabled.
-            // Green box = a guest is live; click to open the Sandbox Terminal
-            // and run commands / watch the agent in the isolated Linux VM.
-            if sandbox.isEnabled {
-                TrayRowSeparator()
-                Button {
-                    openSandboxTerminal()
-                } label: {
-                    TrayFeatureRow(
-                        icon: "shippingbox.fill",
-                        title: "Agent Sandbox",
-                        // guestMemoryText is quantized + published only on
-                        // change, so this row doesn't re-render per second.
-                        subtitle: sandbox.guestRunning
-                            ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "")
-                            : "Idle — boots on the first command",
-                        isOn: true,
-                        tint: sandbox.guestRunning ? .green : .orange
-                    ) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Open the Sandbox Terminal")
-            }
         }
     }
 
@@ -638,13 +601,8 @@ struct StatusMenuView: View {
                         serverContextLength: server.chatModelInfo?.contextLength,
                         models: server.allModels,
                         isEnabled: server.status == .running,
-                        openSandboxAgent: { agentId in
-                            // Post the request FIRST — the Sandbox window
-                            // reads it in .onAppear when this click is what
-                            // opens the window.
-                            appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
-                            openSandboxTerminal()
-                        }
+                        openSandboxAgent: { appState.startTerminal(agentId: $0) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0) }
                     )
                 } else {
                     CLISetupInstructionsButton(
@@ -1092,7 +1050,7 @@ struct EndpointsSection: View {
 /// (which touches `NSApp`) just makes the requirement explicit.
 @MainActor
 func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
-    let panel = NSOpenPanel()
+    let panel = OpenPanel.make()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
     panel.allowsMultipleSelection = false

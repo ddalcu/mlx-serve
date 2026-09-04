@@ -408,7 +408,7 @@ struct MusicGenView: View {
 
     private func chooseSourceFile() {
         srcError = nil
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -498,7 +498,7 @@ struct MusicGenView: View {
 
     private func chooseReferenceFile() {
         refError = nil
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

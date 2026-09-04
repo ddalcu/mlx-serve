@@ -4355,7 +4355,7 @@ Ours built the dense `[1,1,S,kv]` bool mask (`qsaMaskFromQk`: block expand → t
 What shipped:
 
 - `msv_attn_qsa256` (`gatherQsa256`, kill switch `MLX_SERVE_QSA_GATHER=0`): one threadgroup per (query token, kv head, batch); the token's 12 GQA heads are the tile rows (NSG = ceil(gqa/8) simdgroups), keys are gathered by the token's sorted block list (`blocks[b, s, :]`, RATIO tokens each, INT_MAX past the row's count) followed by its own incomplete tail. Same fragment math, transposed K staging and fp32 online softmax as p256. BK is a template arg; 16 and 32 measured identical (~75 ms per 4096-row chunk-layer), 32 is the default.
-- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Decode/verify widths (S < 16) and batched decode keep the dense mask path; a declined gather expands the selection with `qsaMaskFromBlocks` (also the fixture trace's mask at layer 3).
+- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Verify widths (S 2..15) keep the dense mask path; decode S==1 is `qsaDecodeGatherAttn` (next story); batched decode expands per-slot selections with `qsaMaskFromBlocks`. A declined gather expands the same way (also the fixture trace's mask at layer 3).
 - `server.qsaMaskBytes` bills the bounded sheet at prefill widths, the old `4 B x rows x keys` below 16 rows.
 
 Measured (M4 Max, 4-bit pack, warm, same boot type, natural 38k prompt): gather 55.1 s (692 tok/s) vs mask arm 67.0 s (568 tok/s). Same-session llmprobe ladder, 26.8.11 app binary vs the tree (prefill tok/s): 512 545/532, 4k 784/742, 8k 753/728, 16k 681/707, 32k 589/699, 64k 479/681; single-prompt 128k 395/654, 256k 267/551 (the app needed 954 s for 254k tokens). The 4-8k dip is structural (the gather reads 2051 rows per token with no sharing; the mask arm at kv ≤ 8k reads ≤ kv rows per 64-row tile), so chunks at kv ≤ 8192 keep the mask arm (`QSA_GATHER_MIN_KV_DEFAULT`, `MLX_SERVE_QSA_GATHER_MIN_KV`); a 38k prompt is unchanged by the threshold (55.3 s). The comparison chart that prompted this (mlx 1210 @ 8k) is from ANOTHER machine: no bench artifact or llmprobe card on this box ever exceeded ~800 prefill on flash-next, and our own Aug-28 26.8.11 column reads 685 @ 8k — today's app run (753) was FASTER. Cross-machine charts set the shape of the curve, never the absolute bar. With attention stood in (`QWEN4_STANDIN=attn_sdpa`) the prompt takes 46.8 s, so attention went from ~20 s to 8.9 s (`QWEN4_PROFILE_QSA=1`: gather 53 ms at kv 4k, 71 ms at 8k, 75-79 ms flat to 37k per chunk-layer; selection 1.4 s per prompt). What is left past the flat attention term is the trunk itself (GDN + MoE + PLE + MTP-head history), not QSA.
@@ -4366,3 +4366,269 @@ Two traps met on the way:
 - `QWEN4_STANDIN=attn_qsa` is not a "no indexer" meter: with the indexer stood in there is no selection, the QSA branch is skipped, and the layer runs DENSE causal attention over the whole cache (67 s at 38k, slower than with QSA). Time the selection in-process instead (`[qsa-prof] select`).
 
 Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask` (gqa 12, rows straddling the every-block-fits boundary, sentinel rows, both tiles, the expansion helper equal to the host-built mask). The qwen4 text + vision fixtures run T=20/T=28 prefills through the gather path (layer-3 mask EXACT, cos > 0.9999).
+
+## qwen4 QSA decode: dense mask + full-KV SDPA, O(kv) per step (2026-09-03)
+
+Prefill gather flattened the prompt curve; decode still collapsed 47.5 → 10.7 tok/s from 16k → 384k. At S==1 `qsaMaskFromQk` built a dense bool mask and `gatedFullAttnWith` ran full-KV SDPA. The QSA branch (`qsa_mask`/`qsa_blocks` set) also skipped `qkvAttnDecodeKernel` entirely — so even `--kv-quant 8 --kv-attn-mode auto` dequantized every cache row every step.
+
+`qsaDecodeGatherAttn` (default on, `MLX_SERVE_QSA_DECODE_GATHER=0` restores the mask arm) reuses the same sorted top-k (`qsaSelectBlocks`, same `QSA_GATHER_MIN_KV` floor as prefill) and expands selection + incomplete tail to ascending token indices, gathers those rows from the affine 4/8-bit triples (dequantizing ONLY the ~2k subset) or dense rows, then dense SDPA under an additive validity mask. Prefill, verify widths, MTP verify, and below-budget dense are untouched. Batched slots still expand to masks (`qsaMaskBatched`) — the stacked path has no per-slot gather.
+
+Locked serial ladder (`--kv-quant 8 --kv-attn-mode auto --no-mtp --no-pld --no-drafter`, temp 0, 32 tokens; only the env gate differs):
+
+| ctx | ON | OFF | speedup |
+|---|---|---|---|
+| 32k | 51.3 | 40.8 | 1.26× |
+| 64k | 48.7 | 32.9 | 1.48× |
+| 128k | 46.1 | 23.5 | 1.96× |
+| 256k | 40.9 | 14.6 | 2.80× |
+
+ON is ~flat (51→41); OFF collapses (41→15). Residual ON slope is the indexer (still O(kv/ratio) over pooled blocks), not attention. Parity: unit subset-SDPA vs masked-full-SDPA max diff 0.000000 (quant and dense); take-then-dequant bit-exact. Live 32k logprobs: top-1 32/32, identical completions, max|dlogprob| 0.24 — inside the pre-existing prefill gather-vs-mask envelope (17/32, dlogprob 1.16).
+
+Two footguns: `mlx_take_axis` needs unsigned indices (int32 aborts); quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, not `+0`).
+
+## qwen4 QSA at verify widths: the union of the block's rows, not the whole cache (2026-09-04)
+
+Prefill and decode gathered; the width in between did not. At 2 ≤ S < 16 — an MTP or DFlash verify block — `qsaMaskFromQk` fell through to the dense `[S, kv]` bool mask and `gatedFullAttnWith` read the full `DenseKVView`. Under `--kv-quant 8` that view is a fresh dequant of the ENTIRE stored range, per layer, per verify forward: the arm that was supposed to make MTP cheap paid the whole cache twice a round.
+
+`qsaVerifyGatherAttn` (default on, `MLX_SERVE_QSA_VERIFY_GATHER=0` restores the mask; floor `QSA_VERIFY_GATHER_MIN_KV` = 16384, `MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV`) gathers a FIXED-size superset of the block's rows and dequantizes only those rows through the decode arm's `takeContig` + `dequantizeAffine` path. Fixed-size is the whole design constraint: a real set union has a data-dependent size, and learning it means a host sync inside a lazy decode graph.
+
+Three things had to be got right, and two of them are counter-intuitive.
+
+**The union tail is row 0's, not the last row's.** Each query at cache position `p` always sees `[ratio*floor((p+1)/ratio), p]`. Tail STARTS rise with position and tails are SUFFIXES, so the largest tail belongs to the EARLIEST row. Taking the last row's start (the natural guess — "the newest rows are the tail") drops the first rows' tail tokens; the plan test names the exact `(row, token)` it loses (`S=2 kv=4096 row 0 token 4092`). The union tail is therefore `[tail_start(offset), kv)`, at most `ratio - 1 + S` tokens.
+
+**Duplicates are not free.** The obvious fixed-size union — concatenate the S rows' selections and let duplicates ride — double-counts under the softmax: membership is a property of the BLOCK, so both copies of a shared block test true for the same row and that key is summed twice. The gathered rows must be strictly ascending and distinct. So: the union is taken over the `[S, nb]` scatter as a bool `[nb_lo]`, ranked by `where(u, b, nb_lo + b)`, argsorted, the first `k_blocks = min(nb_lo, S*kb)` kept, then sorted. Padding entries are blocks NO row selected; their tokens sit below every row's tail start and outside every row's selection, so the per-row mask hides them everywhere — the real union size is never needed on the host.
+
+**The two parts must be disjoint.** Part B is only the blocks lying ENTIRELY below the union tail (`b < nb_lo`); a selected block at or above it is already covered by part A. The `[S, R]` mask is then literally the dense formula evaluated at the gathered tokens: `causal ∧ (member ∨ tail)`, with membership read by `take_axis` from an `[S, nb+2]` scatter (column `nb` is the always-false sink for tokens past the last complete block, `nb+1` the INT_MAX sentinel sink).
+
+R per S at the production budget (512 blocks of 4): S=2 → 1024·4, S=5 → 2560·4, S=7 → 14344 rows, S=15 → 30736. So the arm pays from ~16k keys at S=2..7 and only past ~31k at S=15 — at 20k/S=15 `k_blocks` saturates at `nb_lo` and `rows == kv`, which the gate declines rather than dressing a full read as a gather. hd 256 with an array mask still has no fused MLX arm, so the gathered `[R]` goes through `splitMaskedSdpa256` exactly as the dense `[kv]` mask did.
+
+Two more footguns inherited from the decode arm: `mlx_take_axis` wants unsigned indices, and quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, never `+0`). One new one: the prefill kernel `gatherQsa256` has NO q_len floor of its own, so once verify widths carry a selection the dispatch must guard it — otherwise a declined verify gather falls into a kernel that walks the whole cache. Scan-pinned.
+
+Bars: a pure planner (`QsaVerifyGeom` + `qsaVerifyPlanHost`) checked against a brute-force dense `[S, kv]` mask over 7 geometries including a ragged tail and `ratio != 4`; MLX parity of `qsaVerifyGatherAttn` vs `qsaMaskFromBlocks` + full SDPA at S ∈ {2,5,7,15} × kv ∈ {4096, 20000}, dense and through a real affine-8 `KVCache` — max abs diff ≤ 4.9e-4, cosine ≥ 0.999994; and a wiring scan that the selection arm reaches S=2..15 and the dispatch calls the verify arm before the prefill kernel.
+
+Measured (M5, qwen4_exp mixed-4-8bit, 62.7k prompt, `--kv-quant 8 --mtp --mtp-depth 5`, forced depth 5, greedy, 200 tokens). Four COLD boots counterbalanced gather/nogather/nogather/gather, the run's own disk tier cleared between them, 0 restores each: verify forward (`[mtp-trace] eval`) **43.79 vs 56.91 ms/round = -23.1%**; MTP **47.4 vs 40.4 tok/s = +17.3%**. Serial 54.3 vs 54.2 and the short-context control 100.2 vs 99.6 tok/s (36.91 vs 36.89 ms/round) are both FLAT — the arm cannot touch S=1 or a sub-budget prompt, and that is what makes the long cell readable. `active_bytes` neutral (76.49 vs 76.47 GB): the gathered slab is a transient strictly smaller than the dense view it replaces. Against a bf16-KV boot the arm closes ~90% of the kv8 verify penalty (control-normalized eval 1.186 gather / 1.543 mask / 1.146 dense). MTP is still a NET LOSS to serial at this context in BOTH arms (47.4 vs 54.3) — the arm makes MTP cheaper, not winning; it stays opt-in.
+
+The arms fork CONTENT, and that is not the gather's fault: greedy MTP does not reproduce greedy serial here in EITHER arm. Same nonce sent three ways (MTP / serial / serial+logprobs) under `--prefix-cache-entries 0` so nothing can restore between sends — gather diverges at token 67 (top-2 gap 0.0000 nats) and token 44 (0.1250); nogather at token 32 (0.0000) and token 44 (0.1250). All four sit inside the 0.15-nats near-tie class, and on the second nonce BOTH arms break at the IDENTICAL token with the IDENTICAL gap. `nogather` never runs the arm (`[qsa-verify-gather]` absent from its log) and fails the same way, earlier. This is also the whole explanation for the arm's lower `acc_avg` (1.80 vs 2.00): it measures diverged continuations, not a worse mask.
+
+Two harness traps cost a pass each. (1) Fixed nonces — needed so both arms answer the same bytes — plus a disk tier that PERSISTS ACROSS BOOTS means the second boot onward restores ~62.7k tokens and runs warm, so cold-vs-warm confounds with arm order; clear the run's own cache between boots, or boot `--prefix-cache-entries 0` when the question is correctness rather than speed. (2) A `du -sk` fingerprint of a cache directory measures ALLOCATED BLOCKS: it drifted 672 KB with zero files or directories modified anywhere in the tree (`find -newermt` returned nothing), aborting a healthy run. A "did this data change" guard must be content-derived — file count plus summed logical bytes.
+
+## qwen4 QSA history in every SSM checkpoint OOM'd 400k prefills (2026-09-03)
+
+Prefix-cache snapshots copied `aux_state`/`qsa_pooled` (the growing indexer key history) at every stride. 32 copies of a ~273k-row buffer is ~30 GB on top of 70 GB weights — Metal OOM at 400k while auto-context advertised 700k–1M (`--kv-quant 8` made it worse: billed KV shrank, QSA bytes did not).
+
+Fix: stride captures keep GDN/PLE only. `attachQsaHistoryToLatest` puts ONE copy on the latest snap; restore slices it to `cp.pos` (`applyQsaHistoryAt`). A byte-budget trim that would drop that snap first slices the history onto the last kept checkpoint (`sliceQsaHistoryOntoCheckpoint`) — otherwise a 122k trimmed hit left aux empty and the next prefill aborted on `reshape 4096 → (1, nb, 4, 128)` at 77% RAM (not an OOM). `qsaMaskFromQk` returns `error.QsaHistoryGap` if `keys` is shorter than `kv`. Sizer/guard bill live aux once (`qsaHistoryBytesPerToken`). PLE windows stay per-position (they are not a prefix).
+
+Three holes closed on review before merge (2026-09-03): (1) the cancel handoff attached the LIVE history (`pos` rows) to a stride snap at an earlier position, and the restore of that snap installed rows the cache did not hold — silent wrong block selection, because the guard only caught `key_rows < kv`; attach now slices to the snap's `pos` and the guard is `!=`. (2) The prefix-extend merge inherited the previous turn's latest snap with its full copy while this turn's latest got another: one copy per committed turn, the stride leak through another door; `keepOnlyLatestQsaHistory` runs on the merged list. (3) A snap with no history (attach failed on the cancel path, an old on-disk entry) restored aux-less and every request on that prefix died in `QsaHistoryGap` until eviction; on a QSA arch (`HotPrefixCache.qsa_history_required`) no history after restore is a miss on both tiers. Bars: the two `HotPrefixCache` tests named for them, the attach-slices assertion in the transformer test, `[qsa-decode-gather] engaged` in `test_qwen4_exp.sh` [5], and a 400k cache-on prefill + extend turn on the M4 Max.
+
+## QSA scalar RoPE skipped YaRN mscale; partial rotary ranking can flip (2026-09-01)
+
+`--config-overrides` with `rope_type: yarn` stretches Qwen3.8-Flash-Next to 1M. M-RoPE tables already fold mscale into cos/sin via `fillCosSin(..., yarnMscale)`. The QSA indexer's scalar arm (`mlx_fast_rope` when `mrope_cos_cur == null`) did not: a comment claimed mscale "multiplies every relu(q·k) by one positive constant, which cannot change a top-k." That is true of a FULL-head scale. The indexer is 128-wide and only 64 dims rotate, so score = ms²·A + B, and two synthetic blocks whose unscaled winner is the B-heavy one flip under factor-4 mscale (`YaRN mscale on a 128-wide indexer with 64 rotary dims CAN change top-k`).
+
+Image decode is the mixed-arm case: `beginMropeChunk` at `seq_len <= 1` leaves `mrope_cos_cur` null (unchanged — do not "fix" that), so decode queries take the scalar path while prefill queries and pooled keys ride the already-scaled M-RoPE tables. Prefill and decode then ranked different blocks. Never `yarnScaleQK` on the indexer (`[head_dim]` is 256, not 128); never `mlx_fast_rope` scale as mscale (would also scale the pass-through tail); never `mlx_array_new_float` on bf16. Scalar mscale is `yarnScaleRotated` (queries) and `ropeAtFreqs` × `scalarOf` (pooled keys).
+
+`--config-overrides` now rides `modelFingerprint`, so a YaRN boot cannot restore an unscaled SSD prefix. Wipe `~/.mlx-serve/kv-cache` once after this change if you already served with overrides (old entries were fingerprinted without the JSON). DiskTier version and hash seed stay put.
+
+## qwen4 decode: the n-gram gather synced on the token inside the graph build (2026-09-02)
+
+Flash-Next served 63 tok/s short / 55 at 8.5k while the in-situ ubench put the forward at 13.5 ms GPU + 1.3 ms CPU build (74 tok/s if the build overlapped). The pipelined decode (`Generator.next`: build step N+1 on the lazy sample of step N, `async_eval`, then resolve token N) overlaps the build with the GPU on every other arch. On qwen4 the n-gram PLE needs the token ids on the HOST (hash → `ngram_table.bin` rows), and `pleEmbedding` did `mlx_array_eval(ids)` at layer 1 — so the build blocked there until forward N finished, and layers 1..47 (most of the 1.3 ms) plus the gather ran with the GPU idle. Serving was forward + build + gather, every token.
+
+Fix: `ForwardCtx.ple_defer` (set only by `generate.lazyForward`). `pleEmbedding` then hands the graph a zero-filled bf16 leaf and records `PlePending` (leaf + token-id ref + entry); after `forwardWith` returns, `Transformer.flushDeferredPle` evals the ids (the ONE sync — it waits for forward N, which is unavoidable), gathers the rows straight into the leaf's buffer (`mlx_array_data_bfloat16` + `@constCast`; a `new_data` leaf is an evaluated shared-mode buffer nobody reads until the graph runs) and advances the per-entry n-gram history. Batched decode (`batch_slots`), MTP verify and the concrete-token slow path keep the synchronous arm. Short 63.0 → 69.0 tok/s, 8.5k 55.1 → 60.6, greedy bytes identical on both prompts.
+
+Measured null and removed: `mlx_async_eval` of the post-layer-0 stream before the sync (so the GPU would run layer 0 + the sample while the host gathers). First pass 68.8 / 60.6 vs 69.0 / 60.6 while the user watched video on the box (same binary re-booted 67.3 / 59.2); idle interleaved pairs L0-B-B-L0: 68.9, 68.5 vs 68.4, 68.5 short, long 60.3 / 60.2 everywhere — null. Idle same-boot-order pairs read ±0.03 ms on the ubench; a busy desktop widens that to ±2.5%, so sub-2% calls are only worth making on an idle box.
+
+Bar: `qwen4 deferred PLE` (tiny pack, `QWEN4_TEST_MODEL`): two `ple_defer` + flush decode steps == the direct forward bit for bit (the second step proves the history advanced at flush time), and an UNFLUSHED leaf differs — the leaf is load-bearing.
+
+Where the rest of the qwen4 decode goes (same day, stand-in ubench, 14.8 ms GPU): MoE 5.8 ms vs a ~2.7 ms byte floor, GDN 3.3 vs 1.9 (projections 2.8 of it), attention 0.85, hyper-connection read/write + norms ~3.0, lm_head 1.4. Roughly 13 dependent kernels per layer at ~10–20 µs each; the next levers are kernel-count ones (single-kernel hc read via a last-threadgroup reduction, MoE kernel latency), not bytes. 27B for comparison: 33.7 ms/forward vs a 31 ms byte floor (roofline); verify widths S=2/3/4/5/6/8 = 34.9/36.0/39.5/44.8/49.9/89.6 ms, long KV adds ~1 ms at S=2 — its MTP round is the verify forward, so the 27B's only decode lever is the vqmm lane's compute rate at 4–7 rows.
+
+### Leftovers round, same day: five nulls and one loss, all measured in-situ
+
+Stand-ins added for the meter (`QWEN4_STANDIN=hc,moe_shared,moe_router,moe_gateup,moe_down`; a stand-in whose output nothing consumes lets MLX drop the whole block as dead code — the first `hc` arm read 2.8 ms because every block became unreachable; the shipped one keeps the writes live). Decode, GPU ms/forward, base 14.5–14.8:
+
+| arm | result | reading |
+|---|---|---|
+| `moe_gateup` stand-in | −1.7 ms | 16.4 MB/forward → the fused gate+up kernel is at ~450 GB/s: bandwidth |
+| `moe_down` stand-in | −0.6 ms | 8 MB: bandwidth |
+| `moe_shared` stand-in | −0.86 ms | 7.4 MB: bandwidth (the chain overlaps the routed path) |
+| `moe_router` stand-in | −0.88 ms | 2.6 MB in 18 µs/layer: ~13 µs/layer of two-kernel latency (qmv + topk) |
+| `hc` stand-in (view + unit gates, chain writes kept) | −1.65 ms | the three read kernels are ~17 µs per read |
+| `MLX_SERVE_MOE_GATHER_QMV_OFF=1` (stock gather_qmm) | +1.3 ms | ours stays |
+| gate+up with a template pack count + register-preloaded words (the hc-read unroll) | −0.7% (idle pairs 14.88/14.91 vs 14.99/14.99) — SHIPPED, bit-identical | at bandwidth already; the preload only trims issue latency |
+| `MLX_MAX_OPS_PER_BUFFER=64` + `MLX_MAX_MB_PER_BUFFER=1024` (fewer command buffers; ~111/token at the default) | null (idle pairs 14.99/15.06 vs 14.99/14.99) | Metal pipelines buffer commits fine |
+| hc read N folded into D and U (every threadgroup recomputes the 4 stream RMS stats with the stats kernel's exact reduction order; −96 dependent kernels/forward; bytes identical) | **+1.3 ms, serving 69 → 62.6** | 644 threadgroups × 20 KB + a barrier before any weight load: the redundant reduction costs more than the kernel it removes. Reverted |
+| prefill: dense causal instead of the QSA mask arm at the 4096-row chunk over kv 4096–8192 (`attn_qsa` stand-in) | 8.35 s vs 6.33 s per chunk | the masked `msv_attn_p256` arm already beats dense by 2 s; nothing to win there |
+
+Reading of the whole: ~6.4 ms of the 14.5 are weight bytes at 546 GB/s, every big block (experts, GDN projections, shared expert, lm_head) is at bandwidth, and the other ~8 ms is ~840 dependent kernels at roughly 10 µs of turnaround each. The only levers left are kernel-COUNT cuts that do not redistribute work (GDN prework + recurrence + norm-gate as one per-head kernel, −72; router matvec + top-k via a last-threadgroup reduce, −48), each a kernel project worth ≤ 5%. Metal System Trace via `xctrace` gives command-buffer intervals only; the shader-profiler table stays empty without the GUI template, so the stand-in ubench remains the per-kernel meter.
+
+## The MTP round on qwen4: the verify build was serialised behind the draft chain (2026-09-04)
+
+A depth-5 round on Qwen3.8-Flash-Next (`mixed-4-8bit`, M5 Max, forced depth 5) traced at 43.7 ms: eval 33.2 (the verify forward on the GPU), predraft 4.5 (the CPU building the 5 head steps, GPU idle), verify-lap 5.7. That verify lap is supposed to be graph BUILDING only — the forward at S=6 is 33.3 ms GPU against ~1.5 ms of CPU build. About 4.2 ms of it was the host waiting for the GPU, and the remaining ~1.5 ms was CPU build with the GPU idle.
+
+The cause is the same one the pipelined decode hit two days earlier, at a second call site. `Generator.nextMtp` builds the verify forward over `[1, 1+m]` = t1 plus m draft ids that are still LAZY samples off the head chain. At trunk layer 1 the n-gram PLE gathers on the HOST, so `pleEmbedding`'s `mlx_array_eval(ids)` blocked the build until the entire draft chain had finished on the GPU, then did the gather, and only then built layers 2..47 — with the GPU idle for all of it. `ForwardCtx.ple_defer` already existed for exactly this and was wired only into `generate.lazyForward`.
+
+Arming it on the verify build (and flushing once, straight after the build and before Phase 4 evaluates anything) moved the verify lap from a 6.0 ms median to 2.0 ms, and the round total from ~44.6 to ~42.4. The round drops less than the lap because the ~4 ms that was GPU-wait inside the lap reappears in `eval` — what is genuinely recovered is the build that now overlaps.
+
+Two counterbalanced 4-boot A/Bs (base, proto, proto, base then proto, base, base, proto; 100 s after "Model ready", 100 s between the code and prose blocks; `MLX_SERVE_ROUND_COST_PERSIST=0`, `MLX_SERVE_MTP_FORCE_DEPTH=5`, `--prefix-cache-entries 0`):
+
+| | verify (ms) | total (ms) | code tok/s | prose tok/s |
+|---|---|---|---|---|
+| baseline, run 1 | 5.99 | 44.71 | 110.98 | 56.48 |
+| **proto, run 1** | **2.04** | **42.34** | **115.77** | **59.22** |
+| baseline, run 2 | 6.16 | 44.48 | 110.56 | 56.37 |
+| **proto, run 2** | **2.00** | **42.52** | **116.68** | **58.73** |
+
+Per boot the verify lap never overlaps between arms: base 6.82 / 5.89 / 6.12 / 6.18, proto 1.87 / 2.07 / 1.98 / 1.98. `acc_avg` is unchanged (1.67–1.69), so nothing about acceptance moved. Output was byte-identical in 9/9 cells in both runs (3 code reps, 3 prose reps, both spec-off cells, warmup), nonces held constant across arms.
+
+### The trap: a deferred gather must claim its rollback slot at BUILD time
+
+Deferring the gather on a VERIFY forward is not the same as deferring it on a decode step, and the difference is silent. Later in the same forward, `pleForward` captures the PLE conv input for partial-accept rollback under `if (self.spec_capture_ssm and entry.spec_ple_len > 0)`. `spec_ple_len` is written by the gather — which, deferred, has not run yet; and `ssmFreeSpecCapture` zeroes it at the end of every round, so it reads 0. Worse, `forwardQwen4With` does `defer self.spec_capture_ssm = false`, so by flush time the flag is false too and the gather would take its `else entry.spec_ple_len = 0` arm.
+
+Net effect of the naive version: `entry.spec_ple_input` never set, `ssmRollbackFromCapture` silently takes the non-PLE branch, and every partial accept restores the wrong PLE state. Nothing throws.
+
+Fix: one predicate, `pleClaimSpecCapture`, claims (or clears) the slot at BUILD time and returns the decision; `PlePending` carries it to the flush, and `pleGatherBf16` takes it as a parameter instead of re-reading `spec_capture_ssm`. `discardDeferredPle` releases the claim. The regression arm added to `qwen4 deferred PLE` forwards S=4 and S=7 with `capture_ssm_seq` on and asserts bit-identical logits AND identical rollback state — `spec_ple_len`, `spec_ple_tokens`, `ple_prev`, and a non-null `spec_ple_input` on both sides. Without the claim it fails on the null-ness assertion, which is the only thing that catches it.
+
+### The head projected S rows to use one
+
+`MtpHeadRef.qwen4Step` asked `qwen4MtpForward` for the whole block and sliced one row out of `logits`/`stream`. On the merged history step after a partial accept the head gets `1 + accepted` rows, so the mixer `hcRead` and the 248320-wide lm_head ran over all of them for a single row; `appendHistory` ran both stages and threw every row away. `Qwen4MtpProject` (`all_rows` / `last_row` / `none`) cuts `h` before the mixer, or skips both stages.
+
+The bar is NOT bit identity past S=1: a quantized projection at M=1 and at M=S dispatch different kernels (qmv vs qmm), so the last row's logits differ in the last ulp. That is the right bar here — those logits only steer which DRAFTS the head proposes, and the trunk's greedy verify decides every byte that ships, so a last-ulp difference can move acceptance and never output. The test asserts bit-identity of the STREAM (a pure slice / a pure skip) on both modes, bit-identity of the logits at S=1, and the fixture bar (cos > 0.9999, argmax equal) at S=5.
+
+Found while editing that function: two `errdefer _ = mlx.mlx_array_free(h);` at the same function scope, one at the reshape that creates `h` and one after the mixer `hcRead`. Both fire, so an error out of `lmHeadProject` double-freed the stream. Latent only because `lmHeadProject` had never failed. `h` is created once and reassigned in place by every `hcWrite` (and by the `.last_row` slice, which frees the old handle itself), so the errdefer at its birth already covers every path; the duplicate is gone and a source scan pins that exactly one remains.
+
+### Measured and dropped: dispatching each draft step as it is built
+
+`mtpChainBuild` built all m_lo head steps (~0.9 ms of CPU graph building each, GPU idle) before handing the chunk to `mtpChainDispatch`, so on a depth-5 round the GPU did not start step 0 until ~4.5 ms in — the `predraft` lap. Firing each step the moment it exists should start step 0 after one build and overlap the rest.
+
+It did not move anything measurable. Same 4-boot protocol, `predraft` 4.37 → 4.09 ms in one run and 4.40 → 4.33 in the other, with `eval` and `total` showing no separation from the PLE-defer-only arm. That lap measures CPU build time, which dispatching earlier does not shrink; the benefit would have to appear as GPU overlap in `eval`, and it does not. Byte-identical and correct, but neutral, so the commit was dropped from the branch — the code is NOT in the tree. If you retry it, the arm to beat is a same-boot `MLX_SERVE_MTP_STEP_DISPATCH=0/1` A/B, not a cross-boot one.
+
+Also measured null in the same window (sibling A/B, not this branch): 8-bit MTP head experts, −1.7% and −1.0% on the two prompt classes with acceptance +2% / −3%. Head-weight precision is not where the round cost is.
+
+## qwen4 EV controller: every request re-learned the acceptance surface (2026-09-04)
+
+`MtpHeadRef.evSeed`/`setEvSeed` were implemented only for the `.qwen` sidecar arm, which keeps the seed on `MtpModel`. The in-checkpoint `.qwen4` head returned null and no-oped, so every qwen4 request started the EV controller cold: `MTP_EV_WARMUP_ROUNDS` (10) rounds under the legacy windowed controller, then a base-depth climb capped at +1 per round. On a 400-token generation that is most of the first ~15 rounds spent at shallow depth. It showed up as auto reaching acc/round 2.85 on code against 3.65 at forced depth 5, and llmprobe scoring auto 91.4 vs 98.6 tok/s.
+
+The seed is per-LOADED-MODEL state, exactly like the sidecar's, so it goes on `Qwen4Mtp` (`ev_seed_accept` + `ev_seed_m_lo`) and dies with the head — it can never reach another model. `qwen4MtpReset` deliberately does not clear it: a reset starts a new REQUEST, which is precisely who should inherit it. transformer.zig cannot import mtp.zig (mtp imports transformer), so the array width is a local `MTP_EV_SEED_DEPTH` and generate.zig — which sees both — asserts it equals `mtp.MAX_DEPTH` at comptime.
+
+Both gates also decline under `MLX_SERVE_MTP_FORCE_DEPTH`. That mode early-returns from `mtpRoundPlan` and never plans, so a forced run must neither inherit a seed nor, at deinit, PUBLISH the surface it measured at a fixed depth for the next ordinary request to pick up.
+
+AUTO-mode A/B (no `--mtp-depth`, no forced depth; boot order proto3, control, control, proto3; the same 100 s cooldowns plus one before the judge). Acceptance per request, protocol requests only — the pooled `[mtp-trace]` medians are ~84% llmprobe traffic and mislead:
+
+| arm | code warmup | code 1 | code 2 | code 3 | prose 1 | prose 2 | prose 3 |
+|---|---|---|---|---|---|---|---|
+| control | 3.17 | 3.04 | 2.98 | 3.24 | 1.06 | 0.82 | 0.72 |
+| **seeded** | 3.21 | **3.83** | **3.45** | **3.40** | 1.21 | 0.72 | 0.78 |
+
+The warmup request is identical in both arms (3.17 vs 3.21) — the sanity check, since the first request of a boot has no seed to inherit either way. From request 2 the code column separates cleanly; prose does not, because prose accepts ~1 token/round in both arms, the controller collapses to depth ~1, and there is nothing for a seed to preserve.
+
+llmprobe is the cleanest discriminator, because it fires 34 requests after the protocol has already seeded the head:
+
+| boot | decode | spec | predictable · novel | tok/step |
+|---|---|---|---|---|
+| control b2 | 86.3 | 1.63× | 116.7 · 71.6 | 3.33 |
+| control b3 | 104.1 | 1.70× | 117.8 · 69.3 | 3.33 |
+| **seeded b1** | 99.0 | **2.04×** | **143.8** · 70.5 | **5.45** |
+| **seeded b4** | 92.3 | **2.12×** | **149.2** · 70.5 | **5.45** |
+
+`spec:novel` is flat (~70 tok/s) in both arms — same story as prose. Headline decode overlaps and does not discriminate. Protocol tok/s: code 114.99 → 116.73, prose 72.84 → 74.80, with the serial drift meter at 67.16/66.19 vs 67.27/67.04.
+
+Open follow-up: the prose block runs right after the code block, so the seed hands the first prose request a CODE-trained surface, which over-drafts and costs a few rounds to demote. Reproducible in both boots — prose rep 1 is 66.66 / 67.24 seeded against 74.50 / 71.84 unseeded, about −7 tok/s — and reps 2–3 then overshoot the control. The median win survives it, but a workload switch has a real first-request cost. Decaying the published surface toward neutral instead of seeding it verbatim is the untried fix.
+
+### Auto mode is not byte-reproducible, so byte identity cannot be an A/B bar there
+
+The auto A/B came back 3/9 cells byte-identical, which looks like a regression and is not one. The control differs from ITSELF across two boots of the same binary in 4 of 9 cells. In auto mode the EV controller picks depth from MEASURED round times; timing is nondeterministic, so depth is, so the verify width is, so which kernel runs is — and a greedy near-tie flips. Differences are paraphrase-level from an early offset ("not a sudden event but a slow erosion" vs "not a singular event but a gradual erosion" at offset 46).
+
+Confirming that reading: the only cells identical everywhere are the ones with no controller freedom — the warmup request (first of the boot, no seed in either arm) and both `enable_mtp:false` cells. The forced-depth protocol was 9/9 identical in both earlier runs precisely BECAUSE depth was pinned. So: pin `MLX_SERVE_MTP_FORCE_DEPTH` when the bar is bytes, and note that this also disables the EV seed by the gate above — the seed is byte-neutral by construction (it moves only the planner's starting depth; greedy verify decides every token), and no auto-mode run can demonstrate that empirically.
+
+`[spec-stats] depth=` is NOT the chosen depth — it is the controller's cap, and it read `depth 6` for all 86 requests in both arms. The informative fields are `avg_per_round` per request and `m_avg` on the trace line; MTP emits no per-round depth histogram (only DFlash has `block_hist`).
+
+### Harness notes from these runs
+
+Three things cost time and are worth knowing before the next A/B. A binary COPIED out of `zig-out/bin/` cannot resolve its `@rpath` (`@loader_path/../../lib/...`) and dies before "Model ready" with `Library not loaded: @rpath/libllama.dylib` — give each arm a fake root (`root_<arm>/zig-out/bin/mlx-serve` plus a `root_<arm>/lib` symlink). A hand-started server (`mlx-serve serve --model ...`) does not match the harness's `pkill -f "mlx-serve --model"` pattern, so it survives `stop_server` and `wait_ready` will happily benchmark it — check the port is free after the kill and abort the boot if it is not. And the serial drift cell uses nonce `<prompt>_serial` while the MTP reps use `<prompt>_1|2|3`, so no two requests share prompt bytes across the `enable_mtp` boundary: an MTP-vs-serial output comparison is not answerable from that protocol without issuing one rep twice under the same nonce.
+
+## qwen4 drafts read the whole 675 MB lm_head to use one argmax (2026-09-04)
+
+With the verify build no longer serialised (above), a forced-depth-5 round on Flash Next traced at 41.77 ms with a `corr` lap that was not correction work at all — it was the round's first eval waiting for the draft chain to finish on the GPU. The chain was the cost, and the cost was bytes.
+
+`MtpHeadRef.canRerankDrafts` returned false on the `.qwen4` arm and `draftSelect` returned `error.NoDraftRerank`, so `mtpChainBuild` always asked for full logits and every draft step ran the 248320-wide projection. That head is 8-bit: 635.7 MB packed + 39.7 MB of scales/biases = 675 MB, more than everything else in a draft step put together (the head's own layer is ~129 MB at kv 2k, of which the top-10 routed experts are 28 MB). A greedy draft only ever needed the argmax.
+
+The sidecar has answered exactly this for a while, and none of its machinery is head-shaped — it reads the TARGET's lm_head and a vector in that head's input space. So the coarse build, the shortlist select and the full-readout fallback moved out of `MtpModel` into free functions (`buildRerankCoarse` / `rerankSelect` / `fullReadoutArgmax` / `maskAndArgmax`) that both arms call. `MtpModel` keeps its field names and its `draft_head` preference, so the measured sidecar path is unchanged.
+
+Predicted from bytes: 675 MB → 278 MB coarse (3-bit, the `MLX_SERVE_MTP_DRAFT_HEAD_BITS` default) + ~0.09 MB of exact rows, so 5 × (675 − 265) MB / 546 GB/s = 3.75 ms off a depth-5 round. Measured 3.38 ms (41.77 → 38.39). Code ×1.089, prose ×1.085 at forced depth 5; `acc_idx` identical, so the coarse shortlist is not costing acceptance; llmprobe predictable 141 → 153 tok/s.
+
+The load-bearing part is what `x` IS. On the sidecar, `hidden_next` is what the lm_head consumes. On qwen4_exp `hidden_next` is the PRE-mixer `[B,S,hc*H]` stream — 4× the width — and the lm_head's input is the MIXER output. A `want_logits: bool` cannot express that either: a history append and a rerank draft both skip the projection, but the draft still needs the vector it would have consumed. Hence `StepWant{ logits, mixed, none }`, a `.mixed_last_row` projection that runs the mixer on the last row and skips `lmHeadProject`, and `StepOut.rerank_x`. Handing `hidden_next` to `draftSelect` on this arm is a silent shape error, which is why a source scan pins that the chain feeds `rerank_x` and that `.mixed` does not collapse onto `.none`.
+
+The coarse head builds LAZILY on the first draft: `loadQwen4Mtp` runs while the Transformer is still under construction and `lm_head_w` — the very weight it copies — is not assigned yet. `rerank_tried` makes the refusal one-shot. `MLX_SERVE_MTP_DRAFT_RERANK=0` fully restores the full-vocab path, as does a build refusal or a mid-chain shortlist failure; chunk-A confidence and sharp (sampled) proposals still force full logits.
+
+Owed: `MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS` was fitted with the full-vocab draft in the round, so its `draft` term is now stale and the surface needs a refit — see the rule about refitting EV cost tables whenever the verify forward changes; this is the same hazard on the draft side.
+
+2-bit is what the sidecar scheme was measured at and is the obvious second arm, untried here.
+
+## The round-cost table's `tok` column is a workload mixture — and planning around it lost anyway (2026-09-04, qwen4_exp, M5 Max)
+
+**The complaint.** llmprobe `spec:predictable` on the user's own serving config
+(`--ctx-size 1048576 --kv-quant 8 --mtp --prefix-cache-disk 100GB`, qwen4_exp
+mixed-4/8-bit) alternated between ~111 and ~154 tok/s on near-identical prompts,
+ratio 1.56 where a clean-table boot reads 2.0+.
+
+**The diagnosis that looked obvious.** `mtpEvPlanSrc` planned the base depth with
+`src.measuredTokens(m) orelse mtpEvExpectedTokens(a, m)`: whenever a cell was
+trusted, tokens-per-round came from the table's `tok` EMA. That EMA is a WORKLOAD
+MIXTURE — the same width serves prose, code and tool echo, and the cell holds
+whatever ran last. The user's live `<2k` bucket read w1 1.82 tok / 22.5 ms next to
+w6 6.00 / 45.6 (three samples), and the `32k+` w1 cell 1.97 over 8299 samples.
+Nothing in that column answers "what would THIS request emit", which is exactly
+what the per-request acceptance surface `a` tracks (`mtpEvObserve` updates it every
+round; the qwen4 EV seed carries it between requests).
+
+**Two things had to change together.** Tokens from `a` alone move nothing, because
+the standing-base hysteresis only ever scores `m_lo + 1`: on this cost curve the
+neighbouring widths are 3-5% apart in tok/ms, all under `SWITCH_MARGIN` (5%), while
+w1 → w5 is 21%. A hermetic climb sim from base 1 stays at 1 forever. So the
+acceptance arm also scores every width up to the cap and steps ONE width toward the
+winner (demotions stay undamped). Both were prototyped together (`MtpCostSource.plan_accept`, parked on branch
+`parked/mtp-plan-from-acceptance`, commit 403bd1f); nothing shipped.
+
+**The A/B: cand lost the bar.** Four boots, order cand/main/main/cand, the live
+persisted table restored byte-identical before every boot, 100 s thermal settle
+after ready and after each kill, `npx llmprobe --bench-only`:
+
+| boot | arm | decode | spec ratio | predictable | novel | tok/step |
+|---|---|---|---|---|---|---|
+| 1 | cand | 96.1 | 1.85 | 113.1 | 61.0 | 3.75 |
+| 2 | main | 91.8 | 2.02 | 137.2 | 67.8 | 5.00 |
+| 3 | main | 94.2 | 1.51 | 105.3 | 69.7 | 2.86 |
+| 4 | cand | 97.7 | 1.67 | 108.6 | 65.0 | 3.53 |
+
+Bar was "higher predictable AND ratio in BOTH pairings, novel within 2%". Cand won
+pairing 2 and lost pairing 1, and novel was 4-10% LOWER in both. Not shipped.
+
+**What the logs say, and why the premise was half wrong.** `[spec-stats]` per
+predictable probe (`user=368b`, "Repeat the following passage exactly"), with the
+`<2k` table cells beside it:
+
+- main, boot 2: `avg_per_round=4.42 attempts=12 ext_rounds=9`; boot 3:
+  `avg_per_round=1.86 attempts=22 ext_rounds=19`. In BOTH the only `<2k` cell whose
+  sample count moves is w1 — the base never leaves 1 all boot. Predictable
+  throughput on the shipped plan is produced entirely by the EXTENSION horizon
+  (two-chunk rounds never feed the table), and the 111-vs-154 alternation is that
+  horizon flapping: same binary, same restored table, 4.42 vs 1.86 accepted per
+  round.
+- cand: `avg_per_round=2.82 attempts=17 ext_rounds=4`, w4's sample count climbing
+  every request. The acceptance arm does what it was asked to do — it lifts the
+  BASE to 4 — and a higher `best_r` then closes the horizon sooner (`cond <=
+  best_r * mc`). Trading a bimodal 105/137 for a tight 109/113 is a real change in
+  variance and a small loss in level.
+
+**Rules that came out of it.**
+
+- The base depth was never the lever on this arch: `m_lo` sat at 1 in every shipped
+  boot, and what moves predictable tok/s is `tau` and the regime gate. A planner
+  fix aimed at `m_lo` cannot address a horizon bug, and the acceptance model makes
+  the horizon SHORTER by raising the ratio it is compared against.
+- Novel prose is where a per-request token model costs: the acceptance EMA enters a
+  request at the seed/prior and takes rounds to fall, while the table's w1 mixture
+  cell was already prose-shaped (most of the mixture IS prose). Cand's novel rounds
+  cost 25.4 ms against 23.2 for the same ~0.6 accepted.
+- An engine-level A/B on a bistable path needs pairings, not a single boot: main's
+  own two boots differ by 30% on predictable, which is larger than any effect
+  measured here. The persisted table must be restored before EVERY boot (not
+  disabled — the live table IS the subject) or the arms teach each other.

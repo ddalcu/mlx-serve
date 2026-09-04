@@ -23,6 +23,10 @@ enum ChatWorkspace: Equatable {
     /// App settings. A window until 2026-08-08; the sidebar's row and the
     /// menu bar's ⌘, both switch to this mode now (the Window scene is gone).
     case settings
+    /// A sandbox terminal (pi / hermes / shell in the guest VM), a row of the
+    /// Chats section. A window until 2026-09-02 — and closing that window
+    /// killed every live session, which is the whole reason it moved.
+    case terminal(UUID)
 
     var isModels: Bool {
         if case .models = self { return true }
@@ -39,6 +43,14 @@ enum ChatWorkspace: Equatable {
     var isThreeColumn: Bool { isTasks || isAgents }
 
     var isSettings: Bool { self == .settings }
+
+    var isTerminal: Bool { terminalId != nil }
+
+    /// The terminal being shown, or nil outside terminal mode.
+    var terminalId: UUID? {
+        if case .terminal(let id) = self { return id }
+        return nil
+    }
 
     var isCreate: Bool {
         if case .create = self { return true }

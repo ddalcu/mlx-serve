@@ -620,7 +620,7 @@ struct ImageGenView: View {
     }
 
     private func chooseSourceImage() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -631,7 +631,7 @@ struct ImageGenView: View {
     }
 
     private func chooseRefImage() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -659,7 +659,7 @@ struct ImageGenView: View {
 
     private func chooseLora() {
         guard loras.count < maxLoras else { return }
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }

@@ -134,8 +134,8 @@ final class DialogDefaultActionTests: XCTestCase {
     }
 
     /// Comments stripped — without this the scan trips over prose about
-    /// `.alert(`, and there is a comment in SandboxTerminalView that says
-    /// exactly that. Shared with the other source scans (`SourceScan`).
+    /// `.alert(` (the old sandbox window had a comment saying exactly that).
+    /// Shared with the other source scans (`SourceScan`).
     static func strippingComments(_ source: String) -> String {
         SourceScan.strippingComments(source)
     }

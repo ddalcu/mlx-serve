@@ -425,3 +425,22 @@ StyleTTS2 + iSTFTNet, NON-autoregressive, ~17x realtime, 325 MB f32: ALBERT (sha
 ### Runtime LoRA (`src/lora.zig`)
 
 Runtime unfused LoRA adapters, STACKED (`Stack` = up to `MAX_LORAS` 8 files; `deltaSum` sums per-linear, never merges) across QLinear/MixedLinear/MfLinear. `parseKey` accepts diffusers/kohya/dotted-`lora.down`/PEFT-`.default.` spellings + flat `lora_unet_` scheme; `canonicalize` maps every alias onto OUR module name per `Arch` (flux2/krea2/minimax_h3/generic), splitting a fused BFL QKV source into thirds (shared full-rank A). `validatePath` is the ONE path rule (absolute + regular file, checked before mlx sees it); `fileAlphaScale` resolves the file's declared alpha/rank out of the safetensors `__metadata__` (per-module `.alpha` tensor still wins).
+
+## ANE prefill rules
+
+Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/engine-mlx.md`.
+
+- **ANE compile STAGING must stay in $TMPDIR** (aned can't read home paths); cache entries in `~/.mlx-serve/ane-cache`. **A single deep-K ANE conv is a 2.6x cliff**: K-chunk past ~4.6k inputs in-graph; ONE compiled tile width (`denseMLPMaybeAne`), tails run GPU; `msv_ane_model_eval` returns 1 on SUCCESS.
+- **fp16 plane row pitch must be ≡ 0 mod 32 — off-grid tiles compile fine then fail EVERY eval** ("Program Inference error"; the v2 share-0.35 collapse). `aneShareRows` floors to 32; both C emitters refuse by name.
+- **The ANE tile is sized by `effectivePrefillChunk`, never the pin alone** (scan-pinned) — a bare-pin tile is built-but-never-dispatched. **ANE prefill is M4-AND-BELOW** (`anePrefillAllowed`; M5 Max measured a LOSS; `MLX_SERVE_ANE_FORCE=1`).
+- **Channel mode is the default split** (`MLX_SERVE_ANE_MODE`, shares channel 0.45 / row 0.40): output-channel slices at ffn'=k, GPU rest via axis-0 packed VIEWS (bit-exact), boundaries on `CHANNEL_ALIGN` 128, down partials ADD at the seam. A failed channel eval recomputes the WHOLE layer.
+- **ANE I/O planes shared per SHAPE CLASS within a unit** (evals serial; 3 surfaces replace 224; never memset at bind). **MoE gets GDN-ONLY coverage** (shared expert ~5% ceiling; +3.9% at 16k).
+- **An ANE build under 1 GiB internal free disk is REFUSED** (`BUILD_DISK_FLOOR_BYTES`, probe `/private/tmp`). **Compile cache has LRU pruning** (`MLX_SERVE_ANE_CACHE_CAP_GB` 40) — a full disk ships SILENT PARTIAL COVERAGE (`ready: N/M` under-count is the tell).
+- **A compile session's budget is the INTERNAL free disk at boot (~260 MB/program); in-session retries are futile** — a cold build CONVERGES across boots (converge-then-measure).
+- **A killed ANE server leaks staging (8–20 GB/boot); the framework OWNS `$TMPDIR/<identifier>`**: `msv-ane.pid` markers, first create reaps dead owners; deleting a LIVE program's staging is unsafe (only weights blob + MIL text deletable post-load). Guard: `tests/test_ane_prefill.sh`.
+- **fp16 planes are 1-ulp different from f32; byte-identity is not the ANE bar** — per-program cos/rms parity + perceived-content greedy equivalence.
+- **GDN input projections ride ONE fused ANE conv** (`msv_ane_gdn_create`: qkv + z stacked; `gdnProjMaybeAne` seam; combined-proj archs stay GPU; `MLX_SERVE_ANE_GDN=0`); EACH seam logs its own engagement line.
+- **int4/sub-byte ANE weights are a NO-GO on macOS 26.x aned** (bisected) — ANE copy stays int8, billed per model (`engineBillBytes` + `gateAllows`, headroom 12 GB). Probe convs need ROWS≥32.
+- **A pinned second ANE is DEFAULT on M3 Ultra (+7.1%), opt-in elsewhere; a SILENTLY ignored affinity hint is undetectable in-process** (`MLX_SERVE_ANE_DUAL`): `kANEFAneInstanceHint` AND `kANEFProcedureVariantHint` together at compile+load+eval; instance 0 keeps `@{}`; verify with `macpow --dump | grep ANE0_`. Per-unit planes; input packed once then memcpy'd.
+- **The ANE program is a procedure BANK (runtime caps ~121 handles)**: symbol indices READ from `procedureInfoForProcedureIndex:` on the `_ANEModel` behind `-model` (NOT `inputSymbolIndicesForProcedureIndex:`, which answers 0 and fails every procedure >0 as a swallowed slowdown; `eval_failures` is the tell). Cap `MLX_SERVE_ANE_BANK_MAX_BYTES` 2 GiB, halves down a ladder; never a coverage decision.
+- **The ANE split's optimum is per SILICON** (`ane.defaultShare`; M4 channel 0.45 → 311/304, 0.50 regresses; M3 Ultra 0.45 ≈ nothing, 0.35 +8.5%/+13.7%). A share change needs its own A/B, never interpolation. fp16 down-conv wears the (1/16..x16) pow2 wrap.

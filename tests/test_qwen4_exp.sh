@@ -72,6 +72,7 @@ echo "  prompt_tokens|answer: $la"
 check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG")" "1"
 check "needle recovered" "$(echo "$la" | grep -c 'PELICAN-42')" "1"
 check "qsa prefill kernel engaged (mask arm of msv_attn_p256)" "$(grep -c '\[qsa-fused\] engaged' "$LOG")" "1"
+check "qsa decode gather engaged (S=1 subset rows)" "$(grep -c '\[qsa-decode-gather\] engaged' "$LOG")" "1"
 echo "[5b] MTP past the QSA budget (verify rows under the QSA mask)"
 longm=$(echo "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=True; print(json.dumps(d))")
 lm=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$longm" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])")

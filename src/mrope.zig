@@ -227,11 +227,112 @@ pub fn computeInvFreq(out: []f64, rotary_dim: usize, theta: f64) void {
     }
 }
 
+/// YaRN rope scaling (Peng et al., github.com/jquesnelle/yarn) as HF's
+/// `_compute_yarn_parameters` computes it from a `rope_parameters` block with
+/// `rope_type: "yarn"` — the mechanism vLLM exposes through `--hf-overrides`
+/// to stretch Qwen3.5 past its trained window. Pure f64 host math (no MLX), so
+/// it unit-tests straight against the reference values.
+///
+/// The trunk ropes every one of its rotary tables (attention, the QSA indexer,
+/// the MTP head) from ONE of these specs, so the whole model agrees on what a
+/// position means (`Yarn.invFreq` → `fillCosSin` / the `mlx_fast_rope` freqs).
+pub const Yarn = struct {
+    /// `rope_theta` — the base the unscaled frequencies come from.
+    theta: f64,
+    /// `factor` — how far the window is stretched (262144 × 4 = 1M).
+    factor: f64,
+    /// `original_max_position_embeddings` — the PRE-TRAINED window. The ramp
+    /// boundaries are derived from this, never from the extended one.
+    orig_max: u32,
+    /// `int(head_dim * partial_rotary_factor)` — the rotating slice of a head.
+    rotary_dim: u32,
+    /// Wavelengths completing this many rotations across `orig_max` mark the
+    /// ends of the ramp: `beta_fast` the fully-extrapolated side, `beta_slow`
+    /// the fully-interpolated one. HF defaults: 32 / 1.
+    beta_fast: f64 = 32.0,
+    beta_slow: f64 = 1.0,
+    /// HF's `truncate`: floor/ceil the ramp bounds to whole dims (default true).
+    truncate: bool = true,
+
+    pub const CorrectionRange = struct { low: f64, high: f64 };
+
+    /// HF `find_correction_range` — the dim indices the linear ramp spans,
+    /// clamped into `[0, rotary_dim - 1]`.
+    pub fn correctionRange(self: Yarn) CorrectionRange {
+        const dim: f64 = @floatFromInt(self.rotary_dim);
+        const mp: f64 = @floatFromInt(self.orig_max);
+        const two_log_theta = 2.0 * @log(self.theta);
+        // find_correction_dim(r) = dim·ln(orig_max / (2πr)) / (2·ln theta): the
+        // freq index whose wavelength completes `r` rotations across the window.
+        const corr = struct {
+            fn f(rot: f64, d: f64, max_pos: f64, two_log_base: f64) f64 {
+                return (d * @log(max_pos / (rot * 2.0 * std.math.pi))) / two_log_base;
+            }
+        }.f;
+        var low = corr(self.beta_fast, dim, mp, two_log_theta);
+        var high = corr(self.beta_slow, dim, mp, two_log_theta);
+        if (self.truncate) {
+            low = @floor(low);
+            high = @ceil(high);
+        }
+        return .{ .low = @max(low, 0.0), .high = @min(high, dim - 1.0) };
+    }
+
+    /// The YaRN-corrected inverse frequencies into `out` (`out.len ==
+    /// rotary_dim/2`): below `low` the frequency is untouched (extrapolation —
+    /// those dims still encode absolute position across the extended window),
+    /// at/above `high` it is divided by `factor` (interpolation — a position
+    /// `p` now reads as `p/factor`, which is what makes 1M look like 262k), and
+    /// the range between blends the two linearly. `factor` 1.0 collapses every
+    /// band onto `computeInvFreq`.
+    pub fn invFreq(self: Yarn, out: []f64) void {
+        std.debug.assert(out.len * 2 == self.rotary_dim);
+        const dim: f64 = @floatFromInt(self.rotary_dim);
+        const r = self.correctionRange();
+        var ramp_denom = r.high - r.low;
+        if (ramp_denom == 0) ramp_denom = 0.001; // HF's singularity guard
+        for (0..out.len) |i| {
+            // pos_freqs[i] = theta^(2i/rotary_dim)
+            const pos_freq = std.math.pow(f64, self.theta, @as(f64, @floatFromInt(2 * i)) / dim);
+            const inv_extrapolation = 1.0 / pos_freq;
+            const inv_interpolation = 1.0 / (self.factor * pos_freq);
+            var ramp = (@as(f64, @floatFromInt(i)) - r.low) / ramp_denom;
+            ramp = @min(@max(ramp, 0.0), 1.0);
+            const extrapolation_factor = 1.0 - ramp;
+            out[i] = inv_interpolation * (1.0 - extrapolation_factor) +
+                inv_extrapolation * extrapolation_factor;
+        }
+    }
+
+    /// HF's default `attention_factor` for YaRN (the paper's mscale) — what
+    /// `cos`/`sin` get multiplied by when the config does not pin one.
+    pub fn attentionFactor(factor: f64) f64 {
+        if (factor <= 1.0) return 1.0;
+        return 0.1 * @log(factor) + 1.0;
+    }
+
+    /// The window this spec actually covers: HF/vLLM both derive
+    /// `max_model_len` as `original_max_position_embeddings × factor`, and a
+    /// position past it aliases onto one already inside the ramp.
+    pub fn contextLen(self: Yarn) u64 {
+        const orig: f64 = @floatFromInt(self.orig_max);
+        const scaled = @floor(orig * self.factor);
+        if (scaled < 0) return 0;
+        return @intFromFloat(scaled);
+    }
+};
+
 /// Fill NeoX-layout cos/sin rows (`[n, rope_dims]`, both halves tiled) for the
 /// `n` absolute positions `start + stride*i`: the 3-D table inside the prompt,
 /// `abs + delta` past it. `stride 1` is a prefill chunk; the qwen4 QSA indexer
 /// ropes its pooled block keys at block-START positions (`stride = ratio`).
-pub fn fillCosSin(cos: []f32, sin: []f32, positions: PositionContext, start: usize, stride: usize, n: usize, inv_freq: []const f64, sel: []const u8, rope_dims: usize) void {
+///
+/// `mscale` is the YaRN attention factor: HF multiplies the cos/sin tables by
+/// it, which (both halves of every rotary pair sharing one frequency) scales
+/// the rotated slice of q and k by `mscale` — i.e. the attention logits by
+/// `mscale²`, exactly the reference's `cos, sin = cos * mscale, sin * mscale`.
+/// Pass 1.0 for an unscaled rope.
+pub fn fillCosSin(cos: []f32, sin: []f32, positions: PositionContext, start: usize, stride: usize, n: usize, inv_freq: []const f64, sel: []const u8, rope_dims: usize, mscale: f64) void {
     const half = rope_dims / 2;
     std.debug.assert(inv_freq.len == half and sel.len == half);
     std.debug.assert(cos.len == n * rope_dims and sin.len == n * rope_dims);
@@ -241,8 +342,8 @@ pub fn fillCosSin(cos: []f32, sin: []f32, positions: PositionContext, start: usi
         for (0..half) |d| {
             const pid: f64 = @floatFromInt(positions.axisPosition(sel[d], p));
             const angle = pid * inv_freq[d];
-            const c: f32 = @floatCast(@cos(angle));
-            const sn: f32 = @floatCast(@sin(angle));
+            const c: f32 = @floatCast(@cos(angle) * mscale);
+            const sn: f32 = @floatCast(@sin(angle) * mscale);
             cos[o + d] = c;
             cos[o + half + d] = c;
             sin[o + d] = sn;
@@ -273,12 +374,12 @@ test "mrope fillCosSin strided rows == every stride-th row of the contiguous fil
     const n_all: usize = 20; // 8 positions past the table
     var cos_all: [n_all * rope_dims]f32 = undefined;
     var sin_all: [n_all * rope_dims]f32 = undefined;
-    fillCosSin(&cos_all, &sin_all, ctx, 0, 1, n_all, &inv_freq, &sel, rope_dims);
+    fillCosSin(&cos_all, &sin_all, ctx, 0, 1, n_all, &inv_freq, &sel, rope_dims, 1.0);
     const stride: usize = 4;
     const n_s: usize = n_all / stride;
     var cos_s: [n_s * rope_dims]f32 = undefined;
     var sin_s: [n_s * rope_dims]f32 = undefined;
-    fillCosSin(&cos_s, &sin_s, ctx, 0, stride, n_s, &inv_freq, &sel, rope_dims);
+    fillCosSin(&cos_s, &sin_s, ctx, 0, stride, n_s, &inv_freq, &sel, rope_dims, 1.0);
     for (0..n_s) |b| {
         for (0..rope_dims) |d| {
             try std.testing.expectEqual(cos_all[b * stride * rope_dims + d], cos_s[b * rope_dims + d]);
@@ -291,7 +392,7 @@ test "mrope fillCosSin strided rows == every stride-th row of the contiguous fil
     var one_cos: [rope_dims]f32 = undefined;
     var one_sin: [rope_dims]f32 = undefined;
     const plain = PositionContext{ .pos = &pos, .total = 0, .delta = 0 }; // no table: scalar positions
-    fillCosSin(&one_cos, &one_sin, plain, 10, 1, 1, &inv_freq, &sel, rope_dims);
+    fillCosSin(&one_cos, &one_sin, plain, 10, 1, 1, &inv_freq, &sel, rope_dims, 1.0);
     for (0..rope_dims) |d| try std.testing.expectEqual(one_cos[d], cos_all[12 * rope_dims + d]);
 }
 
@@ -422,4 +523,339 @@ test "mrope PositionContext maps suffix caches and generated text" {
     inline for (0..3) |axis| {
         try std.testing.expectEqual(@as(i32, 2), ctx.axisPosition(axis, 2));
     }
+}
+
+// ── YaRN rope scaling (the qwen4_exp 262144 → 1048576 extension) ──
+
+/// The shipped Qwen3.8-Flash-Next rope geometry, from the checkpoint's own
+/// config.json: head_dim 256 × partial_rotary_factor 0.25 → rotary_dim 64 (so
+/// 32 frequencies, which is what `mrope_section` [11,11,10] sums to), theta 1e7,
+/// pre-trained window 262144.
+const QWEN4_YARN = Yarn{
+    .theta = 10_000_000.0,
+    .factor = 4.0,
+    .orig_max = 262_144,
+    .rotary_dim = 64,
+};
+
+/// `_compute_yarn_parameters` output for QWEN4_YARN, produced by the reference
+/// (tests/dump_qwen4_yarn_fixtures.py, transformers 5.9) — and independently by
+/// a transcription of vLLM's `YaRNScalingRotaryEmbedding._compute_inv_freq`,
+/// which agrees with HF bit-for-bit here. f64: the references compute in f32,
+/// which is 1e-7 sloppier than these.
+const QWEN4_YARN_GOLDEN = [_]f64{
+    1.0, // 0   extrapolated band (i < low): unscaled
+    0.6042963902381328, // 1
+    0.36517412725483767, // 2
+    0.220673406908459, // 3
+    0.1333521432163324, // 4
+    0.08058421877614819, // 5
+    0.04869675251658631, // 6
+    0.029427271762092817, // 7
+    0.01778279410038923, // 8
+    0.010746078283213174, // 9
+    0.006493816315762114, // 10
+    0.003924189758484536, // 11
+    0.002371373705661655, // 12
+    0.0014330125702369627, // 13
+    0.0008659643233600654, // 14  last ramp-free extrapolation
+    0.0004742398226801046, // 15  blended: 0.90625 of unscaled
+    0.00025693505988868084, // 16
+    0.0001373497450760004, // 17
+    0.00007217387404309113, // 18
+    0.0000370722498206804, // 19
+    0.000018449222025000475, // 20
+    0.000008759770071179004, // 21  blended: 0.34375 of unscaled
+    0.0000038498163151487305, // 22 interpolated band (i >= high): exactly /4
+    0.0000023264301023242476, // 23
+    0.0000014058533129758728, // 24
+    0.0000008495520822356398, // 25
+    0.0000005133812566142865, // 26
+    0.0000003102344401879299, // 27
+    0.00000018747355233311396, // 28
+    0.00000011328959094002045, // 29
+    0.00000006846049085660903, // 30
+    0.00000004137042749857954, // 31
+};
+
+test "yarn correction range for the qwen4_exp geometry" {
+    const r = QWEN4_YARN.correctionRange();
+    // low = floor(64·ln(262144/(32·2π))/(2·ln 1e7)) = floor(14.24) = 14
+    try std.testing.expectEqual(@as(f64, 14.0), r.low);
+    // high = ceil(64·ln(262144/(1·2π))/(2·ln 1e7)) = ceil(21.12) = 22
+    try std.testing.expectEqual(@as(f64, 22.0), r.high);
+    // Both sit inside the 32-frequency table, so the ramp is a real blend and
+    // neither band is empty: 15 dims extrapolated, 7 blended, 10 interpolated.
+    try std.testing.expect(r.low < @as(f64, 16));
+    try std.testing.expect(r.high < @as(f64, 32));
+    try std.testing.expectEqual(@as(u64, 1_048_576), QWEN4_YARN.contextLen());
+}
+
+test "yarn inv_freq matches HF _compute_yarn_parameters (qwen4_exp 262k -> 1M)" {
+    var f: [32]f64 = undefined;
+    QWEN4_YARN.invFreq(&f);
+    for (QWEN4_YARN_GOLDEN, 0..) |want, i| {
+        try std.testing.expectApproxEqRel(want, f[i], 1e-12);
+    }
+    // HF's default mscale for factor 4: 0.1·ln 4 + 1.
+    try std.testing.expectApproxEqRel(@as(f64, 1.138629436111989), Yarn.attentionFactor(4.0), 1e-15);
+    try std.testing.expectEqual(@as(f64, 1.0), Yarn.attentionFactor(1.0));
+    try std.testing.expectEqual(@as(f64, 1.0), Yarn.attentionFactor(0.5));
+}
+
+test "yarn leaves the low-frequency band unscaled and divides the top band" {
+    var plain: [32]f64 = undefined;
+    computeInvFreq(&plain, 64, 10_000_000.0);
+    var f: [32]f64 = undefined;
+    QWEN4_YARN.invFreq(&f);
+    const r = QWEN4_YARN.correctionRange();
+    for (0..32) |i| {
+        const idx: f64 = @floatFromInt(i);
+        if (idx <= r.low) {
+            // Extrapolation: untouched, so a slow dim still reads absolute
+            // position across the whole 1M window.
+            try std.testing.expectApproxEqRel(plain[i], f[i], 1e-12);
+        } else if (idx >= r.high) {
+            // Interpolation: position p now arrives as p/factor.
+            try std.testing.expectApproxEqRel(plain[i] / 4.0, f[i], 1e-12);
+        } else {
+            // Ramp: the RATIO to the unscaled frequency falls linearly from 1 at
+            // `low` to 1/factor at `high` — the blend HF/vLLM call YaRN.
+            const t = (idx - r.low) / (r.high - r.low);
+            const want_ratio = 1.0 - t + t / 4.0;
+            try std.testing.expectApproxEqRel(plain[i] * want_ratio, f[i], 1e-12);
+        }
+        if (i > 0) try std.testing.expect(f[i] <= f[i - 1]); // strictly decreasing
+    }
+    // The blend is linear in the RATIO, and the ratios at the band edges are the
+    // clamp of the ramp: 1 at `low`, 1/factor at `high`.
+    const ratio_low = f[@intFromFloat(r.low)] / plain[@intFromFloat(r.low)];
+    const ratio_high = f[@intFromFloat(r.high)] / plain[@intFromFloat(r.high)];
+    try std.testing.expectApproxEqRel(@as(f64, 1.0), ratio_low, 1e-12);
+    try std.testing.expectApproxEqRel(@as(f64, 0.25), ratio_high, 1e-12);
+}
+
+test "yarn with factor 1.0 is EXACTLY the unscaled spectrum (no-YaRN regression guard)" {
+    // Every shipped qwen4_exp checkpoint before the override lands here: the
+    // scaled code path must be bit-identical to the old code, not "close".
+    var plain: [32]f64 = undefined;
+    computeInvFreq(&plain, 64, 10_000_000.0);
+    var f: [32]f64 = undefined;
+    const none: Yarn = .{ .theta = 10_000_000.0, .factor = 1.0, .orig_max = 262_144, .rotary_dim = 64 };
+    none.invFreq(&f);
+    for (plain, 0..) |p, i| try std.testing.expectEqual(p, f[i]);
+    try std.testing.expectEqual(@as(f64, 1.0), Yarn.attentionFactor(1.0));
+}
+
+test "yarn reads a 1M position as 262k in the interpolated band" {
+    // The extension's whole point, stated as an equality: for the dims past the
+    // ramp, angle_yarn(p) == angle_plain(p/factor). p = 1,048,572 divides by 4
+    // exactly, so both sides are the same real number.
+    var plain: [32]f64 = undefined;
+    computeInvFreq(&plain, 64, 10_000_000.0);
+    var yarn_f: [32]f64 = undefined;
+    QWEN4_YARN.invFreq(&yarn_f);
+    const p: usize = 1_048_572;
+    const half: usize = 32;
+    var sel: [half]u8 = undefined;
+    interleavedSelector(&sel, .{ 11, 11, 10 });
+    const all_text = PositionContext{ .pos = &.{}, .total = 0, .delta = 0 };
+
+    var cos_y: [half * 2]f32 = undefined;
+    var sin_y: [half * 2]f32 = undefined;
+    fillCosSin(&cos_y, &sin_y, all_text, p, 1, 1, &yarn_f, &sel, half * 2, 1.0);
+    var cos_p: [half * 2]f32 = undefined;
+    var sin_p: [half * 2]f32 = undefined;
+    fillCosSin(&cos_p, &sin_p, all_text, p / 4, 1, 1, &plain, &sel, half * 2, 1.0);
+    for (22..half) |d| {
+        // Absolute tolerance: these are cos/sin values in [-1,1], and some sit
+        // close enough to zero that a RELATIVE bound is meaningless.
+        try std.testing.expectApproxEqAbs(@as(f32, cos_p[d]), cos_y[d], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, sin_p[d]), sin_y[d], 1e-6);
+        // Tiled halves carry the same frequency, so the pair agrees.
+        try std.testing.expectEqual(cos_y[d], cos_y[d + half]);
+    }
+    // And the extrapolated band does NOT collapse: dim 0's frequency is unscaled
+    // (exactly `plain[0]`, since ramp = 0 there), so p = 1,048,572 lands on a
+    // genuinely different angle than the 262,143 it is "compressed" onto — the
+    // model keeps a real sense of absolute distance.
+    try std.testing.expectApproxEqRel(@as(f64, 1.0), yarn_f[0] / plain[0], 1e-12);
+    try std.testing.expect(@abs(cos_y[0] - cos_p[0]) > 0.05);
+}
+
+test "fillCosSin mscale scales the rotated rows only" {
+    var f: [32]f64 = undefined;
+    QWEN4_YARN.invFreq(&f);
+    var sel: [32]u8 = undefined;
+    interleavedSelector(&sel, .{ 11, 11, 10 });
+    const ctx = PositionContext{ .pos = &.{}, .total = 0, .delta = 0 };
+    const rd: usize = 64;
+    var cos1: [rd]f32 = undefined;
+    var sin1: [rd]f32 = undefined;
+    var cos2: [rd]f32 = undefined;
+    var sin2: [rd]f32 = undefined;
+    fillCosSin(&cos1, &sin1, ctx, 1234, 1, 1, &f, &sel, rd, 1.0);
+    // 2.0 is a power of two, so the scaled rows are an exact doubling — this is
+    // the "folding the mscale into cos/sin == scaling the rotated q/k" property
+    // the fused hd-256 path relies on.
+    fillCosSin(&cos2, &sin2, ctx, 1234, 1, 1, &f, &sel, rd, 2.0);
+    for (0..rd) |i| {
+        try std.testing.expectEqual(@as(f32, cos1[i]) * 2.0, cos2[i]);
+        try std.testing.expectEqual(@as(f32, sin1[i]) * 2.0, sin2[i]);
+    }
+    // The qwen4 window the extension targets: every row is finite and bounded by
+    // the mscale (|cos|,|sin| <= 1 before it). No NaN at 1,048,575 positions out.
+    const ms = Yarn.attentionFactor(4.0);
+    var cos3: [rd]f32 = undefined;
+    var sin3: [rd]f32 = undefined;
+    fillCosSin(&cos3, &sin3, ctx, 1_048_575, 1, 1, &f, &sel, rd, ms);
+    for (0..rd) |i| {
+        try std.testing.expect(!std.math.isNan(cos3[i]));
+        try std.testing.expect(!std.math.isNan(sin3[i]));
+        const msf: f32 = @floatCast(ms);
+        const lim = msf + 0.00001;
+        try std.testing.expect(@abs(cos3[i]) <= lim);
+        try std.testing.expect(@abs(sin3[i]) <= lim);
+    }
+}
+
+test "YaRN mscale on a 128-wide indexer with 64 rotary dims CAN change top-k" {
+    // The skip comment in qsaMaskFromQk claimed mscale cannot change a top-k
+    // because it "multiplies every relu(q·k) by one positive constant". That
+    // is true of a FULL-head scale. The indexer is 128-wide and only 64 dims
+    // rotate, so score = ms²·A + B. Two synthetic blocks whose unscaled
+    // winner is the B-heavy one flip under the factor-4 mscale.
+    const ms = Yarn.attentionFactor(4.0);
+    const ms2 = ms * ms;
+    // Block 0: rotary-heavy. Block 1: pass-through-heavy.
+    const a0: f64 = 2.0;
+    const b0: f64 = 0.0;
+    const a1: f64 = 0.0;
+    const b1: f64 = 2.2;
+    const un0 = a0 + b0;
+    const un1 = a1 + b1;
+    const sc0 = ms2 * a0 + b0;
+    const sc1 = ms2 * a1 + b1;
+    try std.testing.expect(un1 > un0); // unscaled winner is block 1
+    try std.testing.expect(sc0 > sc1); // scaled winner is block 0
+}
+
+fn fixtureF64(v: std.json.Value) f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => unreachable,
+    };
+}
+
+test "qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)" {
+    // Env-gated oracle for the context extension. The frequencies, the mscale and
+    // the per-position cos/sin rows come from the REFERENCE —
+    // `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS["yarn"]`, cross-checked
+    // inside the dumper against a transcription of vLLM's
+    // `YaRNScalingRotaryEmbedding` — for THIS checkpoint's own geometry, dumped by
+    // `tests/dump_qwen4_yarn_fixtures.py`. Dormant in normal CI:
+    //
+    //     QWEN4_YARN_FIXTURES=/tmp/qwen4_yarn.json \
+    //         zig build test -Dtest-filter="qwen4 yarn parity"
+    const path_z = std.c.getenv("QWEN4_YARN_FIXTURES") orelse return error.SkipZigTest;
+    const path = std.mem.span(path_z);
+    if (path.len == 0) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader_state = file.reader(io, &read_buf);
+    const data = try reader_state.interface.allocRemaining(std.testing.allocator, .limited(8 << 20));
+    defer std.testing.allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, data, .{});
+    defer parsed.deinit();
+    const fx = parsed.value.object;
+
+    const rotary_dim: u32 = @intCast(fx.get("rotary_dim").?.integer);
+    const spec = Yarn{
+        .theta = fixtureF64(fx.get("rope_theta").?),
+        .factor = fixtureF64(fx.get("factor").?),
+        .orig_max = @intCast(fx.get("original_max_position_embeddings").?.integer),
+        .rotary_dim = rotary_dim,
+        .beta_fast = fixtureF64(fx.get("beta_fast").?),
+        .beta_slow = fixtureF64(fx.get("beta_slow").?),
+        .truncate = fx.get("truncate").?.bool,
+    };
+    // The dumper only describes a qwen4_exp-shaped run; anything else means the
+    // fixture was regenerated against a different checkpoint.
+    std.debug.assert(rotary_dim == 64);
+    try std.testing.expectEqual(@as(u32, 256), @as(u32, @intCast(fx.get("head_dim").?.integer)));
+
+    // 1. The ramp bounds.
+    const cr = spec.correctionRange();
+    try std.testing.expectApproxEqAbs(fixtureF64(fx.get("correction_low").?), cr.low, 1e-12);
+    try std.testing.expectApproxEqAbs(fixtureF64(fx.get("correction_high").?), cr.high, 1e-12);
+
+    // 2. The frequencies — against BOTH references. vLLM's transcription is
+    // f64, so this engine's f64 table has to match it in f64; HF computes in
+    // f32, which is why its column is checked at f32 width.
+    const want_vllm = fx.get("vllm_inv_freq").?.array;
+    const want_hf = fx.get("inv_freq").?.array;
+    try std.testing.expectEqual(@as(usize, rotary_dim / 2), want_vllm.items.len);
+    var got: [32]f64 = undefined;
+    spec.invFreq(&got);
+    var max_vllm: f64 = 0;
+    var max_hf: f64 = 0;
+    for (want_vllm.items, want_hf.items, 0..) |wv, wh, i| {
+        max_vllm = @max(max_vllm, @abs(got[i] - fixtureF64(wv)) / fixtureF64(wv));
+        max_hf = @max(max_hf, @abs(got[i] - fixtureF64(wh)) / fixtureF64(wh));
+    }
+    try std.testing.expect(max_vllm < 1e-14);
+    try std.testing.expect(max_hf < 1e-6); // HF's own float32 rounding
+
+    // 3. The mscale.
+    try std.testing.expectApproxEqAbs(
+        fixtureF64(fx.get("attention_factor").?),
+        Yarn.attentionFactor(spec.factor),
+        1e-12,
+    );
+
+    // 4. The actual tables, at positions spanning the pre-trained window, its
+    // edge, and the extended range it could not previously address. The engine
+    // fills cos/sin in f64 and rounds once to f32; the reference rounds the
+    // same angles, so the rows agree to one f32 step.
+    const sel_half = rotary_dim / 2;
+    var sel: [32]u8 = undefined;
+    var section = [3]u32{ 0, 0, 0 };
+    for (fx.get("mrope_section").?.array.items, 0..) |item, i| section[i] = @intCast(item.integer);
+    interleavedSelector(sel[0..sel_half], section);
+    const text_only = PositionContext{ .pos = &.{}, .total = 0, .delta = 0 };
+    const ms = Yarn.attentionFactor(spec.factor);
+
+    var cos: [64]f32 = undefined;
+    var sin: [64]f32 = undefined;
+    var rows_seen: usize = 0;
+    var it = fx.get("rows").?.object.iterator();
+    while (it.next()) |entry| {
+        const p = try std.fmt.parseInt(usize, entry.key_ptr.*, 10);
+        rows_seen += 1;
+        const row = entry.value_ptr.*.object;
+        // Unscaled: the plain angles at this position.
+        fillCosSin(&cos, &sin, text_only, p, 1, 1, &got, sel[0..], rotary_dim, 1.0);
+        for (row.get("cos").?.array.items, 0..) |w, d| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(fixtureF64(w))), cos[d], 1e-6);
+        }
+        for (row.get("sin").?.array.items, 0..) |w, d| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(fixtureF64(w))), sin[d], 1e-6);
+        }
+        // Scaled: the same rows with the mscale folded in — what the engine
+        // hands to `applyMrope`, and what vLLM bakes into its cos_sin_cache.
+        fillCosSin(&cos, &sin, text_only, p, 1, 1, &got, sel[0..], rotary_dim, ms);
+        for (row.get("cos_scaled").?.array.items, 0..) |w, d| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(fixtureF64(w))), cos[d], 1e-6);
+        }
+        for (row.get("sin_scaled").?.array.items, 0..) |w, d| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(fixtureF64(w))), sin[d], 1e-6);
+        }
+    }
+    try std.testing.expect(rows_seen >= 12);
+    std.debug.print("[qwen4-yarn] {d} freqs + {d} position rows (through {d}) match HF/vLLM\n", .{
+        got.len, rows_seen, fx.get("extended_max_position_embeddings").?.integer,
+    });
 }

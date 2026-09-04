@@ -317,6 +317,9 @@ pub const ModelConfig = struct {
     yarn_beta_fast: f32 = 32.0,
     yarn_beta_slow: f32 = 1.0,
     yarn_attention_factor: f32 = 1.0,
+    /// HF's `truncate` (default true): floor/ceil the ramp correction bounds to
+    /// whole dims. Only the flat-`rope_parameters` readers set it.
+    yarn_truncate: bool = true,
 
     // Inkling (inkling_mm_model, Thinking Machines Inkling Small). NO RoPE:
     // position = the RelativeLogits bias (per-layer wr_du → [heads, d_rel]
@@ -701,6 +704,36 @@ pub const ModelConfig = struct {
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
     }
 
+    /// Which `partial_rotary_factor` the YaRN table covers: laguna/gemma4 scale
+    /// only their full-attention layers and spell that one
+    /// `partial_rotary_factor_global`; every other YaRN arch (qwen4_exp) has a
+    /// single rope for the whole trunk.
+    pub fn yarnPartial(self: *const ModelConfig) f32 {
+        return if (self.isQwen4()) self.partial_rotary_factor else self.partial_rotary_factor_global;
+    }
+
+    /// `int(head_dim × yarnPartial())` — the rotating slice of a head, i.e. the
+    /// dims the YaRN frequency table covers (qwen4_exp: 256 × 0.25 = 64, whose
+    /// 32 frequencies are what `mrope_section` [11,11,10] sums to).
+    pub fn yarnRotaryDim(self: *const ModelConfig) u32 {
+        return @intFromFloat(@as(f32, @floatFromInt(self.head_dim)) * self.yarnPartial());
+    }
+
+    /// The longest sequence the rope can actually resolve. Plain:
+    /// `max_position_embeddings`. YaRN: `original_max_position_embeddings ×
+    /// factor` — the window HF and vLLM both derive `max_model_len` from — since
+    /// a position past it aliases back inside the ramp. 0 = no rope-derived cap.
+    pub fn contextCap(self: *const ModelConfig) u32 {
+        const declared = self.max_position_embeddings;
+        if (!self.rope_yarn) return declared;
+        const orig: f64 = @floatFromInt(self.yarn_orig_max_pos);
+        const factor: f64 = @floatCast(self.yarn_factor);
+        const scaled: f64 = @floor(orig * factor);
+        const max_u32: f64 = @floatFromInt(std.math.maxInt(u32));
+        const window: u32 = if (scaled >= max_u32) std.math.maxInt(u32) else @intFromFloat(scaled);
+        return if (declared == 0) window else @min(window, declared);
+    }
+
     /// How many layers hold an attention KV cache. A hybrid arch interleaves
     /// linear-attention layers, which carry a FIXED-SIZE recurrent state
     /// instead of a per-token cache — billing them as attention layers made
@@ -759,6 +792,19 @@ pub const ModelConfig = struct {
         else
             @as(u64, self.num_key_value_heads);
         return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
+    }
+
+    /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
+    /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
+    /// layer. Not kv-quantized. Zero on archs without an indexer. The
+    /// auto-context sizer and the prefill guard add this ONCE — stride
+    /// checkpoints no longer clone it.
+    pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
+        return n * hd * 2 + n * hd * 2 / ratio;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1469,8 +1515,133 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
     }
 }
 
+/// Flat HF `rope_parameters` carrying `rope_type: "yarn"` — the YaRN context
+/// extension, i.e. exactly what vLLM's `--hf-overrides` recipe for Qwen3.5
+/// writes:
+///
+///   {"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+///     "original_max_position_embeddings": 262144, "rope_theta": 10000000,
+///     "partial_rotary_factor": 0.25, "mrope_interleaved": true,
+///     "mrope_section": [11,11,10]}}}
+///
+/// `factor` may be omitted, in which case HF derives it from
+/// `max_position_embeddings / original_max_position_embeddings` (as vLLM's
+/// `_get_and_verify_max_len` does). `attention_factor` is HF's key and
+/// REPLACES the computed mscale; `attn_factor` is vLLM's and MULTIPLIES
+/// `yarnMscale(factor)`. Neither is present in a vendor config, and per HF's
+/// default the mscale is then COMPUTED as 0.1·ln(factor)+1 — the value the
+/// scaling was calibrated with. Nested per-layer-type `rope_parameters`
+/// (laguna/gemma4) never reach here: they have no top-level `rope_type`.
+fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !void {
+    const rp_val = cfg_obj.get("rope_parameters") orelse return;
+    if (rp_val != .object) return;
+    const rp = rp_val.object;
+    const rt = rp.get("rope_type") orelse return;
+    if (!(rt == .string and std.mem.eql(u8, rt.string, "yarn"))) return;
+
+    if (rp.get("original_max_position_embeddings")) |v| {
+        if (v == .integer) config.yarn_orig_max_pos = @intCast(v.integer);
+    }
+    // A YaRN block with no window to scale FROM is not a scaling we can
+    // reproduce: the ramp bounds (and so every mid-band frequency) come from
+    // it. Refuse the load rather than serve a silently-wrong rotation.
+    if (config.yarn_orig_max_pos == 0) return error.YarnRopeNeedsOriginalMaxPos;
+    if (rp.get("factor")) |v| config.yarn_factor = jsonFloat(v);
+    if (rp.get("beta_fast")) |v| config.yarn_beta_fast = jsonFloat(v);
+    if (rp.get("beta_slow")) |v| config.yarn_beta_slow = jsonFloat(v);
+    if (rp.get("truncate")) |v| {
+        if (v == .bool) config.yarn_truncate = v.bool;
+    }
+    if (config.yarn_factor <= 0.0) return error.InvalidRopeScalingFactor;
+    // HF: `factor = max_position_embeddings / original_max_position_embeddings`
+    // when the block leaves it out (the config then only states the window).
+    if (rp.get("factor") == null and config.max_position_embeddings > config.yarn_orig_max_pos) {
+        config.yarn_factor = @as(f32, @floatFromInt(config.max_position_embeddings)) /
+            @as(f32, @floatFromInt(config.yarn_orig_max_pos));
+    }
+    // HF `attention_factor` replaces; vLLM `attn_factor` multiplies the
+    // computed 0.1·ln(factor)+1. Both present → HF wins.
+    if (rp.get("attention_factor")) |v| {
+        config.yarn_attention_factor = jsonFloat(v);
+    } else if (rp.get("attn_factor")) |v| {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor) * jsonFloat(v);
+    } else {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor);
+    }
+    config.rope_yarn = true;
+}
+
+/// HF's default YaRN mscale (`attention_factor`) for a scaling `factor`.
+fn yarnMscale(factor: f32) f32 {
+    if (factor <= 1.0) return 1.0;
+    return 0.1 * @log(@as(f32, factor)) + 1.0;
+}
+
+/// Launch-time JSON deep-merged into every `config.json` before it is parsed,
+/// set once from `--config-overrides`. vLLM's `--hf-overrides` analogue: the
+/// only way to re-shape a checkpoint's declared geometry — most often to scale
+/// its rope and widen the context — without editing the model directory, and
+/// therefore the way to A/B a scaling experiment on identical weights.
+var config_overrides: ?[]const u8 = null;
+
+pub fn setConfigOverrides(raw: ?[]const u8) void {
+    config_overrides = raw;
+}
+
+pub fn getConfigOverrides() ?[]const u8 {
+    return config_overrides;
+}
+
+/// Deep-merge `overrides` into a config.json document: objects merge key by key
+/// — so `{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4}}}`
+/// keeps every sibling it passes through, exactly like vLLM's
+/// `_apply_dict_overrides` — and anything else replaces. The whole merge lives
+/// in an arena that dies before this returns; only the re-serialized bytes (in
+/// `allocator`) escape.
+fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dst = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
+    const src = try std.json.parseFromSliceLeaky(std.json.Value, a, overrides, .{});
+    if (dst != .object or src != .object) return error.ConfigOverridesMustBeObject;
+    try mergeObjects(a, &dst.object, src.object);
+    var out: std.Io.Writer.Allocating = .init(a);
+    var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    try dst.jsonStringify(&jws);
+    return allocator.dupe(u8, out.written());
+}
+
+fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.ObjectMap) !void {
+    var it = src.iterator();
+    while (it.next()) |e| {
+        if (dst.getPtr(e.key_ptr.*)) |p| {
+            if (p.* == .object and e.value_ptr.* == .object) {
+                // The handle is copied, so a rehash inside the recursion would
+                // be lost — merge through the copy and store it back. `p` stays
+                // valid: `dst` itself is not written during the recursion.
+                var child = p.object;
+                try mergeObjects(a, &child, e.value_ptr.object);
+                p.* = .{ .object = child };
+                continue;
+            }
+        }
+        // Keys and values are arena-owned by the override document, which
+        // outlives this merge.
+        try dst.put(a, e.key_ptr.*, e.value_ptr.*);
+    }
+}
+
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    // The launch-time overrides apply to EVERY parse (primary load, on-demand
+    // load, discovery stubs), so the advertised context and the loaded model
+    // can never disagree about what window the checkpoint has.
+    const merged: ?[]const u8 = if (config_overrides) |ov| blk: {
+        break :blk try mergeConfigJson(allocator, content, ov);
+    } else null;
+    defer if (merged) |m| allocator.free(m);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged orelse content, .{});
     defer parsed.deinit();
 
     const root = parsed.value.object;
@@ -2086,6 +2257,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.hc_lowrank = 320;
         config.ple_embed_dim = config.hidden_size;
         parseQwenVisionFields(&config, root, cfg_obj);
+        // YaRN (262144 → e.g. 1048576) rides ONE rotary table for the whole
+        // trunk: attention, the QSA indexer and the MTP head all read it, so
+        // a scaled rotation cannot desync the block selector from attention.
+        try parseYarnRopeParameters(&config, cfg_obj);
         if (cfg_obj.get("hc_count")) |v| {
             if (v == .integer) config.hc_count = @intCast(v.integer);
         }
@@ -6344,6 +6519,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 12 * 128 * 2 + 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
@@ -6383,4 +6559,289 @@ test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower
     try testing.expectEqual(@as(u32, 248057), c.video_token_id);
     try testing.expectEqual(@as(u32, 248053), c.vision_start_token_id);
     try testing.expectEqual(@as(u32, 248054), c.vision_end_token_id);
+}
+
+// ── qwen4_exp YaRN context extension (262144 → 1048576) ──────────────────
+//
+// Both documents below are the SHIPPED checkpoint's text config (Qwen3.8-Flash-
+// Next, `model_type: qwen4_exp`) — one as it ships (plain rope, 262144) and one
+// with the YaRN block vLLM's `--hf-overrides` recipe writes. Keeping them as
+// literals means the parser is tested against the real file shape, braces and
+// all, rather than a synthesized one.
+
+/// The checkpoint as it ships: `rope_type: "default"`, a 262144 window.
+const QWEN4_SHIPPED =
+    \\{
+    \\  "architectures": ["Qwen4ExpForConditionalGeneration"],
+    \\  "model_type": "qwen4_exp",
+    \\  "text_config": {
+    \\    "model_type": "qwen4_exp_text",
+    \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
+    \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+    \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+    \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 262144,
+    \\    "rope_parameters": {
+    \\      "rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+    \\      "mrope_section": [11, 11, 10], "mrope_interleaved": true
+    \\    }
+    \\  }
+    \\}
+;
+
+/// The same checkpoint with its rope scaled 4× and the window widened — exactly
+/// `vllm serve ... --hf-overrides '{"text_config": {"rope_parameters": {...}}}'
+/// --max-model-len 1010000` expressed as config instead of a flag.
+const QWEN4_YARN =
+    \\{
+    \\  "architectures": ["Qwen4ExpForConditionalGeneration"],
+    \\  "model_type": "qwen4_exp",
+    \\  "text_config": {
+    \\    "model_type": "qwen4_exp_text",
+    \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
+    \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+    \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+    \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 1048576,
+    \\    "rope_parameters": {
+    \\      "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144,
+    \\      "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+    \\      "mrope_section": [11, 11, 10], "mrope_interleaved": true
+    \\    }
+    \\  }
+    \\}
+;
+
+test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576" {
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expect(c.isQwen4());
+    // The scaling is recognised and lands where the engine reads it —
+    // transformer.yarnSpec() consumes exactly these fields.
+    try testing.expect(c.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), c.yarn_beta_fast, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.yarn_beta_slow, 1e-9);
+    try testing.expect(c.yarn_truncate); // HF's default, absent from the block
+    // The mscale is COMPUTED (no `attention_factor` in the block, so HF's
+    // default applies): 0.1·ln 4 + 1 — the value the extension is calibrated to.
+    try testing.expectApproxEqAbs(@as(f32, 1.138629436111989), c.yarn_attention_factor, 1e-6);
+    // qwen4_exp has ONE rope for the trunk, so the YaRN table spans exactly the
+    // 64 dims attention rotates: `partial_rotary_factor`, NOT laguna's
+    // `partial_rotary_factor_global` (1.0 here — reading it would scale all 256
+    // dims and rotate the pass-through slice).
+    try testing.expectApproxEqAbs(@as(f32, 0.25), c.yarnPartial(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.partial_rotary_factor_global, 1e-9);
+    try testing.expectEqual(@as(u32, 64), c.yarnRotaryDim());
+    try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), c.rope_theta, 1.0);
+    // The 32 frequencies of the scaled table are the 32 halves the interleaved
+    // M-RoPE selector splits [11,11,10] across. If they disagreed, half the
+    // table would rotate against an axis the position table doesn't have.
+    try testing.expectEqual(
+        c.mrope_section[0] + c.mrope_section[1] + c.mrope_section[2],
+        c.yarnRotaryDim() / 2,
+    );
+    // The window the server may advertise: original × factor, and the config's
+    // own declaration agrees.
+    try testing.expectEqual(@as(u32, 1_048_576), c.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // Cost of that window: only the 12 interval-full layers bill KV, so
+    // 12 layers × 2 kv heads × (K+V) × 256 dims × 2 bytes = 24 KiB per token.
+    try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 24_576), c.kvBytesPerToken());
+}
+
+test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {
+    // The regression guard for every checkpoint that predates the extension:
+    // no YaRN, and `contextCap` is just max_position_embeddings, so no server
+    // sizing path can shift for a model that did not ask to be scaled.
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(c.isQwen4());
+    try testing.expect(!c.rope_yarn);
+    try testing.expectEqual(@as(f32, 1.0), c.yarn_factor);
+    try testing.expectEqual(@as(u32, 262_144), c.max_position_embeddings);
+    try testing.expectEqual(c.max_position_embeddings, c.contextCap());
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.yarn_attention_factor, 1e-9);
+    // Same geometry otherwise — YaRN is a rotation, not an architecture change.
+    const y = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expectEqual(c.kvBytesPerToken(), y.kvBytesPerToken());
+    try testing.expectEqual(c.num_hidden_layers, y.num_hidden_layers);
+    try testing.expectEqual(c.head_dim, y.head_dim);
+    try testing.expectEqual(c.mrope_section, y.mrope_section);
+}
+
+test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a pinned mscale" {
+    defer setConfigOverrides(null);
+    // HF's `attention_factor` REPLACES the computed 0.1·ln(factor)+1.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,"attention_factor":1.25}}}
+    );
+    const pinned = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(pinned.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 1.25), pinned.yarn_attention_factor, 1e-9);
+    // Still reads theta/partial from the merged block (the base config's values).
+    try testing.expectApproxEqAbs(@as(f32, 0.25), pinned.yarnPartial(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), pinned.rope_theta, 1.0);
+
+    // vLLM's `attn_factor` MULTIPLIES the computed 0.1·ln(factor)+1.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,"attn_factor":0.5}}}
+    );
+    const vl = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 0.5 * 1.138629436111989), vl.yarn_attention_factor, 1e-6);
+
+    // Both keys present: HF's attention_factor wins (replace, not multiply).
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,
+        \\  "attention_factor":1.25,"attn_factor":0.5}}}
+    );
+    const both = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 1.25), both.yarn_attention_factor, 1e-9);
+
+    // The ramp knobs are read too — they move the blend, and so every frequency
+    // between the bands.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,
+        \\  "beta_fast":16,"beta_slow":2,"truncate":false}}}
+    );
+    const tuned = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 16.0), tuned.yarn_beta_fast, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), tuned.yarn_beta_slow, 1e-9);
+    try testing.expect(!tuned.yarn_truncate);
+    // With no pinned mscale, the computed default returns.
+    try testing.expectApproxEqAbs(@as(f32, 1.138629436111989), tuned.yarn_attention_factor, 1e-6);
+}
+
+test "parseConfigFromJson: YaRN derives factor from the window when the block omits it (HF)" {
+    defer setConfigOverrides(null);
+    // HF: `factor = max_position_embeddings / original_max_position_embeddings`
+    // when the block names only the window. Here the override widens the
+    // declared window to 2M out of 262144 → factor 8, mscale 0.1·ln 8 + 1.
+    setConfigOverrides(
+        \\{"text_config":{"max_position_embeddings":2097152,
+        \\  "rope_parameters":{"rope_type":"yarn","original_max_position_embeddings":262144}}}
+    );
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(c.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 8.0), c.yarn_factor, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.2079441541679836), c.yarn_attention_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 2_097_152), c.contextCap());
+}
+
+test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fails the load" {
+    defer setConfigOverrides(null);
+    // The ramp bounds come from `original_max_position_embeddings`. Without it
+    // every blended frequency is a guess — refuse the load rather than serve a
+    // rope that looks fine at short contexts and decays beyond the window.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0}}}
+    );
+    try testing.expectError(
+        error.YarnRopeNeedsOriginalMaxPos,
+        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+    );
+    // A zero factor is not "no scaling", it is a divide-by-zero waiting to run.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":0.0,
+        \\  "original_max_position_embeddings":262144}}}
+    );
+    try testing.expectError(
+        error.InvalidRopeScalingFactor,
+        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+    );
+}
+
+test "ModelConfig.contextCap: the rope-derived window binds what the server advertises" {
+    const scaled = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    // Over-advertised: a config claiming 2M tokens on a factor-4 ramp out of
+    // 262144 still cannot resolve past 1048576 — past there positions alias back
+    // inside the window, which is the failure this clamps against.
+    var c = scaled;
+    c.max_position_embeddings = 2_000_000;
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // Under-advertised: serving LESS than the scaled window is legal — the ramp
+    // is fixed by the pre-trained length, not by what you choose to run.
+    c.max_position_embeddings = 400_000;
+    try testing.expectEqual(@as(u32, 400_000), c.contextCap());
+    // Declaring nothing: the ramp still says how far the rope reaches.
+    c.max_position_embeddings = 0;
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // A fractional factor floors (vLLM's `int()` of the same product).
+    c.yarn_factor = 3.5;
+    try testing.expectEqual(@as(u32, 917_504), c.contextCap()); // floor(262144*3.5)
+}
+
+test "parseConfigFromJson: --config-overrides deep-merges a nested block without clobbering siblings" {
+    // The merge is what makes the flag usable for rope at all: `rope_parameters`
+    // is written as a whole object, and a REPLACE would drop the
+    // `partial_rotary_factor` / `mrope_section` keys beside it — silently
+    // rotating 256 dims instead of 64, or the wrong axes. vLLM has the same
+    // rule (`_update_nested` merges, `_apply_dict_overrides` only replaces
+    // non-config values), and the same trap is documented in its source.
+    defer setConfigOverrides(null);
+    // Pre-override: the shipped config really does have no scaling.
+    try testing.expect(!(try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED)).rope_yarn);
+    setConfigOverrides(
+        \\{"text_config":{"max_position_embeddings":1048576,
+        \\  "rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\    "original_max_position_embeddings":262144}}}
+    );
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(c.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // Keys the override never mentioned survived at BOTH levels of the merge.
+    try testing.expectApproxEqAbs(@as(f32, 0.25), c.partial_rotary_factor, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), c.rope_theta, 1.0);
+    try testing.expect(c.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, c.mrope_section);
+    try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
+    // The result is indistinguishable from the hand-written extended config.
+    const written = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expectApproxEqAbs(written.yarn_factor, c.yarn_factor, 1e-9);
+    try testing.expectEqual(written.contextCap(), c.contextCap());
+    try testing.expectApproxEqAbs(written.yarn_attention_factor, c.yarn_attention_factor, 1e-9);
+}
+
+test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creates new keys, rejects junk" {
+    defer setConfigOverrides(null);
+    // Scalars and arrays replace wholesale (vLLM's base case); an array nested
+    // in an object that is otherwise merged still replaces the array it meets.
+    setConfigOverrides(
+        \\{"text_config":{"num_hidden_layers":8,"head_dim":128,
+        \\  "rope_parameters":{"mrope_section":[9,9,9]}}}
+    );
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expectEqual(@as(u32, 8), c.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 128), c.head_dim);
+    try testing.expectEqual([3]u32{ 9, 9, 9 }, c.mrope_section);
+    try testing.expect(c.rope_yarn); // the block's other keys survived
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
+
+    // A key the document never had is created at the level the parser reads
+    // (qwen4's fields come from `text_config`, so that's where it must land).
+    setConfigOverrides(
+        \\{"text_config":{"ngram_size":5}}
+    );
+    const n = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectEqual(@as(u32, 5), n.ngram_size);
+
+    // Only an object is a document; a bare array must not half-apply.
+    setConfigOverrides(
+        \\[1,2,3]
+    );
+    try testing.expectError(
+        error.ConfigOverridesMustBeObject,
+        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+    );
+    // Clearing the seam restores the shipped document exactly.
+    setConfigOverrides(null);
+    const clean = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectEqual(@as(u32, 48), clean.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 256), clean.head_dim);
+    try testing.expectEqual(@as(u32, 3), clean.ngram_size);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, clean.mrope_section);
+    try testing.expect(!clean.rope_yarn);
 }

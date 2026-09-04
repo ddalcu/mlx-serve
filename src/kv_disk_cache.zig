@@ -51,6 +51,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
+const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 
@@ -296,6 +297,18 @@ pub const DiskTier = struct {
         defer cp.deinit(self.allocator);
         try self.restoreKvInto(cache, e, cp_pos, s);
         try transformer_mod.restoreSsmCheckpoint(ssm_entries, &cp);
+        // QSA history lives on the latest snap only. Intermediate files have
+        // GDN/PLE state; overlay the sliced indexer keys from the last file.
+        if (e.ssm_positions.len > 0) {
+            const latest = e.ssm_positions[e.ssm_positions.len - 1];
+            if (latest != cp_pos) {
+                if (self.loadSsmFile(e.id, latest, ssm_entries.len)) |qsa_cp_val| {
+                    var qsa_cp = qsa_cp_val;
+                    defer qsa_cp.deinit(self.allocator);
+                    transformer_mod.applyQsaHistoryAt(ssm_entries, &qsa_cp, cp_pos, s) catch {};
+                } else |_| {}
+            }
+        }
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp_pos;
@@ -1742,6 +1755,7 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
         const mt: i128 = st.mtime.nanoseconds;
         h.update(std.mem.asBytes(&mt));
     }
+    if (model.getConfigOverrides()) |raw| h.update(raw);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
@@ -2382,6 +2396,7 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
         try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
@@ -2786,4 +2801,43 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
 
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, ""));
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
+}
+
+test "modelFingerprint: rolls with --config-overrides" {
+    defer model.setConfigOverrides(null);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
+    const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir_a);
+
+    model.setConfigOverrides(null);
+    const fp_none = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_none);
+
+    const yarn = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0}}}";
+    model.setConfigOverrides(yarn);
+    const fp_over = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_over);
+    try testing.expectEqual(@as(usize, 16), fp_over.len);
+    try testing.expect(!std.mem.eql(u8, fp_none, fp_over));
+
+    model.setConfigOverrides(yarn);
+    const fp_again = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_again);
+    try testing.expectEqualStrings(fp_over, fp_again);
+
+    // Raw-bytes pin: a whitespace-different spelling of the same JSON is a
+    // different fingerprint (canonicalizing would hide a YaRN boot restoring
+    // an unscaled SSD prefix if the override was re-spelled).
+    const yarn_ws = "{\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4.0}}}";
+    model.setConfigOverrides(yarn_ws);
+    const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_ws);
+    try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
 }
