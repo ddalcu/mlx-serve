@@ -637,6 +637,60 @@ test "prefill progress is exposed live, not only at request completion" {
     try testing.expect(std.mem.indexOf(u8, jw2.buffered(), "\"requests_prefilling\":1") != null);
 }
 
+test "prefill target/prompt pair exposes live prefix-cache reuse" {
+    const testing = std.testing;
+    // `prefill_tokens_live` had no denominator: "12288 tokens done" out of
+    // WHAT? And the `prefix_cache_*_total` counters are lifetime sums, so
+    // nothing answered "what did the request I am watching reuse?".
+    //
+    // The pair does both. `prompt` is the untrimmed length, `target` is what
+    // the chunk loop will really forward after the hot cache trimmed the
+    // reused head, so:
+    //     progress = live / target        reused_now = prompt - target
+    var m = Metrics.init();
+
+    // The measured warm request from the commit message (M4 Max,
+    // Qwen3.5-4B-4bit): a 27399-token prompt whose head the cache restored,
+    // 3111 tokens left to compute, 24288 tokens' worth of head reused.
+    m.prefill_prompt_tokens.set(27399);
+    m.prefill_target_tokens.set(3111);
+    m.prefill_tokens_live.set(1024);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "# TYPE mlx_serve:prefill_prompt_tokens gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "# TYPE mlx_serve:prefill_target_tokens gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_prompt_tokens 27399") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_target_tokens 3111") != null);
+
+    var jbuf: [8192]u8 = undefined;
+    var jw = std.Io.Writer.fixed(&jbuf);
+    try renderJson(&m, &jw);
+    const jout = jw.buffered();
+    try testing.expect(std.mem.indexOf(u8, jout, "\"prefill_prompt_tokens\":27399") != null);
+    try testing.expect(std.mem.indexOf(u8, jout, "\"prefill_target_tokens\":3111") != null);
+
+    // The contract a consumer relies on: target never exceeds prompt, and the
+    // difference is the reuse. A target published BEFORE the hot-cache trim
+    // would make these equal and the reuse invisible — which is the whole
+    // point of the pair.
+    const prompt = m.prefill_prompt_tokens.load();
+    const target = m.prefill_target_tokens.load();
+    try testing.expect(target <= prompt);
+    try testing.expectEqual(@as(u64, 24288), prompt - target);
+
+    // At rest all three read 0 together. ds4/llama/diffusion prefills never
+    // move any of them, so a consumer must not see prompt > 0 next to
+    // target == 0 and read it as "nothing left to compute".
+    m.prefill_prompt_tokens.set(0);
+    m.prefill_target_tokens.set(0);
+    m.prefill_tokens_live.set(0);
+    try testing.expectEqual(@as(u64, 0), m.prefill_prompt_tokens.load());
+    try testing.expectEqual(@as(u64, 0), m.prefill_target_tokens.load());
+}
+
 test "renderPrometheus emits well-formed Prometheus text" {
     const testing = std.testing;
     var m = Metrics.init();

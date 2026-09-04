@@ -323,6 +323,109 @@ check "forwarded + restored == billed ($F2 + $C2 == $P2)" \
 check "prefill_tokens_total <= prompt_tokens_total" \
     "$([ "$F2" -le "$P2" ] 2>/dev/null && echo 1 || echo 0)"
 
+# ── Phase 6: the prefill target is the POST-trim figure ──
+#
+# `prefill_prompt_tokens` is published at the top of the MLX prefill (the
+# UNTRIMMED prompt); `prefill_target_tokens` only after the hot prefix cache
+# has trimmed the reused head off it. Their difference is what the cache
+# restored for the request in flight.
+#
+# This phase is the guard the unit test cannot be. Dropping the target store,
+# or moving it back above the trim, still renders a well-formed gauge and still
+# passes `zig build test` — what it breaks is only visible live: target ==
+# prompt on a warm request, the reuse invisible, and the progress bar jumping
+# to ~97% on the first chunk.
+echo ""
+echo "── Phase 6: prefill target is post-trim (live prefix-cache reuse) ──"
+
+# Sample the pair WHILE a request prefills, keeping only a POST-TRIM sample.
+#
+# The gauge sampler ticks every 2 s and the target is published later than the
+# prompt (the cache restore runs between them), so an early tick legitimately
+# reads "prompt=N target=0". Latching the first sample with the largest prompt
+# would keep exactly that one and report target=0 for every request — so take
+# the largest prompt among samples that HAVE a target. `final_len` is at least
+# 1 even on a full match (the cache re-forwards the last token), so target > 0
+# is a sound "we are past the trim" signal. Echoes "prompt target", or "0 0"
+# when the window was missed entirely.
+sample_pair() {
+    local body="$1" bp=0 bt=0 pp tt
+    curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+         -d "$body" >/dev/null &
+    local pid=$!
+    for _ in $(seq 1 700); do
+        kill -0 $pid 2>/dev/null || break
+        read -r pp tt <<< "$(curl -s -m 2 "$BASE/metrics.json" | python3 -c "
+import json,sys
+try:
+    g = json.load(sys.stdin)['gauges']
+    print(g.get('prefill_prompt_tokens', 0), g.get('prefill_target_tokens', 0))
+except Exception: print(0, 0)" 2>/dev/null)"
+        if [ "${tt:-0}" -gt 0 ] 2>/dev/null && [ "${pp:-0}" -ge "$bp" ] 2>/dev/null; then
+            bp=$pp; bt=$tt
+        fi
+        sleep 0.5
+    done
+    wait $pid 2>/dev/null
+    echo "$bp $bt"
+}
+
+mk_body() { python3 -c "
+import json,sys
+print(json.dumps({'model':'mlx-serve','stream':False,'max_tokens':1,'temperature':0,
+                  'messages':[{'role':'user','content':sys.stdin.read()}]}))" ; }
+
+# One shared head, a UNIQUE tail per request. A warm request then reuses
+# exactly the head and forwards exactly its own tail — which keeps the warm
+# prefill long enough (thousands of tokens) to span a 2 s sampler tick. Re-
+# sending an identical prompt would instead trim to a single token and finish
+# between two ticks.
+P6_HEAD=$(python3 -c "print(('A prefix cache restores the head of a repeated prompt. ' * 1500).strip())")
+p6_tail() { python3 -c "
+import sys
+print('Variant ' + sys.argv[1] + ' begins here. ' +
+      ('This suffix is new and must actually be computed. ' * 600).strip())" "$1"; }
+
+COLD=$(printf '%s' "$P6_HEAD" | mk_body)
+read -r C_PROMPT C_TARGET <<< "$(sample_pair "$COLD")"
+check "cold prefill: both gauges published mid-prefill (prompt=$C_PROMPT target=$C_TARGET)" \
+    "$([ "$C_PROMPT" -gt 0 ] 2>/dev/null && [ "$C_TARGET" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+# Not `==`: earlier phases left entries in the cache that share this prompt's
+# chat-template header, and the RAM tier has no minimum match length, so a
+# handful of header tokens can legitimately be trimmed. What must hold is that
+# nothing SUBSTANTIAL was reused.
+check "cold prefill: nothing substantial reused, target >= 95% of prompt" \
+    "$([ "$C_TARGET" -gt 0 ] 2>/dev/null && [ "$C_TARGET" -ge $((C_PROMPT * 95 / 100)) ] 2>/dev/null && echo 1 || echo 0)"
+
+# Same head + a fresh tail: the cache restores the head, so the target must be
+# MUCH smaller than the prompt. This is the assertion that dies if the target
+# is published before the trim. Retry with a new tail if the sampler missed the
+# post-trim window — the head stays hot, so every attempt is equivalent.
+W_PROMPT=0; W_TARGET=0
+for V in 1 2 3; do
+    WARM6=$(p6_tail "$V" | { printf '%s ' "$P6_HEAD"; cat; } | mk_body)
+    read -r W_PROMPT W_TARGET <<< "$(sample_pair "$WARM6")"
+    [ "${W_TARGET:-0}" -gt 0 ] 2>/dev/null && break
+done
+W_REUSED=$((W_PROMPT - W_TARGET))
+check "warm prefill: post-trim sample caught (prompt=$W_PROMPT target=$W_TARGET)" \
+    "$([ "$W_TARGET" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+check "warm prefill: prompt grew (=$W_PROMPT > cold $C_PROMPT)" \
+    "$([ "$W_PROMPT" -gt "$C_PROMPT" ] 2>/dev/null && echo 1 || echo 0)"
+check "warm prefill: target is POST-trim, well below prompt ($W_TARGET < half of $W_PROMPT)" \
+    "$([ "$W_TARGET" -lt $((W_PROMPT / 2)) ] 2>/dev/null && echo 1 || echo 0)"
+check "warm prefill: reuse is visible and matches the cold prompt (reused=$W_REUSED ~ $C_PROMPT)" \
+    "$([ "$W_REUSED" -gt $((C_PROMPT * 8 / 10)) ] 2>/dev/null && echo 1 || echo 0)"
+
+# Both return to rest, so "prefilling" keeps meaning exactly that.
+sleep 3
+IDLE_PAIR=$(curl -s "$BASE/metrics.json" | python3 -c "
+import json,sys
+g = json.load(sys.stdin)['gauges']
+print(g.get('prefill_prompt_tokens', -1), g.get('prefill_target_tokens', -1))")
+check "both gauges back to 0 at rest ($IDLE_PAIR)" \
+    "$([ "$IDLE_PAIR" = "0 0" ] && echo 1 || echo 0)"
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 TOTAL=$((PASS + FAIL))
