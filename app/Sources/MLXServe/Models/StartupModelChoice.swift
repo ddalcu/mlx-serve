@@ -119,6 +119,30 @@ enum StartupModelChoice {
         /// Server up with `--model <path>` — the eager load, now only ever
         /// reached because the user explicitly asked for it.
         case load(path: String)
+
+        /// The model this plan puts resident, or nil for none.
+        var modelPath: String? {
+            guard case .load(let path) = self else { return nil }
+            return path
+        }
+    }
+
+    /// The model a server started for LAN duty AT LAUNCH should load.
+    ///
+    /// LAN sharing and discovery live in the server process, so with either on
+    /// the app brings a server up even when auto-start is off — and that start
+    /// used to pass `selectedModelPath`, which is the eager load this whole
+    /// split exists to stop (issue #214). It would have been the back door:
+    /// auto-start off, "Load a model at start" off, and login still pays for a
+    /// checkpoint because the Mac happens to share models. Empty = headless,
+    /// which is all LAN duty needs; only a plan that ASKED for a load names one.
+    ///
+    /// Only for the launch path. `ensureServerForLan()` called later — from the
+    /// chat window's Start button, a LAN model pick, a peer-list refresh — still
+    /// loads the selection, because there the user just asked for a server they
+    /// intend to chat with.
+    static func lanStartPath(plan: Launch) -> String {
+        plan.modelPath ?? ""
     }
 
     static func launch(autoStart: Bool,
