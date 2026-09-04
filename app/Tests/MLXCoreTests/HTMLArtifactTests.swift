@@ -98,12 +98,19 @@ final class HTMLArtifactTests: XCTestCase {
                        "exactly one document element")
     }
 
-    func testScaffoldFollowsTheAppAppearance() {
-        // A transcript is read in both appearances; a scaffold that hard-codes
-        // one paints black text on black half the time.
+    func testTheScaffoldStylesNothingItself() {
+        // A transcript is read in both appearances, and following one is the
+        // STAGE's job (`HTMLArtifactRuntime`), which a complete document gets
+        // too. A stylesheet here would sit later in the cascade than that one
+        // and beat it — so a fragment and a page would be styled by different
+        // rules, and the opaque `Canvas` background this used to paint is a
+        // white slab inside a dark card.
         let out = HTMLArtifact.document(for: "<div>x</div>").lowercased()
-        XCTAssertTrue(out.contains("color-scheme: light dark"))
-        XCTAssertTrue(out.contains("canvastext"))
+        XCTAssertFalse(out.contains("<style"))
+        XCTAssertFalse(out.contains("canvastext"))
+        XCTAssertTrue(HTMLArtifactRuntime.stageCSS(theme: .init(foreground: "#111", background: "#fff",
+                                                               accent: "#07f", dark: false))
+                        .contains("color-scheme"))
     }
 
     func testScaffoldNeverReferencesTheNetwork() {

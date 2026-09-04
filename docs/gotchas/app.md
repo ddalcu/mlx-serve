@@ -145,6 +145,114 @@ artifact selects within the page, not as part of a drag across the whole reply �
 which is why the block keeps a Code toggle showing the same `CodeBlockBody`
 every other fence renders.
 
+### Refining it: an artifact is a surface, not a page in a box
+
+The first shape was faithful and looked it. A model writes a page — and a page
+written by a model is written for a browser window: `body { min-height: 100vh;
+display: flex; align-items: center; background: #0f172a; color: #e2e8f0 }`.
+Loaded verbatim into a `CodeBlockView` card that is a dark rectangle inside a
+light rounded rectangle with a grey header strip on top, and a hairline between
+them. Three surfaces where the reader sees one object, and every one of them
+technically correct.
+
+Three things fixed it, and each is a different kind of problem.
+
+**The stage.** The page is still loaded verbatim; nothing rewrites the model's
+markup, which is what kept the "a complete document loads VERBATIM" rule true.
+The defaults arrive instead as a `WKUserScript` at document START — a stylesheet
+inserted ahead of everything the page declares, so it is a floor the page
+overrides rather than a costume fighting its CSS. That is also where the app's
+palette is handed over (`--mlx-fg`, `--mlx-bg`, `--mlx-accent`): a model that
+knows about the custom properties can write a widget that matches the chat
+exactly, and one that doesn't still lands on the app's type and accent colour
+instead of Times New Roman on white. Document start is load-bearing a second
+time for a reason that has nothing to do with CSS: the error listeners have to
+be installed before the page's own inline scripts execute, or a script that
+throws has already thrown by the time anything is watching.
+
+**The clamp, and the measurement that was circular.** `min-height: 100vh` inside
+a transcript is a self-fulfilling measurement — `100vh` resolves to the frame
+height, which is whatever we guessed, so the page reports our guess back and can
+never say anything else however long it settles. Measured, with a 90pt card in a
+400pt frame: 428pt reported, i.e. 300-odd points of the model's background
+colour with a two-line widget floating in the middle of it. That is the "crappy
+background" complaint in its exact form. The clamp is the one rule allowed to
+shout (`!important`), and it needs two halves: a stylesheet rule for html/body,
+and a bounded JS pass for descendants, because `.wrap { min-height: 100vh }`
+locks a page just as hard and a rule on html/body cannot reach it. Both halves
+were verified red-on-revert, each reporting the same 428. It removes a FLOOR
+only — nothing is ever made shorter than its own content, or Expand would reveal
+a page cut off at the knee.
+
+Worth recording what was NOT the bug, since the first version of the guard
+tested for it and passed vacuously: a viewport-locked page with content TALLER
+than the frame measures fine, because `scrollHeight` is content-driven and
+`min-height` is a floor. The failure is entirely on short content.
+
+**The hoist.** Once the page collapses to its own content, the remaining
+mismatch is colour: a dark page still sits inside a light card. So the probe
+reports the page's own computed background and the card wears it. An opaque
+colour (alpha ≥ 0.9) becomes the card's fill; a gradient cannot be reduced to
+one fill, so the page keeps painting it edge to edge and only lends its mood —
+which way the floating controls should read, answered by the page's own text
+colour, since light text means a dark surface under it. The fill goes through
+`CodeBlockChrome(fill:)`, a parameter on the shared modifier rather than a
+second modifier, because an artifact with a different corner radius than the
+code block beside it reads as a different app.
+
+**The transparency that isn't available.** The obvious version of all this is to
+make the page transparent and let the card show through. WebKit paints an opaque
+backdrop under a transparent page, and on macOS the public switch does not turn
+it off: `underPageBackgroundColor = .clear` was measured NOT to composite (a
+pixel read off a red backdrop came back dark), and the answer every search result
+gives — `setValue(false, forKey: "drawsBackground")` — is KVC into a private
+property, which this app cannot ship because it also goes to the App Store. So
+the stage gives the page the transcript card's own colour as its DEFAULT
+background instead. There is no seam to hide because both sides paint the same
+thing, and the failure mode is unbuildable rather than fixed.
+
+That has one consequence worth naming: "unpainted" stops being "transparent" and
+has to be RECOGNISED. The probe resolves `--mlx-bg` through a scratch element —
+the same engine that computed the page's colours — and reports anything equal to
+it as unpainted. Without that, every artifact including a plain fragment comes
+back claiming a surface and the "follow the app's appearance" branch is dead
+code.
+
+**Chrome that isn't there until you reach for it.** The header strip is gone from
+the preview half; the controls are a translucent capsule that fades in on hover,
+in the corner, over the page. Material is the only background that reads over
+colours we do not choose, and its light/dark is pointed at what the page
+actually painted rather than at what the app is wearing. The source half keeps
+the ordinary `CodeBlockHeader` + `CodeBlockBody`, because in that half it IS a
+code block and should be indistinguishable from every other one.
+
+**Saying what the page did not get.** Artifacts run offline by design, so a model
+reaching for a charting library on a CDN produces an empty box — the worst
+possible outcome, because it reads as a broken feature rather than a stated
+limitation. Blocked remote loads are counted (a subresource failure fires its
+error event on the ELEMENT and never bubbles, so a capture-phase listener on
+window is the only place that sees one) and named in a strip under the block,
+along with the first uncaught script error. The user's next move — "make it
+self-contained" — is one a local model can actually act on.
+
+Two smaller ones. A collapsed block hands its scroll back to the transcript
+(`documentElement.style.overflow = 'hidden'`, so the wheel event goes unhandled
+and continues up the responder chain) — a tall artifact is exactly what the
+pointer is over while you read past it. And an appearance change REPLACES the
+stage's stylesheet in place rather than reloading the page: a reload restarts a
+running widget from zero, animations and all, for a colour change.
+
+The guards split the same way the code does. `HTMLArtifactRuntimeTests` holds
+everything pure — colour parsing, the surface decision, the report, the
+diagnostic wording, and two structural rules about the stylesheet itself (the
+defaults must never contain `!important`, the clamp must). `HTMLArtifactLiveTests`
+(`MLX_SERVE_LIVE_ARTIFACT=1`) stands a real `WKWebView` up around the real stage
+and probe, because the clamp, the hoist, the blocked-load count and the
+regrow-on-late-layout are all behaviours of strings inside strings — the same
+class of thing that made the content rule list's missing disjunction findable
+only by hand.
+
+
 ### WKWebView main thread
 `BrowserManager` is `@MainActor`. All WKWebView ops (navigate, readText, evaluateJS) on main thread. Created eagerly at app launch so tools work without Browser window open.
 

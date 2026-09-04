@@ -242,9 +242,19 @@ struct CodeBlockBody: View {
 /// One modifier rather than a copy per block type — an HTML preview sitting
 /// beside a code block with a different radius reads as a different app.
 struct CodeBlockChrome: ViewModifier {
+    /// The surface to paint. `nil` is the transcript's own.
+    ///
+    /// The parameter exists for one caller: an HTML artifact whose page paints
+    /// itself hands its OWN background up here, so the block reads as one
+    /// surface in the model's palette instead of as a coloured rectangle inside
+    /// a grey card. It stays a parameter on the shared modifier rather than a
+    /// second modifier, because the radius and the hairline must not drift
+    /// between a code block and the artifact sitting beside it.
+    var fill: Color?
+
     func body(content: Content) -> some View {
         content
-            .background(CodeTheme.background)
+            .background(fill ?? CodeTheme.background)
             .clipShape(RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius))
             .overlay(
                 RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius)

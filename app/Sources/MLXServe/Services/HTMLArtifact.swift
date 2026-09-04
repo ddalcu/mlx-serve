@@ -92,30 +92,24 @@ enum HTMLArtifact {
         isCompleteDocument(code) ? code : Self.scaffoldOpen + code + Self.scaffoldClose
     }
 
-    /// Wrapper for a fragment: enough for it to be legible in the transcript,
-    /// and nothing more.
+    /// Wrapper for a fragment: a document element to live in, and nothing more.
     ///
-    /// Colours come from the CSS system palette (`Canvas` / `CanvasText`) under
-    /// `color-scheme: light dark`, so the page follows the app's appearance
-    /// without the block having to be re-rendered when the user switches. No
-    /// font file, no reset stylesheet, no `<base>` — the block is loaded with a
-    /// nil base URL and every remote load is blocked, so anything the scaffold
-    /// pulled in would be the one request that had to be let through.
+    /// It carries NO styling. Everything a page needs to be legible in the
+    /// transcript — the palette, the type, the padding, the transparent
+    /// background that lets the card show through — is injected at document
+    /// start by `HTMLArtifactRuntime`, which a complete document gets too. A
+    /// stylesheet here would sit LATER in the cascade than that one and beat
+    /// it, so a fragment and a page would be styled by different rules; worse,
+    /// this one used to paint an opaque `Canvas` background, which is a white
+    /// slab inside a dark card the moment the app and the page disagree.
+    ///
+    /// No font file, no reset stylesheet, no `<base>`: the block is loaded with
+    /// a nil base URL and every remote load is blocked, so anything the
+    /// scaffold pulled in would be the one request that had to be let through.
     private static let scaffoldOpen = """
     <!doctype html><html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-    :root { color-scheme: light dark; }
-    html { height: auto; }
-    body {
-      margin: 0; padding: 8px; height: auto;
-      background: Canvas; color: CanvasText;
-      font: 15px system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-      -webkit-text-size-adjust: 100%;
-    }
-    img, svg, canvas, video, table, pre { max-width: 100%; }
-    a { color: LinkText; }
-    </style></head><body>
+    </head><body>
     """
 
     private static let scaffoldClose = "</body></html>"
@@ -123,7 +117,9 @@ enum HTMLArtifact {
     /// Shown in place of the preview when the network blocker is unavailable.
     ///
     /// Carries none of the model's markup — the whole point is that nothing
-    /// from the reply executes on this path.
+    /// from the reply executes on this path. Its one inline rule is a colour it
+    /// inherits from the stage, so the refusal reads on whatever the app is
+    /// wearing without naming a colour of its own.
     static let previewUnavailableDocument = Self.scaffoldOpen + """
     <p style="opacity:.7;font-size:13px;margin:0">
     Preview unavailable — the sandbox that keeps this page offline could not be
