@@ -463,8 +463,9 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
-        case .flux2Klein9B:
-            // The one MLX conversion of klein 9B ships no root config.json.
+        case .flux2Klein9B, .flux2Klein9BBase:
+            // The MLX conversions of klein 9B — distilled and base alike —
+            // ship no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))

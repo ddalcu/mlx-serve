@@ -1242,6 +1242,38 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(json["lora_scales"] as? [Double], [0.9])
     }
 
+    func testImageRequestJsonOmitsGuidanceFieldsAtDefaults() {
+        let req = ImageGenRequest(model: .flux2Klein9BBase_Q4, prompt: "x", width: 1024, height: 1024, steps: 30)
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertNil(json["guidance_scale"])
+        XCTAssertNil(json["negative_prompt"])
+    }
+
+    func testImageRequestJsonIncludesGuidanceScaleAndTrimmedNegativePrompt() {
+        var req = ImageGenRequest(model: .flux2Klein9BBase_Q4, prompt: "x", width: 1024, height: 1024, steps: 30)
+        req.guidanceScale = 3.5
+        req.negativePrompt = "  blurry, low quality  "
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["guidance_scale"] as? Double, 3.5)
+        XCTAssertEqual(json["negative_prompt"] as? String, "blurry, low quality")
+    }
+
+    func testImageRequestJsonOmitsBlankNegativePromptEvenWithGuidanceSet() {
+        var req = ImageGenRequest(model: .flux2Klein9BBase_Q4, prompt: "x", width: 1024, height: 1024, steps: 30)
+        req.guidanceScale = 3.5
+        req.negativePrompt = "   "
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["guidance_scale"] as? Double, 3.5)
+        XCTAssertNil(json["negative_prompt"])
+    }
+
+    func testOnlyTheBaseKleinPresetDeclaresGuidanceSupport() {
+        XCTAssertTrue(ImageModelPreset.flux2Klein9BBase_Q4.supportsGuidance)
+        XCTAssertFalse(ImageModelPreset.flux2Klein4B_Q4.supportsGuidance)
+        XCTAssertFalse(ImageModelPreset.flux2Klein9B_Q4.supportsGuidance)
+        XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsGuidance)
+    }
+
     func testParseCondWeightsAcceptsCommasAndSpacesRejectsGarbage() {
         XCTAssertEqual(ImageGenRequest.parseCondWeights("1,2,3"), [1, 2, 3])
         XCTAssertEqual(ImageGenRequest.parseCondWeights(" 0.5  1\t-2 "), [0.5, 1, -2])

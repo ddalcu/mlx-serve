@@ -141,6 +141,7 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 
 - `POST /v1/images/edits` = OpenAI multipart translated by `gen.openaiEditFormToJson` into the `mode:"edit"` JSON body; unhonored fields = NAMED 400.
 - LoRAs are STACKED, ONE grammar across image/LTX/H3: `lora_paths`+`lora_scales` (cap 8, `gen.parseLoraFields`), summed at forward — never merged. Resident backends reconcile via `setLoras`; H3 pre-validates (`lora.validatePath`), Turbo = file 0.
+- **FLUX real CFG** (`guidance_scale`+`negative_prompt`, `gen.ImageEngine.supportsGuidance`): distilled klein bakes guidance into the weights and takes NEITHER field (1.0 default = the unconditional forward never runs, `flux.ditVelocity` called once); the undistilled "base" 9B checkpoint (`flux2-klein-9b-base`, app preset `flux2Klein9BBase_Q4`) needs it — TWO forwards per denoise step, blended `uncond + scale·(cond−uncond)`. Same DiT geometry as the distilled 9B (checkpoint-derived), so nothing else about loading changes.
 - Endpoint/field/backend detail: `docs/reference.md`. Guards: `tests/test_unified_gen.sh` + per-modality scripts; parity via env-gated cos oracles (`tests/dump_*_fixtures.py`).
 
 ## HTTP APIs

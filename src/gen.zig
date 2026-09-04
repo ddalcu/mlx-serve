@@ -360,20 +360,22 @@ const FluxImpl = struct {
         self.allocator.free(self.model_dir);
     }
 
-    /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline →
-    /// image [1,3,H,W] f32 in [0,1] (owned mlx array; caller frees).
-    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
-        // mflux Qwen3 chat template (enable_thinking=False adds an empty <think> block).
-        const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{prompt});
+    /// Tokenize text with the mflux Qwen3 chat template (enable_thinking=False
+    /// adds an empty <think> block), padded/truncated to the fixed
+    /// `FLUX_SEQ_LEN` the DiT's text-position ids are built for. Shared by
+    /// the prompt and (CFG) negative-prompt encodes so both land on the same
+    /// shape.
+    fn tokenizeFixed(self: *FluxImpl, allocator: std.mem.Allocator, text: []const u8) !struct { ids: []i32, mask: []i32 } {
+        const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{text});
         defer allocator.free(templated);
 
         const enc = try self.tok.encode(allocator, templated);
         defer allocator.free(enc);
 
-        var ids = try allocator.alloc(i32, FLUX_SEQ_LEN);
-        defer allocator.free(ids);
-        var mask = try allocator.alloc(i32, FLUX_SEQ_LEN);
-        defer allocator.free(mask);
+        const ids = try allocator.alloc(i32, FLUX_SEQ_LEN);
+        errdefer allocator.free(ids);
+        const mask = try allocator.alloc(i32, FLUX_SEQ_LEN);
+        errdefer allocator.free(mask);
         const real = @min(enc.len, FLUX_SEQ_LEN);
         for (0..FLUX_SEQ_LEN) |i| {
             if (i < real) {
@@ -384,7 +386,18 @@ const FluxImpl = struct {
                 mask[i] = 0;
             }
         }
-        var fopts = flux.GenOpts{ .cond_gain = opts.cond_gain, .cond_weights = opts.cond_weights };
+        return .{ .ids = ids, .mask = mask };
+    }
+
+    /// Run the FLUX pipeline → image [1,3,H,W] f32 in [0,1] (owned mlx array;
+    /// caller frees).
+    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+        const pos = try self.tokenizeFixed(allocator, prompt);
+        defer allocator.free(pos.ids);
+        defer allocator.free(pos.mask);
+        const ids = pos.ids;
+        const mask = pos.mask;
+        var fopts = flux.GenOpts{ .cond_gain = opts.cond_gain, .cond_weights = opts.cond_weights, .guidance_scale = opts.guidance_scale };
         var init_lat: ?mlx.mlx_array = null;
         defer if (init_lat) |l| {
             _ = mlx.mlx_array_free(l);
@@ -417,6 +430,15 @@ const FluxImpl = struct {
         // (pinned by tests/test_flux_lowmem.sh).
         if (self.te == null) {
             self.te = try flux.loadTextEncoder(self.io, self.allocator, self.s, self.model_dir);
+        }
+        // Classifier-free guidance (base klein): encode the negative prompt
+        // (default "" — unconditional) at the SAME fixed length, so the
+        // denoise loop's cond/uncond forwards share img_ids/txt_ids.
+        if (opts.guidance_scale != 1.0) {
+            const neg = try self.tokenizeFixed(allocator, opts.negative_prompt);
+            defer allocator.free(neg.ids);
+            defer allocator.free(neg.mask);
+            fopts.neg_enc = try flux.encodePrompt(&self.te.?, neg.ids, neg.mask, fopts);
         }
         const cond = try flux.encodePrompt(&self.te.?, ids, mask, fopts);
         if (self.low_mem) {
@@ -493,6 +515,12 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
+    /// Classifier-free guidance — the undistilled "base" klein checkpoints,
+    /// gated by `ImageEngine.supportsGuidance()`. 1.0 (default) skips the
+    /// unconditional forward entirely; distilled klein has guidance baked
+    /// into the weights and is never asked to run it.
+    guidance_scale: f32 = 1.0,
+    negative_prompt: []const u8 = "",
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -577,6 +605,14 @@ pub const ImageEngine = struct {
     /// needs a target-size VAE resize AND a separate VLM resize per reference.
     pub fn editUsesRawBytes(self: *const ImageEngine) bool {
         return self.backend == .mage_flow;
+    }
+
+    /// True when real classifier-free guidance (`guidance_scale`/`negative_prompt`)
+    /// is wired — FLUX only. Distilled klein still accepts the fields (1.0
+    /// is a no-op, matching mflux's basic guider); Krea/Mage-Flow have no
+    /// negative-encode path.
+    pub fn supportsGuidance(self: *const ImageEngine) bool {
+        return self.backend == .flux;
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -1956,6 +1992,27 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.info("[image] rebalance: gain={d:.2} weights={d}\n", .{ cond_gain, wl.len });
     }
 
+    // Classifier-free guidance (base klein, undistilled): 'guidance_scale'
+    // != 1.0 runs a second, unconditional forward per step against
+    // 'negative_prompt' (default "" — empty-string unconditioning, the
+    // standard CFG convention). 1.0 is a no-op, so distilled klein can
+    // accept both fields harmlessly; only an ACTUALLY-requested CFG run
+    // needs the capability.
+    var guidance_scale: f32 = 1.0;
+    if (extractJsonFloat(body, "guidance_scale")) |g| {
+        if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
+        guidance_scale = @floatCast(g);
+    }
+    var negative_prompt: []const u8 = "";
+    var negative_prompt_owned: ?[]u8 = null;
+    defer if (negative_prompt_owned) |np| allocator.free(np);
+    if (extractJsonString(body, "negative_prompt")) |raw_neg| {
+        negative_prompt_owned = try jsonUnescape(allocator, raw_neg);
+        negative_prompt = negative_prompt_owned.?;
+    }
+    if (guidance_scale != 1.0 and !engine.supportsGuidance())
+        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 model");
+
     // Style LoRA(s): one or more absolute paths to .safetensors adapters,
     // each with an optional scale — mirrors mflux's `--lora-paths`/
     // `--lora-scales`. Accepts the array form (`lora_paths`/`lora_scales`)
@@ -1987,7 +2044,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
+    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -1999,6 +2056,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
+        .guidance_scale = guidance_scale,
+        .negative_prompt = negative_prompt,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
