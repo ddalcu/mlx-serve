@@ -14,11 +14,13 @@
 #     skips incomplete media packs). It must be absent from /v1/models.
 #
 # The second case used to be this script's only case, asserting a 500 for it.
-# It cannot produce one: an id the registry does not hold falls back to the
-# default model, deliberately — Claude Code launches with
-# ANTHROPIC_DEFAULT_*_MODEL=mlx-serve, and clients hardcode ids like gpt-4o.
-# Asserting 500 there would break that fallback, so the assertion is now that
-# it is skipped, which is the real behaviour and was previously unpinned.
+# It cannot produce one: discovery never registers it, so naming it is an
+# UNKNOWN ID, not a load failure. On this server — one holding model ROOTS —
+# an unknown id is a 404 naming the ids that ARE served; on a single-`--model`
+# server it still falls back to the default model, which is what lets clients
+# that hardcode gpt-4o (and Claude Code's ANTHROPIC_DEFAULT_*_MODEL=mlx-serve)
+# work. The 404 is asserted below; the single-`--model` fallback is pinned by
+# `unknownModelIdRefused`'s own test in src/server.zig.
 #
 # A valid sibling model keeps working throughout (isolation).
 #
@@ -123,6 +125,29 @@ if [ "$UNKNOWN" = "absent" ]; then
     echo -e "${GREEN}PASS${NC} unknown-arch-model absent from /v1/models"
 else
     echo -e "${RED}FAIL${NC} unknown-arch-model registered as '$UNKNOWN' (discovery should refuse it)"
+    FAIL=1
+fi
+
+echo
+echo "== an id the registry does not hold is a 404, not the default model =="
+BODY=$(curl -s -o /dev/stdout -w '\n%{http_code}' -X POST "$BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"unknown-arch-model","messages":[{"role":"user","content":"Hi."}],"max_tokens":4}')
+HTTP_STATUS=$(echo "$BODY" | tail -1)
+ERR_BODY=$(echo "$BODY" | sed '$d')
+if [ "$HTTP_STATUS" = "404" ]; then
+    echo -e "${GREEN}PASS${NC} unknown id → HTTP 404"
+else
+    echo -e "${RED}FAIL${NC} unknown id → $HTTP_STATUS (expected 404)"
+    FAIL=1
+fi
+# A 200 here answers a typo from whatever else is resident and echoes the
+# unknown id back — the client cannot tell that from a real answer. The
+# refusal has to name what it compared against, or it is not actionable.
+if echo "$ERR_BODY" | grep -q 'model_not_found' && echo "$ERR_BODY" | grep -q "$VALID_ID"; then
+    echo -e "${GREEN}PASS${NC} the 404 names the served ids"
+else
+    echo -e "${RED}FAIL${NC} 404 body does not name the served ids: $ERR_BODY"
     FAIL=1
 fi
 
