@@ -121,39 +121,6 @@ final class ShellHandlerTests: XCTestCase {
         XCTAssertTrue(reg.isAlive(handle: "bg1"))
     }
 
-    // MARK: - Bare `python` retry (stock macOS ships no `python`, only `python3`)
-
-    func testPythonNotFoundFallbackRewritesLeadingPythonToken() {
-        let result = "[cwd: /tmp]\n\n[stderr]: zsh:1: command not found: python\n[exit code: 127]"
-        XCTAssertEqual(ShellHandler.pythonNotFoundFallback(command: "python foo.py", result: result), "python3 foo.py")
-        XCTAssertEqual(ShellHandler.pythonNotFoundFallback(command: "python", result: result), "python3")
-        XCTAssertEqual(ShellHandler.pythonNotFoundFallback(command: "  python -m http.server  ", result: result),
-                       "python3 -m http.server")
-    }
-
-    func testPythonNotFoundFallbackNeverTouchesPython3OrOtherCommands() {
-        let result = "[cwd: /tmp]\n\n[stderr]: zsh:1: command not found: python\n[exit code: 127]"
-        XCTAssertNil(ShellHandler.pythonNotFoundFallback(command: "python3 foo.py", result: result),
-                     "python3 is already correct — must not be rewritten")
-        XCTAssertNil(ShellHandler.pythonNotFoundFallback(command: "pythonic-tool foo.py", result: result),
-                     "must match a whole leading token, not a prefix")
-        XCTAssertNil(ShellHandler.pythonNotFoundFallback(command: "echo python", result: result),
-                     "python must be the command itself, not an argument")
-    }
-
-    func testPythonNotFoundFallbackRequiresTheSpecificFailure() {
-        XCTAssertNil(ShellHandler.pythonNotFoundFallback(command: "python foo.py", result: "[cwd: /tmp]\nOK"),
-                     "a successful run must never be retried")
-        XCTAssertNil(ShellHandler.pythonNotFoundFallback(
-            command: "python foo.py",
-            result: "[cwd: /tmp]\nTraceback...\n[exit code: 1]"),
-            "a real script error (not a missing interpreter) must not trigger a retry")
-        XCTAssertNil(ShellHandler.pythonNotFoundFallback(
-            command: "python foo.py",
-            result: "[cwd: /tmp]\n\n[stderr]: zsh:1: command not found: python3\n[exit code: 127]"),
-            "a DIFFERENT missing command must not be mistaken for bare python")
-    }
-
     func testHasTrailingBackgroundOperator() {
         XCTAssertTrue(ShellHandler.hasTrailingBackgroundOperator("cmd &"))
         XCTAssertTrue(ShellHandler.hasTrailingBackgroundOperator("cmd &   "))
