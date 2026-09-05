@@ -1,7 +1,8 @@
 #!/bin/bash
-# Guard (issue #331): schema JSON must reach CONTENT on every mask-building
+# Guard (issue #331): completed schema JSON must reach CONTENT on every mask-building
 # surface. Supported unlimited Qwen reasoning may defer the grammar; requests
 # with a finite response-side reasoning budget retain the thinking-off fallback.
+# Exhausting max_tokens during reasoning may leave content empty with length.
 #
 # Greedy throughout. Usage: ./tests/test_json_schema_thinking.sh [model_dir] [port]
 
@@ -100,6 +101,42 @@ if echo "$MTEXT" | jq -e 'has("answer")' >/dev/null 2>&1; then
 else
     run_test "schema JSON lands in text delta (messages, finite budget)" FAIL "streamed text: '$(echo "$MTEXT" | head -c 120)'"
 fi
+
+# Unlike a reasoning cutoff with answer capacity left, the hard completion cap
+# must not force a boundary, reserve answer tokens, or move reasoning to content.
+# This short request exercises exhaustion inside the prompt-opened think block;
+# only routing, accounting, and the finish reason matter, never the model's prose.
+for STREAMING in false true; do
+    echo "=== /v1/chat/completions: reasoning exhausts max_tokens, stream=$STREAMING ==="
+    BODY=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "{
+        \"model\": \"mlx-serve\", \"max_tokens\": 64, \"temperature\": 0, \"stream\": $STREAMING,
+        \"enable_thinking\": true, \"reasoning_budget_tokens\": -1,
+        \"stream_options\": {\"include_usage\": true},
+        \"response_format\": {\"type\": \"json_schema\", \"json_schema\": {\"name\": \"answer\", \"strict\": true, \"schema\": $SCHEMA}},
+        \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}]
+    }")
+    if [ "$STREAMING" = true ]; then
+        RESULT=$(echo "$BODY" | sed -n 's/^data: \({.*}\)$/\1/p' | jq -s '{
+            finish_reason: [.[] | .choices[]? | .finish_reason // empty] | last,
+            completion_tokens: [.[] | .usage.completion_tokens // empty] | last,
+            content: [.[] | .choices[]? | .delta.content // empty] | join(""),
+            reasoning: [.[] | .choices[]? | .delta.reasoning_content // empty] | join("")
+        }' 2>/dev/null)
+    else
+        RESULT=$(echo "$BODY" | jq '{
+            finish_reason: .choices[0].finish_reason,
+            completion_tokens: .usage.completion_tokens,
+            content: (.choices[0].message.content // ""),
+            reasoning: (.choices[0].message.reasoning_content // "")
+        }' 2>/dev/null)
+    fi
+    if echo "$RESULT" | jq -e '.finish_reason == "length" and .completion_tokens == 64 and
+        .content == "" and (.reasoning | length > 0)' >/dev/null 2>&1; then
+        run_test "reasoning-only length stop respects completion cap (stream=$STREAMING)" PASS ""
+    else
+        run_test "reasoning-only length stop respects completion cap (stream=$STREAMING)" FAIL "$(echo "$RESULT" | head -c 240)"
+    fi
+done
 
 grep -q '\[grammar\] finite reasoning budget; rerendered with thinking off' "$LOG" \
     && run_test "finite budgets retain thinking-off fallback" PASS "" \
