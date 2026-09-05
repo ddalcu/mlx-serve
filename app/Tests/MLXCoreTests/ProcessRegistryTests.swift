@@ -170,6 +170,51 @@ final class ProcessRegistryTests: XCTestCase {
         XCTAssertTrue(reg.isAlive(handle: pb.handle), "other session's sandbox process must be untouched")
     }
 
+    // MARK: - Bare `python` fallback (stock macOS ships no `python`, only `python3`)
+
+    /// Runs `command` under `makeProcess` and returns captured stdout, trimmed.
+    private func runAndCaptureOutput(_ command: String) -> String {
+        let process = ProcessRegistry.makeProcess(command: command, workingDirectory: nil)
+        let pipe = process.standardOutput as! Pipe
+        try? process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// Writes an executable shell script named `name` into `dir` that echoes `echoes`.
+    private func writeFakeInterpreter(named name: String, echoing echoes: String, into dir: URL) {
+        let url = dir.appendingPathComponent(name)
+        try? "#!/bin/sh\necho \(echoes)\n".write(to: url, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    func testPythonFallbackUsesPython3WhenNoPythonOnPath() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fakebin-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        writeFakeInterpreter(named: "python3", echoing: "FAKE_PY3", into: dir)
+        // No `python` in this directory at all — the fallback's only option.
+
+        let out = runAndCaptureOutput("export PATH=\(dir.path); python")
+        XCTAssertEqual(out, "FAKE_PY3", "with no `python` on PATH, the shim must fall back to `python3`")
+    }
+
+    func testPythonFallbackPrefersRealPythonOverFallback() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fakebin-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        writeFakeInterpreter(named: "python", echoing: "REAL_PY", into: dir)
+        writeFakeInterpreter(named: "python3", echoing: "FAKE_PY3", into: dir)
+        // A venv/conda-style PATH provides both — the real `python` must win,
+        // never be silently overridden by the static `python3` fallback.
+
+        let out = runAndCaptureOutput("export PATH=\(dir.path); python")
+        XCTAssertEqual(out, "REAL_PY", "an environment-provided `python` on PATH must never be shadowed")
+    }
+
     func testAdoptedProcessIsManagedAndAlive() async {
         let reg = ProcessRegistry()
         defer { reg.killAll() }

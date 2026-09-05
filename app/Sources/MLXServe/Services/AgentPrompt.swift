@@ -112,7 +112,7 @@ enum AgentPrompt {
                 + "Exported shell variables persist between calls."
         }
         return "\n\n# Execution environment\n"
-            + "Shell commands run directly on this Mac (macOS, zsh login shell, BSD userland; node, npm, python, git, and brew are on PATH). "
+            + "Shell commands run directly on this Mac (macOS, zsh login shell, BSD userland; node, npm, python3, git, and brew are on PATH). "
             + "Each call is a fresh login shell. "
             + "A server bound to 0.0.0.0 is reachable from the user's other devices too — hand back http://<local-ip>:<port> (the IP is in the grounding line above; if it's missing, use http://localhost:<port> and say so)."
     }

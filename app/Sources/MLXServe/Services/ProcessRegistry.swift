@@ -194,13 +194,39 @@ final class ProcessRegistry: ObservableObject {
 
     // MARK: - Shared process construction
 
+    /// Shell-function prelude prepended to every host command so a bare
+    /// `python` call resolves the SAME way the rest of the script already
+    /// resolves it — dynamically, via `$PATH`, at the moment it's called —
+    /// and only falls back to the static `python3` when no `python` binary
+    /// is on PATH at all. This is a runtime FALLBACK, never a rewrite: a
+    /// venv/conda `activate` (sourced earlier in the very same `-c` script)
+    /// prepends its own `bin/python` onto PATH, and that real interpreter
+    /// must keep winning — unconditionally forcing `python3` would silently
+    /// run the wrong interpreter (or the wrong installed package set) inside
+    /// an activated environment. Stock macOS ships no `python` binary at all
+    /// (only `python3` — and even that stub refuses to run when invoked
+    /// through a `python` alias/symlink, since it dispatches on argv[0] and
+    /// looks for a CLT tool literally named `python`), so on a bare Mac the
+    /// lookup below finds nothing and falls to the static `python3`, called
+    /// by its own name so the argv[0] dispatch quirk never enters into it.
+    /// `whence -p` restricts the lookup to PATH executables — it cannot
+    /// recurse into the shell function of the same name being defined here —
+    /// and `command python3` bypasses that same function to reach the real
+    /// binary. One prelude on the whole script (rather than a match-and-retry
+    /// on a parsed failure) covers `python` at any position in a compound
+    /// command and both the foreground and background paths, since both go
+    /// through this single spawn point, and it never runs anything twice.
+    static let pythonFallbackPrelude =
+        "python() { local p; p=$(whence -p python 2>/dev/null); "
+        + "if [ -n \"$p\" ]; then \"$p\" \"$@\"; else command python3 \"$@\"; fi }; "
+
     /// The exact spawn shape both `ShellHandler` and the registry use: a
     /// `/bin/zsh -l -c` login shell, stdin from `/dev/null` (an interactive
     /// prompt hits EOF instead of hanging), and a pipe each for stdout/stderr.
     nonisolated static func makeProcess(command: String, workingDirectory: String?) -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", command]
+        process.arguments = ["-l", "-c", pythonFallbackPrelude + command]
         if let wd = workingDirectory {
             process.currentDirectoryURL = URL(fileURLWithPath: wd)
         }
