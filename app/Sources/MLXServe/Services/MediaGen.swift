@@ -134,6 +134,13 @@ enum FluxVariant: String, Hashable, Codable {
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
+    case sdxlBase10       // Stable Diffusion XL base 1.0 — served by the sdxl backend
+    case sdxlTurbo        // Stable Diffusion XL Turbo — same backend, distilled few-step
+    case sdxlFinetune     // A community SDXL finetune (Illustrious/Pony/NoobAI) — same backend, full guidance
+    case sd1              // Stable Diffusion 1.5 — served by the sd1 backend (sdxl_unet/sdxl_vae/sdxl_clip reused at SD 1.x's own config)
+    case sdTurbo          // SD-Turbo — an SD 2.1 distill, same sd1 backend + StableDiffusionPipeline shape, different (OpenCLIP-H) tower
+    case sd3              // Stable Diffusion 3.5 Large / Medium — MMDiT + three text encoders, real guidance
+    case sd3Turbo         // SD 3.5 Large Turbo — the same MMDiT distilled to 4 steps, guidance-free
 }
 
 struct ImageQualitySettings: Hashable {
@@ -161,6 +168,13 @@ struct ImageModelPreset: Identifiable, Hashable {
     let defaultQuality: QualityPreset
     /// Plain-English explanation shown under the model in the Media pane.
     let description: String
+    /// Non-nil: this preset is ONE variant subfolder of a multi-variant repo
+    /// (`q4/` of SceneWorks illustrious-xl-v2), pulled flat into its own dir.
+    var repoSubfolder: String? = nil
+    /// Non-nil: the repo ships a SINGLE-FILE LDM checkpoint and this is the
+    /// file — the Civitai shape the server converts at load. Only that one file
+    /// is pulled, never a diffusers folder the repo may also carry.
+    var singleFileCheckpoint: String? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -168,6 +182,45 @@ struct ImageModelPreset: Identifiable, Hashable {
     func settings(_ quality: QualityPreset) -> ImageQualitySettings {
         qualityProfiles[quality] ?? qualityProfiles[defaultQuality]!
     }
+
+    /// Whether this model reads a negative prompt and a guidance scale.
+    ///
+    /// True for exactly the backends that run real classifier-free guidance.
+    /// Every other image model here is DISTILLED and generates guidance-free,
+    /// so it has no unconditional branch for a negative prompt to steer — the
+    /// field would be decoration, which is why the Advanced panel deliberately
+    /// carried neither before SDXL arrived.
+    /// The community finetunes are NOT distilled — they run the same real
+    /// guidance base does, and the anime-SDXL ecosystem leans on negative
+    /// prompts harder than base ever did, so withholding the field would be
+    /// hiding the control those checkpoints are actually steered with.
+    var supportsNegativePrompt: Bool {
+        variant == .sdxlBase10 || variant == .sdxlFinetune || variant == .sd1 || variant == .sd3
+    }
+
+    /// Whether this model reads a `guidance` (CFG scale) override.
+    ///
+    /// Same condition as `supportsNegativePrompt` — a real-guidance backend
+    /// has a scale to steer, a distilled one runs guidance-free and has none.
+    /// The server already accepts an override (`gen.zig` parses `guidance`/
+    /// `guidance_scale`, range-checked `[1,30]`) and falls back to the
+    /// checkpoint's own default when the field is absent; this control is
+    /// what lets the app reach that already-live knob instead of always
+    /// riding the default.
+    var supportsGuidance: Bool { supportsNegativePrompt }
+
+    /// SDXL is trained on a fixed list of ~1 MP buckets, every one a multiple
+    /// of 64. It is the SAME bucket list FLUX uses (that list came from here),
+    /// so the two share it rather than keeping two copies that can drift.
+    /// Sizes between buckets are off-distribution: they generate, just worse.
+    static let sdxlResolutions: [ResolutionOption] = fluxResolutions
+
+    /// Turbo's native canvas. Looked up IN the shared list rather than built
+    /// here: `ResolutionOption` is `Hashable` over its label too, so a
+    /// same-size option with a different label is not `==` to the menu row and
+    /// `validResolution` would reject the preset's own default.
+    private static let sdxlSquare512: ResolutionOption =
+        sdxlResolutions.first { $0.width == 512 && $0.height == 512 } ?? sdxlResolutions[0]
 
     // FLUX is trained at ~1 MP across a stable bucket of aspect ratios.
     // The architecture is shared across versions, so the bucket is too.
@@ -401,13 +454,325 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
-    /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
-    /// 4B Q4 — smallest download.
+    /// Stable Diffusion XL base 1.0 — the full base model, not a distill.
+    ///
+    /// The odd one out in this list: everything else here is a few-step
+    /// distilled flow model, while SDXL is epsilon-prediction on a discrete
+    /// beta schedule and needs REAL classifier-free guidance — two UNet
+    /// forwards per step. That is why its step counts are 20-50 rather than
+    /// 4-12, and why it is the only preset that reads a negative prompt.
+    ///
+    /// Its repertoire is the reason to carry it: SDXL has by far the largest
+    /// LoRA ecosystem of any open image model, and those adapters work here
+    /// (verified against nerijs/pixel-art-xl — 722/722 modules bound).
+    static let sdxlBase10 = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-xl-base-1.0",
+        name: "Stable Diffusion XL 1.0 (~7 GB)",
+        variant: .sdxlBase10,
+        configName: "sdxl",
+        repo: "stabilityai/stable-diffusion-xl-base-1.0",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 30),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "The classic Stable Diffusion XL. Slower than the distilled models here because it runs real guidance, but it takes a negative prompt and has the widest LoRA ecosystem of any open image model."
+    )
+
+    /// SDXL Turbo — the adversarially distilled few-step build of the same
+    /// architecture, so it loads through the same server backend and the same
+    /// LoRAs bind. It generates guidance-free, which is why it does NOT get a
+    /// negative prompt box: there is no unconditional branch for one to steer.
+    ///
+    /// Its default canvas is 512², not base's 1024²: Turbo was distilled at
+    /// 512 and the larger buckets are off-distribution for it. The full bucket
+    /// list is still offered, since a LoRA can move where it is happy.
+    static let sdxlTurbo = ImageModelPreset(
+        id: "stabilityai/sdxl-turbo",
+        name: "Stable Diffusion XL Turbo (~7 GB)",
+        variant: .sdxlTurbo,
+        configName: "sdxl", // same server backend as base
+        repo: "stabilityai/sdxl-turbo",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlSquare512,
+        qualityProfiles: [
+            .fast:         .init(steps: 1),
+            .good:         .init(steps: 2),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 8),
+        ],
+        defaultQuality: .good,
+        description: "Distilled few-step SDXL — a picture in 1-4 steps, no guidance. Takes the same LoRAs as the base model."
+    )
+
+    /// Stable Diffusion 1.5 — the original, non-XL checkpoint. Same backend
+    /// family as SDXL server-side (`sdxl_unet`/`sdxl_vae`/`sdxl_clip` reused
+    /// at SD 1.x's own config: one 768-wide CLIP-L tower, no micro-
+    /// conditioning), but its own capability facts: a smaller 512-trained
+    /// canvas (`resolutionGrid` above) and no LoRA verified here yet, even
+    /// though the server-side plumbing binds one (`lora.Arch.sd1`) — the
+    /// declaration stays conservative until a real SD 1.5 adapter has been
+    /// tried against it, the same discipline `supportsLoRA`'s doc comment
+    /// asks for everywhere else.
+    static let sd15 = ImageModelPreset(
+        id: "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        name: "Stable Diffusion 1.5 (~4 GB)",
+        variant: .sd1,
+        configName: "sd1",
+        repo: "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        approxDownloadGB: 4,
+        approxRAMGB: 6,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlSquare512,
+        qualityProfiles: [
+            .fast:         .init(steps: 15),
+            .good:         .init(steps: 25),
+            .quality:      .init(steps: 35),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .good,
+        description: "The original Stable Diffusion. Smaller and faster than SDXL — trained at 512×512 — with real guidance and a negative prompt. The checkpoint that started the open image-model ecosystem."
+    )
+
+    /// SD-Turbo — stability's own adversarially-distilled few-step build.
+    /// NOT an SD 1.5 distill: it is SD 2.1's UNet + OpenCLIP-H text tower,
+    /// which is exactly why it needs its OWN `FluxVariant` case rather than
+    /// riding `.sd1` — that variant's `supportsNegativePrompt`/`supportsGuidance`
+    /// are true, and Turbo generates guidance-free with no unconditional
+    /// branch for either to steer, same reasoning as SDXL Turbo beside SDXL
+    /// base. Still the `sd1` server backend and bundle shape: same
+    /// `StableDiffusionPipeline` class, same missing-`text_encoder_2` shape.
+    static let sdTurbo = ImageModelPreset(
+        id: "stabilityai/sd-turbo",
+        name: "SD-Turbo (~2 GB)",
+        variant: .sdTurbo,
+        configName: "sd1",
+        repo: "stabilityai/sd-turbo",
+        approxDownloadGB: 2,
+        approxRAMGB: 4,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlSquare512,
+        qualityProfiles: [
+            .fast:         .init(steps: 1),
+            .good:         .init(steps: 2),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 8),
+        ],
+        defaultQuality: .good,
+        description: "Distilled few-step Stable Diffusion — a picture in 1-4 steps, no guidance. Smaller and faster than SDXL Turbo, at SD-Turbo's own 512×512 native scale."
+    )
+
+    /// Quality ladder shared by the full-guidance community finetunes. They are
+    /// base-SDXL descendants, not distills, so they want base's step counts.
+    private static let sdxlFinetuneQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 20),
+        .good:         .init(steps: 28),
+        .quality:      .init(steps: 36),
+        .superQuality: .init(steps: 48),
+    ]
+
+    /// Illustrious XL v2, 4-bit. An anime/illustration SDXL finetune, served by
+    /// the same backend as base — the affine MLX pack binds per-tensor through
+    /// the quantized `Linear` arm, so the only thing 4-bit changes is the size.
+    /// The repo holds three complete variants in subfolders; each preset pulls
+    /// exactly one (`MediaBundle.sdxlVariant`).
+    static let illustriousXLv2_Q4 = ImageModelPreset(
+        id: "sceneworks/illustrious-xl-v2-q4",
+        name: "Illustrious XL v2 4-bit (~4 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "SceneWorks/illustrious-xl-v2-mlx",
+        approxDownloadGB: 4,
+        approxRAMGB: 6,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "An anime and illustration model built on Stable Diffusion XL. Takes a negative prompt, and the smallest of the SDXL family here — a good first pick on an 8 GB Mac.",
+        repoSubfolder: "q4"
+    )
+
+    /// Pony Diffusion V6 XL — shipped the Civitai way, as ONE LDM-keyed
+    /// `.safetensors`. The server converts it at load (`sdxl_single_file`),
+    /// which is why no diffusers folder is needed on disk.
+    ///
+    /// NOT in `ImageModelPreset.all` — see the comment on `all` for why the
+    /// SDXL finetune shelf is deliberately curated down to one anime pick in
+    /// the app. The preset itself, and its download-selection behaviour,
+    /// stay real and tested (`SdxlFinetuneCatalogTests`): `mlx-serve pull
+    /// pony` reaches the identical bundle from the CLI.
+    static let ponyDiffusionV6XL = ImageModelPreset(
+        id: "lylia/pony-diffusion-v6-xl",
+        name: "Pony Diffusion V6 XL (~7 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "LyliaEngine/Pony_Diffusion_V6_XL",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "A widely used stylized SDXL finetune with a large LoRA ecosystem. Responds strongly to its own tag-style prompts and to a negative prompt.",
+        singleFileCheckpoint: "ponyDiffusionV6XL_v6StartWithThisOne.safetensors"
+    )
+
+    /// NoobAI-XL v1.1 — epsilon-prediction, the conventional schedule.
+    ///
+    /// NOT in `ImageModelPreset.all` (see `all`'s comment) — `mlx-serve pull
+    /// noobai` reaches it from the CLI; `SdxlFinetuneCatalogTests` still
+    /// covers its single-file download selection.
+    static let noobaiXLv11 = ImageModelPreset(
+        id: "laxhar/noobai-xl-v1.1",
+        name: "NoobAI-XL v1.1 (~7 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "Laxhar/noobai-XL-1.1",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "An anime SDXL finetune trained on a very large tagged corpus. Takes a negative prompt; prompt it with comma-separated tags.",
+        singleFileCheckpoint: "NoobAI-XL-v1.1.safetensors"
+    )
+
+    /// NoobAI-XL V-Pred 1.0 — the v-prediction, zero-terminal-SNR build.
+    ///
+    /// Deliberately pulled as the SINGLE FILE, not the diffusers folder the same
+    /// repo also ships: the folder's `scheduler_config.json` declares
+    /// `prediction_type: epsilon`, which is WRONG for this checkpoint and would
+    /// silently wash out every image, while the single file carries the
+    /// `v_pred` + `ztsnr` marker tensors the engine reads instead.
+    ///
+    /// NOT in `ImageModelPreset.all` (see `all`'s comment) — `mlx-serve pull
+    /// noobai:vpred` reaches it from the CLI.
+    static let noobaiXLVPred10 = ImageModelPreset(
+        id: "laxhar/noobai-xl-vpred-1.0",
+        name: "NoobAI-XL V-Pred 1.0 (~7 GB)",
+        variant: .sdxlFinetune,
+        configName: "sdxl",
+        repo: "Laxhar/noobai-XL-Vpred-1.0",
+        approxDownloadGB: 7,
+        approxRAMGB: 10,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: sdxlFinetuneQuality,
+        defaultQuality: .good,
+        description: "The v-prediction build of NoobAI-XL — deeper blacks and a wider tonal range than the standard model, at the same speed.",
+        singleFileCheckpoint: "NoobAI-XL-Vpred-v1.0.safetensors"
+    )
+
+    /// Catalog ordered cheapest → heaviest by DOWNLOAD size, which is the order
+    /// the picker shows and `testMageFlow8BitPresetsMatchTheirBf16Siblings`
+    /// enforces. It happens to be ascending in `approxRAMGB` too (comments
+    /// below: download / RAM) — where the two disagree, download wins, because
+    /// that is the number the user is committing to at the moment they choose.
+    ///
+    /// This was ordered by RAM alone once, which put SDXL (7 GB down / 10 RAM)
+    /// after klein 9B (10 / 16) and broke the ascending-download invariant.
+    ///
+    /// The SDXL finetune shelf is deliberately CURATED, not exhaustive: base,
+    /// Turbo and one anime quant (Illustrious) cover the shapes worth a picker
+    /// row, while Pony/NoobAI-v1.1/NoobAI-VPred are near-duplicates of the same
+    /// "anime SDXL finetune, takes a negative prompt" slot — four rows saying
+    /// almost the same thing is clutter, not choice. Every SDXL checkpoint the
+    /// server can load is still one `mlx-serve pull` away (`src/cli.zig`'s
+    /// alias table is intentionally WIDER than this array); the presets
+    /// themselves stay defined and tested (`SdxlFinetuneCatalogTests`) so nothing
+    /// about their download/load behaviour goes uncovered just because the app
+    /// doesn't list them.
+    /// Stable Diffusion 3.5 Medium — MMDiT-X (its first 13 blocks carry a
+    /// second, image-only attention), 24 layers at width 1536. The smallest
+    /// complete SD 3.5 download, and still 16 GB: all three checkpoints share
+    /// the same 9.5 GB T5-XXL tower, so on this family the cheap option is a
+    /// different transformer rather than a narrower quantization.
+    static let sd35Medium = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-3.5-medium",
+        name: "Stable Diffusion 3.5 Medium (~16 GB)",
+        variant: .sd3,
+        configName: "sd3",
+        repo: "stabilityai/stable-diffusion-3.5-medium",
+        approxDownloadGB: 16,
+        approxRAMGB: 20,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 28),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 60),
+        ],
+        defaultQuality: .good,
+        description: "Stable Diffusion 3.5 Medium. A flow-matching MMDiT with three text encoders — two CLIP towers plus T5-XXL — which is what makes it far better at prompt adherence and legible text than the SDXL family. Real guidance and a negative prompt."
+    )
+
+    /// SD 3.5 Large — 38 layers at width 2432, no dual attention.
+    static let sd35Large = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-3.5-large",
+        name: "Stable Diffusion 3.5 Large (~28 GB)",
+        variant: .sd3,
+        configName: "sd3",
+        repo: "stabilityai/stable-diffusion-3.5-large",
+        approxDownloadGB: 28,
+        approxRAMGB: 36,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 28),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 60),
+        ],
+        defaultQuality: .good,
+        description: "The full 8B Stable Diffusion 3.5. The strongest prompt adherence and text rendering of any model here, and the largest — it needs a 48 GB Mac to run comfortably."
+    )
+
+    /// SD 3.5 Large Turbo — the SAME transformer, VAE, towers and declared
+    /// scheduler as Large; 4 steps at guidance 1 is the entire difference, and
+    /// the server reads it off the model dir rather than a config (the two
+    /// repos ship byte-identical configs).
+    static let sd35LargeTurbo = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-3.5-large-turbo",
+        name: "SD 3.5 Large Turbo (~28 GB)",
+        variant: .sd3Turbo,
+        configName: "sd3",
+        repo: "stabilityai/stable-diffusion-3.5-large-turbo",
+        approxDownloadGB: 28,
+        approxRAMGB: 36,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 6),
+            .superQuality: .init(steps: 8),
+        ],
+        defaultQuality: .good,
+        description: "SD 3.5 Large distilled to four steps. The same 8B transformer and the same three text encoders, guidance-free — roughly seven times fewer steps than Large, at some cost in fine detail."
+    )
+
     static let all: [ImageModelPreset] = [
-        .flux2Klein4B_Q4,                              // 5
-        .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
-        .flux2Klein9B_Q4,                              // 10
-        .krea2Turbo,                                   // 15
+        .sdTurbo,                                       // 2 / 4
+        .sd15,                                         // 4 / 6
+        .illustriousXLv2_Q4,                           // 4 / 6
+        .flux2Klein4B_Q4,                              // 5 / 8
+        .sdxlBase10, .sdxlTurbo,                       // 7 / 10
+        .mageFlowTurbo8bit,                            // 9 / 10
+        .mageFlowEditTurbo8bit,                        // 10 / 11
+        .flux2Klein9B_Q4,                              // 10 / 16
+        .krea2Turbo,                                   // 15 / 24
+        .sd35Medium,                                   // 16 / 20
+        .sd35Large, .sd35LargeTurbo,                   // 28 / 36
     ]
 }
 
@@ -1769,6 +2134,20 @@ struct ImageGenRequest {
     /// image 2". Sent as `ref_images` beside the primary source; the server
     /// takes at most 3.
     var refImagePaths: [String] = []
+    /// What to steer AWAY from. Only models with `supportsNegativePrompt`
+    /// read it; the rest generate guidance-free and have no unconditional
+    /// branch for it to act on.
+    ///
+    /// EMPTY MEANS ABSENT here, and the two are genuinely different on the
+    /// wire: an omitted `negative_prompt` zeroes SDXL's unconditional branch,
+    /// while `""` gets encoded (BOS + EOS + 75 pads through both text towers)
+    /// and is NOT the same tensor. `requestJson` therefore omits the key
+    /// entirely when this is blank rather than sending an empty string.
+    var negativePrompt: String = ""
+    /// Classifier-free guidance scale. Only sent when `model.supportsGuidance`
+    /// — an omitted `guidance` field lets the server fall back to the
+    /// checkpoint's own trained default.
+    var guidance: Double = 5.0
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
     var condGain: Double = 1.0
@@ -1808,6 +2187,28 @@ extension ImageModelPreset {
         // widest preset edge.
         case .flux2Klein4B, .flux2Klein9B:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+        // Mirrors the server's `gen.clampSdxlDim`: SDXL's VAE only needs a
+        // multiple of 8, but the model is trained on a /64 bucket list and
+        // drifts off-distribution between them, so 64 is the grid and 512 the
+        // floor. Drift here shows up as the app accepting a size the server
+        // then silently snaps somewhere else.
+        // The community finetunes are the same architecture on the same bucket
+        // list — a finetune does not move the grid its base was trained on.
+        case .sdxlBase10, .sdxlTurbo, .sdxlFinetune:
+            return ResolutionGrid(alignment: 64, minDim: 512, maxDim: 2048)
+        // Mirrors `gen.clampSd1Dim`: SD 1.x/2.x train at 512 (occasionally
+        // 768 — SD-Turbo's `sample_size:64` is the same 512 native canvas),
+        // the same /64-bucket-drift reasoning as SDXL at its own scale — a
+        // lower floor and ceiling than SDXL's, not SDXL's grid reused.
+        case .sd1, .sdTurbo:
+            return ResolutionGrid(alignment: 64, minDim: 256, maxDim: 1536)
+        // Mirrors the server's `.sd3 => clampKreaDim`: the VAE downsamples by 8
+        // and the MMDiT patches by 2, so the patch grid is exact only on
+        // multiples of 16. SD 3.5 trains at ~1 MP like SDXL, but unlike SDXL it
+        // is not bucket-locked — the pos-embed is centre-cropped per request
+        // rather than interpolated, so intermediate sizes stay on-distribution.
+        case .sd3, .sd3Turbo:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         }
     }
 
@@ -1835,9 +2236,17 @@ extension ImageModelPreset {
 
     /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLora`).
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
+    ///
+    /// SD 3.5 is the same story for a different reason: its adapters target the
+    /// MMDiT's joint blocks, a different module tree from the UNet convention
+    /// `lora.canonicalizeSdxl` speaks, so `gen.zig`'s `.sd3` arm returns 0
+    /// matched by construction. Offering the picker would be advertising a
+    /// control that always 400s — the flag is a claim about the SERVER's arm,
+    /// not about the ecosystem having adapters.
     var supportsLoRA: Bool {
         switch variant {
         case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        case .sd3, .sd3Turbo: return false
         default: return true
         }
     }

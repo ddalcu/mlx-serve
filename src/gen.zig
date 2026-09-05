@@ -18,6 +18,12 @@ const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
+const sdxl_mod = @import("sdxl.zig");
+const sdxl_pipeline = @import("sdxl_pipeline.zig");
+const sdxl_unet = @import("sdxl_unet.zig");
+const sd1_pipeline = @import("sd1_pipeline.zig");
+const sd3_mod = @import("sd3.zig");
+const sd3_pipeline = @import("sd3_pipeline.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -93,13 +99,17 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "sdxl",
+    "sd1",       "sd3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
+    if (std.mem.eql(u8, model_type, "sdxl")) return .image;
+    if (std.mem.eql(u8, model_type, "sd1")) return .image;
+    if (std.mem.eql(u8, model_type, "sd3")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -168,12 +178,83 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
     // the "mage_flow" marker so routing + the backend dispatch light up.
     if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    // SDXL is the same shape — a diffusers repo whose identity lives only in
+    // model_index.json. Same predicate discovery uses (`sdxl.indexDeclaresSdxl`),
+    // so `list` and the loader cannot disagree about whether a dir is a model.
+    // SD 3.5 first among the diffusers shapes: it is the only one carrying a
+    // THIRD text encoder, so its predicate is the most specific of the three
+    // and an SDXL or SD 1.x engine handed one of these repos would bind a
+    // `unet/` that is not there.
+    if (isSd3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "sd3") catch null;
+    if (isSdxlRepo(io, allocator, model_dir)) return allocator.dupe(u8, "sdxl") catch null;
+    // SD 1.x is the same shape one level down: a diffusers repo whose
+    // identity lives only in model_index.json, and the SDXL check above
+    // already ruled out the second tower that would make it SDXL.
+    if (isSd1Repo(io, allocator, model_dir)) return allocator.dupe(u8, "sd1") catch null;
     // Same for an mflux FLUX.2 conversion with no config.json at all (the only
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
     // the loader end up disagreeing about whether a dir is a model.
     if (isMfluxFlux2Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux2-klein") catch null;
     return null;
+}
+
+/// True when `model_dir/model_index.json` declares an SDXL pipeline. Shares
+/// `sdxl.indexDeclaresSdxl` with `model_discovery.peekSdxlIndex` — documented
+/// duplication of the CALL, never of the rule.
+fn isSdxlRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+        defer allocator.free(content);
+        if (sdxl_mod.indexDeclaresSdxl(allocator, content)) return true;
+    } else |_| {}
+    // No (or non-SDXL) model_index.json: a single-file LDM checkpoint. Same
+    // classification the discovery side uses (`peekSdxlSingleFile`), so `list`
+    // and the routing here agree on what "an SDXL model" is.
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekSdxlSingleFile(io, allocator, dir);
+}
+
+/// True when `model_dir/model_index.json` declares an SD 1.x pipeline. Same
+/// shape as `isSdxlRepo`, minus the single-file fallback: `sdxl_single_file`
+/// converts decode-only and has no SD 1.x key map, so a Civitai/A1111 SD 1.x
+/// checkpoint is not yet a model this server can load.
+/// True when `model_dir` is an SD 3.5 diffusers repo. Delegates to the ONE
+/// predicate (`sd3.indexDeclaresSd3`) discovery also calls — a private copy
+/// here is how `list` and the loader end up disagreeing about whether a dir is
+/// a model.
+fn isSd3Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+        defer allocator.free(content);
+        return sd3_mod.indexDeclaresSd3(allocator, content);
+    } else |_| {}
+    return false;
+}
+
+fn isSd1Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+        defer allocator.free(content);
+        return sdxl_mod.indexDeclaresSd1(allocator, content);
+    } else |_| {}
+    return false;
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -443,6 +524,9 @@ const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
+    sdxl: *sdxl_pipeline.Engine,
+    sd1: *sd1_pipeline.Engine,
+    sd3: *sd3_pipeline.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -493,6 +577,21 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
+    /// Classifier-free guidance scale. Only SDXL uses it: the distilled flow
+    /// backends here run guidance-free, which is why this defaults to null
+    /// ("the backend's own default") rather than to a number that would be
+    /// meaningless on three of the four arms.
+    guidance: ?f32 = null,
+    /// Overrides the checkpoint's declared timestep spacing. Needed for
+    /// SDXL-Lightning, which is a LoRA over base SDXL and therefore inherits
+    /// base's `leading` config while being trained for `trailing`. Parsed at
+    /// the wire through `sdxl.spacingFromString`, so a name we do not serve is
+    /// a named 400 instead of a silent fallback this far down.
+    spacing: ?sdxl_mod.TimestepSpacing = null,
+    /// Negative prompt. ABSENT (null) and EMPTY ("") are different requests on
+    /// SDXL — absent zeroes the unconditional branch, empty encodes the empty
+    /// string. See `sdxl_pipeline.GenOpts.negative_prompt`.
+    negative_prompt: ?[]const u8 = null,
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -521,6 +620,18 @@ pub const ImageEngine = struct {
                 self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "sdxl")) {
+                self.backend = .{ .sdxl = try sdxl_pipeline.Engine.loadAuto(io, allocator, model_dir) };
+                return self;
+            }
+            if (std.mem.eql(u8, mt, "sd1")) {
+                self.backend = .{ .sd1 = try sd1_pipeline.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
+            if (std.mem.eql(u8, mt, "sd3")) {
+                self.backend = .{ .sd3 = try sd3_pipeline.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -532,6 +643,9 @@ pub const ImageEngine = struct {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
+            .sdxl => |x| x.deinit(),
+            .sd1 => |x| x.deinit(),
+            .sd3 => |x| x.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -541,6 +655,9 @@ pub const ImageEngine = struct {
             .flux => |*f| f.s,
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
+            .sdxl => |x| x.s,
+            .sd1 => |x| x.s,
+            .sd3 => |x| x.s,
         };
     }
 
@@ -550,6 +667,9 @@ pub const ImageEngine = struct {
             .flux => 3,
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
+            .sdxl => 0, // SDXL taps no intermediate encoder layers
+            .sd1 => 0, // same reason — no intermediate-layer taps
+            .sd3 => 0, // nor SD 3.5 — its three towers are read at the top only
         };
     }
 
@@ -559,6 +679,11 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
+            // False on a single-file checkpoint (Pony/NoobAI): the LDM
+            // converter is decode-only, so `x.vae_enc` is null there.
+            .sdxl => |x| x.vae_enc != null,
+            .sd1 => |x| x.vae_enc != null,
+            .sd3 => |x| x.vae_enc != null,
         };
     }
 
@@ -569,6 +694,9 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
+            .sdxl => false, // base SDXL has no instruction-edit training
+            .sd1 => false, // base SD 1.x has no instruction-edit training either
+            .sd3 => false, // nor base SD 3.5
         };
     }
 
@@ -604,6 +732,17 @@ pub const ImageEngine = struct {
                 .flux => .flux2,
                 .krea => .krea2,
                 .mage_flow => .generic,
+                .sdxl => .sdxl,
+                // Same unfused stacked-LoRA grammar; the SD 3.5 ecosystem's
+                // adapters target the MMDiT rather than a UNet, so nothing here
+                // can bind yet — see `attachLora` below.
+                .sd3 => .generic,
+                // SD 1.x's UNet is an `sdxl_unet.Unet` too (same module tree,
+                // same kohya/diffusers LDM key convention, just fewer/narrower
+                // stages) — `lora.canonicalizeSdxl`'s index substitution is
+                // stage-count-agnostic, so it binds an SD 1.x adapter the same
+                // way it binds an SDXL one.
+                .sd1 => .sd1,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -615,6 +754,13 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
+            .sdxl => |x| sdxl_unet.attachLora(&x.unet, &stack),
+            .sd1 => |x| sdxl_unet.attachLora(&x.unet, &stack),
+            // 0 matched → `attachLora` reports the adapter as unusable rather
+            // than pretending it applied. SD 3.5 adapters target the MMDiT's
+            // joint blocks, a different module tree from the UNet convention
+            // `lora.canonicalizeSdxl` speaks, so binding them is its own change.
+            .sd3 => 0,
         };
         if (matched == 0) {
             stack.deinit();
@@ -630,6 +776,9 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
+            .sdxl => |x| sdxl_unet.detachLora(&x.unet),
+            .sd3 => {}, // no LoRA attached — MMDiT adapters are not wired yet
+            .sd1 => |x| sdxl_unet.detachLora(&x.unet),
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -663,6 +812,52 @@ pub const ImageEngine = struct {
                 m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
             else
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            .sdxl => |x| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
+                break :blk x.generate(prompt, .{
+                    .width = width,
+                    .height = height,
+                    .steps = steps,
+                    .guidance = opts.guidance,
+                    .seed = seed,
+                    .negative_prompt = opts.negative_prompt,
+                    .spacing = opts.spacing,
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                }, progress);
+            },
+            .sd3 => |x| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
+                break :blk x.generate(prompt, .{
+                    .width = width,
+                    .height = height,
+                    // NULL rather than the resolved `steps`, so a request that
+                    // named none takes the CHECKPOINT's default — 28 on Large,
+                    // 4 on Turbo. See `sd3_pipeline.GenOpts.steps`.
+                    .steps = steps,
+                    .guidance = opts.guidance,
+                    .seed = seed,
+                    .negative_prompt = opts.negative_prompt,
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                }, progress);
+            },
+            .sd1 => |x| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
+                break :blk x.generate(prompt, .{
+                    .width = width,
+                    .height = height,
+                    .steps = steps,
+                    .guidance = opts.guidance,
+                    .seed = seed,
+                    .negative_prompt = opts.negative_prompt,
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                }, progress);
+            },
         };
     }
 
@@ -682,6 +877,14 @@ pub const ImageEngine = struct {
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // SDXL's VAE downsamples by 8, but the model is TRAINED on a /64
+            // bucket list and drifts off-distribution between them, so the snap
+            // is to 64 rather than to the 8 the latent arithmetic would allow.
+            .sdxl => .{ .w = clampSdxlDim(req_w), .h = clampSdxlDim(req_h) },
+            .sd1 => .{ .w = clampSd1Dim(req_w), .h = clampSd1Dim(req_h) },
+            // The VAE downsamples by 8 and the MMDiT patches by 2, so the grid
+            // is exact only on multiples of 16 — the same clamp Krea uses.
+            .sd3 => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 
@@ -693,6 +896,9 @@ pub const ImageEngine = struct {
         return switch (kind) {
             .flux => 1536,
             .krea, .mage_flow => 2048,
+            .sdxl => 2048,
+            .sd1 => 1536,
+            .sd3 => 2048,
         };
     }
 
@@ -707,6 +913,31 @@ pub const ImageEngine = struct {
 pub fn clampFluxDim(v: u32) u32 {
     if (v == 0) return 1024;
     const rounded = ((v + 31) / 32) * 32;
+    return std.math.clamp(rounded, 256, 1536);
+}
+
+/// Round a requested dimension to a multiple of 64 in [512, 2048], defaulting
+/// to SDXL's native 1024.
+///
+/// The VAE only needs a multiple of 8, and `sdxl.latentDims` enforces exactly
+/// that. 64 is the TRAINING bucket granularity: SDXL's micro-conditioning is
+/// fit on a fixed list of /64 resolutions, and sizes between them are
+/// off-distribution — they generate, they just look worse. The floor is 512
+/// rather than 256 for the same reason.
+pub fn clampSdxlDim(v: u32) u32 {
+    if (v == 0) return 1024;
+    const rounded = ((v + 63) / 64) * 64;
+    return std.math.clamp(rounded, 512, 2048);
+}
+
+/// Round a requested dimension to a multiple of 64 in [256, 1536], defaulting
+/// to SD 1.x's native 512. Same /64 training-bucket reasoning as SDXL's
+/// clamp, at SD 1.x's own trained scale — its VAE downsamples by 8 too, but
+/// the checkpoint was trained at 512 (occasionally 768), and drifts further
+/// off-distribution past 1024 than a wider ceiling would suggest.
+pub fn clampSd1Dim(v: u32) u32 {
+    if (v == 0) return 512;
+    const rounded = ((v + 63) / 64) * 64;
     return std.math.clamp(rounded, 256, 1536);
 }
 
@@ -1986,6 +2217,47 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
+    // `negative_prompt`, `guidance` and `timestep_spacing` are read ONLY here —
+    // every other image backend runs guidance-free and ignores all three, so
+    // `condWeightCount`-style per-backend gating would be noise. A model that
+    // cannot use them simply does not look at them.
+    //
+    // This sits ABOVE the SSE header write on purpose: all three can 400, and
+    // `sendError` on a socket that has already been handed `text/event-stream`
+    // headers writes a second status line into the event body. Every other 400
+    // in this handler is above that line for the same reason.
+    //
+    // The ABSENT/EMPTY distinction is load-bearing on SDXL and is preserved
+    // all the way from the wire: a body with no `negative_prompt` key leaves
+    // this null (zeroed unconditional branch), while `"negative_prompt": ""`
+    // arrives as an empty slice and gets ENCODED. Collapsing the two is worth
+    // cos 0.975 vs 0.997 against diffusers — see sdxl_pipeline.GenOpts.
+    //
+    // Unescaped like `prompt` above: `extractJsonString` hands back the RAW
+    // span between the quotes, so `"neg": "text, \"watermark\", caf\u00e9"`
+    // would otherwise reach the CLIP tokenizer with literal backslash-escapes
+    // and encode an unconditional branch the client never asked for. The
+    // optional is preserved THROUGH the unescape — absent stays null.
+    const negative_prompt_owned: ?[]u8 = if (extractJsonString(body, "negative_prompt")) |raw|
+        try jsonUnescape(allocator, raw)
+    else
+        null;
+    defer if (negative_prompt_owned) |np| allocator.free(np);
+    const negative_prompt: ?[]const u8 = negative_prompt_owned;
+    const spacing: ?sdxl_mod.TimestepSpacing = blk: {
+        const sp = extractJsonString(body, "timestep_spacing") orelse break :blk null;
+        break :blk sdxl_mod.spacingFromString(sp) orelse
+            return sendError(conn, 400, "'timestep_spacing' must be 'leading', 'trailing' or 'linspace'");
+    };
+    // `guidance_scale` is diffusers' own spelling, accepted so a pasted script
+    // works; `guidance` wins when a body carries both.
+    const guidance: ?f32 = blk: {
+        const gv = extractJsonFloat(body, "guidance") orelse
+            extractJsonFloat(body, "guidance_scale") orelse break :blk null;
+        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance' must be in [1,30]");
+        break :blk @as(f32, @floatCast(gv));
+    };
+
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
@@ -1999,6 +2271,9 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
+        .negative_prompt = negative_prompt,
+        .guidance = guidance,
+        .spacing = spacing,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
@@ -5228,6 +5503,45 @@ test "media model types: discovery and modality dispatch agree" {
     }
 }
 
+test "sd3: the routing side and discovery classify a repo the SAME way" {
+    // The three diffusers families reach three different engines off ONE file,
+    // and every predicate is shared between `peekModelType` (routing) and
+    // `model_discovery` (listing) precisely because two private copies drift —
+    // leaving a checkpoint the server can load but cannot see, or worse, one it
+    // lists and then binds with the wrong engine.
+    //
+    // SD 3.5 is the specific hazard: it is a diffusers repo with `vae/`,
+    // `text_encoder/` and `text_encoder_2/` just like SDXL, so an SDXL engine
+    // handed one would get all the way to binding a `unet/` that is not there.
+    // What separates them is the declared class plus the THIRD tower.
+    const a = std.testing.allocator;
+    const sd3_index =
+        \\{"_class_name":"StableDiffusion3Pipeline",
+        \\"transformer":["diffusers","SD3Transformer2DModel"],
+        \\"text_encoder":["transformers","CLIPTextModelWithProjection"],
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"],
+        \\"text_encoder_3":["transformers","T5EncoderModel"],
+        \\"vae":["diffusers","AutoencoderKL"]}
+    ;
+    const sdxl_index =
+        \\{"_class_name":"StableDiffusionXLPipeline","unet":["diffusers","UNet2DConditionModel"],
+        \\"text_encoder":["transformers","CLIPTextModel"],
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"],
+        \\"vae":["diffusers","AutoencoderKL"]}
+    ;
+    // Exactly one predicate claims each repo — never zero, never two.
+    try std.testing.expect(sd3_mod.indexDeclaresSd3(a, sd3_index));
+    try std.testing.expect(!sdxl_mod.indexDeclaresSdxl(a, sd3_index));
+    try std.testing.expect(!sdxl_mod.indexDeclaresSd1(a, sd3_index));
+    try std.testing.expect(!sd3_mod.indexDeclaresSd3(a, sdxl_index));
+    try std.testing.expect(sdxl_mod.indexDeclaresSdxl(a, sdxl_index));
+
+    // And "sd3" is a media image type on BOTH sides, the drift the test above
+    // this one exists to catch.
+    try std.testing.expect(discovery.isMediaModelType("sd3"));
+    try std.testing.expectEqual(Modality.image, modalityFromType("sd3").?);
+}
+
 test "stagedPeakBytes: disjoint stages never sum, and resident always carries" {
     const GB: u64 = 1024 * 1024 * 1024;
     // The whole point: stages are loaded and freed in turn, so only the
@@ -5439,6 +5753,61 @@ test "instrumental is parsed off the body only when spelled true" {
     try testing.expect(sse.bodyWantsTrue("{\"instrumental\": true}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"instrumental\":false}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"prompt\":\"x\"}", "instrumental"));
+}
+
+test "negative_prompt reaches the tokenizer UNESCAPED, and absent still differs from empty" {
+    // Regression (PR #301 review): `negative_prompt` was passed straight from
+    // `extractJsonString`, which returns the RAW span between the quotes, while
+    // `prompt` three lines above was unescaped. A client sending
+    // `"text, \"watermark\""` encoded the backslashes as CLIP tokens.
+    //
+    // The pair is what the handler does, so the pair is what is asserted — and
+    // the ABSENT/EMPTY distinction (a zeroed unconditional branch vs. an encoded
+    // empty string, cos 0.997 vs 0.975 against diffusers) must survive it.
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"prompt\":\"a cat\"}", .want = null },
+        .{ .body = "{\"negative_prompt\":\"\"}", .want = "" },
+        .{ .body = "{\"negative_prompt\":\"text, \\\"watermark\\\", caf\\u00e9\"}", .want = "text, \"watermark\", café" },
+        .{ .body = "{\"negative_prompt\":\"blurry\\nlowres\"}", .want = "blurry\nlowres" },
+    };
+    for (cases) |c| {
+        const owned: ?[]u8 = if (extractJsonString(c.body, "negative_prompt")) |raw|
+            try jsonUnescape(a, raw)
+        else
+            null;
+        defer if (owned) |o| a.free(o);
+        if (c.want) |w| {
+            try std.testing.expect(owned != null);
+            try std.testing.expectEqualStrings(w, owned.?);
+        } else {
+            try std.testing.expect(owned == null);
+        }
+    }
+}
+
+test "every image-request text field the tokenizer sees is unescaped" {
+    // Class guard for the bug above: `prompt` was unescaped and
+    // `negative_prompt` was not, and nothing said the two had to agree. Any new
+    // free-text field that reaches a text encoder gets the same treatment, so
+    // the scan is over the extraction spelling rather than over one field.
+    const src = @embedFile("gen.zig");
+    for ([_][]const u8{ "prompt", "negative_prompt" }) |field| {
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "extractJsonString(body, \"{s}\")", .{field});
+        var i: usize = 0;
+        var seen: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, needle)) |at| : (i = at + needle.len) {
+            seen += 1;
+            // The extraction and its `jsonUnescape` sit within a few lines of
+            // each other in every correct spelling (`orelse`-guarded or
+            // `if`-captured); a raw hand-off has neither.
+            const window_end = @min(src.len, at + 240);
+            try std.testing.expect(std.mem.indexOf(u8, src[at..window_end], "jsonUnescape") != null);
+        }
+        try std.testing.expect(seen > 0);
+    }
 }
 
 test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {

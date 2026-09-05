@@ -216,6 +216,17 @@ final class ImageGenService: ObservableObject {
                 json["strength"] = request.strength
             }
         }
+        // Omitted when blank — absent and empty are DIFFERENT requests on a
+        // guidance model: an absent `negative_prompt` zeroes SDXL's
+        // unconditional branch, while "" is encoded (BOS + EOS + 75 pads
+        // through both text towers) and is not the same tensor. A user who
+        // never touched the box means absent.
+        let neg = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !neg.isEmpty { json["negative_prompt"] = neg }
+        // Omitted on a model that can't read it, so the server's own
+        // checkpoint default (`SchedulerConfig.default_guidance`) applies —
+        // sending a bare number to a guidance-free distill would earn a 400.
+        if request.model.supportsGuidance { json["guidance"] = request.guidance }
         if request.condGain != 1.0 { json["cond_gain"] = request.condGain }
         if !request.condWeightsText.trimmingCharacters(in: .whitespaces).isEmpty,
            let weights = ImageGenRequest.parseCondWeights(request.condWeightsText),

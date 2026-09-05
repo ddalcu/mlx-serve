@@ -79,7 +79,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
         }
     }
     if (!flat) {
-        inline for (.{ "base_model.model.", "transformer.", "diffusion_model." }) |pfx| {
+        inline for (.{ "base_model.model.", "transformer.", "diffusion_model.", "unet." }) |pfx| {
             if (std.mem.startsWith(u8, k, pfx)) k = k[pfx.len..];
         }
     }
@@ -122,7 +122,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
 // comment above for the taxonomy of naming schemes this covers.
 // ════════════════════════════════════════════════════════════════════════
 
-pub const Arch = enum { flux2, krea2, minimax_h3, generic };
+pub const Arch = enum { flux2, krea2, minimax_h3, sdxl, sd1, generic };
 
 /// Which third of a fused up-projection a canonical target draws from, when
 /// the source tensor packs several linears together (BFL's fused QKV).
@@ -289,6 +289,14 @@ fn archTable(arch: Arch) []const AliasRow {
         .flux2 => &flux2_table,
         .krea2 => &krea2_table,
         .minimax_h3 => &minimax_h3_table,
+        // SDXL never reaches the template table — `canonicalize` routes it to
+        // `canonicalizeSdxl` above, because its LDM names are a prefix
+        // substitution with two varying indices, which `AliasRow` (one `{}`)
+        // cannot express. SD 1.x's UNet is the same module tree (see
+        // `canonicalize`'s `arch == .sdxl or arch == .sd1` branch), so it
+        // never reaches this table either.
+        .sdxl => &.{},
+        .sd1 => &.{},
         .generic => &.{},
     };
 }
@@ -348,6 +356,85 @@ pub const CanonMatch = struct { canon: []const u8, split: Split };
 /// table recognizes it, so unlisted-but-already-compatible names and
 /// genuinely-unknown ones both degrade to today's behavior rather than
 /// silently dropping the tensor.
+
+// ════════════════════════════════════════════════════════════════════════
+// SDXL: LDM block names, which the template table cannot express
+//
+// Kohya's sd-scripts trains SDXL against the ORIGINAL (compvis/LDM) UNet, so
+// its keys name `input_blocks_4_1` / `middle_block_1` / `output_blocks_5_1` —
+// NOT diffusers' `down_blocks.1.attentions.0`. Verified against a real file
+// (nerijs/pixel-art-xl v1.1: 2166 tensors, every key under `lora_unet_`, block
+// ids exactly the eleven below). A diffusers/PEFT export of the same adapter
+// uses the dotted diffusers path instead, so both spellings must land on one
+// canonical name.
+//
+// This does not fit `AliasRow`: the alias carries TWO varying indices (block
+// and sub-block) that map to two DIFFERENT indices on the canonical side, and
+// the template machinery allows one `{}`. It is not arithmetic either — the
+// attention-carrying blocks are an enumerable, irregular set (input 4,5,7,8;
+// output 0..5), because LDM counts downsamplers and conv_in as blocks. So the
+// translation is a PREFIX SUBSTITUTION over a fixed table, with the rest of the
+// path passed through untouched.
+//
+// Canonical here is the diffusers path in the FLAT underscore spelling, which
+// is what `sdxl_unet.attachLora` queries. Flat is the right direction to
+// canonicalize toward: dots -> underscores is unambiguous, while the reverse is
+// not (`down_blocks`, `transformer_blocks`, `to_q` all contain underscores).
+
+const SdxlBlock = struct { ldm: []const u8, diffusers: []const u8 };
+
+/// The eleven attention-carrying blocks of the SDXL UNet, in both namings.
+///
+/// LDM indexing counts conv_in and the downsamplers as blocks, which is why
+/// input 3 and 6 are missing (they are downsamplers) and why the up path is
+/// contiguous. The `_1` suffix selects the ATTENTION half of a block whose
+/// `_0` half is the resnet.
+pub const SDXL_BLOCKS = [_]SdxlBlock{
+    .{ .ldm = "input_blocks_4_1", .diffusers = "down_blocks_1_attentions_0" },
+    .{ .ldm = "input_blocks_5_1", .diffusers = "down_blocks_1_attentions_1" },
+    .{ .ldm = "input_blocks_7_1", .diffusers = "down_blocks_2_attentions_0" },
+    .{ .ldm = "input_blocks_8_1", .diffusers = "down_blocks_2_attentions_1" },
+    .{ .ldm = "middle_block_1", .diffusers = "mid_block_attentions_0" },
+    .{ .ldm = "output_blocks_0_1", .diffusers = "up_blocks_0_attentions_0" },
+    .{ .ldm = "output_blocks_1_1", .diffusers = "up_blocks_0_attentions_1" },
+    .{ .ldm = "output_blocks_2_1", .diffusers = "up_blocks_0_attentions_2" },
+    .{ .ldm = "output_blocks_3_1", .diffusers = "up_blocks_1_attentions_0" },
+    .{ .ldm = "output_blocks_4_1", .diffusers = "up_blocks_1_attentions_1" },
+    .{ .ldm = "output_blocks_5_1", .diffusers = "up_blocks_1_attentions_2" },
+};
+
+/// Rewrite one module name to the flat diffusers canonical.
+///
+/// Handles three input spellings: Kohya LDM flat, diffusers flat, and
+/// diffusers dotted (converted to flat first). Anything else passes through
+/// unchanged and simply fails to match a runtime module, which is the safe
+/// direction — a wrong MATCH would silently apply an adapter to the wrong
+/// layer, while a miss is reported by the zero-match refusal.
+fn canonicalizeSdxl(module: []const u8, buf: *CanonBuf) []const u8 {
+    // Dots -> underscores. Unambiguous in this direction only.
+    var flat_buf: [256]u8 = undefined;
+    var flat = module;
+    if (std.mem.indexOfScalar(u8, module, '.') != null and module.len <= flat_buf.len) {
+        for (module, 0..) |c, i| flat_buf[i] = if (c == '.') '_' else c;
+        flat = flat_buf[0..module.len];
+    }
+
+    for (SDXL_BLOCKS) |b| {
+        if (!std.mem.startsWith(u8, flat, b.ldm)) continue;
+        const tail = flat[b.ldm.len..];
+        // Guard a PREFIX collision: `input_blocks_4_1` must not also match
+        // `input_blocks_4_10` if such a block ever existed. A real tail always
+        // starts with `_` (or is empty, for the block itself).
+        if (tail.len != 0 and tail[0] != '_') continue;
+        const out = std.fmt.bufPrint(buf, "{s}{s}", .{ b.diffusers, tail }) catch return module;
+        return out;
+    }
+    // Already diffusers-flat (or something we do not know) — copy so the
+    // returned slice has the same lifetime as the rewritten case.
+    const out = std.fmt.bufPrint(buf, "{s}", .{flat}) catch return module;
+    return out;
+}
+
 pub fn canonicalize(
     module: []const u8,
     flat: bool,
@@ -357,6 +444,15 @@ pub fn canonicalize(
 ) []CanonMatch {
     var n: usize = 0;
     var fbuf_alias: [128]u8 = undefined;
+
+    // SDXL's LDM block naming is a prefix substitution, not a template match.
+    // SD 1.x's UNet is the SAME module tree at a different stage count/width,
+    // so the same substitution binds it — only the number of blocks differs,
+    // and `canonicalizeSdxl` reads that from the module path, not a constant.
+    if (arch == .sdxl or arch == .sd1) {
+        out[0] = .{ .canon = canonicalizeSdxl(module, &bufs[0]), .split = .none };
+        return out[0..1];
+    }
 
     for (archTable(arch)) |row| {
         if (n >= MAX_FANOUT) break;
@@ -1354,4 +1450,60 @@ test "loadFile rejects a MISSING file before mlx can kill the process" {
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, buf[0..root_len], .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors", .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "", .generic));
+}
+
+test "sdxl lora: Kohya LDM block names translate to the diffusers canonical" {
+    // The trap: kohya's sd-scripts trains SDXL against the ORIGINAL (compvis)
+    // UNet, so a real adapter names `input_blocks_4_1`, not
+    // `down_blocks_1_attentions_0`. Verified against nerijs/pixel-art-xl v1.1.
+    var buf: CanonBuf = undefined;
+
+    try std.testing.expectEqualStrings(
+        "down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q",
+        canonicalizeSdxl("input_blocks_4_1_transformer_blocks_0_attn1_to_q", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "mid_block_attentions_0_transformer_blocks_9_ff_net_2",
+        canonicalizeSdxl("middle_block_1_transformer_blocks_9_ff_net_2", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "up_blocks_1_attentions_2_proj_in",
+        canonicalizeSdxl("output_blocks_5_1_proj_in", &buf),
+    );
+
+    // A diffusers/PEFT export of the same adapter is already canonical, in
+    // dotted form — dots to underscores, which is unambiguous in that
+    // direction only (`down_blocks`/`to_q` both contain underscores).
+    try std.testing.expectEqualStrings(
+        "down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q",
+        canonicalizeSdxl("down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q", &buf),
+    );
+
+    // An unknown name passes through rather than being forced onto a wrong
+    // block: a miss is reported by the zero-match refusal, a wrong MATCH would
+    // silently drive the adapter into the wrong layer.
+    try std.testing.expectEqualStrings("something_else", canonicalizeSdxl("something_else", &buf));
+
+    // The LDM indices are irregular BECAUSE that scheme counts conv_in and the
+    // downsamplers as blocks — 3 and 6 are downsamplers, which is why they are
+    // absent. Pin the count so a "tidied" table that invents them fails.
+    try std.testing.expectEqual(@as(usize, 11), SDXL_BLOCKS.len);
+    for (SDXL_BLOCKS) |b| {
+        try std.testing.expect(std.mem.indexOf(u8, b.diffusers, "attentions") != null or
+            std.mem.indexOf(u8, b.diffusers, "mid_block") != null);
+    }
+}
+
+test "sdxl lora: parseKey strips the unet. prefix diffusers exports use" {
+    const info = parseKey("unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight").?;
+    try std.testing.expectEqualStrings("down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q", info.module);
+    try std.testing.expectEqual(Role.a, info.role);
+    try std.testing.expect(!info.flat);
+
+    // Kohya flat, with `to_out_0` normalized to `to_out` so both spellings
+    // land on the single runtime linear.
+    const k = parseKey("lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_out_0.lora_down.weight").?;
+    try std.testing.expectEqualStrings("input_blocks_4_1_transformer_blocks_0_attn1_to_out", k.module);
+    try std.testing.expectEqual(Role.a, k.role);
+    try std.testing.expect(k.flat);
 }

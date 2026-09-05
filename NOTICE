@@ -146,6 +146,20 @@ mlx-serve addition modeled on the same project's `h3_ane_linear.m` blob
 layout and int8 constexpr-dequantize idioms.
 
 --------------------------------------------------------------------------------
+OpenAI CLIP tokenizer (BPE vocab + merges)
+https://github.com/openai/CLIP
+https://huggingface.co/openai/clip-vit-large-patch14
+Copyright (c) 2021 OpenAI
+Licensed under the MIT License.
+
+`src/assets/clip_tokenizer/{vocab.json,merges.txt}` are the standard CLIP BPE
+vocabulary and merge table, embedded into the binary (`@embedFile` via
+`src/sdxl_single_file.zig`) so a SINGLE-FILE SDXL checkpoint — which ships no
+tokenizer of its own — is self-contained. Both SDXL text towers use this same
+byte-identical vocab and merges; they differ only in their pad token. Verbatim
+redistribution, unmodified.
+
+--------------------------------------------------------------------------------
 SwaTex
 https://github.com/PhraseHQ/SwaTex
 Copyright (c) 2026 Phrase (https://phrase.so) and SwaTex contributors

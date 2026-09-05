@@ -1691,3 +1691,330 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+---
+## SDXL: four components that are each individually right
+
+The SDXL port (`src/sdxl*.zig`, 2026-08-17) is the repo's first EPSILON-prediction
+diffusion backend and its first with real classifier-free guidance. Every trap
+below produces a RUNNING model and a plausible image, which is why each one is
+pinned against an executed diffusers reference rather than argued from the paper.
+
+### `attention_head_dim` is the head COUNT
+
+diffusers' field name has been wrong for years. SDXL's `[5, 10, 20]` are head
+COUNTS against block widths `[320, 640, 1280]`, so the head DIM is 64 at every
+stage. Reading it as a dim gives 5 heads of 5 channels: shapes divide, the model
+runs, attention is nonsense. `UnetConfig.num_heads` carries the corrected name
+and the config test asserts `width / heads == 64` at all three stages, which is
+the invariant a future size (the refiner is 384-wide) also has to satisfy.
+
+### `use_linear_projection` reorders the transformer entry
+
+With it true (SDXL), `Transformer2DModel` flattens the spatial tensor to tokens
+and THEN applies a linear. With it false (SD 2.x), a 1x1 conv projects first and
+the flatten follows. A `[640, 640]` tensor is a valid kernel for both, so the
+wrong order is a silent transpose of the projection. `parseConfig` REFUSES a
+config that declares `false` by name instead of running the branch it has.
+
+### Two group-norm epsilons in one forward
+
+Resnets and the output norm take the config's `norm_eps` (1e-5).
+`Transformer2DModel`'s input norm hardcodes 1e-6 upstream. One value for both is
+a small, uniform, entirely invisible error, so `sdxl_nn.groupNorm` takes eps as a
+PARAMETER and the two call sites pass different constants. The VAE is a third
+value again (1e-6 everywhere), which is why `sdxl_vae.VAE_EPS` is its own
+constant with a test asserting it differs from the UNet's.
+
+### The ninth skip is `conv_in`'s output
+
+The up path pops nine skip connections; only eight come from the down blocks
+(2 resnets + 1 downsampler, 2 + 1, then 2 with no downsampler). The ninth is the
+output of `conv_in`, pushed before the down loop starts. Losing it still
+type-checks, because every up block pops the same count either way — the error
+surfaces as a wrong image, and `forward` asserts `SkipLeftover` at the end so a
+miscount is named rather than absorbed.
+
+### A random-conditioning fixture cannot see a cross-attention bug
+
+The first UNet fixture used `torch.randn` for `encoder_hidden_states`. With noise
+there, cross-attention has nothing coherent to attend to and its contribution to
+the output is small — a defect on that path still scores cos ~1.0. The fixture
+set now carries a SECOND UNet case driven by real text embeddings from
+`encode_prompt` (`sdxl unet real conditioning`), and a third driven by the ZERO
+conditioning the unconditional branch actually uses. Both measured cos 0.999999;
+the point is that the first test could not have told you.
+
+### `force_upcast: true` is not advice
+
+SDXL's VAE overflows fp16 — its mid-block activations pass 65504 — and the
+failure is a black or banded image, not an error. The checkpoint's own
+`vae/config.json` says so, diffusers carries the same flag, and
+`sdxl_vae.DEFAULT_DTYPE` is float32 while the UNet serves fp16 beside it. The two
+dtypes in one pipeline are deliberate.
+
+### ABSENT and EMPTY negative prompts are different requests
+
+This is the one that survived every component test. diffusers zeroes the
+unconditional branch only when
+
+    zero_out_negative_prompt = negative_prompt is None and force_zeros_for_empty_prompt
+
+so `negative_prompt=""` takes the OTHER branch and encodes the empty string —
+which is not zero, because "" still carries BOS, EOS and 75 pads through both
+towers. Our `GenOpts.negative_prompt` was `[]const u8 = ""`, collapsing the two.
+
+End to end against `StableDiffusionXLPipeline` on an injected latent, that scored
+**cos 0.975 / mae 0.091** while the UNet, the VAE, the tokenizer, the schedule,
+the conditioning and the Euler+CFG algebra were each verified exact. Making the
+field `?[]const u8` (null = absent = zeros) took it to **cos 0.997 / mae 0.027**.
+The lesson generalizes past SDXL: when every part is right and the whole is not,
+suspect a place where the API collapsed a distinction the reference draws.
+
+### How that was localized, in order
+
+Worth recording because the bisect is reusable for any diffusion port:
+
+1. Widen the dtype (`SDXL_UNET_F32=1`). It did not move — precision was out.
+2. Compare per-step latent statistics against the reference's own
+   `callback_on_step_end` (`MLX_SERVE_SDXL_TRACE=1`). The divergence appeared at
+   step 0 and compounded, so the schedule was not drifting.
+3. Verify the schedule numerically against `EulerDiscreteScheduler.set_timesteps`
+   — timesteps exact, sigmas exact.
+4. Re-derive the step in numpy from the dumped eps tensors. `cos 1.0000` against
+   the reference's step-0 latent, so the ALGEBRA was right and the INPUTS were
+   not.
+5. Inject diffusers' own conditioning (`GenOpts.cond_override`). The image jumped
+   to cos 0.997, which named the conditioning as the differing input — and from
+   there the unconditional branch as the specific half.
+
+### The two tokenizers pad differently
+
+`tokenizer/` and `tokenizer_2/` ship byte-identical `vocab.json` and `merges.txt`
+and different `pad_token`s: `<|endoftext|>` (49407) for CLIP-L, `!` (0) for bigG.
+Every id is in-vocab either way and every shape is right either way, so padding
+both alike is invisible — and it changes the embeddings at most of a short
+prompt's 77 positions. The pad id is read from each tokenizer's own config.
+
+Related: CLIP's pretokenizer splits `[\p{N}]` with NO quantifier, so "42" is TWO
+tokens. The LM tokenizers' `\p{N}{1,3}` grouping would merge it, and
+mis-grouping digits presents as a model-quality bug rather than a tokenizer one.
+
+### Conv weights need permuting; flux's do not
+
+PyTorch stores conv weights `[out, in, kh, kw]`; MLX wants `[out, kh, kw, in]`.
+`flux.zig` loads its conv weights with a plain copy because the mflux CONVERSION
+already permuted them — SDXL is a raw diffusers repo and needs the transpose at
+load. A mis-permuted conv weight is a valid tensor of the right element count, so
+nothing errors and the image is noise. Everything goes through
+`sdxl_nn.loadConvWeight`, and the permutation itself has a unit test.
+
+### `zig build test` caches the RUN step
+
+Not SDXL-specific, but it cost real time here: env vars are not part of the cache
+key, so re-running a fixture-gated test with a different `*_FIXTURE` path reports
+the PREVIOUS run's result and prints nothing. `touch` does not help either — Zig
+hashes content. `rm -rf .zig-cache/h` forces it. A parity test that prints
+nothing has not necessarily passed; check for its output line, not its silence.
+
+### Single-file SDXL checkpoints (Civitai / A1111 — Illustrious XL, Pony)
+
+Illustrious XL and Pony Diffusion XL are vanilla SDXL — same UNet geometry, the
+same CLIP-L + OpenCLIP-bigG pair, the same VAE, epsilon on a discrete beta
+schedule — so the only thing standing between them and `sdxl_pipeline` is
+PACKAGING. The folder loader reads a diffusers multi-folder repo (`unet/`,
+`vae/`, `text_encoder/`, `text_encoder_2/`, each with a `config.json` and
+diffusers-named weights). Civitai ships one `.safetensors` in LDM/SGM key
+naming, no configs, no tokenizer files. `sdxl_single_file.zig` bridges the two:
+it loads the blob once, converts its keys into the diffusers layout, and feeds
+the SAME `*FromWeights` binders the folder path uses (`unet.loadFromWeights`,
+`vae.loadFromWeights`, `clip.loadTowerFromWeights` — all split out for this).
+`Engine.loadAuto` picks the path: a `model_index.json` means the folder layout;
+otherwise a root `.safetensors` whose header carries the LDM markers
+(`sdxl.headerDeclaresLdmSdxl`) is a single-file checkpoint. Discovery classifies
+the same dir the same way (`model_discovery.peekSdxlSingleFile`), so `list` and
+the loader agree — the MageFlow "loadable but invisible" precedent.
+
+What the converter fills that the blob omits: geometry is `unet.BASE_CONFIG`
+(standard SDXL, correct for any base-geometry finetune); the schedule is the
+base default (leading / epsilon / guidance 5 — a Turbo/Lightning single-file
+still runs, just at base defaults, because the format carries nothing that could
+say otherwise); the tokenizer is the standard OpenAI CLIP BPE, embedded
+(`@embedFile`) so the checkpoint is self-contained, with each tower's own pad id
+(49407 for CLIP-L, 0 for bigG).
+
+Three conversions are more than a rename, and each fails SILENTLY (plausible
+image, wrong content) if wrong:
+
+  - **OpenCLIP bigG packs Q/K/V into one `in_proj_weight` `[3d, d]`.** diffusers
+    wants three `[d, d]` linears, so `attn.in_proj_{weight,bias}` splits 3-ways
+    on axis 0 → `self_attn.{q,k,v}_proj`.
+  - **`text_projection` transposes.** OpenCLIP applies `pooled @ P` with `P`
+    `[hidden, proj]`; HF `CLIPTextModelWithProjection` stores `[proj, hidden]`
+    and applies `pooled @ W.T`, so `W = P.T`. The tower loader transposes it back
+    at bind, landing on `P` — get the transpose wrong and the pooled vector (the
+    whole `add_embeds` conditioning) is subtly off with no shape error, since
+    bigG's projection is square 1280×1280.
+  - **LDM VAE attention stores Q/K/V/proj_out as 1×1 convs `[c, c, 1, 1]`.**
+    diffusers wants `[c, c]` linears, so those squeeze (rank-gated — SDXL's UNet
+    `proj_in`/`proj_out` are already linear under `use_linear_projection`, so the
+    squeeze no-ops there and a conv-style checkpoint still loads).
+
+The UNet body is diffusers' `convert_ldm_unet_checkpoint` index arithmetic:
+`input_blocks`/`output_blocks` are flat lists that group into
+`down_blocks`/`up_blocks` at `(i-1)/3` / `i/3` (stride `layers_per_block+1`), the
+`.op`/`.conv` sub-module at `j>=1` is the sampler; the VAE is
+`convert_ldm_vae_checkpoint`, whose `decoder.up.{n}` is REVERSED against
+`up_blocks` (`block_id = num_up - 1 - n`).
+
+The trap the design had to dodge: the two CLIP towers CANNOT share one converted
+map. Both encoders use byte-identical `text_model.encoder.layers.N.*` names — in
+the folder layout they live in separate dirs, so nothing collides, but a single
+flat converted map has bigG silently overwrite CLIP-L (or vice versa, iteration
+order). `convert` returns THREE maps (`main` = unet+vae, `clip_l`, `clip_g`); a
+unit test asserts bigG's layer-5 q_proj is present in `clip_g` and ABSENT from
+`clip_l`.
+
+ORACLE: SDXL has no executed-diffusers reference in this repo (its component
+tests are invariants + shape/bind checks). The conversion's ground truth is
+instead the FOLDER loader — for any model shipped both ways, the converter's
+output must equal `model.loadWeights(<repo>/<component>)` key-and-shape-for-
+key-and-shape. That is the env-gated `sdxl single-file folder parity` test
+(`SDXL_SINGLE_FILE` + `SDXL_DIFFUSERS_DIR`); the hermetic tests cover the
+block-index math, the collision guard, and detection. Because there is no
+numeric oracle, the `text_projection` transpose and the in_proj split ORDER are
+the two places a future bug is most likely — verify them against a real
+checkpoint pair before trusting output that merely "looks like an SDXL image."
+
+### Quantized SDXL packs (q4/q8 diffusers) and the nested-repo bundle trap
+
+Some SDXL diffusers repos ship MLX affine-quantized variants (SceneWorks
+illustrious-xl-v2 ships `bf16/`, `q4/`, `q8/` side by side). The SDXL engine was
+dense-only — the loaders `astype` weights and matmul, no `QLinear` — so a
+quantized pack loaded packed uint32 weights as fp16 and produced garbage, not an
+error. Support is now per-tensor and covers exactly the LINEARS the packs
+quantize: `sdxl_nn.Linear` gained an affine arm (packed weight kept as-is,
+`mlx_quantized_matmul(transpose_w=true)`), detected in `loadLinear` by a sibling
+`.scales`, geometry solved from packed shape. `sdxl_clip.Linear` has the same
+arm for the text encoders. Two things are NOT `mlx_quantized_matmul`:
+
+  - **`text_projection`** — the pooled projection is a plain `pooled @ W`, not a
+    layer forward, so a quantized `text_projection.weight` is DEQUANTIZED at load
+    (`mlx_dequantize`) to a dense matrix before the transpose.
+  - **convs, norms, the whole VAE** — the packs leave these dense (measured: the
+    q4 `vae/` is byte-identical to bf16). MLX quantization is matmul-only, so
+    there was never anything to do there; `loadConvWeight`/`dupWeight` are
+    untouched and the VAE path never sees a `.scales`.
+
+The dense path is unchanged (no `.scales` → the old transpose+matmul), so bf16
+packs bind bit-identically — that is the guard: the existing dense SDXL tests
+still pass, plus a hermetic `loadLinear detects affine quantization` test.
+
+The BUNDLE trap is unrelated to numerics: the CLI `pull` is built for FLAT LLM
+repos — `shouldDownload` rejects every nested path except `mtp/`. A diffusers
+repo is inherently nested (`unet/`, `vae/`, …), and the SceneWorks repo nests
+its variants one level deeper still (`q4/unet/…`). So `Alias` grew a `subdir`
+(download only that variant, strip the prefix so it lands as a flat model dir
+discovery finds) and a `dest_name` (so `q4` and `q8` of the SAME repo don't
+collide on disk). `wantedFile` filters nested files inside the subdir via
+`wantedInVariant` rather than the flat `mtp/`-only rule. Pony needs none of this
+— it is a single `.safetensors` at the repo ROOT, which `shouldDownload` already
+keeps. `pull pony` / `pull illustrious[:q4|q8|bf16]`.
+
+Not verified against real output — the quant path binds and runs, but like the
+rest of SDXL here it has no numeric oracle. Pull a q4 pack and eyeball a
+generation before trusting it.
+
+### A v-prediction checkpoint whose own config says epsilon (NoobAI-XL V-Pred)
+
+NoobAI-XL ships two builds. v1.1 is ordinary epsilon-prediction. V-Pred 1.0 is
+v-prediction trained with zero terminal SNR — and the diffusers folder in its own
+repo declares:
+
+    "prediction_type": "epsilon",
+    "rescale_betas_zero_snr": false,
+
+Both wrong for that checkpoint. This is the "when an arch's reference IGNORES a
+config field, that field is not the truth" class, with the sharpest possible
+edge: read as epsilon, a v-prediction model does not error, does not produce
+noise, and does not look obviously broken. It produces a plausible image with
+systematically washed-out contrast — the failure a user reports as "this model
+isn't very good" rather than as a bug.
+
+The checkpoint itself is honest. Single-file SDXL checkpoints carry zero-size
+MARKER TENSORS in the A1111/ComfyUI convention, and NoobAI V-Pred's header holds
+both:
+
+    "v_pred": {"dtype":"F32","shape":[0],"data_offsets":[334615452,334615452]}
+    "ztsnr": {"dtype":"F32","shape":[0],"data_offsets":[334615452,334615452]}
+
+So `sdxl_single_file.TrainingMarkers` reads them and they OUTRANK every default
+at `loadSingleFile`. That in turn decides the app's bundle: `MediaBundle` pulls
+that repo's SINGLE FILE, not the diffusers folder sitting beside it, because the
+single file is the copy that describes itself correctly. The markers are matched
+QUOTED (`"v_pred"`) so a longer key containing the name cannot false-positive,
+and `convert` never carries them into the diffusers maps — they are sentinels,
+and a shapeless array handed to a binder is its own failure.
+
+Zero terminal SNR is the other half. The stock scaled-linear schedule ends at
+`alphas_cumprod ≈ 0.0047` — never pure noise — so the model is always shown a
+faint trace of the image. A model TRAINED that way is fine; one trained at zero
+terminal SNR expects the last step to start from pure noise, and sampling it on
+the stock ladder washes out contrast for the same reason the prediction type
+does. `sdxl.rescaleZeroTerminalSnr` is Lin et al.'s rescale (diffusers'
+`rescale_zero_terminal_snr`): operate on sqrt(acp), shift so the last entry is
+zero, rescale so the first is unchanged, square back. The terminal entry is then
+FLOORED at 2^-24 — the rescale drives it to exactly zero and `trainSigmas`
+divides by it, so a literal zero is an `inf` sigma and NaN through every
+downstream coefficient. diffusers floors it for the same reason and at the same
+value (fp16's smallest positive subnormal).
+
+There is no numeric oracle for any of this, so the tests assert the LADDER'S OWN
+properties rather than values: terminal alphas_cumprod at the floor, the head
+entry preserved to 1e-9, still monotonically decreasing, every sigma finite and
+ascending, terminal sigma far above the stock ~14.6. A degenerate (constant)
+table is left alone rather than divided by its zero span.
+
+Still unverified against real output — like the rest of SDXL here, this binds
+and runs and is reasoned from the reference, but nothing executes diffusers to
+check it. Generate with NoobAI V-Pred and look before trusting it.
+
+### Community SDXL finetunes in the app catalog, and the shapes they ship in
+
+Illustrious XL, Pony Diffusion V6 and NoobAI-XL are all vanilla SDXL, so they
+reach one backend — but they ship in three different repo shapes, and the preset
+DECLARES which rather than the bundle sniffing an id:
+
+  - **A nested quant variant.** SceneWorks illustrious-xl-v2 holds `bf16/`,
+    `q4/` and `q8/`, each a COMPLETE diffusers SDXL. `MediaBundle.sdxlVariant`
+    pulls one with `recursive` + `subfolder`. The existing `subfolder` support
+    kept only a subfolder's IMMEDIATE children (right for a flat MLX quant
+    folder like `4bit/config.json`), which rejects `q4/unet/…` and downloads a
+    variant with no weights — so `selectNeededFiles` now keeps depth under a
+    subfolder when `recursive` is also set. The prefix comes off on the way to
+    disk, so the result looks like a plain SDXL repo to the folder loader.
+  - **A root single-file checkpoint** (Pony, both NoobAI builds).
+    `MediaBundle.sdxlSingleFile` pulls exactly one `.safetensors`. Two things it
+    must exclude: the repo's other weights (Pony ships a standalone VAE; NoobAI
+    ships a whole diffusers folder — pulling both doubles a 7 GB download), and
+    `model_index.json` BY NAME, because its presence alone sends
+    `Engine.loadAuto` down the folder path into weights that were deliberately
+    not downloaded.
+  - **A plain diffusers repo** — stability's own, unchanged.
+
+Two catalog invariants came out of this. The finetunes are NOT distills, so they
+run real guidance and take a negative prompt (the anime-SDXL ecosystem steers
+with them harder than base does); `supportsNegativePrompt` is two variants now,
+and the guard that asserted "only sdxlBase10" had to grow rather than be
+deleted. And `ImageModelPreset.all` is ascending by DOWNLOAD size, which is the
+order the picker shows and what `testMageFlow8BitPresetsMatchTheirBf16Siblings`
+enforces — the SDXL presets had been inserted in RAM order, putting a 7 GB model
+after a 10 GB one and leaving that test red on the branch before any of this.
+
+The limit worth knowing: a download's destination is derived from its REPO, so
+two presets on one repo overwrite each other's files on disk — each reading as
+"downloaded" while holding the other's weights. That is why only ONE Illustrious
+variant (q4) ships. Shipping q8 as well needs a per-variant destination
+(`download(destRepoId:)` exists for MLX chat variants; the media bundle path
+keys `comp.repo` as source, destination AND progress key in ~7 places). Pinned
+by `testNoTwoCatalogPresetsShareADownloadDestination` so the collision cannot be
+introduced silently.

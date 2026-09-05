@@ -3372,6 +3372,21 @@ pub const Weights = struct {
     pub fn count(self: *const Weights) u32 {
         return @intCast(self.map.count());
     }
+
+    /// Insert `arr` under a copy of `name`. The map takes ownership of the
+    /// array (freed on `deinit`) and of its key copy; a value already stored
+    /// under `name` is freed first so the map never leaks on an overwrite.
+    /// Used by in-memory Weights builders (e.g. `sdxl_single_file` converts an
+    /// LDM checkpoint into a diffusers-keyed map without ever touching disk).
+    pub fn put(self: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
+        const gop = try self.map.getOrPut(name);
+        if (gop.found_existing) {
+            _ = mlx.mlx_array_free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try self.allocator.dupe(u8, name);
+        }
+        gop.value_ptr.* = arr;
+    }
 };
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's

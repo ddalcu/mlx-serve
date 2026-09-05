@@ -438,6 +438,192 @@ extension MediaBundle {
         )
     }
 
+    /// Stable Diffusion XL (stability's own diffusers-multifolder repos:
+    /// `stable-diffusion-xl-base-1.0`, `sdxl-turbo`). The engine reads
+    /// `unet/`, `vae/`, `text_encoder/`, `text_encoder_2/`, `tokenizer/`,
+    /// `tokenizer_2/`, and `scheduler/` — but the repo itself is ~77 GB: it
+    /// also carries a fp32 duplicate of every subfolder weight file, root-level
+    /// single-file merged checkpoints (`sd_xl_base_1.0.safetensors`,
+    /// `..._0.9vae.safetensors`, an offset-LoRA), and an `onnx/`/`openvino/`
+    /// export tree. A plain recursive fetch (the `.flux` default) has no
+    /// basename allowlist, so it pulls all of that — the "downloads the whole
+    /// HF repo" bug. `.bin`/`.msgpack`/`.onnx` are already dropped by
+    /// `selectNeededFiles`'s extension allowlist; `keepSafetensors` here does
+    /// the rest by basename: `diffusion_pytorch_model.fp16.safetensors` keeps
+    /// only the UNet+VAE fp16 weights (the fp32 sibling shares the same
+    /// subfolder but a different basename), `model.fp16.safetensors` keeps
+    /// only the two CLIP towers' fp16 weights — both root-level single-file
+    /// checkpoints have neither basename, so neither is pulled.
+    /// `onnx/`/`openvino/` are excluded outright since a recursive scan would
+    /// otherwise still walk their config/json sidecar files.
+    static func sdxlDiffusers(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sdxl:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: ["onnx/", "openvino/"],
+                        keepSafetensors: [
+                            "diffusion_pytorch_model.fp16.safetensors",
+                            "model.fp16.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "model_index.json", "unet", "vae",
+                        "text_encoder", "text_encoder_2",
+                        "tokenizer", "tokenizer_2", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// Same diffusers-multifolder layout as `sdxlDiffusers`, MINUS the second
+    /// tower: SD 1.x ships one `text_encoder`/`tokenizer`, never a `_2` pair —
+    /// requiring `text_encoder_2` in the ready markers here would make a
+    /// complete SD 1.x download read as permanently incomplete (the same
+    /// configless-repo class as `flux2-klein-9b`'s missing root json).
+    static func sd1Diffusers(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sd1:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: ["onnx/", "openvino/"],
+                        keepSafetensors: [
+                            "diffusion_pytorch_model.fp16.safetensors",
+                            "model.fp16.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "model_index.json", "unet", "vae",
+                        "text_encoder", "tokenizer", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// Stable Diffusion 3.5 (Large, Large-Turbo, Medium). The same
+    /// diffusers-multifolder shape as SDXL with a THIRD text encoder, and two
+    /// selection differences that both matter:
+    ///
+    ///   * `text_encoder_3` (T5-XXL) is SHARDED. Its fp16 variant is spelled
+    ///     `model.fp16-00001-of-00002.safetensors` — the marker's separator is
+    ///     `-`, not `.` — and, more importantly, the server resolves a sharded
+    ///     dir through `model.safetensors.index.json`, which names the PLAIN
+    ///     shards. diffusers puts the fp16 shard map in a differently-named
+    ///     file we do not read, so an fp16 shard set would be skipped
+    ///     shard-for-shard and the dir would load as "no usable weights".
+    ///     `keepSafetensors` therefore takes the plain shard names here.
+    ///   * The repos also ship a 16 GB merged root checkpoint and a ComfyUI
+    ///     flat `text_encoders/` drop — a second and third copy of the same
+    ///     weights. Neither basename is in the allowlist, so neither is pulled.
+    ///
+    /// Ready markers name `transformer` rather than `unet`, and `text_encoder_3`
+    /// rather than nothing: a download missing the T5 tower is not servable, and
+    /// leaving it out of the markers would let a half-download read as complete.
+    static func sd3Diffusers(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sd3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: ["onnx/", "openvino/", "text_encoders/"],
+                        keepSafetensors: [
+                            "diffusion_pytorch_model.safetensors",
+                            "diffusion_pytorch_model-00001-of-00002.safetensors",
+                            "diffusion_pytorch_model-00002-of-00002.safetensors",
+                            "model.fp16.safetensors",
+                            "model-00001-of-00002.safetensors",
+                            "model-00002-of-00002.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "model_index.json", "transformer", "vae",
+                        "text_encoder", "text_encoder_2", "text_encoder_3",
+                        "tokenizer", "tokenizer_2", "tokenizer_3", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// One quant variant of a multi-variant SDXL diffusers repo — SceneWorks
+    /// ships `bf16/`, `q4/` and `q8/`, each a COMPLETE diffusers SDXL. The
+    /// variant is pulled with its nested weight dirs (`recursive` + `subfolder`,
+    /// the combination `selectNeededFiles` keeps at any depth) and written at
+    /// the destination root, so on disk it looks exactly like a plain SDXL repo
+    /// and the server's ordinary folder loader binds it. `q4`/`q8` are affine
+    /// MLX packs — the engine reads them per-tensor through `sdxl_nn.Linear`'s
+    /// quantized arm; nothing here has to say which.
+    ///
+    /// No `keepSafetensors`: unlike stabilityai's repos these hold exactly one
+    /// weight file per component, with no fp32 sibling to filter out.
+    static func sdxlVariant(repo: String, subfolder: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sdxl:\(repo)#\(subfolder)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, subfolder: subfolder),
+                    readyMarkers: [
+                        "model_index.json", "unet", "vae",
+                        "text_encoder", "text_encoder_2",
+                        "tokenizer", "tokenizer_2", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// A SINGLE-FILE SDXL checkpoint (the Civitai / A1111 distribution): one
+    /// LDM-keyed `.safetensors` at the repo root, no configs and no tokenizer.
+    /// The server converts it in place (`sdxl_single_file`), reading the
+    /// checkpoint's own `v_pred`/`ztsnr` marker tensors for how it was trained.
+    ///
+    /// `checkpoint` is the ONE file to pull: these repos also ship a standalone
+    /// VAE, sample images, and — for NoobAI — a COMPLETE diffusers folder beside
+    /// the checkpoint, which would double the download. Non-recursive drops the
+    /// folder's weights; `model_index.json` is excluded BY NAME because its mere
+    /// presence would send `Engine.loadAuto` down the folder path, into a
+    /// directory whose weights were deliberately not downloaded. For NoobAI
+    /// V-Pred that exclusion is also a correctness fix: its folder export
+    /// declares `prediction_type: epsilon`, which is wrong for it, while the
+    /// single file self-identifies.
+    static func sdxlSingleFile(repo: String, checkpoint: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sdxl-single:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: false,
+                        excludeSubstrings: ["model_index.json"],
+                        keepSafetensors: [checkpoint]
+                    ),
+                    readyMarkers: [checkpoint]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -466,6 +652,32 @@ extension ImageModelPreset {
         case .flux2Klein9B:
             // The one MLX conversion of klein 9B ships no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
+        case .sdxlBase10, .sdxlTurbo:
+            // NOT a flux-shaped repo — stability's own diffusers-multifolder
+            // layout (unet/vae/text_encoder/text_encoder_2), and unlike the
+            // FLUX mirrors it isn't a bundle we control: it carries fp32
+            // duplicates, single-file checkpoints, and onnx/openvino exports
+            // the `.flux` default has no allowlist to skip.
+            return .sdxlDiffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .sdxlFinetune:
+            // Three repo shapes reach the same backend, and the preset declares
+            // which it is rather than the bundle sniffing the id.
+            if let checkpoint = singleFileCheckpoint {
+                return .sdxlSingleFile(repo: repo, checkpoint: checkpoint,
+                                       displayName: name, sizeGB: Double(approxDownloadGB))
+            }
+            if let sub = repoSubfolder {
+                return .sdxlVariant(repo: repo, subfolder: sub,
+                                    displayName: name, sizeGB: Double(approxDownloadGB))
+            }
+            return .sdxlDiffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .sd1, .sdTurbo:
+            // NOT `.sdxlDiffusers` — its ready markers require `text_encoder_2`,
+            // which neither SD 1.x nor SD-Turbo ships (one tower each), so a
+            // complete download would read as permanently incomplete.
+            return .sd1Diffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .sd3, .sd3Turbo:
+            return .sd3Diffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }
