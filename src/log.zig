@@ -257,6 +257,23 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+/// Would a line at `level` be written? For call sites whose ARGUMENTS cost
+/// something to compute (byte divisions, a verdict string, a formatted
+/// number): `emit` is only reached inside the four wrappers above, but the
+/// argument tuple is built by the caller either way. Ask this first and build
+/// nothing when the answer is no.
+pub fn enabled(level: Level) bool {
+    return @intFromEnum(current_level) >= @intFromEnum(level);
+}
+
+/// `info`/`debug`/`warn` with the level chosen at RUNTIME. One line, one
+/// format string, one set of arguments — the alternative is the same `print`
+/// duplicated per level, which is how two arms of the same log drift into
+/// quoting different numbers.
+pub fn atLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
+    if (enabled(level)) emit(fmt, args);
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -405,4 +422,34 @@ fn readFileForTest(path: [*:0]const u8, buf: []u8) usize {
     defer _ = std.c.close(fd);
     const n = std.c.read(fd, buf.ptr, buf.len);
     return if (n > 0) @intCast(n) else 0;
+}
+
+test "enabled/atLevel: the level check a caller can ask BEFORE building its arguments" {
+    const original = current_level;
+    defer current_level = original;
+    const original_stderr = stderr_enabled;
+    stderr_enabled = false; // this test drives atLevel for real
+    defer stderr_enabled = original_stderr;
+
+    current_level = .info;
+    try testing.expect(enabled(.err));
+    try testing.expect(enabled(.warn));
+    try testing.expect(enabled(.info));
+    try testing.expect(!enabled(.debug));
+
+    current_level = .warn;
+    try testing.expect(enabled(.warn));
+    try testing.expect(!enabled(.info));
+    try testing.expect(!enabled(.debug));
+
+    current_level = .debug;
+    inline for (.{ Level.err, Level.warn, Level.info, Level.debug }) |lv| {
+        try testing.expect(enabled(lv));
+    }
+
+    // `enabled` is exactly the predicate the four wrappers use, so a caller
+    // that asks first and then calls `atLevel` cannot disagree with them.
+    current_level = .info;
+    atLevel(.debug, "suppressed {d}\n", .{1});
+    atLevel(.info, "written {d}\n", .{2});
 }

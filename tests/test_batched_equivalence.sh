@@ -435,4 +435,134 @@ kill $KVQ_PID 2>/dev/null || true
 wait $KVQ_PID 2>/dev/null || true
 rm -f "$KVQ_LOG"
 echo -e "${GREEN}PASS${NC} batched decode survives --kv-quant 8 (server alive, completion returned)"
+
+# ── pad-waste cap arm (opt-in: MLX_SERVE_PADWASTE_ARM=1) ──────────────────
+# Everything above runs streams of comparable length, where the pad-waste cap
+# never has anything to veto. This arm runs the pair the cap EXISTS for: one
+# ~1k-token stream beside one ~64k one. `padAndStackBatchedKV` pads every slot
+# to the group's longest, so batching those two makes the 1k slot build a
+# 64k-wide KV tensor every tick — a per-tick transient no gate bills, whose
+# failure mode is an uncatchable Metal OOM.
+#
+# It was dead on every trunk with a LINEAR global layer 0 (GDN qwen3_5 /
+# qwen4_exp, gated-conv lfm2, mamba2 nemotron_h, KDA bailing_hybrid): the cap
+# was fed `cache.step`, which only advances inside `update` on layer 0 and so
+# reads 0 forever there. Every slot reported 0, the waste ratio was 1.0 for any
+# group, and the cap kept everybody — silently, because the output is fine.
+#
+# Off by default: it needs a long-context checkpoint and a multi-minute 64k
+# prefill. The bar is the SPLIT, not bytes — batching decisions on these archs
+# change by design, so byte-equality across a changed group would be the wrong
+# bar (the forced-N=1 arm and the N=2 near-tie arm above carry that).
+if [ "${MLX_SERVE_PADWASTE_ARM:-0}" = "1" ]; then
+    echo
+    echo "== pad-waste cap: a 1k stream must NOT batch with a 64k one =="
+
+    PROMPTS_DIR="${PADWASTE_PROMPTS_DIR:-$HOME/claude-tmp/bench-qwen4-ladder/prompts_judge}"
+    PW_LOG=$(mktemp)
+    PW_LONG=$(mktemp); PW_SHORT=$(mktemp)
+    PW_LONG_BODY=$(mktemp); PW_SHORT_BODY=$(mktemp)
+    PW_PID=""
+    cleanup_padwaste() {
+        if [ -n "$PW_PID" ]; then
+            kill $PW_PID 2>/dev/null || true
+            wait $PW_PID 2>/dev/null || true
+        fi
+        rm -f "$PW_LOG" "$PW_LONG" "$PW_SHORT" "$PW_LONG_BODY" "$PW_SHORT_BODY"
+        return 0
+    }
+
+    # Request bodies: the bench corpus rungs when they are there (already
+    # OpenAI chat bodies), else synthetic filler of the same token order.
+    python3 - "$PROMPTS_DIR" "$PW_LONG" "$PW_SHORT" <<'PW_PYEOF'
+import json, pathlib, sys
+
+d = pathlib.Path(sys.argv[1])
+
+
+def body(rung, words, max_tokens):
+    src = d / ("rung_%s.json" % rung)
+    if src.is_file():
+        b = json.loads(src.read_text())
+    else:
+        # ~1.3 tokens per word of prose-shaped filler.
+        filler = " ".join("section %d paragraph body text" % i for i in range(words))
+        b = {"messages": [{"role": "user", "content": filler}]}
+    b["model"] = "mlx-serve"
+    b["max_tokens"] = max_tokens
+    b["temperature"] = 0.0
+    b["stream"] = True
+    b.pop("enable_thinking", None)
+    b.pop("enable_pld", None)
+    return b
+
+
+pathlib.Path(sys.argv[2]).write_text(json.dumps(body("64k", 50000, 600)))
+pathlib.Path(sys.argv[3]).write_text(json.dumps(body("1k", 800, 400)))
+PW_PYEOF
+
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$PW_LOG" 2>&1 &
+    PW_PID=$!
+    up=0
+    for i in $(seq 1 90); do
+        if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
+        sleep 1
+    done
+    if [ "$up" != "1" ]; then
+        echo -e "${RED}FAIL${NC} pad-waste server did not become healthy in 90s"
+        tail -20 "$PW_LOG"; cleanup_padwaste; exit 1
+    fi
+
+    # The long stream first, and the short one only once the long one is
+    # DECODING — otherwise the short request finishes during the 64k prefill
+    # and the two never form a group at all. Streaming makes "decoding" an
+    # observable: the first SSE bytes land when the first token is emitted.
+    curl -s -N -m 900 -X POST -H "Content-Type: application/json" -d @"$PW_LONG" \
+        "$BASE/v1/chat/completions" > "$PW_LONG_BODY" &
+    PW_A=$!
+    decoding=0
+    for i in $(seq 1 900); do
+        if [ -s "$PW_LONG_BODY" ]; then decoding=1; break; fi
+        if ! kill -0 $PW_A 2>/dev/null; then break; fi
+        sleep 1
+    done
+    if [ "$decoding" != "1" ]; then
+        echo -e "  ${YELLOW}NOT RUN${NC} the 64k stream never reached decode (prefill refused, or too slow)"
+        grep -iE "context|memory|refus|error" "$PW_LOG" | head -5 | sed 's/^/    /'
+        cleanup_padwaste
+        exit 0
+    fi
+
+    curl -s -N -m 300 -X POST -H "Content-Type: application/json" -d @"$PW_SHORT" \
+        "$BASE/v1/chat/completions" > "$PW_SHORT_BODY" &
+    PW_B=$!
+    wait $PW_B 2>/dev/null || true
+    wait $PW_A 2>/dev/null || true
+
+    PW_FAIL=0
+    # (a) the cap must have fired on the pair, naming the waste it compared.
+    if ! grep -qE "\[batched\] pad-waste cap: kept [0-9]+ of [0-9]+ slots \(waste " "$PW_LOG"; then
+        echo -e "${RED}FAIL${NC} the 1k+64k pair never hit the pad-waste cap —"
+        echo "    on a linear-layer-0 trunk this is the dead-cap defect: every slot"
+        echo "    reports cache.step == 0, so the waste ratio is 1.0 and nothing caps."
+        grep "\[batched\]" "$PW_LOG" | head -5 | sed 's/^/    /'
+        PW_FAIL=1
+    else
+        echo "  $(grep -m1 'pad-waste cap' "$PW_LOG" | sed 's/^ *//')"
+    fi
+    # (b) and the pair must NOT have been dispatched as one batch of 2: the
+    # long slot falls out of the group and decodes serially.
+    if grep -qE "engaged \(slots=2\)" "$PW_LOG"; then
+        echo -e "${RED}FAIL${NC} the 1k+64k pair batched anyway (engaged (slots=2)) —"
+        echo "    the long slot must fall out of the group and decode serially."
+        grep -E "engaged \(slots=" "$PW_LOG" | head -5 | sed 's/^/    /'
+        PW_FAIL=1
+    fi
+    if [ "$PW_FAIL" != "0" ]; then
+        tail -20 "$PW_LOG"; cleanup_padwaste; exit 1
+    fi
+    echo -e "${GREEN}PASS${NC} pad-waste cap split the 1k+64k pair (no batch of 2; long slot serial)"
+    cleanup_padwaste
+fi
+
 exit 0

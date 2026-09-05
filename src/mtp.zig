@@ -55,6 +55,26 @@ const Weights = model_mod.Weights;
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
 
+/// `--max-mtp-ctx`: the context length past which MTP speculative decoding
+/// stays OFF. A verify row is BYTES, and on a long-context sparse-attention
+/// trunk (qwen4_exp) those bytes grow with kv while prose acceptance stays
+/// near 1.0 — so past some context an MTP round costs more than the serial
+/// steps it replaces. This is the operator's hard ceiling for that, a MACHINE
+/// limit rather than a request preference: an explicit `enable_mtp:true` in
+/// the body does NOT lift it.
+///
+/// Boundary: INCLUSIVE. `ctx_tokens == max` still runs MTP; the first token
+/// PAST the ceiling turns it off. `max == 0` means unlimited (the default),
+/// so the flag is absent and "ceiling at the model's whole context" both read
+/// as "never off".
+///
+/// Applies to MTP ONLY — PLD, the Gemma drafter and DFlash/DSpark have their
+/// own economics and their own runtime gates.
+pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
+    if (max == 0) return true;
+    return ctx_tokens <= @as(usize, max);
+}
+
 /// Per-silicon adaptive depth cap for machines on the `.generic` cost
 /// surface. The cap is a MACHINE measurement, so each row is one, never
 /// interpolated between chips; an unmeasured chip keeps the default row.
@@ -5107,4 +5127,20 @@ test "adaptiveDepthCapForMachine: base M5 caps at 4, Pro/Max/Ultra keep the defa
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Pro", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Ultra", 6).cap);
+}
+
+test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
+    // 0 = unlimited: no context is ever past it.
+    try testing.expect(mtpCtxWithinLimit(0, 0));
+    try testing.expect(mtpCtxWithinLimit(0, 1_000_000));
+
+    // Inclusive at N, off at N+1 — the documented boundary.
+    try testing.expect(mtpCtxWithinLimit(4096, 4095));
+    try testing.expect(mtpCtxWithinLimit(4096, 4096));
+    try testing.expect(!mtpCtxWithinLimit(4096, 4097));
+    try testing.expect(!mtpCtxWithinLimit(4096, 1_000_000));
+
+    // A ceiling of 1 admits the empty and single-token cases only.
+    try testing.expect(mtpCtxWithinLimit(1, 1));
+    try testing.expect(!mtpCtxWithinLimit(1, 2));
 }

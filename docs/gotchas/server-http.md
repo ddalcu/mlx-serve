@@ -1655,6 +1655,108 @@ shed-not-evict, FailingAllocator ownership) and the catch-arm/detach source
 scan in scheduler.zig. NOT built: the issue's proposed `--prefix-cache-mem
 auto` context-sized floor — the default-sizing question is still open.
 
+## The trim #330 promised never fired: retention had end-anchored the checkpoints (#330 follow-up, 2026-09-05)
+
+**Symptom.** qwen4_exp, SSM checkpoint stride 4096, a long agent session. The
+commit of a 383,069-token entry logged
+
+    [hot-cache] skipped oversized entry (383069 tokens, 8757.79 MB > 3873.54 MB budget)
+
+— the FLAT DECLINE #330 exists to prevent. Every later turn cold-prefilled
+while the cap "held" zero bytes, exactly the cliff #330 was written for.
+
+**Three defects, one line.**
+
+**1. Retention was end-anchored.** Both capture sites in `generate.zig` (the
+stride capture in the chunk loop and the end-of-prompt snap after it) honoured
+`ssm_checkpoint_max` with `orderedRemove(0)` — drop the OLDEST. With max 16 and
+stride 4096 the survivors of a 383k prefill are the highest 16 positions, i.e.
+they cover only the last `max * stride` = 65k tokens; the LOWEST survivor sits
+around 320k, and 320k rows at 13,056 B/token plus its checkpoint is ~4,004 MB
+against a 3,873.54 MB budget. `trimLenForBudget` walks the list downward
+looking for an affordable position, finds none at all, and returns null — the
+decline. Thinned span-preservingly instead, the same 16 survivors span the
+whole prompt (4,096 … 383,039) and a trim point like 126,976 = 31 x 4096 costs
+about 1.73 GB. The disk tier (`ssmTargetPositions`) thinned from the front for
+the same stated reason and had the same consequence for a restore that
+diverges early.
+
+The hot cache had ALREADY solved this twice — `mergeCheckpointLists` and
+`shedCheckpointsToFit` both thin the interior, and the merge comment even
+names the 415 s cold prefill that taught it. Two policies for one decision is
+how the third site kept the old one, so the selection is now ONE pure helper,
+`transformer.spanPreservingDropIndex` (typed as `ssmCheckpointDropIndex` /
+`positionDropIndex`), and all four sites call it: keep index 0 (a prompt that
+diverges early restores only there) and the last (where warm turns match),
+drop whichever interior checkpoint sits between the closest pair of
+neighbours. Under three there is no interior, so the oldest goes.
+
+**2. The trim billed checkpoints the commit sheds anyway.** At candidate `k`
+the cost was `p * row_bytes + Σ bytes(list[0..k+1])` — every LOWER checkpoint
+at full price, although the commit path's own `shedCheckpointsToFit` thins
+them the moment the entry lands over the cap. The bill is now what SURVIVES a
+span-preserving shed to the remaining allowance (`shedSurvivorBytes`, the same
+selection helper, simulated on stack arrays; a list past `SHED_SIM_MAX` falls
+back to the old all-lower bill, which can only pick a shorter prefix). The
+promise has to be kept on the other side too: the replace path already ended
+with `shedCheckpointsToFit`, and the NEW-entry path now does as well.
+
+**3. One line for three outcomes.** `trimLenForBudget` returning null, the
+`trimmedCopy` failing, and the trimmed checkpoint list's `dupe` failing all
+printed the identical `skipped oversized entry` line, and the two failures
+swallowed their error entirely — so the live log above could not be read as
+"the arithmetic declined" versus "a copy failed". `TrimDecline` now names
+which, with `@errorName` appended, and a failed `trimmedCopy` retries at the
+next-lower checkpoint (`limit = tl - 1`) before declining rather than treating
+one width's failure as a verdict on the entry. The `dupe` arm leaks nothing —
+`new_snap` is by then the trimmed copy and the decline path deinits exactly
+that — but it throws the copy away, which is worth its own line.
+
+Not changed, worth knowing: `new_bytes` bills the slot's RESERVED capacity
+rows, not the token count, so the MB in that line reads high for a slot that
+grew its KV buffer past the prompt.
+
+**The count is a spacing decision, priced against the tier (follow-up).** Span-preserving
+survivors sit ~`L/K` apart, so a warm turn that diverges BETWEEN two of them re-prefills that gap:
+the policy trades an unbounded loss (no checkpoint at or below the match — a full cold prefill)
+for a bounded one. The disk tier's `SSM_DISK_MAX_PER_ENTRY` was the weakest cell at K=8, and a
+checkpoint is not a constant — on qwen4_exp it measures 83 MB + ~3 KB per token of its own
+position (191.3 MB at position 36,864), so the bill grows with K and with where the survivors sit.
+At a 383k entry, 4 entries in the tier, 900 tok/s:
+
+| K | cps/entry | 4 entries (+KV) | max spacing | worst-case re-prefill |
+|---|---|---|---|---|
+| 8 (was) | 5.6 GB | 41 GB | ~54,700 tok | ~61 s |
+| **16 (is)** | **10.6 GB** | **61 GB** | **~25,500 tok** | **~28 s** |
+| 24 | 15.6 GB | 81 GB | ~16,700 tok | ~19 s |
+| 32 | 20.7 GB | 101 GB | ~12,400 tok | ~14 s |
+
+K=32 does not fit a 100 GB tier at all, and K=24 — the smallest holding a ~16k spacing — leaves
+19 GB for a tier that must also hold every other entry and not thrash. 16 halves the worst case at
+61% of the tier. The RAM tier's own cap (32) is unchanged: its checkpoints are already resident,
+so the count costs residency, not disk.
+
+**An even spread is the wrong shape at the end (audit S15a).** Thinning the whole interior
+uniformly makes a warm turn that EDITS NEAR THE END restore up to a full spacing back, where
+drop-oldest restored one stride back — the opposite trade from the one the 383k measurement
+covered, and it binds on every hybrid arch (lfm2, nemotron_h, qwen3_5, bailing_hybrid), not just
+qwen4_exp. `spanPreservingDropIndex` therefore never selects from the newest QUARTER: that part
+stays at capture density and everything below it is thinned span-preservingly. Measured on the
+383k shape at K=32, the last gap goes 10,303 -> 2,111 tokens while the widest gap grows
+16,384 -> 20,480 — about 9 s bought at the end for 4.5 s given up in the middle at 900 tok/s. Both
+halves are pinned: the retention test asserts stride-spaced final gaps AND a front gap many
+strides wide, so neither an even spread nor a return to drop-oldest passes.
+
+Guards (hermetic, no engine): `transformer.zig`'s span-preserving retention
+test (94 positions at 4096 thinned to 16 — both ends kept, no gap past twice
+the ideal), and in `prefix_cache.zig` the 383k arithmetic both ways
+(end-anchored survivors → null, thinned survivors → a trim ≥ 126,976 that
+fits once shed), `shedSurvivorBytes`, the retry-lower selection, the three
+distinct `TrimDecline` reasons, and a class scan that no retention site has
+gone back to drop-oldest. `kv_disk_cache.zig`'s retention test changed sides
+with the policy: it asserted the lowest position was dropped and now asserts
+both ends survive.
+
 ## The schema thinking-off gate lived on one surface of three (#331, 2026-08-31)
 
 A JSON-schema grammar mask constrains from token 0 and cannot express "think
@@ -1680,3 +1782,2243 @@ contract.
 Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
 + mask-engagement count) and the server.zig source scan pairing every
 `[grammar] enforcing` site with a gate call.
+
+## A 458k prefill killed the server, and the fatal part was mlx-c's default error handler (#353, 2026-09-03)
+
+**Symptom.** Apple M5 Max 128 GB, Qwen3.8-Flash-Next `mixed-4-8bit`, main at
+`fa960f1`, `--ctx-size 1048576 --kv-quant 8 --mtp --mtp-depth 5
+--prefix-cache-entries 4 --prefix-cache-mem 24GB`. A cold prefill of 458,832
+tokens passed the memory preflight (billed ~18.1 GB against 26.6 GB
+available) and then the PROCESS died mid-prefill with
+
+    Command buffer execution failed: Insufficient Memory
+    (kIOGPUCommandBufferCallbackErrorOutOfMemory) at transforms.cpp:15
+
+No 503, no connection close, every other in-flight request gone. The rung
+before it — 393k, cold — had completed at `peak_bytes` 103.0 GB under a
+103.4 GB ceiling, and its own 6478 MB hot-cache entry was resident when the
+458k request was admitted.
+
+**It was filed as an uncatchable Metal abort. It was not.** The tell is the
+suffix: `" at %s:%d"` is appended by mlx-c's own `_mlx_error`
+(`lib/mlxc-src/mlx/c/error.cpp`), and the file it names is
+`mlx/c/transforms.cpp` — `mlx_eval`. So the exception had already been caught
+at the C boundary. Reading the pinned MLX (0.32.2) end to end:
+
+* a failed command buffer's status is stored into `CommandEncoder::error_` by
+  the completion handler and re-thrown from `synchronize()` /
+  `get_command_encoder()` — `mlx/backend/metal/device.cpp:518-579`;
+* an exception raised on a stream thread is captured into
+  `StreamThread::error` and re-thrown on the main thread at the next enqueue
+  — `mlx/scheduler.cpp:77-79, 99-112`;
+* every mlx-c entry point is
+  `try { … } catch (std::exception& e) { mlx_error(e.what()); return 1; }`.
+
+What killed the server is the handler nobody had replaced:
+
+    static void mlx_error_handler_default_(const char* msg, void* data) {
+      printf("MLX error: %s\n", msg);
+      exit(-1);
+    }
+
+`mlx.installErrorHandler` (once, from `main()`, beside `applyMlxCacheLimit`)
+latches the message and returns; `mlx.checkError()` turns the latch into
+`error.OutOfMemory` (memory class, by message) or `error.MlxFailure`, checked
+once per prefill chunk. MLX clears its own error state as it throws, so the
+next request starts clean. `MLX_SERVE_MLX_ERROR_LATCH=0` restores `exit(-1)`.
+
+**What the guard could not see.** Two terms, both proportional, both billed as
+constants or not at all:
+
+1. *Growth coexistence.* `KVCache.growQuantBuf` allocates the whole new
+   capacity with `mlx_zeros` and slice_updates the old buffer into it; the QSA
+   indexer history is a `mlx_concatenate_axis(old, new)` per chunk per
+   full-attention layer. Both leave the old buffer live in the chunk's lazy
+   graph. `PREFILL_RUNTIME_FLOOR_BYTES` claims this in its own doc comment and
+   prices it at a flat 512 MB — measured as an intercept on prompts of a few
+   thousand tokens. At 458,832 it is ~7.75 GB.
+2. *Retained SSM checkpoints.* 36 GatedDeltaNet layers x (state + conv) =
+   58.8 MB each, up to `--ssm-checkpoint-max` (32) held while the prefill
+   runs: 1.88 GB, billed at zero, and saturated at both 393k and 458k.
+
+**Why the obvious fix was parked.** `parked/admission-guard-rewrite` bills the
+growth copy at the worst chunk. It is correct and it refuses the request that
+died — and it roughly HALVES the maximum admissible context on every arch,
+because the peak is then modelled as two copies of everything the prefill has
+accumulated. Pricing a transient you can delete is the wrong trade.
+
+**What shipped instead.** Remove the transient, then let the cache pay:
+
+* `KVCache.reservedTokens` (prompt + max_tokens + one chunk, only past
+  `RESERVE_MIN_TOKENS` = 32k) is reserved before the first chunk writes, so a
+  long prefill grows its buffers exactly ONCE and nothing coexists. The guard
+  bills that reservation's headroom — tens of megabytes — instead of a second
+  copy of the cache. Short prompts keep the proportional policy untouched.
+
+  **`MLX_SERVE_KV_RESERVE=0` restores the ALLOCATION policy, not the bill**
+  (audit N3, correcting an earlier draft of this line that said it "restores it
+  everywhere"). The switch is read in `KVCache.nextCapacity`, so with it off the
+  cache returns to proportional growth; but `server.reservedCacheTokens`
+  delegates to `KVCache.reservedTokens`, which does NOT read it, so the
+  admission guard keeps billing the reservation either way. The direction is
+  conservative — the bill exceeds what the engine then allocates, so a request
+  is refused slightly early rather than admitted and OOMed — but it is not the
+  byte-for-byte return the line promised, and a wrong restore claim sends the
+  next person hunting the wrong file when the numbers do not match.
+* `retainedSsmCheckpointBytes` and `statePerTokenBilled` join the estimator,
+  the latter read by the auto-context sizer AND the guard so advertised and
+  admitted contexts cannot diverge. The QSA history was billed at TWO copies
+  while it re-concatenated per chunk; with the capacity-buffer append in the
+  same tree (`qsaAppendKeys` -> `capBufAppend`) the bill is ONE copy. That
+  halving is not cosmetic: at
+  `--ctx-size 1048576` on qwen4_exp the doubled bill clamped a requested
+  24,576 MB hot cache to 5,703 MB, and the single copy gives most of it back.
+  (Later: the prefill-end checkpoint attach turned out to MATERIALIZE a second
+  copy anyway, so 63cf6bd re-doubled the bill; the commit-time handoff of
+  2026-09-05 removed that copy and the bill is one copy + the f32 score bank —
+  story in `engine-mlx.md`, "HELD twice from prefill end to commit".)
+  The bill reads the two LEVERS that decide the copy count (the commit handoff
+  and the reservation), not the shape of the append: a `QSA_HISTORY_GROWS_IN_PLACE`
+  flag once stood here and was removed because a fact about the append cannot
+  say whether a second copy exists. If the append ever returns to
+  `mlx_concatenate_axis(old, new)`, `statePerTokenBilled` is what has to move.
+* `HotPrefixCache.evictLruToAdmit` gives memory back rather than refusing: a
+  cached prefix is an optimization, the request is the work. It runs on the
+  inference thread (sole mlx caller, even for frees) after the prefix restore
+  — which makes the entry in use the most-recently-used one, so LRU reaches it
+  last and `protect_mru` stops before it. The fits predicate is re-asked after
+  every eviction, never compared against a precomputed shortfall (#126).
+  Refusal happens only with an empty cache, and quotes the hot-cache bytes it
+  counted.
+
+**Bar.** The unit tests pin the terms and the single-grow invariant; the live
+bar is a 64k-step ladder 384k → 512k on a 128 GB box: every rung either
+completes or answers a 503, and the process is still serving at the end.
+
+### Three defects the #353 branch shipped with (audit, 2026-09-05)
+
+**1. The guard billed the UNCLAMPED `max_tokens`.** All four text surfaces ran
+
+    if (!try checkAttentionMemory(… max_tokens …)) return;
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+in that order — harmless while the guard ignored `max_tokens`, fatal the
+moment it started billing a reservation from it. An omitted `max_tokens` is
+`omittedMaxTokensDefault` = `maxInt(u32)/4` = 1,073,741,823, which on
+qwen4_exp at 8-bit is ~26 TB of KV: **every prompt past
+`RESERVE_MIN_TOKENS` with no `max_tokens` field would have been refused 400**
+— the overwhelmingly common shape for an agent client. The 512k ladder rung
+missed it because the runner sets `max_tokens: 16`.
+
+Fixed at BOTH ends, because a reservation is a number two subsystems must
+agree on and neither may trust its caller for it: the four surfaces clamp
+first and hand the guard `effective_max_tokens` (scan-pinned, including that
+a clamp precedes each guard within 900 bytes), and `KVCache.reservedTokens`
+takes the context and bounds the headroom by `ctx - seq` itself. `ctx == 0`
+means "unknown" and imposes no clamp.
+
+**2. The evict-to-admit probe billed a different request than the guard
+admitted.** `prefillFitsNow` hardcoded `kv_override = null` and
+`unchunked_prefill = false` while `checkAttentionMemory` passed the request's
+own `kv_quant_override` and `visionPrefillUnchunked(...)`. A `kv_quant: 4`
+request therefore priced its cache at fp16 on the inference thread —
+over-billing ~2.4x, evicting a hot cache that did not need to go, and able to
+refuse by name a request the connection thread had already admitted. One
+estimator means one set of INPUTS too: the hook now carries the scheme and the
+chunking, the scheduler reads them off the slot (`slot.cache.config`,
+`slot.vision_embeddings`), and both are scan-pinned.
+
+**3. A decode-time MLX failure was never consumed.** `mlx.checkError` lived
+only in the prefill chunk loop. A decode forward that failed left the slot
+sampling from buffers Metal never wrote — the request finished **200** with
+whatever those bytes decoded to — and the latch waited for the NEXT request's
+first prefill chunk, which answered 503 for a failure that was not its own:
+two wrong answers from one error. `runSingleDecodeTick` and
+`runBatchedDecodeTick` are now thin wrappers that run the tick and then
+consume the latch (`mlx.checkErrorDecode`), attributing the failure to that
+slot — or, for a batched group, to every slot in it, since they share the one
+forward and there is no honest way to blame one. A latched MLX message is the
+root cause and any Zig error above it is the symptom, so the latch wins;
+either way it is cleared before the next tick.
+
+**Bar.** `MLX_SERVE_MLX_FAULT_STEP=<n>` is the decode sibling of
+`MLX_SERVE_MLX_FAULT_CHUNK`, with its own counter (a decode-step test must not
+have its count eaten by the prefill's chunks); `tests/test_mlx_error_recovery.sh`
+arms it, asserts the faulting request fails and the next succeeds, and sends
+one long prompt with **no** `max_tokens` field — the class defect 1 belongs to.
+
+### The reservation bought a generation nobody asked for (#353 follow-up, 2026-09-05)
+
+Functional check on the mega candidate (`longctx-mega-cand-nk` @ de41ffc,
+`--ctx-size 1048576 --kv-quant 8 --mtp --prefix-cache-mem 24GB
+--prefill-chunk 4096 --prefix-cache-disk 100GB`), three rows:
+
+- 50k prompt, no `max_tokens` → **200**.
+- 512k prompt, `max_tokens: 16` → **200** (524,253 tokens, 862 tok/s prefill,
+  peak 100.7 GB, liveness after it 200).
+- **374k prompt, no `max_tokens` → 503**, with the abandoned-generation
+  message. The log:
+
+      generation budget squeezed: 665509/1073741823 tokens remaining (prompt=383067, ctx=1048576)
+      prompt 383067 tokens needs ~37394MB, ~37130MB available + ~1564MB evictable hot cache — admitting, the prefill will evict
+      [hot-cache] reused 51662/383067 tokens (matched 51662; entry 1/1)
+      [scheduler] prefill refused: 383067 tokens do not fit even with an empty hot cache
+
+No `[mlx]` line: nothing ran out of anything, and nothing was abandoned. Two
+defects, and it took both to produce that 503.
+
+**1. The reservation was sized by the CONTEXT, not by a generation.**
+`clampMaxTokens` turns an omitted `max_tokens` into `ctx - prompt` — here
+665,509 tokens — and `reservedTokens` reserved every one of them: ~8.3 GB of
+8-bit KV headroom plus ~4.8 GB of QSA indexer history (billed at both copies),
+**13 GB** of a 37.4 GB bill, for a generation the request would never run. The
+context bound added by the previous audit is the right bound for a caller who
+NAMES a huge `max_tokens`; it is the wrong bound for one who names none.
+
+What the reservation is for is the prefill's old+new coexistence: a grow
+allocates the new capacity beside the old one and both stay live in the
+chunk's lazy graph. That is a PREFILL property. Past the prompt, a decode grow
+takes the ordinary +25% policy — one grow per quarter of the cache (~94k
+tokens at 374k), between decode steps, with nothing else live. So the
+reservation now buys `seq + min(max_tokens, RESERVE_GEN_HEADROOM) + chunk`,
+with the headroom at 8192 tokens (~100 MB of KV here): more than any real
+answer, and 130x less than the window. The same `KVCache.reservedTokens` is
+still the ONE definition the guard bills and the engine allocates.
+
+**2. "Fits after eviction" credited memory eviction would never return.**
+The bill was 264 MB over the headroom and was admitted only because the hot
+cache held 1,564 MB. That was ONE entry — the one this very prompt then
+restored from. A restore refcount-shares the entry's buffers with the slot's
+cache, so `evictLruToAdmit` protects it by construction (`protect_mru`) and
+evicting it would return nothing anyway; `lruIndexExcluding` had nothing else
+to offer and the request was refused after being promised.
+
+The connection thread cannot know which entry a prompt will match, but it
+knows a restore pins at most ONE, so the provable credit is the residency
+minus the largest entry: `HotPrefixCache.reclaimableBytes`, published beside
+`residentBytes` and read by the guard as `AdmissionBill.reclaimable`.
+`fitsAfterEviction` credits that; `evictable` stays in the message, because
+the operator's question is still "why didn't it drop a cache entry?".
+
+**3. And the refusal was dishonest.** The scheduler returned
+`error.OutOfMemory`, which is the MLX latch's name, so the client was told the
+engine "ran out of GPU memory during this request and it was abandoned" for a
+request that never ran a forward. It is now `error.PrefillDoesNotFit` — a
+named **400** on all four surfaces, with the compared byte counts logged
+(`refused before prefill`) by the estimator that owns them.
+
+**Also seen in the same boot, and expected:** `[hot-cache] budget clamped
+24576 -> 5703 MB (weights + ctx KV + prefill reserve vs GPU ceiling)` and
+`[hot-cache] skipped oversized entry (524269 tokens, 11349.42 MB > 5703.95 MB
+budget)`. At 1M context the clamp reserves the whole context's KV, and an
+entry is billed at the QSA history's two copies — 11.3 GB for 524k tokens. The
+entry lands on the SSD tier instead; that is the cap working, not a defect.
+
+---
+
+## The chunk sizer read the cache ASK, so a smaller ask bought a smaller cache
+
+Two boots of the same 69 GB `qwen4_exp` pack on the same 137 GB Mac, same
+`--ctx-size 1048576 --kv-quant 8`, differing only in one flag:
+
+```
+--prefix-cache-mem 10GB  ->  [hot-cache] budget clamped 10240 -> 3873 MB
+--prefix-cache-mem 24GB  ->  [hot-cache] budget clamped 24576 -> 5703 MB
+```
+
+Asking for **less** got **less than half** the cache. Not noise — arithmetic,
+and reproducible.
+
+### The loop
+
+Both boots imply the same headroom: `ceiling - weights` = 28,909 MiB, and the
+1M context's KV is `(13,056 + 7,680) B/tok x 1,048,576` = 20,736 MiB. So both
+have 8,173 MiB to split between the prefill transient and the hot cache. What
+differed was the split, and the ask decided it:
+
+1. `pinPrefillChunk` passed the RAW requested budget into `resolvePrefillChunk`
+   as `hot_cache_reserve`. The rung bar is
+   `(ceiling - weights - hot_cache_reserve) / 4`.
+2. At a 10 GB ask that bar admitted rung **1024**, whose transient reserve is
+   ~4,300 MiB. At a 24 GB ask the bar dropped below every rung's reserve, so
+   the ladder bottomed out at **512** — reserve ~2,470 MiB.
+3. `prefixCacheMemForLoad` then billed *that* chunk's reserve back against the
+   *same* request: `min(ask, ceiling - weights - ctx_kv - reserve)`.
+   - 28,909 - 20,736 - 4,300 = **3,873**
+   - 28,909 - 20,736 - 2,470 = **5,703**
+
+A bigger ask stepped the chunk DOWN, which shrank the reserve, which left the
+cache MORE bytes. The ask was on both sides of the equation with opposite
+signs, so the composed function was not monotone in it — and the operator's
+lever pointed the wrong way over part of its range.
+
+A later probe swept the ask further and found the inversion is not confined to
+the low end. Same pack, quiet box, `--prefill-chunk 4096` pinned, wired 120000:
+
+| ask | resolved | `max_safe_context` |
+|---|---|---|
+| 10 GB | 9,765 MB | 1.03M |
+| 24 GB | 13,244 MB | 565k |
+| 40 GB | **15,917 MB** | 34k |
+| 60 GB | **15,830 MB** | 1,024 |
+| 10 GB (repeat) | 9,562 MB | 1.02M |
+
+Two more things fall out of that table. **40 GB buys more cache than 60 GB** —
+a second inversion, at the top of the range, where the extra ask pushes the
+sizer across a rung boundary and the wider reserve costs more than the ask
+gains. And the 10 GB repeat differs from the first 10 GB boot by 2.1% (9,765 vs
+9,562) with nothing changed but the minute — that is the free-RAM term in the
+ceiling, which the static-ceiling fix further down removes.
+
+### The fix is an ORDER, not a formula
+
+The clamp already subtracts the chunk's reserve from the cache's headroom.
+That makes the cache the **residual claimant**: it gets what the chunk leaves.
+Pre-charging the cache in the sizer and then charging the chunk to the cache in
+the clamp is the same bytes billed twice, in a circle. So the dependency runs
+one way now:
+
+- `resolvePrefillChunk` no longer takes the ask at all — the parameter is gone,
+  which is what makes the property structural rather than a comment. Its share
+  bar prices the whole post-weights serving budget.
+- `clampedPrefixCacheMem` then hands the cache the remainder.
+
+Monotonicity is now by construction: nothing before the clamp reads
+`requested`, and the clamp is `@min(requested, headroom)` over a headroom the
+ask cannot move. A fixpoint iteration (chunk -> clamp -> chunk until stable)
+would also have worked and was rejected as more machinery for the same answer.
+
+### Second bite: `requested == 0` used to feed the sizer a zero reserve
+
+The old code was accidentally *right* about one thing — with the ask in the
+bar, a big ask forced a narrow chunk, which left the cache something. Remove
+the ask and a wide rung can eat the whole remainder, and
+`clampedPrefixCacheMem`'s `@max(..., 1)` "never return 0" floor then hands the
+cache **one byte**: an enabled cache that cannot hold a single turn. The clamp
+cannot defend a budget the chunk has already spent, so the defence moved one
+step earlier, into the sizer, as a second ask-independent bar:
+
+```
+cap = min( serving / PREFILL_RESERVE_BUDGET_SHARE,
+           (serving - ctx_kv) - HOT_CACHE_FLOOR_BYTES )
+```
+
+`HOT_CACHE_FLOOR_BYTES` is 1 GiB. That is a PICK, not a measurement: one
+agentic prefix on a large model is order-GB of KV, so below it the cache cannot
+retain a single turn and the feature is dead weight. It is the only tunable
+this fix introduced.
+
+`ctx_kv` here is `sizerCtxKvBytes` — the PINNED context's bill under an
+explicit `--ctx-size`, and **0** while the context is auto. Auto-context is
+derived FROM the chunk (`pinAutoContext` pins the chunk first, deliberately),
+so reading it here would be circular; and it does not need to be read, because
+`computeMemoryContext` subtracts the chunk's reserve itself and shrinks to fit
+whatever rung comes out. Both terms are ask-independent, so neither reopens the
+loop above.
+
+### Third bite: `--prefill-chunk` was honored by the forward and ignored by the bill
+
+`generate.effectivePrefillChunk` lets an explicit `--prefill-chunk` outrank the
+machine-sized pin. `pinPrefillChunk` did not — only its *log line* consulted
+`prefill_chunk_explicit`. So on the deployed flags (`--prefill-chunk 4096`) the
+clamp reserved a 512- or 1024-token transient for a forward that ran 4096: an
+under-reserve of several GB, in the one estimator whose entire job is to stop
+the cache from filling into an uncatchable Metal OOM. `explicitPrefillChunk()`
+mirrors the precedence and `billedPrefillChunk` is where both readers meet; the
+test calls *both* with an explicit chunk set and demands the same number.
+
+### Fourth bite: the clamped value went nowhere
+
+`prefixCacheMemForLoad`'s answer reached `initWithMem` and stopped there. The
+process-global `prefix_cache_mem_bytes` still held the raw ask, and
+`computeMemoryContext` and `aneGateHeadroom` both read it — so the auto-context
+sizer and the ANE admission gate went on reserving 24 GB for a cache that had
+been given 5.7. The clamp now publishes into `hot_cache_mem_resolved` and every
+post-load reserve reads `resolvedPrefixCacheMem()`. It is a SEPARATE global
+rather than an overwrite of the ask: the ask is the launch flag, and
+re-clamping an already-clamped value on the next model load would ratchet the
+budget toward 1 byte across a model swap. A line scan over `server.zig` pins
+that no code path reads the ask directly except the accessor's own fallback.
+
+**Known limit — the ANE gate reads the budget before the load publishes it.**
+`aneGateHeadroom` is the one remaining consumer (after the sizer fix above,
+`computeMemoryContext` no longer reads the published budget at all), and it is
+NOT ordered behind the resolver: `doLoadOnInferenceThread` calls
+`buildAnePrefill(..., params.ane_headroom_resolver)` at `scheduler.zig` ~3929,
+while `prefixCacheMemForLoad` publishes ~74 lines later at ~4004. So on a first
+boot the gate reads the pre-load fallback — the raw ask, which is the LARGER
+reserve, so the direction is conservative — and after a model switch that leaves
+the previous entry resident, or a load of a model whose prefix cache is off
+(`scheduler.zig` ~4110 is `if (entry.prefix_cache) |*hc|` with no else, so
+neither the resolver nor the retire hook runs), model B's gate can reserve model
+A's budget. What DID land is the staleness half: `hot_cache_mem_resolved` is
+atomic, and `scheduler.hot_cache_budget_invalidate` retires the published number
+at every site that drops the resident cache (five sites; the test scans for the
+PAIRING, so a sixth drop site fails the scan). The ordering half is open. It is
+reachable only through `--ane-prefill`, which is opt-in and M4-and-below, and
+this box cannot exercise that path — so the reorder is recorded as a follow-up
+rather than done blind. Do not read this section as "S7 fixed".
+
+**The damage was worse than a mis-sized reserve: it floored the ADVERTISED
+context.** Right-hand column of the probe table above — `max_safe_context` goes
+1.03M -> 565k -> 34k -> **1,024** as the ask grows 10 -> 24 -> 40 -> 60 GB.
+`computeMemoryContext` subtracted the whole RAW ask from the serving budget, so
+a 60 GB ask reserved 60 GB of cache the clamp had already refused to grant, and
+the context sizer had nothing left to report.
+
+Which surface that reaches depends on one flag, and the distinction is worth
+keeping straight:
+
+- **`/props` `max_safe_context`** comes from `computeMaxSafeContext`, called on
+  every boot with no `--ctx-size` early-out. It misreports either way — but it
+  is a diagnostic, so the cost is a misleading number.
+- **The ADVERTISED context** — `/v1/models` `context_length`, which agent CLIs
+  read ONCE and budget their own `max_tokens` against for the rest of the
+  session — comes from `getEffectiveContextLength`, and both it and
+  `pinAutoContext` return `server_config.max_context_size` immediately when
+  `--ctx-size` is set. So **a manual `--ctx-size` boot is protected**: the
+  advertised value is the operator's own number and never routes through
+  `computeMemoryContext`.
+
+The bite is therefore on **AUTO-context boots** — no `--ctx-size`, which is the
+default. There `pinAutoContext` -> `autoContextFor` -> `computeMemoryContext`,
+and a generous `--prefix-cache-mem` silently pins a 1,024-token advertised
+context for the life of the process. The operator's lever for "hold more cache"
+was quietly also the lever for "advertise almost no context", on exactly the
+configuration where nothing pins it back.
+
+The log line names what it billed, so the next report is one grep:
+
+```
+[hot-cache] budget clamped 24576 -> 5703 MB (chunk 512 reserve 2470 MB, ctx KV 20736 MB)
+```
+
+### Not fixed here
+
+The `ctx_kv` term itself double-counts: the clamp bills the FULL configured
+context against a budget the hot cache shares with the live KV, so at 1M
+context 20.7 GB is subtracted from the cache's headroom for KV that only exists
+once a request is that long. That is being removed arch-gated on the SSD-first
+branch. This fix makes the default sane with that bill still in place.
+
+**And there was a second inversion, in the CEILING.** Same 10 GB ask, same
+pack, same session; only `iogpu.wired_limit_mb` differs — from
+`judge_mega3_fix.budget.txt`, boot 1 at 2026-09-05 13:42:36:
+
+```
+sysctl iogpu.wired_limit_mb = 120000
+[preflight] weights ~70.13 GB, available 108.72 GB
+[hot-cache] budget clamped 10240 -> 1076 MB
+```
+
+against the default ceiling's `10240 -> 3873 MB`. **Raising the ceiling ~10 GB
+shrank the cache 3.6x.** Mechanism: the extra headroom bought the sizer a wider
+rung, the rung's reserve grew faster than the headroom did, and the cache — the
+residual claimant — paid for the upgrade. Making the ask monotone did not touch
+this: the rung ladder is discrete, so any ceiling increase that crosses a rung
+boundary can cost more than it gains.
+
+The fix is to notice what the load-time reserve is FOR. **It is a promise to
+the FIRST request.** On an arch that picks its width per request (below), every
+request re-prices its own real width at admission against live memory, and
+`fitsAfterEviction` can hand hot-cache bytes back to admit it — so the promise
+only has to cover the narrowest forward the box can ever be asked for. That is
+the ladder floor, and it does not move with the ceiling:
+
+```
+budget = ceiling - weights - ctx_kv - reserve(floor)
+```
+
+monotone in the ceiling AND in the ask. `clampReserveWidth` is the one place
+that decides it; `HotCachePlan` carries both widths (`chunk` for the boot log
+and the default pin, `reserve_chunk` for what the clamp billed) and the log
+line names both, because they answer different questions:
+
+```
+[hot-cache] budget clamped 10240 -> 7000 MB (chunk 1024, reserve at width 512 = 2470 MB, ctx KV 20736 MB)
+```
+
+Two carve-outs. An explicit `--prefill-chunk` is billed as-is — the operator
+pinned a width, every request runs it, nothing narrower is ever chosen. And an
+arch without the per-request gate keeps the sizer's rung, because it has no
+per-request re-bill to fall back on; for those the load-time promise really is
+the promise.
+
+**The residual risk, stated:** the floor promise leans on evict-to-admit, and
+`reclaimableBytes` is residency minus the largest entry — so a cache holding
+one giant entry cannot give it back. That entry is the one a restore would
+share, which is why it is excluded; the exposure is a wide forward arriving
+against a cache that is one huge unreclaimable entry. The admission bill still
+refuses by name rather than OOMing in that case.
+
+**And the whole thing was non-reproducible anyway.** Two boots of the identical
+binary, flags and wired limit, 11 minutes apart on 2026-09-05:
+
+```
+13:42 (straight after two suites)  [preflight] available 108.7 GB -> 10240 -> 1076 MB
+13:53 (quiet box)                  [preflight] available 116.6 GB -> 10240 -> 9757 MB
+```
+
+A 9x spread on the same machine and the same ask, because
+`currentGpuMemoryCeiling` is `min(recommendedMaxWorkingSet, footprint + free
+RAM)` and the load-time clamp read it. The free-RAM half is a property of the
+minute the server happened to start in; the budget it produced was therefore
+whatever the box was doing at the time, and the user's bar is one boot that
+works.
+
+So the LOAD-TIME clamp bills the STATIC term only — `staticGpuMemoryCeiling()`,
+Metal's `max_recommended_working_set_size` or the wired limit:
+
+```
+budget = staticGpuMemoryCeiling() - weights - ctx_kv - reserve(floor|explicit)
+```
+
+Every term is a property of the machine and the model, so two boots agree.
+
+**The free-RAM term is moved, not deleted.** It stays exactly where it can be
+acted upon: request-time admission (`prefillAdmissionBill`, and `prefillFitsNow`
+re-asking it after every eviction) and the `active_mem` guards. A cache sized
+above what free RAM currently allows is not a crash — it is entries the
+admission pass evicts on the first request that needs the room, which is the
+#353 machinery doing its job. What it must never be is a budget that silently
+shrinks 9x because a test suite was running.
+
+Deliberately NOT changed: `computeMemoryContext` (the auto-context sizer) and
+`pinPrefillChunk` (the memory-sized rung) both still read the live ceiling. The
+advertised context is pinned once and read by agent CLIs that never re-read it,
+and the rung feeds the boot log and non-gated archs; neither is the hot-cache
+budget, and neither was the thing that was irreproducible in a way anyone felt.
+The registry's eviction gate (`--max-resident-mem`, `gateEstimateBytes`) never
+touched this helper at all.
+
+Under external pressure the load line says so without acting on it:
+
+```
+[hot-cache] budget 9757 MB (static ceiling); free at load 38.6 GB — live admission will evict as needed
+```
+
+**CORRECTED BY MEASUREMENT.** I first wrote here that the wide rung would
+arrive when the SSD-first branch removed this bill. It does not need to, and
+the arithmetic I used to say so was wrong in two ways: I was comparing a full
+admission bill against a transient reserve, and I was assuming the load-time
+`PREFILL_RESERVE_BUDGET_SHARE` still gated the outcome. The per-request chooser
+below does not go through the load-time sizer at all — it prices the REQUEST
+against live free memory — so on this box a 300k or 384k prompt already gets
+chunk 4096 today, with this bill still in the clamp. What the SSD-first change
+buys is a bigger hot cache, not a wider chunk.
+
+`PREFILL_RESERVE_BUDGET_SHARE` and the reserve estimator both stay untouched:
+the judge at chunk 4096 peaked 90.3 GB of a ~93 GiB ceiling at 384k, so the
+estimator is not loose, and the share is what stops one forward from trading
+the whole session for its own speed at LOAD time.
+
+**The ordering wrinkle was NOT moot — it was the whole of live check #6.**
+An earlier draft of this section said the clamp reading a stale context was
+"bounded, and moot once the SSD-first branch removes the full-context bill."
+Both halves were wrong, and the live check found it:
+
+    # auto-context boot (no --ctx-size), --prefix-cache-mem 60GB
+    [hot-cache] budget clamped 61440 -> 48673 MB (chunk 4096, reserve at width 512 = 1474 MB, ctx KV 26 MB)
+    Context size: 870 tokens (auto: 85% of the 1024-token memory ceiling)
+    # the same boot at the default ask
+    Context size: 1048576 tokens (auto: the model's maximum; memory would allow 1113088)
+
+`ctx KV 26 MB` is the tell. The clamp runs during the load and `pinAutoContext`
+runs after it, so `getEffectiveContextLength` answers with the 1024-token floor;
+the clamp subtracts ~26 MB of "context" instead of ~20.7 GB, grants almost the
+whole ask, and the sizer that runs afterwards has nothing left. An
+over-generous `--prefix-cache-mem` therefore pinned an **870-token advertised
+context** for the life of the process — and agent CLIs read that number once
+per session. Publishing the RESOLVED budget rather than the raw ask made it
+48,673 instead of 61,440, which is smaller and still fatal: **an ORDER bug is
+not fixed by better arithmetic on the wrong input.**
+
+It is also not SSD-first's to fix. Both arms of the load-time bill had it, and
+both now read ONE pure resolver, `resolvedContextForLoad` — explicit
+`--ctx-size` wins, else a pinned context, else a sized one that mirrors
+`autoContextFor`'s margin-then-cap WITHOUT calling the accessor it works
+around. The arms differ in exactly one argument, the cache reserve:
+
+- **SSD-first passes 0.** Its resident entry IS the live KV, so the honest
+  load-time reserve genuinely is zero and no fixpoint exists.
+- **RAM-first passes `CTX_SIZING_CACHE_RESERVE`**, a fixed 2 GiB. It holds cache
+  in ADDITION to the live KV, so it has no such out — which is why the
+  parameter exists at all.
+
+That constant must never be derived from the ask, and passing the ask itself is
+the same bug one level in: `ceiling - active` is 39,568 MiB against a 61,440 MiB
+ask, so sizing the context against it saturates to zero usable and returns the
+1024-token floor — the 870 boot again. **Context is the primary claimant and the
+cache is the residual**, the same order the prefill chunk follows. An ask must
+never be able to shrink the context that is then used to bill that ask.
+
+The manual path is untouched by all of it: `--ctx-size` wins in the resolver's
+first branch, before any memory arithmetic runs, so a pinned boot bills exactly
+what it billed before.
+
+### The width is re-asked after the eviction pass (N5)
+
+`prefillAdmissionBill` computes `available` WITHOUT `reclaimable` and hands
+that to `chooseRequestPrefillChunk`, so a resident hot cache narrows the
+prefill width — the ladder floor instead of 4096 — rather than being evicted.
+That is the right call at that moment: crediting `reclaimable` there would
+choose a width justified by memory eviction has not actually returned yet, the
+same "credit what you cannot prove" shape as the `evictable` vs `reclaimable`
+split this work introduced after a 383k prompt was admitted on 1,564 MB of
+cache that turned out to be the single entry the prompt itself had just
+restored. The two failure costs are not symmetric: a narrow width costs prefill
+throughput, a width justified by absent memory costs an uncatchable Metal OOM.
+
+The fix is therefore not a wider bill but **a second look**. The scheduler's
+prefill path now asks the width TWICE around the eviction pass:
+
+1. `admitted_prefill_chunk` — the pre-eviction reading, taken through the same
+   `prefill_request_chunk` hook, with the same inputs and the same live memory
+   as the probe that just failed. It is captured ONLY on the path that actually
+   evicts: when the probe already fits, no memory moves and there is nothing to
+   compare a second reading against.
+2. `evictLruToAdmit` runs and returns an `EvictionReport`.
+3. `evicted_live_bytes = report.bytes` — the ALLOCATOR's delta, never
+   `accounted_bytes` (a shared snapshot bills megabytes and returns none of
+   them) and never `reclaimable` (a projection).
+4. The re-ask, then `scheduler.postEvictionPrefillChunk(admitted, reasked)`.
+
+**The re-ask is the truth, and the comparison is only a log.** This shipped as
+`@max(admitted, reasked)`, argued as an assertion: an eviction only ever
+RETURNS memory, so post-eviction availability is `>=` pre-eviction, the max
+changes nothing on the expected path, and it "catches" the impossible case. The
+external review of PR #363 turned that argument around. A max is not an
+assertion — it is a clamp, and the ONLY case in which it does anything is the
+case where the invariant broke. There it discards the reading taken after the
+pass against LIVE memory and keeps the pre-eviction one because it is WIDER,
+which is widening onto memory that has already gone to a co-tenant slot's
+decode: the uncatchable Metal OOM, arrived at by way of a safety check. The
+costs are not symmetric and the safe arm is the narrow one, so the second
+reading — taken by the same estimator that admits the request, after the pass,
+against what is actually free — is the width that runs, whichever direction it
+moved. The floor still holds because the CHOOSER holds it: its ladder falls
+through to the floor rung and `postEvictionPrefillChunk` computes no width of
+its own. Both directions log under `[prefill] re-ask:` (a distinct prefix from
+the per-chunk `[prefill] width N -> M at pos P` contract line), the widening at
+info naming the bytes the pass returned, the narrowing at warn naming both
+widths — a narrow re-ask is rare and worth seeing, it is just not worth
+overruling.
+
+The re-asked width has to reach two consumers with different rules, and a
+change that wires one and not the other ships a width nobody runs:
+
+* The request's own chunk: `req_prefill_chunk` →
+  `InitOptions.pinned_prefill_chunk` → `effectivePrefillChunk` →
+  `PREFILL_CHUNK` → `default_chunk` → `cur_chunk`.
+* The per-chunk adapter's ceiling, `cap_adapt`. It is built from the arch
+  resolver with the pin left OUT (a literal `0` rung), so it is `>=` any ladder
+  width the chooser can return and cannot clip a re-ask. If it ever starts
+  reading the pin, the widened width becomes its own ceiling and the adapter
+  can only narrow.
+
+Both are scan-pinned (`the re-asked width reaches the request's chunk AND is
+never capped by the adapter`), as is the ORDER of the four steps above.
+
+### The admission bill is logged on ADMITTED requests too
+
+The tight-admission path used to log nothing when it went through: the numbers
+only ever appeared once a request had already been refused, so there was no way
+to watch the machine walk up to the edge. `checkAttentionMemory` now emits ONE
+line per REQUEST — never per chunk — at the admission decision:
+
+```
+[admission] needed=N MB available=A MB reclaimable=R MB width=W verdict=admit|evict|refuse
+```
+
+Every field comes off the SAME `AdmissionBill` the three arms act on and the
+refusal message quotes, so the two cannot name different numbers for the same
+request; a second estimator call here would be #126 ("a gate that runs BEFORE
+the estimator that knows better IS the estimator") in log form, quoting a bill
+nobody acted on. `admissionVerdict` derives the verdict from that bill with the
+same two predicates the arms branch on (`fits`, `fitsAfterEviction`).
+
+The level is chosen by `admissionLogLevel`: info on the first request after a
+model becomes resident (`model_registry.load_generation`, consumed by one
+compare-and-swap so N racing connection threads produce ONE line), info
+whenever `needed > 0.9 * available` — the band where the next request is the
+one that evicts or refuses — and debug otherwise, because a roomy machine
+would otherwise write one info line per request for the life of the process.
+The level check runs FIRST and the byte divisions and verdict string happen
+only after it; under `--log-level warn` the call returns before it can even
+consume the post-load token, which must not be spent on a line that was never
+going to be written.
+
+### The billed session and the advertised session were two numbers (2026-09-05)
+
+Found by the SSD-first owner while folding these branches together, and it is
+the same family as audit S6 one level out.
+
+On an SSD-first boot the load-time bill and the pinned context are supposed to
+be one session:
+
+- `ssdFirstSessionTokensNow` bills the session the budget FLOOR is built for
+  (`ssdFirstPrefixCacheMem` floors the budget at one entry at the working
+  context), and it passed `cache_reserve = 0` — the reasoning being that the
+  resident entry IS the live KV, so the cache reserves nothing beyond the
+  session.
+- `pinAutoContext` -> `computeMemoryContext` then sized the ADVERTISED context
+  against `CTX_SIZING_CACHE_RESERVE`.
+
+Same box, same instant, two reserves, two sessions. An agent CLI reads the
+smaller number out of `/v1/models` ONCE and budgets against it for the whole
+session, while the cache floor holds RAM for the larger one. It survived review
+because neither number looks wrong on its own: both are real contexts, a few
+percent apart, and the wrongness is only visible when you ask which one "one
+session" means.
+
+The `= 0` argument is true of the RESIDENT entry and false of the mode's IDLE
+allowance, which is RAM in addition to it. But the honest idle allowance is
+`--prefix-cache-mem`, i.e. the ASK — and reading the ask is live check #6 (a
+60GB ask collapsed the advertised context to 870 tokens), while reading the
+budget resolved from it is audit S6, the same bug as a one-step loop. Context is
+the primary claimant and the cache is the residual. So the reserve is the
+CONSTANT on both arms and on both sides, and the constant is the server's own
+`--prefix-cache-mem` default, so a default boot is unchanged.
+
+The relation, stated exactly, is now one expression in one helper
+(`autoContextFrom`) that both sides run:
+
+```
+advertised = autoContextFrom(
+    safeContextForBudget(ceiling, active,
+                         CTX_SIZING_CACHE_RESERVE + transient,
+                         per_tok, 0),
+    ctx_cap)
+```
+
+The 85% memory margin lives INSIDE it and the checkpoint cap is applied AFTER
+the margin, un-margined — get that order wrong and the two sides differ by
+exactly the margin, which is how the S6 test read at the fold (it compared the
+raw memory context against the clamp's margined answer).
+
+Explicit `--ctx-size` boots are untouched: the operator's number is the
+resolver's FIRST early return and `pinAutoContext` returns it before any sizing
+runs. Pinned as INVARIANCE in the reserve rather than against a recorded
+constant, because that is the property the change has to preserve.
+
+### Rules this produced
+
+- The load-time session bill and the advertised context are ONE number. They are
+  computed in different functions at different times, so they must read one
+  reserve and one margin helper, or they are two answers to "how big is one
+  session" and the cache floor is sized for a session nobody can request.
+- A per-arm reserve is a per-arm SESSION. If an arm has a reason to reserve
+  differently, the sizer needs the same reason — otherwise the arm is billing a
+  machine the server does not advertise.
+- A margin and a cap that are applied in a fixed ORDER belong in one helper. Two
+  sites spelling "85% then cap" agree until one of them is edited.
+- A width chosen from free memory is asked TWICE around an eviction pass, and the
+  second reading is credited only the bytes the ALLOCATOR returned — never
+  `reclaimable`, never `accounted_bytes`. The clamp to the max is the assertion
+  that an eviction cannot take memory away.
+- An admission path logs its bill on the requests it ADMITS, not only on the
+  ones it refuses; both arms format the same fields from the same bill.
+- A resolver whose output is billed back against its own input is a loop; check
+  monotonicity in the input before believing the output.
+- A knob that is read on both sides of a bill with opposite signs is not a
+  knob. Give the residual claimant the remainder instead of pre-charging it.
+- A precedence rule (`--prefill-chunk` outranks the pin) is a property of the
+  PAIR of readers. Pin it with a test that calls both.
+- A clamp's "never return 0" floor is not a guarantee that anything useful
+  survives; the floor has to be defended by whoever spends first.
+
+---
+
+## The prefill width is a property of the REQUEST, not of the boot
+
+`--ctx-size 1048576`, no other flags. The load-time sizer does its job
+correctly and the result is still wrong for almost every request the server
+then serves.
+
+### Why load-time sizing cannot win here
+
+`resolvePrefillChunk` runs once, with the weights resident and nothing else
+known. The only context it can reserve for is the one the operator configured,
+and at 1M that context's own KV is 20,736 MiB of a 28,909 MiB serving budget.
+Whatever is left has to hold both the prefill transient and the hot cache, so
+the widest affordable rung is 1024 — and every prompt for the rest of the boot
+prefills at 1024, including the 4k ones.
+
+But a 4k prompt does not hold a 1M-token cache. Neither does a 384k one: the
+judge ran 384k prompts at chunk 4096 well inside the ceiling (peak 90.3 GB of
+~93 GiB). The width the machine can afford is a function of THIS request's KV,
+and the estimator that already knows THIS request's KV is the admission bill.
+
+So the decision moved to where the information is:
+
+```
+scheduler prefill: admit -> evict -> CHOOSE WIDTH -> InitOptions.pinned_prefill_chunk
+```
+
+`chooseRequestPrefillChunk` walks `PREFILL_CHUNK_LADDER` and takes the widest
+rung whose bill fits the memory that is free right now. Post-eviction is
+load-bearing: it is the first moment the free memory is the memory the prefill
+will actually run in.
+
+### It is priced by the estimator that admits it, or it is a second bill
+
+A chooser with its own arithmetic is #126 ("a gate that runs BEFORE the
+estimator that knows better IS the estimator") with the biggest term — the
+chunk — as the difference. So `prefillNeededAtChunk` was factored out of
+`prefillAdmissionBill`, and both go through it; a source scan pins that there
+is exactly one definition and that both callers reach it. Whatever the chooser
+picks, `needed(picked) <= available` by construction, so the forward is billed
+and fits.
+
+### Two details that are easy to get wrong
+
+**Price the WIDTH, not the rung, and return the width.**
+`generate.effectivePrefillChunk` still caps by arch — a hd-256 MoE never
+forwards wider than 4096 — so rungs 8192 and 4096 are the same forward.
+Pricing the raw rung would over-bill the top of the ladder and then pick it for
+the wrong reason, and pinning 8192 would describe a width that never runs.
+Candidates are priced at `effectivePrefillChunk(rung)` and the chooser returns
+that width, which makes the pin a fixpoint of the resolver.
+
+**The connection thread admits on the load-time pin, and that is fine.** Its
+bill uses the narrower width, so it admits requests the wide path might not
+fit — but the scheduler's choice is bounded by live memory, so a request that
+only fits at 512 gets 512. The dangerous direction (admit narrow, run wide) is
+closed by the chooser never returning a width whose bill exceeds `available`.
+
+### The other direction: the guard refused at a width nobody was going to run
+
+Choosing the width at the scheduler left the ADMISSION probe still pricing the
+load-time pin, and that is a refusal, not a slowdown. A prompt that fits at 512
+and nothing wider was refused by name — `error.PrefillDoesNotFit`, a 400 — for
+a width the forward would never have used.
+
+**Measured, and not what I assumed.** I wrote this expecting the 1M-token
+prompt to be the case it serves. It is not: on this box a 1M prompt bills
+30,261 MB even at the ladder floor against 28,909 MB free, so it does not fit
+at ANY width and is refused whatever the ladder does — the advertised context
+is larger than the machine can prefill, which is a ctx-KV problem and not a
+width one. The case this actually serves is the long-but-not-maximal prompt:
+at 384k the floor bills 12,258 MB and the load-time pin's width bills 12,632,
+so a budget between them is admitted at 512 instead of refused at 1024.
+
+So `prefillAdmissionBill` picks its width the same way, through the same
+`chooseRequestPrefillChunk`, which walks the ladder from the widest affordable
+rung DOWN. Since `prefillFitsNow` (the inference-thread probe, re-asked after
+every eviction) and `checkAttentionMemory` (the connection thread) are both
+that bill, all three now ask one question. The named 400 fires only when
+NOTHING on the ladder fits, and the message says which width it gave up at:
+
+```
+prompt 1048576 tokens needs ~31402MB at prefill chunk 512 (the narrowest width
+tried), ~28909MB available after evicting ~0MB of hot cache — refused before
+prefill
+```
+
+`AdmissionBill.chunk` carries that width so the message and the number it
+quotes cannot describe different forwards.
+
+An explicit `--prefill-chunk` keeps TODAY's behaviour on purpose: the chooser
+returns it unchanged and the refusal fires at that width. The operator picked
+it; silently downgrading the width they asked for would be a worse answer than
+saying no.
+
+### The measured ladder
+
+From the estimator itself, bills in MB for the deployed shape (8-bit KV,
+`max_tokens` 2048), against the live box's 28,909 MiB of free memory:
+
+| seq | w4096 | w2048 | w1024 | w512 | chooser picks |
+|---|---|---|---|---|---|
+| 4,096 | 3,981 | 2,441 | 1,521 | 1,136 | **4096** |
+| 60,000 | 6,227 | 4,732 | 3,770 | 3,045 | **4096** |
+| 300,000 | 12,743 | 11,249 | 10,351 | 9,978 | **4096** |
+| 384,000 | 15,024 | 13,529 | 12,632 | 12,258 | **4096** |
+| 1,048,576 | 33,027 | 31,532 | 30,635 | 30,261 | floor, refused |
+
+Load-time sizing hands all five of those rows chunk 1024. Note the ladder is
+seq-INDEPENDENT here (rung 8192 and 4096 both forward at 4096, the rest map to
+themselves): that is the hd-256 non-sliding branch of `boundedPrefillChunk`. On
+a sliding-band arch the composed-causal score budget collapses every rung to
+the floor past ~300k, which is a different policy family and one reason the
+gate is an opt-in of one.
+
+### Scope
+
+Gated to `qwen4_exp` (`ModelConfig.perRequestPrefillChunk`) and killable with
+`MLX_SERVE_PREFILL_CHUNK_PER_REQUEST=0`. It is the arch with a 1M advertised
+context and the QSA terms that make the load-time bill lopsided; every other
+arch keeps the load-time pin, unmeasured. An explicit `--prefill-chunk` still
+wins outright and is billed as-is. The `<- N+M tokens` accounting is untouched
+— this changes a width, not a token count.
+
+One line per request at debug, because a narrowed prefill reads as an
+unexplained slowdown and a widened one as an unexplained peak:
+
+```
+[prefill] chunk 4096 for this request (reserve 15667 MB beside KV 6075 MB)
+```
+
+### Rules this produced
+
+- A resource decision made at load can only reserve for the configured worst
+  case. If the per-request estimator knows better, that is where the decision
+  belongs.
+- Two estimators for the same quantity is one estimator and one bug. Factor the
+  shared function and scan-pin that both callers reach it.
+- Price a candidate at the value that will actually be used, not at the knob
+  you turned — a capped resolver makes those different numbers.
+## SSD-first prefix cache (qwen4_exp) — the disk tier only ever got what RAM kept (2026-09-05)
+
+*Symbols moved here from CLAUDE.md (2026-09-06, to keep `## Rules` under its byte cap):*
+`capturePendingDisk`, `encodeSafetensors`, `writeThroughSpanReached`, `reserve()`,
+`kv_cap_buf_grows`, and the disk-budget formula `min(cap, free − min(64 GiB, 10% vol))`,
+*which CLAUDE.md now calls "the free-space reserve". Each is described below.*
+
+At 1M context on the M5 Max the arithmetic does not close for a RAM-first
+cache. The weights are ~70 GB resident, one session's entry is ~24 GB
+(~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history, the SSM
+checkpoints, the pooled block banks) and the prefill transients are 3–7 GB,
+against a ~107.5 GB ceiling. There is room for the model plus *one* session
+and nothing else — so the SSD has to be the capacity tier, not a nice-to-have.
+
+Five things stood between the code and that, and every one of them was a place
+where the disk tier was treated as a junior copy of RAM rather than as the tier
+that holds everything RAM cannot.
+
+**1. The flush read the RAM entry.** `flushPendingDisk` took the snapshot the
+commit had just stored, and the commit trims an oversized candidate to the byte
+budget (#330). So the disk copy was capped by the *RAM* budget: past the budget
+a long prefix trimmed in RAM and persisted trimmed, and the tier that was
+supposed to be the deep one never held more than the shallow one. The fix is a
+`PendingDiskFlush` captured in `commitWithMediaState` *before* the trim, holding
+the live snapshot, the FULL token record, this turn's checkpoints and the spec
+snaps. Everything in it is refcount-SHARED with the live KV, so the record costs
+bookkeeping and not GPU bytes; it is consumed once by the flush and dropped on
+invalidation.
+
+**2. `max_flush_bytes` bounded a stall by truncating the entry.** The 512 MB
+per-commit cap existed because the write ran synchronously on the inference
+thread — the sole mlx caller — and a 4 GB write measurably stalled the next
+request. At 8-bit KV that cap is 41,984 tokens per finished request, so a 374k
+session needed ~9 turns to land whole and a restart before that re-prefilled
+~340k (~8 minutes). A byte cap is the wrong instrument: it bounds the stall by
+making the *data* wrong.
+
+The split that works: the inference thread keeps the device→host readback (mlx
+arrays are inference-thread-owned, frees included) and hands ONE writer thread a
+plain host byte buffer per file. Only bytes cross. `serializeSafetensors`
+reproduces mlx's own image byte for byte — 8-byte little-endian header length,
+a JSON header carrying `__metadata__` and each tensor's dtype/shape/data_offsets,
+then the tensors' bytes in header order — so `mlx_load_safetensors` reads back
+what we wrote without knowing a Zig writer produced it. Two bounds keep the
+writer honest: a ~1 GiB host-byte permit, so `submit` blocks rather than trading
+GPU memory for an unbounded host queue, and an epoch fence at the tier's ONE
+directory-removal site.
+
+The fence is prefix-scoped, and that is load-bearing rather than tidy: a global
+fence would have thrown away the bytes an `appendCommit` had just staged for the
+entry it was writing, because the same call can evict an LRU entry on its way
+out. Only the doomed directory's blobs go.
+
+Durability comes from the queue being FIFO. An entry's `meta.json` is submitted
+after its chunks, so it is the last file to land; a kill -9 mid-flush leaves
+chunks with no index, which `scan` already reads as a miss. Every file is
+written `.tmp` then renamed, so a crash can leave a `.tmp` but never a truncated
+file under its real name.
+
+**3. Nothing persisted until the request finished.** A 1M prefill that was
+cancelled — or killed — threw away every chunk it had forwarded, and the
+end-of-request flush had the whole entry in front of it. But a chunk's bytes are
+final the moment it is evaluated. `Generator.WriteThroughHook` fires at each
+completed prefill chunk with the absolute KV position and the checkpoints so
+far, and the scheduler hands the tier `full_prompt[0..abs_pos]` — a genuine
+prefix of this turn's prompt, which is exactly the shape `appendCommit` already
+recognises as an EXTEND. Chunks `[0, kv_len/chunk)` are kept as written, so a
+1M session writes each chunk once and not once per turn, and the end-of-request
+flush is only the tail.
+
+**4. A checkpoint was budgeted behind the chunks it makes usable.** The SSM
+checkpoints shared the per-flush byte budget with the KV and were written after
+it, so the first flush of a long hybrid entry landed KV with zero recurrent
+state — and KV without recurrent state is not restorable on a GDN trunk. The
+entry was dead weight until a later turn topped it up. Checkpoints now ride
+outside the byte budget, beside the chunk that closes their position, and an
+entry restores from its first flush.
+
+**5. The budget counted the active session's KV twice.** `clampedPrefixCacheMem`
+treats the hot cache as what is left over after the live session's
+full-context KV reserve. But a restore refcount-shares the entry's buffers with
+the slot's cache: the resident entry for the session being served costs nothing
+beyond the reserve already billed.
+
+The subtraction is not a rounding error. `prefixCacheMemForLoad` bills the FULL
+configured context — at 1M and 8-bit KV that is 13,056 B/token of KV plus
+7,680 B/token of recurrent and indexer state, 20,736 MiB — against the very
+budget the hot cache SHARES with the live KV. Measured on the 137 GB box: a
+10 GB ask resolved to 3,873 MB and a 24 GB ask to 5,703 MB. Neither holds one
+entry, so the entry could not stay resident and every warm turn cold-prefilled
+while the cap "held" — the #330 cliff again, one level down, and this time the
+cap was right about its own arithmetic and wrong about what it was counting.
+
+`ssdFirstPrefixCacheMem` floors the budget at one entry at the working context
+and gives `--prefix-cache-mem` to IDLE entries on top of it; 0 means none idle,
+which is the mode's whole point. It is a SEPARATE function selected by the arch
+gate through a one-line call site rather than a branch woven into
+`prefixCacheMemForLoad`, because that function's other inputs — the prefill
+chunk it pins, the transient reserve it derives — have their own defects under
+repair, and both arms must inherit those fixes without this one being
+re-litigated in the merge.
+
+The disk side gets the reciprocal treatment: the budget is
+`min(operator cap, free - min(64 GiB, 10% of the volume))` with a 1 GiB store
+floor, re-read from the volume before every store, because free space moves
+under us and a cache must never fill a user's disk. Below the floor no NEW
+entry persists and what is already there stays restorable — evicting a
+restorable 1M entry to free a gigabyte is a bad trade. `volumeSpace` hand-
+declares darwin's `struct statfs` (std has no binding in this Zig) with a
+generous tail and a plausibility check — `f_bsize` a power of two in
+[512 B, 1 MiB], available never past total — so a wrong layout fails SAFE back
+to the operator cap instead of inventing a budget.
+
+**A deliberate semantics change, qwen4_exp only.** `--prefix-cache-mem` means
+something different on this arch: it is the allowance for IDLE entries on top
+of the one-session floor, and `0` means "no idle entries" rather than today's
+"no explicit cap, use all the headroom". At long context that is strictly
+better — the headroom at 1M is less than one entry, so the old reading cached
+nothing usable — but at SHORT context it is a real reduction: a 32k-context
+qwen4_exp server that passes no flag now keeps one session resident where it
+used to keep several. That is the design ("model + transients + one current KV
+copy in RAM, the rest on SSD"), and evict-on-idle makes the two readings
+converge at rest anyway, since RAM holds one session between requests either
+way. The resolved budget is logged once at load, naming the flag, so nobody
+has to infer which reading applied.
+
+**A knock-on that turned out to belong somewhere else: the prefill chunk.** The
+generic sizer spends at most a QUARTER of the post-weights serving budget on the
+one-off prefill transient (`PREFILL_RESERVE_BUDGET_SHARE`), because it cannot
+know what the hot cache will actually need and a quarter is a safe guess for a
+16 GB Mac. On this 137 GB box that quarter is ~7.2 GiB against rung 4096's
+~15.3 GiB reserve, so a no-flag boot prefilled at 1024 — measured 25–34% slower
+at ≤256k — while the real headroom was several times the reserve.
+
+Under SSD-first the cache's need is not a guess: it is one session at the
+working context, exactly the quantity mechanism 5 already computes. So this work
+briefly carried its own arch-gated chunk chooser, sized against
+`serving − one_session − slack` instead of the quarter-share.
+
+It was removed before shipping, and the reason is the more useful lesson: the
+width is a per-REQUEST property, not a boot property. A LOAD-time arm must bill
+a session at the CONFIGURED context, and almost no request is that long, so it
+is structurally pessimistic no matter how honest its arithmetic — at an
+explicit `--ctx-size 1048576` it lands on 1024 while a real 300k prompt bills
+only 12.7 GB at width 4096 and a 384k prompt 15.0 GB, against 28.9 GB free.
+The per-request chooser prices the prompt in front of it and gets 4096, and it
+is gated on `ModelConfig.perRequestPrefillChunk()` — the SAME arch as
+`ssdFirstCapable()`. Two arch-gated choosers for one value on one arch is a
+rule that can only disagree with itself, so there is exactly ONE: the
+per-request one. SSD-first buys a whole-session hot cache, and nothing about
+the forward's width.
+
+**How one-session-resident meets evict-to-admit.** The load-time clamp reserves
+only the ladder FLOOR once the per-request width gate is on, so a wide request
+depends on request-time admission and, when it does not fit outright, on
+evict-to-admit: `fitsAfterEviction` credits `reclaimableBytes`, which is
+residency minus the LARGEST entry. Under SSD-first the steady state is exactly
+ONE resident entry, so that credit is 0. Two cases, and they are not the same
+case.
+
+*The prompt EXTENDS the resident session.* Then the resident entry is the
+request's own KV: the restore refcount-SHARES those buffers into the slot's
+cache, so evicting the entry would return nothing live, and `active_mem` already
+counts the bytes so the guard must not add them again. A credit of 0 is not a
+conservatism here, it is the correct number — and it is the same number the
+#353 follow-up already established for a matching prompt. Nothing to reclaim,
+nothing double-billed.
+
+*A DIFFERENT session's request arrives.* Now the resident entry belongs to
+someone else. Its disk copy is COMPLETE — its own turn flushed it, and
+mechanisms 1–4 are what make that true — so evicting it costs restore time and
+nothing else. The inference thread can in fact evict it: `last_restored_used` is
+cleared at the start of every lookup and only set by a restore, so a
+non-matching prompt protects nothing and `evictLruToAdmit` will take it.
+
+**The connection thread could not see that — so it was given a way to.**
+`reclaimableBytes` subtracts the largest entry because the guard cannot know
+WHICH entry a prompt will match, only that a restore pins at most one. With one
+resident entry that always subtracts the whole cache, so a wide request for a
+different session was judged as if a fully-flushed 24 GB entry were immovable,
+and refused by name while the eviction it needed was available all along. The
+refusal even said "the entry a restore would share is not evictable" when no
+restore would have shared it.
+
+The obvious repair is wrong: crediting residency outright fails the MATCHING
+case, where the shared buffers genuinely return nothing however complete the
+disk copy is — durability is not liveness. The correct rule needs the PROMPT,
+and the guard runs on a connection thread that may never touch
+`hot_prefix_cache` (inference-thread state, freed on every model switch).
+
+So the prompt meets the cache through a published snapshot instead. At every
+site that already republishes the residency scalars, the inference thread also
+builds an immutable `[]EntryDigest` — `{fingerprint, len, kv_bytes}`, where the
+fingerprint hashes the entry's first `MIN_CANCELLED_COMMIT_TOKENS` ids — and
+swaps it under a small mutex, freeing the superseded slice afterwards. The
+connection thread hashes the same prefix of the incoming prompt, and under that
+lock reduces to a scalar: residency minus the largest entry whose fingerprint
+matches. No pointer into cache-owned memory ever leaves.
+
+Two details are load-bearing. An entry shorter than the restore floor gets no
+digest at all — nothing can pin it, so omitting it correctly credits its bytes.
+And the pin test is the fingerprint match ALONE, deliberately not also
+`len <= prompt_len`: an entry whose record is LONGER than the prompt still
+shares the floor-width prefix and `restore` clamps to the shorter of the two, so
+it really can be restored from. Excluding it would credit bytes about to be
+pinned, and over-crediting is the unsafe direction — the guard promises, the
+inference thread then evicts nothing, and the request is refused after being
+admitted. The refusal text is conditional now too: it claims a restore would
+share the difference only when something actually withheld it.
+
+An allocation failure leaves the PREVIOUS snapshot standing rather than clearing
+it. A stale digest is a hint; an empty one is a claim that the cache holds
+nothing, and that is a lie that credits bytes which exist.
+
+**What SSD-first cannot do: serve a 1M prompt on this box.** The live KV must
+be resident — that is the one thing no tier can move — so the longest prompt
+this machine can serve is set by the prefill peak, not by the cache. At kv8 a
+1M prompt bills 30.3 GB even at the ladder FLOOR against 28.9 GB free, and
+guard 5c measures a 512k prompt peaking at 99.05 GB with `max_safe_context`
+475,737. So the max servable prompt here is ~476k, and SSD-first does not raise
+it by a token. What it changes is what happens to the sessions you are NOT
+currently serving: they survive on disk instead of being re-prefilled. Anyone
+reading "1M context" off the config and expecting a 1M prompt to be admitted is
+reading the wrong number, and it is the same number before and after this work.
+
+**Blast radius.** Every one of these is gated on `ModelConfig.ssdFirstCapable()`
+(`model_type == "qwen4_exp"`) AND `MLX_SERVE_PREFIX_SSD_FIRST`, read at exactly
+one place — the scheduler's disk-tier attach — into `HotPrefixCache.ssd_first`
+and mirrored onto `DiskTier.ssd_first` and the writer arm. Every mechanism reads
+that field; none reads a model_type. A source scan pins the single arming site,
+and each mechanism's test carries an arm B asserting the legacy path is what
+runs when the predicate is false.
+
+**No manifest bump.** SSD-first changes WHEN chunks are written and WHICH
+checkpoints are present — never the on-disk format — so the manifest stays at
+v5 and no existing entry becomes a miss. What buys that decision is a test
+rather than a version number: an entry written by the legacy path must restore
+under SSD-first, and an entry written by SSD-first (hand-serialized safetensors
+out of the background writer, never `mlx_save_safetensors`) must restore under
+the legacy path. Both directions, same values, in one test.
+
+**Two companions.** The `#353` reservation sizes the KV to prompt + max_tokens
+up front, and a grow is not in place, so a restore that provokes one holds two
+copies of the whole cache at the tightest possible moment. It does not, because
+`snapshot`/`restore` refcount-SHARE the capacity buffer: the entry carries the
+PREVIOUS turn's reservation with it, and the grow guard (`offset + new_len >
+bufferCapacity`) then simply does not fire. That was true by construction and
+untested, which is the same as untrue — `KVCache.kv_cap_buf_grows` now counts
+the moments a second copy exists, and the guard asserts zero across a restore
+whose donor capacity suffices.
+
+Writing that guard turned up something stronger than the claim it was meant to
+pin: a reservation is NOT retroactive. `reserve()` raises the capacity of a grow
+that HAPPENS; it does not provoke one. So a restored slot that merely reserves
+more than the donor holds still allocates nothing — the copy is deferred until
+the data actually needs the room, and on a warm turn it usually never does. The
+negative arm therefore cannot be "reserve more than the donor" (that also
+counts zero, which is why the first version of the test failed); it has to be a
+write that genuinely runs past the donor's capacity.
+
+### The external review of PR #363: six defects, all of them in the EVICTION half (2026-09-05)
+
+Every mechanism above is about writing to the SSD. An external reviewer on an
+M4 Max with 14 GiB free on `/` found that the writing was fine and the
+*discarding* was not — six defects, five of which only bite on a box the
+authors did not have.
+
+**A free-space probe that reads the real volume makes every test a property of
+the tester's disk.** `refreshDiskBudget` runs on every store in this mode and
+calls `statfs`, so with 14 GiB free `diskBudgetFromFreeSpace` returned null
+against the 64 GiB reserve, the tier latched `store_declined`, and the
+write-through test went red with `kv_len` stuck at the first commit's value.
+The engine was correct; the suite was measuring the machine. `DiskTier.space_probe`
+is now injectable (`armTestSpace`), every SSD-first test arms it, and a scan
+pins the pairing so the class cannot come back. Writing the inverse case — 10
+GiB free, the store must decline — immediately found a second defect underneath:
+the `store_declined` early-out sat ABOVE the refresh, so the commit that first
+observed a short volume latched the flag and then wrote anyway. A filling disk
+always got one entry more than the budget allowed.
+
+**A bool that means "nothing more to write" also means "I wrote nothing".**
+This is the one that mattered. `appendCommitWithSpec` returned `true` for a
+completed copy AND for every silent skip: under `MIN_PERSIST_TOKENS`,
+TurboQuant, a layer offset short of the range, a non-B1 shape, a declined
+volume. `spillIdleEntries` read that bool as "the SSD holds this session" and
+called `evictAt`. So on qwen4_exp with `--prefix-cache-disk` on and a disk under
+~65 GiB free, EVERY idle hot-cache entry was discarded from RAM at the end of
+EVERY request with nothing whatsoever written in its place — the mode's promise
+("idle sessions live on the SSD") inverted into "idle sessions are deleted".
+The same shape, quietly, for a TurboQuant boot or a sub-512-token session on any
+disk. `PersistOutcome { persisted, partial, skipped }` names the three, and only
+`.persisted` licenses eviction. And `.persisted` is only the write path's
+*claim*, so the INDEX must agree too (`holdsFullPrefix`: an entry at the same
+key whose `kv_len` reaches the persist target and whose `chunk_bytes` has one
+non-zero size per chunk that length implies — the same array `scan` clamps
+against real file sizes after a `kill -9`).
+
+**Writing and evicting are two decisions.** The spill evicted every non-newest
+entry on every `finishSlot`, ignoring the resolved `--prefix-cache-mem`
+entirely, so two alternating sessions bounced off the SSD on every single turn
+even though RAM had been budgeted to hold both. Writing is cheap and stays
+unconditional; EVICTING is what the allowance bounds. The allowance had to be
+plumbed to reach the cache at all — `prefixCacheMemForLoad` now writes it
+through an out-parameter beside its return value, because on this arm the flag
+means the idle allowance and the return value is the whole budget including the
+live session.
+
+The allowance is a HARD cap, shed in two tiers, and the ordering is what lets
+it coexist with the rule above: shed idle entries that have a proven durable
+copy first, oldest first; only if still over, shed the rest, oldest first, with
+a log line naming why. An unpersistable entry therefore survives while the cache
+is under the cap and is dropped only past it — losing WORK (a cold prefill),
+never data. A soft cap was the tempting alternative and it is wrong: the
+allowance exists to bound RAM for the NEXT admission, and "0 = nothing idle
+stays resident" has to mean what it says even when the disk refuses.
+
+**A mode is not an arch.** `ssdFirstEnabled()` never checked that a disk tier
+exists, and `--prefix-cache-disk` is OFF by default — so out of the box
+qwen4_exp armed the mode with no tier underneath it, took the "one full-context
+session + idle" budget floor (~20 GB, plus the whole ask at 1M) and could run
+none of the spill machinery, because every mechanism needs somewhere to write.
+A budget sized for a tier that does not exist is RAM the server cannot use.
+`ssdFirstActive(config, has_disk)` is now THE predicate, asked at both sites
+(the load-time budget and the arming), scan-pinned; the arming moved BELOW the
+attach block, because the tier is part of the answer.
+
+**An arm that short-circuits above a fix does not get the fix.** Audit S1
+caught this for the GPU ceiling; the same argument list carried a second
+instance. `ssdFirstBudgetForLoad` returns before `planHotCache`, so
+`clampReserveWidth` — the fix that made the clamp monotone in the ceiling by
+reserving only the ladder FLOOR on an arch that re-bills its width per request —
+never ran on the one arch these gates are about. The arm now derives its clamp
+reserve through the same helper. Two reserves, exactly as on the RAM arm: the
+SESSION is billed at the pinned width (that is what `computeMemoryContext`
+advertises against), the BUDGET at the floor (the load-time reserve is only a
+promise to the FIRST request; every request re-bills its real width at
+admission).
+
+**A durability check that WAITS is a decode stall.** The audit-S3 fix above
+("drain the writer, then re-read `writeErrors()`") was correct about durability
+and wrong about where it ran: `drainWriter` waits on the whole queue, and
+`spillIdleEntries` runs on the INFERENCE thread inside `finishSlot`. Every
+finished request with a flush outstanding parked decode until the background
+writer caught up — precisely the stall the writer was added to remove. The
+question is now asked without blocking (`Writer.pendingPrefix` ->
+`DiskTier.entryWritesPending`): an entry whose files are still in flight is not
+evictable on THIS pass, the pass returns, and the next one asks again. Nothing
+is lost by waiting — the entry is safe in RAM meanwhile — and no drain runs on
+the inference thread at all. Scan-pinned over both end-of-request functions.
+
+### The JSON grammar's token->bytes table was a process singleton (relocated from CLAUDE.md, 2026-09-05)
+
+The table is derived from a MODEL's vocabulary, but it was built once per process. A second model
+loaded into the same server then masked with a foreign vocab — the grammar was right and the bytes
+it matched belonged to someone else. It lives on `LoadedModel` now (`grammarTokenBytes`), which is
+the general rule: a cache derived from a model is per-model, never per-process.
+
+### Three audit findings that stayed stories (2026-09-05)
+
+These three came out of the bundle audit. They are rules in spirit, but CLAUDE.md was at its
+byte floor when they landed, and the growth policy's own answer to that is a story here rather
+than a symbol dropped there. Named so the next reader can find them.
+
+**A published snapshot is freed by the PUBLISHER, below the join** (`hot_cache_digests`, audit
+B0). The inference thread publishes an immutable digest slice and frees the one it supersedes,
+once per request. A `deinit` that frees it *above* `t.join()` therefore races the publisher: either
+a double free, or a connection thread reading a slice that has already gone. The ordering is the
+invariant — the free belongs below the join, in the same thread that publishes — and it is
+scan-pinned, because the wrong order compiles and serves correctly until the one interleaving.
+
+**A "complete" disk commit is STAGED, not durable** (audit S3). The background writer logs a failed
+blob, counts it and drops it; the entry is still "committed" from the caller's point of view. So
+anything that discards the RAM copy on the strength of a disk commit must first confirm the files
+actually landed. Treating the commit itself as durability is how a cache entry that exists in
+neither tier gets created. The first fix confirmed it by DRAINING the writer, which was a decode
+stall on the inference thread — see item 6 of the external review below: the confirmation is now
+non-blocking (`entryWritesPending`), and an entry still in flight simply waits for the next pass.
+
+**An index-less entry directory is another process's flush in progress until proven old** (audit
+S4). Meta lands last by design, so a directory without it is indistinguishable from a partial
+write — and our epoch fence is per-process, so it cannot tell a *second* server's in-flight flush
+from our own debris. The sweep therefore only reclaims past `STRAY_MIN_AGE_NS`, and treats
+unreadable as young rather than as garbage.
+
+## The prefill width, re-chosen per chunk (2026-09-05)
+
+The per-request width above answers "how wide may this prompt prefill?" once,
+at admission, and then holds that answer for the whole prefill. A 1M-token
+prefill on Flash Next runs for minutes and 256 chunks. Everything the answer
+was based on can move in that time.
+
+### What actually moves, and what does not
+
+The obvious story — "the KV fills as the prefill proceeds, so the width has to
+narrow" — is FALSE for every prompt this feature targets, and getting that
+wrong would have shipped a mechanism that fires for a reason that does not
+exist. `KVCache.reservedTokens` reserves `seq + headroom + chunk` up front for
+any prompt past `RESERVE_MIN_TOKENS` (32,768) and `nextCapacityReserved` grows
+the buffer exactly once, so the whole request's KV — 21.7 GB at 1M tokens on
+the deployed pack — is resident before the first chunk runs. Re-billing it per
+boundary would have subtracted the same bytes twice and walked every prompt to
+the ladder floor.
+
+What does move between boundaries:
+
+- Another slot's decode, hosted by `interleaveDecodeTick` at the very
+  boundaries this decision is taken at. Nothing bills it against this prefill.
+- A process outside the server. `currentGpuMemoryCeiling` is
+  `min(static, footprint + free RAM)`, so a docker stack starting mid-prefill
+  lowers the ceiling under a forward that was admitted against the old one.
+- The state that genuinely accretes per chunk: the QSA indexer key history
+  (`statePerTokenBilled`), the retained SSM checkpoints (~1.9 GB at the cap),
+  the MTP and DFlash contexts.
+- `MLX_SERVE_KV_RESERVE=0`, and any prompt under 32,768 tokens, where the KV
+  really does grow chunk by chunk.
+
+So this is a safety net and a multi-slot feature, not a single-session speed
+win. On a quiet box serving one request it changes nothing at all, which is
+the correct amount.
+
+### The rule is asymmetric because the failure is
+
+A Metal working-set abort is uncatchable — the process dies. Being one rung
+too narrow costs throughput. The two directions are therefore not the same
+bet:
+
+- **HOLD at margin 1.0.** `prefillMemoryNeeded` already multiplies its whole
+  bill by 5/4; a second 1.25 on the hold would have taken a 768k prompt at the
+  default ceiling from the width admission ADMITTED (2048) down to 1024 at its
+  very first boundary — the feature making the request slower than not having
+  it. The margin belongs on the direction that is a bet, not on the one that
+  is a continuation.
+- **STEP DOWN immediately**, by as many rungs as it takes. Waiting a boundary
+  per rung is waiting inside the abort.
+- **WIDEN one rung at 1.25, after TWO consecutive supporting probes.** The
+  probe is taken after the boundary's `mlx_clear_cache`, so it never contains
+  a chunk's own peak; the second reading is what pays for that blind spot.
+- **One-way ratchet.** A prefill that has stepped down never widens again. The
+  pressure that took the width away is a property of this minute, and
+  re-widening into it turns a safety net into a metronome — the step-down
+  frees exactly the bytes that make the wider rung look affordable again.
+
+### The cliff is 2048, not the ladder
+
+`PREFILL_DQ_GEMM_MIN_M` is 2048: widths at or above it take the dequant+GEMM
+prefill route, 1024 and 512 do not, and most of the measured 25-34% spread
+between the widest and narrowest rung lives at that step. 2048 is the rung
+worth defending; 512 versus 1024 is per-chunk fixed cost only. A policy that
+treats the ladder as uniform will spend its caution in the wrong place.
+
+### Two placements that no unit test can see
+
+The probe sits AFTER the chunk's `mlx_clear_cache` and BEFORE the interleave
+tick. Before the clear it reads the chunk's own peak and narrows on memory
+that is already gone; after the tick it reads a co-tenant's decode
+allocations as this prefill's pressure. Both are scan-pinned, by index, in
+generate.zig.
+
+### Checkpoints do not move
+
+`ssm_cp_stride` is coarsened against the LAUNCH width
+(`max(PREFILL_CHUNK, prefill_chunk_override)`), never the per-request pin and
+never the per-chunk width, and every ladder rung divides it. `nextChunkEnd`
+truncates any chunk that would cross a stride boundary, in ABSOLUTE position.
+So a prefill that walks 4096 -> 512 -> 2048 ends on exactly the stride
+boundaries a fixed-width one would have, in the same order — the prefix cache
+sees the same restore points either way, and the hermetic test walks a
+deliberately nasty width sequence at two strides, two offsets and two prompt
+lengths to say so.
+
+Output is NOT byte-stable across widths, and no test asserts that it is: a
+different width is a different GEMM shape, and 4-bit near-ties flip. That is
+the same bar `#197` set for chunked vision prefill (perceived content), and
+the same reason `tests/test_vision_chunked_prefill.sh` compares colours rather
+than bytes.
+
+### Scope and switches
+
+`ModelConfig.perRequestPrefillChunk` (qwen4_exp) gates both features, so the
+per-request kill switch takes this one with it;
+`MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0` disables only this one. An explicit
+`--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` outranks it — an operator who
+pinned a width pinned every forward — and so does the unchunked vision arm,
+which has no next chunk to size. The ADMISSION bill never learns about any of
+it: the width a request was admitted at is the width it is billed at.
+
+One line per transition, and one summary per request that moved:
+
+```
+[prefill] width 4096 -> 2048 at pos 606208 (headroom 2216 MB, reserve 2287 MB)
+[prefill] adaptive: 261 chunks, width 1024..4096, 2 change(s)
+```
+
+### What the audit caught (2026-09-05, fix round)
+
+Four findings, all of them the same shape: a decision taken at a NEW moment
+kept reading numbers built for an OLD one.
+
+**The bill was a load-time bill (blocker).** `prefillChunkCost` reached
+`prefillTransientReserve`, which prices the QSA score sheet at `kv = chunk`
+because at load there is no KV. Past the indexer budget
+`qsaScoreRowsPerChunk` saturates, so the real sheet is ~its whole budget
+rather than the tiny `fwd x nb` product — ~0.5 GB under-billed per decision at
+the default 256 MB, ~9 GB at `MLX_SERVE_QSA_SCORE_SHEET_MB=4096`. The ratchet
+did not cover it: it blocks widening only AFTER a step-down, so the first
+widen at high `pos` was unguarded. `pos` was reaching
+`adaptivePrefillWidthNow` and being spent on the LOG LINE. Fixed by
+`prefillTransientReserveAtKv`, with `prefillTransientReserve` as its
+`kv = chunk` case so every load-time caller keeps its number. The
+project's own rule was already written down one function away: *one estimator
+means one set of INPUTS too*.
+
+**The log quoted a smaller sibling of the number it compared.** The decision
+was `prefillChunkCost`; the line printed `prefillTransientReserve`. An
+under-bill therefore rendered as a comfortable margin.
+
+**Attribution and safety wanted opposite orderings (S17).** Probing before the
+interleave tick keeps a co-tenant's decode out of this prefill's pressure —
+right for attribution. But a widen decided on pre-tick headroom then forwards
+into memory the tick allocated and the probe never saw. The two directions
+split: a step-down commits from the pre-tick branch, a widen is re-priced
+after the tick (`adaptivePrefillWidenStillFits`) and withdrawn if it no longer
+fits. A step-down never waits — waiting is waiting inside the abort.
+
+**Host bytes are memory too (S11).** The SSD write-through stages a full host
+copy of the chunk behind a ~1 GiB permit, at exactly this boundary, and
+`mlx_get_active_memory` counts device bytes only. On unified memory both come
+out of one pool, so the writer publishes `staged_disk_host_bytes` and
+`prefillHeadroomNow` subtracts it.
+
+**And an old constant became reachable (S18).** `TAIL_MERGE_MAX` is a flat 512
+justified as "~6% at 8192". At `PREFILL_CHUNK_FLOOR` it is +100% of the
+transient the step-down just bought. `tailMergeMax(width)` keeps the original
+~6% bound at every rung and is a no-op at 4096 and 8192.
+
+**...and it is GATED, because "only this feature can reach it" was false.**
+The first version replaced the constant inside `nextChunkEnd`, which has no
+arch parameter — so the scaling applied to every arch whose resolved chunk is
+under 4096, which is a lot of them: `resolvePrefillChunk`'s machine ladder
+puts a 27B on a 16 GB Mac at 512; `boundedPrefillChunk`'s score-budget floor
+and its composed-causal 2048 cap hit gemma4, qwen3_5/3_6, muse_glimmer and
+deepseek_v4; any `--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` under 4096
+hits everything. Chunk boundaries are not byte-stable, so that was a
+behaviour change on archs where the bound was never measured — and the
+sentence claiming otherwise is exactly what a future reader would use to skip
+the A/B. The bound now goes through `tailMergeMaxFor(width, adaptive_width)`
+and every other arch keeps the flat constant byte for byte.
+
+**And the first gate was wrong in the same shape, one level down.** It read
+`adapt_chunked and options.chunk_width_hook != null`, on the belief that the
+hook exists only where the adaptive width does. `serve` installs
+`prefill_chunk_adapt` **unconditionally and process-wide**, and the
+scheduler's one `InitOptions` site installs the hook whenever that global is
+non-null — so under a real server the hook is non-null on *every* arch and the
+scaled bound was live everywhere again. The width still held elsewhere, but
+for a different reason than the gate assumed: the POLICY behind the hook
+declines (`adaptivePrefillChunkEnabled`), the hook is not absent. Two tests
+sat green over the defect because both exercised the flag and neither
+exercised the wiring. The flag now comes from the arch predicate itself,
+per model: `scheduler.prefill_chunk_adaptive_enabled` (fifth of the admission
+hook family, `= &adaptivePrefillChunkEnabled`) →
+`scheduler.adaptiveChunkWidthFor(cfg)` → `InitOptions.adaptive_chunk_width`.
+Guards: `server.zig` "the tail-merge gate reads the ARCH, not the installed
+hook" (installs the whole family, then asserts the hook's presence and the
+arch's answer DIFFER for qwen3_5), `server.zig` "the tail-merge bound scales
+ONLY where the per-chunk adaptive width is live" (the predicate), and
+`generate.zig` "the scaled tail-merge bound is gated on the per-chunk adaptive
+width" (both arms, plus a scan that the loop reads the flag and that the
+hook-presence spelling is absent from the loop body).
+
+### Rules this produced
+
+- A helper's arguments encode the QUESTION it was written for. Reusing it from
+  a new moment silently answers the old question — thread the new input
+  through and keep the old call as a named special case.
+- A constant a new feature makes *interesting* is not a constant only that
+  feature can *reach*. Before changing one in a shared helper, enumerate every
+  route into it; if any predates the feature, gate the change on the feature
+  rather than on the value that made you look.
+- **A hook's PRESENCE is not a capability gate.** A hook installed once at
+  startup is a property of the HOST, not of the model, the arch or the
+  request; if the policy behind it answers "no" per model, ask the policy.
+  Reading `!= null` as "this arch opted in" is how a correctly-gated feature
+  becomes ungated again — and a test that exercises the resulting FLAG cannot
+  see it, only one that builds the wiring the way the server does.
+- When attribution and safety want opposite orderings, do not pick one. Split
+  the decision by direction: the safe direction commits early, the risky one
+  is confirmed late.
+- Host allocations on unified memory are working-set pressure. A probe that
+  reads only the device allocator is optimistic by whatever the host side is
+  holding.
+- Establish which quantity actually moves before you write the controller. A
+  plausible mechanism that does not happen is worse than no mechanism: it
+  fires for the wrong reason and the reason is invisible.
+- When one direction of a control loop is fatal and the other is merely slow,
+  the margins are not equal, and the safe-looking symmetric choice is a
+  regression.
+- A probe taken where the transient has just been freed cannot see the
+  transient. Pay for that with a second reading, not with a bigger margin.
+
+## N5: the prefill width is re-asked after the eviction pass, and admission logs on the admit path too (2026-09-05)
+
+The per-request prefill width is a function of what memory is FREE at the
+moment it is chosen. A request whose bill only fit at the ladder's narrowest
+rung was admitted at that floor — correctly, given what was free at admission
+time — but if admission then ran an eviction pass that returned gigabytes back
+to the pool, the prefill ran at the floor width for its ENTIRE length, never
+re-pricing against the memory eviction had just freed.
+
+The fix is a second look, not a wider bill up front: crediting `reclaimable` or
+`accounted_bytes` to the chooser ahead of eviction would justify a width against
+memory the allocator has not actually returned yet, and the failure costs are
+asymmetric — a needlessly narrow width only costs throughput, while a width
+justified by memory that turns out not to be free is an uncatchable Metal OOM.
+So `scheduler.postEvictionPrefillChunk` asks the width chooser TWICE around the
+eviction pass: once before (the same hook, the same inputs, the same live
+memory reading as the probe that just failed to admit at a wider rung — and
+only on the path that actually runs eviction), then again after, crediting only
+the LIVE delta the allocator actually reports (`EvictionReport.bytes` — the
+allocator's own before/after reading), never the pre-eviction ESTIMATE
+(`accounted_bytes`/`reclaimable`), which prices what eviction is expected to
+free rather than what it did.
+
+`postEvictionPrefillChunk` RUNS THE RE-ASK, in both directions. It shipped as
+`@max(admitted, reasked)`, sold as an assertion that post-eviction available
+memory can only rise — a canary for an impossible case, free on the expected
+path. The external review of PR #363 pointed out that this is backwards: a max
+is not an assertion, and the only case in which it does anything at all is the
+case where the invariant BROKE. Where the invariant holds the max is a no-op;
+where memory moved under us between the two readings (a co-tenant slot's decode
+allocations) it discards the reading taken against live memory and keeps the
+stale, WIDER one — widening onto memory that is gone, which is exactly the
+uncatchable Metal OOM the asymmetry argument above exists to avoid. The narrow
+arm only ever costs throughput. So the second reading is the one that runs, and
+the direction is only LOGGED: `[prefill] re-ask:` at info when the pass bought a
+wider rung, at warn when it came back narrower. The width still never falls
+below the ladder floor, because the CHOOSER cannot produce anything narrower
+(`chooseRequestPrefillChunk` falls through to the floor rung) and this function
+computes no width of its own. `cap_adapt`,
+the per-chunk adaptive ceiling, is built PIN-LESS — via `effectivePrefillChunk(…,
+0)`, a literal zero rung rather than the request's pinned width — specifically
+so it can never be the thing that clips a re-ask back down to the pre-eviction
+number.
+
+The width reaches its consumers through one chain: `req_prefill_chunk` ->
+`InitOptions.pinned_prefill_chunk` -> the runtime `PREFILL_CHUNK` constant ->
+`cur_chunk`. Both that chain and the `cap_adapt` seam are scan-pinned so a
+future refactor cannot quietly reintroduce a second, narrower source of truth
+for the chunk width.
+
+**The second half of N5** closes a related visibility gap: the admission path
+only ever logged when a request was REFUSED, so the numbers that explained a
+refusal only ever appeared after the fact — there was no way to see, on a
+request that succeeded, how close it had come to the ceiling. `server.checkAttentionMemory`
+(or the equivalent admission chokepoint) now emits exactly ONE line per
+request, on every request, regardless of outcome:
+
+```
+[admission] needed=<bytes> available=<bytes> reclaimable=<bytes> width=<chunk> verdict=admit|evict|refuse
+```
+
+The line is built from the SAME `AdmissionBill` value the three admission arms
+(admit outright, evict-then-admit, refuse) already act on and that a refusal
+already quotes — this is not a second estimator call, which would reproduce the
+class of bug #126 documents (a gate computing its own answer instead of reading
+the one that runs the actual decision). `admissionVerdict` derives the verdict
+string from the bill using the arms' own two predicates, so the logged verdict
+and the actual decision cannot diverge.
+
+Logging on every admitted request unconditionally would be too noisy at
+sustained load, so `admissionLogLevel` picks the level BEFORE any string is
+formatted (so a `debug`-level line that the configured level would drop is
+never built at all): `info` on the first request after a model load
+(`model_registry.load_generation`, consumed by one compare-and-swap so
+concurrent racing request threads produce exactly ONE `info` line, not one per
+thread) or whenever `needed` exceeds 0.9x `available` (the request is close
+enough to the ceiling that an operator watching info-level logs should see it
+land); `debug` otherwise. The load-generation token is checked for
+consume-ability before the level decision short-circuits, so an operator
+running below `debug` doesn't pay for a CAS on every request only to discard
+the log line.
+
+Tests: `postEvictionPrefillChunk` (widens after an eviction that freed memory,
+holds the single ask when eviction freed nothing, RUNS a narrower re-ask and
+flags it as `moved`, is a no-op when the two readings are unchanged, and hands
+back the ladder floor unmodified), a scan that its body contains no `@max` over
+the pair, the
+composition of the two-ask logic against `chooseRequestPrefillChunk` including
+both the gate-disabled and non-qwen4 arms, a scan of the four-step admit/evict/reask/apply
+order, the `cap_adapt` pin-less-seam scan, `admissionLogLevel`'s
+load-generation and 0.9x-threshold branches, `admissionVerdict` against the
+arms' own predicates, a same-bill scan proving the admit and refuse arms format
+from one shared value, the post-load single-CAS arming scan, and
+`log.enabled`/`log.atLevel` gating.
+
+## The SSD-first write-through was 100% of a warm turn's TTFT regression (2026-09-05)
+
+On the warm control ladder (a restored prefix plus a 31-token instruction tail)
+the SSD-first bundle prefilled new tokens at 60-98 tok/s where the branch
+without the write-through ran 196-235. Decode was equal, the adaptive width
+probe never fired (a warm turn is one chunk, so `pos == loop_end` and the hook
+is not called), and every other candidate was bounded by a 2-3 ms residual. The
+whole gap is the prefill write-through, which runs inside the chunk loop on the
+inference thread and therefore lands inside `prompt_ms` and inside TTFT:
+
+| rung | `prompt_ms` with | without | Δ | write-through persist | unexplained |
+|---|---|---|---|---|---|
+| 16k (16,357 tok) | 316.1 | 133.3 | **182.8** | 181 ms / 203.7 MB / +16 chunks | 1.8 ms |
+| 32k (32,427 tok) | 506.3 | 144.9 | **361.4** | 358 ms / 403.9 MB / +32 chunks | 3.4 ms |
+| 64k (65,665 tok) | 899.3 | 156.5 | **742.8** | 741 ms / 818.0 MB / +65 chunks | 1.8 ms |
+
+Matched 1:1 by the persist at every rung, reproduced on a second boot
+(186/369/753 ms of persist against Δ 204/371/755 ms), four warm arms per rung
+all within 6 ms. Not variance. Source: `~/claude-tmp/bench-qwen4-ladder/WARM_TURN_TRACE.md`.
+
+**Half of it was a per-TENSOR GPU sync wearing bandwidth's clothes.**
+`DiskTier.serializeSafetensors` called `mlx_array_eval` on one array at a time.
+12 KV layers x 6 affine buffers x 32 chunks is ~2,300 full syncs on a 32k warm
+turn — a fixed per-tensor cost that reads as a flat ~1.13 GB/s, against the
+7-8 GB/s the same data reaches through `mlx_save_safetensors` on the same box.
+The tell was in the same log: the end-of-request disk commit goes through mlx's
+own saver (which evals ONCE) and ran 7x faster per byte than the write-through.
+
+The split is `materializeContiguous` (the contiguous pass, then ONE batched
+`mlx_eval` over a vector — exactly what `mlx::core::save_safetensors` does) plus
+`encodeSafetensors` (pure header + payload; no stream, no eval). The output is
+byte-identical, and that is the point: **the eval strategy is a latency
+decision, never a format one.** A regression here is byte-invisible, so it is
+pinned three ways — a timing-free `serialize_eval_count` demanding exactly one
+eval per chunk file, the pre-fix per-tensor materializer kept as a test-only
+golden with the two images compared byte-for-byte, and a scan fixing the SHAPE
+(one eval, batched form, at function-body indent after the loop closes).
+
+**The other half was persisting a prefix that had nothing new in it.**
+`writeThroughArmed` now also takes this turn's un-cached span
+(`prefill_tokens.len`) and declines below one `chunk_tokens`
+(`writeThroughSpanReached`, a pure helper with its own unit test; a scan pins
+that the arming site passes the un-cached tail and that the gate compares
+against the tier's OWN `chunk_tokens`). A restored 32k prefix plus a 31-token
+tail has no chunk-aligned progress a cancel could lose, so the turn was paying
+in-request for a prefix the end-of-request commit persists anyway — and that
+commit runs after the response text, where it costs the user nothing. Declining
+is announced once, not per request.
+
+The rule underneath both halves: **the write-through's job is to make a KILLED
+prefill restartable, not to be the persistence mechanism.** It buys nothing on a
+turn that cannot lose a chunk, and anything it does buy is charged to TTFT — so
+its cost per chunk is a first-class number, not an implementation detail.
+
+## The QSA indexer history was copied per snapshot, and billed as if it were not (2026-09-05)
+
+Flash Next's sparse-attention indexer keeps a raw-key history beside the KV. A
+prefix-cache commit used to hand the new entry its OWN copy of that history, so
+a slot and the entry it just committed held two copies of the same bytes — and
+the admission bill priced only one. Both halves are now one decision:
+`handoffQsaHistoryToLatest` lets the newest snapshot take a VIEW of the live
+buffer at COMMIT (ONE copy per slot ∪ entry), and `statePerTokenBilled` prices
+what is actually held — ONE history copy plus the f32 score bank, 5,376 B/tok.
+
+The bill moves from 20,736 to 18,432 MiB at 1M context, and measured decode
+residency falls 3-4 GB in the 786k-1M band. `MLX_SERVE_QSA_HISTORY_SHARE=0`
+restores the prefill-end copy and the 2x bill, which is also what
+`MLX_SERVE_KV_RESERVE=0` leaves in place — both arms are billed, so the
+estimator is never optimistic about the arm that is running.
+
+The rule: **a buffer two owners can share is billed once only after the sharing
+is real.** The pre-fix code had the sharing in neither place and the bill in
+one; the fix is the pair, not either half.
+
+## SSD-first: every prefix-diverging turn re-persisted the whole entry — chunk sharing by hard link (Defects A+B, 2026-09-05)
+
+Control run on the bundle: `[disk-cache] persisted 32426/32426 tokens (+32 chunks, 403.9 MB, 363ms)` on a 31-token warm turn; the judge's 64k rung: `reused 24576/65665 … persisted 32768/32768 tokens (+32 chunks, 464.5 MB, 375ms)` — TTFT +369 ms at 32k, +737 ms at 64k, ~10 s per turn at 786k. Two defects.
+
+**Defect B** (fixed in 9f43b7a): the write-through serialized with one eval per tensor and ran on sub-chunk warm turns. **Defect A** (this story): an SSD-first entry is committed at the END of a request, so its last tokens are the reply the model just generated — and the next turn's prompt contains that reply and then diverges INSIDE it, so a strict-prefix scan finds no usable common tail and rewrites every chunk of a multi-hundred-MB entry, every turn, for a conversation whose bytes are already on disk. Mechanically: `DiskTier.appendCommitWithSpec`'s extend scan reuses chunk files only under a STRICT prefix relation — `e.tokens` a prefix of the new tokens, or vice versa. A persisted entry's tokens are `prompt ++ generated`, so the next prompt (re-tokenized assistant text + `<|im_end|>` + the user turn) diverges INSIDE the generated span, neither relation holds, `next_id` mints a fresh `e<id>` and `writeChunkFile` writes every chunk from 0 again. Nothing bounded it on the SSD-first arm (`max_flush_bytes` = 2 GiB), and the caller was `prefillWriteThroughCb` at the first chunk boundary — inside the prefill, before the first token.
+
+Fix, two halves. (1) `chunkShareDonor` picks the resident entry (same `has_tools`, same kv-quant config by `std.meta.eql`, and the same model fingerprint by construction — `self.root` IS the fingerprint dir) with the most WHOLE chunks under the common prefix, clamped to the KV this commit holds and the donor's persisted length; `linkInheritedChunks` HARD-LINKS the donor's LANDED leading chunks into the new `e<id>/` (`std.Io.Dir.hardLink`, same filesystem) — a chunk has landed when its final-name file exists at the manifest's size and `Writer.isPending` says no write to it is queued or in flight — and the heir writes everything from the first un-landed chunk on. Audit B-A1: the first cut called `Writer.fence(donor_dir)` to wait for the donor's files; `fence` DISCARDS what it matches (it exists for a directory about to be deleted), so it destroyed the donor's queued chunks and meta while the donor still claimed them — the common state of a donor once the write-through lands one chunk per boundary. The donor's queue is never touched now; the "never rewrite an inherited chunk" invariant is a runtime check that cuts the links from `keep` on and writes those chunks, not a `std.debug.assert`. `[disk-cache] chunk share: e5 inherits 4 chunks (…) from e3 by hard link` is the engagement line. (2) `prefillWriteThroughCb` passes `WRITE_THROUGH_FLUSH_BOUND_BYTES` (1) to `appendCommitBounded` — one chunk per boundary, so a killed prefill still leaves a chunk-aligned restorable prefix; `flushPendingDisk` in `finishSlot` completes the rest after the response.
+
+Accounting — `total_bytes` is bytes on disk BY CONSTRUCTION, and the filesystem is the refcount: an heir bills 0 for inherited chunks (`inherited_chunks`, meta.json v6; `bytes` = files the entry created); `removeAt` frees `nonChunkBytes` plus every chunk file whose `stat.nlink == 1` (`bytesFreedByRemoving`), so the donor's removal keeps the shared files billed and the LAST holder frees them; `scan` counts every inode once (`billChunksOnce`), so a heir whose donor died before a reboot becomes the payer — the budget, the sweep and the eviction all read the same number, and a shared chunk cannot be freed while another entry still names it; extend and ssm-only commits move `total_bytes` by file DELTAS, never by recomputing an entry's bill. A manifest counter would have gone stale in the crash window between the link and `meta.json`; `nlink` cannot — and a crash there leaves an `e<id>` without meta.json, which `scan` deletes, dropping the extra link. A rewrite never lands on a link: links are whole chunks below `inherited`, and the rewritten partial chunk sits at `keep >= inherited`. Bars: the donor-then-heir / heir-then-donor test (`total_bytes` returns to the pre-commit value both ways), the link+restore test (one inode, two links, heir restores whole through a fresh scan with the same bill), the legacy-arm + kill-switch test (never links), v6 round-trip + v5 load, and the hook-bound scan pin. `MLX_SERVE_SSD_CHUNK_SHARE=0` restores the write-everything commit.
+
+Follow-up: the LEGACY (non-SSD-first) tier has the same per-turn rewrite and is deliberately gated OFF here (qwen4_exp blast radius); it shares `appendCommitWithSpecBounded`, so enabling it is `chunkShareDonor`'s `ssd_first` check plus its own A/B.
+
+## Restore by MOVE: a shared restore cannot donate, and the first append pays for it
+
+**Symptom.** Warm TTFT on qwen4_exp scaled linearly with context even though the turn
+forwarded 31 tokens: 198 ms at 128k, 277 ms at 256k, 360 ms at 384k — `prompt_ms ≈ 117 ms +
+0.617 µs × prompt_tokens`, i.e. two thirds of the wait was proportional to a prefix that was
+already in the cache. At 1M that projects to ~0.6 s of pure bookkeeping per warm turn.
+
+**Cause.** `KVCache.restore` binds the entry's buffers into the slot with `mlx_array_set`,
+which is a C++ `array` copy-assign in mlx-c — a refcount bump, deliberately, because the hot
+cache must keep the entry restorable for the next request. But mlx donates a `slice_update`'s
+input only when `array::is_donatable()` holds, and that is
+`array_desc_.use_count() == 1 && data.use_count() == 1` (`mlx/array.h`). The entry's second
+reference fails it, so the very first `writeAtOffset` of the turn fell through
+`SliceUpdate::eval_gpu` → `copy_gpu` and privatised the ENTIRE prefix: 13,056 B/tok × 392,966
+tokens = 5.13 GB, ~110 ms, 45% of the warm TTFT. Every subsequent append donated (its input
+was the uniquely-owned output of the first), and a cold prefill was never affected — which is
+why nothing in the KV growth counters could see it: **a copy-on-write is not a grow.**
+
+The same root cause fired a second time on the QSA side for a different reason. A restore
+republishes `aux_state` (the authority) but leaves the append ACCELERATOR empty, so
+`qsaAppendKeys` re-seeded with `materializedOwnedCopy` — producing a TIGHT `held`-row buffer
+that `capBufAppend` then grew one line later, `mlx_zeros` of the whole reservation plus a
+`slice_update` of the entire history. Two full passes over the prefix where one does, on the
+raw-key bank (3,072 B/tok) and again on the pooled bank (768 B/tok): ~81 ms at 384k.
+
+**Fix, and the ownership it costs.** On an SSD-first FULL-prefix hit — the entry's whole token
+record is a prefix of this prompt, which is what makes the commit's replace path land on this
+same entry — the restore is followed by a CHECKOUT: `KVCacheSnapshot.releaseHandles()` drops
+the entry's own handles, the slot becomes the sole owner, and the append donates in place. The
+copy disappears rather than moving.
+
+The price is that the record now outlives its bytes, so the entry is marked
+`checked_out_by = <slot>` and:
+
+* it is **invisible** to every other reader — `findBestRestorableMatch` (a second slot gets a
+  MISS, never an empty snapshot), `lruIndexExcluding` (eviction would free nothing and discard
+  the record the owner is about to replace), `spillIdleEntries`, `digestsAlloc`,
+  `reclaimableBytes`/`reclaimableBytesFor` (its bytes come OFF the base — crediting them is the
+  unsafe direction), and the commit path's "kept resident prefix" one-shot;
+* it is **reclaimed** by the commit that replaces it, which installs the grown buffers and
+  clears the mark;
+* it is **dropped** at slot end otherwise, with `[hot-cache] checked-out entry dropped: <reason>`.
+
+That last rule is where the class bug lives. There are TWO slot-end paths and they do not
+chain: `finishSlot`, and the inference loop's cleanup drain — which is where a decode-phase
+cancel lands, having been pulled straight out by `complete()` without ever reaching
+`finishSlot` (the same seam the commit-in-the-drain guard exists for). Both releases are
+unconditional (a pad-only, errored, oversized-and-declined or refused slot ends without a
+commit, and "the commit ran" is exactly the fact this cannot depend on) and the drain's sits
+BEFORE `s.deinit()`, which frees the very buffers the entry would otherwise still claim. Scan-pinned.
+
+**Rules.**
+
+* Restore by move is gated to the SSD-first arm (`ssd_first`, qwen4_exp today) and killed by
+  `MLX_SERVE_RESTORE_MOVE=0`, which is the refcount-share byte-for-byte. Partial-prefix hits
+  keep the share: they make no promise about the commit, and the entry is still worth keeping.
+* A checkout is declined while a `pending_disk` record shares the same buffers. mlx's own
+  use_count test would decline the donation anyway; the guard is there so nobody has to reason
+  about a flush reading buffers a slot is appending into.
+* `seedCapBuf` seeds a history accelerator AT its reservation. Byte-identical to the pair it
+  replaces — `capBufAppend`'s grow builds exactly that array — and the bar is that the grow it
+  would have done becomes a no-op: **1 seed, 0 `qsa_cap_buf_allocs`.**
+
+**The observable.** Buffer IDENTITY is the only in-process evidence of donation:
+`testKeyDataPtr` reads the layer's data pointer after an eval, and "the appended buffer sits at
+the address the prefix already occupied" IS "no copy happened". The copy arm cannot fake it —
+its donor is still alive in the entry, so the allocator cannot hand the copy that same address.
+Both arms then assert the SAME BYTES: the arms differ in ownership, never in output.
+
+## A WARM turn was billed for the prefix it was about to SHARE
+
+Live 2026-09-05, qwen4-ladder run on `4d180d1`. The 768k rung's SECOND request
+— 786,707 tokens, 31 more than the entry the turn before it had just committed
+— was refused before its first forward:
+
+```
+[admission] needed=25866 MB available=19032 MB reclaimable=10294 MB width=512 verdict=evict
+  prompt 786707 tokens needs ~25866MB, ~19032MB available + ~10294MB reclaimable
+    hot cache (of ~24826MB resident) — admitting, the prefill will evict
+  [hot-cache] reused 786676/786707 tokens (matched 786695; entry 2/2)
+  [hot-cache] evicted 1 entries (9397 MB live, 10294 MB billed) to admit a 786707-token prefill
+[scheduler] prefill refused: 786707 tokens do not fit even with an empty hot cache
+  prompt 786707 tokens needs ~25866MB at prefill chunk 512 …, ~19320MB available
+    after evicting ~14531MB of hot cache — refused before prefill
+```
+
+It restored its own 786,676-token entry from RAM, destroyed the OTHER session's
+523,887-token entry on the way, and was then refused anyway. The same request
+served on `5c4b4bc`, so it read as a fix-round regression — and it is not. No
+commit in `5c4b4bc..4d180d1` touched the bill: `prefillMemoryNeeded`,
+`prefillRequestTerms`, `reservedCacheTokens`, `statePerTokenBilled` and
+`qsaMaskBytes` are byte-identical across the range. What changed was the
+machine's slack. The blindness is older than the fix round; the fix round only
+took away the room it had been hiding in.
+
+**The term.** `prefillMemoryNeeded` bills `seq * kv_per_tok` and
+`prefillRequestTerms` bills `reserved * statePerTokenBilled` — the whole
+prompt's KV and the whole prompt's QSA indexer history, unconditionally. A RAM
+hot-cache restore rebinds the entry's MLX handles by REFCOUNT: those rows are
+already inside `mlx_get_active_memory`, so the `available` the bill is compared
+against is already net of them. Billing them again is a second copy nobody
+allocates. At 786,707 tokens on qwen4_exp at 8-bit that is 786,676 x (13,056 +
+3,840) = 13.3 GB of the 25.9 GB bill — against 19.0 GB free.
+
+The existing rule ("`active_mem` already holds the resident entry, so the
+prefill guard must never ADD it again") had only ever been read as a
+prohibition on adding a term. The other half — that the terms already there
+describe rows the request will not allocate — was never written down.
+
+**Why it is not a subtraction.** The credit is gated on CAPACITY, not on the
+match. Past the restored buffer's capacity `KVCache.nextCapacityReserved`
+allocates the whole new capacity beside the old one (`growQuantBuf`
+slice_updates the old into the new and both live until the eval) — and the old
+one belongs to the hot entry, which eviction PROTECTS, so it does not go away.
+A chain extension that outgrows its entry therefore really does have to find a
+full fresh buffer, and must be credited nothing. `WarmPrefix.creditedRows` is
+all-or-nothing on `reserved <= capacity_tokens` for exactly that reason:
+
+* 786,707 over a 786,676-row entry: `reserved` 787,419 <= capacity 787,456 —
+  no grow, full credit, bill 26.6 GB -> 10.8 GB, ADMITTED with no eviction.
+* 1,047,556 over the same entry: `reserved` 1,048,268 > 787,456 — a grow, no
+  credit, bill unchanged. That request is refused by MARGIN (33.2 GB billed
+  against 31.7 GB free; the terms sum to ~27.9 GB before the estimator's 5/4),
+  which is a separate question from this one.
+
+**Two threads, one subtraction.** The credit leaves the bill through exactly
+ONE door — `PrefillRequestTerms.shared_resident_bytes`, assigned in one place
+and subtracted in one place, scan-pinned — because the other failure mode of
+this rule is crediting the same prefix twice: once out of `needed` and once as
+reclaimable hot cache. `HotPrefixCache.reclaimableBytesFor` already withholds
+the matched entry (eviction refuses to take it), and that withholding is what
+the connection thread's `pinnedResidentBytes` reads.
+
+The connection thread does not price the credit at all. It has no slot, no
+cache and no capacity reading, and a published `EntryDigest` fingerprints only
+the first `DIGEST_PREFIX_TOKENS` ids — so it cannot know how much of a matching
+entry a prompt actually shares, and guessing is the OVER-credit direction,
+which ends in an uncatchable Metal abort rather than a 400. Instead it defers:
+when `pinnedResidentBytes(bill) > 0` the guard admits and says so, and the
+inference thread — which holds the real cache and `KVCache.residentCapacityTokens()`
+— bills the warm request and still refuses by NAME if it does not fit. A gate
+that runs BEFORE the estimator that knows better IS the estimator (#126); the
+honest form of that rule here is not to decide.
+
+The 1M rung had been naming the defect in its own refusal text: "of which ~0MB
+can be reclaimed (the entry a restore would share is not evictable)" — the
+guard reporting that the bytes it was billing were bytes it had also proved
+nobody was going to hand back.
+
+Tests: the two live-numbered bills (786,707 @ 19,032 MB admits at ~10.8 GB;
+1,047,556 over the same entry is credited nothing until its buffer covers the
+reservation), the exactly-once scan across both files, and `pinnedResidentBytes`
+at the live 24,826/10,294 MB reading.
+
+### Follow-ups the 1M rung is still waiting on
+
+The 1,047,556-token chain extension above is refused by MARGIN, not by this
+defect. The terms sum to ~27.9 GB against 31,717 MB free; the estimator's 5/4
+takes the bill to 33.2 GB (the log's own number, 32,953 MB). Two levers were
+costed and DECLINED for the change that fixed the warm bill, because shaving a
+margin on a path where a real OOM is uncatchable is not a trade a warm-bill fix
+gets to make:
+
+* **(B) one copy of `state_bytes` while the QSA capacity buffer is being
+  reallocated.** `statePerTokenBilled` bills two — the live history plus the
+  copy `attachQsaHistoryToLatest` materializes at the end of the prefill. On a
+  GROW the old history belongs to the protected hot entry and is already in
+  `active_mem`, so the pair that actually coexists may be one new buffer plus
+  the attach, not two new ones. Worth ~4 GB at 1M. Needs the attach's lifetimes
+  checked against the grow's, not assumed.
+* **(C) exempt exactly-known buffer sizes from the 5/4.** The margin exists for
+  transients whose peak is estimated; a reserved KV buffer's size is arithmetic,
+  not an estimate. Worth ~1.5 GB at 1M — probably not enough on its own.
+
+Note also that the QSA-history bill fix landing beside this one takes 2,304 MiB
+off the 1M bill directly (33.2 GB -> ~30.2 GB against 31,717 MB free), so the
+rung may admit without either lever. The re-judge is what decides that, not this
+arithmetic.
+
+One seam between the two changes, since they touch the same terms — and the
+first version of this paragraph got it wrong, which is why the rule is now
+spelled at the site. The credit is `credited *| kv_per_tok`: **KV only**. The
+QSA history travels with the restore but is PRIVATISED on arrival
+(`restoreQsaHistory` -> `seedCapBuf`, a `materializedOwnedCopy` when the
+reservation already fits, a slice_update into fresh `mlx_zeros` when it does
+not), so the slot allocates its own and not one byte of it is shared. Crediting
+one copy of it read as a harmless conservatism; folded with the one-copy
+`statePerTokenBilled` this tree now ships, the history term CANCELLED — ~3.0 GB
+under-billed at 786k, on a path whose failure mode is an uncatchable Metal
+abort rather than a 400 (audit W-2).
+
+The rule that survives is narrower than "the credit is what a restore shares":
+**the credit is what the restore hands over WITHOUT allocating**. A buffer
+handed to the slot qualifies; a view copied on arrival does not. A change to
+how many copies the bill charges must therefore not move the credit at all, and
+a scan pins the credit expression against ever naming `qsaHistoryBytesPerToken`
+or `statePerTokenBilled` again.
+
+The capacity gate has the same shape and was got wrong the same way (audit
+W-1). `KVCache.entries` is allocated at `num_hidden_layers`, but on a GDN trunk
+only the ATTENTION layers ever call `update` — 12 of 48 on qwen4_exp — so 36
+entries are `initialized == false` forever. The first `residentCapacityTokens`
+vetoed on the first of those (`if (!e.initialized) return 0;`), which made the
+capacity 0 on every qwen4_exp request and the whole warm credit unreachable on
+the one arch it was written for: the `kvLenForBatching` class, a guard reading a
+value that is zero forever on a linear-layer trunk. The fold now SKIPS an
+uninitialized entry and takes the minimum over those that hold a buffer, 0 when
+none does — which is also the safe direction, since a caching layer with no rows
+yet can only happen while the whole cache is cold.
+
+### ...and "hands over without allocating" means the CHECKOUT, not the restore (audit B-A3)
+
+The third bite of the same rule, and the one that shows how narrow it really is.
+The credit fired on `matched > 0`: any restore, any arch. But `KVCache.restore`
+is `mlx_array_set` — a refcount bump — and the story two sections up
+("Restore by MOVE") is the proof that a refcount-shared prefix is COPIED by the
+turn's first `writeAtOffset`: `is_donatable()` is
+`array_desc_.use_count() == 1 && data.use_count() == 1`, the entry's second
+reference fails it, and `SliceUpdate::eval_gpu` falls through to `copy_gpu` on
+the whole prefix. A shared restore therefore allocates exactly what the COLD
+bill charges. Only the CHECKOUT — `HotPrefixCache.checkoutEligible`, which drops
+the entry's own handles so the slot is the sole owner — makes the credited rows
+rows nobody allocates.
+
+The checkout is narrow: SSD-first (qwen4_exp AND a disk tier) ∧ full-prefix hit
+∧ no pending disk record ∧ `MLX_SERVE_RESTORE_MOVE`. So the credit was an
+under-bill on every non-qwen4 arch, on every PARTIAL hit (the ordinary
+chain-divergence case), while a flush is pending, and on both documented
+kill-switch arms — 12,244 MB removed at the pinned 786,707-token scenario, on a
+path whose failure mode is an uncatchable Metal abort rather than a 400.
+
+The fix carries the decision rather than re-deriving it: `checkoutIfEligible`
+RETURNS whether it took the checkout, `LookupResult.checked_out` carries it out
+of the cache, the scheduler's `hot_checked_out` rides beside `hot_matched` into
+both inference-thread guards (the fits probe and the refusal that must quote the
+number it compared), and `WarmPrefix.will_donate` gates `creditedRows` ahead of
+the capacity gate. ONE predicate: a scan pins that the estimator never calls or
+spells `ssdFirstEnabled`/`restoreMoveEnabled`/`pending_disk`, because the credit
+and the checkout drifting apart IS the defect. The connection thread is
+unchanged — it still has no slot, no cache and no capacity reading, so it defers
+(`pinnedResidentBytes`) instead of pricing any of this.
+
+Numbers at the pinned scenario are unchanged where the checkout is taken: cold
+24,475 MB, credit 786,676 × 13,056 × 5/4 = 12,244 MB, warm 12,231 MB against
+19,032 MB free. Everywhere else the bill is the cold one again.
+## The 400/503 mapping existed only where nobody was looking (external review of PR #363, item 2, 2026-09-06)
+
+Two named, actionable errors reach a client from the generation path: a memory
+503 when the MLX working-set latch (#353) abandons a request mid-forward, and a
+400 when the admission estimator refuses a prompt that does not fit even with an
+empty hot cache. Both messages name the levers. Both were written four times —
+once per surface — on the NON-STREAMING arm only.
+
+The streaming arms did something else entirely. `/v1/chat/completions` wrote
+`data: {"error":{"message":"Internal server error: GenerationOutOfMemory",
+"type":"server_error"}}`. `/v1/messages` wrote the same string into an
+Anthropic `error` event. `/v1/completions` logged the error and wrote
+**nothing** — the client got a dropped socket mid-stream. `/v1/responses` had no
+`catch` anywhere on its path, streaming or not, so the error propagated to the
+route dispatcher and the socket died there too.
+
+Agents stream. So the surface that carried the actionable message was the one
+almost nobody reached, and the surface everyone reached carried a Zig error name.
+
+The fix is ONE mapping, `server.mapGenerationError`, asked by both paths:
+
+* `error.GenerationOutOfMemory` / `error.OutOfMemory` → 503, `GEN_OOM_MSG`;
+* `error.PrefillDoesNotFit` → 400, `PREFILL_NOFIT_MSG` (a request refused before
+  its first forward is the client's request being too large, not an engine
+  fault, so `invalid_request_error` on BOTH dialects);
+* `error.GenerationFailed` → 500, "generation failed";
+* anything else → 500 keeping the error NAME in the message — the streaming
+  arms' one virtue over the non-streaming ones, which sent it bare.
+
+`sendGenerationError` is the single arm every surface's `catch` calls, and it
+branches on ONE fact: has the SSE response head gone out?
+
+* **Not yet** — the status line is still ours, so the streaming request gets
+  byte-for-byte the response its non-streaming twin would have got. A client
+  should not have to parse a different error shape because it asked for a
+  stream.
+* **Already** — the status is spent, so the same `type` and `message` ride the
+  surface's terminal `error` event: an OpenAI `data:` frame that also carries
+  `choices[0].finish_reason: "error"` (so a client parsing only chunks
+  terminates instead of waiting out a stream that will never deliver another
+  delta) followed by `[DONE]`; an Anthropic `event: error` (which IS the
+  terminator there — no `[DONE]`); a Responses `event: error` with its
+  `sequence_number`, then `[DONE]` on HTTP and nothing extra over the WS bridge.
+
+That fact needs one owner, so `Conn.sse_headers_sent` is set in exactly one
+place — `sendSseHeaders`, which is now the only site in server.zig that spells
+`Content-Type: text/event-stream`. Three of four surfaces setting a flag is the
+same defect one layer down.
+
+Two structural consequences fell out. `/v1/responses` gained a wrapper
+(`handleResponses` around `handleResponsesInner`) purely to have an error arm at
+all, and it owns the SSE sequence counter so the terminal `error` event can
+carry the number the spec requires on every Responses event; the WS transport
+keeps the error instead, because it has its own terminal frame AND
+borrowed-store cleanup to run at the call site (it now maps through the same
+function). And the four inner `catch |err| switch (err)` blocks around
+`nonStreamingViaScheduler` are GONE: they mapped the same three classes a second
+time, which is exactly how the two paths came to disagree. Every class now
+propagates to the surface's one arm.
+
+Tests: `mapGenerationError` per class including the unknown arm; the three SSE
+body builders carrying the mapped type, code and message plus their surface's
+terminator; absent-form scans for every pre-review spelling of a raw error name
+in a client-visible frame; a count of the surfaces routing through the sender;
+and arm [6] of `tests/test_mlx_error_recovery.sh`, which fires
+`MLX_SERVE_MLX_FAULT_STEP` at a STREAMING request and asserts the 503 message
+and `finish_reason: "error"` on the wire, with the raw name absent.
+
+## A finish is not a finish when the last forward failed (external review of PR #363, item 3, 2026-09-06)
+
+S20 already knew that `runSingleDecodeTickInner` can reach `finishSlot` — and
+so the hot-cache commit — on an EOS the FAILING forward itself produced. Metal
+returns ZEROS before it aborts, so a plausible EOS sampled out of buffers it
+never wrote is exactly what that failure looks like, and the tick wrapper's
+`checkErrorDecode` has not run yet. S20's guard (`if (mlx.errorPending())
+return;` inside `commitSlotIfApplicable`) keeps that garbage out of the prefix
+cache.
+
+It does nothing for the client. The same EOS ran on through `finishSlot` to
+`slot.markFinished("stop")`, the connection thread's `waitNext` returned
+`.done`, and the request answered **200 with fabricated text**. The wrapper's
+`markError` a moment later hit `if (self.error_code != null or self.finished)
+return` and was a no-op. The commit was guarded; the response was not.
+
+`finishSlot` now reads the latch BEFORE anything finalizes the request and
+publishes its terminator through `publishSlotTerminator`, the only caller of
+`Slot.markFinished` in the file: latched → `markError(name)`, clean →
+`markFinished(reason)`. The name is `@errorName`'s, so `errorNameIsMemory`
+classifies it exactly as a consumed failure and the client gets the memory 503
+through item 2's mapping — on the streaming surfaces too, which is why the two
+items ship together. The metrics sink is billed `"error"` rather than the reason
+the request never earned.
+
+The read is a PEEK (`mlx.peekErrorName`), never a consume, and that is the
+subtle half. The decode-tick wrapper still owns the latch: on a BATCHED group
+one forward serves every slot, and the wrapper's `checkErrorDecode` is what
+fails all of them. A slot that consumed the latch on its way out would answer
+itself correctly and leave its siblings finishing 200 on the same dead buffers —
+the original bug, minus one victim.
+
+Tests: `publishSlotTerminator` against a stub slot (clean finishes, latched
+never publishes a reason at all, and the published name carries the memory
+class); a scan that the latch read precedes the publish, that the publish is the
+only `markFinished` caller, that `finishSlot` does not CONSUME, and that S20's
+own `errorPending` guard is still on the commit path; and `peekErrorName`'s own
+test in mlx.zig — same name as the consuming path, latch still pending
+afterwards.
+## PR #363 blast-radius ledger — what runs on archs the PR never measured
+
+PR #363 is described as a qwen4_exp (Qwen3.8-Flash-Next) long-context
+optimization. It is not one: a systematic sweep of
+`git diff a93e2c0..aad0315 -- src/` found behaviour changes reaching llama,
+mistral, gemma3/4, muse_glimmer, qwen3_5 (the 27B sidecar-MTP pack),
+qwen3_5_moe, qwen3_next, lfm2, nemotron_h, bailing_hybrid and deepseek_v4 —
+none of which was benchmarked, and several of which can only lose.
+
+The policy this ledger encodes: **every long-context behaviour change is
+qwen4_exp-gated by ONE predicate (`ModelConfig.longCtxGated()`); other archs
+are byte-identical to a93e2c0, characterization-pinned. Genuine bug fixes are
+NOT gated — they ship for everyone.**
+
+Classes: **A** = bug fix, keep for all archs. **B** = output-preserving, proof
+cited. **C** = behaviour change on a non-qwen4 arch, must be gated. **D** =
+already unreachable off qwen4 by a verified guard (a comment claiming a guard
+is not a guard — every D below was checked by reading the predicate body).
+
+### Class C — gated by this round
+
+| # | site | what changed for other archs | gate | pin |
+|---|---|---|---|---|
+| 1 | `KVCache.reserve` from `generate.runPrefill` | every arch past a 32k prompt allocated prompt + 8192 + chunk of KV up front instead of the +25% ladder | `generate.reservedPrefillTokens` returns 0 ungated ⇒ `reserve_tokens` stays 0 ⇒ `nextCapacityReserved` IS `nextCapacity` | `reservedPrefillTokens:` tests + the one-call-site scan |
+| 2 | `scheduler.batchKvLenOf` / `Slot.batchKvLen` | a93e2c0 fed the pad-waste cap `cache.step`, which is 0 forever on a linear-layer-0 trunk, so the cap was DEAD there; the PR wakes it and skewed groups now split on qwen3_5 dense and qwen3_next | `batchKvLenOf(cache, cfg)` — `cfg.longCtxGated()` picks the kv-length rule, else `cache.step` | `batchKvLen:` characterization over the four hybrid families |
+| 3 | `transformer.spanPreservingDropIndex` at five retention sites | a93e2c0 had TWO baselines: drop-oldest at the two prefill-capture sites and at the disk tier, min-span-with-NO-recency-quarter at `mergeCheckpointLists`/`shedCheckpointsToFit`. The PR replaced both with min-span + a dense newest quarter, so which checkpoint a warm turn restores from moved on every hybrid | a per-site `ThinPolicy` chosen by the ONE predicate; the ungated arm names which a93e2c0 policy it reproduces | retention characterization per site |
+| 4 | `server.prefillRequestTerms` (all four terms) | reserved KV headroom billed on every arch while its allocator twin was gated; retained SSM checkpoints (~1.9 GB) billed on qwen3_5/qwen3_5_moe/qwen3_next/bailing_hybrid but NOT lfm2/nemotron_h; the warm credit under-bills on every arch | `if (!config.longCtxGated()) return .{};` — `.{}` is the identity for `prefillMemoryNeeded`, so the bill is a93e2c0's 13-argument expression | bill characterization + the sizer/bill consistency test on qwen4 |
+| 5 | `server.prefillChunkCap` (ex-`resolvePrefillChunk`) | TWO changes at once: the hot-cache ask was dropped from the serving budget (widens the rung) and the ctx bar was added (can pin chunk 512 for a process) | one gated helper; the ungated arm is a93e2c0's `(ceiling − (active + ask)) / SHARE` | `prefillChunkCap:` characterization over seven archs |
+
+### Class C — found by the sweep (all closed in the second round, below)
+
+| site | reach | note |
+|---|---|---|
+| `prefix_cache.evictLruToAdmit` + `reclaimableBytes`/`digestsAlloc`/`reclaimableFromDigests` + `scheduler`'s `prefill_admission_fits` pass + `error.PrefillDoesNotFit` | every arch, every request | wholly new (a93e2c0 has none of it). A long prefill now EVICTS hot-cache entries and can be refused by a name that did not exist. The `publishHotCacheResidency` half is class A (it fixes a real connection-thread use-after-free on `hot_prefix_cache`); the CREDIT and the EVICTION are the policy change |
+| `prefix_cache.trimLenForBudget` shed simulation | every hybrid, no flag needed | a93e2c0 billed EVERY lower checkpoint; the PR bills only shed survivors, so it systematically retains a LONGER prefix at the same budget |
+| `server.prefixCacheMemForLoad` | every arch | three simultaneous input changes to the resolved hot-cache budget: static instead of live ceiling, `ramFirstContextForLoad` instead of `getEffectiveContextLength`, `planHotCache` instead of the direct clamp |
+| `server.computeMemoryContext` → `CTX_SIZING_CACHE_RESERVE` | every arch | changes the ADVERTISED `context_length` whenever `--prefix-cache-mem` differs from the 2 GiB default; agent CLIs read that number once per session |
+| `server.checkAttentionMemory` new evict / warm-deferral admit arms | every arch, four surfaces | a93e2c0 refused pre-flight with a clean 400; the PR admits and can die later after evicting the whole hot cache |
+| `kv_disk_cache.SSM_DISK_MAX_PER_ENTRY` 8 → 16 | every hybrid with `--prefix-cache-disk` | doubles the persisted checkpoint footprint per entry and changes `gcToBudget` pressure |
+| `kv_disk_cache` meta.json `"v":4` → `"v":6`, written unconditionally | every arch with disk on | forward-compatible, NOT backward: an a93e2c0 binary rejects v6 and discards the whole persisted tier on downgrade |
+| `prefix_cache` trim retry loop | every arch, error path | a failed `trimmedCopy` retries at the next-lower checkpoint instead of declining |
+| `ModelConfig.perRequestPrefillChunk` | — | hand-rolls `model_type == "qwen4_exp"` instead of delegating; `model.zig`'s own doc forbids exactly that (a second predicate drifts) |
+
+### Class A — kept for every arch, deliberately ungated
+
+The MLX error latch (`mlx.installErrorHandler`, `checkError` in the prefill
+chunk loop and both decode ticks, `commitSlotIfApplicable`'s `errorPending`
+guard — a Metal working-set abort used to `exit(-1)`, and a poisoned prefix
+used to be committed from an EOS the failing forward produced); the
+`Transformer` teardown double free of `aux_state`/`qsa_pooled`; the
+`publishHotCacheResidency` scalar (the guard used to dereference
+inference-thread state); `hot_cache_digests` freed below the thread join;
+`warmQsaEnvCaches`/`warmEnvCaches` on the main thread (first touch of a lazy
+`?bool` cache from two threads is a race); `snapshotRowBytes`' ndim guard (an
+out-of-bounds shape read on a dense snapshot); the slot error-NAME mapping
+(`slotFailure`, `errorIsMemory`) that turns a memory failure into a 503 and a
+pre-prefill refusal into a 400 instead of a generic 500; and
+`kv_disk_cache.appendSsmOnly`'s byte accounting, which drops the spec
+sidecar's size delta and drifts `total_bytes` on every sidecar-only commit
+(reachable on any arch with a dflash/MTP snap plus `--prefix-cache-disk`).
+
+### Class C — gated by the second round (open list closed)
+
+| # | site | reach off qwen4 | gate | test |
+|---|---|---|---|---|
+| A-1 | `ModelConfig.perRequestPrefillChunk` (`src/model.zig:790`) | hand-rolled `"qwen4_exp"`; the ONLY gate on the admission re-ask, the tail-merge bound and the per-chunk adapter | delegates to `longCtxGated()` | `no policy predicate hand-rolls the qwen4_exp literal` — a PRODUCTION-WINDOW scan of the literal, since counting predicate CALLS cannot see an inline `std.mem.eql` |
+| 6 | `kv_disk_cache.SSM_DISK_MAX_PER_ENTRY` 8 → 16 | every hybrid with `--prefix-cache-disk`: double the persisted checkpoint footprint per entry, and different `gcToBudget` pressure for the whole tier | `DiskTier.ssm_max_per_entry`, mirrored beside `cp_thin` at the ONE wiring site; `SSM_DISK_MAX_PER_ENTRY_LEGACY` (8) is the default | `the per-entry checkpoint cap is gated; a legacy tier keeps a93e2c0's 8` |
+| 7 | `meta.json` `"v":6` written unconditionally | every arch with disk on: a93e2c0's reader accepts 2/3/4 only, so a downgrade discards the WHOLE persisted tier | `metaVersionFor` stamps the LOWEST version that describes the entry (v6 = inherited chunks, v5 = the MTP head's QSA half, else v4). Not an arch gate — a property of the entry | `the manifest stamps the LOWEST version that describes the entry` |
+| 8 | `server.prefixCacheMemForLoad` | every arch, THREE inputs at once: static ceiling, `ramFirstContextForLoad`, `planHotCache` + `clampReserveWidth` | ungated arm is a93e2c0's verbatim, placed ABOVE both the SSD arm and the plan | `the ungated budget arm is a93e2c0's arithmetic` |
+| 9 | `server.computeMemoryContext` → `CTX_SIZING_CACHE_RESERVE` | every arch: a different ADVERTISED `context_length` at any `--prefix-cache-mem` but the 2 GiB default, read once per session by every agent CLI | `ctxSizingCacheReserve(config)`; both load-time wrappers read it too, so the billed session and the advertised session stay one number | `the advertised context is a93e2c0's on every other arch` |
+| 10 | evict-to-admit: the two credits, the two new `checkAttentionMemory` admit arms, `evictLruToAdmit`, `error.PrefillDoesNotFit` | every arch, every request | the two CREDITS zeroed in `prefillAdmissionBill` (one lever: `fitsAfterEviction()` becomes `fits()`, `pinnedResidentBytes` becomes 0, so both arms go dead together) + the same predicate on the scheduler's pass | `the evict-to-admit credits are qwen4_exp-only` |
+| 11 | `prefix_cache` trim retry loop | every arch, error path: retries an allocation immediately on a path whose failure is memory pressure | `self.cp_thin == .min_span` → decline, a93e2c0's behaviour; the error is still LATCHED on both arms | the retry test's gate/log/latch ordering assertions |
+
+### Class A — the second round's additions
+
+`kv_disk_cache.appendSsmOnly` billed its `total_bytes` delta from the
+checkpoint files alone while also writing `spec.safetensors`, and assigned
+`e.spec_bytes` before taking the delta — so the sidecar was written and never
+billed, `gcToBudget` priced the tier low, and the footprint drifted past
+`--prefix-cache-disk`. Reachable on any arch with a dflash/MTP snap plus a disk
+tier; fixed for everyone (`an ssm/spec-only append bills the SPEC sidecar's byte
+delta`, red at 80,739 vs 118,668).
+
+**This fix IS live on qwen4_exp** — correcting a premise this ledger and the
+round-2 brief both carried. The claim was that qwen4 never writes a spec
+sidecar because `MtpCacheRef.kv()` returns null for the in-checkpoint head.
+That was true at a93e2c0 and is **false on this tree**: `generate.kv()`'s
+`.qwen4` arm returns `&t.qwen4_mtp.?.cache` whenever `mtpHeadPersistEnabled()`,
+and `mtpHeadPersistFromEnv(null)` returns **true** — head persistence is
+default-ON (`MLX_SERVE_MTP_HEAD_PERSIST=0` turns it off). `metaVersionFor`
+returns 5 for exactly that case. So on qwen4_exp with `--mtp` +
+`--prefix-cache-disk` a v5 sidecar IS written, `specWorkPending` CAN be true —
+notably through its own v5-upgrade arm, which fires on every entry of a tier
+carried over from an older build — and the delta really moves `e.bytes` and
+`tier.total_bytes`.
+
+What the delta cannot reach is a DECISION: its only consumer is `gcToBudget`,
+which is a no-op unless `total_bytes > max_bytes`. The judge boots at
+`--prefix-cache-disk 100GB` against tiers of ~20-28 GB, so the budget never
+binds and no eviction moves — which is why the root_all5 judge table still
+stands for root_all6. **That is a run-configuration argument, not a property:**
+under a tight `--prefix-cache-disk` this fix does change qwen4 eviction. Nobody
+writing the PR body should repeat the `kv()` → null claim.
+
+`publishResolvedPrefixCacheMem` stays ungated **on purpose**: a93e2c0's ANE
+gate reserved the RAW `--prefix-cache-mem` while the cache could only ever hold
+the clamp, so three places disagreed about how many bytes the cache holds.
+Publishing a number the cache is actually capped at cannot over-admit.
+
+Its reach is **wider than "`--ane-prefill` boots"**, which this ledger claimed
+and the code does not support. `resolvedPrefixCacheMem()` has three ungated
+production readers: the `serve()` boot banner (`Hot prefix cache: ENABLED
+(mem-cap=…)` now prints the RESOLVED cap where a93e2c0 printed the raw ask —
+cosmetic, operator-visible, every arch); `aneGateHeadroom`; and — until this
+round — `pinPrefillChunk`. The third was the one that mattered and is now
+gated: off `longCtxGated` the pin reads `legacyPrefixCacheAsk()`, because in a
+multi-model registry the SECOND model to load was sizing its prefill width
+against the FIRST model's clamped budget, an input a93e2c0 never fed it.
+Single-model boot was identical either way, which is why it went unnoticed.
+
+### Class C — the completeness sweep's seven, gated in round 3
+
+The auditor's line-by-line sweep of `a93e2c0..00b7a8e -- src/` found seven
+changed hunks the ledger had no row for. Five change behaviour off qwen4_exp
+and are gated; two are log-only and are recorded as such.
+
+| # | site | what changed for other archs | gate |
+|---|---|---|---|
+| 12 | `pinPrefillChunk` → `billedPrefillChunk` override precedence, and `chooseRequestPrefillChunk`'s short-circuit | a93e2c0 pinned the machine RUNG and let `generate.effectivePrefillChunk` apply an explicit `--prefill-chunk` / `MLX_SERVE_PREFILL_CHUNK` at forward time. The PR moved that precedence into the PIN — the audit-S8 fix — and the pin is read by the admission bill, by the ungated `clampedPrefixCacheMem` reserve and by `computeMemoryContext`'s **advertised** context, so three numbers moved at once on every arch that sets the flag | `pin_override` is `explicitPrefillChunk()` only when gated, else 0; the chooser asks the arch BEFORE the override |
+| 13 | `pinPrefillChunk` reading `resolvedPrefixCacheMem()` | in a multi-model registry the second model to load pinned its width against the first model's CLAMPED budget — an input a93e2c0 never fed it. Single-model boot is identical, which is why it went unnoticed | ungated reads `legacyPrefixCacheAsk()`, the raw `--prefix-cache-mem` |
+| 14 | the memory-refusal 400 body | gate 4 zeroes both credits off the gate, and the message formats them: every non-qwen4 refusal read "the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere)" on a box with a multi-GB resident cache. Client-visible, and false | `memoryRefusalMessage` — one formatter, two arms, discriminated on the ARCH GATE (`config.longCtxGated()`, passed in); the ungated arm is a93e2c0's exact sentence, pinned byte for byte, and the gated arm keeps qwen4's bytes verbatim |
+| 15 | `scheduler`'s batched-group sort | the stable insertion sort replaced `std.sort.pdq`, which is UNSTABLE. On equal keys the two hand `batchedKvKeepCount` different slots in the tail, and the tail falls to SERIAL decode — a different kernel. Off qwen4 every key is `cache.step`, 0 forever on a hybrid, so EVERY key ties and the sort decides the whole ordering | `gate_batch_kv_len`, the same predicate as the kv-length rule, read once per group so a group cannot be ordered by one key and capped by the other |
+| 16 | `round_cost.BUCKET_NAMES[5]` | the legacy grid's top bucket is unbounded `32k+`; the array spells the long grid's `32-64k`. Every `[spec-stats]` / `[mtp-trace]` / adaptive-switch line on a sidecar-MTP pack labelled a 374k request "32-64k" — the number right, the label a lie | `bucketName(layout, b)`; labels only, no cell/edge/plan moves |
+
+**Row 14 was nearly keyed on the wrong thing.** The first shape discriminated
+on `bill.evictable == 0` — "name the cache only when there is a cache", which
+reads better on the merits and is wrong here twice over:
+
+* it CHANGES qwen4's bytes. That arch reaches the refusal arm with an empty hot
+  cache (a large first request, before anything is resident), where it used to
+  render the long sentence with two zeroes; a byte-count discriminator would
+  have silently switched it to a93e2c0's short one. This round's mandate is
+  zero qwen4-path changes, so the gate decides and qwen4 keeps the zeroes.
+* it splits on ONE credit while the guard's arms read BOTH. `evictable == 0`
+  with `reclaimable > 0` is not a state the cache produces (`reclaimable` is
+  residency minus the largest entry, so it is bounded by `evictable`), but
+  nothing in the formatter said so, and `pinnedResidentBytes` couples the two.
+  A message keyed on half of a coupled pair is a latent disagreement with the
+  arm that refused. The gate keys on neither and cannot drift from either.
+
+The merits question — whether a GATED bill on an empty cache should name the
+cache at all — is real and deferred, to a change that can be measured on its
+own rather than folded into an arch gate.
+
+**Known limit of the ungated arm of row 12,** inherited from a93e2c0 and stated
+rather than silently fixed: with `--prefill-chunk` set, a non-qwen4 boot bills
+and advertises against the machine rung while the forward runs the flag's
+width. That inconsistency *is* a93e2c0's behaviour; closing it is a change that
+owes the archs it touches a measurement.
+
+### Log-only, recorded so the sweep is closed
+
+`[spec-stats]`'s new fields (`width_trials=`, `table=`, the serial-row and
+EV-plan terms) and the `[admission]` verdict line are **emitted, never read**.
+`logAdmissionDecision` derives its verdict from the same `AdmissionBill` the
+guard acts on, so off the gate it prints `reclaimable=0 MB` and the arm it
+names is a93e2c0's reject — a true statement about a bill whose credits the
+gate dropped. No decision keys on either line.
+
+### Two ungated costs gate 4 leaves behind
+
+Recorded because they are real and unmeasured, not because they are wrong:
+
+1. **The 400's text** — closed by row 14 above.
+2. **Publishing machinery every ungated arch pays for and never reads.**
+   `publishHotCacheResidency` calls `publishHotCacheDigests`, which allocates
+   and takes `digest_mu` on every commit, eviction, invalidation and model
+   switch; and `prefillAdmissionBill` calls `reclaimableHotCacheBytesFor` **per
+   request on the connection thread**, hashing the prompt under the same mutex
+   — then discards the result at the ungated return. a93e2c0 had none of it. No
+   correctness impact: the two scalars are the class-A use-after-free fix and
+   must stay. The DIGEST half arguably belongs inside the gate; left as-is this
+   round because moving it is a threading change, not a text change, and it
+   owes a measurement of its own.
+
+**A coupling worth stating:** gate 4's ungated identity rests on gate 1 holding.
+`needed` reduces to a93e2c0's expression only because the reservation is zeroed
+(`generate.reservedPrefillTokens`) and `checkAttentionMemory` passes a cold
+`.{}` warm prefix. Break gate 1 and gate 4's arm stops being a93e2c0's.
+
+### Sweep extension: aad0315 → f3f0a25
+
+| commit | site | class | note |
+|---|---|---|---|
+| `c7f0657` | ONE error mapping for streaming and non-streaming (`mapGenerationError` / `sendGenerationError`) | **A** | a streaming fault answered differently from the same non-streaming fault. `mapGenerationError` is the one classifier and `sendGenerationError` the one emitter, so a surface cannot answer twice. Pinned by `a streaming fault answers with the SAME mapped error a non-streaming one does` |
+| `035da33` | a latched MLX failure ends the request, never a 200 (`publishSlotTerminator`) | **A** | `publishSlotTerminator` is the ONE publisher and it reads the latch BEFORE it publishes, so no path can end a latched request with a success terminator. `peekErrorName names the class WITHOUT consuming the latch`, `a finish over a latched MLX failure ends the request as an ERROR, never a 200`, `the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher` |
+| `db9fa58` | `DiskTier.deinit` lifts the writer pause before `w.drain()` | **A** | a paused background writer deadlocked `zig build test` (the B-A1 hang this branch reproduced on aad0315). `DiskTier: deinit RETURNS with the writer paused, and lands what was queued`, `every test that PAUSES the background writer owes a deferred unpause`, `kv_disk_writer: a PAUSED writer deinits without blocking` |
+| `8959c78` | the post-eviction re-ask is the width that runs, in both directions | **C, already gated** | `postEvictionPrefillChunk` runs only where there IS a per-request width, i.e. behind `perRequestPrefillChunk` — which A-1 now routes through `longCtxGated()`. `the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width` |
+| `124f19d` | the warm KV credit fires only where the restore CHECKS OUT its entry (B-A3) | **C, subsumed** | `WarmPrefix.will_donate` gates `creditedRows`; off qwen4_exp the credit is already zero because `prefillRequestTerms` returns `.{}` (gate 4). The two compose — the fold's fix tightens the gated arm, this branch removes the ungated one |
+| `e59e259` | one round-cost `Layout` resolver (`layoutFor`, `migrateLegacy`) | **D** | `layoutFor` is the single resolver and `Layout.legacy` keeps a sidecar pack booting warm off the `rc1` file 26.9.1 wrote. `migrateLegacy` lifts a six-bucket table onto the long grid behind `if (layout != .long) return null;`, so a sidecar pack's `rc1` file is read in place and never rewritten. Verified gated, not assumed: `layoutFor is THE round-cost layout resolver`, `every round-cost layout assignment routes through the ONE resolver` |
+
+### The round-cost / planner cluster — class D, verified
+
+The adaptive MTP width/depth planner, the EV cost profiles and the persisted
+round-cost table do not reach a non-qwen4 arch's behaviour: the adaptive-serial
+block is behind `mtpAdaptiveArchEligible`, `MtpCostProfile` falls back to
+`generic`/cap-6 for any unmeasured fingerprint, and the table's on-disk layout
+is resolved by the ONE `layoutFor` with `.legacy` preserving the `rc1` file a
+sidecar pack (the qwen3_5 27B) already has. The 27B's SIDECAR MTP head
+therefore boots warm off its existing table rather than re-measuring — which is
+the property that would otherwise have been a silent first-request regression
+on that pack.
+
+### The rule this leaves
+
+A "qwen4_exp long-context" change that touches a shared function is a
+cross-arch change until a predicate says otherwise. The predicate is
+`ModelConfig.longCtxGated()`, it has ONE body, and a site that cannot see a
+ModelConfig mirrors it ONCE into a field at wiring time
+(`HotPrefixCache.cp_thin`, the `qsa_history_required` pattern) and
+is scan-pinned to it.

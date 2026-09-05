@@ -715,3 +715,378 @@ test "wired fit target: zero headroom, clamped, declines empty" {
     try t.expectEqual(@as(?usize, null), wiredFitTarget(0, 64 << 20, 115 * gb));
     try t.expectEqual(@as(?usize, null), wiredFitTarget(10 * gb, 64 << 20, 0));
 }
+
+// ── mlx-c error latch: an MLX failure is an ERROR, never `exit(-1)` ──
+//
+// mlx-c's DEFAULT error handler is
+//
+//     static void mlx_error_handler_default_(const char* msg, void* data) {
+//       printf("MLX error: %s\n", msg);
+//       exit(-1);
+//     }
+//
+// (`lib/mlxc-src/mlx/c/error.cpp`), installed unless someone calls
+// `mlx_set_error_handler`. Every mlx-c entry point is
+// `try { ... } catch (std::exception& e) { mlx_error(e.what()); return 1; }`,
+// so an MLX exception is CAUGHT at the C boundary and then the process is
+// killed by the handler before the `return 1` ever reaches us.
+//
+// That is what a Metal working-set OOM looks like from the outside: mlx
+// 0.32.2 stores a failed command buffer's status in `CommandEncoder::error_`
+// and re-throws it from `synchronize()`/`get_command_encoder()`
+// (`lib/mlx-src/mlx/backend/metal/device.cpp:564-579`), a stream thread's
+// exception is captured into `StreamThread::error` and re-thrown on the main
+// thread at the next enqueue (`lib/mlx-src/mlx/scheduler.cpp:77-79,99-112`),
+// and mlx-c catches it — the live 458,832-token report's
+// "…Insufficient Memory… at transforms.cpp:15" is `_mlx_error`'s own
+// " at %s:%d" suffix naming `mlx/c/transforms.cpp`, i.e. `mlx_eval`. The
+// death was ours to prevent, not Metal's to inflict (issue #353).
+//
+// So: install a handler that LATCHES the message and returns. The mlx-c call
+// then returns 1 as designed, and the engine turns the latch into a named
+// error at its next checkpoint. mlx clears its own error state when it
+// throws (`Error::check` exchanges the message out), so the process stays
+// serviceable for the next request.
+var mlx_error_latched = std.atomic.Value(bool).init(false);
+var mlx_error_buf: [512]u8 = undefined;
+var mlx_error_len: usize = 0;
+/// A pthread mutex, not `std.Io.Mutex`, for `log.zig`'s reason and one more:
+/// mlx-c calls the handler from whatever thread raised — an MLX stream thread
+/// included — and none of them carry an `Io` handle.
+var mlx_error_mtx: std.c.pthread_mutex_t = .{};
+fn lockErrBuf() void {
+    _ = std.c.pthread_mutex_lock(&mlx_error_mtx);
+}
+fn unlockErrBuf() void {
+    _ = std.c.pthread_mutex_unlock(&mlx_error_mtx);
+}
+
+/// Classification of a latched mlx-c message. Memory failures must reach the
+/// client as a memory 503 (`ModelRegistry.loadErrorFromName` keeps BOTH
+/// `error.OutOfMemory` and `error.InsufficientMemory` in that class), so the
+/// spelling of the failure decides the error we raise. Every MLX allocation
+/// failure and every Metal command-buffer OOM lands in one of these:
+///
+///   * "[METAL] Command buffer execution failed: Insufficient Memory …"
+///     — the working-set abort this latch exists for;
+///   * "[malloc] Unable to allocate N bytes." / "[metal::malloc] …" —
+///     `MetalAllocator::malloc`'s own throws;
+///   * "[metal::malloc] Resource limit (N) exceeded." — buffer-count wall,
+///     which is a memory condition from the operator's side too.
+pub fn mlxErrorIsMemory(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "Insufficient Memory",
+        "insufficient memory",
+        "Unable to allocate",
+        "Resource limit",
+        "out of memory",
+        "Out of memory",
+        "maximum allowed buffer size",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const span = std.mem.span(msg);
+    lockErrBuf();
+    defer unlockErrBuf();
+    // FIRST error wins: mlx preserves the earliest error for the same reason
+    // (a poisoned stream produces follow-on noise that hides the cause).
+    if (!mlx_error_latched.load(.acquire)) {
+        const n = @min(span.len, mlx_error_buf.len);
+        @memcpy(mlx_error_buf[0..n], span[0..n]);
+        mlx_error_len = n;
+        mlx_error_latched.store(true, .release);
+    }
+    log.err("[mlx] {s}\n", .{span});
+}
+
+/// Install the latching handler. Called ONCE from `main()`, next to
+/// `server.applyMlxCacheLimit`, for the same reason: a per-path install is how
+/// a mode ends up silently keeping the old behaviour.
+///
+/// `MLX_SERVE_MLX_ERROR_LATCH=0` restores mlx-c's `exit(-1)` handler for
+/// same-boot A/Bs and for anyone who would rather have a core than a 503.
+pub fn installErrorHandler() void {
+    if (std.c.getenv("MLX_SERVE_MLX_ERROR_LATCH")) |p| {
+        if (std.mem.eql(u8, std.mem.span(p), "0")) {
+            log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
+            return;
+        }
+    }
+    mlx_set_error_handler(latchMlxError, null, null);
+}
+
+/// True when an MLX call has failed since the last `takeError`.
+pub fn errorPending() bool {
+    return mlx_error_latched.load(.acquire);
+}
+
+/// PEEK the latch WITHOUT consuming it: the NAME of the Zig error a
+/// `checkError`/`checkErrorDecode` call would raise right now, or null when
+/// nothing is latched. The names are `@errorName`'s own, so
+/// `scheduler.Slot.errorNameIsMemory` classifies a peeked failure exactly as
+/// it classifies a consumed one and the client still gets the memory 503.
+///
+/// It exists because a slot FINISH must not answer 200 over a forward that
+/// failed (external review of PR #363, item 3) and yet must not STEAL the
+/// latch from the decode-tick wrapper, whose job is to fail every OTHER slot
+/// in a batched group from that same failure. Peek here, mark this slot, let
+/// the wrapper consume.
+pub fn peekErrorName() ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return if (mlxErrorIsMemory(mlx_error_buf[0..mlx_error_len])) "OutOfMemory" else "MlxFailure";
+}
+
+/// Consume the latched message into `buf`, clearing the latch. Returns null
+/// when nothing is latched. The message is COPIED so the caller can format it
+/// after another MLX call has run.
+pub fn takeError(buf: []u8) ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const n = @min(mlx_error_len, buf.len);
+    @memcpy(buf[0..n], mlx_error_buf[0..n]);
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return buf[0..n];
+}
+
+/// One-shot fault injection AT the engine's checkpoint, for builds that are
+/// not test builds — `fault.arm` above is `builtin.is_test`-only and the
+/// invariant this proves ("an MLX error costs one REQUEST, not the server")
+/// can only be observed end to end, with a real model behind a real socket.
+///
+/// `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal working-set OOM
+/// at the n-th `checkError` of the process and then disarms itself, so the
+/// NEXT request runs clean and the test can assert both halves. Absent or `0`
+/// = off (`diagEnvOn` discipline: an env read with `getenv != null` is armed
+/// by `=0`). Resolved once; the armed path costs one relaxed load per prefill
+/// chunk.
+const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";
+const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_STEP). at transforms.cpp:15";
+
+/// One armed, self-disarming injector. Two instances: one for the prefill
+/// chunk checkpoint, one for the decode step checkpoint — separate counters
+/// because a test that wants to fail the 3rd DECODE step must not have its
+/// count consumed by the prefill's chunks.
+const FaultSite = struct {
+    env: [:0]const u8,
+    msg: [:0]const u8,
+    at: ?u64 = null,
+    seen: u64 = 0,
+
+    fn target(self: *FaultSite) u64 {
+        if (self.at) |v| return v;
+        var v: u64 = 0;
+        if (std.c.getenv(self.env.ptr)) |pz| {
+            v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
+        }
+        self.at = v;
+        if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ self.env, v });
+        return v;
+    }
+
+    /// Latch this site's message on the n-th call, then disarm — one boot
+    /// exercises both the failure and the recovery.
+    fn maybeFire(self: *FaultSite) void {
+        const t = self.target();
+        if (t == 0) return;
+        self.seen += 1;
+        if (self.seen != t) return;
+        self.at = 0;
+        latchErrorForTest(self.msg);
+    }
+
+    fn reset(self: *FaultSite) void {
+        self.at = null;
+        self.seen = 0;
+    }
+};
+
+var fault_chunk = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_CHUNK", .msg = FAULT_CHUNK_MSG };
+var fault_step = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_STEP", .msg = FAULT_STEP_MSG };
+
+/// Consume a latched MLX failure as a Zig error: `error.OutOfMemory` for the
+/// memory class (named memory 503), `error.MlxFailure` for everything else.
+/// Zero cost when nothing is latched — one acquire load.
+fn consumeLatch() !void {
+    if (!mlx_error_latched.load(.acquire)) return;
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return;
+    if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
+    return error.MlxFailure;
+}
+
+/// PREFILL checkpoint: called once per chunk plus once after the last.
+pub fn checkError() !void {
+    fault_chunk.maybeFire();
+    return consumeLatch();
+}
+
+/// DECODE checkpoint: called once per decode tick, after the tick's forward.
+/// A separate entry point ONLY so the two injectors count separately — a
+/// decode-time failure is the same latch and the same errors.
+///
+/// It exists at all because a prefill-only check attributes nothing: a decode
+/// forward that failed left the slot emitting tokens sampled from unwritten
+/// buffers, the request finished 200 with garbage, and the latch was handed
+/// to the NEXT request's first prefill chunk as ITS 503 (#353 follow-up).
+pub fn checkErrorDecode() !void {
+    fault_step.maybeFire();
+    return consumeLatch();
+}
+
+/// Latch a message as if mlx-c had raised it. Tests call it directly; the
+/// `MLX_SERVE_MLX_FAULT_CHUNK` injector above calls it once.
+pub fn latchErrorForTest(msg: [:0]const u8) void {
+    latchMlxError(msg.ptr, null);
+}
+
+/// TEST-ONLY reset so one test's injector state cannot leak into another.
+pub fn resetFaultChunkForTest() void {
+    fault_chunk.reset();
+    fault_step.reset();
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+}
+
+test "an MLX memory failure is classified as a memory error, an argument error is not" {
+    const t = std.testing;
+    // The exact strings mlx produces for the two OOM shapes issue #353 hit.
+    try t.expect(mlxErrorIsMemory("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:15"));
+    try t.expect(mlxErrorIsMemory("[malloc] Unable to allocate 8589934592 bytes."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Resource limit (128000) exceeded."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Attempting to allocate 99 bytes which is greater than the maximum allowed buffer size of 5 bytes."));
+    // A shape/argument bug must NOT be reported to the client as "out of
+    // memory" — it is a 500-class engine fault, not something the operator
+    // fixes by shortening the prompt.
+    try t.expect(!mlxErrorIsMemory("[slice_update] Invalid slice sizes."));
+    try t.expect(!mlxErrorIsMemory("[matmul] Last dimension of first input must match."));
+}
+
+test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
+    const t = std.testing;
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expect(errorPending());
+    // FIRST error wins — a poisoned stream's follow-on noise must not rename
+    // the cause.
+    latchErrorForTest("[slice_update] Invalid slice sizes.");
+    try t.expectError(error.OutOfMemory, checkError());
+    // Consumed: the next request starts clean, which is the whole point of
+    // not exiting.
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!errorPending());
+}
+
+test "the injected MLX error costs ONE checkError and the engine keeps working after it" {
+    const t = std.testing;
+    // The invariant behind issue #353, at the level a hermetic test can reach:
+    // an MLX failure is consumed EXACTLY once, and everything after it runs.
+    // The end-to-end half of it — a 503 for the failing request and a 200 for
+    // the next one on the same server — needs a real model behind a real
+    // socket, which is why the injector below is also reachable in a release
+    // build through `MLX_SERVE_MLX_FAULT_CHUNK` and pinned by
+    // `tests/test_mlx_error_recovery.sh`.
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    // Chunk 1 and 2 of a prefill: clean.
+    try checkError();
+    try checkError();
+
+    // Chunk 3 fails, the way the Metal working-set abort does.
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkError());
+
+    // And the process is still an engine: the latch is clear, the next
+    // prefill's chunks pass, and MLX itself still evaluates. (Before the
+    // handler was installed there was no "after" — mlx-c called exit(-1).)
+    try t.expect(!errorPending());
+    try checkError();
+    const s = gpuStream();
+    const shape = [_]c_int{2};
+    const data = [_]f32{ 1.5, 2.5 };
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    var sum = mlx_array_new();
+    defer _ = mlx_array_free(sum);
+    try t.expectEqual(@as(c_int, 0), mlx_sum(&sum, a, false, s));
+    _ = mlx_array_eval(sum);
+    var out: f32 = 0;
+    _ = mlx_array_item_float32(&out, sum);
+    try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
+    try checkError();
+}
+
+test "peekErrorName names the class WITHOUT consuming the latch" {
+    const t = std.testing;
+    // The slot-finish guard (external review of PR #363, item 3) has to know
+    // whether the last forward failed before it publishes a terminator, and
+    // has to leave the latch for the tick wrapper that fails the rest of a
+    // batched group from the same failure. Consuming here would answer this
+    // slot correctly and let its siblings finish 200 on the same dead buffers.
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    // Same name the consuming path raises, so the memory classification (and
+    // with it the 503) survives the peek.
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    // ...and the latch is STILL there, twice over.
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expect(errorPending());
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+
+    // A shape bug is not a memory failure and must not be reported as one.
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("MlxFailure", peekErrorName().?);
+    try t.expectError(error.MlxFailure, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+}
+
+test "a DECODE-time MLX failure is attributed to the decoding request, not the next one" {
+    const t = std.testing;
+    // The third defect of the #353 branch: `checkError` was consumed ONLY by
+    // the prefill chunk loop. A decode forward that failed left the slot
+    // sampling from buffers Metal never wrote — the request finished 200 with
+    // garbage — and the latch waited for the NEXT request's first prefill
+    // chunk, which answered 503 for a failure that was not its own. Two wrong
+    // answers from one error.
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    // Both checkpoints read the SAME latch: whichever runs first consumes it.
+    try checkError();
+    try checkErrorDecode();
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(!errorPending());
+    // Consumed by decode means the next prefill is clean — that is the whole
+    // point of attributing it where it happened.
+    try checkError();
+
+    // The two injectors count SEPARATELY: a test that wants to fail the n-th
+    // decode step must not have its count eaten by the prefill's chunks.
+    // (Neither is armed here, so both are inert and this asserts the shape.)
+    try checkError();
+    try checkError();
+    try checkErrorDecode();
+    try t.expect(!errorPending());
+}

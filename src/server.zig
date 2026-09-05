@@ -4,6 +4,7 @@ const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const mtp_mod = @import("mtp.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -243,6 +244,14 @@ pub const Conn = struct {
     /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
     /// `sendResponse` / `sendAnthropicEvent` chokepoints.
     ws_mode: ?*WsBridge = null,
+    /// True once this connection has written a `text/event-stream` response
+    /// head. The status line is spent from that moment, so a generation
+    /// failure past it can only be an SSE `error` EVENT — before it, the
+    /// streaming surfaces answer with the same HTTP status a non-streaming
+    /// request would have got (`sendGenerationError`). Set in exactly one
+    /// place (`sendSseHeaders`, scan-pinned); never cleared, because every SSE
+    /// head this server writes carries `Connection: close`.
+    sse_headers_sent: bool = false,
     /// Non-null while an Ollama /api/* handler runs an inner /v1 handler:
     /// every write the inner handler makes is fed to the sink (SSE → NDJSON
     /// re-framing) instead of the socket. The sink writes its translated
@@ -257,6 +266,7 @@ pub const Conn = struct {
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.ollama_sink = null;
+        c.sse_headers_sent = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -538,6 +548,27 @@ fn mtpCapable(lm: *LoadedModel) bool {
     return lm.mtp != null or dsv4DraftStages(lm);
 }
 
+/// `--max-mtp-ctx` admission: MTP is refused for a request whose prompt is
+/// past the operator's context ceiling. The ONE place this runs, called on
+/// every request surface once the prompt is tokenized (the count is not known
+/// where `enable_mtp` is parsed, and the ceiling is about TOKENS) and before
+/// the value reaches either dispatch. That placement also makes it apply to
+/// stream and non-stream alike from a single site per surface.
+///
+/// The ceiling is a MACHINE limit, not a request preference, so it outranks an
+/// explicit `enable_mtp:true` in the body — hence a gate on the resolved value
+/// rather than another conjunct in `defaultEnableMtp`, which only answers for
+/// requests that OMITTED the field.
+///
+/// MTP only: PLD, the Gemma drafter and DFlash/DSpark are untouched.
+fn admitMtpForCtx(enable_mtp: bool, prompt_tokens: usize) bool {
+    if (!enable_mtp) return false;
+    const max = generate_mod.max_mtp_ctx;
+    if (mtp_mod.mtpCtxWithinLimit(max, prompt_tokens)) return true;
+    log.info("  mtp=off (ctx {d} > --max-mtp-ctx {d})\n", .{ prompt_tokens, max });
+    return false;
+}
+
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
 /// from an explicit value, for fields whose default comes from the
 /// resolution chain above.
@@ -745,6 +776,49 @@ pub var prefix_cache_capacity: u32 = 32;
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
+
+/// What the hot cache was ACTUALLY given for the model that is loaded, after
+/// `clampedPrefixCacheMem`. Published by `prefixCacheMemForLoad`; every
+/// post-load reserve reads it through `resolvedPrefixCacheMem()` so the sizer,
+/// the ANE gate and the cache itself all reserve ONE number. Kept separate
+/// from the ask above rather than overwriting it: the ask is the launch flag,
+/// and re-clamping an already-clamped value on the next model load would
+/// ratchet the budget toward 1 byte across a model swap. 0 = no load has
+/// resolved it yet, in which case the ask is the honest (larger) reserve.
+/// ATOMIC because the writer and the readers are different threads (audit S5):
+/// written on the INFERENCE thread by `prefixCacheMemForLoad`, read from
+/// CONNECTION threads through `computeMemoryContext` (via `pinAutoContext` on
+/// an on-demand load, and via `/props` -> `computeMaxSafeContext`). Same rule
+/// the sibling counters already follow — `resident_hot_cache_bytes` and
+/// `reclaimable_hot_cache_bytes` are `std.atomic.Value(u64)` for exactly this.
+/// An aligned u64 will not tear on arm64, so the practical hazard is the
+/// compiler caching or reordering the read, not a torn value.
+///
+/// `maxInt(u64)` is the UNRESOLVED sentinel, not 0: `--prefix-cache-mem 0`
+/// with an SSD-first budget legitimately publishes a resolved ZERO, and a
+/// `> 0` test then fell back to the raw ask and printed a boot line claiming
+/// a 2048 MB cap for a cache whose real cap was `ctx_kv` (audit N2).
+const HOT_CACHE_MEM_UNRESOLVED: u64 = std.math.maxInt(u64);
+var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED);
+
+/// The hot-cache byte budget every post-load reserve must bill: the clamp's
+/// answer once a model is loaded, the raw ask before that.
+pub fn resolvedPrefixCacheMem() u64 {
+    const v = hot_cache_mem_resolved.load(.monotonic);
+    return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
+}
+
+/// Publish the clamp's answer. Called on the inference thread at the end of a
+/// load; `clearResolvedPrefixCacheMem` puts it back to the sentinel on unload
+/// so the NEXT model does not inherit this one's budget (the budget is
+/// per-model, the global is process-wide — audit S5, second half).
+pub fn publishResolvedPrefixCacheMem(v: u64) void {
+    hot_cache_mem_resolved.store(v, .monotonic);
+}
+
+pub fn clearResolvedPrefixCacheMem() void {
+    hot_cache_mem_resolved.store(HOT_CACHE_MEM_UNRESOLVED, .monotonic);
+}
 
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
 /// prefixes persist as chunked safetensors under
@@ -1213,6 +1287,31 @@ pub fn serve(
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    // The inference thread's evict-or-refuse hook (issue #353). Installed
+    // beside `global_scheduler` because it answers with the same estimator
+    // this module owns, and the scheduler deliberately has no server import.
+    scheduler_mod.prefill_admission_fits = &prefillFitsNow;
+    defer scheduler_mod.prefill_admission_fits = null;
+    scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;
+    defer scheduler_mod.prefill_request_chunk = null;
+    // The published budget is per MODEL; the global is process-wide. Retire it
+    // whenever the scheduler drops the resident cache (audit S5/S7).
+    scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefixCacheMem;
+    defer scheduler_mod.hot_cache_budget_invalidate = null;
+    scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
+    defer scheduler_mod.prefill_admission_refused_log = null;
+    // Fourth of the family, and the only one the PREFILL LOOP asks rather
+    // than the scheduler: the width of the next chunk, re-priced at every
+    // boundary by the same estimator.
+    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
+    defer scheduler_mod.prefill_chunk_adapt = null;
+    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
+    defer scheduler_mod.prefill_chunk_widen_ok = null;
+    // Fifth: whether the fourth can move anything for a given model. The four
+    // installs above are process-wide and unconditional, so NONE of their
+    // presences is an arch gate — this is (audit B-A2).
+    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
+    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -1250,8 +1349,8 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (prefix_cache_mem_bytes > 0) {
-            const cap_mb = @as(f64, @floatFromInt(prefix_cache_mem_bytes)) / (1024.0 * 1024.0);
+        if (resolvedPrefixCacheMem() > 0) {
+            const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
@@ -1384,6 +1483,9 @@ pub fn serve(
     }
     if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
+    }
+    if (generate_mod.max_mtp_ctx != 0) {
+        log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     if (g_api_key != null) {
@@ -2515,10 +2617,22 @@ fn safeAutoContext(raw: u32) u32 {
 /// a YaRN-scaled checkpoint — the same derivation vLLM applies to
 /// `max_model_len`, because a position past the scaled window aliases back
 /// inside the ramp rather than reading as a longer distance.
+/// PURE: the context the server ADVERTISES, from the largest context memory
+/// alone allows. The margin applies to the MEMORY number and the checkpoint cap
+/// is taken afterwards, un-margined — see `safeAutoContext`.
+///
+/// Extracted so the LOAD-TIME session bill and the boot-time sizer cannot spell
+/// the same relation two ways. `resolvedContextForLoad` bills the session the
+/// hot-cache budget floor is built for and `autoContextFor` publishes the one an
+/// agent CLI reads out of `/v1/models`; those are the same session, so they are
+/// the same expression over the same inputs, in one place.
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
+    const with_headroom = safeAutoContext(memory_ctx);
+    return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
+}
+
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    const with_headroom = safeAutoContext(computeMemoryContext(config));
-    const max_pos = config.contextCap();
-    return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
+    return autoContextFrom(computeMemoryContext(config), config.contextCap());
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -2657,6 +2771,25 @@ pub fn applyMlxCacheLimit() void {
 /// regression), while external pressure — reflected in `getAvailableMemBytes`
 /// (total − wired − compressed − internal-anon) — tightens it. See
 /// `physicalMemoryCeiling`.
+/// The ceiling term that does NOT move with instantaneous free RAM: Metal's
+/// `max_recommended_working_set_size` (or the wired limit behind
+/// `getMetalBufferLimit`). The static half of `currentGpuMemoryCeiling`.
+///
+/// The LOAD-TIME hot-cache clamp bills against this, and nothing else does.
+/// Measured 2026-09-05: identical binary, flags and wired limit, two boots 11
+/// minutes apart, resolved `10240 -> 1076 MB` (13:42, straight after two
+/// suites) and `10240 -> 9757 MB` (13:53, quiet box) — `[preflight] available`
+/// 108.7 vs 116.6 GB. The live free-RAM term made the deployed shape
+/// non-reproducible boot to boot, and what the user needs is one boot that
+/// works. The free-RAM term still does its job where it can act on the answer:
+/// request-time admission (`prefillAdmissionBill` / `prefillFitsNow`, which
+/// re-reads live memory and can evict to admit) and the `active_mem` guards.
+/// A cache sized above what free RAM allows is not a crash — it is entries the
+/// admission pass evicts on the first request that needs the room.
+pub fn staticGpuMemoryCeiling() u64 {
+    return getGpuWorkingSetLimit();
+}
+
 fn currentGpuMemoryCeiling(active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
@@ -2757,8 +2890,36 @@ fn defaultKvBits() u64 {
 /// Same estimator as the admission guard with the KV term zeroed, because the
 /// KV cache is exactly what the sizer is solving for.
 pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    return prefillTransientReserveAtKv(config, kv_bits, chunk, chunk);
+}
+
+/// PURE: `prefillTransientReserve` with the KV length made EXPLICIT.
+///
+/// The load-time sizer has no KV yet, so it asks at `kv = chunk` and the
+/// wrapper above is exactly that case — byte-identical, and every existing
+/// caller keeps its number. A per-CHUNK decision does have a KV, and two terms
+/// of this bill are linear in it: the attention score sheet
+/// (`prefillAttnKeys`) and the QSA mask/score bytes. Past the indexer budget
+/// `qsaScoreRowsPerChunk` saturates, so `qsaPrefillTransientBytes` returns
+/// roughly the whole sheet budget rather than the tiny `fwd x nb` product a
+/// chunk-length KV implies — ~0.5 GB under-billed per decision at the default
+/// 256 MB sheet, ~9 GB with `MLX_SERVE_QSA_SCORE_SHEET_MB=4096`. Deciding a
+/// WIDEN against that number is deciding against a bill the forward will not
+/// honour, and a Metal working-set abort is uncatchable.
+///
+/// This is the admission bill's own input rule applied one level down: one
+/// estimator means one set of INPUTS too. `prefillNeededAtChunk` has always
+/// passed the real `seq` here; this is the same argument, spelled for a caller
+/// that is mid-prefill.
+pub fn prefillTransientReserveAtKv(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    chunk: u64,
+    kv_len: u64,
+) u64 {
+    const seq: u64 = @max(kv_len, chunk);
     return prefillMemoryNeeded(
-        chunk,
+        seq,
         config.num_attention_heads,
         config.num_key_value_heads,
         0,
@@ -2768,10 +2929,11 @@ pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u6
         prefillFfnWidth(config),
         kv_bits,
         chunk,
-        config.prefillAttnKeys(chunk),
+        config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-    ) + qsaMaskBytes(config, chunk, chunk);
+        .{},
+    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
@@ -2815,8 +2977,21 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
         ane_mod.MIN_CONTEXT_TOKENS;
     return ane_mod.GATE_BASELINE_BYTES +|
         (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
-        prefix_cache_mem_bytes +|
+        resolvedPrefixCacheMem() +|
         prefillTransientReserve(config, kv_bits, chunk);
+}
+
+var ctx_bar_cached: ?bool = null;
+
+/// `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` restores the share-only rung cap.
+pub fn ctxBarEnabled() bool {
+    if (ctx_bar_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_CTX_BAR") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    ctx_bar_cached = v;
+    return v;
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -2829,6 +3004,17 @@ pub const PREFILL_CHUNK_LADDER = [_]u32{ 8192, 4096, 2048, 1024, 512 };
 /// trading the whole session's context for one forward's speed, which is the
 /// trade that reported a 1024-token context on a 16 GB Mac.
 const PREFILL_RESERVE_BUDGET_SHARE: u64 = 4;
+
+/// The hot prefix cache's smallest USEFUL budget. One agentic prefix on a
+/// large model is order-GB of KV, so below this the cache cannot retain a
+/// single turn and the feature is dead weight — a prefill chunk that would
+/// price the cache under this steps down instead of taking the bytes.
+///
+/// This is what stops `requested == 0` ("no byte cap") from resolving to the
+/// 1-byte floor `clampedPrefixCacheMem` returns when the headroom is gone: the
+/// clamp cannot defend a budget the chunk has already spent, so the defence
+/// belongs one step earlier, in the sizer.
+const HOT_CACHE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// PURE: the widest prefill chunk THIS machine can afford for THIS model.
 ///
@@ -2844,16 +3030,90 @@ const PREFILL_RESERVE_BUDGET_SHARE: u64 = 4;
 ///
 /// Never raises anything: `effectivePrefillChunk` takes the MIN of this and the
 /// launch chunk, and an explicit `--prefill-chunk` outranks it entirely.
+///
+/// It does NOT read the hot-cache ASK, and must not. The clamp downstream
+/// (`clampedPrefixCacheMem`) subtracts THIS chunk's reserve from the cache's
+/// headroom, so feeding the ask back in here closed a loop that was
+/// non-monotone in the ask: a bigger `--prefix-cache-mem` stepped the chunk
+/// DOWN, which shrank the reserve, which handed the cache MORE bytes than a
+/// smaller ask got (live: 10 GB clamped to 3873 MB, 24 GB to 5703 MB, same
+/// box, same pack). The order is one-way now — the chunk is sized against the
+/// post-weights serving budget alone, and the cache is the RESIDUAL claimant
+/// that takes what the chunk leaves. So the quarter-share bar prices the whole
+/// serving budget rather than a post-cache remainder: pre-charging the cache
+/// here and charging the chunk to the cache there is the same bytes billed
+/// twice, in a circle.
+///
+/// `ctx_kv_bytes` is the KV a PINNED context has already spoken for (0 under
+/// auto-context, which is derived FROM this chunk and adapts to it — reading a
+/// context that does not exist yet would be circular). It is ask-independent,
+/// so it cannot reintroduce the loop above; what it buys is the second half of
+/// the same bug: at `--ctx-size 1048576` the context alone takes 20.2 GB of a
+/// 28.2 GB serving budget, and a rung sized against the quarter share of the
+/// WHOLE budget then spends the remaining 8 GB on one forward and leaves the
+/// cache at the clamp's 1-byte floor.
+/// PURE: the byte cap ONE prefill forward's transient may claim, and the ONE
+/// place PR #363's two changes to the chunk sizer are gated by architecture.
+///
+/// a93e2c0 sized the rung against `ceiling - active_mem - hot_cache_ask`, a
+/// quarter share. PR #363 changed BOTH halves for every arch at once:
+///
+///   1. it dropped the hot-cache ASK from the budget (which WIDENS the rung),
+///      because feeding the ask in here closed a loop that was non-monotone in
+///      the ask — a bigger `--prefix-cache-mem` stepped the chunk DOWN, which
+///      shrank the reserve, which handed the cache MORE bytes than a smaller
+///      ask got (live: 10 GB clamped to 3873 MB, 24 GB to 5703 MB, same box);
+///   2. it added the ctx bar, `(budget - ctx_kv) - HOT_CACHE_FLOOR_BYTES`,
+///      which can only ever NARROW, and on a dense model with a large
+///      `--ctx-size` pins chunk 512 for the life of the process.
+///
+/// Both are real, and both were measured on qwen4_exp at 1M context. Neither
+/// was measured on anything else, and together they move the prefill width —
+/// the biggest multiplier in the whole memory bill — on every arch. So they
+/// arrive together, behind `ModelConfig.longCtxGated()`, and every other arch
+/// takes a93e2c0's arithmetic byte for byte. The non-monotone ask loop is a
+/// known defect on the ungated arm; it is the defect a93e2c0 shipped, and
+/// unwinding it belongs to a change that measures the archs it touches.
+///
+/// `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` still drops bar 2 inside the gate.
+pub fn prefillChunkCap(
+    config: *const model_mod.ModelConfig,
+    ceiling: u64,
+    active_mem: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
+) u64 {
+    if (!config.longCtxGated()) {
+        // a93e2c0, verbatim: the ask is spoken for, and a quarter of what is
+        // left is the whole cap.
+        const spoken_for: u64 = active_mem +| hot_cache_ask;
+        return (ceiling -| spoken_for) / PREFILL_RESERVE_BUDGET_SHARE;
+    }
+    const serving_budget: u64 = ceiling -| active_mem;
+    // Two ask-independent bars, both of which the rung must clear: a share of
+    // the serving budget (one forward never trades the whole session for its
+    // own speed), and whatever the pinned context leaves, less a cache worth
+    // having.
+    const share_bar: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
+    // The ctx bar can only ever narrow (audit S9). `--ctx-size` is a CAP, not
+    // an allocation — the KV reservation itself deliberately refuses to
+    // pre-buy the whole window — so billing the entire configured context here
+    // can pin chunk 512 for the life of a process. `MLX_SERVE_PREFILL_CHUNK_-
+    // CTX_BAR=0` restores the share-only cap, and the narrowing is LOGGED
+    // rather than silent.
+    const ctx_bar: u64 = if (ctxBarEnabled()) (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES else share_bar;
+    return @min(share_bar, ctx_bar);
+}
+
 pub fn resolvePrefillChunk(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
     ceiling: u64,
     active_mem: u64,
-    hot_cache_reserve: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
 ) u32 {
-    const spoken_for: u64 = active_mem +| hot_cache_reserve;
-    const serving_budget: u64 = if (ceiling > spoken_for) ceiling - spoken_for else 0;
-    const cap: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
+    const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
@@ -2861,6 +3121,58 @@ pub fn resolvePrefillChunk(
     // rung: it is the smallest bill this box can be asked for, and returning 0
     // would read as "not pinned" and hand the forward the launch width.
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
+/// The width `--prefill-chunk` asked for, or 0 when the operator asked for
+/// nothing. `generate.effectivePrefillChunk` lets an explicit flag outrank the
+/// machine-sized pin, so the BILL has to let it outrank the pin too: without
+/// this, `--prefill-chunk 4096` ran a 4096-token forward while the hot-cache
+/// clamp had reserved a 512- or 1024-token transient — an under-reserve of
+/// several GB, and the memory the clamp is there to protect.
+pub fn explicitPrefillChunk() u32 {
+    // `MLX_SERVE_PREFILL_CHUNK` outranks EVERYTHING in
+    // `generate.effectivePrefillChunk` — it returns the env width before it
+    // even looks at the pin — so a bill that only knew about the CLI flag
+    // described the machine-sized rung while every forward ran the env width
+    // (audit S8). With `MLX_SERVE_PREFILL_CHUNK=8192` on any arch that
+    // over-granted the hot-cache budget by several GB, which is the exact bug
+    // this function was added to close for `--prefill-chunk`.
+    //
+    // The env value is unbounded at its source, so it is clamped here rather
+    // than `@intCast` on trust (audit N4: a value past 4 Gi is ReleaseFast UB).
+    const env_w: usize = @min(generate_mod.envPrefillChunk(), @as(usize, std.math.maxInt(u32)));
+    if (env_w > 0) return @intCast(env_w);
+    if (!generate_mod.prefill_chunk_explicit) return 0;
+    const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
+    return @intCast(raw);
+}
+
+/// PURE: the chunk this model is BILLED at — and therefore the chunk it runs
+/// at. `chunk_override` (0 = none) is the operator's explicit width, mirroring
+/// `generate.effectivePrefillChunk`'s precedence exactly; everything else is
+/// the machine-sized rung.
+pub fn billedPrefillChunk(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_mem: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
+    chunk_override: u32,
+) u32 {
+    if (chunk_override > 0) return chunk_override;
+    return resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
+}
+
+/// The context KV the chunk sizer must leave standing: the PINNED context's
+/// bill under an explicit `--ctx-size`, and 0 while the context is auto — the
+/// auto sizer subtracts the chunk's reserve itself, so it shrinks to fit
+/// whatever rung this picks, and feeding it back here would be circular
+/// (`pinAutoContext` pins the chunk BEFORE it computes any context).
+pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (server_config.max_context_size == 0) return 0;
+    return (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config)) *| server_config.max_context_size;
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -2872,13 +3184,54 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
-        config.pinned_prefill_chunk = resolvePrefillChunk(
+        const kv_bits: u64 = defaultKvBits();
+        // The hot-cache ASK, and WHICH ask (PR #363, two gated inputs).
+        //
+        // a93e2c0 passed `prefix_cache_mem_bytes` — the operator's raw number.
+        // The accessor returns the RESOLVED budget once a model has published
+        // one, so in a multi-model registry the SECOND model to load pins its
+        // prefill width against the FIRST model's clamped budget: an input
+        // a93e2c0 never fed it, on every arch. Single-model boot is identical
+        // either way (nothing has published yet), which is why this went
+        // unnoticed. The gated arch keeps the accessor — it is the arm the
+        // publish was measured on; every other arch reads the raw ask.
+        const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
+        // The OVERRIDE's precedence is the second gated input.
+        //
+        // a93e2c0's `pinPrefillChunk` had no override arm at all: it pinned
+        // the MACHINE RUNG, and `generate.effectivePrefillChunk` then let an
+        // explicit `--prefill-chunk` / `MLX_SERVE_PREFILL_CHUNK` outrank the
+        // pin at forward time. `billedPrefillChunk` moved that precedence into
+        // the PIN, which is the audit-S8 fix — the bill should describe the
+        // forward — but `config.pinned_prefill_chunk` is read by the admission
+        // bill, by the ungated `clampedPrefixCacheMem` reserve and by
+        // `computeMemoryContext`'s ADVERTISED context, so on every arch that
+        // sets the flag three numbers moved at once, unmeasured.
+        //
+        // KNOWN LIMIT of the ungated arm, inherited from a93e2c0 and stated
+        // rather than silently fixed: with `--prefill-chunk` set, a non-qwen4
+        // boot bills and advertises against the machine rung while the forward
+        // runs the flag's width. That inconsistency IS a93e2c0's behaviour;
+        // closing it is a change that owes the archs it touches a measurement.
+        const pin_override: u32 = if (config.longCtxGated()) explicitPrefillChunk() else 0;
+        config.pinned_prefill_chunk = billedPrefillChunk(
             config,
-            defaultKvBits(),
+            kv_bits,
             currentGpuMemoryCeiling(active_mem),
             active_mem,
-            prefix_cache_mem_bytes,
+            sizerCtxKvBytes(config, kv_bits),
+            hot_cache_ask,
+            pin_override,
         );
+        // The ctx bar narrows the rung on the GATED arch only, so say when it
+        // is the binding one — a chunk pinned at 512 by a large `--ctx-size`
+        // is otherwise indistinguishable from a small box (audit S9).
+        if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
+            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0, hot_cache_ask);
+            if (share_only > config.pinned_prefill_chunk) {
+                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
+            }
+        }
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
@@ -2911,30 +3264,439 @@ pub fn clampedPrefixCacheMem(
     return @min(requested, headroom);
 }
 
+/// What the hot cache gets and what it was charged for getting it.
+pub const HotCachePlan = struct {
+    /// The width the sizer pinned: the boot log's number, and the default
+    /// `InitOptions.pinned_prefill_chunk` for a request that does not choose
+    /// its own.
+    chunk: u32,
+    /// The width the CLAMP reserved for, which is NOT `chunk` on an arch that
+    /// re-bills per request — see `clampReserveWidth`.
+    reserve_chunk: u32,
+    /// `prefillTransientReserve` at `reserve_chunk`.
+    reserve: u64,
+    /// The serving context's KV + out-of-cache state.
+    ctx_kv: u64,
+    /// The clamped byte budget — what `initWithMem` is handed.
+    budget: u64,
+};
+
+/// PURE: the whole chain, in the one order that is monotone in the ask —
+/// chunk first (ask-independent), then the cache takes the residual. Every
+/// term the load site bills comes from here so the log line and the budget
+/// cannot describe different arithmetic.
+///
+/// MONOTONE NON-DECREASING in `requested`, by construction: nothing before
+/// `clampedPrefixCacheMem` reads it, and that function is `@min(requested,
+/// headroom)` over a headroom this function fixed already.
+/// PURE: the prefill width the LOAD-TIME clamp reserves for.
+///
+/// The load-time reserve is a promise to the FIRST request. On an arch that
+/// picks its width per request, every request re-bills its own REAL width at
+/// admission against live memory, and `fitsAfterEviction` can hand hot-cache
+/// bytes back to admit it — so the promise only has to cover the narrowest
+/// forward the box can ever be asked for, which is the ladder floor.
+///
+/// Billing the sizer's auto rung instead made the clamp non-monotone in the
+/// CEILING: a bigger ceiling affords a wider rung whose reserve grows faster
+/// than the headroom did, so a strictly better machine got a smaller cache.
+/// Live, same 10 GB ask and same pack: 3873 MB at the default ceiling, but
+/// 1076 MB at `iogpu.wired_limit_mb 120000`. With the floor the budget is
+/// `ceiling - weights - ctx_kv - reserve(floor)`, monotone in the ceiling AND
+/// in the ask.
+///
+/// An explicit `--prefill-chunk` is still billed as-is: the operator pinned a
+/// width, every request runs it, and nothing narrower is ever chosen. Archs
+/// without the gate keep the sizer's rung — they have no per-request re-bill
+/// to fall back on.
+pub fn clampReserveWidth(config: *const model_mod.ModelConfig, pinned_width: u32) u32 {
+    if (explicitPrefillChunk() > 0) return pinned_width;
+    if (!perRequestPrefillChunkEnabled(config)) return pinned_width;
+    return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
+pub fn planHotCache(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_weights: u64,
+    ctx_tokens: u64,
+    sizer_ctx_kv: u64,
+    requested: u64,
+    chunk_override: u32,
+) HotCachePlan {
+    const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
+    const reserve_chunk = clampReserveWidth(config, chunk);
+    const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config)) *| ctx_tokens;
+    return .{
+        .chunk = chunk,
+        .reserve_chunk = reserve_chunk,
+        .reserve = reserve,
+        .ctx_kv = ctx_kv,
+        .budget = clampedPrefixCacheMem(requested, ceiling, active_weights, ctx_kv, reserve),
+    };
+}
+
+/// SSD-first (qwen4_exp) budget semantics — mechanism 5.
+///
+/// The RAM-first formula treats the hot cache as what is LEFT OVER after the
+/// live session's KV reserve, which double-counts: a cache entry's arrays are
+/// refcount-SHARED with the live KV, so the resident entry for the session
+/// being served costs nothing beyond the reserve already billed. At 1M ctx
+/// that clamp cut a 24 GB entry's budget to a few GB and every warm turn
+/// cold-prefilled.
+///
+/// Here the entry IS the live KV: the budget FLOORS at one entry at the
+/// working context (`ctx_kv_bytes`) and `--prefix-cache-mem` becomes the RAM
+/// allowance for IDLE entries on top of it — 0 meaning "none idle", which is
+/// the mode's whole point (every other session lives on SSD).
+pub fn ssdFirstPrefixCacheMem(
+    idle_requested: u64,
+    gpu_ceiling: u64,
+    active_weights: u64,
+    ctx_kv_bytes: u64,
+    transient_reserve: u64,
+) u64 {
+    const headroom = gpu_ceiling -| (active_weights +| ctx_kv_bytes +| transient_reserve);
+    const idle = @min(idle_requested, headroom);
+    // Never 0: `initWithMem` reads 0 as "no byte cap at all".
+    return @max(ctx_kv_bytes +| idle, 1);
+}
+
+/// PURE: the context a LOAD-TIME bill must use, before `pinAutoContext` has run.
+///
+/// `getEffectiveContextLength` cannot answer this yet on an AUTO boot. The
+/// resolver runs during the model load; `pinAutoContext` runs after it, so
+/// `config.pinned_context` is still 0 and the accessor re-derives through
+/// `computeMemoryContext` — which reserves `resolvedPrefixCacheMem()`, i.e. the
+/// very ask being resolved. With a large ask that reserve swamps the budget and
+/// the answer comes back as a placeholder: 1024 tokens ≈ 26 MB of "session" on
+/// the box that found this (clamp live check #6, the 870-token boot).
+///
+/// `cache_reserve` is `CTX_SIZING_CACHE_RESERVE` on BOTH arms, and it is the
+/// same constant `computeMemoryContext` sizes against. That is not a
+/// coincidence to be tidied up later — it is the invariant:
+///
+///   * The number this returns is the session the hot-cache budget floor is
+///     built for. The number `pinAutoContext` freezes right afterwards is the
+///     session the server ADVERTISES, and an agent CLI reads it once and
+///     budgets against it for the whole session. If the two reserves differ,
+///     the load-time bill and the pinned context are two different answers to
+///     "how big is one session", and the floor is sized for a session the box
+///     will never be asked to serve.
+///   * The reserve must never be the ask, nor anything derived from it —
+///     neither `--prefix-cache-mem` nor the budget resolved from it. Context is
+///     the primary claimant and the cache is the residual, the same order rule
+///     the prefill chunk follows. Reading the ask is live check #6 (60GB ask ->
+///     an 870-token advertised context); reading the RESOLVED budget is audit
+///     S6, the same bug one level in, as a one-step loop.
+///
+/// SSD-first used to pass 0 here, on the ground that its resident entry IS the
+/// live KV and so costs nothing beyond the session. True of the RESIDENT entry
+/// and false of the mode's IDLE allowance, which is RAM in addition to it — and
+/// the sizer reserved the constant either way, so the SSD arm billed a session
+/// several percent larger than the one it then advertised. One constant, both
+/// arms, both sides.
+///
+/// Runs `autoContextFrom` — the SAME helper `autoContextFor` runs — rather than
+/// re-spelling the margin, so it cannot depend on the accessor it works around
+/// and cannot drift from it either.
+pub fn resolvedContextForLoad(
+    explicit_ctx: u32,
+    pinned_ctx: u32,
+    ceiling: u64,
+    active_mem: u64,
+    cache_reserve: u64,
+    transient_reserve: u64,
+    per_tok: u64,
+    ctx_cap: u32,
+) u32 {
+    if (explicit_ctx > 0) return explicit_ctx;
+    if (pinned_ctx > 0) return pinned_ctx;
+    // The SAME two steps `autoContextFor` runs, through the same helper: the
+    // number billed here and the number advertised after `pinAutoContext` are
+    // one session, so they are one expression.
+    return autoContextFrom(safeContextForBudget(
+        ceiling,
+        active_mem,
+        cache_reserve +| transient_reserve,
+        per_tok,
+        0,
+    ), ctx_cap);
+}
+
+/// The SSD-first call site. Takes the ceiling rather than reading it: the
+/// budget is a property of the MACHINE, not of how busy the box happened to be
+/// at load, and the caller passes the STATIC ceiling for both arms.
+///
+/// Passes `CTX_SIZING_CACHE_RESERVE`, the same constant the RAM arm and
+/// `computeMemoryContext` pass. The session this bills is the session
+/// `pinAutoContext` advertises a moment later; a reserve of its own here made
+/// them two numbers.
+fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
+    return resolvedContextForLoad(
+        server_config.max_context_size,
+        config.pinned_context,
+        ceiling,
+        active_mem,
+        ctxSizingCacheReserve(config),
+        prefillTransientReserve(config, kv_bits, chunk),
+        kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
+        config.contextCap(),
+    );
+}
+
+/// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included, so the
+/// call site is a single line. Returns null when the arch gate is off, and the
+/// caller falls through to `clampedPrefixCacheMem` unchanged.
+///
+/// Deliberately NOT folded into `prefixCacheMemForLoad`: that function's other
+/// inputs (the prefill chunk it pins, the transient reserve it derives) are
+/// under repair elsewhere, and both arms must inherit those fixes without this
+/// one being re-litigated in the merge.
+fn ssdFirstBudgetForLoad(
+    config: *model_mod.ModelConfig,
+    requested: u64,
+    ceiling: u64,
+    active_mem: usize,
+    ctx_kv: u64,
+    transient_reserve: u64,
+    idle_out: *u64,
+) ?u64 {
+    // THE predicate, shared with the spill site. `--prefix-cache-disk` is OFF
+    // by default, and without a tier none of this mode's machinery can run —
+    // so granting its "one full-context session + idle" floor (~20 GB plus the
+    // whole ask at 1M) would be RAM the server cannot use. Disk off means the
+    // RAM arm below, byte for byte. (external review item 4)
+    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
+    const budget = ssdFirstPrefixCacheMem(
+        requested,
+        ceiling,
+        active_mem,
+        ctx_kv,
+        transient_reserve,
+    );
+    // The RAM-first arm publishes its answer and so must this one: the
+    // auto-context sizer and the ANE gate read `hot_cache_mem_resolved`, and an
+    // SSD-first boot that left it stale would size against a budget the cache
+    // never got.
+    //
+    // What is published is the cache's cost BEYOND the live session, not the
+    // whole budget. Under one-session semantics `budget` INCLUDES `ctx_kv` —
+    // the very bytes the live KV already accounts for — and
+    // `computeMemoryContext` subtracts the published figure before dividing by
+    // the per-token cost. Publishing `budget` would bill that session twice and
+    // roughly halve the auto-context. The RETURN value stays `budget`: that is
+    // the cache's byte cap, and `initWithMem` needs the whole of it.
+    publishResolvedPrefixCacheMem(budget -| ctx_kv);
+    // ...and the same quantity, handed to the CACHE. On this arm
+    // `--prefix-cache-mem` is the RAM allowance for IDLE entries, and
+    // `spillIdleEntries` is what enforces it — without the number the spill
+    // had no cap to work against and evicted every non-active entry on every
+    // finished request (external review item 3).
+    idle_out.* = budget -| ctx_kv;
+    // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
+    // whole cache — 0 means "no idle entries", not "use all the headroom".
+    // Say so once, naming the flag, so the resolved budget is never a mystery.
+    log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB idle (--prefix-cache-mem {d} MB = the IDLE allowance on this arch; 0 = no idle entries)\n", .{
+        budget >> 20,
+        ctx_kv >> 20,
+        (budget -| ctx_kv) >> 20,
+        requested >> 20,
+    });
+    return budget;
+}
+
 /// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
-/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites.
-pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
+/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites, and
+/// PUBLISHES the answer (`hot_cache_mem_resolved`) so the auto-context sizer
+/// and the ANE gate stop reserving a budget the cache was never given.
+/// The hot-cache reserve the CONTEXT is sized against at load time on the
+/// RAM-first arm — a CONSTANT (the server's own `--prefix-cache-mem` default),
+/// and never the ask.
+///
+/// This is the whole ordering rule in one value. The clamp runs during the
+/// load and `pinAutoContext` runs after it, so on an auto boot the effective
+/// context is still a placeholder when the clamp reads it: measured live
+/// 2026-09-05, no `--ctx-size`, `--prefix-cache-mem 60GB`, the clamp billed
+/// `ctx KV 26 MB` instead of ~20.7 GB, granted 48,673 of the 61,440 MB ask,
+/// and the sizer that ran afterwards published `Context size: 870 tokens`.
+/// The same boot at the default ask reports 1,048,576. An agent CLI reads that
+/// number ONCE per session.
+///
+/// It must not be derived from the ask, and passing the ask itself is the same
+/// bug one level in: at this box `ceiling - active` is 39,568 MiB against a
+/// 61,440 MiB ask, so sizing the context against it saturates to zero usable
+/// and returns the 1024-token floor — the 870 boot again. CONTEXT is the
+/// primary claimant and the cache is the RESIDUAL, the same order the prefill
+/// chunk follows; an ask must never be able to shrink the context that is then
+/// used to bill that ask.
+const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// a93e2c0's context-sizing cache reserve: the RAW `--prefix-cache-mem` ask.
+///
+/// The constant above is a better number — it is ask-independent, so the
+/// advertised context stops moving when an operator changes the cache ask, and
+/// it closes live check #6 and audit S6 together. But it CHANGES the advertised
+/// `context_length` for every arch at any ask other than the 2 GiB default, and
+/// an agent CLI reads that number once per session and budgets against it for
+/// the whole session. That is not a change to make on archs nobody measured, so
+/// the constant is gated and every other arch keeps this.
+///
+/// The ONE deliberate unmediated read of the ask (`legacy_ask_read`, exempted
+/// by name in the scan that forbids the rest): a93e2c0 parity means the ASK, not
+/// the resolved budget — reading the budget here is audit S6's one-step loop,
+/// which is a different bug from the one this preserves.
+///
+/// TWO callers, both a93e2c0-parity arms: the context sizer's reserve
+/// (`ctxSizingCacheReserve`) and the prefill pin's hot-cache term
+/// (`pinPrefillChunk`). One reader, so the exemption stays a single line.
+fn legacyPrefixCacheAsk() u64 {
+    return prefix_cache_mem_bytes; // legacy_ask_read
+}
+
+/// Impure twin of the SSD arm's wrapper: the context the RAM-first clamp bills,
+/// read through the ONE shared pure resolver so the two arms cannot drift.
+/// They differ in exactly one argument — the cache reserve. SSD-first passes 0
+/// because its resident entry IS the live KV, so the honest load-time reserve
+/// really is zero and no fixpoint exists; RAM-first holds cache in ADDITION to
+/// the live KV, which is why the parameter has to exist at all.
+fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
+    return resolvedContextForLoad(
+        server_config.max_context_size,
+        config.pinned_context,
+        currentGpuMemoryCeiling(active_mem),
+        active_mem,
+        ctxSizingCacheReserve(config),
+        prefillTransientReserve(config, kv_bits, chunk),
+        kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
+        config.contextCap(),
+    );
+}
+
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idle_out: *u64) u64 {
+    // RAM-first default: this arch has no idle allowance, because it has no
+    // SSD to spill to. Written FIRST so every early return carries it.
+    idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
-    const chunk: u64 = pinPrefillChunk(config);
-    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken()) *|
-        getEffectiveContextLength(config);
-    const clamped = clampedPrefixCacheMem(
-        requested,
-        currentGpuMemoryCeiling(active_mem),
-        active_mem,
-        ctx_kv,
-        prefillTransientReserve(config, kv_bits, chunk),
-    );
-    if (requested > 0 and clamped < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
-    } else if (requested == 0) {
-        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+    // ARCH GATE (PR #363). The budget resolver changed THREE inputs at once for
+    // every arch, and each moves the number a different way:
+    //   * the STATIC ceiling replaced the live one (reproducibility — but it
+    //     also stops the budget shrinking when another process holds unified
+    //     memory, which is what #64 added the live read for);
+    //   * `ramFirstContextForLoad` replaced `getEffectiveContextLength` (a
+    //     different context, so a different `ctx_kv` term);
+    //   * `planHotCache` + `clampReserveWidth` replaced the direct clamp (the
+    //     reserve is billed at the ladder FLOOR, which only makes sense on an
+    //     arch that re-bills its width per request).
+    // The third is meaningless off `perRequestPrefillChunk`, and the other two
+    // were measured on the 69 GB qwen4_exp pack alone. Ungated, this is
+    // a93e2c0's `prefixCacheMemForLoad` verbatim
+    // (`git show a93e2c0:src/server.zig:2918`).
+    if (!config.longCtxGated()) {
+        const chunk: u64 = pinPrefillChunk(config);
+        // `statePerTokenBilled` is 0 off qwen4_exp, so this is a93e2c0's
+        // `+| config.qsaHistoryBytesPerToken()` term exactly.
+        const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+            getEffectiveContextLength(config);
+        const clamped = clampedPrefixCacheMem(
+            requested,
+            currentGpuMemoryCeiling(active_mem),
+            active_mem,
+            ctx_kv,
+            prefillTransientReserve(config, kv_bits, chunk),
+        );
+        // The one thing a93e2c0 did NOT do, kept on purpose: publishing the
+        // resolved budget is the class-A half of this work — the ANE gate used
+        // to reserve the raw ask while the cache could only ever hold the
+        // clamp, so three places disagreed about how many bytes the cache
+        // holds. Publishing a number the cache is actually capped at cannot
+        // over-admit. (`computeMemoryContext` still does not read it — audit
+        // S6.)
+        publishResolvedPrefixCacheMem(clamped);
+        if (requested > 0 and clamped < requested) {
+            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+        } else if (requested == 0) {
+            log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+        }
+        return clamped;
     }
-    return clamped;
+    // SSD-first (qwen4_exp) takes the budget before the RAM-first plan: the
+    // resident entry IS the live KV there, so the plan's residual arithmetic
+    // would double-count it. One call site, one early return.
+    const ssd_chunk: u64 = pinPrefillChunk(config);
+    // NOT `getEffectiveContextLength`: on an auto boot it is still unpinned here
+    // and re-derives through the cache ask (see `resolvedContextForLoad`).
+    const ssd_ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+        ssdFirstSessionTokensNow(config, kv_bits, staticGpuMemoryCeiling(), active_mem, @intCast(ssd_chunk));
+    // SSD-first takes the whole decision or none of it — ONE line here, so a
+    // change to how `ctx_kv` / the transient reserve are computed above merges
+    // without touching this arm.
+    // STATIC ceiling on BOTH arms, for the reason the RAM arm gives below: the
+    // budget is a property of the machine, not of the minute. Reading the live
+    // ceiling here made the SSD budget swing boot-to-boot — and on this arm the
+    // budget IS the one-session RAM floor, so "one session" would have meant a
+    // different number every boot. This arm also short-circuits above the RAM
+    // plan on qwen4_exp, so a live ceiling here BYPASSED the reproducibility fix
+    // on the only arch the gates are about. The callee takes the ceiling as a
+    // parameter and no longer derives one. (audit S1)
+    // The CLAMP reserve, at the same width `planHotCache` reserves for: the
+    // ladder FLOOR on an arch that re-bills its prefill width per request
+    // (`clampReserveWidth`). This arm short-circuits above the RAM plan on
+    // qwen4_exp, so billing the sizer's rung here meant the floor-reserve fix
+    // never ran on the deployed pack at all — the same shape as the ceiling
+    // bypass audit S1 caught one line up. Two reserves, exactly as on the RAM
+    // arm: the SESSION is billed at the pinned width (`ssdFirstSessionTokensNow`,
+    // twin of `ramFirstContextForLoad`) because that is the width
+    // `computeMemoryContext` advertises against; the BUDGET is billed at the
+    // floor, because the load-time reserve is only a promise to the FIRST
+    // request and every request re-bills its own real width at admission.
+    // (external review item 5)
+    const ssd_clamp_reserve: u64 = prefillTransientReserve(config, kv_bits, clampReserveWidth(config, @intCast(ssd_chunk)));
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out)) |b| return b;
+    // Pin first, then hand the pinned width in as the override: the plan must
+    // bill the width `generate.effectivePrefillChunk` will resolve to, and the
+    // pin is that width (it already folded in an explicit `--prefill-chunk`).
+    const pinned: u32 = pinPrefillChunk(config);
+    // STATIC ceiling, not the live one: the budget must not depend on how busy
+    // the box happened to be at load (see `staticGpuMemoryCeiling`). The
+    // sizer's rung above still reads live memory, and so does every
+    // request-time guard — this is the one number that must be reproducible.
+    const plan = planHotCache(
+        config,
+        kv_bits,
+        staticGpuMemoryCeiling(),
+        active_mem,
+        // NOT `getEffectiveContextLength`: on an auto boot it is still a
+        // placeholder here (the clamp runs before `pinAutoContext`), and
+        // billing it granted almost the whole ask — live check #6.
+        ramFirstContextForLoad(config, kv_bits, active_mem, pinned),
+        sizerCtxKvBytes(config, kv_bits),
+        requested,
+        pinned,
+    );
+    publishResolvedPrefixCacheMem(plan.budget);
+    // Say so when the box is under external pressure RIGHT NOW, but do not
+    // shrink the budget for it: the pressure is a property of this minute, the
+    // budget is a property of the machine, and admission is what reconciles
+    // them per request.
+    const live_ceiling: u64 = currentGpuMemoryCeiling(active_mem);
+    if (live_ceiling < staticGpuMemoryCeiling()) {
+        const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
+        log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
+    }
+    if (requested > 0 and plan.budget < requested) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    } else if (requested == 0) {
+        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    }
+    return plan.budget;
 }
 
 test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {
@@ -2952,6 +3714,1523 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
     try t.expectEqual(@as(u64, 1), clampedPrefixCacheMem(40 * GB, 64 * GB, 70 * GB, 6 * GB, 4 * GB));
 }
 
+/// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk
+/// with a QSA indexer, so both out-of-KV terms the bill has (`statePerTokenBilled`
+/// and `qsaMaskBytes`) are non-zero. The absolute rung it lands on depends on
+/// the checkpoint's own reserve ladder; every assertion below is an INVARIANT
+/// over that ladder, never a hardcoded width.
+///
+/// It DECLARES `qwen4_exp` (a test config is a checkpoint CLAIM): only that
+/// arch parses the indexer fields this fixture sets, and every #363 mechanism
+/// is gated on `ModelConfig.longCtxGated()`, so a fixture that left the
+/// default `model_type` would silently measure the a93e2c0 arm while claiming
+/// to pin the new one.
+fn longCtxTestConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 40;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 2560;
+    cfg.intermediate_size = 9216;
+    cfg.intermediate_size_declared = true;
+    cfg.quant_bits = 4;
+    cfg.max_position_embeddings = 1048576;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    return cfg;
+}
+
+test "planHotCache: the budget is MONOTONE in the ask" {
+    // The defect: `pinPrefillChunk` fed the RAW `--prefix-cache-mem` into
+    // `resolvePrefillChunk`, and `prefixCacheMemForLoad` then billed that
+    // chunk's transient back against the same request. Bigger ask -> narrower
+    // chunk -> smaller reserve -> BIGGER cache. Live on a 137 GB Mac with the
+    // 69 GB qwen4_exp pack at --ctx-size 1048576 --kv-quant 8:
+    //   --prefix-cache-mem 10GB -> rung 1024, reserve ~4300 MB -> 3873 MB
+    //   --prefix-cache-mem 24GB -> ladder floor 512, reserve ~2470 MB -> 5703 MB
+    // Asking for less bought MORE cache. The sweep below is the guard.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const cfg = longCtxTestConfig();
+    const kv_bits: u64 = 8;
+    const ctx_tokens: u64 = 262144;
+    const weights: u64 = 69 * GiB;
+    const ceiling: u64 = weights + 28_909 * (1 << 20);
+
+    var prev: u64 = 0;
+    var ask: u64 = GiB;
+    while (ask <= 64 * GiB) : (ask += GiB) {
+        const plan = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, ask, 0);
+        try t.expect(plan.budget >= prev);
+        // Nothing may exceed the headroom the clamp is defending.
+        try t.expect(plan.budget <= @max((ceiling -| weights) -| plan.ctx_kv -| plan.reserve, 1));
+        prev = plan.budget;
+    }
+
+    // The two live asks, which used to invert, now agree — the chunk is the
+    // same rung for both because the sizer no longer sees the ask at all.
+    const at10 = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, 10 * GiB, 0);
+    const at24 = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, 24 * GiB, 0);
+    try t.expect(at24.budget >= at10.budget);
+    try t.expectEqual(at10.chunk, at24.chunk);
+}
+
+test "planHotCache: an out-of-the-box boot gets the whole remaining headroom, never the 1-byte floor" {
+    // ONE boot with no flags is the bar: no `--prefix-cache-mem` (ask 0, "no
+    // byte cap") and no `--prefill-chunk`. `requested == 0` used to hand the
+    // sizer a ZERO hot-cache reserve, so it took a wide rung whose transient
+    // then ate the whole headroom and `clampedPrefixCacheMem` returned its
+    // 1-byte "never 0" floor — an enabled cache that can hold nothing.
+    // `HOT_CACHE_FLOOR_BYTES` moves that defence into the sizer, which is the
+    // only place that can still step down.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const cfg = longCtxTestConfig();
+    const kv_bits: u64 = 8;
+    const weights: u64 = 69 * GiB;
+    const ceiling: u64 = weights + 28_909 * (1 << 20);
+    // A PINNED context (`--ctx-size`) is what the sizer must leave standing.
+    const ctx_tokens: u64 = 262144;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) + statePerTokenBilled(&cfg);
+    const sizer_ctx_kv: u64 = per_tok * ctx_tokens;
+
+    const boot = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 0, 0);
+    // Everything left over, exactly — the cache is the residual claimant.
+    try t.expectEqual(@max((ceiling -| weights) -| boot.ctx_kv -| boot.reserve, 1), boot.budget);
+    // And a cache worth having, not the floor. The disjunction is the honest
+    // guarantee: if not even the narrowest rung clears the bar the ladder
+    // bottoms out and the box is simply too small.
+    try t.expect(boot.budget >= HOT_CACHE_FLOOR_BYTES or
+        boot.chunk == PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    // The rung is the WIDEST that clears both ask-independent bars.
+    const serving: u64 = ceiling - weights;
+    const cap: u64 = @min(serving / PREFILL_RESERVE_BUDGET_SHARE, (serving -| sizer_ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
+    for (PREFILL_CHUNK_LADDER) |c| {
+        if (c <= boot.chunk) break;
+        try t.expect(prefillTransientReserve(&cfg, kv_bits, c) > cap);
+    }
+
+    // An explicit ask can only ever take a SLICE of that same headroom, so a
+    // huge one lands exactly on the no-flag default and no ask beats it.
+    const huge = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 1024 * GiB, 0);
+    try t.expectEqual(boot.budget, huge.budget);
+    try t.expect(planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 4 * GiB, 0).budget <= boot.budget);
+}
+
+test "the clamp's live inversion, as arithmetic" {
+    // The reported boot, reduced to `clampedPrefixCacheMem` with nothing else
+    // moving: ceiling - weights = 28,909 MiB, ctx KV = (13,056 + 7,680) B/tok
+    // x 1,048,576 = 20,736 MiB. The only difference between the two arms was
+    // the rung the sizer picked BECAUSE of the ask.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const serving: u64 = 28_909 * MiB;
+    const ctx_kv: u64 = 20_736 * MiB;
+    const reserve_1024: u64 = 4_300 * MiB;
+    const reserve_512: u64 = 2_470 * MiB;
+
+    const ask10 = clampedPrefixCacheMem(10 * GiB, serving, 0, ctx_kv, reserve_1024);
+    const ask24 = clampedPrefixCacheMem(24 * GiB, serving, 0, ctx_kv, reserve_512);
+    try t.expectEqual(3_873 * MiB, ask10);
+    try t.expectEqual(5_703 * MiB, ask24);
+    try t.expect(ask10 < ask24); // the inversion, in the numbers that shipped
+
+    // ONE ask-independent reserve and the inversion cannot be expressed: the
+    // clamp is `@min(ask, headroom)` over a headroom no ask can move.
+    var prev: u64 = 0;
+    var ask: u64 = GiB;
+    while (ask <= 64 * GiB) : (ask += GiB) {
+        const got = clampedPrefixCacheMem(ask, serving, 0, ctx_kv, reserve_1024);
+        try t.expect(got >= prev);
+        try t.expect(got <= @max((serving -| ctx_kv) -| reserve_1024, 1));
+        prev = got;
+    }
+    try t.expectEqual(3_873 * MiB, clampedPrefixCacheMem(0, serving, 0, ctx_kv, reserve_1024));
+}
+
+test "an explicit --prefill-chunk is the chunk that gets BILLED" {
+    // `generate.effectivePrefillChunk` lets the flag outrank the machine pin,
+    // and `pinPrefillChunk` did not — so `--prefill-chunk 4096` ran a
+    // 4096-token forward against a bill that had reserved a 512- or
+    // 1024-token transient. Both readers must answer the same width.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    var cfg = longCtxTestConfig();
+    cfg.head_dim = 128; // fused dim: boundedPrefillChunk returns its base untouched
+    const kv_bits: u64 = 8;
+    const weights: u64 = 69 * GiB;
+    // Deliberately squeezed, so the machine sizer would step BELOW the flag.
+    const ceiling: u64 = weights + 6 * GiB;
+
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
+    const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0);
+    try t.expect(sized < 4096); // the machine would have narrowed it
+
+    const billed = billedPrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0, explicitPrefillChunk());
+    try t.expectEqual(@as(u32, 4096), billed);
+
+    // The other reader, called with that same pin, agrees — this is the pair
+    // that must never drift.
+    try t.expectEqual(@as(usize, 4096), generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        40_000,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        billed,
+    ));
+
+    // And the plan reserves that width, not the sized-down one.
+    const plan = planHotCache(&cfg, kv_bits, ceiling, weights, 8192, 0, 2 * GiB, billed);
+    try t.expectEqual(@as(u32, 4096), plan.chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), plan.reserve);
+    try t.expect(plan.reserve > prefillTransientReserve(&cfg, kv_bits, sized));
+}
+
+/// The deployed long-context shape, at the per-token widths the live box
+/// reports: 12 caching layers of a 48-layer GDN+MoE trunk (`full_attention_interval`
+/// 4), hd 256 and 2 KV heads => 24,576 B/tok dense, 13,056 at 8-bit; a 128-wide
+/// QSA indexer at ratio 4 => 3,840 B/tok of history, billed twice = 7,680. Those
+/// two are the numbers `--ctx-size 1048576` multiplies into 20,736 MiB.
+fn qwen4RequestTestConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 48;
+    cfg.full_attention_interval = 4;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    // No sliding-band layers: the trunk is GDN + full attention with QSA, and
+    // `ModelConfig`'s field DEFAULTS to true, which is a different arch and a
+    // different prefill-chunk policy family (it routes `boundedPrefillChunk`
+    // down the composed-causal score-budget path, where every rung collapses
+    // to the floor past ~300k and the whole per-request mechanism reads as a
+    // no-op). A test config is a checkpoint claim: leave a field at a default
+    // the real pack does not have and the test measures a machine that does
+    // not exist.
+    cfg.has_sliding_window = false;
+    cfg.hidden_size = 2560;
+    cfg.moe_intermediate_size = 1024;
+    cfg.num_experts_per_tok = 8;
+    cfg.num_experts = 512;
+    cfg.quant_bits = 4;
+    cfg.max_position_embeddings = 1048576;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    cfg.pinned_prefill_chunk = 1024; // what load-time sizing gives at 1M ctx
+    return cfg;
+}
+
+/// The source of one top-level declaration: from its header to the closing
+/// brace in column 0.
+///
+/// Two traps, both hit live while writing these scans. A fixed-size window is
+/// a landmine — a comment grows and the scan silently stops covering the line
+/// it was written for. And a bare `indexOf` finds the SCAN'S OWN string
+/// literal when the test sits above the declaration it names, so it happily
+/// verifies a claim about itself; the header must start a LINE.
+fn countDecls(src: []const u8, header: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, header)) |at| {
+        i = at + 1;
+        if (at > 0 and src[at - 1] == '\n') n += 1; // a declaration, not a scan's own literal
+    }
+    return n;
+}
+
+/// The ARGUMENT TEXT of the call whose name starts at `at` — balanced from
+/// the opening paren, so a multi-line call and a nested call are both exact.
+///
+/// The scans that check "this call passes that term" used a fixed-size window
+/// and cut at the first `);`. Both calls this file scans end in `))` or span
+/// several lines, so the window ran 400+ characters PAST the call and the
+/// assertion could be satisfied by unrelated code below it — the same
+/// self-satisfying-scan class as audit B0c, one level out. A scan that cannot
+/// go red is not a scan. (external review item 5)
+fn callArgs(src: []const u8, at: usize) ?[]const u8 {
+    const open = std.mem.indexOfScalarPos(u8, src, at, '(') orelse return null;
+    var depth: usize = 0;
+    var i: usize = open;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return src[open + 1 .. i];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// One declaration's source window. Thin alias for the ONE extractor,
+/// `generate.productionDeclSource` — the same windows the prefill loop's own
+/// ordering scans read, so the two cannot drift. It generalises what this used
+/// to do: any indentation, and the closer at the declaration's own indent.
+fn declBody(src: []const u8, decl: []const u8) ?[]const u8 {
+    return generate_mod.productionDeclSource(src, decl);
+}
+
+/// The width a ladder rung actually forwards at for this prompt — the resolver
+/// the chooser prices against, spelled once so the tests cannot drift from it.
+fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
+    return @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        @intCast(seq),
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        rung,
+    ));
+}
+
+test "the load-time budget is reproducible: free RAM at load does not move it" {
+    // Measured 2026-09-05: identical binary, flags and wired limit, two boots
+    // 11 minutes apart resolved the SAME 10 GB ask to 1076 MB (13:42, straight
+    // after two suites) and 9757 MB (13:53, quiet box). `[preflight] available`
+    // read 108.7 vs 116.6 GB, and `currentGpuMemoryCeiling` is
+    // min(static, footprint + free RAM) — so the deployed shape was not
+    // reproducible boot to boot, and the user's bar is one boot that works.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const GB: u64 = 1000 * 1000 * 1000;
+    const weights: u64 = 70 * GB;
+    const ctx_tokens: u64 = 1_048_576; // the deployed --ctx-size
+    const static_ceiling: u64 = 120_000 * 1024 * 1024; // the wired limit, both boots
+    // `requested == 0` is the no-flag boot AND the arm where the clamp is the
+    // only thing deciding: the budget IS the headroom, so any difference in
+    // the headroom shows up in it. (An ask small enough to fit both arms
+    // returns the ask in both and hides the defect — that is how this test
+    // first passed a build it should have failed.)
+    const uncapped: u64 = 0;
+
+    // The live ceiling really did differ between the two boots...
+    const busy = physicalMemoryCeiling(static_ceiling, weights, 108_700 * 1000 * 1000 -| weights);
+    const quiet = physicalMemoryCeiling(static_ceiling, weights, 116_600 * 1000 * 1000 -| weights);
+    try t.expect(busy < quiet);
+
+    // ...and billing the budget against it produced two different answers.
+    const on_busy = planHotCache(&cfg, kv_bits, busy, weights, ctx_tokens, 0, uncapped, 0);
+    const on_quiet = planHotCache(&cfg, kv_bits, quiet, weights, ctx_tokens, 0, uncapped, 0);
+    try t.expect(on_busy.budget != on_quiet.budget);
+    try t.expect(on_quiet.budget > on_busy.budget);
+
+    // Billed against the STATIC term, both boots agree — that is the fix.
+    const a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, uncapped, 0);
+    const b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, uncapped, 0);
+    try t.expectEqual(a.budget, b.budget);
+    try t.expect(a.budget >= on_quiet.budget);
+
+    // A capped ask is bounded by the same headroom, so it inherits the
+    // reproducibility: same ceiling, same answer, whatever the box was doing.
+    const capped_a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 24 * GB, 0);
+    const capped_b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 24 * GB, 0);
+    try t.expectEqual(capped_a.budget, capped_b.budget);
+    try t.expect(capped_a.budget <= a.budget);
+
+    // And the static term is the one that does not read free RAM: same limit
+    // and footprint, any free-RAM figure, same answer.
+    try t.expectEqual(static_ceiling, physicalMemoryCeiling(static_ceiling, weights, 400 * GB));
+}
+
+test "free RAM still binds where it can be acted on: request-time admission" {
+    // The live term is not deleted, it is MOVED. The load-time budget is a
+    // property of the machine; the admission bill is a property of this
+    // request at this instant, and it can evict to admit. Scan-pinned because
+    // the whole point is WHICH ceiling each site reads. Needles split so this
+    // test's own source cannot satisfy them.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const live = "currentGpuMemory" ++ "Ceiling(";
+    const static_c = "staticGpuMemory" ++ "Ceiling()";
+
+    // Audit S1. The old form asserted `staticGpuMemoryCeiling()` appeared
+    // SOMEWHERE in `prefixCacheMemForLoad` — it did, in the RAM arm, which
+    // qwen4_exp never takes because `ssdFirstBudgetForLoad` short-circuits
+    // above it. A term present in the file but absent from the path taken is
+    // exactly what a body-scoped scan cannot see, so both budget-returning
+    // calls are checked at the CALL, on their arguments.
+    const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    for ([_][]const u8{ "ssdFirstBudgetFor" ++ "Load(", "planHot" ++ "Cache(" }) |callee| {
+        const at = std.mem.indexOf(u8, load, callee) orelse return error.CallSiteMoved;
+        // Balanced from the opening paren: the old form cut at the first `);`
+        // in a 600-byte window, and BOTH calls here end in `))` or span
+        // several lines, so it ran ~420 bytes past the call and could be
+        // satisfied by code below it. (external review item 5)
+        const args = callArgs(load, at) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, args, static_c) != null);
+    }
+    // ...and neither callee may re-derive a live ceiling behind the argument.
+    for ([_][]const u8{ "fn ssdFirstBudgetForLoad(", "fn ssdFirstSessionTokensNow(", "pub fn planHotCache(" }) |decl| {
+        if (declBody(src, decl)) |arm| try t.expect(std.mem.indexOf(u8, arm, live) == null);
+    }
+
+    // ...and every request-time guard still reads live memory.
+    for ([_][]const u8{ "pub fn prefillAdmissionBill(", "pub fn requestPrefillChunkNow(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, live) != null);
+        try t.expect(std.mem.indexOf(u8, body, static_c) == null);
+    }
+    // `prefillFitsNow` is that same bill.
+    const probe = declBody(src, "pub fn prefillFitsNow(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, probe, "prefillAdmission" ++ "Bill(") != null);
+
+    // The auto-context sizer and the chunk pin are NOT part of this change:
+    // both still read the live ceiling, so the advertised context and the
+    // memory-sized rung keep exactly the behaviour they had.
+    for ([_][]const u8{ "fn computeMemoryContext(", "pub fn pinPrefillChunk(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, live) != null);
+    }
+
+    // Exactly one static-ceiling reader outside the helper itself and the
+    // pressure note beside it.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ static_c[0 .. static_c.len - 2] ++ "("));
+}
+
+test "an auto boot sizes the SAME context whatever the cache ask (live check #6)" {
+    // The collapse, as arithmetic. 2026-09-05, no `--ctx-size`, wired 120000,
+    // qwen4_exp, weights ~69,827 MiB resident:
+    //   --prefix-cache-mem 60GB -> budget clamped 61440 -> 48673 MB (ctx KV 26 MB)
+    //                           -> Context size: 870 tokens
+    //   default ask             -> Context size: 1048576 (memory would allow 1113088)
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB; // backed out of the live clamp line
+    const live_ceiling: u64 = 109_395 * MiB;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
+    const cap: u32 = cfg.contextCap();
+
+    // The fix: the sizing reserve is a CONSTANT, so the answer cannot move
+    // with the ask. Same call, two very different asks, one answer.
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    try t.expectEqual(ctx_default, ctx_big_ask);
+    try t.expect(ctx_default > 900_000); // a real context, not the floor
+
+    // THE DEFECT, both spellings. Sizing against the GRANTED budget...
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
+    try t.expect(vs_granted <= 1024);
+    // ...and sizing against the RAW ASK, which is the trap one level in: the
+    // ask exceeds `ceiling - active`, so usable saturates to zero.
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
+    try t.expect(vs_raw_ask <= 1024);
+    try t.expect(ctx_default > vs_granted * 500);
+}
+
+test "the clamp bills the context that will be SERVED, not the placeholder" {
+    // The other half: with a placeholder context the clamp hands back nearly
+    // the whole ask; with the real context it bills ~20.7 GB and the cache
+    // gets only the remainder.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const static_ceiling: u64 = 120_000 * MiB;
+    const ask: u64 = 60 * 1024 * MiB;
+
+    const placeholder = planHotCache(&cfg, kv_bits, static_ceiling, active, 1024, 0, ask, 4096);
+    const real = planHotCache(&cfg, kv_bits, static_ceiling, active, 1_048_576, 0, ask, 4096);
+
+    try t.expect(placeholder.budget > 45_000 * MiB); // reproduces the live 48,673
+    // 13,056 KV + 5,376 state (one history copy + the f32 score bank).
+    try t.expectEqual(@as(u64, 1_048_576) * (13_056 + 5_376), real.ctx_kv);
+
+    // The bar is the ARITHMETIC, not a hand-picked fraction. Both calls share
+    // a ceiling, a resident weight figure and a reserve width, and on this box
+    // the ask exceeds the headroom in both, so each budget IS its headroom and
+    // the whole difference between them is the session each one billed:
+    //
+    //     placeholder.budget - real.budget == real.ctx_kv - placeholder.ctx_kv
+    //
+    // A fraction bar cannot be stated here at all: `real.budget <
+    // placeholder.budget / 2` needs a reserve above ~8.7 GiB, and the
+    // `> 45_000 MiB` line above needs one below ~5.1 GiB. It was written
+    // against arithmetic nothing on this branch ever ran.
+    try t.expectEqual(placeholder.budget - real.budget, real.ctx_kv - placeholder.ctx_kv);
+    try t.expect(real.budget < placeholder.budget);
+    // ...and the placeholder's "session" is the rounding error that made this a
+    // bug: 1024 tokens of KV against a full context's ~20.7 GB.
+    try t.expect(placeholder.ctx_kv < 30 * MiB);
+    try t.expect(real.ctx_kv > 18_000 * MiB);
+    try t.expect(real.budget > 0);
+}
+
+test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live numbers" {
+    // External review item 5. `ssdFirstBudgetForLoad` short-circuits ABOVE
+    // `planHotCache`, so `clampReserveWidth` — the fix that made the clamp
+    // monotone in the ceiling by reserving only the ladder FLOOR on an arch
+    // that re-bills its width per request — never executed on qwen4_exp, the
+    // one arch these gates are about. Exactly the shape audit S1 caught for
+    // the ceiling, one argument along.
+    //
+    // Live numbers, the same boot the other clamp tests use (2026-09-05,
+    // wired 120000): the guards' boot lines are
+    //   [hot-cache] budget clamped 10240 -> 9642 MB          (RAM arm)
+    //   [hot-cache] SSD-first budget 34748 MB                (SSD arm)
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+    // Both gates pinned, so the environment cannot decide this test's verdict.
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    const orig_explicit = generate_mod.prefill_chunk_explicit;
+    defer generate_mod.prefill_chunk_explicit = orig_explicit;
+    generate_mod.prefill_chunk_explicit = false;
+
+    // The PURE chunk resolver — the same one the neighbouring clamp tests use.
+    // `pinPrefillChunk` reads live memory, and a box that happened to resolve
+    // the floor rung would make the floor-vs-pinned comparison below vacuous.
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    // The arch DOES re-bill per request, so the two widths really differ —
+    // otherwise this test would be vacuous.
+    try t.expect(perRequestPrefillChunkEnabled(&cfg));
+    const floor_w = clampReserveWidth(&cfg, chunk);
+    try t.expectEqual(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], floor_w);
+    try t.expect(floor_w < chunk);
+
+    const reserve_pinned = prefillTransientReserve(&cfg, kv_bits, chunk);
+    const reserve_floor = prefillTransientReserve(&cfg, kv_bits, floor_w);
+    try t.expect(reserve_floor < reserve_pinned);
+
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg)) *|
+        ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    const ask: u64 = 10 * 1024 * MiB;
+
+    // What the arm bills now, and what it billed before: the idle allowance
+    // is the residual after the reserve, so the whole difference lands there.
+    const now = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_floor);
+    const before = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_pinned);
+    try t.expect(now >= before);
+
+    // ...and the RAM arm reserves the same floor for the same pack, which is
+    // the point: the two arms differ in their SEMANTICS (residual vs
+    // one-session floor), never in the width they promise the first request.
+    const plan = planHotCache(&cfg, kv_bits, ceiling, active, 1_048_576, sizerCtxKvBytes(&cfg, kv_bits), ask, chunk);
+    try t.expectEqual(floor_w, plan.reserve_chunk);
+    try t.expectEqual(reserve_floor, plan.reserve);
+
+    // The session the floor holds is the one the server advertises — unchanged
+    // by this fix, and asserted here so the two reserves cannot be conflated
+    // by a later tidy-up. `ssdFirstSessionTokensNow` bills the PINNED width
+    // because that is what `computeMemoryContext` sizes against.
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
+        cfg.contextCap(),
+    );
+    try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+}
+
+test "the SSD-first budget arm reads the same clamp reserve the RAM plan does" {
+    // Scan half of item 5: a body-scoped assertion cannot see which arm ran,
+    // so the reserve is checked AT THE CALL, on its arguments — the lesson
+    // audit S1 wrote down for the ceiling. Needles split.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const clamp = "clampReserve" ++ "Width(config, ";
+    const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    // The SSD arm derives its clamp reserve through the shared helper...
+    const at = std.mem.indexOf(u8, load, "ssdFirstBudgetFor" ++ "Load(") orelse return error.CallSiteMoved;
+    const args = callArgs(load, at) orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, args, "ssd_clamp_reserve") != null);
+    // ...and it is the ONLY reserve the arm passes: a second, pinned-width
+    // term beside it would be the bug wearing the fix's name.
+    try t.expect(std.mem.indexOf(u8, args, "prefillTransientReserve(") == null);
+    const decl = std.mem.indexOf(u8, load, "const ssd_clamp_reserve") orelse return error.ReserveMoved;
+    try t.expect(std.mem.indexOf(u8, load[decl..@min(load.len, decl + 200)], clamp) != null);
+    // ...and the RAM arm still reaches it through `planHotCache`.
+    const plan = declBody(src, "pub fn planHotCache(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, plan, clamp) != null);
+}
+
+test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm" {
+    // External review item 4. `ssdFirstEnabled()` never checked that a tier
+    // exists, and `--prefix-cache-disk` is OFF by default — so out of the box
+    // qwen4_exp got the mode's "one full-context session + idle" budget floor
+    // (~20 GB, plus the whole ask at 1M) with none of the spill machinery
+    // under it. A budget sized for a tier that does not exist is RAM the
+    // server cannot use.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+
+    const orig_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = orig_disk;
+    // `prefixCacheMemForLoad` PUBLISHES its answer into a process global that
+    // the auto-context sizer and the ANE gate both read, so a test that calls
+    // it must put the global back. Leaving it set made
+    // `aneGateHeadroom: reserves a usable context...` fail depending on test
+    // ORDER — green alone, red in the suite.
+    defer clearResolvedPrefixCacheMem();
+    const orig_over = prefix_cache_mod.ssd_first_override;
+    defer prefix_cache_mod.ssd_first_override = orig_over;
+    prefix_cache_mod.ssd_first_override = true; // the env switch is not what is on trial
+
+    // The predicate itself: three conjuncts, and the disk is one of them.
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    var dense = model_mod.ModelConfig{};
+    dense.model_type = "qwen3";
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    prefix_cache_mod.ssd_first_override = false;
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    prefix_cache_mod.ssd_first_override = true;
+
+    // ...and the budget arm follows it. Both arms are computed from the SAME
+    // live numbers, so the comparison is between the two formulas and not
+    // between two instants: the SSD arm FLOORS at one session's KV, the RAM
+    // arm is a residual bounded by the ask. A 4 GiB ask against a 1M context
+    // separates them by orders of magnitude.
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 1_048_576; // explicit: no auto-sizing in the way
+    cfg.pinned_context = 0;
+    const ask: u64 = 4 * 1024 * 1024 * 1024;
+
+    prefix_cache_disk_bytes = 0;
+    var idle_off: u64 = 12345;
+    const ram_arm = prefixCacheMemForLoad(&cfg, ask, &idle_off);
+    // The RAM arm publishes no idle allowance — the concept does not exist
+    // there, and `spillIdleEntries` never runs.
+    try t.expectEqual(@as(u64, 0), idle_off);
+    try t.expect(ram_arm <= ask);
+
+    prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
+    var idle_on: u64 = 0;
+    const ssd_arm = prefixCacheMemForLoad(&cfg, ask, &idle_on);
+    // One session at 1M on this pack is tens of GB; the floor makes the SSD
+    // arm's budget larger than the whole ask, which the RAM arm can never be.
+    try t.expect(ssd_arm > ask);
+    try t.expect(ssd_arm > ram_arm);
+    // The idle allowance is the ask clamped to what is left; on any box with
+    // headroom for a 4 GiB cache that is the ask itself, and it is never more.
+    try t.expect(idle_on > 0 and idle_on <= ask);
+    try t.expect(ssd_arm -| idle_on > ask); // the one-session floor
+}
+
+test "ONE SSD-first predicate: both the budget site and the spill site ask it" {
+    // Scan, across both files. The mode used to be spelled out at each site
+    // (`ssdFirstCapable() and ssdFirstEnabled()`), which is exactly how the
+    // disk conjunct came to be missing from one of them. Needles split so
+    // this test's own source cannot satisfy them.
+    const t = std.testing;
+    const pred = "ssdFirst" ++ "Active(";
+    const old_form = "ssdFirst" ++ "Enabled()";
+
+    const srv = @embedFile("server.zig");
+    const budget = declBody(srv, "fn ssdFirstBudgetForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, budget, pred) != null);
+    try t.expect(std.mem.indexOf(u8, budget, old_form) == null);
+
+    const sch = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sch, "ssd_first = prefix_cache_mod." ++ pred) != null);
+    // The raw env reader survives only inside the predicate itself and the
+    // warm-up call; no OTHER site may spell the mode out by hand.
+    const pc = @embedFile("prefix_cache.zig");
+    const decl = declBody(pc, "pub fn ssdFirstActive(") orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, decl, "ssdFirstCapable()") != null);
+    try t.expect(std.mem.indexOf(u8, decl, old_form) != null);
+    try t.expect(std.mem.indexOf(u8, decl, "has_disk") != null);
+}
+
+test "an auto boot advertises the session the SSD-first budget floor was billed for" {
+    // The load-time bill and the pinned context are ONE session, and until this
+    // they were two numbers on the SSD-first arm.
+    //
+    // `ssdFirstSessionTokensNow` billed the session with `cache_reserve = 0`
+    // (its resident entry IS the live KV, so the cache reserves nothing beyond
+    // the session), the budget floored at that session's KV, and then
+    // `pinAutoContext` -> `computeMemoryContext` sized the ADVERTISED context
+    // against `CTX_SIZING_CACHE_RESERVE`. Same box, same instant, two reserves,
+    // two sessions — and an agent CLI reads the smaller one out of
+    // `/v1/models` once and budgets against it for the whole session while the
+    // cache floor holds RAM for the larger one.
+    //
+    // THE RELATION, stated exactly (the 85% memory margin lives inside
+    // `autoContextFrom`, and the checkpoint cap is applied AFTER it,
+    // un-margined — see `safeAutoContext`):
+    //
+    //   advertised = autoContextFrom(
+    //       safeContextForBudget(ceiling, active,
+    //                            CTX_SIZING_CACHE_RESERVE + transient,
+    //                            per_tok, 0),
+    //       ctx_cap)
+    //
+    // and the billed session must be that same value, for the same ceiling,
+    // the same live memory and the same prefill chunk.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    // Auto boot: nothing explicit, nothing pinned yet (the resolver runs during
+    // the load, before `pinAutoContext`).
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+
+    // The chunk the sizer resolves, so the two sides differ in the RESERVE and
+    // in nothing else.
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, chunk);
+
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
+        cfg.contextCap(),
+    );
+    const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    try t.expectEqual(advertised, billed);
+
+    // The defect, as the number it was: sizing the session against a reserve of
+    // its own hands back a BIGGER session than the box will ever be asked to
+    // serve, so the floor holds KV for tokens nobody can send.
+    // Under the one-copy history bill this box fits the checkpoint's whole
+    // context cap on BOTH arms (old and new both clamp to 1,048,576), so the
+    // disagreement is shown on a TIGHTER box where the cap does not bind —
+    // the arithmetic is the same, only the ceiling moves.
+    const tight: u64 = active + 24_000 * MiB;
+    const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
+    try t.expect(old_billed > billed_t);
+    // Both are real contexts — this is a disagreement, not a collapse, which is
+    // why it survived: neither number looks wrong on its own.
+    try t.expect(billed > 500_000);
+    try t.expect(billed_t > 300_000);
+
+    // ...and what the disagreement costs, in the one place it lands: the budget
+    // floor is one session's KV, so an over-billed session over-reserves RAM
+    // for a context the server never advertises.
+    const idle: u64 = 4 * 1024 * MiB;
+    const floor_now = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t), transient);
+    const floor_old = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, old_billed), transient);
+    try t.expect(floor_old > floor_now);
+    try t.expectEqual(per_tok *| @as(u64, old_billed - billed_t), floor_old - floor_now);
+}
+
+test "an explicit --ctx-size boot never consults the session reserve" {
+    // The deployed shape. `--ctx-size` wins in the resolver's FIRST branch and
+    // `pinAutoContext`/`getEffectiveContextLength` return it before any sizing
+    // runs, so changing what the auto arm reserves cannot move it by a byte.
+    // Asserted as INVARIANCE in the reserve rather than against a recorded
+    // constant: that is the property the change has to preserve.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+
+    server_config.max_context_size = 262_144;
+    cfg.pinned_context = 0;
+    // Every ceiling / live-memory / chunk combination the box can present, and
+    // the operator's number regardless.
+    for ([_]u64{ 0, 40_000 * MiB, 109_395 * MiB, 900_000 * MiB }) |ceiling| {
+        for ([_]u64{ 0, 69_827 * MiB }) |active| {
+            for ([_]u32{ 512, 1024, 4096, 8192 }) |chunk| {
+                try t.expectEqual(@as(u32, 262_144), ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+            }
+        }
+    }
+    // The reserve argument itself is unreachable on this path: same answer with
+    // no reserve, with the constant, and with an absurd one.
+    for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
+        try t.expectEqual(
+            @as(u32, 262_144),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
+        );
+    }
+
+    // A pinned context (a second load of an already-sized model) is the same
+    // story one branch down.
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 131_072;
+    try t.expectEqual(@as(u32, 131_072), ssdFirstSessionTokensNow(&cfg, kv_bits, 109_395 * MiB, 69_827 * MiB, 4096));
+}
+
+test "the session bill and the advertised context read ONE reserve and ONE margin" {
+    // Scan. The equality above is only stable if neither side can respell the
+    // relation, and the two sides live in different functions — which is
+    // exactly how one of them drifts. Needles split so this scan's own source
+    // cannot satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    // ONE reserve, at all three sites: both load-time arms and the sizer. It
+    // is now a RESOLVER rather than the bare constant (PR #363's arch gate:
+    // the ask-independent constant is the gated arch's, and every other arch
+    // keeps a93e2c0's raw ask). Three sites reading one FUNCTION is the
+    // stronger form of the same rule — the gate cannot be applied to two of
+    // them and forgotten at the third, which is exactly the drift this scan
+    // exists for.
+    const reserve = "ctxSizingCache" ++ "Reserve(config)";
+
+    for ([_][]const u8{
+        "fn ramFirstContextForLoad(",
+        "fn ssdFirstSessionTokensNow(",
+        "fn computeMemoryContext(",
+    }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        std.testing.expect(std.mem.indexOf(u8, body, reserve) != null) catch |err| {
+            std.debug.print("site does not reserve through the shared resolver: {s}\n", .{decl});
+            return err;
+        };
+        // ...and none of them SPELLS the ask or the resolved budget itself.
+        // The ask now has exactly one reader (`legacyCtxSizingCacheReserve`,
+        // a93e2c0 parity) and the resolved budget still has none: reading the
+        // ask is live check #6, which a93e2c0 shipped and the gate preserves
+        // off qwen4_exp; reading the BUDGET is audit S6's one-step loop, which
+        // is a different bug and stays closed on both arms.
+        try t.expect(std.mem.indexOf(u8, body, "resolvedPrefixCache" ++ "Mem()") == null);
+        try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem" ++ "_bytes") == null);
+    }
+
+    // The resolver holds both arms, and the constant is defined once.
+    const res_body = declBody(src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, res_body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
+    try t.expect(std.mem.indexOf(u8, res_body, "legacyPrefixCache" ++ "Ask()") != null);
+    // The ask is read in ONE place, and it is not the resolved budget.
+    const legacy_body = declBody(src, "fn legacyPrefixCache" ++ "Ask(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, legacy_body, "resolvedPrefixCache" ++ "Mem()") == null);
+
+    // ONE margin: both consumers apply it through the shared helper rather than
+    // spelling `safeAutoContext` + the cap themselves, so the 85% and the
+    // un-margined checkpoint cap cannot land in one and not the other.
+    const helper = "autoContext" ++ "From(";
+    for ([_][]const u8{ "fn autoContextFor(", "pub fn resolvedContextForLoad(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, helper) != null);
+        try t.expect(std.mem.indexOf(u8, body, "safeAuto" ++ "Context(") == null);
+    }
+    // The helper is the only place the two steps are written down.
+    var defs: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "fn autoContext" ++ "From(")) defs += 1;
+    }
+    try t.expectEqual(@as(usize, 1), defs);
+}
+
+test "an explicit --ctx-size keeps the load-time context byte-identical" {
+    // The manual path must not move: the operator's number wins in the
+    // resolver's FIRST branch, before any memory arithmetic runs.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = 20_736;
+    // Asserts the RETURN VALUE, not a downstream number: `explicit_ctx` is the
+    // resolver's FIRST early return and never reaches the sizer, so this stays
+    // true if the sizing arithmetic changes underneath it. Every memory
+    // argument is deliberately hostile — zero ceiling, huge reserves, and a
+    // `ctx_cap` BELOW the answer — and the operator's number still wins.
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
+    // A pinned context wins next, over any sizing.
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
+}
+
+test "the RAM-first clamp's context comes from the shared resolver, ask-independent" {
+    // Scan. Two claims: the clamp reads the resolver rather than the
+    // placeholder accessor, and the reserve it sizes against cannot be derived
+    // from the ask (that is the same loop one level in). Needles split so this
+    // scan's own source cannot satisfy them.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    const resolver = "ramFirstContextFor" ++ "Load(config, kv_bits, active_mem, pinned)";
+    try t.expect(std.mem.indexOf(u8, body, resolver) != null);
+
+    // The wrapper passes the SHARED RESOLVER, never `requested`. (It passed
+    // the bare constant until PR #363's arch gate made the reserve per-arch;
+    // the invariant is unchanged — the wrapper must not respell the reserve —
+    // and `requested` is still the thing it may never touch, because a reserve
+    // derived from THIS call's ask is the loop, on either arm.)
+    const wrap = declBody(src, "fn ramFirstContextForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, wrap, "ctxSizingCache" ++ "Reserve(config)") != null);
+    try t.expect(std.mem.indexOf(u8, wrap, "CTX_SIZING_CACHE_RESERVE") == null);
+    try t.expect(std.mem.indexOf(u8, wrap, "requested") == null);
+    try t.expect(std.mem.indexOf(u8, wrap, "resolvedPrefixCache" ++ "Mem()") == null);
+    // ONE shared resolver: both arms reach it.
+    try t.expect(std.mem.indexOf(u8, wrap, "resolvedContextFor" ++ "Load(") != null);
+}
+
+test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
+    // The ceiling inversion. Same 10 GB ask, same pack, only the Metal ceiling
+    // differs, both PRE-fix and both live:
+    //   default ceiling            -> [hot-cache] budget clamped 10240 -> 3873 MB
+    //   iogpu.wired_limit_mb 120000 -> [hot-cache] budget clamped 10240 -> 1076 MB
+    // A strictly better machine got a 3.6x smaller cache, because the extra
+    // headroom bought the sizer a wider rung and the rung's reserve grew
+    // faster than the headroom did. The cache is the residual claimant, so it
+    // paid for the upgrade.
+    //
+    // On an arch that re-bills its width per request, the load-time reserve
+    // only has to cover the narrowest forward the box can be asked for — every
+    // request prices its own real width at admission against live memory, and
+    // `fitsAfterEviction` can reclaim cache to admit it. So the clamp bills the
+    // ladder floor and the budget becomes monotone in the CEILING too.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const weights: u64 = 70 * GiB;
+    const ctx_tokens: u64 = 1_048_576;
+    const floor_rung = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+
+    // Gate ON: the clamp reserves at the floor whatever rung the sizer picked.
+    const low = planHotCache(&cfg, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    const high = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(floor_rung, low.reserve_chunk);
+    try t.expectEqual(floor_rung, high.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, floor_rung), low.reserve);
+    // THE BAR: a bigger ceiling never buys a smaller cache.
+    try t.expect(high.budget >= low.budget);
+    // And the sizer's rung is still reported for the boot log — the two
+    // numbers are different questions and the log names both.
+    try t.expect(low.chunk >= low.reserve_chunk);
+
+    // Monotone across a ceiling sweep, not just at two points.
+    var prev: u64 = 0;
+    var mb: u64 = 24_000;
+    while (mb <= 60_000) : (mb += 1_000) {
+        const p = planHotCache(&cfg, kv_bits, weights + mb * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+        try t.expect(p.budget >= prev);
+        prev = p.budget;
+    }
+
+    // An explicit --prefill-chunk is billed as-is: the operator pinned a width
+    // and every request runs it, so the promise is that width, not the floor.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
+    generate_mod.prefill_chunk_override = 8192;
+    generate_mod.prefill_chunk_explicit = false;
+    try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), pinned.reserve);
+
+    // Gate OFF: today's behaviour — the clamp reserves at the sizer's rung,
+    // because there is no per-request re-bill to fall back on.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off = planHotCache(&cfg, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(off.chunk, off.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, off.chunk), off.reserve);
+    per_request_chunk_override = null;
+
+    // An arch without the gate is untouched by any of this.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const neutral = planHotCache(&other, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(neutral.chunk, neutral.reserve_chunk);
+}
+
+test "the per-token widths the request chooser is built on" {
+    // Pin the two constants every number in the story is derived from. If a
+    // config field renames or `attnCacheLayerCount` changes its mind, the
+    // tests below would still pass against a different machine — this one
+    // would not.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    try t.expectEqual(@as(u32, 12), cfg.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
+    // One copy of the history (3,840) + the f32 score bank (1,536).
+    transformer_mod.qsa_history_share_override = true;
+    defer transformer_mod.qsa_history_share_override = null;
+    try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
+    try t.expectEqual(@as(u64, 1_536), cfg.qsaScoreBankBytesPerToken());
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
+    // And therefore the 1M context bill the load-time clamp subtracts.
+    try t.expectEqual(@as(u64, 18_432 * (1 << 20)), (13_056 + 5_376) * @as(u64, 1_048_576));
+}
+
+test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
+    // The user's bar: `--ctx-size 1048576` with no chunk or cache flags must
+    // still prefill ordinary prompts at the wide chunk. Load-time sizing
+    // cannot do it — it has to reserve for the whole configured session, which
+    // at 1M is 20,736 MiB of a 28,909 MiB serving budget, leaving rung 1024
+    // for every prompt of the boot. The request in front of the server is not
+    // a 1M session, and the admission bill is the estimator that knows it.
+    //
+    // MEASURED bills for this shape at `available` = 28,909 MiB (ceiling minus
+    // the 69 GB pack), in MB, from the estimator itself:
+    //   seq      w4096   w2048   w1024   w512
+    //   4,096     3981    2441    1521    1136
+    //   300,000  12743   11249   10351    9978
+    //   384,000  15024   13529   12632   12258
+    //   1,048,576 33027  31532   30635   30261
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const available: u64 = 28_909 * MiB;
+    const pin = cfg.pinned_prefill_chunk;
+
+    // An ordinary agent prompt, and the 384k the judge actually ran: both get
+    // 4096 — the width the load-time pin could never hand out.
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    // 4x the pinned width, and the whole point of the change.
+    try t.expect(4096 > pin);
+
+    // The full 1M context: under the two-copy history bill it did not fit on
+    // this box at ANY width (30,261 MiB at the ladder floor against 28,909
+    // available) and the chooser bottomed out at 512 for admission to refuse.
+    // The one-copy bill (the commit handoff, `statePerTokenBilled` 5,376
+    // B/tok) takes 2,304 B/tok off — ~2,304 MiB at 1M — and the same prompt
+    // now fits at 2048, not at 4096. Honest either way: the chooser hands out
+    // the widest rung the estimator can afford, and the bill is the residency.
+    const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0, .{});
+    try t.expectEqual(@as(u32, 2048), full);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 2048, .{}) <= available);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 4096, .{}) > available);
+
+    // The invariant behind all of it, true of any checkpoint's ladder: a
+    // shorter prompt holds less KV, so it can afford at least as wide a
+    // forward. Load-time sizing has ONE width for every prompt.
+    var prev: u32 = 0;
+    var i: usize = 0;
+    const seqs = [_]u64{ 1_048_576, 384_000, 300_000, 60_000, 4096 };
+    while (i < seqs.len) : (i += 1) {
+        const w = chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, 0, .{});
+        try t.expect(w >= prev);
+        prev = w;
+    }
+}
+
+test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
+    // The rule is "widest that fits", not "wide when there is lots of room".
+    // Priced at the exact bill of a width, that width must come out; one byte
+    // under it, a strictly narrower one must — except at the bottom of the
+    // ladder, where there is nothing narrower and the floor is the answer.
+    // Walks the config's OWN ladder, so it pins the RULE rather than a
+    // constant.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const pin = cfg.pinned_prefill_chunk;
+    const floor_width: u32 = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    var prev_width: u32 = 0;
+    var distinct: usize = 0;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        const width = widthForRung(&cfg, seq, rung);
+        if (width == prev_width) continue; // rungs 8192 and 4096 both forward at 4096
+        prev_width = width;
+        distinct += 1;
+        const bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, width, .{});
+        // Exactly affordable: this width comes out.
+        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill, pin, 0, .{}));
+        // One byte short: strictly narrower, unless this IS the narrowest.
+        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill - 1, pin, 0, .{});
+        if (width == floor_width) {
+            try t.expectEqual(floor_width, under);
+        } else {
+            try t.expect(under < width);
+        }
+    }
+    // The ladder has to offer real choices or none of the above means anything.
+    try t.expect(distinct >= 4);
+
+    // Nothing fits at all: the ladder floor, never 0 and never the load-time
+    // pin — admission decides whether it runs, the width just has to be the
+    // smallest bill this request can be asked for.
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}));
+}
+
+test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const roomy: u64 = 200 * (@as(u64, 1) << 30);
+    const pin = cfg.pinned_prefill_chunk;
+
+    // An explicit `--prefill-chunk` wins outright and is billed as-is — the
+    // defect-B precedence, carried into the per-request path.
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 2048, .{}));
+    // ...even when nothing would fit.
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, 2048, .{}));
+
+    // Kill switch: the load-time pin, unchanged, for every request.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    per_request_chunk_override = null;
+
+    // Another arch keeps the load-time pin exactly — the gate is an opt-in of
+    // one, and nothing was measured anywhere else.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    try t.expect(!other.perRequestPrefillChunk());
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expect(cfg.perRequestPrefillChunk());
+}
+
+test "admission tries the ladder DOWN before refusing: a prompt that fits only at 512" {
+    // Gap closed in the same pass: the scheduler chose a per-request width but
+    // the PROBE still priced the load-time pin, so a prompt that fits at the
+    // ladder floor and nothing wider was refused by name — a 400 — for a
+    // forward that would never have run.
+    //
+    // `prefillAdmissionBill` reads live MLX memory, so the bar here is the
+    // pure pair it composes: the chooser picks the width, `prefillNeededAtChunk`
+    // prices it, and `fits` is `needed <= available`. 384k is the judge's own
+    // prompt length; its measured bills are 12,632 MB at w1024 and 12,258 at
+    // w512, so a budget of exactly the floor's bill is the case.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 384_000;
+    const pin = cfg.pinned_prefill_chunk;
+    const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+    const pin_width = widthForRung(&cfg, seq, pin);
+
+    // The premise: the load-time pin is a strictly wider — and dearer —
+    // forward than the ladder floor. Without it there is no gap to close.
+    try t.expect(pin_width > floor_width);
+    const at_floor = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{});
+    const at_pin = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width, .{});
+    try t.expect(at_floor < at_pin);
+
+    // Exactly enough for the floor width and not a byte more: it fits ONLY
+    // there, at the very bottom of the ladder.
+    const available = at_floor;
+
+    // Gate ON: the chooser walks down, lands on the floor, and the request is
+    // admitted at a width the machine can actually run.
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{}) <= available);
+
+    // Gate OFF: the load-time pin, priced as-is, does not fit — the named 400
+    // this used to fire every time.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width, .{}) > available);
+    per_request_chunk_override = null;
+
+    // An explicit `--prefill-chunk` keeps today's behaviour on purpose: the
+    // operator chose the width, so a refusal at that width is the honest
+    // answer rather than a silent downgrade.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    const forced = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, explicitPrefillChunk(), .{});
+    try t.expectEqual(@as(u32, 4096), forced);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, forced, .{}) > available);
+}
+
+test "the refusal names the width it tried, and one rule picks it everywhere" {
+    // A refusal quotes the number it COMPARED — and that number is meaningless
+    // without the width it describes, now that the width is per request. Both
+    // refusal surfaces carry `bill.chunk`, which is the width the bill was
+    // actually taken at.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const chooser = "chooseRequest" ++ "PrefillChunk(";
+
+    // SPLIT needles (audit B0c). These four were unsplit and this test sits
+    // ABOVE the lines it checks, so `indexOf` matched the test's own literal
+    // every time and all four assertions were unconditionally true — they
+    // could not have gone red on the regression they exist for. Two lines up,
+    // `chooser` was already split correctly, so the mitigation was known here
+    // and missed.
+    try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} " ++ "({s})") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, width_note, bill." ++ "available / mb") != null);
+    // The label is qualified by the arch, not asserted as a bare claim (N1).
+    try t.expect(std.mem.indexOf(u8, src, "perRequestPrefillChunkEnabled(config)) \"the narrowest width " ++ "tried\"") != null);
+    try t.expect(std.mem.indexOf(u8, src, "(KV+working+margin) at prefill " ++ "chunk {d}") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, needed_mb, bill.chunk, " ++ "avail_mb") != null);
+
+    // ONE rule, both sides. `prefillFitsNow` (the inference-thread probe, and
+    // the connection thread's guard through the same bill) and
+    // `requestPrefillChunkNow` (what the scheduler pins with) must reach the
+    // same chooser — a probe that refuses at a width the forward would never
+    // run is the bug this closes, in the other direction.
+    for ([_][]const u8{ "pub fn prefillAdmissionBill(", "pub fn requestPrefillChunkNow(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, chooser) != null);
+    }
+    // And `prefillFitsNow` is that bill, not a second opinion.
+    const probe = declBody(src, "pub fn prefillFitsNow(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, probe, "prefillAdmission" ++ "Bill(") != null);
+
+    // ONE definition — a second one is a second rule. Counted at line starts:
+    // the sibling scan below names this same header in a string literal, and a
+    // counter that cannot tell a declaration from a mention of one reports 2.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ chooser));
+}
+
+test "the per-request rung is priced by the SAME estimator that admits it" {
+    // A chooser with its own arithmetic is #126 waiting to happen: it would
+    // run BEFORE the estimator that knows better and therefore BE the
+    // estimator, and the two would differ by the chunk term — the biggest one.
+    // Both must go through `prefillNeededAtChunk`, and there must be exactly
+    // one of those. Needles split so this scan's own source cannot satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const est = "prefillNeeded" ++ "AtChunk(";
+
+    for ([_][]const u8{ "pub fn chooseRequestPrefillChunk(", "pub fn prefillAdmissionBill(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, est) != null);
+    }
+    // Exactly one definition — a second one is a second bill.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ est));
+
+    // And the width the scheduler pins is the one this chooser returned.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill_chunk,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "const pick = prefill_request_chunk orelse break :blk pin;") != null);
+    // The hook is installed beside the admission one, so a server that admits
+    // also chooses; a host without it keeps the load-time pin. Read inside
+    // `serve`'s OWN body: a bare `indexOf(src, ...)` finds this test's own
+    // copy of the literal, so it stayed green with the install deleted (N15).
+    const serve_body = declBody(src, "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_request_chunk = &requestPrefillChunk" ++ "Now;") != null);
+}
+
+test "the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width" {
+    // Audit N5, the composition the scheduler runs: `chooseRequestPrefillChunk`
+    // is asked once before the eviction pass and once after, and
+    // `scheduler.postEvictionPrefillChunk` decides which reading runs — the
+    // SECOND one, the one taken against live memory (external review of PR
+    // #363; it shipped taking the max, which widened exactly when the memory
+    // it was widening onto had gone). The pure halves are tested in their own
+    // files; this pins that the two compose to the right answer, including for
+    // the archs that never opted in.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 383_000;
+    const pin: u32 = 512;
+    const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    // Pre-eviction: the hot cache is holding everything, nothing on the ladder
+    // fits and the chooser hands back the floor. That is the width admission
+    // is billed at and the width the prefill used to run for its whole length.
+    const admitted = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
+    try t.expectEqual(floor_width, admitted);
+
+    // Post-eviction, with the cache's bytes ACTUALLY returned: a wider rung
+    // fits and the request runs at it.
+    const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096), .{});
+    const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    try t.expect(reasked > admitted);
+    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked).width);
+
+    // No eviction pass: the single ask stands, whatever it was.
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted).width);
+
+    // And the reverse reading — memory moved between the two asks, so the
+    // ladder now affords only the floor — runs at the FLOOR, not at the width
+    // admission was billed at. Live memory is what the forward meets.
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(reasked, admitted).width);
+
+    // A non-qwen4 arch is untouched end to end: the chooser returns the
+    // load-time pin against ANY availability, so both readings are the pin and
+    // the clamp is a no-op. Same for the gate's kill switch on qwen4 itself.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
+    const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    try t.expectEqual(pin, other_pre);
+    try t.expectEqual(pin, other_post);
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post).width);
+
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
+    const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post).width);
+}
+
+test "admissionLogLevel: free on the first request after a load and at the edge, quiet in the middle" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+
+    // A fresh load is the reading that says what "normal" is for this
+    // checkpoint on this box — always free, however roomy the machine.
+    try t.expectEqual(log.Level.info, admissionLogLevel(1 * GiB, 100 * GiB, true));
+
+    // Inside 10% of what is available: the next request is the one that
+    // evicts or refuses, so this is where the operator needs the numbers.
+    try t.expectEqual(log.Level.info, admissionLogLevel(95 * GiB, 100 * GiB, false));
+    try t.expectEqual(log.Level.info, admissionLogLevel(120 * GiB, 100 * GiB, false)); // already over
+    // The boundary itself: 10*needed > 9*available, so exactly 0.9 is quiet
+    // and one byte past it talks.
+    try t.expectEqual(log.Level.debug, admissionLogLevel(90 * GiB, 100 * GiB, false));
+    try t.expectEqual(log.Level.info, admissionLogLevel(90 * GiB + 1, 100 * GiB, false));
+
+    // A roomy machine says nothing at info — one line per request forever is
+    // a log nobody greps.
+    try t.expectEqual(log.Level.debug, admissionLogLevel(1 * GiB, 100 * GiB, false));
+
+    // An unknown ceiling is inside the band by construction and reports.
+    try t.expectEqual(log.Level.info, admissionLogLevel(1 * GiB, 0, false));
+
+    // No overflow on the way to the comparison.
+    try t.expectEqual(log.Level.info, admissionLogLevel(std.math.maxInt(u64), 1, false));
+    try t.expectEqual(log.Level.debug, admissionLogLevel(1, std.math.maxInt(u64), false));
+}
+
+test "admissionVerdict names the same three arms the guard acts on" {
+    const t = std.testing;
+    // Fits outright.
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(.{ .needed = 10, .available = 20 }));
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(.{ .needed = 20, .available = 20 }));
+    // Fits once the cache gives back what it can PROVE it will return —
+    // `reclaimable`, never `evictable`.
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(.{ .needed = 30, .available = 20, .reclaimable = 10 }));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(.{ .needed = 30, .available = 20, .evictable = 1000, .reclaimable = 0 }));
+    // Does not fit at all.
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(.{ .needed = 100, .available = 20, .reclaimable = 10 }));
+
+    try t.expectEqualStrings("admit", AdmissionVerdict.admit.name());
+    try t.expectEqualStrings("evict", AdmissionVerdict.evict.name());
+    try t.expectEqualStrings("refuse", AdmissionVerdict.refuse.name());
+}
+
+test "the admission line and the refusal quote the SAME bill, field for field" {
+    // The tight-admission path used to log nothing on an ADMITTED request:
+    // the numbers only appeared once the request had already been refused, so
+    // there was no way to watch the machine walk up to the edge. Adding a line
+    // is only worth it if it names the same numbers the refusal does — a
+    // second estimator call here would be #126 ("a gate that runs BEFORE the
+    // estimator that knows better IS the estimator") in log form, quoting a
+    // bill nobody acted on. Needles ++-split so this scan's own source cannot
+    // satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const guard = declBody(src, "fn checkAttentionMemory(") orelse return error.CallSiteMoved;
+    const emitter = declBody(src, "fn logAdmissionDecision(") orelse return error.CallSiteMoved;
+
+    // ONE bill per request. Both arms read it; neither recomputes it.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, guard, "prefillAdmission" ++ "Bill("));
+    try t.expect(std.mem.indexOf(u8, guard, "logAdmission" ++ "Decision(bill);") != null);
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, emitter, "prefillAdmission" ++ "Bill("));
+
+    // The same four fields, off the same struct, on both sides.
+    inline for (.{ "needed", "available", "reclaimable", "chunk" }) |field| {
+        try t.expect(std.mem.indexOf(u8, emitter, "bill." ++ field) != null);
+        try t.expect(std.mem.indexOf(u8, guard, "bill." ++ field) != null);
+    }
+    // And the refusal's own numbers are aliases of the bill's, not fresh reads.
+    try t.expect(std.mem.indexOf(u8, guard, "const needed = bill." ++ "needed;") != null);
+    try t.expect(std.mem.indexOf(u8, guard, "const available = bill." ++ "available;") != null);
+
+    // The contract line's shape — the operator (and any harness) greps it.
+    try t.expect(std.mem.indexOf(u8, emitter, "[admission] needed={d} MB available={d} MB " ++ "reclaimable={d} MB width={d} verdict={s}") != null);
+
+    // ONE line per REQUEST, so it is emitted from the once-per-request guard
+    // and nowhere else — never from the prefill chunk loop.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "logAdmission" ++ "Decision(bill);"));
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "[admission] " ++ "needed=") == null);
+    const gen = @embedFile("generate.zig");
+    try t.expect(std.mem.indexOf(u8, gen, "[admission] " ++ "needed=") == null);
+
+    // The level check comes BEFORE the formatting: the divisions and the
+    // verdict string are this call's whole cost.
+    const i_check = std.mem.indexOf(u8, emitter, "if (!log." ++ "enabled(level)) return;") orelse return error.CallSiteMoved;
+    const i_fmt = std.mem.indexOf(u8, emitter, "[admission] " ++ "needed=") orelse return error.CallSiteMoved;
+    try t.expect(i_check < i_fmt);
+}
+
+test "the post-load admission line is armed by the registry, and consumed once" {
+    // "First request after a load" needs an event, not a timer. The registry's
+    // ONE ready transition is that event; a second reader (or N connection
+    // threads racing the same first request) must not each get their own
+    // "first", which is why the token is consumed by a compare-and-swap on a
+    // monotone generation rather than by clearing a flag. Needles ++-split so
+    // this scan cannot satisfy itself.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const reg = @embedFile("model_registry.zig");
+
+    // Armed at the ONE place a model becomes resident. `markReadyLocked` is a
+    // method, so its closing brace is indented and `declBody` (column-0 only)
+    // would swallow the rest of the struct — bound the window by hand.
+    const ready_at = std.mem.indexOf(u8, reg, "\n    pub fn markReadyLocked(") orelse return error.CallSiteMoved;
+    const ready_end = std.mem.indexOfPos(u8, reg, ready_at + 1, "\n    }\n") orelse return error.CallSiteMoved;
+    const ready = reg[ready_at..ready_end];
+    try t.expect(std.mem.indexOf(u8, ready, "load_generation" ++ ".fetchAdd(1, .monotonic)") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, reg, "load_generation" ++ ".fetchAdd("));
+
+    // Consumed by a CAS, not a load-then-store: two threads must not both win.
+    const first = declBody(src, "fn firstRequestAfterLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, first, "model_registry_mod.load" ++ "_generation.load(.monotonic)") != null);
+    try t.expect(std.mem.indexOf(u8, first, "cmpxchg" ++ "Strong(last, gen") != null);
+    try t.expect(std.mem.indexOf(u8, first, ".store(") == null);
+
+    // And it is CALLED exactly once — the level function's third input and
+    // nothing else's. Keyed on the call's closing `);` so the declaration's own
+    // header is not counted as a use.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "firstRequest" ++ "AfterLoad());"));
+}
+
+/// Iterate the PRODUCTION lines of a Zig source: every line outside a
+/// top-level `test "..." { ... }` block. Twin of `model.zig`'s — duplicated
+/// rather than exported because it is test scaffolding, and neither file
+/// should grow a production dependency on the other for it. See that copy for
+/// why the `indexOf("\ntest \"")` window it replaces is unsound here.
+const ProdLineScan = struct {
+    src: []const u8,
+    pos: usize = 0,
+    in_test: bool = false,
+
+    fn next(self: *ProdLineScan) ?[]const u8 {
+        while (self.pos < self.src.len) {
+            const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len;
+            const line = self.src[self.pos..end];
+            self.pos = end + 1;
+            if (self.in_test) {
+                if (std.mem.eql(u8, line, "}")) self.in_test = false;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "test \"")) {
+                self.in_test = true;
+                continue;
+            }
+            return line;
+        }
+        return null;
+    }
+};
+
+test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" {
+    // `prefixCacheMemForLoad` clamps, but the clamped value used to reach only
+    // `initWithMem`: the auto-context sizer and the ANE gate kept reserving
+    // the raw `--prefix-cache-mem`, so three places disagreed about how many
+    // bytes the cache would ever hold. Needles split so this scan's own source
+    // cannot satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const needle = "prefix_cache_mem" ++ "_bytes";
+    const accessor = "resolvedPrefix" ++ "CacheMem()";
+
+    // PRODUCTION lines only. The rule is about the RESERVES that used to read
+    // the ask instead of the accessor; a test that deliberately drives the
+    // global (setting it, or saving and restoring it) is exercising the
+    // contract, not bypassing it.
+    //
+    // NOT `src[0 .. indexOf("\ntest \"")]`. That is what this scan was narrowed
+    // to a round ago, and in server.zig the first test is at line 104 of
+    // 24,129 — so the loop below ran ZERO times, the guard was dead, and the
+    // `// legacy_ask_read` marker deliberately placed on `legacyPrefixCacheAsk`
+    // so this scan would exempt it by name became unreachable dead annotation
+    // (audit addendum 4, item 7). `ProdLineScan` skips top-level `test` blocks
+    // instead, which reaches every production line.
+    //
+    // The counters below are the point: a scan whose window collapses reports
+    // "no violations" forever, and only a hit count can tell that apart from a
+    // real pass. This is the same failure the arch-literal scan in `model.zig`
+    // had, and both were introduced in the same round.
+    var scan = ProdLineScan{ .src = src };
+    var inspected: usize = 0;
+    var exempted_by_name: usize = 0;
+    while (scan.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) == null) continue;
+        inspected += 1;
+        const trimmed = std.mem.trim(u8, line, " \t");
+        // The declaration, the accessor's own fallback, and prose.
+        if (std.mem.startsWith(u8, trimmed, "///")) continue;
+        if (std.mem.startsWith(u8, trimmed, "//")) continue;
+        if (std.mem.startsWith(u8, trimmed, "pub var " ++ needle)) continue;
+        if (std.mem.indexOf(u8, trimmed, "hot_cache_mem_resolved") != null) continue;
+        // The accessor's own fallback. Audit S5 moved the global behind an
+        // atomic, so the line that returns the ask names the SENTINEL rather
+        // than the global — the exemption has to follow it, or the accessor
+        // convicts itself and the scan can never be green.
+        if (std.mem.indexOf(u8, trimmed, "HOT_CACHE_MEM_" ++ "UNRESOLVED") != null) continue;
+        // The ONE deliberate read: `legacyPrefixCacheAsk` reproduces a93e2c0's
+        // context-sizing reserve AND its prefill-pin hot-cache term for every
+        // arch outside the long-context gate, and a93e2c0 billed the ASK.
+        // Exempted BY NAME rather than by shape, so a second bypass cannot
+        // inherit the exemption.
+        if (std.mem.indexOf(u8, trimmed, "legacy_ask" ++ "_read") != null) {
+            exempted_by_name += 1;
+            continue;
+        }
+        // A line that names the ask AND calls the accessor in one expression is
+        // COMPARING the two — that is the fallback contract, which is the one
+        // thing that has to read both. A bypass reads the ask INSTEAD of the
+        // accessor and so can never look like this.
+        if (std.mem.indexOf(u8, trimmed, accessor) != null) continue;
+        std.debug.print("unmediated read of the hot-cache ASK: {s}\n", .{trimmed});
+        return error.UnmediatedAskRead;
+    }
+    // The scan ran, and it reached the line the named exemption is FOR. Both
+    // are load-bearing: `inspected == 0` is the dead-window failure, and
+    // `exempted_by_name == 0` means the one deliberate a93e2c0-parity read
+    // moved or lost its marker, in which case the exemption is no longer
+    // documenting anything.
+    try t.expect(inspected > 0);
+    try t.expectEqual(@as(usize, 1), exempted_by_name);
+
+    // And the two reserves that used to read it now go through the accessor.
+    // The ANE gate still reads the RESOLVED budget — it is asking what the
+    // cache will actually hold. `computeMemoryContext` deliberately does NOT
+    // (audit S6): the context must not move with the budget, or the two
+    // passes form a loop. Different questions, different sources.
+    const gate = declBody(src, "pub fn aneGateHeadroom(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, gate, accessor) != null);
+    const sizer = declBody(src, "fn computeMemoryContext(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, sizer, accessor) == null);
+    // The load site publishes it — otherwise the accessor is a synonym for the ask.
+    try t.expect(std.mem.indexOf(u8, src, "publishResolvedPrefix" ++ "CacheMem(plan.budget);") != null);
+}
+
 /// The largest context this model's per-token footprint fits into RAM right
 /// now, IGNORING the checkpoint's own maximum. Reads live memory.
 fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
@@ -2964,7 +5243,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     //   an unconditional fp16. A `--kv-quant 4` server otherwise reports (and
     //   serves) under a third of the context it can actually hold.
     const kv_bits: u64 = defaultKvBits();
-    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + config.qsaHistoryBytesPerToken();
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + statePerTokenBilled(config);
 
     // `total_ctx = 0` asks boundedPrefillChunk for the UNSHRUNK cap: every
     // branch that narrows the chunk does so for longer contexts, so this is the
@@ -2989,13 +5268,49 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill
         // has to land on top of whatever context we report — reserve both.
-        prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk),
+        // CTX_SIZING_CACHE_RESERVE, not the resolved budget and not the ask.
+        //
+        // This is the root of live check #6 and of audit S6, and the two are
+        // the same bug seen from opposite ends. Reading the ASK let a big
+        // `--prefix-cache-mem` starve the context (60GB ask -> 870-token
+        // advertised context). Reading the RESOLVED budget — the earlier fix —
+        // made that number smaller but turned the pair into a one-step loop
+        // that moves the unsafe way: the clamp bills a context computed
+        // against one reserve, publishes a budget, and this then computes a
+        // BIGGER context against the smaller budget, so the budget was
+        // justified against a session the box no longer serves.
+        //
+        // A CONSTANT closes both: the context is ask-independent, and the two
+        // passes agree by construction because neither depends on the other.
+        // Context is the primary claimant and the cache is the residual — the
+        // same order the prefill chunk follows. It is the server's own
+        // `--prefix-cache-mem` default, so a default boot is unchanged.
+        //
+        // GATED (PR #363): the constant is the better number, and it is also a
+        // different ADVERTISED context on every arch at any ask other than the
+        // 2 GiB default. `ctxSizingCacheReserve` is the one predicate; off the
+        // gate this is a93e2c0's raw ask, so `/v1/models` reports what it
+        // always did.
+        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
         // cap AFTER the safety margin, so a model whose own max is the binding
         // constraint keeps every token of it (see `autoContextFor`).
         0,
     );
+}
+
+/// The cache reserve the context sizer bills, and the ONE place PR #363's
+/// change to it is gated. Gated: the ask-independent constant. Ungated:
+/// a93e2c0's raw `--prefix-cache-mem`.
+///
+/// Both load-time wrappers (`ramFirstContextForLoad`, `ssdFirstSessionTokensNow`)
+/// must pass the SAME value as this: the number they bill is the session the
+/// hot-cache floor is built for, and the number `pinAutoContext` freezes right
+/// afterwards is the session the server ADVERTISES. Two reserves there means
+/// the floor is sized for a session the box is never asked to serve.
+fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
 /// Pure memory model behind checkAttentionMemory. All quantities in bytes,
@@ -3063,7 +5378,98 @@ const PREFILL_RUNTIME_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 /// every 4th layer, so 4 layers' worth is what the peak holds.
 const MOE_PREFILL_COEXIST: u64 = 4;
 
-pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64) u64 {
+/// What a WARM turn ALREADY holds, and the one input that tells the admission
+/// bill a restored prefix from a cold one.
+///
+/// A RAM hot-cache restore hands the slot the entry's KV buffers without
+/// allocating another copy of them: the matched rows are already inside
+/// `mlx_get_active_memory`, so `available` is already net of them and billing
+/// them a second time invents a copy nobody allocates. That is what refused a
+/// 786,707-token warm turn whose own 786,676-token entry was resident (live
+/// 2026-09-05): `needed` was 25,866 MB against 19,032 MB free, of which
+/// ~14.5 GB was KV the restore was about to hand over — bytes that are neither
+/// to be allocated nor, since eviction protects the entry, to be reclaimed.
+///
+/// KV ONLY. The QSA indexer history travels with the restore but is
+/// PRIVATISED on arrival (`restoreQsaHistory` -> `seedCapBuf`, a
+/// `materializedOwnedCopy` or a slice_update into fresh `mlx_zeros`), so the
+/// slot allocates its own and no byte of it is shared. Crediting it was audit
+/// W-2: against the one-copy `statePerTokenBilled` this tree ships, the
+/// history term cancelled outright — ~3.0 GB under-billed at 786k.
+///
+/// The credit is gated on CAPACITY, not on the match alone. Past the
+/// destination buffer's capacity the prefill grows, and a grow allocates the
+/// whole new capacity beside the old one — and the old one belongs to the
+/// protected entry, so it does not go away. A chain extension that outgrows
+/// the entry therefore pays the full buffer and is credited NOTHING for its
+/// KV, which is the honest bill and the direction that ends in a 400 rather
+/// than an uncatchable Metal abort.
+pub const WarmPrefix = struct {
+    /// Prompt rows the hot cache restored (`hot_matched`). 0 = cold.
+    matched_tokens: u64 = 0,
+    /// Tokens of capacity the restored buffers hold right now
+    /// (`KVCache.residentCapacityTokens`). The connection thread cannot see a
+    /// slot's cache and passes 0, which credits nothing — its guard defers the
+    /// warm decision to the inference thread instead (`checkAttentionMemory`).
+    capacity_tokens: u64 = 0,
+    /// Did the restore CHECK OUT its entry (`prefix_cache.checkoutEligible`)?
+    /// Only then are the restored rows the slot's own: everywhere else
+    /// `KVCache.restore` is a refcount SHARE, the entry keeps its second
+    /// reference, `array::is_donatable()` fails and the turn's very first
+    /// `writeAtOffset` privatises the ENTIRE prefix through
+    /// `SliceUpdate::eval_gpu` -> `copy_gpu` (the restore-by-move story). A
+    /// shared restore therefore allocates exactly what the cold bill charges,
+    /// and crediting it is an under-bill on a path whose failure mode is an
+    /// uncatchable Metal abort (audit B-A3). Assigned from restore-move's OWN
+    /// predicate — never re-derived from its conjuncts — so the two decisions
+    /// cannot drift apart.
+    will_donate: bool = false,
+
+    /// PURE: rows of KV this request will NOT allocate, because the restore
+    /// already handed it the buffer holding them. All-or-nothing on the
+    /// capacity gate, and never more than the reservation itself.
+    pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
+        // A restore that did not check out SHARES; a shared prefix is copied
+        // on the first append, so its rows really are allocated again.
+        if (!self.will_donate) return 0;
+        if (self.matched_tokens == 0) return 0;
+        if (reserved > self.capacity_tokens) return 0;
+        return @min(self.matched_tokens, reserved);
+    }
+};
+
+/// Per-REQUEST bytes that scale with the PROMPT rather than the chunk, and
+/// that no per-token term above can see. Passed as one struct so a new term
+/// is a named field with a default instead of a 15th positional `0` in forty
+/// call sites.
+pub const PrefillRequestTerms = struct {
+    /// Cache capacity RESERVED at admission beyond `seq * kv_per_tok`: the
+    /// generation headroom (`max_tokens`) plus a chunk of slack that
+    /// `KVCache.reserve_tokens` pre-allocates so no buffer GROWS during the
+    /// prefill (issue #353 — a grow allocates the whole new capacity beside
+    /// the old one and both live until the chunk's eval). Bill it once here;
+    /// the alternative is billing a second copy of everything accumulated so
+    /// far, which halves the admissible context on every arch.
+    reserved_kv_bytes: u64 = 0,
+    /// Per-request state the arch keeps OUTSIDE the KV cache and grows with
+    /// the prompt, at its RESERVED size — today the qwen4_exp QSA indexer key
+    /// history and pooled block bank (`qsaHistoryBytesPerToken`), which the
+    /// ONE caller used to add AFTER the safety margin.
+    state_bytes: u64 = 0,
+    /// SSM checkpoints the prefill has TAKEN and is still holding when it
+    /// reaches its last chunk (`retainedSsmCheckpointBytes`).
+    checkpoint_bytes: u64 = 0,
+    /// Bytes of the KV terms above that are ALREADY resident in the buffer the
+    /// restore handed this slot (`WarmPrefix`), so `mlx_get_active_memory` —
+    /// and therefore `available` — already counts them. KV only: `state_bytes`
+    /// is re-allocated on a warm turn (audit W-2), so it is never credited.
+    /// Subtracted ONCE, at the one site in `prefillMemoryNeeded` (scan-pinned):
+    /// the other failure mode of this rule is crediting the same prefix twice,
+    /// once here and once as reclaimable cache.
+    shared_resident_bytes: u64 = 0,
+};
+
+pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
@@ -3088,7 +5494,12 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
     // already dominates.
     const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
-    return (kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4;
+    const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
+        scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+    // The ONE place a warm turn's resident, refcount-shared rows leave the
+    // bill. Saturating, and inside the 5/4 so the margin describes what is
+    // actually about to be allocated.
+    return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
 
 /// deepseek_v4 sibling of `prefillMemoryNeeded`: bills what `extendState`
@@ -3199,66 +5610,1108 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// `lm` is the resolved model: an embedded-engine model skips this guard
 /// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
 /// every current and future call site is covered without per-site gating.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
-    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
-    const heads = config.num_attention_heads;
-    if (heads == 0) return true; // unknown architecture, skip check
+/// Per-token bytes of the arch's own out-of-cache request state AS BILLED:
+/// the QSA indexer history at the number of copies a live slot HOLDS, plus
+/// the f32 block-score bank the slot keeps beside it.
+///
+/// ONE copy on the default arm: the history lives in the slot's capacity
+/// buffer (`qsaAppendKeys` -> `capBufAppend`, grown ONCE by the reservation),
+/// and the newest SSM checkpoint takes a slice VIEW of that buffer at COMMIT
+/// (`transformer.handoffQsaHistoryToLatest`, the slot dying next) — no
+/// second copy ever exists. TWO copies when either lever is off:
+/// `MLX_SERVE_QSA_HISTORY_SHARE=0` restores the prefill-end attach that
+/// MATERIALIZES the history onto the checkpoint (`copyQsaHistorySliced(…
+/// materialize = true)`, 1.76 GB at 458,832 tokens, beside the buffer for
+/// the whole decode); `MLX_SERVE_KV_RESERVE=0` restores the +25% ladder,
+/// whose old + new pair at the last grow is the same two-copy bound.
+///
+/// The score bank (`qsaScoreBankBytesPerToken`, 1,536 B/tok on qwen4_exp)
+/// was never billed: the two-copy history bill had 3,840 B/tok of slack
+/// that covered it by accident. The one-copy bill does not, so it is named.
+///
+/// One helper because the auto-context sizer and the admission guard must
+/// agree on it: a sizer that bills one copy advertises a context the guard
+/// then refuses (issue #353).
+pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
+    const one = config.qsaHistoryBytesPerToken();
+    if (one == 0) return 0;
+    const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
+    return one * copies + config.qsaScoreBankBytesPerToken();
+}
 
-    const seq: u64 = @intCast(prompt_len);
-    const layers: u64 = config.num_hidden_layers;
-    const kv_heads: u64 = config.num_key_value_heads;
-    const hdim: u64 = config.head_dim;
-    const hidden: u64 = config.hidden_size;
-    const ffn: u64 = prefillFfnWidth(config);
+/// Tokens of cache capacity a request RESERVES at admission: the prompt, the
+/// generation it is allowed, and one chunk of slack so the last partial chunk
+/// cannot tip it over. `Generator.initWithOptions` hands this to
+/// `KVCache.reserve_tokens`, which allocates the whole buffer on the FIRST
+/// grow — so the prefill never runs a second grow, and the old+new
+/// coexistence that `PREFILL_RUNTIME_FLOOR_BYTES` prices at a flat 512 MB
+/// (calibrated on prompts of a few thousand tokens; ~7.75 GB at 458,832 on
+/// qwen4_exp) never happens at all.
+///
+/// The guard bills the reservation, so the guard and the allocator are the
+/// same number by construction. PURE.
+pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
+    // Delegates: the cache's own definition is the authority, so the number
+    // the guard bills and the number the allocator takes cannot drift — the
+    // context bound included.
+    return transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, ctx);
+}
 
-    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
-        (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
-    const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    // A vision prefill chunks like text since issue #197 (the splice resumes
-    // its row index across chunks), so it bills the chunk-bounded envelope —
-    // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
-    // whole-prompt forward, in which case `unchunked_prefill` bills the real
-    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
-    // so the guard and the prefill loop cannot disagree.
-    const chunk: u64 = if (unchunked_prefill)
-        @max(seq, 1)
-    else
-        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.pinned_prefill_chunk));
+/// Bytes of SSM checkpoints a prefill of `seq` tokens is still HOLDING when it
+/// reaches its last chunk. The prefill captures one every
+/// `generate.effectiveSsmCheckpointStride` tokens and keeps at most
+/// `--ssm-checkpoint-max` of them, so this saturates — but until it does it is
+/// proportional, and on a 36-layer GatedDeltaNet trunk it is ~1.9 GB the guard
+/// billed at zero (issue #353).
+///
+/// Mirrors the stride the prefill loop resolves, against the same uncapped
+/// base chunk `runPrefill` uses, so the bill and the captures cannot disagree
+/// about how many land.
+pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+    const per_cp = config.ssmCheckpointBytes();
+    if (per_cp == 0 or ssm_checkpoint_stride == 0) return 0;
+    const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
+        ssm_checkpoint_stride,
+        @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
+    );
+    if (stride == 0) return 0;
+    var n: u64 = seq / stride;
+    if (ssm_checkpoint_max > 0) n = @min(n, ssm_checkpoint_max);
+    return n * per_cp;
+}
+
+/// The per-request terms of the admission bill, in ONE place so the guard, the
+/// eviction decision and the reservation the engine actually makes are the
+/// same arithmetic (the #126 one-estimator discipline).
+pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
+    // THE ARCH GATE for every term in this struct (PR #363 item 4). All four
+    // are new bill terms, and all four reach archs nobody measured them on:
+    //
+    //   `reserved_kv_bytes`  -- `KVCache.reservedTokens` has no arch test, so
+    //      every arch past a 32k prompt was billed up to (8192 + chunk) rows of
+    //      headroom. Worse, its ALLOCATOR twin IS gated
+    //      (`generate.reservedPrefillTokens`): off qwen4 the guard billed
+    //      memory the engine then never reserved. A pure over-bill is a 400 on
+    //      a prompt a93e2c0 admitted.
+    //   `checkpoint_bytes`   -- `ModelConfig.ssmCheckpointBytes` keys on
+    //      `linear_num_value_heads`, which is parsed generically: qwen3_5,
+    //      qwen3_5_moe, qwen3_next and bailing_hybrid all bill it (~1.9 GB on a
+    //      36-layer GDN trunk), while lfm2 and nemotron_h bill zero. An
+    //      under-bill fixed unevenly across the hybrids is not a fix.
+    //   `state_bytes`        -- 0 off qwen4 anyway (`statePerTokenBilled`).
+    //   `shared_resident_bytes` -- the warm CREDIT, and the only term that errs
+    //      toward UNDER-billing. Its failure mode is an uncatchable Metal abort,
+    //      so it is the last term that should ship unmeasured.
+    //
+    // Zeroing the struct makes `prefillMemoryNeeded` reduce to a93e2c0's
+    // 13-argument expression exactly: every new term is added into `gross` and
+    // the credit is a saturating subtraction, so `.{}` is the identity.
+    if (!config.longCtxGated()) return .{};
+    // `reservedTokens` returns 0 below its length threshold (a short request
+    // keeps the proportional growth policy). The prompt's own rows are still
+    // billed, so floor the reserved length at `seq`: short prompts then bill
+    // exactly what they did before, with no headroom term.
+    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
+    // Only the HEADROOM is new here: `prefillMemoryNeeded` already bills
+    // `seq * kv_per_tok` for the prompt's own rows.
+    const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    // Rows the restore hands over without allocating another copy, and this
+    // prefill reuses in place. KV ONLY — never the indexer history.
+    //
+    // AUDIT W-2. The restore does NOT share the history: `restoreQsaHistory`
+    // privatises it immediately through `seedCapBuf`, which is a
+    // `materializedOwnedCopy` when the reservation already fits and a
+    // slice_update into a fresh `mlx_zeros` when it does not. Either way the
+    // slot ends up holding its own array, so every byte of history the prompt
+    // covers is allocated again on a warm turn exactly as on a cold one.
+    // Crediting one copy of it read as a harmless conservatism and was not:
+    // folded with the one-copy `statePerTokenBilled` this tree now ships, the
+    // history term CANCELS — a ~3.0 GB under-bill at 786k, on a path where the
+    // failure is an uncatchable Metal abort rather than a 400.
+    const credited = warm.creditedRows(reserved);
+    return .{
+        .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
+        // The indexer history at the width `statePerTokenBilled` decides
+        // (one copy + the score bank; two copies with a lever off).
+        .state_bytes = reserved * statePerTokenBilled(config),
+        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, chunk),
+        .shared_resident_bytes = credited *| kv_per_tok,
+    };
+}
+
+/// A slot that errored reports WHY. The MLX error latch turns a Metal
+/// working-set abort into `error.OutOfMemory` on the inference thread instead
+/// of `exit(-1)` (issue #353); a request that dies that way is a MEMORY
+/// failure the operator can act on, not a generic engine fault. ONE helper so
+/// the three slot-drain sites cannot answer differently.
+fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
+    // A pre-prefill admission refusal is NOT an abandoned generation: nothing
+    // ran, and the client gets the 400 the connection-thread guard would have
+    // sent (#353 follow-up). Distinguished by NAME, like every slot error.
+    if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
+    return error.GenerationFailed;
+}
+
+/// The message `error.GenerationOutOfMemory` sends, on every surface and on
+/// both the streaming and non-streaming paths (`mapGenerationError` is the
+/// only reader). Names the condition and the levers; the byte counts live in
+/// the server log's `[mlx]` line, the only place that knows which allocation
+/// failed.
+const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
+
+/// The body of the pre-flight memory 400, in ONE place.
+///
+/// Two arms, chosen by whether the bill CARRIES the hot cache. With the
+/// credits present the message quotes them, because they are what the guard
+/// compared and the operator's first question is "why didn't it just drop a
+/// cache entry?". With the credits structurally zero — every arch outside
+/// `longCtxGated`, where `prefillAdmissionBill` drops both — quoting them
+/// asserts that a resident cache holds nothing, which is false and
+/// client-visible. That arm is a93e2c0's exact sentence
+/// (`git show a93e2c0:src/server.zig:3261`), which named no cache at all —
+/// the honest message where the cache is genuinely not part of the decision.
+///
+/// The discriminator is the ARCH GATE, not `bill.evictable`, and that is a
+/// deliberate second choice. Keying on the byte count reads better on the
+/// merits — a gated bill on an empty cache also holds nothing, and "~0MB" is
+/// no more true there — but it CHANGES the qwen4_exp message: that arch does
+/// reach this arm with an empty cache (a large first request, before anything
+/// is resident), and it used to render the long sentence with two zeroes. This
+/// round's mandate is zero qwen4-path changes, so the gated arch keeps its
+/// bytes exactly, zeroes and all, and only the ungated arm moves — to
+/// a93e2c0's sentence, which is what it had. Revisit on the merits later,
+/// separately, where it can be measured as its own change.
+///
+/// Caller owns the returned bytes.
+fn memoryRefusalMessage(
+    allocator: std.mem.Allocator,
+    prompt_len: usize,
+    needed_mb: u64,
+    avail_mb: u64,
+    bill: AdmissionBill,
+    carries_cache: bool,
+) ![]u8 {
+    if (!carries_cache) {
+        return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+    }
+    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
+}
+
+/// The message `error.PrefillDoesNotFit` sends (`mapGenerationError`, the one
+/// reader, on every surface and both paths). The request was
+/// refused BEFORE its first forward, by the same estimator the connection
+/// thread's guard uses, re-asked after the hot prefix cache gave back
+/// everything it could — so it is the client's request that is too large, not
+/// the engine that failed. The compared byte counts are in the server log's
+/// "refused before prefill" line (the connection thread cannot re-read the
+/// inference thread's live memory to repeat them here honestly).
+const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// A generation failure as the wire sees it: ONE status, ONE message, and the
+/// two dialects' spelling of the type.
+pub const GenErrorWire = struct {
+    status_line: []const u8,
+    code: u32,
+    /// `error.type` on the OpenAI dialects (chat, completions, responses).
+    openai_type: []const u8,
+    /// `error.type` on `/v1/messages`.
+    anthropic_type: []const u8,
+    message: []const u8,
+};
+
+/// PURE: THE mapping from a failed generation to what the client is told.
+///
+/// External review of PR #363, item 2. This mapping existed only on the
+/// NON-streaming arms; every streaming arm caught the same errors and wrote
+/// `"Internal server error: GenerationOutOfMemory"` as a `server_error` into
+/// an SSE frame, on a connection that had already answered 200. Agents stream,
+/// so the actionable 400/503 — the one that names the lever — was the one
+/// nobody ever saw. Both paths ask this function now, so they cannot answer
+/// differently: before the SSE head goes out the stream sends the same status
+/// and the same JSON body, and past it the same `type` and `message` ride the
+/// surface's terminal `error` event.
+///
+/// The unknown arm keeps the error NAME (the streaming arms' one virtue over
+/// the non-streaming ones, which sent it bare) at a mapped 500. `buf` backs
+/// only that arm; the three named classes return their module constants.
+pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    return switch (err) {
+        // The MLX working-set latch (#353) — the engine ran out of GPU memory
+        // mid-request and abandoned it. A memory 503, exactly as
+        // `loadErrorFromName` treats the same names on the load path.
+        error.GenerationOutOfMemory, error.OutOfMemory => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = GEN_OOM_MSG,
+        },
+        // Refused BEFORE the first forward by the same estimator that admits:
+        // the client's request is too large for this machine, not an engine
+        // fault. A named 400 on both dialects.
+        error.PrefillDoesNotFit => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = PREFILL_NOFIT_MSG,
+        },
+        error.GenerationFailed => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = "generation failed",
+        },
+        else => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = std.fmt.bufPrint(buf, "Internal server error: {s}", .{@errorName(err)}) catch
+                "Internal server error",
+        },
+    };
+}
+
+/// The terminal SSE frame for the OpenAI dialects. Carries the mapped error
+/// AND a `choices` entry with `finish_reason: "error"`, so a client that only
+/// parses chunks terminates cleanly instead of waiting out a stream that will
+/// never produce another delta.
+fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}]}}
+    ++ "\n\n", .{ esc, w.openai_type, w.code });
+}
+
+/// The `/v1/messages` terminal `error` event payload (the event NAME is
+/// `error`; `sendAnthropicEvent` writes the framing).
+fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
+    , .{ w.anthropic_type, esc });
+}
+
+/// The `/v1/responses` terminal `error` event payload. `sendResponsesEvent`
+/// splices in the `sequence_number` every Responses event must carry.
+fn buildResponsesStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","code":"{s}","message":{s},"param":null}}
+    , .{ w.openai_type, esc });
+}
+
+/// Which wire dialect a generative surface speaks its errors in. `.responses`
+/// carries the live SSE sequence counter because every Responses event must.
+const ErrorSurface = union(enum) {
+    /// `/v1/chat/completions` and `/v1/completions`.
+    openai,
+    /// `/v1/messages`.
+    anthropic,
+    /// `/v1/responses`.
+    responses: *u64,
+};
+
+/// THE error arm for every generative surface, streaming or not.
+///
+/// Before the SSE head is on the wire the status line is still ours, so a
+/// streaming request gets byte-for-byte the response its non-streaming twin
+/// would have got — which is the whole point: a client cannot be expected to
+/// parse a different error shape because it asked for a stream. Past the head
+/// the status is spent, so the same `type` and `message` ride the surface's
+/// terminal `error` event, followed by the surface's own end-of-stream marker.
+fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
+    var msg_buf: [192]u8 = undefined;
+    const w = mapGenerationError(err, &msg_buf);
+
+    if (!stream.sse_headers_sent) {
+        return switch (surface) {
+            .anthropic => sendAnthropicError(allocator, stream, w.anthropic_type, w.message, w.code),
+            else => sendErrorResponse(allocator, stream, w.status_line, w.openai_type, w.message, w.code),
+        };
+    }
+
+    switch (surface) {
+        .openai => {
+            const body = try buildOpenAiStreamError(allocator, w);
+            defer allocator.free(body);
+            try stream.writeAllNoFlush(body);
+            try stream.writeAll("data: [DONE]\n\n");
+        },
+        .anthropic => {
+            const body = try buildAnthropicStreamError(allocator, w);
+            defer allocator.free(body);
+            // Anthropic streams have no `[DONE]`; the `error` event IS the
+            // terminator.
+            try sendAnthropicEvent(stream, "error", body);
+        },
+        .responses => |seq| {
+            const body = try buildResponsesStreamError(allocator, w);
+            defer allocator.free(body);
+            try sendResponsesEvent(allocator, stream, seq, "error", body);
+            // Same gate as the success path: no `[DONE]` over the WS bridge,
+            // where the per-response boundary is the frame itself.
+            if (stream.ws_mode == null) try stream.writeAll("data: [DONE]\n\n");
+        },
+    }
+}
+
+/// The admission bill and the headroom it is compared against, as ONE number
+/// each. Extracted so the connection thread's guard and the inference
+/// thread's evict-or-refuse decision cannot compute the bill differently
+/// (#126: a gate that runs before the estimator that knows better IS the
+/// estimator).
+pub const AdmissionBill = struct {
+    needed: u64 = 0,
+    available: u64 = 0,
+    /// Bytes the hot prefix cache is holding. A racy hint on the connection
+    /// thread; exact on the inference thread. REPORTED in a refusal, never
+    /// credited toward admission — see `reclaimable`.
+    evictable: u64 = 0,
+    /// The part of `evictable` an eviction can PROVE it will return: the
+    /// residency minus the largest entry
+    /// (`HotPrefixCache.reclaimableBytes`). A prefix restore refcount-shares
+    /// the matched entry's buffers with the slot's cache, so evicting THAT
+    /// entry returns nothing and `evictLruToAdmit` will not even try. A
+    /// restore pins at most one entry, so this is the provable credit.
+    reclaimable: u64 = 0,
+    /// The prefill WIDTH this bill was taken at — on a per-request arch, the
+    /// widest ladder rung that fit `available` (`chooseRequestPrefillChunk`),
+    /// so a refusal can name the narrowest width it tried instead of leaving
+    /// the operator to guess which forward the number describes.
+    chunk: u64 = 0,
+
+    pub fn fits(self: AdmissionBill) bool {
+        return self.needed <= self.available;
+    }
+
+    /// Fits once the cache has given back what it PROVABLY can. The guard
+    /// admits on THIS and the inference thread then evicts only as much as it
+    /// has to — a cached prefix is an optimization, the request is the work.
+    ///
+    /// Credits `reclaimable`, not `evictable`: a 383k-token prompt was
+    /// admitted on 1,564 MB of cache that was one entry — the one the prompt
+    /// then restored from — and refused after the eviction pass returned
+    /// nothing (guards run 2026-09-05, #353 follow-up). A guard that admits on
+    /// memory it cannot get back is a 503 with extra steps.
+    pub fn fitsAfterEviction(self: AdmissionBill) bool {
+        return self.needed <= self.available +| self.reclaimable;
+    }
+};
+
+/// PURE: everything the admission guard bills for ONE request at ONE prefill
+/// width. Factored out of `prefillAdmissionBill` so the per-request chunk
+/// chooser prices a candidate rung with the SAME function that then admits it
+/// — a chooser with its own arithmetic is the "a gate that runs BEFORE the
+/// estimator that knows better IS the estimator" rule (#126) waiting to
+/// happen, and here the two would differ by the chunk term, which is the
+/// biggest one.
+///
+/// `chunk` is the width the forward will RUN, already through
+/// `generate.effectivePrefillChunk` — never a raw ladder rung.
+pub fn prefillNeededAtChunk(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    chunk: u64,
+    warm: WarmPrefix,
+) u64 {
     // deepseek_v4 gets its own estimator: the arch sub-chunks prefill
     // internally and its state/transients are module-owned f32, so the
     // generic bill misses in BOTH directions (over on the chunk term, under
     // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
     // stay generic.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
-    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
-    // allocate another copy of the cached buffers. `active_mem` below already
-    // includes the resident entry, while `prefillMemoryNeeded` bills the full
-    // destination KV capacity that may be allocated when the restored cache
-    // grows. Adding the resident entry here again would invent a third copy
-    // and reject long warm prompts (and even cache misses) spuriously.
-    const needed: u64 = if (is_dsv4)
-        dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
-    else
-        prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
-            seq * config.qsaHistoryBytesPerToken();
+    // These aliases are load-bearing, not style: two scan tests pin the exact
+    // argument SPELLING at this site (`checkAttentionMemory routes deepseek_v4
+    // ...` and `... wires the CONFIG's key bound, not a dense seq`), because
+    // the bug class they guard is a caller passing a dense `seq` or a
+    // recomputed KV product instead of what the config says. Moving the site
+    // here from `prefillAdmissionBill` must not cost that.
+    const heads: u64 = config.num_attention_heads;
+    const layers: u64 = config.num_hidden_layers;
+    const kv_heads: u64 = config.num_key_value_heads;
+    const hdim: u64 = config.head_dim;
+    const hidden: u64 = config.hidden_size;
+    const ffn: u64 = prefillFfnWidth(config);
+    if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
+    return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
+        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+}
 
+/// Test hook for `perRequestPrefillChunkEnabled`'s kill switch.
+pub var per_request_chunk_override: ?bool = null;
+
+/// The arch capability AND the kill switch. `MLX_SERVE_PREFILL_CHUNK_PER_REQUEST=0`
+/// restores the load-time pin for every request; absent or anything but "0"
+/// leaves it on, so an unset variable is the ON arm.
+pub fn perRequestPrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
+    if (!config.perRequestPrefillChunk()) return false;
+    if (per_request_chunk_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_PER_REQUEST") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// PURE: the widest ladder rung THIS request can afford, priced by the SAME
+/// estimator that admits it (`prefillNeededAtChunk`) against the memory that
+/// is actually free — which at the call site is post-eviction and already net
+/// of the resident hot cache and this request's own reserved KV.
+///
+/// Candidates are priced at the width the forward will RUN, not at the raw
+/// rung: `generate.effectivePrefillChunk` still caps by arch (a hd-256 MoE
+/// never forwards wider than 4096), so pricing the rung would over-bill the
+/// top of the ladder and pick it for the wrong reason.
+///
+/// Returns the WIDTH, not the rung, for `InitOptions.pinned_prefill_chunk`:
+/// on a hd-256 MoE both the 8192 and 4096 rungs forward at 4096, and a pin of
+/// 8192 would describe a width that never runs. `effectivePrefillChunk` takes
+/// the min of the pin and the launch chunk, so handing it the width is a
+/// fixpoint. An explicit `--prefill-chunk` wins outright and is billed as-is;
+/// nothing fitting means the ladder floor — the smallest bill this request can
+/// be asked for, and admission has already decided separately whether it runs
+/// at all.
+pub fn chooseRequestPrefillChunk(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    available: u64,
+    load_time_pin: u32,
+    chunk_override: u32,
+    warm: WarmPrefix,
+) u32 {
+    // The arch gate FIRST. An ungated arch has no per-request width at all —
+    // its answer is the load-time pin, which is what a93e2c0 billed — and
+    // honouring the override above the gate handed it a width a93e2c0's bill
+    // never saw (`pinPrefillChunk` deliberately pins the RUNG there).
+    if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
+    if (chunk_override > 0) return chunk_override;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim,
+        // which has no upper bound at its source — clamp before narrowing
+        // (audit N4), the same way `explicitPrefillChunk` does.
+        const width: u64 = @min(
+            @as(u64, generate_mod.effectivePrefillChunk(
+                config.prefillScoreHeadDim(),
+                config.num_attention_heads,
+                @intCast(seq),
+                config.has_sliding_window,
+                config.isMoe(),
+                rung,
+            )),
+            @as(u64, std.math.maxInt(u32)),
+        );
+        if (prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm) <= available) return @intCast(width);
+    }
+    return @intCast(generate_mod.effectivePrefillChunk(
+        config.prefillScoreHeadDim(),
+        config.num_attention_heads,
+        @intCast(seq),
+        config.has_sliding_window,
+        config.isMoe(),
+        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1],
+    ));
+}
+
+/// Impure wrapper the scheduler reaches through `prefill_request_chunk`,
+/// mirroring `prefillFitsNow`'s inputs exactly so the width and the admission
+/// decision cannot be taken against different requests. Reads live memory, so
+/// it must run AFTER the eviction pass.
+///
+/// Logs one line per request at debug — a narrowed prefill otherwise reads as
+/// an unexplained slowdown, and a widened one as an unexplained peak.
+pub fn requestPrefillChunkNow(
+    config: *const model_mod.ModelConfig,
+    prompt_len: usize,
+    max_tokens: u32,
+    kv_cfg: transformer_mod.KVQuantConfig,
+    unchunked_prefill: bool,
+    warm_matched: u64,
+    warm_capacity: u64,
+    warm_will_donate: bool,
+) u32 {
+    const pin: u32 = config.pinned_prefill_chunk;
+    const explicit: u32 = explicitPrefillChunk();
+    if (explicit > 0) return explicit;
+    // The vision kill switch forwards the WHOLE prompt; there is no chunk to
+    // choose and the bill already knows it.
+    if (unchunked_prefill) return pin;
+    if (!perRequestPrefillChunkEnabled(config)) return pin;
+
+    const seq: u64 = @intCast(prompt_len);
+    const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const available: u64 = currentGpuMemoryCeiling(active_mem) -| active_mem;
+    const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate };
+    const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm);
+    if (chosen != pin) {
+        // `chosen` IS the width (see `chooseRequestPrefillChunk`).
+        const width: u64 = chosen;
+        const terms = prefillRequestTerms(config, seq, max_tokens, kv_bits, width, warm);
+        const kv_bytes: u64 = seq *| kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| terms.reserved_kv_bytes;
+        log.debug("[prefill] chunk {d} for this request (reserve {d} MB beside KV {d} MB)\n", .{ width, prefillTransientReserve(config, kv_bits, width) >> 20, kv_bytes >> 20 });
+    }
+    return chosen;
+}
+
+/// Test hook for `adaptivePrefillChunkEnabled`'s kill switch.
+pub var adaptive_chunk_override: ?bool = null;
+
+/// The per-CHUNK adaptive width: subordinate to the per-REQUEST gate (arch +
+/// its own kill switch, so one switch disables both), plus
+/// `MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
+/// An explicit `--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` means every
+/// forward runs that width and nothing narrows or widens it — the precedence
+/// `effectivePrefillChunk` already keeps. Absent or anything but "0" leaves it
+/// on, so an unset variable is the ON arm.
+pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
+    // Arch first: it is the cheapest and by far the most selective of the
+    // four, and this runs once per chunk BOUNDARY rather than once per
+    // request.
+    if (!config.perRequestPrefillChunk()) return false;
+    if (explicitPrefillChunk() > 0) return false;
+    if (generate_mod.envPrefillChunk() > 0) return false;
+    if (!perRequestPrefillChunkEnabled(config)) return false;
+    if (adaptive_chunk_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// Consecutive supporting probes a WIDENING needs. One probe is a moment; two
+/// is a trend, and the probe is taken after `mlx_clear_cache` so it never
+/// contains a chunk's own peak — the second reading is what pays for that
+/// blind spot.
+pub const PREFILL_WIDEN_PROBES: u8 = 2;
+
+/// PURE: what one chunk of `width` costs BEYOND what is already resident —
+/// its transient envelope plus the per-token state the chunk itself is about
+/// to write. `prefillTransientReserve` is the #126 one estimator (the same
+/// function the load-time sizer and the hot-cache clamp bill); the growth term
+/// is the KV and out-of-cache state for `width` more tokens.
+///
+/// Under the default reservation the KV buffer is resident from chunk 0 for
+/// every prompt this feature targets, so the growth term is usually already
+/// paid — it is billed anyway because `MLX_SERVE_KV_RESERVE=0` and prompts
+/// under `RESERVE_MIN_TOKENS` do grow per chunk, and a safety step-down that
+/// is wrong is an uncatchable Metal abort.
+pub fn prefillChunkCost(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    width: u64,
+    kv_len: u64,
+) u64 {
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config);
+    return prefillTransientReserveAtKv(config, kv_bits, width, kv_len) +| (width *| per_tok);
+}
+
+/// PURE: the width the NEXT chunk runs at, and the state that decision leaves.
+///
+/// ASYMMETRIC on purpose — a Metal working-set abort is uncatchable, so the
+/// two directions are not the same bet:
+///   HOLD while `headroom >= cost(current)`, margin 1.0. The estimator
+///     already carries its own 5/4; a second 1.25 here would step the 768k
+///     prompt this feature is for from the width admission ADMITTED (2048)
+///     down to 1024 — a regression dressed as caution.
+///   STEP DOWN immediately, by as many rungs as it takes, to the widest rung
+///     that holds; floored at `PREFILL_CHUNK_FLOOR` (at the floor it simply
+///     continues — admission already decided whether this request runs).
+///   WIDEN one rung, only at 1.25x its cost, only after
+///     `PREFILL_WIDEN_PROBES` consecutive supporting probes, only up to `cap`,
+///     and never after a step-down.
+///
+/// `cap` is the widest width this arch will forward for this prompt
+/// (`generate.effectivePrefillChunk` at the arch cap) — never a raw ladder
+/// rung, or the top of the ladder gets picked for a width that never runs.
+pub fn adaptivePrefillWidth(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    kv_len: u64,
+    headroom: u64,
+    current: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    if (cap == 0 or current == 0) return current;
+    const floor: u32 = @min(cap, @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+
+    if (prefillChunkCost(config, kv_bits, current, kv_len) > headroom) {
+        st.supporting = 0;
+        st.ratcheted = true;
+        var best: u32 = floor;
+        for (PREFILL_CHUNK_LADDER) |rung| {
+            const w: u32 = @min(rung, cap);
+            if (w >= current) continue;
+            if (prefillChunkCost(config, kv_bits, w, kv_len) <= headroom) {
+                best = w;
+                break;
+            }
+        }
+        return @min(best, current);
+    }
+
+    // The narrowest rung strictly wider than the current width, capped.
+    var next: u32 = 0;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        const w: u32 = @min(rung, cap);
+        if (w > current and (next == 0 or w < next)) next = w;
+    }
+    if (next == 0 or st.ratcheted) {
+        st.supporting = 0;
+        return current;
+    }
+    const asked: u64 = prefillChunkCost(config, kv_bits, next, kv_len) *| 5 / 4;
+    if (asked > headroom) {
+        st.supporting = 0;
+        return current;
+    }
+    st.supporting +|= 1;
+    if (st.supporting < PREFILL_WIDEN_PROBES) return current;
+    st.supporting = 0;
+    return next;
+}
+
+/// The live headroom one prefill chunk has to fit in: the GPU ceiling less
+/// what MLX's allocator is holding. Allocator counters, not a GPU barrier —
+/// one host read per chunk BOUNDARY is the whole cost, and it is taken after
+/// the boundary's `mlx_clear_cache` so the reading is the steady state the
+/// next chunk starts from rather than the previous chunk's peak.
+///
+/// The same expression `prefillAdmissionBill` compares against, so the width
+/// the loop takes mid-prefill and the width admission billed are answers to
+/// the same question asked at two moments.
+pub fn prefillHeadroomNow(staged_host: u64) u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    // S11: the SSD write-through stages chunk blobs as HOST bytes behind a
+    // ~1 GiB permit, and `mlx_get_active_memory` counts none of them. On
+    // unified memory they are the same physical pool the Metal working set
+    // comes out of, so a probe that ignores them can widen at 1.25x a
+    // headroom up to a whole permit optimistic — at exactly the boundary
+    // where both the staging and this decision happen.
+    //
+    // The number is the SSD owner's `HotPrefixCache.stagedHostBytes()`,
+    // documented INFERENCE-THREAD-ONLY, so it is read at the hook site (which
+    // runs on that thread, inside the prefill loop) and passed in rather than
+    // reached for from here — this function has no model handle, and a
+    // multi-model registry makes "the" cache ambiguous anyway.
+    return prefillHeadroomFrom(currentGpuMemoryCeiling(active_mem), active_mem, staged_host);
+}
+
+/// PURE half of `prefillHeadroomNow`, so the one arithmetic decision in it —
+/// that staged HOST bytes are subtracted like resident device bytes — is
+/// testable without a live allocator.
+pub fn prefillHeadroomFrom(ceiling: u64, active: u64, staged_host: u64) u64 {
+    return ceiling -| active -| staged_host;
+}
+
+/// S17: does a WIDEN the pre-tick probe chose still fit AFTER the interleave
+/// tick allocated for the co-tenant slots it hosted?
+///
+/// The probe runs before the tick so a co-tenant's decode is not attributed to
+/// this prefill — correct for attribution, backwards for safety. A step-down
+/// commits at once and never asks this; only the growth direction does, and a
+/// refusal costs nothing but the width it already had.
+///
+/// Same 1.25 bar and the same estimator at the same live KV, so this cannot
+/// disagree with the decision it is confirming for any reason but the tick.
+pub fn adaptivePrefillWidenStillFits(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    pos: usize,
+    want: u32,
+    staged_host: u64,
+) bool {
+    if (!adaptivePrefillChunkEnabled(config)) return false;
+    const headroom = prefillHeadroomNow(staged_host);
+    const asked: u64 = prefillChunkCost(config, kv_bits, want, pos) *| 5 / 4;
+    if (asked <= headroom) return true;
+    log.info("[prefill] widen to {d} withdrawn at pos {d} (headroom {d} MB after the decode tick, cost {d} MB)\n", .{
+        want,
+        pos,
+        headroom >> 20,
+        asked >> 20,
+    });
+    return false;
+}
+
+/// Impure wrapper the prefill loop reaches through `generate.prefill_chunk_adapt`
+/// (installed beside the scheduler's three admission hooks — this module owns
+/// the estimator and neither generate.zig nor scheduler.zig imports it).
+///
+/// Logs one line per CHANGE, never per boundary: a width that walks
+/// 4096 -> 2048 -> 1024 down a long prompt says so twice, a steady one says
+/// nothing. The line is a CONTRACT (the bench harness greps it).
+pub fn adaptivePrefillWidthNow(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    pos: usize,
+    current: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+    staged_host: u64,
+) u32 {
+    if (!adaptivePrefillChunkEnabled(config)) return current;
+    const headroom = prefillHeadroomNow(staged_host);
+    // `pos` is the LIVE KV this chunk will attend to — the one input the two
+    // KV-linear terms of the bill need, and the reason this is not the
+    // load-time question (see `prefillTransientReserveAtKv`).
+    const next = adaptivePrefillWidth(config, kv_bits, pos, headroom, current, cap, st);
+    if (next != current) {
+        // Quote the number it COMPARED, not a smaller sibling of it: the
+        // decision is `prefillChunkCost` at this KV, so that is what the line
+        // says. `prefillTransientReserve` here read ~0.5 GB low at long KV and
+        // made an under-bill look like a comfortable margin in the log.
+        log.info("[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, cost {d} MB)\n", .{
+            current,
+            next,
+            pos,
+            headroom >> 20,
+            prefillChunkCost(config, kv_bits, next, pos) >> 20,
+        });
+    }
+    return next;
+}
+
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
+    const heads = config.num_attention_heads;
+    if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
+    const seq: u64 = @intCast(prompt_len);
+
+    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
+        (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
+    const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
     // working-set max and what's physically reachable now (currentGpuMemoryCeiling)
     // so the two prefill guards agree AND both see external memory pressure — a
     // docker stack holding tens of GB otherwise leaves this guard admitting a
     // prefill that OOMs the command buffer (#64).
+    //
+    // Read BEFORE the width is chosen: on a per-request arch the width is a
+    // function of what is free, so the order is load-bearing.
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
 
+    // A vision prefill chunks like text since issue #197 (the splice resumes
+    // its row index across chunks), so it bills the chunk-bounded envelope —
+    // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
+    // whole-prompt forward, in which case `unchunked_prefill` bills the real
+    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
+    // so the guard and the prefill loop cannot disagree.
+    //
+    // Otherwise the width comes from `chooseRequestPrefillChunk` — the SAME
+    // rule the scheduler pins with, so the guard cannot refuse a width the
+    // forward would never have run. On an arch that has not opted in (and
+    // under an explicit `--prefill-chunk`) the chooser hands back the
+    // load-time pin and this is byte-for-byte the old expression; on a
+    // per-request arch it is the widest rung that fits, which is what stops a
+    // 1M-token prompt at `--ctx-size 1048576` from being refused at a width it
+    // never had to use. `effectivePrefillChunk` is applied either way: the
+    // chooser returns a width and this resolver is idempotent on one.
+    const chosen: u32 = if (unchunked_prefill) 0 else chooseRequestPrefillChunk(
+        config,
+        seq,
+        max_tokens,
+        kv_bits,
+        available,
+        config.pinned_prefill_chunk,
+        explicitPrefillChunk(),
+        warm,
+    );
+    const chunk: u64 = if (unchunked_prefill)
+        @max(seq, 1)
+    else
+        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), chosen));
+    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
+    // allocate another copy of the cached buffers. `active_mem` above already
+    // includes the resident entry, while `prefillMemoryNeeded` bills the full
+    // destination KV capacity that may be allocated when the restored cache
+    // grows. Adding the resident entry here again would invent a third copy
+    // and reject long warm prompts (and even cache misses) spuriously.
+    const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk, warm);
+    // PUBLISHED number, never the pointer: `hot_prefix_cache` is
+    // inference-thread state — nulled and freed on every model switch — so
+    // dereferencing it from a connection thread to ask `residentBytes()` was a
+    // use-after-free waiting for the wrong interleaving. The inference thread
+    // republishes this after every commit, eviction and switch; it is stale by
+    // at most one entry, which is all a HINT has to be (the decision that
+    // matters is re-asked there, against live memory).
+    const evictable: u64 = if (global_scheduler) |sch|
+        sch.resident_hot_cache_bytes.load(.monotonic)
+    else
+        0;
+    // Prompt-aware when the caller has the ids: an entry this prompt could
+    // NOT restore from is genuinely evictable, and the prompt-blind scalar
+    // withholds the largest entry unconditionally — which under SSD-first's
+    // one-resident-session steady state is the whole cache. Still a published
+    // snapshot, never the cache pointer (`hot_prefix_cache` is freed on model
+    // switch); the reduction happens under the scheduler's digest lock.
+    const reclaimable: u64 = if (global_scheduler) |sch|
+        if (prompt_tokens) |toks|
+            scheduler_mod.reclaimableHotCacheBytesFor(sch, toks)
+        else
+            sch.reclaimable_hot_cache_bytes.load(.monotonic)
+    else
+        0;
+    // THE ARCH GATE for the whole evict-to-admit half (PR #363), in ONE place.
+    //
+    // a93e2c0's guard had a single arm: `needed > available` refuses. The PR
+    // added two ADMIT arms above it — evict-and-admit, and the warm deferral —
+    // and both are driven ENTIRELY by these two credits:
+    //   `fitsAfterEviction()` is `fits()` when `reclaimable == 0`, so the
+    //   evict-and-admit arm cannot fire; `pinnedResidentBytes` is
+    //   `evictable -| reclaimable`, so the deferral arm cannot either.
+    // Zeroing them here therefore restores a93e2c0's decision exactly, for the
+    // connection thread and for `admissionVerdict`'s log line together, without
+    // a gate at each arm that could drift from the others.
+    //
+    // Why gate at all: on the gated arch this trades a cache hit for a request
+    // the machine can serve, and it was measured there (the live 1,047,556-token
+    // chain extension). Off it, the same two arms admit a request a93e2c0
+    // refused pre-flight with a clean 400 — and it can then die mid-prefill in
+    // an uncatchable Metal abort, after evicting the whole hot cache on the way.
+    // A 400 the operator can act on is better than that, on an arch nobody
+    // measured the trade on.
+    //
+    // What is NOT gated: `resident_hot_cache_bytes` / `reclaimable_hot_cache_bytes`
+    // are still PUBLISHED by the inference thread. That is the class-A half —
+    // the guard used to dereference `hot_prefix_cache`, which is freed on every
+    // model switch — and it stays for every arch.
+    if (!config.longCtxGated()) {
+        return .{ .needed = needed, .available = available, .chunk = chunk };
+    }
+    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
+}
+
+/// PURE: bytes of the resident hot cache this prompt PINS — residency less
+/// what an eviction pass can prove it will return. Non-zero means an entry
+/// this prompt would restore FROM is holding memory that neither goes back to
+/// the allocator nor has to be allocated again.
+///
+/// The connection thread knows only that such an entry exists, never how much
+/// of it this prompt shares (a digest fingerprints the first
+/// `DIGEST_PREFIX_TOKENS` ids and nothing more). So it must not price the
+/// credit — it defers, and the inference thread, which holds the real cache
+/// and the slot's live capacity, bills the warm request with `WarmPrefix`.
+/// The gate that runs before the estimator that knows better IS the estimator
+/// (#126); here the honest form of that rule is not to decide.
+pub fn pinnedResidentBytes(bill: AdmissionBill) u64 {
+    return bill.evictable -| bill.reclaimable;
+}
+
+/// What the admission guard decided, derived from ONE bill so the log line and
+/// the arm that acts on it cannot disagree. Mirrors `checkAttentionMemory`'s
+/// three arms exactly (scan-pinned below): fits outright, fits once the hot
+/// cache gives back what it PROVABLY can, or does not fit at all.
+pub const AdmissionVerdict = enum {
+    admit,
+    evict,
+    refuse,
+
+    pub fn name(self: AdmissionVerdict) []const u8 {
+        return switch (self) {
+            .admit => "admit",
+            .evict => "evict",
+            .refuse => "refuse",
+        };
+    }
+};
+
+pub fn admissionVerdict(bill: AdmissionBill) AdmissionVerdict {
+    if (bill.fits()) return .admit;
+    if (bill.fitsAfterEviction()) return .evict;
+    return .refuse;
+}
+
+/// The generation of `markReadyLocked` the last info-level admission line was
+/// emitted for. `maxInt` is never a real generation, so the first request of
+/// the process is also a "first after a load".
+var admission_logged_generation = std.atomic.Value(u64).init(std.math.maxInt(u64));
+
+/// Has a model become resident since the last time this returned true?
+/// Consuming (compare-and-swap on the generation) so N concurrent connection
+/// threads racing the first request after a load produce ONE info line, not N.
+fn firstRequestAfterLoad() bool {
+    const gen = model_registry_mod.load_generation.load(.monotonic);
+    const last = admission_logged_generation.load(.monotonic);
+    if (gen == last) return false;
+    return admission_logged_generation.cmpxchgStrong(last, gen, .monotonic, .monotonic) == null;
+}
+
+/// PURE: the level ONE admission line is emitted at.
+///
+/// Info on the first request after a load — the operator's first look at a
+/// fresh model is the reading that has to be free, because it is the only one
+/// that says what "normal" is for this checkpoint on this box — and info
+/// whenever the bill is within 10% of what is available, the band where the
+/// NEXT request is the one that evicts or refuses. Debug otherwise: a roomy
+/// machine would otherwise write one info line per request for the life of the
+/// process, and a log that always talks is a log nobody greps.
+///
+/// `available == 0` (an unknown arch, or a ceiling already fully spent) is
+/// inside the band by construction and reports.
+pub fn admissionLogLevel(needed: u64, available: u64, first_after_load: bool) log.Level {
+    if (first_after_load) return .info;
+    // `needed > 0.9 * available` without floating point and without an
+    // overflow on the way: 10*needed > 9*available.
+    if (needed *| 10 > available *| 9) return .info;
+    return .debug;
+}
+
+/// ONE line per REQUEST at the admission decision — never per chunk, and on
+/// ADMITTED requests too, which is what was missing: a tight admission that
+/// went through logged nothing at all, so the numbers only ever appeared once
+/// the request had already been refused, and there was no way to see the
+/// machine walking up to the edge.
+///
+/// Every field comes off the SAME `bill` the arms below act on and the refusal
+/// message quotes, so the two cannot name different numbers for the same
+/// request (scan-pinned). The level check runs FIRST: the divisions and the
+/// verdict string are the whole cost of this call and none of them happen on
+/// the debug-suppressed path.
+fn logAdmissionDecision(bill: AdmissionBill) void {
+    // `info` is the LOUDEST level this line is ever emitted at, so under
+    // `--log-level warn` nothing here can print — and `firstRequestAfterLoad`
+    // CONSUMES the post-load token, which must not be spent on a line that was
+    // never going to be written.
+    if (!log.enabled(.info)) return;
+    const level = admissionLogLevel(bill.needed, bill.available, firstRequestAfterLoad());
+    if (!log.enabled(level)) return;
+    const mb = 1024 * 1024;
+    log.atLevel(level, "[admission] needed={d} MB available={d} MB reclaimable={d} MB width={d} verdict={s}\n", .{
+        bill.needed / mb,
+        bill.available / mb,
+        bill.reclaimable / mb,
+        bill.chunk,
+        admissionVerdict(bill).name(),
+    });
+}
+
+/// Inference-thread predicate behind `Scheduler`'s admission hook: does this
+/// request fit RIGHT NOW, with live memory re-read? Re-asked after every
+/// hot-cache eviction, so the estimator — not a precomputed shortfall —
+/// decides when to stop evicting.
+///
+/// Every input is FORWARDED, none defaulted: this and `checkAttentionMemory`
+/// must bill the same number for the same request, and hardcoding
+/// `kv_override = null` here made a `kv_quant: 4` request price its cache at
+/// fp16 on the inference thread — over-billing by ~2.4x, evicting a hot cache
+/// that did not need to go and refusing by name a request the connection
+/// thread had already admitted. One estimator means one set of INPUTS too.
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool) bool {
+    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+        .matched_tokens = warm_matched,
+        .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
+    }).fits();
+}
+
+/// The inference thread's refusal, quoting the numbers it COMPARED — the same
+/// estimator, re-read after the eviction pass gave back everything it could.
+/// The scheduler calls this through `prefill_admission_refused_log`; it cannot
+/// format a bill it has no estimator for.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool) void {
+    // The SAME warm inputs the probe was refused on — the checkout decision
+    // included — so the refusal quotes the number it COMPARED and not a cold
+    // (or, worse, an over-credited) sibling of it.
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+        .matched_tokens = warm_matched,
+        .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
+    });
+    const mb = 1024 * 1024;
+    // "narrowest width TRIED" is only true where the ladder was walked; on a
+    // non-per-request arch the chooser returns the load-time pin immediately
+    // (audit N1), so the label is qualified rather than claiming a search that
+    // did not happen.
+    const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
+        prompt_len, bill.needed / mb, bill.chunk, width_note, bill.available / mb, bill.evictable / mb,
+    });
+}
+
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
+    const prompt_len: usize = prompt_ids.len;
+    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
+    if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
+    // The connection thread has no slot and no cache: it bills COLD (`.{}`)
+    // and, when the prompt pins a resident entry, refuses nothing — see the
+    // deferral arm below.
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{});
+    // ONE line per request, all three verdicts, from THIS bill.
+    logAdmissionDecision(bill);
+    const needed = bill.needed;
+    const available = bill.available;
+    // LIMIT THE CACHE WHILE MEMORY IS LEFT (issue #353). A resident hot-cache
+    // entry is an optimization; the request in front of us is the work. When
+    // the bill only fails because the cache is holding memory, ADMIT — the
+    // inference thread evicts LRU entries until it fits (they survive on the
+    // SSD tier when --prefix-cache-disk is on) and refuses by name only if
+    // the cache is empty and it still does not fit. Refusing here would trade
+    // a request the machine can serve for a cache hit nobody asked for.
+    if (needed > available and bill.fitsAfterEviction()) {
+        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) — admitting, the prefill will evict\n", .{
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024),
+        });
+        return true;
+    }
+    // WARM DEFERRAL. The bill above is a COLD one: this thread has no slot,
+    // no cache and no capacity reading, so `prefillAdmissionBill` bills every
+    // row of the prompt even when most of them are already resident and
+    // refcount-shared with a hot entry this prompt would restore from. A
+    // non-zero `pinnedResidentBytes` is exactly that situation — bytes that
+    // will neither be allocated (the restore shares them) nor reclaimed
+    // (eviction protects the entry). How MANY of them this prompt shares is
+    // knowable only where the real cache and the slot's live buffer capacity
+    // are, so this guard hands the decision to the inference thread instead
+    // of pricing it: the gate that runs before the estimator that knows
+    // better IS the estimator (#126), and the honest form of the rule here is
+    // not to decide. The inference thread bills the same request with
+    // `WarmPrefix` and still refuses by NAME if it truly does not fit.
+    //
+    // LIVE 2026-09-05: a 1,047,556-token chain extension over a resident
+    // 786,707-token entry was refused here with "of which ~0MB can be
+    // reclaimed (the entry a restore would share is not evictable)" — the
+    // guard naming, in its own refusal, the reason its bill was wrong.
+    if (needed > available and pinnedResidentBytes(bill) > 0) {
+        log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, and ~{d}MB of hot cache is a prefix this prompt would SHARE — deferring to the prefill, which bills the warm request\n", .{
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), pinnedResidentBytes(bill) / (1024 * 1024),
+        });
+        return true;
+    }
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024) });
+        // A refusal quotes the numbers it COMPARED — including the hot cache,
+        // because the operator's first question is "why didn't it just drop a
+        // cache entry?" and the honest answer here is that there was nothing
+        // left to drop (issue #353).
+        // Everything the cache holds is evictable HERE by construction: the
+        // withheld case — an entry this prompt would restore FROM — took the
+        // deferral arm above rather than being refused on a cold bill. So the
+        // message says the one thing that is true on this path and does not
+        // reach for a branch that can no longer be taken.
+        // The cache clause is only TRUE where the bill CARRIES the cache. Off
+        // the long-context gate both credits are structurally zero
+        // (`prefillAdmissionBill` drops them), so this sentence rendered
+        // "holds ~0MB more, all of which can be reclaimed (~0MB — the
+        // shortfall is elsewhere)" on a box with a multi-GB resident cache: a
+        // client-visible 400 stating a falsehood, on exactly the archs the
+        // gate exists to leave alone. `memoryRefusalMessage` is the ONE
+        // formatter, so the two arms cannot drift.
+        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.longCtxGated());
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -5573,6 +9026,7 @@ fn handleChatCompletions(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
@@ -5591,11 +9045,15 @@ fn handleChatCompletions(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
-
-    // Clamp max_tokens to stay within context window
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     // ── Adaptive spec-decode gating ──
@@ -5687,18 +9145,16 @@ fn handleChatCompletions(
     if (is_stream) {
         handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            // Send SSE error event so the client gets a proper error instead of a dropped connection
-            const err_chunk = std.fmt.allocPrint(allocator,
-                \\data: {{"error":{{"message":"Internal server error: {s}","type":"server_error"}}}}
-            , .{@errorName(err)}) catch return;
-            defer allocator.free(err_chunk);
-            stream.writeAllNoFlush(err_chunk) catch {};
-            stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
+            // ONE mapping with the non-streaming arm below: a 503 for a memory
+            // abandon, a 400 for a prompt that does not fit, and the same
+            // message either way. Before the SSE head it is an HTTP status;
+            // after it, an SSE `error` event (external review of #363, item 2).
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
         handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -5861,6 +9317,7 @@ fn handleCompletions(
         break :blk out;
     } else try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Enforce context size limit
     const effective_ctx = getEffectiveContextLength(config);
@@ -5871,12 +9328,15 @@ fn handleCompletions(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    // (/v1/completions has no per-request kv_quant field -> process default.)
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, null, lm, false)) return;
-
-    // Clamp max_tokens to stay within context window
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, lm, false)) return;
+
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
     // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
@@ -5916,11 +9376,14 @@ fn handleCompletions(
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
+            // This arm sent NOTHING at all before the review: the client got a
+            // dropped connection mid-stream.
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
         handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -5950,10 +9413,11 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
-        error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
-        else => return err,
-    };
+    // Every failure class propagates to the surface's ONE error arm
+    // (`handleCompletions` -> `sendGenerationError`), which is the same arm
+    // the streaming twin uses. Mapping them a second time here is how the two
+    // paths drifted apart in the first place (external review of #363).
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -6086,17 +9550,7 @@ fn handleStreamingCompletion(
     defer ts.deinit(allocator);
 
     // SSE headers
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("completions");
+    try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
@@ -6326,7 +9780,7 @@ fn nonStreamingViaScheduler(
         switch (nr) {
             .token => |t| try output_ids.append(allocator, t),
             .done => break :wait,
-            .err => return error.GenerationFailed,
+            .err => return slotFailure(slot),
         }
     }
 
@@ -6431,13 +9885,9 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-        error.GenerationFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
-            return;
-        },
-        else => return err,
-    };
+    // Propagates to `handleChatCompletions`' ONE error arm, shared with the
+    // streaming twin (external review of #363).
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -6781,7 +10231,7 @@ const StreamingTokenStream = struct {
                     self.finished = true;
                     return .done;
                 },
-                .err => return error.GenerationFailed,
+                .err => return slotFailure(s),
             }
         }
         if (try self.next(allocator)) |t| return .{ .token = t };
@@ -6802,7 +10252,7 @@ const StreamingTokenStream = struct {
                     self.finished = true;
                     return null;
                 },
-                .err => return error.GenerationFailed,
+                .err => return slotFailure(s),
             }
         }
         // Drain any pending tokens from a previous speculative step FIRST,
@@ -7083,17 +10533,7 @@ fn handleStreamingGeneration(
     defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("chat.completions");
+    try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     // Logprobs ride the chunks beside their deltas. Requesting them already
     // forced this stream off every speculative path (see `pickStreamMode`), so
@@ -8163,6 +11603,31 @@ fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u
     if (!log.isDebug()) return;
     log.debug("[http] <- {s} {s} body={d}b\n", .{ status, content_type, body.len });
     logHttpBody("[http] response body", body);
+}
+
+/// The `Access-Control-Allow-Headers` value each SSE surface advertises. The
+/// Anthropic surface accepts two extra request headers; nothing else differs.
+const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization";
+const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version";
+
+/// THE one place a `text/event-stream` response head is written, so
+/// `Conn.sse_headers_sent` cannot be set by three of four surfaces. Past this
+/// call the status line is spent and a generation failure is an SSE `error`
+/// EVENT; before it, the streaming surfaces answer with the same status and
+/// body their non-streaming twins do (`sendGenerationError`). Scan-pinned:
+/// no other site in this file may spell the content type.
+fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8) !void {
+    try stream.writeAllNoFlush("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+        "Access-Control-Allow-Headers: ");
+    try stream.writeAllNoFlush(allow_headers);
+    try stream.writeAll("\r\n\r\n");
+    stream.sse_headers_sent = true;
+    logHttpStreamStart(kind);
 }
 
 fn logHttpStreamStart(kind: []const u8) void {
@@ -11966,6 +15431,7 @@ fn handleAnthropicMessages(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
     if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
@@ -11999,10 +15465,15 @@ fn handleAnthropicMessages(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
-
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
@@ -12042,16 +15513,12 @@ fn handleAnthropicMessages(
     if (is_stream) {
         handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            const err_data = std.fmt.allocPrint(allocator,
-                \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
-            , .{@errorName(err)}) catch return;
-            defer allocator.free(err_data);
-            sendAnthropicEvent(stream, "error", err_data) catch {};
+            sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
         handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     }
 }
@@ -12117,10 +15584,9 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-        error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
-        else => return err,
-    };
+    // Propagates to `handleAnthropicMessages`' ONE error arm, shared with the
+    // streaming twin (external review of #363).
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -12384,17 +15850,7 @@ fn handleAnthropicStreaming(
     defer ts.deinit(allocator);
 
     // SSE headers
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("anthropic.messages");
+    try sendSseHeaders(stream, "anthropic.messages", SSE_ALLOW_HEADERS_ANTHROPIC);
 
     // message_start
     {
@@ -13307,11 +16763,36 @@ fn handleResponsesCompact(
     try sendResponse(stream, "200 OK", "application/json", out);
 }
 
+/// Route entry for `/v1/responses`. It exists only to give the handler an
+/// error arm: this was the ONE generative surface with no `catch` anywhere on
+/// its path, streaming or not — a failed generation propagated to the route
+/// dispatcher and the client got a dropped socket (external review of #363,
+/// item 2). The SSE sequence counter lives here so the terminal `error` event
+/// can carry the number the spec requires on every Responses event.
 fn handleResponses(
     allocator: std.mem.Allocator,
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+) !void {
+    var seq_num: u64 = 0;
+    handleResponsesInner(allocator, stream, body, lm, &seq_num) catch |err| {
+        // The WS transport keeps its error: it has its own terminal frame AND
+        // borrowed-store cleanup to run at the call site.
+        if (stream.ws_mode != null) return err;
+        log.err("  -> responses error: {s}\n", .{@errorName(err)});
+        sendGenerationError(allocator, stream, err, .{ .responses = &seq_num }) catch {};
+    };
+}
+
+fn handleResponsesInner(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+    lm: *LoadedModel,
+    /// Owned by `handleResponses` so its error arm can number the terminal
+    /// `error` event after everything this function emitted.
+    seq_num: *u64,
 ) !void {
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gates below use `config.has_hybrid_layers`.
@@ -13607,8 +17088,14 @@ fn handleResponses(
     }
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -13680,23 +17167,13 @@ fn handleResponses(
         .max_tool_calls = max_tool_calls_echo,
     };
 
-    // SSE event sequence counter (required field on every Responses streaming event).
-    var seq_num: u64 = 0;
+    // SSE event sequence counter (required field on every Responses streaming
+    // event) — owned by the wrapper, see `handleResponses`.
 
     // ── streaming: send SSE headers + response.created + response.in_progress ──
     if (is_stream) {
         if (stream.ws_mode == null) {
-            const sse_headers =
-                "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: text/event-stream\r\n" ++
-                "Cache-Control: no-cache\r\n" ++
-                "Connection: close\r\n" ++
-                "Access-Control-Allow-Origin: *\r\n" ++
-                "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-                "\r\n";
-            try stream.writeAll(sse_headers);
-            logHttpStreamStart("responses");
+            try sendSseHeaders(stream, "responses", SSE_ALLOW_HEADERS_DEFAULT);
         }
 
         // Skeleton envelope (status:in_progress, output:[])
@@ -13726,10 +17203,10 @@ fn handleResponses(
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
         defer allocator.free(created_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.created", created_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.created", created_payload);
         const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel});
         defer allocator.free(ip_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.in_progress", ip_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.in_progress", ip_payload);
     }
 
     // ── generate (streaming path: emit deltas live; non-streaming: existing) ──
@@ -13773,6 +17250,7 @@ fn handleResponses(
     else
         defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
+    enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -14008,10 +17486,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
+                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
                     }
                     if (streamed_reasoning_started) live_output_index += 1;
 
@@ -14030,10 +17508,10 @@ fn handleResponses(
                         if (!streamed_message_started) {
                             streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                             streamed_message_index = live_output_index;
-                            try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
+                            try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
                             streamed_message_started = true;
                         }
-                        try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, content_after);
+                        try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, content_after);
                     }
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
@@ -14046,10 +17524,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
+                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
                         const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
@@ -14062,10 +17540,10 @@ fn handleResponses(
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
-                    try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
+                    try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
                     streamed_message_started = true;
                 }
-                try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, token_text);
+                try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, token_text);
             }
         }
 
@@ -14074,10 +17552,10 @@ fn handleResponses(
             if (!streamed_reasoning_started) {
                 streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                 streamed_reasoning_index = live_output_index;
-                try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                 streamed_reasoning_started = true;
             }
-            try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
+            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
         }
 
         ts.finalize();
@@ -14111,10 +17589,9 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-            error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
-            else => return err,
-        };
+        // Propagates to `handleResponses`' ONE error arm, which is also the
+        // streaming half's (external review of #363).
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -14176,13 +17653,13 @@ fn handleResponses(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
-            try emitResponsesReasoningEnd(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
+            try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
             defer allocator.free(rid);
             try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
             if (is_stream) {
-                try emitResponsesReasoningEvents(allocator, stream, &seq_num, output_index, rid, rt);
+                try emitResponsesReasoningEvents(allocator, stream, seq_num, output_index, rid, rt);
             }
         }
         emitted += 1;
@@ -14212,7 +17689,7 @@ fn handleResponses(
             try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
             emitted += 1;
             if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
+                try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
             }
             output_index += 1;
         }
@@ -14224,13 +17701,13 @@ fn handleResponses(
         if (is_stream and streamed_message_started) {
             // Live deltas already streamed; emit just the closing events.
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-            try emitResponsesMessageEnd(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, visible_text);
+            try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, visible_text);
         } else {
             const mid = try responses_mod.makeId(stream.io, allocator, "msg");
             defer allocator.free(mid);
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
             if (is_stream) {
-                try emitResponsesMessageEvents(allocator, stream, &seq_num, output_index, mid, visible_text);
+                try emitResponsesMessageEvents(allocator, stream, seq_num, output_index, mid, visible_text);
             }
         }
         emitted += 1;
@@ -14284,7 +17761,7 @@ fn handleResponses(
     if (is_stream) {
         const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
         defer allocator.free(completed_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.completed", completed_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.completed", completed_payload);
         // OpenAI terminates the Responses HTTP SSE stream with the same
         // `data: [DONE]` sentinel as chat completions; generic SSE middleware
         // keys stream end off it. The WS transport must NOT get one — its
@@ -14553,8 +18030,12 @@ fn handleResponsesWebSocket(
         bridge.reset();
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
-            // Best-effort error frame; connection may already be torn.
-            wsSendErrorTurn(allocator, &ws_conn, 500, "server_error", @errorName(err)) catch {};
+            // Best-effort error frame; connection may already be torn. Same
+            // mapping as every HTTP surface — a WS client is owed the memory
+            // 503 and the too-large 400 as much as an SSE one is.
+            var ws_err_buf: [192]u8 = undefined;
+            const ws_wire = mapGenerationError(err, &ws_err_buf);
+            wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
             // Restore borrowed prev entry back to local cache on failure.
             if (did_borrow_to_global and prev_id_owned != null) {
                 const store = getOrInitResponseStore(stream.io, allocator);
@@ -15885,7 +19366,7 @@ test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
     // an admitted offload leaves a usable context behind.
     try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
         kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
-        prefix_cache_mem_bytes +
+        resolvedPrefixCacheMem() +
         prefillTransientReserve(&cfg, defaultKvBits(), 1024));
 
     // A model that cannot reach the reserve context only reserves its own max.
@@ -16663,7 +20144,7 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // full re-prefill per turn. The byte budget (prefix_cache_mem_bytes)
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
-    try testing.expect(prefix_cache_mem_bytes > 0);
+    try testing.expect(resolvedPrefixCacheMem() > 0);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -17552,8 +21033,8 @@ test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-widt
     // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
     // 31-token forward (~25 MB). A forward is never wider than the prompt:
     // the envelope must use min(chunk, seq). Guard-tracks-reality rule.
-    const small = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 31, 31, 0, 0);
-    const capped = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 8192, 31, 0, 0);
+    const small = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 31, 31, 0, 0, .{});
+    const capped = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 8192, 31, 0, 0, .{});
     try std.testing.expectEqual(small, capped);
     // Sanity: the clamped estimate for the live 31-token case sits far below
     // the ~4 GB that was actually available. It is not zero — every prefill
@@ -17572,17 +21053,17 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
     try t.expectEqual(
         @as(u64, 32_854_507_520 + 671_088_640),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
     );
     // 4-bit: kv billed at (2*4+1)/16 bytes/elem (payload + group scale/bias)
     // = 6.912 GB, plus the 0.8192 GB per-layer dense dequant transient.
     try t.expectEqual(
         @as(u64, 11_798_507_520 + 671_088_640),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0, .{}),
     );
     // Direction: quantized admission must be under half the fp16 bill.
-    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0) * 2 <
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0));
+    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0, .{}) * 2 <
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}));
 }
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
@@ -17593,7 +21074,7 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
     // mlp 0.377 GB, x1.25 = ~13.1 GiB — admittable on a big Mac.
-    const needed = prefillMemoryNeeded(262_144, 16, 2, 81920, 256, 256, 2048, 15360, 4, 512, 262_144, 0, 0);
+    const needed = prefillMemoryNeeded(262_144, 16, 2, 81920, 256, 256, 2048, 15360, 4, 512, 262_144, 0, 0, .{});
     try t.expectEqual(@as(u64, 14_061_404_160 + 671_088_640), needed);
     try t.expect(needed < 16 << 30);
     // The retired seq-scaled envelope billed 8 x seq x ffn x 2 working bytes
@@ -17611,13 +21092,13 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
     // mlp 69.2 MB, x1.25.
     try t.expectEqual(
         @as(u64, 15_446_507_520 + 671_088_640),
-        prefillMemoryNeeded(100_000, 16, 8, 122880, 128, 128, 2816, 2112, 16, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 122880, 128, 128, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
     );
     // hd=256 adds the [heads, chunk, seq] score tensor (the guard must see
     // what the composed SDPA path actually allocates). Decomposition: the
     // hd-128 bill + the KV doubling from 128->256 (12.288 GB x1.25) + the
     // score tensor (16x512x100000x2 = 1.6384 GB x1.25).
-    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0);
+    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{});
     try t.expectEqual(@as(u64, 15_446_507_520 + 671_088_640 + 15_360_000_000 + 2_048_000_000), with_scores);
 }
 
@@ -17633,8 +21114,8 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
     const kv_per_tok: u64 = 6 * 16 * (192 + 128) * 2; // 6 caching layers of 24
     const stored: u64 = 128;
     const scored: u64 = 192;
-    const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0);
-    const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768, 0, 0);
+    const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{});
+    const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{});
     // The difference is exactly the score tensor: heads x chunk x seq x 2, x1.25.
     const score_bytes: u64 = 16 * 4096 * 32_768 * 2;
     try t.expectEqual(honest - blind, score_bytes * 5 / 4);
@@ -17643,7 +21124,7 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
     // stored width touches nothing the score term reads.
     try t.expectEqual(
         honest,
-        prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, scored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0),
+        prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, scored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{}),
     );
 }
 
@@ -17656,25 +21137,30 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
         @as(u64, 32_854_507_520 + 671_088_640 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
     );
     // The quantized-KV dequant transient is a denseView property, NOT a score
     // property — it must survive the fused kernel (fires on every kv-quant
     // request regardless of head_dim).
     try t.expectEqual(
         @as(u64, 11_798_507_520 + 671_088_640 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0, .{}),
     );
 }
 
 test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keeps it" {
     // The reserve at the widest chunk must never claim more than a quarter of
-    // what is left after the weights and the hot-cache budget. Numbers are the
-    // measured 16 GB profile: Metal's recommended working set on a 16 GB Mac is
-    // ~11.9 GiB, Mistral-7B-4bit sits at 3.80 GiB resident, the hot prefix
-    // cache reserves its default 2 GB. At chunk 8192 the transient reserve is
-    // 7.2 GiB against 6.1 GiB of budget — the case that reported a 1024-token
-    // context and 400'd a 10k-token prompt whose real peak is 2.39 GiB.
+    // what is left after the weights. Numbers are the measured 16 GB profile:
+    // Metal's recommended working set on a 16 GB Mac is ~11.9 GiB and
+    // Mistral-7B-4bit sits at 3.80 GiB resident. At chunk 8192 the transient
+    // reserve is ~7.6 GiB against 1.83 GiB of share — the case that reported a
+    // 1024-token context and 400'd a 10k-token prompt whose real peak is
+    // 2.39 GiB.
+    //
+    // UPDATED with the ask-independence fix: the hot-cache budget is no longer
+    // an input to this function (it was the non-monotone loop), so the former
+    // `2 * GiB` argument is now the PINNED-context KV bar and is 0 here — this
+    // profile runs auto-context, which adapts to whatever rung comes out.
     const t = std.testing;
     const GiB: u64 = 1024 * 1024 * 1024;
     var mistral = model_mod.ModelConfig{};
@@ -17690,19 +21176,23 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
 
     const ceiling_16: u64 = 11_918_000_000;
     const weights: u64 = 4_080_000_000;
-    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 2 * GiB);
+    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 0, 0);
     try t.expect(narrowed < 8192);
     try t.expect(narrowed >= 512);
     // It is the WIDEST rung that fits, not simply the floor.
     try t.expect(prefillTransientReserve(&mistral, 16, narrowed) <=
-        (ceiling_16 - weights - 2 * GiB) / 4);
+        (ceiling_16 - weights) / 4);
+    for (PREFILL_CHUNK_LADDER) |c| {
+        if (c <= narrowed) break;
+        try t.expect(prefillTransientReserve(&mistral, 16, c) > (ceiling_16 - weights) / 4);
+    }
 
     // Same model, a machine with room: nothing narrows.
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 2 * GiB));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 0, 0));
 
     // A model that barely fits gets the narrowest rung rather than a wide one
     // it cannot pay for — and never 0, which would read as "not pinned".
-    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 2 * GiB));
+    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 0, 0));
 
     // Every rung is a real ladder entry, descending, floored at generate's own
     // minimum — a chunk generate would refuse is a chunk the bill cannot model.
@@ -17747,8 +21237,8 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     // A ceiling whose quarter-share sits between the two bills at 8192.
     const weights: u64 = 70_000_000_000;
     const ceiling = weights + (twin_bill + q4_bill) / 2 * 4;
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0));
-    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0, 0));
+    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0, 0));
 }
 
 test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinned" {
@@ -17824,23 +21314,23 @@ test "prefillMemoryNeeded: every MEASURED prefill peak on the box is billed for"
     // 48 GatedDeltaNet layers x (2x16x128 + 48x128) elems x 2 B of stream.
     const q27_stream: u64 = 48 * (2 * 16 * 128 + 48 * 128) * 2;
     const q27_dq: u64 = 3 * 17408 * 5120 * 2;
-    try t.expect(prefillMemoryNeeded(9320, 24, 4, 65536, 256, 256, 5120, 17408, 16, 2048, 9320, q27_stream, q27_dq) >= 3_978_000_000);
-    try t.expect(prefillMemoryNeeded(9270, 24, 4, 65536, 256, 256, 5120, 17408, 16, 8192, 9270, q27_stream, q27_dq) >= 10_838_000_000);
+    try t.expect(prefillMemoryNeeded(9320, 24, 4, 65536, 256, 256, 5120, 17408, 16, 2048, 9320, q27_stream, q27_dq, .{}) >= 3_978_000_000);
+    try t.expect(prefillMemoryNeeded(9270, 24, 4, 65536, 256, 256, 5120, 17408, 16, 8192, 9270, q27_stream, q27_dq, .{}) >= 10_838_000_000);
     // qwen3_5 4B: hidden 2560, ffn 9216, 32 layers / 8 caching, 24 GDN layers.
     const q4_stream: u64 = 24 * (2 * 16 * 128 + 32 * 128) * 2;
     const q4_dq: u64 = 3 * 9216 * 2560 * 2;
-    try t.expect(prefillMemoryNeeded(9340, 16, 4, 32768, 256, 256, 2560, 9216, 16, 1024, 9340, q4_stream, q4_dq) >= 1_648_000_000);
-    try t.expect(prefillMemoryNeeded(9270, 16, 4, 32768, 256, 256, 2560, 9216, 16, 8192, 9270, q4_stream, q4_dq) >= 5_110_000_000);
+    try t.expect(prefillMemoryNeeded(9340, 16, 4, 32768, 256, 256, 2560, 9216, 16, 1024, 9340, q4_stream, q4_dq, .{}) >= 1_648_000_000);
+    try t.expect(prefillMemoryNeeded(9270, 16, 4, 32768, 256, 256, 2560, 9216, 16, 8192, 9270, q4_stream, q4_dq, .{}) >= 5_110_000_000);
     // gemma4 26B-A4B MoE: hidden 2816, top_k 8 x moe 704, 30 sliding layers.
     const g4_stream: u64 = 4 * 8 * 2 * (2816 + 704) * 2;
     const g4_dq: u64 = 3 * 5632 * 2816 * 2;
-    try t.expect(prefillMemoryNeeded(8204, 16, 8, 245760, 256, 256, 2816, 5632, 16, 4096, 8204, g4_stream, g4_dq) >= 3_960_000_000);
+    try t.expect(prefillMemoryNeeded(8204, 16, 8, 245760, 256, 256, 2816, 5632, 16, 4096, 8204, g4_stream, g4_dq, .{}) >= 3_960_000_000);
     // lfm2 2.6B conv hybrid at the narrowest chunk measured: no stream term,
     // and the forward is under the dequant route's minimum width.
-    try t.expect(prefillMemoryNeeded(10089, 32, 8, 16384, 64, 64, 2048, 10752, 16, 256, 10089, 0, 3 * 10752 * 2048 * 2) >= 782_000_000);
-    try t.expect(prefillMemoryNeeded(10206, 32, 8, 16384, 64, 64, 2048, 10752, 16, 8192, 10206, 0, 3 * 10752 * 2048 * 2) >= 2_527_000_000);
+    try t.expect(prefillMemoryNeeded(10089, 32, 8, 16384, 64, 64, 2048, 10752, 16, 256, 10089, 0, 3 * 10752 * 2048 * 2, .{}) >= 782_000_000);
+    try t.expect(prefillMemoryNeeded(10206, 32, 8, 16384, 64, 64, 2048, 10752, 16, 8192, 10206, 0, 3 * 10752 * 2048 * 2, .{}) >= 2_527_000_000);
     // muse_glimmer 30B dense: hidden 6656, ffn 19968, 52 layers, hd 128.
-    try t.expect(prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 3 * 19968 * 6656 * 2) >= 2_178_000_000);
+    try t.expect(prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 3 * 19968 * 6656 * 2, .{}) >= 2_178_000_000);
 }
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {
@@ -17853,9 +21343,9 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
 
     // The stream term is per CHUNK-TOKEN: it scales with the forward width and
     // not with the prompt, which is what the whole chunk-bounded model says.
-    const at2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, stream, 0);
-    const at8k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 8192, q27.seq, stream, 0);
-    const flat2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0);
+    const at2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, stream, 0, .{});
+    const at8k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 8192, q27.seq, stream, 0, .{});
+    const flat2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0, .{});
     const mlp2k: u64 = 8 * 2048 * q27.ffn * 2;
     const floor: u64 = 512 * 1024 * 1024;
     // The stream arm wins on this arch — that IS the fix — so the bill is one
@@ -17867,23 +21357,23 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
 
     // A longer prompt at the same chunk adds KV only — the stream term does
     // not move, or it would be the per-token multiplier this class is about.
-    const long = prefillMemoryNeeded(4 * q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, 4 * q27.seq, stream, 0);
+    const long = prefillMemoryNeeded(4 * q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, 4 * q27.seq, stream, 0, .{});
     try t.expectEqual(long - at2k, 3 * q27.seq * q27.kvpt * 5 / 4);
 
     // The dequant-weight term is chunk-INDEPENDENT (it is weights) but only
     // bills where the route can fire: at or above PREFILL_DQ_GEMM_MIN_M.
-    const dq_wide = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, dq);
+    const dq_wide = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, dq, .{});
     try t.expectEqual(dq_wide - flat2k, dq * 5 / 4);
-    const narrow_with = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, dq);
-    const narrow_without = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, 0);
+    const narrow_with = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, dq, .{});
+    const narrow_without = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, 0, .{});
     try t.expectEqual(narrow_with, narrow_without);
     // A dense checkpoint passes 0 and is billed nothing for it (measured: a
     // bf16 lfm2 sits within 0.19 GB of the 8-bit one, which IS this term).
-    try t.expectEqual(flat2k, prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0));
+    try t.expectEqual(flat2k, prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0, .{}));
 
     // An arch with neither keeps the 3-envelope bill it had, plus the floor —
     // no plain-attention arch's admission tightens by more than the floor.
-    const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0);
+    const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0, .{});
     const pre_fix: u64 = (9827 * 53248 + 3 * 8 * 2048 * 19968 * 2) * 5 / 4;
     try t.expectEqual(dense_only - pre_fix, 512 * 1024 * 1024 * 5 / 4);
 }
@@ -17967,13 +21457,13 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     // 8629 MB free. Pre-fix it billed 10277 MB — a dense 5806-wide key axis
     // PLUS the 15360 intermediate_size struct default — and 400'd.
     const available: u64 = 8629 * 1024 * 1024;
-    const before = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 15360, 8, 5632, 5806, 0, 0);
+    const before = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 15360, 8, 5632, 5806, 0, 0, .{});
     try t.expectEqual(@as(u64, 10277 + 640), before / (1024 * 1024));
     try t.expect(before > available);
     // Fixed: 641 keys (window 128 + top-512 + sink) and the width the config
     // actually states (top_k 6 x moe_intermediate 2048 = 12288, what
     // prefillFfnWidth resolves for this checkpoint) — 4848 MB, admitted.
-    const after = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 12288, 8, 5632, 641, 0, 0);
+    const after = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 12288, 8, 5632, 641, 0, 0, .{});
     try t.expectEqual(@as(u64, 4848 + 640), after / (1024 * 1024));
     try t.expect(after < available);
     // The score term is the ONLY one the key bound may touch: same call with a
@@ -17981,8 +21471,8 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
-        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0),
-        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0, .{}),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0, .{}),
     );
 }
 
@@ -17997,7 +21487,7 @@ test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, no
     // f32 gathered-K set (the very allocation PREFILL_SUB exists to bound).
     // The honest bill for the same request is ~2.3 GB — admitted with room.
     const available: u64 = 3610 * 1024 * 1024;
-    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641, 0, 0);
+    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641, 0, 0, .{});
     try t.expectEqual(@as(u64, 4069 + 640), generic / (1024 * 1024));
     try t.expect(generic > available);
     const honest = dsv4PrefillMemoryNeeded(7514, 43, 512, 4096, 12288, 512, 641);
@@ -18033,13 +21523,27 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     // resident entry to `needed` again (the 138k-token false-400 regression).
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const start = std.mem.indexOf(u8, src, "fn checkAttention" ++ "Memory(") orelse return error.CallSiteMoved;
+    // The bill and the headroom moved into `prefillAdmissionBill` (#353: the
+    // inference thread's evict-or-refuse probe must compute them the same
+    // way), so the span this pins runs from THERE to the end of the guard —
+    // the same code, one function earlier.
+    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
     const tail = src[start..];
     const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
     const body = tail[0..end];
     try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
     try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
     try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
+    // The hot cache appears exactly ONCE and only as `evictable` — a hint for
+    // the admit-after-eviction arm, never added to `needed` — and it is read
+    // as the PUBLISHED atomic, never by dereferencing the inference thread's
+    // `hot_prefix_cache` pointer from a connection thread.
+    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
+    // The forbidden thing is the DEREFERENCE, not the name: the comment above
+    // the published read has to be free to say which pointer it is avoiding.
+    try t.expect(std.mem.indexOf(u8, body, "sch." ++ "hot_prefix_cache") == null);
+    try t.expect(std.mem.indexOf(u8, body, ".hot_prefix_cache.?") == null);
+    try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
 }
 
 test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
@@ -18066,8 +21570,30 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // are the same class of parameter: derived from the CONFIG at the site, or
     // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
     // and a quantized checkpoint gets a dense one's.
-    try t.expect(std.mem.indexOf(u8, src, "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
-    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
+    // The per-request terms are the same class again: seq-scaled, derived
+    // from the CONFIG at the site, and billing them at zero is what admitted
+    // the 458,832-token qwen4_exp prompt that killed the process (#353).
+    // COUNTED, not just found: the literal below is itself part of `src`, so
+    // `!= null` alone is self-satisfying and would keep passing after the call
+    // site drops the argument.
+    const wired = "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm))";
+    var wired_seen: usize = 0;
+    var wired_at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, wired_at, wired)) |hit| {
+        wired_seen += 1;
+        wired_at = hit + 1;
+    }
+    try t.expectEqual(@as(usize, 2), wired_seen); // the call site + this literal
+    // The RESERVE half of the same estimator is pinned at the same site rule.
+    // Since B1 it lives in `prefillTransientReserveAtKv`, which bills at an
+    // EXPLICIT KV length because two terms of it — the attention score sheet
+    // and the QSA sheet — are linear in the KV, and the load-time wrapper is
+    // only its `kv = chunk` case. So the length is pinned too: `seq` must stay
+    // `@max(kv_len, chunk)`, or a per-chunk decision drops back to the
+    // load-time bill (the B1 blocker, ~0.5-9 GB under-billed) while the
+    // argument needle below still matches.
+    try t.expect(std.mem.indexOf(u8, src, "    const seq: u64 = @max(kv_len, chunk);\n") != null);
+    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(seq),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
 
     // Auto-context sizing reads the same helpers — the two must not drift.
     // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
@@ -18078,7 +21604,12 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // The prefill transient: the sizer RESERVES it once at the chunk width
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
-    try t.expect(std.mem.indexOf(u8, src, "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    // Reads the RESOLVED budget, not the ask: the sizer must reserve what the
+    // cache was actually given (`prefixCacheMemForLoad` publishes it), or a
+    // clamped-down cache keeps a reserve nobody will ever use.
+    // UPDATED (audit S6): the sizer now reserves the CONSTANT, not the
+    // resolved budget — reading either dynamic budget is the one-step loop.
+    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -18098,10 +21629,37 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
             i = at + 1;
             // Skip the declaration itself.
             if (at >= 3 and std.mem.eql(u8, src[at - 3 .. at], "fn ")) continue;
+            // Skip TEST call sites. The drift this scan exists to catch is a
+            // PRODUCTION path resolving a width nobody billed; a test may hand
+            // the resolver any width it likes, and since the width became a
+            // per-request value the tests hand it plenty. A hit belongs to a
+            // test when the nearest `test "` above it is nearer than the
+            // nearest function header.
+            const before = src[0..at];
+            const last_test = std.mem.lastIndexOf(u8, before, "\ntest \"");
+            const last_fn = std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0;
+            const last_pub_fn = std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0;
+            if (last_test) |lt| {
+                if (lt > @max(last_fn, last_pub_fn)) continue;
+            }
             const tail = src[at..@min(src.len, at + 512)];
             const end = std.mem.indexOf(u8, tail, "));") orelse
                 std.mem.indexOf(u8, tail, ");") orelse return error.CallSiteMoved;
-            try t.expect(std.mem.indexOf(u8, tail[0..end], "pinned_prefill_chunk") != null);
+            // WIDENED for the per-request chooser: the rule is "hand it the
+            // width that will be pinned for this forward", and since
+            // `chooseRequestPrefillChunk` the model's load-time pin is no
+            // longer the only such value. `rung` is a candidate being PRICED
+            // (its bill decides whether it is chosen) and `chosen`/the ladder
+            // floor is the value that becomes `InitOptions.pinned_prefill_chunk`
+            // — all three are billed by `prefillNeededAtChunk` in the same
+            // breath, pinned by "the per-request rung is priced by the SAME
+            // estimator". A bare launch-width argument still fails, which is
+            // the drift the scan exists to catch.
+            const args = tail[0..end];
+            try t.expect(std.mem.indexOf(u8, args, "pinned_prefill_chunk") != null or
+                std.mem.indexOf(u8, args, "rung") != null or
+                std.mem.indexOf(u8, args, "chosen") != null or
+                std.mem.indexOf(u8, args, "PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]") != null);
             sites += 1;
         }
     }
@@ -18114,7 +21672,15 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // scheduler sources it from `slot.model.config` — the same object the
     // guard bills against.
     const sched = @embedFile("scheduler.zig");
-    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
+    // UPDATED: the width is now chosen per REQUEST (`req_prefill_chunk`,
+    // resolved right after the eviction pass), and falls back to
+    // `cfg.pinned_prefill_chunk` whenever the hook is absent or the arch has
+    // not opted in. The property the scan defends is unchanged — the value
+    // still comes off `slot.model.config`, never off a Transformer's stale
+    // copy — so it now checks both halves of that derivation.
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill_chunk,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "const pin = cfg.pinned_prefill_chunk;") != null);
     try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
 
     // And the width has to be frozen BEFORE anything is computed from it:
@@ -18156,7 +21722,9 @@ test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 
     const launch = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, 8192), per_tok, 32768);
     try t.expectEqual(@as(u32, 1024), launch); // the floor: nothing fits
 
-    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 2 * GiB);
+    // The hot-cache budget is no longer an input (see the ask-independence
+    // fix); auto-context here means the pinned-context bar is 0 too.
+    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 0, 0);
     const sized = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, chunk), per_tok, 32768);
     try t.expect(sized > 12_000);
 
@@ -18177,6 +21745,7 @@ test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 
         cfg.prefillAttnKeys(10_348),
         prefillStreamBytesPerToken(&cfg),
         prefillDequantWeightBytes(&cfg),
+        .{},
     );
     try t.expect(needed < ceiling - weights);
     // Still comfortably above the measured 2.391 GiB peak — narrowing the chunk
@@ -18353,6 +21922,97 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
+    // External review of PR #363, item 2. The 400/503 mapping — `GEN_OOM_MSG`
+    // as a 503, `PREFILL_NOFIT_MSG` as a 400 — existed ONLY on the
+    // non-streaming arms. Every streaming arm caught the same errors and wrote
+    // `"Internal server error: GenerationOutOfMemory"` with `type` "server_error"
+    // into an SSE frame with a 200 already on the wire. Agents stream, so the
+    // named, actionable error was the one nobody saw.
+    const t = std.testing;
+    const a = t.allocator;
+
+    // ONE mapping, asked once per class, and the message is the same constant
+    // the non-streaming arms already sent.
+    var buf: [192]u8 = undefined;
+    {
+        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        try t.expectEqual(@as(u32, 503), w.code);
+        try t.expectEqualStrings("503 Service Unavailable", w.status_line);
+        try t.expectEqualStrings(GEN_OOM_MSG, w.message);
+        try t.expectEqualStrings("server_error", w.openai_type);
+        try t.expectEqualStrings("api_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings(PREFILL_NOFIT_MSG, w.message);
+        // A request refused before its first forward is the CLIENT's request
+        // being too large, on both dialects.
+        try t.expectEqualStrings("invalid_request_error", w.openai_type);
+        try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.GenerationFailed, &buf);
+        try t.expectEqual(@as(u32, 500), w.code);
+        try t.expectEqualStrings("generation failed", w.message);
+    }
+    {
+        // Anything else keeps its NAME in the message — the streaming arms'
+        // one virtue — but at a mapped status, and identically on both paths.
+        const w = mapGenerationError(error.WriteFailed, &buf);
+        try t.expectEqual(@as(u32, 500), w.code);
+        try t.expectEqualStrings("Internal server error: WriteFailed", w.message);
+    }
+
+    // The SSE bodies carry that same type and message, plus the surface's own
+    // terminal marker. A client that only reads `choices` still terminates.
+    {
+        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        const body = try buildOpenAiStreamError(a, w);
+        defer a.free(body);
+        try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, body, "\"code\":503") != null);
+        try t.expect(std.mem.indexOf(u8, body, GEN_OOM_MSG) != null);
+        try t.expect(std.mem.indexOf(u8, body, "\"finish_reason\":\"error\"") != null);
+
+        const anth = try buildAnthropicStreamError(a, w);
+        defer a.free(anth);
+        try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"error\"") != null);
+        try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"api_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, anth, GEN_OOM_MSG) != null);
+
+        const resp = try buildResponsesStreamError(a, w);
+        defer a.free(resp);
+        try t.expect(std.mem.indexOf(u8, resp, "\"type\":\"error\"") != null);
+        try t.expect(std.mem.indexOf(u8, resp, "\"code\":\"server_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, resp, GEN_OOM_MSG) != null);
+    }
+
+    // And no surface may hand-format a raw error NAME into a client-visible
+    // frame any more: that is the bug, and it is what a revert restores.
+    // Needles ++-split so this test's own source cannot satisfy them.
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, "Internal server error: {s}" ++ "\",\"type\":\"server_error\"") == null);
+    try t.expect(std.mem.indexOf(u8, src, "\"message\":\"Internal server error: {s}" ++ "\"") == null);
+    try t.expect(std.mem.indexOf(u8, src, "sendAnthropicError(allocator, stream, \"api_error\", @errorName" ++ "(err), 500)") == null);
+    try t.expect(std.mem.indexOf(u8, src, "\"server_error\", @errorName" ++ "(err), 500)") == null);
+
+    // All four generative surfaces route their catch through the one sender:
+    // chat stream + non-stream, completions stream + non-stream, messages
+    // stream + non-stream, and `/v1/responses` (one wrapper covering both
+    // modes, since it is the surface that had no arm at all). EXACT, and the
+    // needle is ++-split so this test's own source is not one of them —
+    // counting itself is how a `>=` guard survives losing a surface.
+    var senders: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, "sendGeneration" ++ "Error(allocator, stream, err,")) |hit| {
+        senders += 1;
+        at = hit + 1;
+    }
+    try t.expectEqual(@as(usize, 7), senders);
 }
 
 test "contextOverflowMessage: the 400 names both counts so a client can act on it" {
@@ -18662,4 +22322,2028 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag" {
+    const saved = generate_mod.max_mtp_ctx;
+    defer generate_mod.max_mtp_ctx = saved;
+
+    // Unlimited (the default): the gate is a pass-through in both directions.
+    generate_mod.max_mtp_ctx = 0;
+    try std.testing.expect(admitMtpForCtx(true, 1_000_000));
+    try std.testing.expect(!admitMtpForCtx(false, 1));
+
+    // Inclusive at the ceiling, off at the first token past it. `true` here is
+    // the resolved value — an explicit `enable_mtp:true` in the body reaches
+    // the gate exactly like the default does, and loses.
+    generate_mod.max_mtp_ctx = 4096;
+    try std.testing.expect(admitMtpForCtx(true, 4096));
+    try std.testing.expect(!admitMtpForCtx(true, 4097));
+
+    // It never turns MTP ON for a request that had it off for another reason
+    // (logprobs, no head loaded, ...).
+    try std.testing.expect(!admitMtpForCtx(false, 1));
+}
+
+test "every request surface runs the --max-mtp-ctx admission gate" {
+    // Class guard (the per-surface wiring class): four surfaces resolve
+    // `enable_mtp`, and a surface that skipped the ceiling would serve MTP at
+    // any context while every other layer looked correct. Needles split so
+    // this test's own text cannot satisfy the count.
+    const src = @embedFile("server.zig");
+    // Leading "= " so the FUNCTION DEFINITION does not count as a call site:
+    // `fn admitMtpForCtx(enable_mtp: bool, ...)` matches the bare needle too,
+    // which is why the old bound had to be `>= 4` and could not be exact.
+    const call = "= admitMtpFor" ++ "Ctx(enable_mtp";
+    var sites: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, src, idx, call)) |at| {
+        sites += 1;
+        idx = at + call.len;
+    }
+    // chat/completions, completions, messages, responses (`enable_mtp_resp`
+    // shares the prefix) — and EXACTLY those four. `>= 4` passed while a
+    // surface was missing as long as another had two calls, which is the
+    // shape this scan exists to catch; the helper takes the RESOLVED value
+    // and each surface resolves it once, so the count is exact.
+    try std.testing.expectEqual(@as(usize, 4), sites);
+
+    // The gate reads the ONE value the CLI sets; a second source of truth for
+    // the ceiling is the bug this pins.
+    try std.testing.expect(std.mem.indexOf(u8, src, "generate_mod.max_mtp" ++ "_ctx;") != null);
+
+    // `--max-mtp-ctx` must be in main.zig's match list or the arg loop eats it
+    // silently (`cli.classifyUnparsedArg` only classifies what falls through).
+    const main_src = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "\"--max-mtp" ++ "-ctx\"") != null);
+    // ... and in --help, which is the flag list users read.
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "--max-mtp" ++ "-ctx <n>") != null);
+}
+
+test "an MLX failure is a named memory 503, and main installs the latch that makes one possible" {
+    const t = std.testing;
+    // Class guard for issue #353: mlx-c's DEFAULT error handler calls
+    // exit(-1), so before this the FIRST Metal working-set abort took the
+    // whole server with it — no status line, no connection close, every other
+    // in-flight request gone. The handler must be installed ONCE from main(),
+    // beside the cache limit, or a subcommand keeps the fatal default.
+    const main_src = @embedFile("main.zig");
+    try t.expect(std.mem.indexOf(u8, main_src, "mlx.installErrorHandler();") != null);
+
+    // The prefill chunk loop is the checkpoint that turns a latched failure
+    // into an abandoned REQUEST rather than an abandoned process: once per
+    // chunk (the cancel check's cadence) and once after the last chunk, which
+    // has no next iteration to catch it.
+    const gen_src = @embedFile("generate.zig");
+    var seen: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, gen_src, at, "try mlx.checkError();")) |hit| {
+        seen += 1;
+        at = hit + 1;
+    }
+    try t.expect(seen >= 2);
+
+    // And the client sees the CLASS, not "generation failed": every slot
+    // drain site answers through `slotFailure`, never a bare
+    // `error.GenerationFailed`.
+    const src = @embedFile("server.zig");
+    // The needle is SPLIT with `++` (the file's scan-test convention) so this
+    // test's own source cannot match it — without that, an absent-form
+    // assertion over `@embedFile("server.zig")` can only ever fail.
+    const bare = ".err => return error.Generation" ++ "Failed,";
+    var bare_seen: usize = 0;
+    var bare_at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, bare_at, bare)) |hit| {
+        bare_seen += 1;
+        bare_at = hit + 1;
+    }
+    try t.expectEqual(@as(usize, 0), bare_seen);
+    // Both spellings of a memory failure are the memory class, exactly as
+    // `loadErrorFromName` treats them on the load path.
+    try t.expect(scheduler_mod.Slot.errorNameIsMemory("OutOfMemory"));
+    try t.expect(scheduler_mod.Slot.errorNameIsMemory("InsufficientMemory"));
+    try t.expect(!scheduler_mod.Slot.errorNameIsMemory("MissingWeight"));
+}
+
+/// The qwen4_exp shape of the live #353 report: Qwen3.8-Flash-Next
+/// mixed-4-8bit, `--ctx-size 1048576 --kv-quant 8`, on an M5 Max 128 GB.
+fn qwen4ExpOomConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 48;
+    cfg.full_attention_interval = 4; // 12 caching layers, 36 GatedDeltaNet
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 2560;
+    cfg.moe_intermediate_size = 640;
+    cfg.num_experts = 512;
+    cfg.num_experts_per_tok = 10;
+    cfg.shared_expert_intermediate_size = 640;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_key_head_dim = 128;
+    cfg.linear_num_value_heads = 48;
+    cfg.linear_value_head_dim = 128;
+    cfg.linear_conv_kernel_dim = 4;
+    cfg.indexer_budget = 512;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    // PINNED, and load-bearing: the reservation is clamped to the effective
+    // context, and with nothing pinned `getEffectiveContextLength` falls
+    // through to `autoContextFor`, which reads LIVE GPU memory. That made
+    // every expectation below a function of how much RAM this box happened to
+    // have free — on a busy machine the auto context came out BELOW the
+    // 458,832-token prompt, the clamp took the whole generation headroom away,
+    // and the test failed for a reason that had nothing to do with the
+    // estimator. 1,048,576 is the `--ctx-size` of the live run these numbers
+    // come from.
+    cfg.pinned_context = 1_048_576;
+    return cfg;
+}
+
+test "the 458k prefill's two unbilled terms are billed: retained checkpoints and reserved capacity" {
+    const t = std.testing;
+    // LIVE 2026-09-03: a 458,832-token cold prefill was ADMITTED against
+    // 26.6 GB of headroom (bill ~18.1 GB) and then died mid-prefill. Two
+    // terms were missing from the bill entirely.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 458_832;
+    const chunk: u64 = 4096;
+
+    // 1. SSM CHECKPOINTS. 36 GatedDeltaNet layers x (state + conv window),
+    //    captured every stride and held up to --ssm-checkpoint-max (32) —
+    //    ~1.9 GB the guard billed at zero.
+    const per_cp = cfg.ssmCheckpointBytes();
+    // 36 linear layers x (1,572,864 B of state + 61,440 B of conv window) =
+    // 58.83 MB. Stated in BYTES: the same number is 56.1 MiB, and the two
+    // spellings are 5% apart.
+    try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
+    const held = retainedSsmCheckpointBytes(&cfg, seq, chunk);
+    try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, held);
+    try t.expect(held > 1_800_000_000);
+    // It saturates: 393k holds the same 32 as 458k, which is why the term is
+    // not what separates the two runs.
+    try t.expectEqual(held, retainedSsmCheckpointBytes(&cfg, 393_216, chunk));
+    // An arch with no linear layers has nothing to checkpoint and is billed
+    // nothing — no plain-attention arch's admission tightens.
+    var dense = model_mod.ModelConfig{};
+    dense.num_hidden_layers = 32;
+    dense.num_attention_heads = 32;
+    try t.expectEqual(@as(u64, 0), dense.ssmCheckpointBytes());
+    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&dense, seq, chunk));
+
+    // 2. RESERVED CAPACITY. The request reserves prompt + max_tokens + one
+    //    chunk up front so the prefill never grows a buffer beside its
+    //    replacement; the guard bills the headroom that reservation adds
+    //    beyond the prompt's own rows, and NOT a second copy of the cache
+    //    (which is what pricing the transient would have cost: it roughly
+    //    halves the admissible context on every arch).
+    const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    try t.expectEqual((2048 + chunk) * kv_per_tok, terms.reserved_kv_bytes);
+    try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
+    // The indexer history is billed at ONE copy here: the growth transient is
+    // gone (`qsaAppendKeys` appends into a capacity buffer the reservation
+    // sized once) and the newest checkpoint takes a VIEW of that buffer at
+    // commit instead of a prefill-end copy. The score bank rides beside it.
+    // The sizer bills the same width, so advertised and admitted contexts
+    // cannot diverge. Full contract in "billed at the copies it HOLDS" below.
+    // What the bill reads is `statePerTokenBilled`, which follows the two
+    // LEVERS that decide the copy count (the commit handoff and the
+    // reservation) — asserted directly on the next line, so there is nothing
+    // for a flag about the append to add.
+    try t.expectEqual(cfg.qsaHistoryBytesPerToken() + cfg.qsaScoreBankBytesPerToken(), statePerTokenBilled(&cfg));
+    try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
+    try t.expectEqual(held, terms.checkpoint_bytes);
+
+    // 3. The bill MOVED, and in the direction that ends in a 503 instead of a
+    //    corpse: more than 3 GB above what the flat runtime floor accounted
+    //    for at this length.
+    const with_terms = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms);
+    const without = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{});
+    try t.expect(with_terms > without + 3_000_000_000);
+    // The SENTINEL runs through the same path: an omitted max_tokens must not
+    // move the bill past the context, or the guard refuses every prompt past
+    // the reservation threshold (the defect this pairing exists to catch).
+    const sentinel: u64 = omittedMaxTokensDefault(@intCast(@min(getEffectiveContextLength(&cfg), 1_048_576)));
+    const with_sentinel = prefillRequestTerms(&cfg, seq, sentinel, 8, chunk, .{});
+    const with_explicit = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
+    try t.expect(with_sentinel.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
+    try t.expect(with_sentinel.state_bytes < 4 * with_explicit.state_bytes);
+    // and the checkpoints term does not depend on max_tokens at all.
+    try t.expectEqual(with_explicit.checkpoint_bytes, with_sentinel.checkpoint_bytes);
+
+    // A short prompt is untouched: no reservation below the threshold, and
+    // the state term is what the caller used to add after the margin.
+    const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk, .{});
+    try t.expectEqual(@as(u64, 0), short.reserved_kv_bytes);
+    try t.expectEqual(4096 * statePerTokenBilled(&cfg), short.state_bytes);
+}
+
+test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bill 26 TB" {
+    const t = std.testing;
+    // Live defect found auditing the #353 branch. An omitted `max_tokens` is
+    // the `omittedMaxTokensDefault` sentinel — maxInt(u32)/4 = 1,073,741,823 —
+    // which `clampMaxTokens` reduces to `context - prompt` on the NEXT line.
+    // The memory guard used to run BEFORE that line, so the reservation term
+    // billed a billion tokens of KV (~26 TB on qwen4_exp at 8-bit) and every
+    // prompt past RESERVE_MIN_TOKENS with no max_tokens field was refused 400.
+    const KVCache = transformer_mod.KVCache;
+    const ctx: u64 = 262_144;
+    const seq: u64 = 50_000;
+    const sentinel: u64 = omittedMaxTokensDefault(@intCast(ctx));
+    try t.expectEqual(@as(u64, std.math.maxInt(u32) / 4), sentinel);
+
+    // Two independent bounds, because a reservation is a number two
+    // subsystems must agree on and neither may trust its caller for it.
+    // (1) The cache clamps: the generation cannot exceed what is left of the
+    //     context, so the reservation cannot exceed the context plus a chunk.
+    const reserved = KVCache.reservedTokens(seq, sentinel, 4096, ctx);
+    // Bounded twice over since the guards run of 2026-09-05: by the generation
+    // HEADROOM first (see "an omitted max_tokens reserves a generation
+    // HEADROOM" below) and by the context second. The context bound is what
+    // keeps a caller that names a huge-but-finite max_tokens honest; the
+    // headroom is what keeps an OMITTED one from billing the whole window.
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, reserved);
+    try t.expect(reserved < ctx);
+    // (2) The four surfaces clamp FIRST and hand the guard the clamped value.
+    const clamped: u64 = clampMaxTokens(@intCast(sentinel), @intCast(seq), @intCast(ctx));
+    try t.expectEqual(ctx - seq, clamped);
+    try t.expectEqual(reserved, KVCache.reservedTokens(seq, clamped, 4096, ctx));
+
+    // An explicit max_tokens under the remaining window is untouched, and a
+    // caller that names no context (unit tests) is not clamped at all.
+    try t.expectEqual(seq + 2048 + 4096, KVCache.reservedTokens(seq, 2048, 4096, ctx));
+    // A caller that names no context (unit tests) is not context-clamped, but
+    // the headroom bound still applies — it is a property of the RESERVATION,
+    // not of the context.
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
+    // A prompt that already fills the context reserves no generation headroom.
+    try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, sentinel, 4096, ctx));
+
+    // And the bill that the guard computes for such a request stays inside a
+    // sane envelope instead of exceeding every machine ever built.
+    const cfg = qwen4ExpOomConfig();
+    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096, .{});
+    try t.expect(terms.reserved_kv_bytes < 4 * 1024 * 1024 * 1024);
+}
+
+/// The generic (non-dsv4) admission bill for `qwen4ExpOomConfig`, minus the
+/// live-memory read a unit test cannot make. Same expression as
+/// `prefillAdmissionBill`'s generic arm, so a test can move the per-request
+/// terms and read the WHOLE bill move.
+fn oomBillFor(cfg: *const model_mod.ModelConfig, seq: u64, chunk: u64, terms: PrefillRequestTerms) u64 {
+    return prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(cfg), prefillDequantWeightBytes(cfg), terms) +
+        qsaMaskBytes(cfg, @min(chunk, @max(seq, 1)), seq);
+}
+
+test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the context" {
+    const t = std.testing;
+    // LIVE DEFECT (guards run 2026-09-05, candidate `longctx-mega-cand-nk`,
+    // `--ctx-size 1048576 --kv-quant 8 --prefill-chunk 4096`): a 383,067-token
+    // prompt with NO `max_tokens` field was admitted — "prompt 383067 tokens
+    // needs ~37394MB, ~37130MB available + ~1564MB evictable hot cache —
+    // admitting, the prefill will evict" — and then refused on the inference
+    // thread ("do not fit even with an empty hot cache") and answered 503.
+    // The same boot served 524,253 tokens with `max_tokens: 16`.
+    //
+    // `clampMaxTokens` turns an omitted max_tokens into `ctx - prompt` =
+    // 665,509 tokens, so the reservation covered the WHOLE context: ~8.3 GB of
+    // KV headroom plus ~4.8 GB of indexer history for a generation the request
+    // will almost certainly never run. The reservation exists to stop the
+    // old+new buffer coexistence DURING PREFILL (#353), not to pre-buy an
+    // unbounded generation — past the headroom the +25% growth policy takes
+    // over, which is amortized and never mid-prefill.
+    const KVCache = transformer_mod.KVCache;
+    const MB: u64 = 1024 * 1024;
+    const cfg = qwen4ExpOomConfig();
+    const ctx: u64 = getEffectiveContextLength(&cfg);
+    try t.expectEqual(@as(u64, 1_048_576), ctx);
+    const seq: u64 = 383_067;
+    const chunk: u64 = 4096;
+    const clamped: u64 = clampMaxTokens(@intCast(omittedMaxTokensDefault(@intCast(ctx))), @intCast(seq), @intCast(ctx));
+    try t.expectEqual(ctx - seq, clamped); // 665,509 — the live number
+
+    // The reservation is bounded by the HEADROOM, not by the context.
+    const reserved = KVCache.reservedTokens(seq, clamped, chunk, ctx);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, reserved);
+    try t.expect(reserved < seq + ctx / 8);
+    // An explicit max_tokens under the headroom is honoured exactly: a client
+    // that names its budget still gets exactly that reserved.
+    try t.expectEqual(seq + 512 + chunk, KVCache.reservedTokens(seq, 512, chunk, ctx));
+    // And the context bound still binds when it is the tighter of the two.
+    try t.expectEqual(ctx + chunk, KVCache.reservedTokens(ctx - 16, clamped, chunk, ctx));
+
+    // The bill follows: only the headroom terms move.
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk, .{});
+    try t.expectEqual((KVCache.RESERVE_GEN_HEADROOM + chunk) * kv_per_tok, terms.reserved_kv_bytes);
+    try t.expectEqual(reserved * statePerTokenBilled(&cfg), terms.state_bytes);
+
+    // ... and the whole bill drops by more than 10 GB: from ABOVE the live
+    // headroom (37,394 MB needed against 37,130 MB available, which is why the
+    // request could only be admitted by eviction) to comfortably under it.
+    const ctx_bounded: PrefillRequestTerms = .{
+        .reserved_kv_bytes = (ctx + chunk - seq) * kv_per_tok,
+        .state_bytes = (ctx + chunk) * statePerTokenBilled(&cfg),
+        .checkpoint_bytes = terms.checkpoint_bytes,
+    };
+    const bill = oomBillFor(&cfg, seq, chunk, terms);
+    const old_bill = oomBillFor(&cfg, seq, chunk, ctx_bounded);
+    try t.expect(old_bill > bill + 10 * 1024 * MB);
+    try t.expect(old_bill > 37_000 * MB); // the live "needs ~37394MB"
+    try t.expect(bill < 30_000 * MB); // under the live "~37130MB available"
+}
+
+test "the guard credits only PROVABLY reclaimable cache bytes, never the entry a restore will pin" {
+    const t = std.testing;
+    // The second half of the same live defect. The guard admitted on
+    // `available + evictable >= needed` (37,130 + 1,564 >= 37,394), but the
+    // 1,564 MB was ONE entry — the one this very prompt then restored from. A
+    // restore refcount-shares that entry's buffers with the slot's cache, so
+    // `evictLruToAdmit` protects it by construction and evicting returns
+    // NOTHING: the inference thread refused a request the connection thread
+    // had already promised. A single restore can pin at most one entry, so the
+    // provable credit is the residency MINUS the largest entry
+    // (`HotPrefixCache.reclaimableBytes`), published beside it.
+    const MB: u64 = 1024 * 1024;
+    var bill = AdmissionBill{ .needed = 37_394 * MB, .available = 37_130 * MB, .evictable = 1_564 * MB, .reclaimable = 0 };
+    try t.expect(!bill.fits());
+    try t.expect(!bill.fitsAfterEviction()); // it DID, before this fix
+    // Bytes held by other conversations' entries are reclaimable and still buy
+    // admission — that is what evict-to-admit is for (#353).
+    bill.reclaimable = 1_564 * MB;
+    try t.expect(bill.fitsAfterEviction());
+
+    // And the guard reads the PUBLISHED number, never the inference thread's
+    // cache pointer (same discipline as `evictable`).
+    const src = @embedFile("server.zig");
+    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, tail[0..end], "reclaimable_hot_cache_bytes.load(.monotonic)") != null);
+}
+
+test "the admission bill and the engine's reservation read ONE function" {
+    // #126 discipline, applied to the reservation: the guard bills what the
+    // cache allocates because both call `KVCache.reservedTokens`. A second
+    // copy of the arithmetic anywhere is how the two drift, and a drift here
+    // is either an OOM (guard low) or a false refusal (guard high).
+    const t = std.testing;
+    const srv = @embedFile("server.zig");
+    const gen = @embedFile("generate.zig");
+    const call = "KVCache.reserved" ++ "Tokens(";
+    // server: exactly one non-test caller, `reservedCacheTokens`, and it
+    // delegates (the rest of the hits are this file's tests).
+    try t.expect(std.mem.indexOf(u8, srv, "pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {\n" ++
+        "    // Delegates: the cache's own definition is the authority, so the number\n") != null);
+    // generate: the engine reserves through the same function, once.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, gen, "transformer_mod." ++ call));
+    // and the headroom constant lives with the function that applies it.
+    const xfm = @embedFile("transformer.zig");
+    try t.expect(std.mem.indexOf(u8, xfm, "pub const RESERVE_GEN_" ++ "HEADROOM: u64 =") != null);
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, srv, "RESERVE_GEN_" ++ "HEADROOM: u64 ="));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, gen, "RESERVE_GEN_" ++ "HEADROOM: u64 ="));
+}
+
+test "every text surface clamps max_tokens BEFORE it bills the memory guard" {
+    // Class guard for the above: the ordering is the fix, and it is invisible
+    // at the call site — both lines mention `max_tokens`, and the wrong order
+    // compiles and serves every short prompt correctly. Four surfaces
+    // (/v1/chat/completions, /v1/completions, /v1/messages, /v1/responses):
+    // each must compute `effective_max_tokens` and then hand THAT to the
+    // guard. Needles are split so this test's own source never matches.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const guard = "checkAttention" ++ "Memory(allocator, stream, prompt_ids, effective_max_tokens,";
+    const clamp = "const effective_max_tokens = clamp" ++ "MaxTokens(max_tokens, prompt_ids.len, effective_ctx);";
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, src, guard));
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, src, clamp));
+    // No surface may pass the RAW value.
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "checkAttention" ++ "Memory(allocator, stream, prompt_ids, max_tokens,"));
+    // …and every guard call is PRECEDED by its own clamp: walk the four in
+    // order and require a clamp between each guard and the one before it.
+    var at: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, guard)) |g| {
+        const c = std.mem.lastIndexOf(u8, src[0..g], clamp) orelse return error.ClampMissingBeforeGuard;
+        try t.expect(c < g);
+        // The clamp must be the one for THIS surface, not a previous
+        // surface's: nothing but whitespace, comments and the kv-override
+        // parse sits between them, so the span stays small.
+        try t.expect(g - c < 900);
+        seen += 1;
+        at = g + 1;
+    }
+    try t.expectEqual(@as(usize, 4), seen);
+}
+
+test "the admission probe bills the request's OWN kv-quant and chunking, not the process defaults" {
+    // The inference thread's evict-to-admit probe and the connection thread's
+    // guard must produce the SAME number for the same request (#126). The
+    // probe used to hardcode `kv_override = null` and `unchunked = false`, so
+    // a `kv_quant: 4` request priced its cache at fp16 on the inference
+    // thread — over-billing ~2.4x, evicting a hot cache that did not need to
+    // go, and able to refuse by name a request already admitted.
+    const t = std.testing;
+    const cfg = qwen4ExpOomConfig();
+    const seq: usize = 200_000;
+    const q4 = transformer_mod.KVQuantConfig.affine(4);
+    const q8 = transformer_mod.KVQuantConfig.affine(8);
+    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, false, null, .{});
+    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, false, null, .{});
+    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false, null, .{});
+    // The three widths must be three different numbers, or the override is
+    // being dropped somewhere between the parameter and the estimator.
+    try t.expect(bill4.needed < bill8.needed);
+    try t.expect(bill8.needed < bill16.needed);
+
+    // The probe is a pure forward of its inputs into that one estimator.
+    const src = @embedFile("server.zig");
+    const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{\n        .matched_tokens = warm_matched,\n        .capacity_tokens = warm_capacity,\n        .will_donate = warm_will_donate,\n    }).fits();";
+    // The needle is assembled with `++`, so this test's own source does NOT
+    // contain it: the call site is the only occurrence.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, fwd));
+    // And the scheduler hands it the SLOT's own scheme and vision state.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, ".kv_cfg = slot.cache.config,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),") != null);
+}
+
+test "the QSA history is billed at the copies a slot HOLDS: one with the commit handoff, two with a lever off, plus the score bank" {
+    const t = std.testing;
+    // The two-copy bill was honest while `attachQsaHistoryToLatest` ran at
+    // the end of every prefill and MATERIALIZED the history onto the newest
+    // SSM checkpoint (1.76 GB at 458,832 tokens; 3.0 GB at 786k beside the
+    // live buffer for the whole decode). The commit handoff
+    // (`handoffQsaHistoryToLatest`) makes that snap a VIEW of the live
+    // buffer, so the bill follows the residency down to one copy — and picks
+    // up the f32 score bank that the old slack hid.
+    const cfg = qwen4ExpOomConfig();
+    const one = cfg.qsaHistoryBytesPerToken();
+    const bank = cfg.qsaScoreBankBytesPerToken();
+    try t.expect(one > 0);
+    try t.expect(bank > 0 and bank < one);
+    defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_history_share_override = true;
+    try t.expectEqual(one + bank, statePerTokenBilled(&cfg));
+    // The kill switch restores the prefill-end copy AND its bill together.
+    transformer_mod.qsa_history_share_override = false;
+    try t.expectEqual(one * 2 + bank, statePerTokenBilled(&cfg));
+    transformer_mod.qsa_history_share_override = true;
+
+    // The bill reads the LEVERS, never the append-shape flag: a flag that is
+    // a fact about the append cannot say whether a second copy exists.
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, "QSA_HISTORY_GROWS" ++ "_IN_PLACE) per_tok") == null);
+    const fn_start = std.mem.indexOf(u8, src, "pub fn statePerToken" ++ "Billed(").?;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n}\n").?;
+    const body = src[fn_start..fn_end];
+    try t.expect(std.mem.indexOf(u8, body, "qsaHistoryShare" ++ "Enabled()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "kvReservation" ++ "Enabled()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "qsaScoreBankBytes" ++ "PerToken()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "QSA_HISTORY_GROWS" ++ "_IN_PLACE") == null);
+
+    // At the live 458,832-token length the copy the handoff removes is real
+    // money, and the bill is exactly one copy plus the bank.
+    const seq: u64 = 458_832;
+    try t.expect(seq * one > 1_700_000_000);
+    const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
+    try t.expectEqual((seq + 2048 + 4096) * (one + bank), terms.state_bytes);
+    try t.expect(terms.state_bytes < 2 * seq * one);
+
+    // Both sizer sites read the BILLED width, never the one-copy helper.
+    try t.expect(std.mem.indexOf(u8, src, "+| config.qsaHistoryBytes" ++ "PerToken()) *|") == null);
+    try t.expect(std.mem.indexOf(u8, src, "kv_bits) + config.qsaHistoryBytes" ++ "PerToken();") == null);
+    // An arch with no indexer is billed nothing, either way.
+    var dense = model_mod.ModelConfig{};
+    dense.num_hidden_layers = 32;
+    dense.num_attention_heads = 32;
+    try t.expectEqual(@as(u64, 0), statePerTokenBilled(&dense));
+}
+
+test "the admission guard reads a PUBLISHED hot-cache residency, never the inference thread's pointer" {
+    // `Scheduler.hot_prefix_cache` is inference-thread state: it is nulled and
+    // the cache freed on a model switch or unload (four sites), so a
+    // connection thread that dereferenced it to ask `residentBytes()` — which
+    // the #353 admission guard did — was one interleaving away from reading
+    // freed memory. Class guard: the pointer is never read outside the
+    // scheduler, and every site that changes residency republishes.
+    const t = std.testing;
+    const whole = @embedFile("server.zig");
+    // Scan the CODE, not this test's own literals — an assertion that matches
+    // itself proves nothing.
+    const src = whole[0 .. std.mem.indexOf(u8, whole, "test \"the admission guard reads a PUBLISHED") orelse whole.len];
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "sch.hot_prefix" ++ "_cache"));
+
+    const sched = @embedFile("scheduler.zig");
+    // Every assignment of the pointer is followed by a republish. Counted, so
+    // a fifth null site cannot be added without one.
+    const sets = std.mem.count(u8, sched, "hot_prefix_cache = null;");
+    try t.expect(sets >= 4);
+    const publishes = std.mem.count(u8, sched, "publishHotCache" ++ "Residency(");
+    // the fn itself + every set/clear + both commits + the admission eviction
+    try t.expect(publishes >= sets + 3);
+
+    // The prompt-aware credit does not weaken the rule. The connection thread
+    // reads the digest SNAPSHOT through the scheduler; the reduction happens
+    // under the digest lock and only a scalar comes back, so no pointer into
+    // cache-owned memory ever reaches this file.
+    try t.expect(std.mem.indexOf(u8, src, "reclaimableHotCacheBytesFor(sch, toks)") != null);
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "hot_cache" ++ "_digests"));
+    // The snapshot is republished from the same one place the scalars are, and
+    // the superseded slice is freed by the publisher — never by a reader.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, sched, "publishHotCache" ++ "Digests(sch);"));
+    const pub_start = std.mem.indexOf(u8, sched, "fn publishHotCache" ++ "Digests(").?;
+    const pub_end = std.mem.indexOfPos(u8, sched, pub_start, "\n}\n").?;
+    const body = sched[pub_start..pub_end];
+    try t.expect(std.mem.indexOf(u8, body, "digest_mu.lockUncancelable") != null);
+    try t.expect(std.mem.indexOf(u8, body, "allocator.free(old)") != null);
+}
+
+test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the floor" {
+    const t = std.testing;
+    const GB: u64 = 1 << 30;
+    // The 1M qwen4 case: 107.5 GB ceiling, ~70 GB weights, ~24 GB of 1M-ctx
+    // KV, ~3 GB prefill reserve.
+    const ceiling: u64 = 107 * GB;
+    const weights: u64 = 70 * GB;
+    const ctx_kv: u64 = 24 * GB;
+    const transient: u64 = 3 * GB;
+
+    // RAM-first clamps the cache to the LEFTOVER — 10 GB, less than half an
+    // entry, so a 1M prefix cannot stay resident at all.
+    const ram_first = clampedPrefixCacheMem(0, ceiling, weights, ctx_kv, transient);
+    try t.expect(ram_first < ctx_kv);
+
+    // SSD-first floors at one entry (the SAME buffers as the live KV) and
+    // hands `--prefix-cache-mem` to IDLE entries on top.
+    try t.expectEqual(ctx_kv, ssdFirstPrefixCacheMem(0, ceiling, weights, ctx_kv, transient));
+    try t.expectEqual(ctx_kv + 4 * GB, ssdFirstPrefixCacheMem(4 * GB, ceiling, weights, ctx_kv, transient));
+    // An idle request past the headroom is clamped to the headroom, never
+    // below the one-entry floor.
+    const huge = ssdFirstPrefixCacheMem(500 * GB, ceiling, weights, ctx_kv, transient);
+    try t.expectEqual(ctx_kv + (ceiling - weights - ctx_kv - transient), huge);
+    // No headroom at all: still one entry, never 0 (0 = "no byte cap").
+    try t.expectEqual(ctx_kv, ssdFirstPrefixCacheMem(8 * GB, 80 * GB, weights, ctx_kv, transient));
+    try t.expect(ssdFirstPrefixCacheMem(0, 0, 0, 0, 0) >= 1);
+}
+
+
+test "both hot-cache budget arms publish hot_cache_mem_resolved" {
+    // `hot_cache_mem_resolved` is what the auto-context sizer and the ANE gate
+    // read instead of re-deriving the budget. The RAM-first plan arm always
+    // published it; the SSD-first arm returned its budget without doing so, so
+    // an SSD-first boot sized against a budget the cache never got. The two
+    // arms are in different functions, which is exactly how one of them gets
+    // added later without the assignment — so scan both.
+    //
+    // The needle is split so this test's own source cannot satisfy the scan.
+    const src = @embedFile("server.zig");
+    // Both arms now publish through the setter (the global went atomic —
+    // audit S5), so the needle is the CALL, not an assignment.
+    const needle = "publishResolvedPrefix" ++ "CacheMem(";
+    const arms = [_][]const u8{ "fn ssdFirstBudgetForLoad(", "pub fn prefixCacheMemForLoad(" };
+    for (arms) |decl| {
+        const start = std.mem.indexOf(u8, src, decl) orelse return error.ArmNotFound;
+        const body = src[start..];
+        const end = std.mem.indexOf(u8, body, "\n}\n") orelse body.len;
+        std.testing.expect(std.mem.indexOf(u8, body[0..end], needle) != null) catch |err| {
+            std.debug.print("arm does not publish the resolved budget: {s}\n", .{decl});
+            return err;
+        };
+    }
+
+    // The two arms publish DIFFERENT quantities, and the difference is the bug
+    // that made this worth pinning. `computeMemoryContext` subtracts the
+    // published figure and divides the rest by the per-token cost, so the
+    // number has to be the cache's cost BEYOND the live session. Under
+    // one-session semantics the SSD-first budget INCLUDES `ctx_kv` — the same
+    // bytes the live KV already accounts for — so publishing the whole budget
+    // billed that session twice and roughly halved the auto-context.
+    const ssd_start = std.mem.indexOf(u8, src, "fn ssdFirstBudgetForLoad(").?;
+    const ssd_end = ssd_start + (std.mem.indexOf(u8, src[ssd_start..], "\n}\n") orelse 0);
+    // The needle closes the CALL: audit S5 turned the assignment
+    // (`hot_cache_mem_resolved = budget -| ctx_kv;`) into a setter, so the
+    // quantity is an argument now and the trailing byte is `)`, not `;`.
+    try std.testing.expect(std.mem.indexOf(u8, src[ssd_start..ssd_end], needle ++ "budget -| ctx_kv)") != null);
+
+    // ...and the arithmetic that makes it so: an idle allowance of 0 floors the
+    // budget at exactly one session, so the cache costs NOTHING beyond it.
+    const GB: u64 = 1 << 30;
+    const ctx_kv: u64 = 12 * GB;
+    const only_session = ssdFirstPrefixCacheMem(0, 120 * GB, 70 * GB, ctx_kv, 4 * GB);
+    try std.testing.expectEqual(ctx_kv, only_session);
+    try std.testing.expectEqual(@as(u64, 0), only_session -| ctx_kv);
+    // A real idle allowance is published in full: it is cache the session does
+    // not already own.
+    const with_idle = ssdFirstPrefixCacheMem(4 * GB, 120 * GB, 70 * GB, ctx_kv, 4 * GB);
+    try std.testing.expectEqual(@as(u64, 4 * GB), with_idle -| ctx_kv);
+}
+
+
+/// The widest width the adaptive chooser may take for a prompt on this
+/// config — `generate.effectivePrefillChunk` at the arch cap, spelled once so
+/// the tests cannot drift from the loop.
+fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
+    return widthForRung(cfg, seq, PREFILL_CHUNK_LADDER[0]);
+}
+
+test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it takes, and never 0" {
+    // A Metal working-set abort is uncatchable, so the DOWN direction does not
+    // wait for a trend, a margin, or a second opinion: the chunk that would
+    // not fit is the next one.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 1_048_576;
+    const kv: u64 = seq;
+    const cap = adaptCapFor(&cfg, seq);
+
+    // One rung: headroom below the current width's bill, at or above the next.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const h = prefillChunkCost(&cfg, kv_bits, 2048, kv);
+        try t.expect(h < prefillChunkCost(&cfg, kv_bits, cap, kv));
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
+        try t.expect(st.ratcheted);
+    }
+    // Several rungs, in ONE call — waiting a boundary per rung is waiting
+    // inside the abort.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const h = prefillChunkCost(&cfg, kv_bits, 512, kv);
+        try t.expectEqual(@as(u32, 512), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
+    }
+    // No headroom at all: the ladder FLOOR, never 0 — the loop reads 0 as
+    // "no change" and admission already decided whether this request runs.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const got = adaptivePrefillWidth(&cfg, kv_bits, kv, 0, cap, cap, &st);
+        try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), got);
+        try t.expect(got != 0);
+    }
+    // Already at the floor: it stays there rather than reporting 0.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const floor: u32 = @intCast(generate_mod.PREFILL_CHUNK_FLOOR);
+        try t.expectEqual(floor, adaptivePrefillWidth(&cfg, kv_bits, kv, 0, floor, cap, &st));
+    }
+}
+
+test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not second-guessed" {
+    // The regression this bar exists for: `prefillMemoryNeeded` already
+    // carries its own 5/4, so a second 1.25 on the HOLD would take the 768k
+    // prompt this feature is for from the width admission ADMITTED (2048 at
+    // the default ceiling) down to 1024 at its very first boundary — the
+    // feature making the request slower than not having it.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 786_432;
+    const cap = adaptCapFor(&cfg, 786_432);
+    const cost_2k = prefillChunkCost(&cfg, kv_bits, 2048, kv);
+
+    // Exactly its own bill: it holds.
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k, 2048, cap, &st));
+    try t.expect(!st.ratcheted);
+    // And anywhere below a 1.25 hold's bar, which is where a margined HOLD
+    // would have stepped down.
+    try t.expect(cost_2k * 5 / 4 > cost_2k);
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k * 5 / 4 - 1, 2048, cap, &st2));
+    // One byte short of its own bill is the other side of the line.
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expect(adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k - 1, 2048, cap, &st3) < 2048);
+}
+
+test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting probes" {
+    // The probe is taken after the chunk's `mlx_clear_cache`, so it never
+    // contains a chunk's own peak. One reading is a moment; the second is
+    // what pays for that blind spot. And the margin is asymmetric on purpose:
+    // holding is free, growing is a bet.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 524_288;
+    const cap = adaptCapFor(&cfg, 524_288);
+    const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv);
+
+    // Plenty of room: still NOT on the first probe.
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(@as(u8, 1), st.supporting);
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(@as(u8, 0), st.supporting); // and the count restarts at the new width
+
+    // Room for the wider chunk's BILL but not its margin: never, however many
+    // probes agree.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    const between = cost_up * 5 / 4 - 1;
+    try t.expect(between >= cost_up);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st2));
+    }
+
+    // A single unsupporting probe RESETS the run: "two consecutive", not
+    // "two ever".
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st3));
+    try t.expectEqual(@as(u8, 0), st3.supporting);
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+}
+
+test "the tail-merge gate reads the ARCH, not the installed hook (serve installs it for everyone)" {
+    // B-A2. The first cut of the S18 gate spelled the loop's flag
+    // `adapt_chunked and options.chunk_width_hook != null`, on the belief that
+    // the hook exists only where the adaptive width does. It does not: `serve`
+    // installs `prefill_chunk_adapt` UNCONDITIONALLY and process-wide, and
+    // `scheduler`'s one InitOptions site installs the hook whenever that
+    // global is non-null. So under a real server the hook is non-null on every
+    // arch and the scaled tail-merge bound was live everywhere again — the
+    // defect the gate exists to prevent, with two green tests over it, because
+    // both exercised the FLAG and neither exercised the WIRING.
+    //
+    // This one builds the slot state the way `serve` does: every hook of the
+    // family installed, then a non-qwen4 config, and it asserts the two
+    // answers DIFFER.
+    const t = std.testing;
+    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
+    defer scheduler_mod.prefill_chunk_adapt = null;
+    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
+    defer scheduler_mod.prefill_chunk_widen_ok = null;
+    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
+    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
+
+    // What the scheduler's `.chunk_width_hook = if (prefill_chunk_adapt != null)`
+    // evaluates to for ANY slot, on ANY arch, under `serve`.
+    const hook_installed = scheduler_mod.prefill_chunk_adapt != null;
+    try t.expect(hook_installed);
+
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    // ...and what the arch actually says for this slot.
+    const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
+    try t.expect(!adaptive);
+    // The whole finding in one line: the hook's presence is not the answer.
+    try t.expect(hook_installed != adaptive);
+
+    // So a qwen3_5 slot keeps the FLAT bound, hook and all — a 300-token tail
+    // at the machine ladder's 512 rung merges, one chunk, as before S18.
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));
+
+    // qwen4_exp on the same installed hooks: live, and the bound scales.
+    const cfg = qwen4RequestTestConfig();
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    if (unpinned) {
+        try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+    }
+    // A slot with no config (the embedded engines) and a host with no
+    // predicate installed both answer NOT LIVE, never "the hook is there".
+    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
+    scheduler_mod.prefill_chunk_adaptive_enabled = null;
+    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    try t.expect(scheduler_mod.prefill_chunk_adapt != null); // ...with the hook still installed
+
+    // And the loop takes the flag, not the hook. Inside `initWithOptions`'
+    // own body, so neither needle can fall through to a test's bytes.
+    const gen = @embedFile("generate.zig");
+    const impl = generate_mod.productionDeclSource(gen, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(impl));
+    try t.expect(std.mem.indexOf(u8, impl, "const width_is_adaptive = " ++ "adapt_chunked and options.adaptive_chunk_width;") != null);
+    // The reverted spelling must not come back anywhere in that body.
+    try t.expect(std.mem.indexOf(u8, impl, "adapt_chunked and options.chunk_width" ++ "_hook != null") == null);
+    // ...and the scheduler fills it from the arch predicate, at the ONE
+    // InitOptions site.
+    const sched = @embedFile("scheduler.zig");
+    const sched_fn = generate_mod.productionDeclSource(sched, "pub fn adaptiveChunkWidthFor(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, sched_fn, "prefill_chunk_adaptive" ++ "_enabled orelse return false;") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, sched, ".adaptive_chunk_width = " ++ "adaptiveChunkWidthFor(width_ctx.cfg),"));
+    const serve_body = declBody(@embedFile("server.zig"), "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunk" ++ "Enabled;") != null);
+}
+
+test "the tail-merge bound scales ONLY where the per-chunk adaptive width is live" {
+    // BL-5, the arch half. `generate.nextChunkEnd` takes the gate as a
+    // parameter; this is the predicate that fills it. Every arch but an
+    // adaptive-width qwen4_exp keeps the flat `TAIL_MERGE_MAX`, byte for byte,
+    // at every chunk width — including the sub-4096 widths the machine ladder
+    // and the score budget hand out on gemma4, qwen3_5/3_6, muse_glimmer and
+    // deepseek_v4, where the scaled bound was never measured.
+    const t = std.testing;
+
+    // Another arch: the gate fails at its FIRST conjunct (`perRequestPrefillChunk`),
+    // so no env, flag or override can turn it on. Nothing to restore.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    try t.expect(!other.perRequestPrefillChunk());
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+    const off = adaptivePrefillChunkEnabled(&other);
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
+    // A 300-token tail at the ladder's 512 rung still merges: ONE chunk.
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+
+    // qwen4_exp with the per-chunk width live: the bound scales and the tail
+    // becomes its own chunk.
+    const cfg = qwen4RequestTestConfig();
+    try t.expect(cfg.perRequestPrefillChunk());
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    // The remaining conjuncts are "no operator pinned a width" — env/flag
+    // state, so the gate is asserted against them rather than assumed.
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
+    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    // ...and an operator pin turns the scaling back off with everything else:
+    // that width is what every forward runs, narrowed or not.
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
+}
+
+test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 1_048_576;
+    const cap = adaptCapFor(&cfg, 1_048_576);
+
+    // Step down once, then hand it the whole machine: it stays. The pressure
+    // that took the width away is a property of this minute, and re-widening
+    // into it turns a safety net into a metronome.
+    var st: generate_mod.AdaptiveWidthState = .{};
+    const narrowed = adaptivePrefillWidth(&cfg, kv_bits, kv, prefillChunkCost(&cfg, kv_bits, 1024, kv), cap, cap, &st);
+    try t.expect(narrowed < cap);
+    try t.expect(st.ratcheted);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(narrowed, adaptivePrefillWidth(&cfg, kv_bits, kv, std.math.maxInt(u64) / 2, narrowed, cap, &st));
+    }
+
+    // Nothing above the arch cap, ever — a wider rung is a width that never
+    // runs, and picking it would be picking it for the wrong reason.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, std.math.maxInt(u64) / 2, cap, cap, &st2));
+    }
+    // A cap of 0 (the unchunked vision arm) is "do not touch the width".
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, 0, 2048, 0, &st3));
+}
+
+test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small one never moves" {
+    // The mechanism, as a sweep rather than a cell: whatever the box does to
+    // the headroom, the width is the widest rung that fits it, it only ever
+    // narrows within one prefill, and every width it picks is one the arch
+    // will actually forward.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const kv: u64 = 1_048_576;
+    const cap = adaptCapFor(&cfg, 1_048_576);
+
+    var st: generate_mod.AdaptiveWidthState = .{};
+    var width: u32 = cap;
+    var seen_narrower: usize = 0;
+    var headroom: u64 = 50 * 1024 * MiB; // the wired-limit box, quiet
+    var step: usize = 0;
+    while (step < 64) : (step += 1) {
+        const next = adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, width, cap, &st);
+        try t.expect(next <= width); // never widens after the first step-down
+        try t.expect(next >= @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        try t.expect(next <= cap);
+        // Whatever it picked, it fits — or it is the floor and there is
+        // nothing narrower to pick.
+        try t.expect(prefillChunkCost(&cfg, kv_bits, next, kv) <= headroom or
+            next == @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        if (next < width) seen_narrower += 1;
+        width = next;
+        headroom -|= 1024 * MiB; // a co-tenant, or the accreting state
+    }
+    // It really did walk down the ladder rather than falling off it in one go.
+    try t.expect(seen_narrower >= 2);
+    try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), width);
+
+    // A 32k prompt on the same box: the width never moves, so the machinery
+    // is inert and the prefill is the one it was admitted as.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    const cap32 = adaptCapFor(&cfg, 32_768);
+    var w32: u32 = cap32;
+    step = 0;
+    while (step < 16) : (step += 1) {
+        w32 = adaptivePrefillWidth(&cfg, kv_bits, 32_768, 50 * 1024 * MiB, w32, cap32, &st2);
+        try t.expectEqual(cap32, w32);
+    }
+    try t.expect(!st2.ratcheted);
+}
+
+test "prefillHeadroomNow subtracts the SSD writer's staged HOST bytes" {
+    // S11. `serializeSafetensors` stages a full host copy of the chunk behind
+    // a ~1 GiB permit, at exactly the boundary the width probe is taken.
+    // `mlx_get_active_memory` counts device bytes only, but on unified memory
+    // both come out of the same pool — so without this the widen bar is met
+    // by up to a whole permit of memory that is already spoken for.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    try t.expectEqual(90 * GiB, prefillHeadroomFrom(120 * GiB, 30 * GiB, 0));
+    try t.expectEqual(89 * GiB, prefillHeadroomFrom(120 * GiB, 30 * GiB, GiB));
+    // Saturating, never wrapping: a permit larger than the headroom reads as
+    // no headroom, which refuses every widen — the safe answer.
+    try t.expectEqual(@as(u64, 0), prefillHeadroomFrom(120 * GiB, 119 * GiB, 8 * GiB));
+
+    // And the live reader is wired to the published number, not to a constant.
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefillHeadroom" ++ "Now(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, body, "prefillHeadroom" ++ "From(") != null);
+    try t.expect(std.mem.indexOf(u8, body, "staged_host") != null);
+    // The number comes from the SSD owner's inference-thread-only accessor,
+    // read at the hook site and passed in — never reached for from here.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "hc.staged" ++ "HostBytes()") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "chunkWidthStaged" ++ "Bytes(wc)") != null);
+}
+
+test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not at one chunk" {
+    // BLOCKER, caught in audit. `prefillTransientReserve` answers a LOAD-TIME
+    // question, so it bills the QSA score sheet at `kv = chunk`. Past the
+    // indexer budget `qsaScoreRowsPerChunk` saturates and the sheet costs
+    // roughly its whole budget rather than the tiny `fwd x nb` product a
+    // chunk-length KV implies — so a widen decided on that number is decided
+    // against a bill the forward will not honour, by ~0.5 GB at the default
+    // 256 MB sheet and ~9 GB at `MLX_SERVE_QSA_SCORE_SHEET_MB=4096`. The
+    // ratchet does not save it: it only blocks widening AFTER a step-down, so
+    // the FIRST widen at high `pos` is unguarded, and a Metal working-set
+    // abort is uncatchable.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const cap = adaptCapFor(&cfg, 786_432);
+    const short_kv: u64 = 4096;
+    const long_kv: u64 = 400_000;
+
+    // The bill is strictly larger at the live KV — this is the term that was
+    // missing, stated as arithmetic before it is stated as a decision.
+    const at_short = prefillChunkCost(&cfg, kv_bits, cap, short_kv);
+    const at_long = prefillChunkCost(&cfg, kv_bits, cap, long_kv);
+    try t.expect(at_long > at_short);
+    // ...and `prefillTransientReserve` is exactly the `kv = chunk` case, so
+    // every load-time caller keeps the number it had.
+    try t.expectEqual(
+        prefillTransientReserve(&cfg, kv_bits, cap),
+        prefillTransientReserveAtKv(&cfg, kv_bits, cap, cap),
+    );
+
+    // Headroom that clears the SHORT bill's 1.25 bar but not the LONG one:
+    // the same two probes must widen at 4k of KV and REFUSE at 400k.
+    const headroom: u64 = at_short * 5 / 4 + 1;
+    try t.expect(headroom < at_long * 5 / 4);
+
+    var st_short: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
+
+    var st_long: generate_mod.AdaptiveWidthState = .{};
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, 2048, cap, &st_long));
+    }
+    try t.expectEqual(@as(u8, 0), st_long.supporting);
+
+    // The HOLD keeps its margin-1.0 semantics at the live KV: exactly its own
+    // bill still holds, one byte short still steps down.
+    const hold = prefillChunkCost(&cfg, kv_bits, 2048, long_kv);
+    var st_hold: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold, 2048, cap, &st_hold));
+    var st_down: generate_mod.AdaptiveWidthState = .{};
+    try t.expect(adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold - 1, 2048, cap, &st_down) < 2048);
+}
+
+test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned width" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5_moe";
+
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+    // Another arch never adapts: the per-request width is qwen4_exp-only and
+    // this is subordinate to it, so ONE switch disables both.
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+
+    // The per-REQUEST kill switch takes the per-CHUNK one with it.
+    per_request_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    per_request_chunk_override = null;
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+
+    // Its own kill switch.
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    adaptive_chunk_override = null;
+
+    // An operator who pinned a width pinned EVERY forward — the same
+    // precedence `effectivePrefillChunk` keeps for the flag and the env.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+}
+
+test "the per-chunk width is ONE estimator away from the admission bill, and says so once per change" {
+    // Three claims, all scan-pinned because the whole feature is a second
+    // opinion about the same bytes: the chooser prices with the estimator the
+    // load-time sizer and the hot-cache clamp already share (#126), the
+    // ADMISSION bill never learns about it (the width the request was admitted
+    // at is the width it is billed at, forever), and the transition line is a
+    // CONTRACT the bench harness greps.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+
+    // One chooser, and it bills through `prefillChunkCost` -> the shared
+    // `prefillTransientReserve`. Needles split so this test's own source
+    // cannot satisfy them.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn adaptivePrefill" ++ "Width("));
+    const chooser = declBody(src, "pub fn adaptivePrefill" ++ "Width(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, chooser, "prefillChunk" ++ "Cost(") != null);
+    const cost = declBody(src, "pub fn prefillChunk" ++ "Cost(") orelse return error.CallSiteMoved;
+    // The kv-EXPLICIT entry point, never the load-time wrapper: the wrapper
+    // bills the QSA sheet at `kv = chunk` and that is the blocker this scan
+    // exists to keep closed.
+    try t.expect(std.mem.indexOf(u8, cost, "prefillTransientReserve" ++ "AtKv(") != null);
+    try t.expect(std.mem.indexOf(u8, cost, "prefillTransientReserve(") == null);
+    // And the live KV reaches the pure chooser rather than stopping at the
+    // log line, which is how the defect survived the first round.
+    const impure_kv = declBody(src, "pub fn adaptivePrefillWidth" ++ "Now(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, impure_kv, "adaptivePrefillWidth(config, kv_bits, pos,") != null);
+
+    // The admission bill is untouched by it: it must not consult a width the
+    // prefill might move to later, or the guard and the forward drift.
+    const bill = declBody(src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, bill, "adaptivePrefill") == null);
+
+    // The probe is one live read per boundary and reads the same ceiling every
+    // request-time guard does.
+    const probe = declBody(src, "pub fn prefillHeadroom" ++ "Now(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, probe, "currentGpuMemory" ++ "Ceiling(") != null);
+    try t.expect(std.mem.indexOf(u8, probe, "staticGpuMemory" ++ "Ceiling()") == null);
+
+    // The transition line, byte for byte. It quotes `cost`, not `reserve`: the
+    // decision is `prefillChunkCost` at the live KV, and the line used to print
+    // the strictly smaller `prefillTransientReserve` — an under-bill rendered
+    // as a comfortable margin. A decision quotes the number it COMPARED, so
+    // the word is part of the contract, not cosmetic.
+    const impure = declBody(src, "pub fn adaptivePrefillWidth" ++ "Now(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, impure, "[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, cost {d} MB)") != null);
+    try t.expect(std.mem.indexOf(u8, impure, "prefillChunk" ++ "Cost(config, kv_bits, next, pos)") != null);
+    // ...and the kill switch is consulted before anything is logged or moved.
+    try t.expect(std.mem.indexOf(u8, impure, "adaptivePrefillChunkEnabled(") != null);
+    // ...and the kill switch is read where the gate lives. Inside that
+    // function's OWN body: a bare `indexOf(src, ...)` finds this test's copy
+    // of the name and stays green with the env read deleted (N15).
+    const gate = declBody(src, "pub fn adaptivePrefillChunkEnabled(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(gate));
+    try t.expect(std.mem.indexOf(u8, gate, "MLX_SERVE_PREFILL_CHUNK" ++ "_ADAPTIVE") != null);
+
+    // And the loop asks it through the hook, not through an import.
+    const gen = @embedFile("generate.zig");
+    try t.expect(std.mem.indexOf(u8, gen, "options.chunk_width_hook") != null);
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "const pick = prefill_chunk" ++ "_adapt orelse return cur;") != null);
+    const serve_body = declBody(src, "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidth" ++ "Now;") != null);
+}
+
+test "resolvedContextForLoad: an auto boot bills the session it will serve, not the placeholder" {
+    // Clamp live check #6, SSD-first arm. The resolver runs during the load and
+    // `pinAutoContext` runs after it, so on an auto boot the effective-context
+    // accessor re-derives through `computeMemoryContext`, which reserves the
+    // cache ask being resolved — and answers 1024 tokens (~26 MB of "session").
+    // Billing that inverts the mode, so the session bill comes from here.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    // This box: ~28,909 MiB of serving budget after the weights, 20,736 B/token
+    // at 1M/kv8 (13,056 KV + 7,680 recurrent+indexer), ~3 GiB of transient.
+    const per_tok: u64 = 20_736;
+    const active: u64 = 70_000 * MiB;
+    const ceiling: u64 = active + 28_909 * MiB;
+    const transient: u64 = 3 * 1024 * MiB;
+    const cap: u32 = 1_048_576;
+
+    // Auto boot, nothing pinned: the session is what the machine can serve —
+    // NOT the 1024-token placeholder.
+    //
+    // `cache_reserve = 0` here is a test isolation, not the arm's value: this
+    // test is about the placeholder-vs-real session, so it holds the reserve
+    // out of the comparison. The reserve the SSD arm actually passes (the same
+    // constant the sizer reserves, so the billed session IS the advertised one)
+    // is pinned by "an auto boot advertises the session the SSD-first budget
+    // floor was billed for".
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
+    try t.expect(auto > 100_000);
+    try t.expect(auto <= cap);
+
+    // The defect in one comparison: the placeholder bills ~26 MB of session and
+    // hands the idle allowance almost the whole machine; the real session bills
+    // GBs and leaves the ask properly clamped.
+    const placeholder_kv: u64 = per_tok * 1024;
+    const real_kv: u64 = per_tok * auto;
+    try t.expect(placeholder_kv < 30 * MiB);
+    try t.expect(real_kv > 100 * placeholder_kv);
+    const ask: u64 = 24 * 1024 * MiB;
+    const bogus = ssdFirstPrefixCacheMem(ask, ceiling, active, placeholder_kv, transient);
+    const fixed = ssdFirstPrefixCacheMem(ask, ceiling, active, real_kv, transient);
+    // Published reserve is the IDLE half; under the placeholder it is the whole
+    // ask, which is what collapsed the advertised context.
+    try t.expect(bogus -| placeholder_kv == ask);
+    // ...and under the real session bill the same ask no longer fits: it is
+    // clamped to what is left after the weights, ONE session and the prefill
+    // transient. The bar is that arithmetic — `ssdFirstPrefixCacheMem`'s own
+    // pinned contract ("an idle request past the headroom is clamped to the
+    // headroom") — and not a hand-picked byte count: with 20,736 B/token the
+    // session alone is ~14 GiB of this box's 28,909 MiB serving budget, so any
+    // constant bar below that headroom asserts a rule the helper never had.
+    const idle_headroom: u64 = ceiling - (active + real_kv + transient);
+    try t.expectEqual(real_kv + idle_headroom, fixed);
+    try t.expect(fixed -| real_kv < ask);
+    // The whole point of the fix, in one comparison: billing the real session
+    // more than halves what the idle allowance is handed.
+    try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
+
+    // An explicit --ctx-size wins outright, and a pinned context is used as-is;
+    // neither may consult the sizer.
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
+    // The checkpoint's own cap still binds on a roomy box.
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
+}
+
+test "the advertised context does not move with the cache ask (live check #6 / audit S6)" {
+    // Two bugs, one root. Sizing the context against the ASK let a big
+    // `--prefix-cache-mem` collapse it (measured: 60GB ask -> 870 tokens
+    // advertised, where the default ask gave 1,048,576). Sizing it against the
+    // RESOLVED budget instead made the number smaller but left a one-step loop
+    // -- clamp bills context A, publishes budget B, sizer then computes
+    // context C > A against B -- so the budget was justified against a session
+    // the box no longer serves.
+    //
+    // A CONSTANT reserve closes both: ask-independent, and the two passes
+    // cannot disagree because neither reads the other.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const live_ceiling: u64 = 109_395 * MiB;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
+
+    // What the sizer now does, for any ask. `max_pos` is 0 here for the reason
+    // `computeMemoryContext` gives: the checkpoint cap is applied by the caller
+    // AFTER the safety margin, never before it.
+    const memory_ctx = safeContextForBudget(live_ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0);
+    try t.expect(memory_ctx > 900_000);
+
+    // The two defect spellings, both of which this replaces.
+    const vs_ask = safeContextForBudget(live_ceiling, active, 60 * 1024 * MiB +| transient, per_tok, 0);
+    const vs_resolved = safeContextForBudget(live_ceiling, active, 48_673 * MiB +| transient, per_tok, 0);
+    try t.expect(vs_ask <= 1024);
+    try t.expect(vs_resolved <= 1024);
+
+    // And the pair AGREES, at the ADVERTISED number rather than the raw one:
+    // the sizer's output goes through `autoContextFrom` (85% margin, then the
+    // checkpoint cap un-margined) on its way to `/v1/models`, and the clamp's
+    // resolver runs the same helper. Comparing the raw memory context against
+    // the clamp's answer compares two different quantities and is off by
+    // exactly the margin.
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
+    try t.expectEqual(advertised, clamp_ctx);
+}
+
+test "the sizer's cache reserve is a constant, not the ask or the resolved budget" {
+    // Scan (audit S6): `computeMemoryContext` must not read either dynamic
+    // budget, or the loop comes back. Needles split.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "fn computeMemoryContext(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
+    try t.expect(std.mem.indexOf(u8, body, "resolvedPrefixCache" ++ "Mem()") == null);
+    try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem_" ++ "bytes") == null);
+}
+
+test "the published hot-cache budget is retired when the cache is dropped" {
+    // Audit S5/S7: the budget is PER MODEL, the global holding it is
+    // process-wide. Without a retire, model B's ANE gate reserves model A's
+    // cache, and a first boot reads a budget no load has published.
+    const t = std.testing;
+    publishResolvedPrefixCacheMem(4096);
+    try t.expectEqual(@as(u64, 4096), resolvedPrefixCacheMem());
+    clearResolvedPrefixCacheMem();
+    // Back to the ASK, which is the honest pre-load answer — and, being the
+    // larger figure, the conservative one for anything that reserves.
+    try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+
+    // A resolved ZERO is a real budget (`--prefix-cache-mem 0` under
+    // SSD-first), not "unresolved" — audit N2. The sentinel is maxInt.
+    publishResolvedPrefixCacheMem(0);
+    try t.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    clearResolvedPrefixCacheMem();
+    try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+
+    // Scan: every site that drops the resident cache retires the budget with
+    // it, and the hook is installed. Needles split.
+    const sched = @embedFile("scheduler.zig");
+    const drop = "hot_prefix_cache = " ++ "null;";
+    const retire = "hot_cache_budget_" ++ "invalidate) |f| f();";
+    var i: usize = 0;
+    var drops: usize = 0;
+    while (std.mem.indexOfPos(u8, sched, i, drop)) |at| {
+        i = at + 1;
+        // The declaration sites (`.hot_prefix_cache = null,` in a struct
+        // literal) are initialisers, not drops. A BARE leading `.` is what
+        // marks one: every real drop is `self.` or `sch.`, which ALSO puts a
+        // `.` in front of the field — so the dot alone excluded all five drops
+        // and left the count at zero. The field-access dot is preceded by an
+        // identifier byte; the initialiser's is not.
+        if (at > 0 and sched[at - 1] == '.') {
+            const before: u8 = if (at > 1) sched[at - 2] else ' ';
+            const is_field_access = std.ascii.isAlphanumeric(before) or before == '_' or before == ')' or before == ']';
+            if (!is_field_access) continue;
+        }
+        drops += 1;
+        const tail = sched[at..@min(sched.len, at + 400)];
+        try t.expect(std.mem.indexOf(u8, tail, retire) != null);
+    }
+    try t.expect(drops >= 4);
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefix" ++ "CacheMem;") != null);
+}
+
+test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 19,032 MB)" {
+    const t = std.testing;
+    // LIVE 2026-09-05, qwen4-ladder run on 4d180d1. The 768k rung's SECOND
+    // request — 786,707 tokens, 31 more than the entry the previous turn had
+    // just committed — was admitted `verdict=evict`, restored its own
+    // 786,676-token entry from RAM, evicted the OTHER session's 523,887-token
+    // entry to make room, and was then refused by name:
+    //
+    //   [admission] needed=25866 MB available=19032 MB reclaimable=10294 MB
+    //   [hot-cache] reused 786676/786707 tokens (matched 786695; entry 2/2)
+    //   [scheduler] prefill refused: 786707 tokens do not fit even with an
+    //     empty hot cache
+    //
+    // The restore hands the slot the entry's KV buffers without allocating a
+    // second copy, so those ~14.5 GB were already inside
+    // `mlx_get_active_memory` — already netted out of the 19,032 MB — and
+    // `needed` billed every one of them again as if the prompt were cold. The
+    // same request served on 5c4b4bc only because the box had more slack; the
+    // blindness is older than the fix round.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 786_707;
+    const chunk: u64 = 512; // the width the ladder came down to that evening
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const mb: u64 = 1024 * 1024;
+    const available: u64 = 19_032 * mb;
+
+    // The per-token bill this arch pays, spelled out because every number
+    // below is a multiple of it: 13,056 B of 8-bit KV and 3,840 B of QSA
+    // indexer history per token. The history is billed at ONE copy since the
+    // commit handoff (qsa-history-bill), plus the 1,536 B/tok f32 score bank
+    // — 5,376 B/tok, where this test was first written against 7,680 (two
+    // copies, no bank). The CREDIT below prices KV and nothing else: the
+    // history is PRIVATISED on restore (`seedCapBuf`), so none of it is
+    // shared and crediting a copy of it under a one-copy bill cancelled the
+    // term outright (audit W-2).
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    try t.expectEqual(@as(u64, 13_056), kv_per_tok);
+    try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
+
+    // COLD: the bill the log printed, to within the rounding of a live
+    // `--ssm-checkpoint-max`. This is the refusal, reproduced.
+    const cold = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+    // 24,475 MB here. The live log printed 25,866 and this test first bracketed
+    // 26,638, both under the TWO-copy history bill; folding qsa-history-bill
+    // takes 2,304 B/tok off the state term, which rides the same 5/4 margin as
+    // the rest — 787,419 tok x 2,304 x 5/4 = 2,163 MB, exactly the drop seen.
+    // The band is re-derived here, not re-measured: no live 1M boot has been
+    // run under the one-copy bill. `qwen4ExpOomConfig` is a TRANSCRIPTION of
+    // the checkpoint's shapes, not the checkpoint, and the dequantized-weight
+    // term is a per-pack number, so within 3% is what a synthetic config can
+    // claim. The SIGN is what matters and it is unchanged: still a refusal.
+    try t.expect(cold / mb > 24_000 and cold / mb < 25_000);
+    try t.expect(cold > available);
+
+    // WARM: the entry is resident and its buffers hold the capacity the
+    // PREVIOUS turn reserved (786,676 + 200 + 512, rounded up by the cache's
+    // 256-token step). This turn reserves 786,707 + 200 + 512 = 787,419,
+    // which that capacity still covers — so nothing grows and nothing of the
+    // shared prefix is allocated again.
+    const matched: u64 = 786_676;
+    const capacity: u64 = 787_456;
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    try t.expectEqual(@as(u64, 787_419), reserved);
+    try t.expect(reserved <= capacity);
+
+    // `will_donate`: this restore CHECKED OUT its entry (SSD-first, full-prefix
+    // hit, switch on), so the buffers are the slot's own and the append donates
+    // in place. Without the checkout the first write copies the whole prefix and
+    // there is nothing to credit — pinned next door (audit B-A3).
+    const warm_prefix = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = true };
+    try t.expectEqual(matched, warm_prefix.creditedRows(reserved));
+
+    // The CONTRACT, stated as arithmetic: the credit is the handed-over rows
+    // at this arch's KV width and NOTHING else, and it comes off inside the
+    // 5/4 margin — so the warm bill is the cold bill less exactly 5/4 of it,
+    // and nothing else moves. Independent of `statePerTokenBilled`: a change
+    // to how many copies of the history the BILL charges must not move the
+    // credit, because the credit describes what the restore hands over.
+    const credit = matched * kv_per_tok;
+    try t.expectEqual(@as(u64, 786_676 * 13_056), credit);
+    try t.expect(credit < matched * (kv_per_tok + cfg.qsaHistoryBytesPerToken()));
+    const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, warm_prefix);
+    try t.expectEqual(cold - credit * 5 / 4, warm);
+
+    // And the verdict flips: ~11.9 GB against 19,032 MB free, so the request
+    // is ADMITTED outright — no eviction pass, and the other session's
+    // 523,887-token entry survives. KV-only makes the credit SMALLER than the
+    // 15,844 MB the fold executor measured with the history in it:
+    // 786,676 x 13,056 x 5/4 = 12,244 MB, so warm is 24,475 - 12,244 = 12,231
+    // rather than 8,630. Under-crediting is the safe direction and the verdict
+    // is the same; the 3.0 GB difference is history this turn really does
+    // allocate.
+    try t.expect(warm < available);
+    try t.expect(warm / mb > 11_500 and warm / mb < 13_000);
+
+    // A COLD 786,707-token prompt on the same box keeps the old refusal: the
+    // credit is a property of what is resident, never of the prompt length.
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) > available);
+    // As does a warm prompt whose match is below the restore floor.
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = 0, .capacity_tokens = capacity, .will_donate = true }) > available);
+}
+
+test "a chain extension that OUTGROWS the resident entry is credited nothing" {
+    const t = std.testing;
+    // Same run, the 1M rung: 1,047,556 tokens over the SAME resident
+    // 786,707-token entry, refused at the connection thread with
+    //   needed=32953 MB available=31717 MB reclaimable=0 MB verdict=refuse
+    // and a message that named the reason its own bill was wrong: "of which
+    // ~0MB can be reclaimed (the entry a restore would share is not
+    // evictable)".
+    //
+    // The credit is nevertheless ZERO here, and that is not an oversight.
+    // Past the restored buffer's capacity `KVCache.nextCapacityReserved`
+    // allocates the WHOLE new capacity beside the old one, and the old one is
+    // the hot entry's — which eviction protects, so it does not go away. The
+    // request really does have to find 1,048,268 tokens of fresh KV. What
+    // changes is only that the guard no longer REFUSES it on a cold bill it
+    // has no standing to price (see the deferral scan below): the inference
+    // thread, which holds the cache and the live capacity, decides.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 1_047_556;
+    const chunk: u64 = 512;
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const capacity: u64 = 787_456; // what the 786k turn reserved
+
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    try t.expectEqual(@as(u64, 1_048_268), reserved);
+    const extend = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = capacity, .will_donate = true };
+    try t.expect(reserved > capacity);
+    try t.expectEqual(@as(u64, 0), extend.creditedRows(reserved));
+    try t.expectEqual(
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}),
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, extend),
+    );
+
+    // Give the same request a buffer that ALREADY covers its reservation —
+    // the state a `--ctx-size`-wide reservation leaves after one long turn —
+    // and the credit is the full shared prefix again. The gate is CAPACITY,
+    // not prompt length.
+    const roomy = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = 1_048_576, .will_donate = true };
+    try t.expectEqual(@as(u64, 786_707), roomy.creditedRows(reserved));
+    const credit = 786_707 * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    try t.expectEqual(
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) - credit * 5 / 4,
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, roomy),
+    );
+}
+
+/// The live 768k scenario's checkout inputs, as `prefix_cache.checkoutEligible`
+/// takes them: a full-prefix hit on a 786,695-token entry by a 786,707-token
+/// prompt, on the SSD-first arm with a slot to hand the buffers to.
+const CheckoutCase = struct {
+    ssd_first: bool = true,
+    move_enabled: bool = true,
+    pending_disk: bool = false,
+    entry_tokens: usize = 786_695,
+    shared: usize = 786_695,
+    prompt_len: usize = 786_707,
+    has_slot: bool = true,
+
+    /// Build the WarmPrefix the scheduler builds, with `will_donate` coming
+    /// from restore-move's OWN predicate — the point of the fix.
+    fn warm(self: CheckoutCase, matched: u64, capacity: u64) WarmPrefix {
+        return .{
+            .matched_tokens = matched,
+            .capacity_tokens = capacity,
+            .will_donate = prefix_cache_mod.HotPrefixCache.checkoutEligible(
+                self.ssd_first,
+                self.move_enabled,
+                self.pending_disk,
+                self.entry_tokens,
+                self.shared,
+                self.prompt_len,
+                self.has_slot,
+            ),
+        };
+    }
+};
+
+test "the warm KV credit fires ONLY where the restore checked its entry out" {
+    const t = std.testing;
+    // AUDIT B-A3. `KVCache.restore` binds the entry's buffers by REFCOUNT, and
+    // mlx donates a `slice_update`'s input only when `is_donatable()` holds —
+    // `use_count() == 1`. The entry's second reference fails it, so on a
+    // SHARED restore the turn's first `writeAtOffset` falls through
+    // `SliceUpdate::eval_gpu` -> `copy_gpu` and privatises the whole prefix:
+    // the credited bytes ARE allocated. Only the CHECKOUT (restore by move)
+    // drops the entry's handles and makes the credit true.
+    //
+    // The credit was gated on `matched > 0` alone, so it fired on every arch
+    // and every partial hit — 12,244 MB removed at the pinned scenario from a
+    // bill whose failure mode is an uncatchable Metal abort, not a 400.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 786_707;
+    const chunk: u64 = 512;
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const mb: u64 = 1024 * 1024;
+    const matched: u64 = 786_676;
+    const capacity: u64 = 787_456;
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    const cold = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+
+    // (1) qwen4_exp, SSD-first, full-prefix hit, switch ON: the entry is
+    // checked out, the append donates in place, and the credit is real.
+    const donating = (CheckoutCase{}).warm(matched, capacity);
+    try t.expect(donating.will_donate);
+    try t.expectEqual(matched, donating.creditedRows(reserved));
+    const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, donating);
+    try t.expectEqual(cold - matched * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
+    try t.expect(warm / mb > 11_500 and warm / mb < 13_000);
+
+    // Every arm below is the SAME restore minus one conjunct of the checkout,
+    // and every one of them SHARES — so every one of them is billed cold.
+    const shared_arms = [_]WarmPrefix{
+        // (2) a PARTIAL hit: the ordinary chain-divergence case. The entry
+        // describes a prefix this prompt left, the commit lands beside it,
+        // and the checkout is declined so the next request can still use it.
+        (CheckoutCase{ .shared = 700_000 }).warm(matched, capacity),
+        // (3) a non-qwen4 arch: `ssd_first` is `ModelConfig.ssdFirstCapable`
+        // AND a disk tier, so a checkout can never be taken there — yet the
+        // credit used to fire on every warm restore on every arch.
+        (CheckoutCase{ .ssd_first = false }).warm(matched, capacity),
+        // (4) `MLX_SERVE_RESTORE_MOVE=0`, a documented arm: the refcount-share
+        // byte for byte, which is exactly the copy this credit denies.
+        (CheckoutCase{ .move_enabled = false }).warm(matched, capacity),
+        // (5) a pending disk record shares the same buffers, so mlx's own
+        // use_count test would decline the donation anyway.
+        (CheckoutCase{ .pending_disk = true }).warm(matched, capacity),
+        // (6) no slot to hand the buffers to (the connection thread's shape).
+        (CheckoutCase{ .has_slot = false }).warm(matched, capacity),
+    };
+    for (shared_arms, 0..) |arm, i| {
+        errdefer std.debug.print("shared arm {d} credited\n", .{i});
+        try t.expect(!arm.will_donate);
+        try t.expectEqual(@as(u64, 0), arm.creditedRows(reserved));
+        try t.expectEqual(cold, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, arm));
+    }
+
+    // The capacity gate still binds ON TOP of the checkout: a checked-out
+    // entry whose buffer cannot cover the reservation grows, and a grow
+    // allocates the whole new capacity beside the old one.
+    const outgrown = (CheckoutCase{}).warm(matched, 700_000);
+    try t.expect(outgrown.will_donate);
+    try t.expectEqual(@as(u64, 0), outgrown.creditedRows(reserved));
+}
+
+test "the checkout decision reaches the bill from restore-move's OWN predicate" {
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const pc = @embedFile("prefix_cache.zig");
+    const sched = @embedFile("scheduler.zig");
+
+    // ONE predicate. `WarmPrefix.will_donate` is never re-derived from
+    // `ssd_first`/`restoreMoveEnabled`/`pending_disk`/`shared` — the credit
+    // and the checkout drifting apart is the whole defect (audit B-A3).
+    const credited = declBody(src, "    pub fn creditedRows(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, credited, "if (!self.will_" ++ "donate) return 0;") != null);
+    // The estimator never re-derives the checkout: it neither calls the
+    // conjuncts nor spells them. `ssdFirstActive` is the CACHE's arming
+    // predicate and is a different question from "did this restore donate".
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "prefix_cache_mod.ssdFirst" ++ "Enabled("));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "prefix_cache_mod.restoreMove" ++ "Enabled("));
+    const warm_decl = declBody(src, "pub const WarmPrefix = struct {") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, warm_decl, "pending_disk") == null);
+    try t.expect(std.mem.indexOf(u8, warm_decl, "ssd_first") == null);
+
+    // The lookup REPORTS the checkout it took, and it takes it through the
+    // predicate — not a second copy of the conjuncts.
+    const cie = declBody(pc, "    fn checkoutIfEligible(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, cie, "if (!checkout" ++ "Eligible(") != null);
+    try t.expect(std.mem.indexOf(u8, cie, "return false;") != null);
+    try t.expect(std.mem.indexOf(u8, cie, "return true;") != null);
+    try t.expect(std.mem.indexOf(u8, pc, "res.checked_out = self.checkoutIf" ++ "Eligible(") != null);
+
+    // ...and the inference thread's probe carries it into BOTH guards: the
+    // fits probe and the refusal that must quote the number it compared.
+    try t.expect(std.mem.indexOf(u8, sched, "hot_checked_out = lookup.checked_out;") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".warm_will_" ++ "donate = hot_checked_out,") != null);
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, sched, "probe.warm_matched, probe.warm_capacity, probe.warm_will_" ++ "donate"));
+
+    // The CONNECTION thread still defers rather than pricing any of this.
+    const guard = declBody(src, "fn checkAttentionMemory(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, guard, "will_" ++ "donate") == null);
+}
+
+test "the shared prefix is subtracted EXACTLY once, and never by the thread that cannot see it" {
+    // The other failure mode of this rule: crediting the same resident prefix
+    // twice — once out of `needed` and once as reclaimable hot cache — admits
+    // a request against memory that exists only in the arithmetic.
+    //
+    // `reclaimableBytesFor` already withholds the matched entry (it is the
+    // one eviction refuses to take), so the entry's bytes must leave the bill
+    // through exactly ONE door: `PrefillRequestTerms.shared_resident_bytes`,
+    // assigned in one place and subtracted in one place.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const field = "shared_resident" ++ "_bytes";
+
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "        .shared_resident" ++ "_bytes = credited *| "));
+    // AUDIT W-2: the credit is KV and NOTHING else. The QSA history rides the
+    // restore but `seedCapBuf` privatises it on arrival, so the slot allocates
+    // its own copy and none of it is shared. Crediting one copy of it against
+    // the one-copy `statePerTokenBilled` this tree ships cancelled the history
+    // term to zero — ~3.0 GB under-billed at 786k, on a path whose failure is
+    // an uncatchable Metal abort. Pinned at the SITE, because the wrong
+    // version passed every arithmetic bar this file had.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "_bytes = credited *| kv_per" ++ "_tok,"));
+    const terms_body = declBody(src, "pub fn prefillRequestTerms(") orelse return error.CallSiteMoved;
+    const credit_at = std.mem.indexOf(u8, terms_body, "_bytes = credited").?;
+    const credit_line = terms_body[credit_at..][0..@min(120, terms_body.len - credit_at)];
+    try t.expect(std.mem.indexOf(u8, credit_line, "qsaHistoryBytes") == null);
+    try t.expect(std.mem.indexOf(u8, credit_line, "statePerToken") == null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "(gross -| req.shared_resident" ++ "_bytes) * 5 / 4"));
+    // ...and nothing else reads the field to bill with. ONE, not two: every
+    // needle in this scan is split across a `++` so the scan's own source
+    // cannot satisfy it.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "req." ++ field));
+
+    // ONE producer of the credit, and it is the capacity-gated helper.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "warm.creditedRows(" ++ "reserved)"));
+    try t.expectEqual(@as(usize, 1), countDecls(src, "    pub fn creditedRows(" ));
+
+    // The CONNECTION thread bills cold. It has no slot, no cache and no
+    // capacity reading, and a digest fingerprints only the first
+    // `DIGEST_PREFIX_TOKENS` ids — so it cannot know how much of a matching
+    // entry this prompt actually shares, and pricing a credit from that is
+    // the over-credit direction, which ends in an uncatchable Metal abort.
+    const guard = declBody(src, "fn checkAttentionMemory(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, guard, "unchunked_prefill, prompt_ids, .{});") != null);
+    try t.expect(std.mem.indexOf(u8, guard, field) == null);
+    // It defers instead of refusing whenever the prompt pins a resident entry.
+    try t.expect(std.mem.indexOf(u8, guard, "if (needed > available and pinnedResident" ++ "Bytes(bill) > 0) {") != null);
+    // And the deferral arm sits ABOVE the refusal, or it never runs.
+    const defer_at = std.mem.indexOf(u8, guard, "pinnedResident" ++ "Bytes(bill) > 0").?;
+    const refuse_at = std.mem.indexOf(u8, guard, "— rejecting").?;
+    try t.expect(defer_at < refuse_at);
+
+    // The INFERENCE thread bills warm, from the slot's own restored state:
+    // the rows the cache returned and the capacity its buffers hold.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, ".warm_matched = hot_matched,\n                .warm_capacity = slot.cache.residentCapacity" ++ "Tokens(),") != null);
+    // The refusal is re-billed with the SAME warm inputs, so it quotes the
+    // number it compared and not a cold sibling of it.
+    try t.expect(std.mem.indexOf(u8, sched, "probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_" ++ "donate);") != null);
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, sched, "probe.warm_matched, probe.warm_capacity, probe.warm_will_" ++ "donate"));
+}
+
+test "pinnedResidentBytes names the entry a restore would share, and only that" {
+    const t = std.testing;
+    // Residency the eviction pass cannot return: the connection thread's one
+    // signal that this prompt is WARM. Zero when everything is evictable
+    // (nothing here would be shared) and zero on a cache-less host.
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 0, .reclaimable = 0 }));
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 4096, .reclaimable = 4096 }));
+    // The live 768k reading: 24,826 MB resident, 10,294 MB reclaimable — the
+    // 14,531 MB difference is this prompt's own entry.
+    const mb: u64 = 1024 * 1024;
+    try t.expectEqual(@as(u64, 14_532 * mb), pinnedResidentBytes(.{ .evictable = 24_826 * mb, .reclaimable = 10_294 * mb }));
+    // Saturating: the two numbers are published from different sites and a
+    // reader can catch them mid-swap, and a negative pin is not a claim.
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 1, .reclaimable = 2 }));
+}
+
+test "prefillChunkCap: the chunk sizer's two #363 changes are qwen4_exp-only" {
+    // PR #363 item 5 (the ctx bar) plus the half the reviewer's list did not
+    // name: `resolvePrefillChunk` also DROPPED the hot-cache ask from the
+    // serving budget. Both moved the prefill width — the biggest multiplier in
+    // the memory bill — on every arch, and both were measured on qwen4_exp
+    // alone.
+    //
+    // The ungated arithmetic is a93e2c0's, transcribed from
+    // `git show a93e2c0:src/server.zig` (resolvePrefillChunk, line 2847):
+    //     spoken_for   = active_mem + hot_cache_ask
+    //     serving      = ceiling > spoken_for ? ceiling - spoken_for : 0
+    //     cap          = serving / PREFILL_RESERVE_BUDGET_SHARE
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const ceiling: u64 = 120 * GiB;
+    const weights: u64 = 69 * GiB;
+    const ask: u64 = 10 * GiB;
+    const ctx_kv: u64 = 20 * GiB;
+
+    // Every other arch: a93e2c0, byte for byte — the ask is spoken for, the
+    // context is NOT, and no HOT_CACHE_FLOOR is subtracted.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mistral" }) |mt| {
+        var cfg = longCtxTestConfig();
+        cfg.model_type = mt;
+        const baseline: u64 = (ceiling - (weights + ask)) / PREFILL_RESERVE_BUDGET_SHARE;
+        try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, ctx_kv, ask));
+        // ... and the ctx bar cannot touch it: a huge pinned context leaves
+        // the cap exactly where it was.
+        try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, 48 * GiB, ask));
+        // ... nor does the ask stop mattering.
+        try t.expect(prefillChunkCap(&cfg, ceiling, weights, ctx_kv, 0) > baseline);
+    }
+
+    // qwen4_exp: the ask is ignored, and the ctx bar binds.
+    var q4 = longCtxTestConfig();
+    q4.model_type = "qwen4_exp";
+    const serving: u64 = ceiling - weights;
+    const share_bar: u64 = serving / PREFILL_RESERVE_BUDGET_SHARE;
+    const want: u64 = @min(share_bar, (serving - ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
+    try t.expectEqual(want, prefillChunkCap(&q4, ceiling, weights, ctx_kv, ask));
+    // The ask really is ignored on the gated arm.
+    try t.expectEqual(
+        prefillChunkCap(&q4, ceiling, weights, ctx_kv, 0),
+        prefillChunkCap(&q4, ceiling, weights, ctx_kv, 24 * GiB),
+    );
+    // A pinned context big enough to bind narrows the cap BELOW the share.
+    try t.expect(prefillChunkCap(&q4, ceiling, weights, 48 * GiB, ask) < share_bar);
+
+    // The whole gate is ONE predicate, in ONE function.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn prefillChunk" ++ "Cap(") orelse return error.HelperMoved;
+    const body = src[at..@min(src.len, at + 1800)];
+    try t.expect(std.mem.indexOf(u8, body, "config.longCtxGated()") != null);
+    // and the ladder walker holds no arithmetic of its own.
+    const rat = std.mem.indexOf(u8, src, "pub fn resolvePrefill" ++ "Chunk(") orelse return error.HelperMoved;
+    const rbody = src[rat..@min(src.len, rat + 700)];
+    try t.expect(std.mem.indexOf(u8, rbody, "prefillChunk" ++ "Cap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask)") != null);
+    try t.expect(std.mem.indexOf(u8, rbody, "PREFILL_RESERVE_BUDGET_" ++ "SHARE") == null);
+}
+
+test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
+    // PR #363 item 4, and the clearest policy violation the review found: the
+    // ALLOCATOR side of the reservation is gated (`generate.reservedPrefill-
+    // Tokens`) while the GUARD side was not, so off qwen4_exp the bill charged
+    // headroom the engine would never reserve. A pure over-bill is a 400 on a
+    // prompt a93e2c0 admitted.
+    const t = std.testing;
+    const seq: u64 = 200_000; // well past RESERVE_MIN_TOKENS
+    const chunk: u64 = 4096;
+    const max_tokens: u64 = 8192;
+    const kv_bits: u64 = 8;
+
+    // A 27B-class GatedDeltaNet pack: `linear_num_value_heads` is parsed
+    // generically, so `ssmCheckpointBytes()` is NON-zero here and the
+    // checkpoint term really did bill on this arch.
+    var q35 = qwen4ExpOomConfig();
+    q35.model_type = "qwen3_5_moe";
+    try t.expect(q35.ssmCheckpointBytes() > 0);
+    try t.expect(retainedSsmCheckpointBytes(&q35, seq, chunk) > 0);
+
+    // `will_donate` is warm-bill-b3's B-A3 field (audit): the KV credit fires
+    // ONLY where the restore CHECKS OUT its entry, so a WarmPrefix that leaves
+    // it false credits nothing and `shared_resident_bytes` is 0 on EVERY arch —
+    // which would make the qwen4_exp assertion below unfalsifiable rather than
+    // true. This test is about the ARCH gate, so it supplies the donating case
+    // and lets the gate decide; the ungated loop still reads 0 through `.{}`.
+    const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
+        var cfg = qwen4ExpOomConfig();
+        cfg.model_type = mt;
+        const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, warm);
+        try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
+        try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
+        try t.expectEqual(@as(u64, 0), terms.state_bytes);
+        try t.expectEqual(@as(u64, 0), terms.shared_resident_bytes);
+        // ...which makes the whole bill a93e2c0's 13-argument expression: the
+        // new terms are added into `gross` and the credit is a saturating
+        // subtraction, so `.{}` is the identity.
+        try t.expectEqual(
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms),
+        );
+    }
+
+    // qwen4_exp keeps every term.
+    const q4 = qwen4ExpOomConfig();
+    const gated = prefillRequestTerms(&q4, seq, max_tokens, kv_bits, chunk, warm);
+    try t.expect(gated.reserved_kv_bytes > 0);
+    try t.expect(gated.checkpoint_bytes > 0);
+    try t.expect(gated.state_bytes > 0);
+    try t.expect(gated.shared_resident_bytes > 0);
+
+    // ONE predicate, at the top of the ONE function that builds the struct.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn prefillRequest" ++ "Terms(") orelse return error.CallSiteMoved;
+    const body = src[at..@min(src.len, at + 2600)];
+    try t.expect(std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) return .{};") != null);
+}
+
+test "ctxSizingCacheReserve: the advertised context is a93e2c0's on every other arch" {
+    // PR #363 ledger row "computeMemoryContext -> CTX_SIZING_CACHE_RESERVE".
+    //
+    // a93e2c0 reserved the RAW `--prefix-cache-mem` when sizing auto-context
+    // (`git show a93e2c0:src/server.zig:2992`,
+    // `prefix_cache_mem_bytes +| prefillTransientReserve(...)`). The constant
+    // is a better number — ask-independent, and it closes live check #6 and
+    // audit S6 together — but it changes the number the server ADVERTISES as
+    // `context_length` at every ask except the 2 GiB default, and an agent CLI
+    // reads that once per session and budgets against it for the whole session.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const saved = prefix_cache_mem_bytes;
+    defer prefix_cache_mem_bytes = saved;
+
+    var q4 = longCtxTestConfig(); // declares qwen4_exp
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+
+    for ([_]u64{ 0, 2 * GiB, 10 * GiB, 60 * GiB }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        // Gated: the constant, whatever the operator asked for.
+        try t.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&q4));
+        // Every other arch: a93e2c0's ask, byte for byte.
+        try t.expectEqual(ask, ctxSizingCacheReserve(&other));
+    }
+
+    // At the DEFAULT ask the two agree — a default boot is unchanged on every
+    // arch, which is why the constant was chosen to be that default.
+    prefix_cache_mem_bytes = CTX_SIZING_CACHE_RESERVE;
+    try t.expectEqual(ctxSizingCacheReserve(&q4), ctxSizingCacheReserve(&other));
+
+    // The reserve really moves the advertised context on the ungated arch: a
+    // bigger ask has to buy a SMALLER context, exactly as a93e2c0 behaved.
+    const kv_bits: u64 = 8;
+    const per_tok = kvBytesPerTokenAtBits(other.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&other);
+    const ceiling: u64 = 120 * GiB;
+    const active: u64 = 69 * GiB;
+    const transient = prefillTransientReserve(&other, kv_bits, 4096);
+    const small = safeContextForBudget(ceiling, active, 2 * GiB +| transient, per_tok, 0);
+    const big = safeContextForBudget(ceiling, active, 40 * GiB +| transient, per_tok, 0);
+    try t.expect(big < small);
+
+    // ONE predicate, and the two load-time wrappers bill the SAME reserve the
+    // sizer does — otherwise the hot-cache floor is built for a session the
+    // box never advertises.
+    const src = @embedFile("server.zig");
+    // `declBody`, not a raw `indexOf`: it requires the match to START a line,
+    // so it finds the DECLARATION and never a needle inside another test's
+    // source. (A raw scan found this file's own scan-test needle first.)
+    const res = declBody(src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.HelperMoved;
+    try t.expect(std.mem.indexOf(u8, res, "config.longCtx" ++ "Gated()") != null);
+    for ([_][]const u8{ "fn ramFirstContextForLoad(", "fn ssdFirstSessionTokensNow(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, "ctxSizingCache" ++ "Reserve(config)") != null);
+    }
+}
+
+test "prefixCacheMemForLoad: the ungated budget arm is a93e2c0's arithmetic" {
+    // PR #363 ledger row "prefixCacheMemForLoad". Three inputs changed at once
+    // for every arch — the static ceiling, `ramFirstContextForLoad` instead of
+    // `getEffectiveContextLength`, and `planHotCache` + `clampReserveWidth`
+    // instead of the direct clamp. The third is meaningless off
+    // `perRequestPrefillChunk`; the other two were measured on the 69 GB
+    // qwen4_exp pack alone.
+    //
+    // The impure resolver reads live memory, so the SHAPE is pinned by source
+    // rather than by running it — but the arithmetic it delegates to is pure
+    // and is pinned directly.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    const gate_at = std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) {") orelse return error.MissingGate;
+    // The ungated arm runs ABOVE the SSD-first arm and above the plan: a gate
+    // that runs after them has already paid for the thing it is declining.
+    const ssd_at = std.mem.indexOf(u8, body, "ssdFirstBudgetForLoad(") orelse return error.CallSiteMoved;
+    const plan_at = std.mem.indexOf(u8, body, "planHotCache(") orelse return error.CallSiteMoved;
+    try t.expect(gate_at < ssd_at);
+    try t.expect(gate_at < plan_at);
+    // The arm ends at ITS OWN closing brace, not at the ssd call: everything
+    // between the two is the SSD prelude, which legitimately reads
+    // `staticGpuMemoryCeiling()` and would satisfy the negative assertions
+    // below for the wrong reason.
+    const arm_end = std.mem.indexOfPos(u8, body, gate_at, "\n    }\n") orelse return error.CallSiteMoved;
+    const arm = body[gate_at..arm_end];
+    try t.expect(arm_end < ssd_at);
+    // a93e2c0's four inputs, by name.
+    try t.expect(std.mem.indexOf(u8, arm, "currentGpuMemoryCeiling(active_mem)") != null);
+    try t.expect(std.mem.indexOf(u8, arm, "getEffectiveContextLength(config)") != null);
+    try t.expect(std.mem.indexOf(u8, arm, "clampedPrefixCacheMem(") != null);
+    try t.expect(std.mem.indexOf(u8, arm, "prefillTransientReserve(config, kv_bits, chunk)") != null);
+    // ...and NOT the three the PR swapped in.
+    try t.expect(std.mem.indexOf(u8, arm, "staticGpuMemoryCeiling()") == null);
+    try t.expect(std.mem.indexOf(u8, arm, "ramFirstContextForLoad(") == null);
+    try t.expect(std.mem.indexOf(u8, arm, "clampReserveWidth(") == null);
+    // The resolved budget is still published — that half is class A (the ANE
+    // gate used to reserve the raw ask while the cache was capped lower).
+    try t.expect(std.mem.indexOf(u8, arm, "publishResolvedPrefix" ++ "CacheMem(clamped);") != null);
+
+    // The clamp itself is a93e2c0's and is shared by both arms, so the ungated
+    // budget is exactly what a93e2c0 computed from the same four numbers.
+    const GB: u64 = 1 << 30;
+    try t.expectEqual(@as(u64, 8 * GB), clampedPrefixCacheMem(8 * GB, 96 * GB, 20 * GB, 2 * GB, 2 * GB));
+    try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
+}
+
+test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
+    // PR #363 ledger row "evictLruToAdmit + reclaimable + the two new
+    // checkAttentionMemory admit arms".
+    //
+    // a93e2c0's guard had ONE arm: `if (needed > available) reject`
+    // (`git show a93e2c0:src/server.zig:3257`). The PR added two ADMIT arms
+    // above it, and both are driven entirely by the two credits this bill
+    // carries — so zeroing them restores a93e2c0's decision exactly, for the
+    // guard and for `admissionVerdict`'s log line together.
+    //
+    // The trade is real on the gated arch: a resident cache entry is an
+    // optimization and the request is the work. Off it, the same arms admit a
+    // request a93e2c0 refused pre-flight with a clean 400, which can then die
+    // mid-prefill in an uncatchable Metal abort after evicting the whole hot
+    // cache on the way. A 400 the operator can act on is the better failure on
+    // an arch nobody measured the trade on.
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+
+    // The two admit arms, as pure predicates over the bill.
+    const gated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB, .evictable = 15 * MB, .reclaimable = 15 * MB };
+    try t.expect(!gated.fits());
+    try t.expect(gated.fitsAfterEviction()); // evict-and-admit
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(gated));
+
+    const deferral = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB, .evictable = 15 * MB, .reclaimable = 0 };
+    try t.expect(!deferral.fitsAfterEviction());
+    try t.expect(pinnedResidentBytes(deferral) > 0); // warm deferral
+
+    // Ungated the bill carries neither credit, and BOTH arms go dead: the
+    // guard reaches a93e2c0's single `needed > available` reject.
+    const ungated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB };
+    try t.expectEqual(ungated.fits(), ungated.fitsAfterEviction());
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(ungated));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(ungated));
+    // ...and a bill that FITS still admits, on both arms — the gate removes
+    // the new arms, never the old one.
+    const roomy = AdmissionBill{ .needed = 10 * MB, .available = 20 * MB };
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(roomy));
+
+    // ONE gate, in the ONE function that builds the bill, and it returns a
+    // struct with the two credits DEFAULTED rather than re-listing the fields.
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefillAdmissionBill(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) {") != null);
+    try t.expect(std.mem.indexOf(u8, body, ".needed = needed, .available = available, .chunk = chunk }") != null);
+    // The PUBLISHERS are untouched: reading a published scalar instead of
+    // dereferencing `hot_prefix_cache` from a connection thread is the class-A
+    // fix and belongs to every arch.
+    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
+    try t.expect(std.mem.indexOf(u8, body, "reclaimable_hot_cache_bytes.load(.monotonic)") != null);
+
+    // Both halves of the mechanism read the SAME predicate: the connection
+    // thread's credits and the inference thread's eviction pass must agree
+    // about whether evict-to-admit exists at all, or a request is admitted on
+    // an eviction that never runs.
+    const sch = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sch, "const admission_pass_armed = if (slot.model.config) |c| c.longCtx" ++ "Gated() else false;") != null);
+    try t.expect(std.mem.indexOf(u8, sch, "if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {") != null);
+    // `publishHotCacheResidency` is NOT inside the gate — it runs for every
+    // arch at every other call site.
+    try t.expect(std.mem.count(u8, sch, "publishHotCacheResidency(sch);") > 1);
+}
+
+test "memoryRefusalMessage: the 400 names the hot cache only where the bill carries it" {
+    // PR #363. Gate 4 zeroes both credits off `longCtxGated`, and this message
+    // formats them — so a non-qwen4 refusal read "the hot prefix cache holds
+    // ~0MB more, all of which can be reclaimed (~0MB — the shortfall is
+    // elsewhere)" on a box with a multi-GB resident cache. Client-visible, and
+    // false on exactly the archs the gate exists to leave alone.
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+
+    // UNGATED → a93e2c0's exact sentence, byte for byte
+    // (`git show a93e2c0:src/server.zig:3261`).
+    const bare = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, false);
+    defer t.allocator.free(bare);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB available. Reduce prompt size or use a smaller model.",
+        bare,
+    );
+
+    // GATED → the message quotes what the guard compared.
+    const rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, true);
+    defer t.allocator.free(rich);
+    try t.expect(std.mem.indexOf(u8, rich, "holds ~1500MB more") != null);
+    try t.expect(std.mem.indexOf(u8, rich, "(~900MB") != null);
+
+    // THE qwen4 BYTE CHECK. The gated arch reaches this arm with an EMPTY hot
+    // cache — a large first request, before anything is resident — and it used
+    // to render the long sentence with two zeroes. Keying the discriminator on
+    // `bill.evictable` would have read better on the merits and silently
+    // changed those bytes, so the gate decides and qwen4 keeps them.
+    const q4_cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, true);
+    defer t.allocator.free(q4_cold);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
+        q4_cold,
+    );
+    // ...and the ungated arm never renders that sentence, at any bill.
+    const ungated_rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, false);
+    defer t.allocator.free(ungated_rich);
+    try t.expectEqualStrings(bare, ungated_rich);
+
+    // ONE formatter: the refusal site does not spell either sentence itself.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "const msg = try memoryRefusal" ++ "Message(") orelse return error.CallSiteMoved;
+    // The call site asks the ONE predicate, never re-derives the condition.
+    try t.expect(std.mem.indexOf(u8, src[at..@min(src.len, at + 160)], "config.longCtx" ++ "Gated())") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "but only ~{d}MB is available and the hot " ++ "prefix cache"));
+}
+
+test "pinPrefillChunk: the explicit width and the hot-cache ask are both gated" {
+    // Two ungated inputs the sweep found (audit addendum 4 / completeness
+    // sweep items 1 and 2). Both feed `config.pinned_prefill_chunk`, which the
+    // admission bill, the ungated `clampedPrefixCacheMem` reserve and
+    // `computeMemoryContext`'s ADVERTISED context all read.
+    //
+    // `pinPrefillChunk` reads live memory, so the SHAPE is pinned by source;
+    // the arithmetic it delegates to is pure and pinned elsewhere.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn pinPrefillChunk(") orelse return error.CallSiteMoved;
+
+    // (1) The OVERRIDE. a93e2c0's `pinPrefillChunk` had no override arm: it
+    // pinned the machine RUNG and let `generate.effectivePrefillChunk` apply
+    // the flag at forward time. Gated, the pin takes the override (audit S8);
+    // ungated it must pass 0 so the rung is what gets pinned.
+    try t.expect(std.mem.indexOf(u8, body, "const pin_override: u32 = if (config.longCtx" ++ "Gated()) explicitPrefill" ++ "Chunk() else 0;") != null);
+    try t.expect(std.mem.indexOf(u8, body, "            pin_override,\n") != null);
+
+    // (2) WHICH ask. a93e2c0 passed the raw `--prefix-cache-mem`; the accessor
+    // returns the RESOLVED budget once a model has published one, so in a
+    // multi-model registry the second model to load pinned against the first
+    // model's clamped budget.
+    try t.expect(std.mem.indexOf(u8, body, "if (config.longCtx" ++ "Gated()) resolvedPrefix" ++ "CacheMem() else legacyPrefixCache" ++ "Ask()") != null);
+
+    // The per-request chooser asks the ARCH before the override, for the same
+    // reason: an ungated arch's answer is the load-time pin, which is what
+    // a93e2c0 billed.
+    const chooser = declBody(src, "pub fn chooseRequestPrefillChunk(") orelse return error.CallSiteMoved;
+    const gate_at = std.mem.indexOf(u8, chooser, "perRequestPrefillChunkEnabled(config)) return load_time_pin;") orelse return error.CallSiteMoved;
+    const ovr_at = std.mem.indexOf(u8, chooser, "if (chunk_override > 0) return chunk_override;") orelse return error.CallSiteMoved;
+    try t.expect(gate_at < ovr_at);
 }

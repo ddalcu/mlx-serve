@@ -33,6 +33,12 @@ const gen_mod = @import("gen.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
 
+/// Bumped every time a model becomes `.ready`. A monotone counter rather than
+/// a flag: readers compare it against the value they last acted on, so a
+/// second reader (or a model switch mid-flight) cannot consume another's
+/// "first request after a load".
+pub var load_generation = std.atomic.Value(u64).init(0);
+
 const Transformer = transformer_mod.Transformer;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -974,6 +980,12 @@ pub const ModelRegistry = struct {
     /// populated weights/transformer/etc on `entry`; this just updates
     /// the bookkeeping + state field.
     pub fn markReadyLocked(self: *ModelRegistry, entry: *LoadedModel, bytes_resident: u64) void {
+        // A fresh load resets what "normal" looks like: the weights moved, the
+        // hot cache is empty and the admission arithmetic is the operator's
+        // first question. Bumping here is what raises exactly ONE admission
+        // line per load to info (`server.admissionLogLevel`), rather than one
+        // per request forever on a roomy machine.
+        _ = load_generation.fetchAdd(1, .monotonic);
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;

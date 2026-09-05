@@ -1691,3 +1691,48 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+
+## An ACE-Step task is a conditioning stream, not a code path (2026-08)
+
+`complete` (vocal2bgm) and `cover` look like two features and are one forward.
+What changes is the DiT's context stream and the instruction line that rides
+with it; everything downstream is the same graph.
+
+`complete` puts the source clip's RAW VAE latent into the context as
+`[src|ones]` alongside its own instruction line. `cover` runs the latent
+through the pooler into FSQ and then the detokenizer. The FSQ step is the part
+that is easy to get half-right: it is a soft clamp, `c·tanh(z/c)` with
+`c = L/(L−1)`, followed by the hard-clamp floor grid — and it is *both*, in
+that order. Either alone produces something that decodes to plausible audio and
+is not the reference's quantization, which is exactly the failure mode that
+survives a listening test. In both tasks the source clip's length IS the track
+length; there is no separate duration to honour.
+
+The FSQ weights are not in the main checkpoint. They ship as a separate DENSE
+bf16 `fsq.safetensors` and load lazily through `ensureFsq`, so a pack that has
+never run `cover` has never touched them — which means a missing or malformed
+file surfaces on the first `cover` request rather than at load, and must be a
+named refusal rather than a crash there.
+
+## A padded vocabulary row is not a token, and the sampler must not draw one (2026-08)
+
+`vocab_size` in a checkpoint's config is a MATRIX DIMENSION, rounded up for the
+kernel. The rows between the last real token and that dimension decode to
+nothing at all. Nothing stops the sampler picking one — they carry logits like
+any other row — and when it does, the response contains a token the tokenizer
+cannot render.
+
+The legitimate set is DERIVED rather than declared: `tokenizer.reservedOutputIds`
+plus `definedVocabSize` feed `installSuppressMask`, which masks
+`[defined, logits_dim)` along with the reserved specials. The one trap is
+double-trimming: a checkpoint that declares `unpadded_vocab_size` has ALREADY
+sliced those rows off, so applying the mask as well would suppress real tokens
+at the top of the vocabulary. One trim, never both.
+
+Logprobs stay RAW. The mask is sampling POLICY — what this server is willing to
+emit — while the `logprobs` field is a report of what the MODEL said. Applying
+the mask to the reported distribution would make the field lie about the
+checkpoint, and a client comparing our logprobs against a reference
+implementation would see a discrepancy that has nothing to do with the model.
+`MLX_SERVE_SUPPRESS_RESERVED=0` restores the unmasked sampler for exactly that
+kind of comparison.

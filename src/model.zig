@@ -774,6 +774,29 @@ pub const ModelConfig = struct {
     /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
     /// memory estimate that sizes a KV cache reads this one helper so the
     /// auto-context sizer and the prefill admission guard cannot disagree.
+    /// Whether this arch resolves its prefill chunk PER REQUEST instead of
+    /// once at load. Load-time sizing has to reserve for the WHOLE configured
+    /// session — at `--ctx-size 1048576` the context's own KV is 20.7 GB of a
+    /// 28.2 GB serving budget, so the widest affordable rung is 1024 and every
+    /// ordinary prompt prefills at that width for the rest of the boot. But an
+    /// ordinary prompt does not hold a 1M-token cache: the same box ran 384k
+    /// prompts at chunk 4096 inside the ceiling (peak 90.3 GB of ~93 GiB). The
+    /// bill that knows the difference is the ADMISSION bill, which is per
+    /// request, so that is where the width belongs.
+    ///
+    /// qwen4_exp only, on purpose. It is the arch with a 1M advertised context
+    /// and the QSA terms that make the load-time bill so lopsided; every other
+    /// arch keeps the load-time pin exactly, unmeasured.
+    ///
+    /// DELEGATES, and does not re-spell the arch: this predicate is the ONLY
+    /// gate on the admission re-ask, the tail-merge bound and the per-chunk
+    /// adapter, so a second spelling of the same condition is three mechanisms
+    /// that can silently disagree with the other five about which archs are
+    /// in. `longCtxGated` is the ONE body (scan-pinned below).
+    pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
+        return self.longCtxGated();
+    }
+
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
@@ -796,15 +819,61 @@ pub const ModelConfig = struct {
 
     /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
     /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
-    /// layer. Not kv-quantized. Zero on archs without an indexer. The
-    /// auto-context sizer and the prefill guard add this ONCE — stride
-    /// checkpoints no longer clone it.
+    /// layer. Not kv-quantized. Zero on archs without an indexer.
+    ///
+    /// This is ONE copy — what a hot-cache ENTRY holds, and (with
+    /// `MLX_SERVE_QSA_HISTORY_SHARE` on) what a live slot holds: the newest
+    /// checkpoint takes a VIEW of the slot's buffer at commit
+    /// (`transformer.handoffQsaHistoryToLatest`). With the switch off the
+    /// prefill-end attach MATERIALIZES a second copy that lives beside the
+    /// buffer for the whole decode. `server.statePerTokenBilled` is the
+    /// billed width (copies + the f32 score bank) and is what the sizer and
+    /// the guard both read — never this helper directly.
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
         return n * hd * 2 + n * hd * 2 / ratio;
+    }
+
+    /// f32 bytes of the QSA block-score operand ONE token occupies on a LIVE
+    /// slot: `SSMCacheEntry.qsa_score_bank` is `[B, 1, idx_hd, nb]` per
+    /// full-attn layer, one block per `ratio` tokens, rebuilt whenever a
+    /// block completes and resident for the request (1,536 B/tok on
+    /// qwen4_exp — 1.1 GB at 786k). Never in an entry (`ssmFreeQsaState` at
+    /// slot teardown); never billed until the one-copy history bill made
+    /// the gap visible. Zero on archs without an indexer.
+    pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
+        return n * hd * 4 / ratio;
+    }
+
+    /// Bytes ONE SSM checkpoint holds: the recurrent state plus the conv
+    /// window of every LINEAR layer, materialized (`captureSsmCheckpoint`
+    /// forces an owned copy of each). The QSA key history is NOT here: it
+    /// lands on ONE checkpoint (the newest), not on every one — as a VIEW of
+    /// the live buffer at commit, or as the prefill-end copy with
+    /// `MLX_SERVE_QSA_HISTORY_SHARE=0` — and `server.statePerTokenBilled`
+    /// prices it per token (one copy, or two on that arm).
+    ///
+    /// GatedDeltaNet state is `[B, v_heads, v_head_dim, key_head_dim]` bf16
+    /// and the conv window is `[B, kernel-1, 2*key_dim + value_dim]` bf16 —
+    /// the shapes `gatedDeltaNet` allocates. Zero on an arch with no linear
+    /// layers (nothing to checkpoint).
+    pub fn ssmCheckpointBytes(self: *const ModelConfig) u64 {
+        if (self.linear_num_value_heads == 0) return 0;
+        const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
+        if (linear_layers == 0) return 0;
+        const state: u64 = @as(u64, self.linear_num_value_heads) *
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * 2;
+        const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
+            @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
+        const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
+        return linear_layers * (state + conv * conv_dim * 2);
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -875,6 +944,38 @@ pub const ModelConfig = struct {
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
+    }
+
+    /// THE long-context blast-radius predicate. ONE definition for every
+    /// mechanism PR #363 introduced, so a non-qwen4_exp arch is byte-identical
+    /// to a93e2c0 on all of them at once.
+    ///
+    /// The PR was measured, tuned and benchmarked on ONE checkpoint
+    /// (Qwen3.8-Flash-Next) at 100k-1M tokens. Every mechanism in it is a
+    /// TRADE — a reservation that pre-buys memory, a pad-waste cap that
+    /// un-batches, a retention policy that moves where a warm turn restores,
+    /// an admission term that refuses earlier, a chunk bar that narrows the
+    /// forward — and none of those trades was measured anywhere else. A trade
+    /// applied to an arch nobody priced it on is a regression waiting for a
+    /// bug report, so the trades are opt-in BY ARCHITECTURE and the fixes
+    /// (double frees, errdefer scopes, the MLX error latch) are not.
+    ///
+    /// Never hand-roll the condition at a call site: a site with its own
+    /// conjunct is a second predicate, and the two drift (the
+    /// `supportsBatchedGdnDecode` story, one file up). Sites that cannot see a
+    /// ModelConfig mirror this ONCE into a field at wiring time
+    /// (`HotPrefixCache.cp_thin`, the `qsa_history_required`
+    /// pattern) and are scan-pinned to it.
+    pub fn longCtxGated(self: *const ModelConfig) bool {
+        return self.isQwen4();
+    }
+
+    /// SSD-first prefix cache (`MLX_SERVE_PREFIX_SSD_FIRST`): the ONE arch
+    /// predicate every SSD-first mechanism checks. True only for qwen4_exp —
+    /// every other arch keeps today's RAM-first behaviour byte-identically.
+    /// Delegates to `longCtxGated` so the blast radius has ONE body.
+    pub fn ssdFirstCapable(self: *const ModelConfig) bool {
+        return self.longCtxGated();
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
@@ -6845,3 +6946,197 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
     try testing.expectEqual([3]u32{ 11, 11, 10 }, clean.mrope_section);
     try testing.expect(!clean.rope_yarn);
 }
+
+test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only" {
+    // PR #363's mechanisms — the KV capacity reservation, the batched
+    // pad-waste cap's kv-length rule, span-preserving checkpoint thinning, the
+    // new admission-bill terms and the prefill chunk's ctx bar — were measured
+    // on qwen4_exp alone. Every one of them asks THIS predicate, so a
+    // non-qwen4 arch is byte-identical to a93e2c0 on all of them at once.
+    const t = std.testing;
+    var qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(qwen4.longCtxGated());
+    // ... and the SSD-first predicate is the SAME body, never a second one.
+    try t.expect(qwen4.ssdFirstCapable());
+
+    // The archs the reviewer named: the 27B sidecar-MTP pack (qwen3_5), the
+    // other hybrids that reach every checkpoint/batching site, and a plain
+    // dense attention arch.
+    for ([_][]const u8{
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_next",
+        "lfm2",
+        "nemotron_h",
+        "bailing_hybrid",
+        "llama",
+        "mistral",
+        "gemma3",
+        "gemma4",
+        "deepseek_v4",
+        "muse_glimmer",
+    }) |mt| {
+        var cfg = ModelConfig{ .model_type = mt };
+        try t.expect(!cfg.longCtxGated());
+        try t.expect(!cfg.ssdFirstCapable());
+    }
+}
+
+test "ModelConfig.longCtxGated: ONE body — ssdFirstCapable delegates, nothing hand-rolls the string" {
+    // Class pin. The failure this prevents is a site growing its own
+    // conjunct: two predicates that agree today and drift at the next arch.
+    const t = std.testing;
+    const src = @embedFile("model.zig");
+    const decl = "pub fn ssdFirstCapable(self: *const ModelConfig) bool {";
+    const at = std.mem.indexOf(u8, src, decl) orelse return error.PredicateMoved;
+    const body = src[at .. at + 200];
+    try t.expect(std.mem.indexOf(u8, body, "self.longCtxGated()") != null);
+
+    // `longCtxGated` itself is the only non-test place the model_type string
+    // is compared for this purpose: `isQwen4` is the string, and the gate
+    // reads it.
+    const gate = "pub fn longCtxGated(self: *const ModelConfig) bool {";
+    const gat = std.mem.indexOf(u8, src, gate) orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, src[gat .. gat + 400], "self.isQwen4()") != null);
+    // ...and `perRequestPrefillChunk` — the ONLY gate on the admission re-ask,
+    // the tail-merge bound and the per-chunk adapter — delegates too, rather
+    // than spelling the arch a second time.
+    const prc = "pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {";
+    const pat = std.mem.indexOf(u8, src, prc) orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, src[pat .. pat + 120], "self.longCtxGated()") != null);
+}
+
+test "ModelConfig: no policy predicate hand-rolls the qwen4_exp literal" {
+    // The real class pin. Counting predicate CALLS cannot catch this — a new
+    // gate that writes `std.mem.eql(u8, self.model_type, "qwen4_exp")` inline
+    // adds no call and reads identically today, then drifts the moment the
+    // family gains a second `model_type` (the `_text` sibling the PARSER
+    // already collapses, a rename, a second Flash-Next pack). PR #363 shipped
+    // exactly that: `perRequestPrefillChunk` spelled the arch itself and was
+    // the only gate on three mechanisms.
+    //
+    // The literal has three legitimate homes and they are not predicates: the
+    // arch's NAME (`isQwen4`), the sampling-defaults FAMILY list, and the
+    // config parser's dispatch/canonicalization. So the bar is scoped to what
+    // it is about — every `bool` predicate on ModelConfig except `isQwen4`
+    // must be free of it.
+    const t = std.testing;
+    const whole = @embedFile("model.zig");
+    const prod = whole[0 .. std.mem.indexOf(u8, whole, "\ntest \"") orelse whole.len];
+    const lit = "\"qwen4" ++ "_exp\"";
+    const sig = "(self: *const ModelConfig) bool {";
+
+    var decls = std.mem.splitSequence(u8, prod, "\n    pub fn ");
+    _ = decls.next(); // everything before the first declaration
+    var checked: usize = 0;
+    while (decls.next()) |decl| {
+        if (std.mem.indexOf(u8, decl, sig) == null) continue;
+        // The body ends at this declaration's closing brace (column 4).
+        const body = decl[0 .. std.mem.indexOf(u8, decl, "\n    }") orelse decl.len];
+        if (std.mem.indexOf(u8, body, lit) == null) continue;
+        const name = body[0 .. std.mem.indexOfScalar(u8, body, '(') orelse body.len];
+        checked += 1;
+        try t.expectEqualStrings("isQwen4", name);
+    }
+    // The scan found something, i.e. the split/sig shape still matches this
+    // file: a silently-zero scan is the failure mode of every source pin.
+    try t.expectEqual(@as(usize, 1), checked);
+
+    // Every other file that gates on this family goes through a predicate, so
+    // none of them carries the literal in production code at all.
+    //
+    // NOT `file[0 .. indexOf("\ntest \"")]`. That idiom is only sound where the
+    // tests TRAIL the code, which is true of THIS file and false of the ones
+    // below: server.zig's first test sits at line 104 of 24,129, so the window
+    // was the import block and this loop asserted a fact about 0.4% of the file
+    // (audit addendum 4, item 1). `ProdLineScan` skips top-level `test` blocks
+    // instead, which reaches the other 99.6%.
+    //
+    // Each file also names a declaration PAST ITS OWN FIRST TEST BLOCK that
+    // the scan must have seen. That is the falsifiability check, and the
+    // needles are chosen against each file's old window rather than "somewhere
+    // deep": a zero-hit result looks identical whether the scan read the whole
+    // file or one line, so only reachability separates a real pass from the
+    // vacuous one this replaces. Every needle below is unreachable under the
+    // old `indexOf("\ntest \"")` window.
+    const files = [_]struct { src: []const u8, deep: []const u8, exempt: usize }{
+        // first test at line 104 of 24,129 — the window was the import block.
+        // Its three exemptions are `longCtxTestConfig`, `qwen4RequestTestConfig`
+        // and `qwen4ExpOomConfig`: test fixtures at column 0, production by
+        // position and test data by purpose.
+        .{ .src = @embedFile("server.zig"), .deep = "pub fn prefillAdmissionBill(", .exempt = 3 },
+        .{ .src = @embedFile("scheduler.zig"), .deep = "pub fn loadRequirementBytes(", .exempt = 0 },
+        .{ .src = @embedFile("generate.zig"), .deep = "pub fn sampleTokenLazy(", .exempt = 0 },
+        .{ .src = @embedFile("prefix_cache.zig"), .deep = "fn testWriteCacheLayer(", .exempt = 0 },
+        .{ .src = @embedFile("kv_disk_cache.zig"), .deep = "fn makeArange(", .exempt = 0 },
+    };
+    for (files) |f| {
+        var scan = ProdLineScan{ .src = f.src };
+        var lines: usize = 0;
+        var hits: usize = 0;
+        var saw_deep = false;
+        var exempt: usize = 0;
+        while (scan.next()) |line| {
+            lines += 1;
+            if (std.mem.startsWith(u8, line, f.deep)) saw_deep = true;
+            if (std.mem.indexOf(u8, line, lit) == null) continue;
+            // ONE named escape, spelled AT the line: a test FIXTURE that
+            // constructs a qwen4_exp config sits at column 0 outside any
+            // `test` block (server.zig's `longCtxTestConfig`,
+            // `qwen4RequestTestConfig`, `qwen4ExpOomConfig`), so it is
+            // production by position and test data by purpose. Exempted by
+            // NAME, never by shape — a real gate cannot acquire the marker by
+            // accident, and a fixture that loses it is caught here.
+            if (std.mem.indexOf(u8, line, "arch-scan-" ++ "exempt") != null) {
+                exempt += 1;
+                continue;
+            }
+            hits += 1;
+        }
+        try t.expectEqual(@as(usize, 0), hits);
+        // The exemption count is EXACT, so a fixture that loses its marker is
+        // caught as a hit and a fourth one that acquires it is caught here.
+        try t.expectEqual(f.exempt, exempt);
+        // The scan ran, and it ran deep enough to matter.
+        try t.expect(lines > 0);
+        try t.expect(saw_deep);
+    }
+}
+
+/// Iterate the PRODUCTION lines of a Zig source: every line outside a
+/// top-level `test "..." { ... }` block.
+///
+/// Top-level declarations start at column 0 and so do their closing braces,
+/// which makes `}` at column 0 an exact terminator for a test block — a nested
+/// close is always indented, and a `\\` multiline string is too.
+///
+/// This exists because `src[0 .. indexOf("\ntest \"")]` — the idiom several
+/// scans in this tree used — silently degenerates to a near-empty window in
+/// any file whose tests are interleaved rather than trailing, and a scan over
+/// an empty window passes forever (audit addendum 4, items 1 and 7). Duplicated
+/// verbatim in `server.zig`'s test region rather than exported: it is test
+/// scaffolding, and neither file should grow a production dependency on the
+/// other for it.
+const ProdLineScan = struct {
+    src: []const u8,
+    pos: usize = 0,
+    in_test: bool = false,
+
+    fn next(self: *ProdLineScan) ?[]const u8 {
+        while (self.pos < self.src.len) {
+            const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len;
+            const line = self.src[self.pos..end];
+            self.pos = end + 1;
+            if (self.in_test) {
+                if (std.mem.eql(u8, line, "}")) self.in_test = false;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "test \"")) {
+                self.in_test = true;
+                continue;
+            }
+            return line;
+        }
+        return null;
+    }
+};

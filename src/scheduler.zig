@@ -155,7 +155,7 @@ pub const LoadParams = struct {
     /// Clamp the hot-cache byte budget against live post-load headroom
     /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
     /// deliberately has no server.zig import. Null = no clamp (tests).
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -296,6 +296,145 @@ pub const SubmitParams = struct {
     /// post-Phase-D; tests using the legacy path pass the default model.
     model: *model_registry_mod.LoadedModel,
 };
+
+/// Set by `server.installPrefillAdmission` at startup: does a request of this
+/// shape fit in GPU memory right now? A function pointer rather than an
+/// import because the scheduler deliberately has no server.zig dependency —
+/// the same shape as `prefix_cache_mem_resolver`. Null in unit tests and on
+/// hosts that never route through the HTTP server, which disables the
+/// evict-to-admit path entirely (behaviour identical to before #353).
+///
+/// The three trailing warm arguments are the WARM prefix: the rows the hot
+/// cache restored into this slot, the capacity its buffers already hold, and
+/// whether that restore CHECKED THE ENTRY OUT (`prefix_cache.checkoutEligible`
+/// — the only restore whose rows the request will not allocate; every other
+/// one is refcount-shared and copied by the first append). A cold caller
+/// passes `0, 0, false` and gets exactly the bill it had. Passed as scalars
+/// rather than `server.WarmPrefix` because this module deliberately does not
+/// import server.zig.
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) bool = null;
+
+/// Third of the same family: the prefill WIDTH this request should run at,
+/// chosen against live post-eviction memory by the estimator that admits it
+/// (`server.requestPrefillChunkNow`). Null in unit tests and wherever the
+/// HTTP server is not installed, which keeps the model's load-time pin —
+/// exactly the behaviour every arch but qwen4_exp gets anyway.
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) u32 = null;
+
+/// What the two readings around the eviction pass decided, and which of the
+/// two directions the call site logs.
+pub const PostEvictionWidth = struct {
+    /// The width the prefill RUNS at. Always the re-ask.
+    width: u32,
+    /// The pass returned enough for a wider rung than admission was billed
+    /// at — the whole point of asking twice.
+    widened: bool,
+    /// The re-ask came back NARROWER than the admitted width: memory moved
+    /// between the two reads. Rare, and worth a line.
+    moved: bool,
+};
+
+/// PURE: the prefill width to RUN, given the width the admission bill was
+/// taken at BEFORE the eviction pass (`admitted`) and the width re-asked
+/// against live memory AFTER it (`reasked`).
+///
+/// Audit N5. The width is a function of what is free, and until this the free
+/// memory it was a function of was the memory BEFORE the hot cache gave
+/// anything back: a request whose bill only fit at the ladder floor was
+/// admitted, the eviction pass then returned gigabytes, and the prefill ran at
+/// the floor anyway. Re-asking after the pass is the whole fix — and it is a
+/// re-ask against memory that was ACTUALLY RETURNED (`EvictionReport.bytes`,
+/// the live allocator delta), never against `reclaimable`, which is a
+/// projection.
+///
+/// THE RE-ASK IS THE TRUTH, in BOTH directions (external review of PR #363).
+/// It shipped as `@max(admitted, reasked)`, sold as "an eviction only ever
+/// returns memory, so the clamp is the assertion". It is not an assertion, it
+/// is a clamp, and it clamps the wrong way: when the invariant holds the max
+/// is a no-op, and the only case where it does anything is the case where the
+/// invariant BROKE — memory moved under us between the two reads — where it
+/// picks the WIDER of two widths, one of which is known to be stale. That is
+/// widening on memory that is gone, the exact uncatchable Metal OOM this
+/// family exists to avoid; the narrow arm only ever costs throughput. The
+/// re-ask ran after the pass, against live memory, through the same estimator
+/// that admits the request — it is the reading to trust.
+///
+/// `admitted == 0` means no eviction pass ran (or the pin is 0 = unpinned):
+/// nothing was returned, there is no second reading to compare against, and
+/// the re-ask is simply the only ask. Same answer, no special case.
+///
+/// The width never falls below the ladder floor because the CHOOSER cannot
+/// return anything narrower: `server.chooseRequestPrefillChunk` walks
+/// `PREFILL_CHUNK_LADDER` and falls through to the floor rung when nothing
+/// fits (pinned by "chooseRequestPrefillChunk: WIDEST that fits, at the
+/// boundary"). Nothing here may invent a width the ladder cannot produce, so
+/// nothing here computes one.
+pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) PostEvictionWidth {
+    return .{
+        .width = reasked,
+        .widened = admitted != 0 and reasked > admitted,
+        .moved = admitted != 0 and reasked < admitted,
+    };
+}
+
+/// Fourth of the family, and the only one the PREFILL LOOP asks rather than
+/// the scheduler: the width of the NEXT chunk, re-priced at every chunk
+/// boundary against live memory (`server.adaptivePrefillWidthNow`). Null keeps
+/// the request's admitted width for the whole prefill.
+pub var prefill_chunk_adapt: ?*const fn (
+    *const model_mod.ModelConfig,
+    u64,
+    usize,
+    u32,
+    u32,
+    *generate_mod.AdaptiveWidthState,
+    u64,
+) u32 = null;
+
+/// Fifth of the family, and the one that says whether the fourth can move
+/// anything at all: is the per-chunk adaptive width ENABLED for this model
+/// (`server.adaptivePrefillChunkEnabled` — qwen4_exp, its two kill switches,
+/// and no operator pin)?
+///
+/// It exists because the fourth hook's PRESENCE cannot answer that question.
+/// `serve` installs `prefill_chunk_adapt` unconditionally and process-wide, so
+/// it is non-null on every arch; the width holds elsewhere because the policy
+/// behind it declines, not because the hook is missing. Reading presence as
+/// the arch gate put the scaled tail-merge bound back on every arch (audit
+/// B-A2). Null here = not live, which is the right answer for a host with no
+/// estimator installed.
+pub var prefill_chunk_adaptive_enabled: ?*const fn (*const model_mod.ModelConfig) bool = null;
+
+/// PURE-ish: what `Generator.InitOptions.adaptive_chunk_width` gets for a slot.
+/// No config (the embedded engines) or no installed predicate = not live.
+pub fn adaptiveChunkWidthFor(cfg: ?*const model_mod.ModelConfig) bool {
+    const c = cfg orelse return false;
+    const enabled = prefill_chunk_adaptive_enabled orelse return false;
+    return enabled(c);
+}
+
+/// S17's twin: re-price a WIDEN after the interleave tick
+/// (`server.adaptivePrefillWidenStillFits`). Null declines every widen, which
+/// is the safe default for a host with no estimator installed.
+pub var prefill_chunk_widen_ok: ?*const fn (
+    *const model_mod.ModelConfig,
+    u64,
+    usize,
+    u32,
+    u64,
+) bool = null;
+
+/// Twin of the above for the REFUSAL: logs the numbers the estimator
+/// compared, from the module that owns them. A refusal quotes the number it
+/// compared, and the scheduler cannot format a bill it has no estimator for.
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) void = null;
+
+/// Invalidate the published hot-cache budget (`server.clearResolvedPrefixCacheMem`).
+/// The budget is PER MODEL but the global holding it is process-wide, so an
+/// unload or a switch must retire it — otherwise the next model's ANE gate
+/// reserves the previous model's cache (audit S5/S7). Same fn-pointer shape as
+/// the neighbours: the scheduler deliberately has no server.zig import.
+pub var hot_cache_budget_invalidate: ?*const fn () void = null;
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
@@ -539,8 +678,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
-                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+                transformer_mod.ssmFreeQsaState(e);
             }
             allocator.free(entries);
         };
@@ -655,6 +793,13 @@ pub const Slot = struct {
         return slot;
     }
 
+    /// This slot's attention KV length, for the batched group's sort key and
+    /// its pad-waste cap. Delegates to `batchKvLenOf` — the ONE source, and
+    /// never `cache.step` (0 forever on a linear-layer-0 trunk).
+    pub fn batchKvLen(self: *const Slot) u32 {
+        return batchKvLenOf(&self.cache, self.model.config);
+    }
+
     /// Free everything the slot owns. Only safe to call when no thread can
     /// observe the slot anymore (i.e. after the inference thread has
     /// finished/errored it AND the connection thread has consumed the final
@@ -683,8 +828,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
-                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+                transformer_mod.ssmFreeQsaState(e);
             }
             self.allocator.free(entries);
         }
@@ -779,6 +923,36 @@ pub const Slot = struct {
 
     /// Inference thread: signal error. `name` is borrowed; we dupe so the
     /// connection thread can read it after the inference loop drops the slot.
+    /// Whether a slot error name names a MEMORY failure. The MLX error latch
+    /// raises `error.OutOfMemory` for a Metal working-set abort and Zig's own
+    /// allocator raises the same name, and the registry's `loadErrorFromName`
+    /// already keeps both spellings in the memory class — this is the decode
+    /// path's copy of that one decision, so a client gets a 503 it can act on
+    /// instead of "generation failed" (issue #353).
+    pub fn errorNameIsMemory(name: []const u8) bool {
+        return std.mem.eql(u8, name, "OutOfMemory") or
+            std.mem.eql(u8, name, "InsufficientMemory");
+    }
+
+    /// Whether the slot's latched error name is exactly `name`. The error
+    /// class crosses the thread boundary as a NAME (the connection thread
+    /// never sees the inference thread's error value), so a caller that needs
+    /// one specific class asks for it by name.
+    pub fn errorNameIs(self: *Slot, name: []const u8) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const have = self.error_code orelse return false;
+        return std.mem.eql(u8, have, name);
+    }
+
+    /// Live form of the above: reads the slot's latched error name.
+    pub fn errorIsMemory(self: *Slot) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const name = self.error_code orelse return false;
+        return errorNameIsMemory(name);
+    }
+
     fn markError(self: *Slot, name: []const u8) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -1022,7 +1196,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1146,7 +1320,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -1197,6 +1371,38 @@ pub const Scheduler = struct {
     /// current model's cache (or null when the cache isn't applicable for
     /// the model, e.g. hybrid SSM archs).
     hot_prefix_cache: ?*prefix_cache_mod.HotPrefixCache,
+    /// Resident hot-cache bytes, PUBLISHED for the connection thread.
+    ///
+    /// `hot_prefix_cache` itself is inference-thread state: the pointer is
+    /// nulled and the cache freed on every model switch/unload, so a
+    /// connection thread that dereferenced it to ask `residentBytes()` was one
+    /// unlucky interleaving away from reading freed memory (found auditing
+    /// #353 — the admission guard's `evictable` term did exactly that). The
+    /// inference thread republishes this after every commit and eviction; the
+    /// guard reads the number and never the pointer. Stale by at most one
+    /// entry, which is what a HINT is allowed to be — the eviction decision
+    /// that matters is re-asked on the inference thread against live memory.
+    resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// The part of the above an eviction can PROVE it will return: residency
+    /// minus the largest entry, because a prefix restore refcount-shares the
+    /// matched entry and eviction protects it (`HotPrefixCache.reclaimableBytes`).
+    /// The guard credits THIS toward admission and reports the other number in
+    /// its refusal — admitting on bytes that are already spoken for is how a
+    /// request gets promised and then refused (guards run 2026-09-05).
+    reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// The published per-entry digest snapshot the connection-thread guard
+    /// reads INSTEAD of the cache. Owned here; replaced under `digest_mu` by
+    /// the inference thread, which frees the superseded slice after the swap.
+    /// A connection thread COPIES what it needs while holding the lock — no
+    /// pointer to this ever escapes, which is the whole point: the cache
+    /// itself is freed on every model switch.
+    hot_cache_digests: []prefix_cache_mod.HotPrefixCache.EntryDigest = &.{},
+    /// The residency the digests above describe, published in the SAME
+    /// critical section so a reader cannot mix a stale set with a fresh total.
+    digest_residency: u64 = 0,
+    digest_mu: std.Io.Mutex = .init,
 
     max_concurrent: u32,
     /// Phase A7 test hook: when true, `runDecodeTick` forces the batched
@@ -1422,6 +1628,19 @@ pub const Scheduler = struct {
 
         if (self.inference_thread) |t| t.join();
 
+        // Digest snapshot: freed HERE, below the join, for the same reason the
+        // slot drains are. `publishHotCacheDigests` frees the superseded slice
+        // on the inference thread after every finished request, and
+        // `reclaimableHotCacheBytesFor` reads the live one on connection
+        // threads under `digest_mu`. Freeing it above the join raced both: two
+        // frees of one pointer, or a reader holding a slice the deinit had
+        // already released. Below the join the publisher is gone, so this is
+        // the last writer. (audit B0)
+        if (self.hot_cache_digests.len > 0) {
+            self.allocator.free(self.hot_cache_digests);
+            self.hot_cache_digests = &.{};
+        }
+
         // Drain any leftover slots — should be empty if all conn threads
         // called `complete` properly, but defensive. Inference thread has
         // already exited by now (joined above), so freeing here is safe.
@@ -1507,6 +1726,9 @@ pub const Scheduler = struct {
         self.drafter = null;
         self.dflash = null;
         self.hot_prefix_cache = null;
+        self.resident_hot_cache_bytes.store(0, .monotonic);
+        if (hot_cache_budget_invalidate) |f| f();
+        self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
@@ -2044,6 +2266,13 @@ pub const Scheduler = struct {
         ) == .regular;
     }
 
+    /// S21. Does this slot owe a module-head release? See
+    /// `Generator.mtpReleasePending` — one single-slot tick lands it.
+    fn slotReleasePending(slot: *const Slot) bool {
+        const gen = if (slot.legacy_gen) |*g| g else return false;
+        return gen.mtpReleasePending();
+    }
+
     /// Active-tick gate. Decides whether a slot is eligible for the batched
     /// decode kernel. Hybrid SSM / MoE / encoder / DSV4 models can't ride
     /// the batched kernel (it doesn't model their state), so any slot
@@ -2053,6 +2282,11 @@ pub const Scheduler = struct {
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
         _ = self;
         if (!slotTicksRegular(slot)) return false;
+        // S21: a slot whose module-owned MTP head release is armed but not yet
+        // landed is still holding the head. It lands on the next single-slot
+        // tick (`nextMtp`'s serial branch); the batched tick would skip it and
+        // the head would stay reserved for the rest of the request.
+        if (slotReleasePending(slot)) return false;
         if (slot.sampling.constraint != null) return false;
         if (slot.logprobs_n > 0) return false;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
@@ -2084,12 +2318,14 @@ pub const Scheduler = struct {
 /// decode serially this tick, so every slot still advances.
 ///
 /// Returns how many of `kv_lens_asc` may batch together (0 or 1 = nobody batches).
-/// The lengths handed in are the caller's `cache.step` — the PRE-tick counts,
-/// while the forward pads to the post-update view, and a sliding layer's view
-/// is trimmed shorter still. So this is deliberately an approximation of the
-/// padding the forward will actually build (one token low, and an upper bound
-/// on sliding layers); it is a heuristic bar, not an accounting identity, and
-/// re-deriving it from the exact per-layer view widths buys nothing.
+/// The lengths handed in come from `batchKvLenOf` — the arch's TRUE attention KV
+/// length, which is NOT `cache.step` on a linear-layer-0 trunk (it is 0 forever
+/// there, which made this cap dead on every GDN / conv / mamba / KDA arch). They
+/// are still PRE-tick counts, while the forward pads to the post-update view, and
+/// a sliding layer's view is trimmed shorter still. So this is deliberately an
+/// approximation of the padding the forward will actually build (one token low,
+/// and an upper bound on sliding layers); it is a heuristic bar, not an accounting
+/// identity, and re-deriving it from the exact per-layer view widths buys nothing.
 /// The padded tensor may be at most this multiple of the bytes the group
 /// actually needs. It must stay BELOW 2.0 or a two-slot group can never be
 /// vetoed: one 1-token slot beside one 200k slot pads to exactly 2x, which is
@@ -2109,6 +2345,53 @@ pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
         if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
     }
     return 0;
+}
+
+/// The padding waste the WHOLE group would pay: the padded `N x kv_max` tensor
+/// over the `sum(kv_len)` bytes the slots actually need. Reported by the cap's
+/// log so the decision names the number it compared, never just its outcome.
+pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
+    var sum: u64 = 0;
+    for (kv_lens_asc) |l| sum += l;
+    if (sum == 0 or kv_lens_asc.len == 0) return 1.0;
+    const padded: f64 = @floatFromInt(@as(u64, kv_lens_asc.len) * kv_lens_asc[kv_lens_asc.len - 1]);
+    return padded / @as(f64, @floatFromInt(sum));
+}
+
+/// ONE source for the length the batched group is sorted by AND capped by.
+///
+/// It must be the arch's TRUE attention KV length. `cache.step` is not: it
+/// advances only inside `update` on GLOBAL layer 0, so on every trunk whose
+/// layer 0 is a LINEAR block — GDN (qwen3_5, qwen3_5_moe, qwen4_exp,
+/// qwen3_next), gated-conv (lfm2, lfm2_moe, lfm2_vl), Mamba2 (nemotron_h),
+/// KDA (bailing_hybrid) — layer 0 never calls `update` and `step` reads 0
+/// forever. Fed from `step`, every slot reported 0, the waste ratio was 1.0
+/// for ANY group and `MAX_PAD_WASTE` never capped anything: a 1k-token slot
+/// batched beside a 60k one padded 59k rows per tick, the unbilled transient
+/// this cap exists to bound. `KVCache.kvLenForBatching` reads the first
+/// ATTENTION layer's own offset on those trunks and `step` where layer 0 is
+/// attention, so it is right on every arch and needs no arch list here.
+pub fn batchKvLenOf(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig) u32 {
+    // ARCH GATE (PR #363 item 2). Waking a cap that was dead is not a free
+    // fix: a group that used to batch now SPLITS, the long slot decodes
+    // serially, and the +12%/+8% two- and four-stream batched wins measured on
+    // the 27B qwen3_5 were measured with the cap dead. `modelBatchable` and
+    // `supportsBatchedGdnDecode` between them mean the archs that actually
+    // reach a batched group on a linear-layer-0 trunk are qwen3_5 dense and
+    // qwen3_next — real packs, real concurrent serving, and nobody has run the
+    // multi-stream A/B on either.
+    //
+    // So the kv-length rule is qwen4_exp's, and every other arch keeps
+    // `cache.step` — the exact field a93e2c0 fed the cap, including the defect
+    // that it is 0 forever on a hybrid and the cap therefore never fires
+    // there. That defect is a KNOWN LIMIT off qwen4_exp, documented in
+    // `docs/gotchas/server-http.md`, pending a multi-stream measurement.
+    //
+    // A null config (unit fixtures, and any future caller with no model in
+    // hand) takes the a93e2c0 arm: an unknown arch is not the gated one.
+    const c = cfg orelse return @intCast(cache.step);
+    if (!c.longCtxGated()) return @intCast(cache.step);
+    return @intCast(cache.kvLenForBatching());
 }
 
 /// Pure-config predicate: is this model's architecture compatible with the
@@ -2141,14 +2424,46 @@ fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     return t.ownsModuleDecodeState();
 }
 
+/// Pure core of `slotExclusiveDecode`, so the S21 release is testable without
+/// a Slot, a LoadedModel and a Transformer.
+///
+/// `model_owns_state` is the MODEL-level bit (`ownsModuleDecodeState`, dsv4):
+/// it wins outright and `head_released` never touches it — that state is the
+/// trunk's decode state, not an MTP head, and nothing in this request can hand
+/// it back. The head clause below is the qwen4_exp one: `Qwen4Mtp.cache` is one
+/// per model, so the slot driving it takes the model to itself.
+///
+/// S21: `head_released` is that slot saying it is DONE with the head — the
+/// adaptive switch moved it to serial and the arm is sticky, so no round, no
+/// probe and no re-entry can follow (`Generator.mtpModuleHeadReleased`). Until
+/// this existed a re-arm was always possible, so the claim could never be
+/// dropped mid-request and a second MTP request queued behind a slot that had
+/// stopped speculating.
+pub fn headExclusiveFor(
+    model_owns_state: bool,
+    head_module_owned: bool,
+    slot_enable_mtp: bool,
+    head_released: bool,
+) bool {
+    if (model_owns_state) return true;
+    if (!head_module_owned or !slot_enable_mtp) return false;
+    return !head_released;
+}
+
 /// Per-SLOT exclusivity: the model's own bit, OR a slot that will drive a
 /// module-owned MTP head (qwen4: `Qwen4Mtp.cache` is one per model). Plain
 /// slots on the same model keep interleaving/batching beside it; two MTP
-/// slots serialize.
+/// slots serialize — until one of them releases the head (S21).
 fn slotExclusiveDecode(slot: *const Slot) bool {
-    if (modelExclusiveDecode(slot.model)) return true;
-    const head = slot.model.mtp orelse return false;
-    return slot.enable_mtp and head == .qwen4;
+    const head = slot.model.mtp;
+    return headExclusiveFor(
+        modelExclusiveDecode(slot.model),
+        // ONE answer for "is this head module-owned", shared with the
+        // generator side — never a second hand-rolled per-arch conjunct.
+        if (head) |h| h.moduleOwned() else false,
+        slot.enable_mtp,
+        if (slot.legacy_gen) |*g| g.mtpModuleHeadReleased() else false,
+    );
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
@@ -2519,6 +2834,8 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = null;
     sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// llama.cpp load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
@@ -2595,6 +2912,8 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = null;
     sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// The post-load residency bill the eviction gate reserves, in bytes.
@@ -2732,6 +3051,8 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.drafter = null;
     sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
@@ -3445,11 +3766,20 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
         // The measured round-cost table rides the same identity: restored
         // here, written at the end of any request that folded new samples.
-        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build);
+        // L27. The bucket grid AND the store version are the ARCH's. Only
+        // qwen4_exp gets the long-context split and the serial row; every
+        // other arch keeps the six-bucket `rc1` table 26.9.1 wrote, so an
+        // upgrading user boots WARM and the EV plan keeps pricing extension
+        // from measurements instead of the always-open prior valve.
+        const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
+        xfm_ptr.round_cost.layout = rc_layout;
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout);
         xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
-        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key)) |t| {
+        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
             xfm_ptr.round_cost = t;
-            log.info("[spec-cost] round-cost table restored ({d} cells)\n", .{t.restored});
+            // Two counts, never one: the width grid and the serial row are
+            // restored independently and answer different questions.
+            log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
         }
     }
 
@@ -3753,8 +4083,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        // The RAM allowance for IDLE entries on the SSD-first arm — 0 on
+        // every other arch, and 0 when the resolver is absent (unit tests).
+        // `spillIdleEntries` enforces it; see `HotPrefixCache.ssd_idle_mem`.
+        var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
-            resolve(params.config, params.prefix_cache_mem_bytes)
+            resolve(params.config, params.prefix_cache_mem_bytes, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
@@ -3763,6 +4097,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
+        // THE checkpoint-retention arch gate, mirrored ONCE from the ONE
+        // predicate (PR #363 item 3). `HotPrefixCache`/`DiskTier` never see a
+        // ModelConfig, so the answer is stored, not re-derived — the
+        // `qsa_history_required` pattern. The ungated value NAMES a93e2c0's
+        // behaviour at each site: min-span-no-recency in RAM, drop-oldest
+        // (= keep the highest N) on disk.
+        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
+        entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
@@ -3791,6 +4133,33 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
+            // Same gate, mirrored onto the tier. a93e2c0's disk retention kept
+            // the highest N, which `.oldest` reproduces exactly, at a cap of 8.
+            entry.prefix_cache.?.disk.?.cp_thin =
+                if (params.config.longCtxGated()) .min_span_recency else .oldest;
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated())
+                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
+            else
+                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+        }
+        // SSD-first prefix cache: ONE predicate, checked here — arch, env
+        // switch, AND a live disk tier. It runs BELOW the attach because the
+        // tier is part of the answer: with `--prefix-cache-disk` off (the
+        // default) there is nowhere to spill to, so qwen4_exp takes the RAM
+        // arm byte for byte like every other arch. The budget site
+        // (`server.ssdFirstBudgetForLoad`) asks the same predicate.
+        entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
+            params.config,
+            entry.prefix_cache.?.disk != null,
+        );
+        if (entry.prefix_cache.?.ssd_first) {
+            // Mirror the predicate onto the disk tier (mechanism 4).
+            entry.prefix_cache.?.disk.?.ssd_first = true;
+            // Mechanism 2: the background writer, SSD-first only.
+            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
+            // Mechanism 6: startup sweep of strays + root-wide LRU across the
+            // other models' fingerprints under the same base.
+            entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
@@ -3847,6 +4216,60 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+    publishHotCacheResidency(sch);
+}
+
+/// Republish the hot cache's residency for the connection thread's admission
+/// guard. Called from the inference thread after anything that changes it —
+/// a commit, an eviction, an invalidation, a model switch. One relaxed store.
+pub fn publishHotCacheResidency(sch: *Scheduler) void {
+    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    sch.resident_hot_cache_bytes.store(bytes, .monotonic);
+    const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
+    sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    publishHotCacheDigests(sch);
+}
+
+/// Swap in a fresh digest snapshot and free the one it supersedes. Runs on the
+/// inference thread only, from the same sites as the scalars above (commit,
+/// eviction, invalidation, model switch), so the guard's view is stale by at
+/// most one entry — which is all a HINT has to be.
+///
+/// An allocation failure leaves the PREVIOUS snapshot in place rather than
+/// clearing it: a stale digest is a hint, an empty one is a claim that the
+/// cache holds nothing, and the second is a lie that credits bytes that exist.
+fn publishHotCacheDigests(sch: *Scheduler) void {
+    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hot_prefix_cache) |hc|
+        (hc.digestsAlloc(sch.allocator) catch return)
+    else
+        &.{};
+    const residency: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    sch.digest_mu.lockUncancelable(sch.io);
+    const old = sch.hot_cache_digests;
+    sch.hot_cache_digests = fresh;
+    // Published UNDER the same lock as the digests it describes: the reader
+    // subtracts one from the other, and a publish landing between two separate
+    // reads gives a mixed view whose stale-digest/fresh-residency direction
+    // OVER-credits. (audit N6)
+    sch.digest_residency = residency;
+    sch.digest_mu.unlock(sch.io);
+    if (old.len > 0) sch.allocator.free(old);
+}
+
+/// CONNECTION-THREAD entry point: what an eviction pass can prove it will get
+/// back for THIS prompt. Copies nothing out — the reduction happens under the
+/// lock and only a scalar leaves.
+pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) u64 {
+    // Hash outside the lock (pure, and the prompt is ours), then take BOTH
+    // halves of the subtraction from the same critical section. (audit N6)
+    const fp = prefix_cache_mod.HotPrefixCache.prefixFingerprint(prompt_tokens);
+    sch.digest_mu.lockUncancelable(sch.io);
+    defer sch.digest_mu.unlock(sch.io);
+    return prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(
+        sch.hot_cache_digests,
+        sch.digest_residency,
+        fp,
+    );
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
@@ -3964,6 +4387,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            // RESTORE BY MOVE: the SECOND slot-end path, and the one that
+            // matters most — a decode-phase cancel never reaches finishSlot,
+            // and `s.deinit()` on the next line frees the KV buffers this
+            // slot took ownership of. Unconditional, OUTSIDE the commit
+            // guard above: an errored or already-finished slot can hold a
+            // checkout too, and the record must not outlive the bytes.
+            if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             s.deinit();
         }
         if (vision_n > 0 or embed_n > 0) {
@@ -4463,6 +4893,8 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.drafter = null;
         sch.dflash = null;
         sch.hot_prefix_cache = null;
+        publishHotCacheResidency(sch);
+        if (hot_cache_budget_invalidate) |f| f();
     }
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
@@ -4493,6 +4925,14 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
+    // S20. `runSingleDecodeTickInner` can reach `finishSlot` — and so this
+    // commit — on an EOS the failing forward itself produced, BEFORE the
+    // wrapper's `checkErrorDecode` reads the latch and stamps `error_code`.
+    // Metal returns ZEROS before it aborts, so that EOS can be plausible and
+    // the KV under it is garbage. `error_code` is therefore not the whole
+    // guard: a latch that is still unread means this slot's last forward may
+    // have failed, and a committed prefix outlives the request that made it.
+    if (mlx.errorPending()) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
@@ -4502,7 +4942,11 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // pad-only guard: `was_pad_only` starts true and only flips on the
         // first pushed token, so a slot that never pushed one is not
         // pad-POISONED, it is merely empty.
-        return commitCancelledPrefillSlot(slot, hc);
+        commitCancelledPrefillSlot(slot, hc);
+        // Republish for the connection thread's admission guard: a cancelled
+        // prefill still commits, so residency moved.
+        publishHotCacheResidency(sch);
+        return;
     };
     const n_gen = gen_ptr.generated_ids.items.len;
     if (n_gen > 0 and slot.was_pad_only) return;
@@ -4534,6 +4978,26 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
+    // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer
+    // history HERE, as a slice VIEW of the capacity buffer — no copy, and the
+    // slot (the buffer's other owner) is torn down right after this commit.
+    // The prefill-end attach used to materialize it, so the whole decode held
+    // two copies (3,840 B/tok). Off (`MLX_SERVE_QSA_HISTORY_SHARE=0`) the
+    // prefill attached already and this is a no-op. Runs on the inference
+    // thread, before `commitWithMediaState` sees the list; a failure commits
+    // the entry history-less, which a QSA arch treats as a miss, never as a
+    // poisoned entry (`qsa_history_required`).
+    if (ssm_cps_opt) |cps| {
+        if (transformer_mod.qsaHistoryShareEnabled() and !transformer_mod.checkpointHasQsaHistory(&cps[cps.len - 1])) {
+            if (slot.ssm_entries) |ents| {
+                if (slot.model.transformer) |xf| {
+                    transformer_mod.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
+                        log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
+                    };
+                }
+            }
+        }
+    }
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -4553,13 +5017,41 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // draft tail first (offset-only, cheap).
     const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {
         const mc = if (gen_ptr.mtp_cache) |*m| m else break :blk null;
+        // S21. A released module head is no longer this request's to read,
+        // let alone to TRUNCATE: the release is exactly what let another slot
+        // claim it, and that slot may be mid-generation on it right now. The
+        // history this request would have committed stopped growing at the
+        // switch anyway (a serial block moves the trunk, not the head), so
+        // there is nothing here worth racing for. The sidecar arm is
+        // unaffected — its cache is per-request and never released.
+        if (gen_ptr.mtpModuleHeadReleased()) break :blk null;
         const committed = gen_ptr.mtpCommittedHistoryLen();
         if (committed == 0) break :blk null;
         mc.truncate(committed, slot.model.transformer.?.s) catch |err| {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
-        break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
+        // The qwen4_exp in-checkpoint head also commits its QSA half — its KV
+        // alone is not a restorable history (`MtpCacheRef.head`).
+        const head = mc.head();
+        // Its row count IS its cache's step (`Transformer.qwen4MtpAdvance`;
+        // the head's layer index is not 0, so `KVCache.update` never advances
+        // it and `truncate` early-returns at an untrimmed tail). A snapshot
+        // whose step disagrees carries a key history the restore can only
+        // decline or silently skip — refuse to commit it, and say why.
+        if (head) |t| {
+            const hm = &t.qwen4_mtp.?;
+            if (hm.cache.step != hm.seq_offset) {
+                log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
+                break :blk null;
+            }
+        }
+        break :blk .{
+            .cache = mc.kv() orelse break :blk null,
+            .base_pos = gen_ptr.mtp_position_base,
+            .head = if (head) |t| &t.qwen4_mtp.?.entry else null,
+            .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
+        };
     };
     hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
@@ -4567,6 +5059,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // here too was a double free, with a different allocator).
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
     };
+    publishHotCacheResidency(sch);
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens
@@ -4671,6 +5164,32 @@ pub fn loopTrimEnabled() bool {
     return enabled;
 }
 
+/// THE terminator a finishing slot publishes, and the ONLY caller of
+/// `Slot.markFinished` in this file.
+///
+/// External review of PR #363, item 3. `runSingleDecodeTickInner` reaches
+/// `finishSlot` on an EOS the FAILING forward itself produced — Metal returns
+/// ZEROS before it aborts, so a plausible EOS sampled out of buffers it never
+/// wrote is exactly what that failure looks like — and it gets there BEFORE
+/// the tick wrapper's `checkErrorDecode` reads the latch and stamps
+/// `error_code`. S20 stopped the hot-cache COMMIT from swallowing that
+/// garbage. The CLIENT RESPONSE was not guarded at all: the request finished
+/// 200, `finish_reason` "stop", with fabricated text, and the wrapper's
+/// `markError` a moment later hit `if (... or self.finished) return` and did
+/// nothing.
+///
+/// `latched` is a PEEK (`mlx.peekErrorName`), never a consume: the wrapper
+/// still owns the latch, and on a batched group that is what fails every other
+/// slot that shared the failed forward. Generic over the slot so the decision
+/// is provable without an mlx-backed `Slot`.
+fn publishSlotTerminator(slot: anytype, reason: []const u8, latched: ?[]const u8) void {
+    if (latched) |name| {
+        slot.markError(name);
+        return;
+    }
+    slot.markFinished(reason);
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -4683,7 +5202,25 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         g.logQsaArms();
         g.persistRoundCost();
     }
+    // The last forward's failure, read BEFORE anything finalizes this request
+    // (external review of PR #363, item 3). A PEEK: `commitSlotIfApplicable`
+    // below still asks `mlx.errorPending()` for S20's own guard, and the
+    // decode-tick wrapper still consumes the latch and still fails the rest of
+    // a batched group with it.
+    const latched: ?[]const u8 = mlx.peekErrorName();
+    if (latched) |name| {
+        log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
+    }
     commitSlotIfApplicable(sch, slot);
+    // RESTORE BY MOVE: whatever the commit above did or did not do, this slot
+    // is over. A commit that landed on the checked-out entry already cleared
+    // the mark (the replace path installed the grown buffers); anything still
+    // marked belongs to a slot that ended WITHOUT committing — cancelled,
+    // errored, refused, pad-poisoned, oversized-and-declined — and its record
+    // now describes bytes that die with `slot.cache`. Drop it and say so.
+    // Unconditional and above every early return, because "the commit ran" is
+    // exactly the fact this cannot be allowed to depend on.
+    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -4701,7 +5238,9 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // e2e = first_token_ns + decode_ns.
     if (sch.metrics) |m| {
         m.recordRequest(
-            reason,
+            // A poisoned finish is an error, not a "stop": billing it under
+            // the reason it never earned is the same lie one layer down.
+            if (latched != null) "error" else reason,
             slot.first_token_ns,
             slot.prefill_ns,
             slot.decode_ns,
@@ -4710,9 +5249,21 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             slot.cached_tokens,
         );
     }
-    slot.markFinished(reason);
+    publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
-        if (stream_opt) |s| hc.flushPendingDisk(s);
+        if (stream_opt) |s| {
+            hc.flushPendingDisk(s);
+            // Mechanism 6: RAM keeps the active session, everything else goes
+            // to the SSD. Runs AFTER the flush so this turn's entry is the
+            // most recently used one (= the active session) and so any entry
+            // spilled here already has a complete copy to spill INTO.
+            hc.spillIdleEntries(s);
+            // The spill moved entries out of RAM; the connection-thread guard
+            // reads a PUBLISHED residency, so without this it keeps crediting
+            // (and the digest snapshot keeps describing) a cache that is
+            // already gone. (audit S10)
+            publishHotCacheResidency(sch);
+        }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
     // clear inside `Generator.advanceStep` can't cover the tail of a turn, and
@@ -5114,6 +5665,136 @@ const InterleaveCtx = struct {
     ticks: u32 = 0,
 };
 
+/// SSD-first mechanism 3: persist each completed prefill chunk as the prefill
+/// produces it. The token record for the chunk-aligned prefix is a genuine
+/// prefix of this turn's prompt, so `appendCommit` recognises the next call as
+/// an EXTEND of the same entry and rewrites nothing: chunks [0, kv_len/chunk)
+/// stay exactly as written. A cancelled or killed prefill therefore leaves a
+/// restorable chunk-aligned prefix, and the end-of-request flush is the tail.
+///
+/// Armed only when the model is SSD-first AND the background writer is up, so
+/// the inference thread pays the readback and never the file write.
+fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
+    const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
+    const slot = wc.slot;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
+    if (!hc.ssd_first) return;
+    const d = if (hc.disk) |*dd| dd else return;
+    if (d.writer == null) return;
+    // Vision entries never spill (the placeholder rows make a token-only key
+    // ambiguous), and a position past the prompt is not a prompt prefix.
+    if (slot.vision_key != 0) return;
+    if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
+    const s = if (slot.model.transformer) |x| x.s else return;
+    wc.chunks += 1;
+    // Bounded to ONE chunk per boundary: this runs INSIDE the prefill, so
+    // every byte it serializes lands before the first token. A restored
+    // prefix that is not on disk yet (32 chunks, 464 MB, 375 ms at 64k) is
+    // left to the end-of-request flush, which runs after the response.
+    _ = d.appendCommitBounded(
+        slot.cache.entries,
+        abs_kv_pos,
+        slot.cache.config,
+        slot.full_prompt[0..abs_kv_pos],
+        slot.has_tools,
+        if (cps.len > 0) cps else null,
+        s,
+        WRITE_THROUGH_FLUSH_BOUND_BYTES,
+    ) catch |err| {
+        log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+/// The write-through hook's per-call flush bound: ONE byte, so the chunk
+/// loop in `DiskTier.appendCommitWithSpecBounded` stops after the first
+/// chunk it writes — one chunk per prefill boundary, never a backlog on the
+/// TTFT path. An explicit call-site parameter, not tier state, so a scan can
+/// pin it (`kv_disk_cache.zig`: "the write-through hook bounds its flush").
+pub const WRITE_THROUGH_FLUSH_BOUND_BYTES: u64 = 1;
+
+const WriteThroughCtx = struct {
+    slot: *Slot,
+    chunks: u32 = 0,
+};
+
+/// Mechanism 3's SPAN condition, pure so it is unit-testable without a Slot.
+///
+/// The write-through only earns its cost when this turn's prefill produces at
+/// least one whole disk chunk: a shorter span has no chunk-aligned progress a
+/// cancel could lose (everything below it is already in RAM and, modulo the
+/// sub-chunk tail, already on disk), while the persist runs INSIDE the prefill
+/// chunk loop on the inference thread and therefore lands in this request's
+/// TTFT. A warm turn — a restored 32k prefix plus a 31-token instruction tail
+/// — is exactly that case, and paid +183/+369/+737 ms at 16k/32k/64k for a
+/// prefix the end-of-request commit persists anyway.
+fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
+    return new_span >= chunk_tokens;
+}
+
+var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
+
+/// The ONE gate for mechanism 3: SSD-first arch predicate + a live background
+/// writer (so the chunk write never runs on the inference thread) + a disk
+/// tier to write into + a NEW span worth at least one chunk. Pure over the
+/// slot (plus this turn's un-cached span) so it can be unit-tested.
+fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    if (!hc.ssd_first) return false;
+    const d = if (hc.disk) |*dd| dd else return false;
+    const writer_up = d.writer != null;
+    if (!writer_up or slot.vision_key != 0) return false;
+    if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
+        if (!write_through_span_declined_logged.swap(true, .monotonic)) {
+            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Context for `Generator.InitOptions.chunk_width_hook`: everything the
+/// per-chunk width policy needs about THIS request, and nothing about the
+/// scheduler. `cfg` is optional because a slot's model may carry none (the
+/// embedded engines), in which case the hook is a no-op and the prefill keeps
+/// its admitted width.
+const ChunkWidthCtx = struct {
+    cfg: ?*const model_mod.ModelConfig,
+    kv_bits: u64,
+    /// This slot's own prefix cache — per-`LoadedModel`, the same handle the
+    /// write-through uses, never `sch.hot_prefix_cache` (a multi-model
+    /// registry makes those different caches). Only used for
+    /// `stagedHostBytes`, which is documented INFERENCE-THREAD-ONLY and is
+    /// read here from inside the prefill loop, on that thread. (audit S11)
+    hc: ?*prefix_cache_mod.HotPrefixCache,
+};
+
+/// Host bytes the SSD writer is holding for this slot right now. Zero without
+/// a cache, without a disk tier, or without an armed writer.
+fn chunkWidthStagedBytes(wc: *ChunkWidthCtx) u64 {
+    const hc = wc.hc orelse return 0;
+    return hc.stagedHostBytes();
+}
+
+fn chunkWidenConfirmCb(opaque_ctx: *anyopaque, pos: usize, want: u32) bool {
+    const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
+    const cfg = wc.cfg orelse return false;
+    const ok = prefill_chunk_widen_ok orelse return false;
+    return ok(cfg, wc.kv_bits, pos, want, chunkWidthStagedBytes(wc));
+}
+
+fn chunkWidthCb(
+    opaque_ctx: *anyopaque,
+    pos: usize,
+    cur: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
+    const cfg = wc.cfg orelse return cur;
+    const pick = prefill_chunk_adapt orelse return cur;
+    return pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+}
+
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
     if (ic.ticks == 0) {
@@ -5140,6 +5821,15 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     }
     sch.queue_mu.unlock(sch.io);
     if (n == 0) return 0;
+    // The interval since each of these slots' previous tick contains a PREFILL
+    // CHUNK, not just decode. `spec_cost_solo` is true throughout — this
+    // stream really is the only one decoding — so the serial cell would fold
+    // a chunk's wall time as if it were a token's, and that number is
+    // persisted and then used to decide against speculation for the rest of
+    // the process. Drop the pending interval; the next tick seeds a fresh one.
+    for (buf[0..n]) |s| {
+        if (s.legacy_gen) |*g| g.invalidateSerialClock();
+    }
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
         log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
@@ -5251,6 +5941,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // per-request, so prefix matching would reuse stale features.
     var prefill_tokens: []const u32 = slot.full_prompt;
     var hot_matched: u32 = 0;
+    // Did the restore CHECK OUT its entry (restore by move)? The admission
+    // bill credits a warm prefix only then: every other restore is a refcount
+    // SHARE, whose first `writeAtOffset` privatises the whole prefix, so its
+    // rows really are allocated (audit B-A3).
+    var hot_checked_out: bool = false;
     // The DFlash assistant's context rides the prefix cache: a restore
     // forwards no trunk layers, so without it the assistant starts every
     // reused turn blind and drafts against nothing. Measured on Muse 4-bit,
@@ -5286,7 +5981,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
-            const lookup = hc.lookupAndRestoreWithMedia(
+            // qwen4_exp: the head's QSA half travels with its KV, so the
+            // target names the Transformer too and the adoption is
+            // all-or-nothing inside `restoreSpecSnap`.
+            const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
+            // RESTORE BY MOVE: the slot names itself, which opts this
+            // restore into the checkout (`Entry.checked_out_by`). The promise
+            // it makes is that `finishSlot` runs `releaseCheckout` on EVERY
+            // path that ends the slot — pinned by
+            // `test "every slot-end path releases a checked-out hot-cache entry"`.
+            const lookup = hc.lookupAndRestoreForSlot(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5296,7 +6000,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.vision_key,
                 slot.media_start,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
-                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
+                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
+                @intFromPtr(slot),
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -5304,6 +6009,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
+                hot_checked_out = lookup.checked_out;
             }
             if (dfl_target) |*dc| {
                 // Adopt only a context that lines up EXACTLY with the trunk
@@ -5339,10 +6045,195 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
     const cp_max: u32 = slot.model.ssm_checkpoint_max;
 
+    // LIMIT THE CACHE WHILE MEMORY IS LEFT (issue #353). The connection
+    // thread's guard admits a request whose bill fits only once the hot cache
+    // gives memory back; this is where it gives it back. Here — not there —
+    // because the inference thread is the SOLE mlx caller (even frees), and
+    // because the prefix restore has already happened, so the entry this
+    // request is using is the MOST recently used one and LRU eviction reaches
+    // it last (`protect_mru`).
+    //
+    // The estimator is re-asked after every eviction rather than compared
+    // against a precomputed shortfall: freeing an entry moves live MLX
+    // memory, and the gate that runs before the estimator that knows better
+    // IS the estimator (#126).
+    //
+    // Audit N5: the width chosen below is a function of what is free, so the
+    // two readings on either side of this pass are two different answers.
+    // `admitted_prefill_chunk` is the pre-eviction one (0 = no pass ran, so
+    // nothing was returned and there is no second reading), and
+    // `evicted_live_bytes` is what the allocator ACTUALLY got back — the live
+    // delta, never `reclaimable`.
+    var admitted_prefill_chunk: u32 = 0;
+    var evicted_live_bytes: u64 = 0;
+    // THE ARCH GATE for this whole pass (PR #363). a93e2c0 had no eviction-to-
+    // admit and no `error.PrefillDoesNotFit`: a prefill that reached the
+    // inference thread ran. The pass trades hot-cache entries for the request
+    // in front of it, and can end in a refusal the connection thread already
+    // admitted — measured on qwen4_exp (the live 1,047,556-token chain
+    // extension) and on nothing else. Its connection-thread half is gated in
+    // `server.prefillAdmissionBill`, which zeroes the two credits that drive
+    // the admit arms; this is the same predicate on the acting half, so the
+    // two cannot disagree about whether the mechanism exists.
+    //
+    // `publishHotCacheResidency` is NOT gated — it runs at every other call
+    // site for every arch, and it is the class-A fix (the guard used to
+    // dereference `hot_prefix_cache`, freed on every model switch).
+    const admission_pass_armed = if (slot.model.config) |c| c.longCtxGated() else false;
+    if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {
+        if (slot.model.config) |cfg| {
+            // The probe bills what the connection thread's guard admitted
+            // with — the request's OWN kv-quant scheme and vision chunking,
+            // not the process defaults. A `kv_quant: 4` request otherwise
+            // priced its cache at fp16 here, evicted the whole hot cache and
+            // could then be refused by name AFTER being admitted.
+            const Probe = struct {
+                cfg: *const model_mod.ModelConfig,
+                seq: usize,
+                max_tokens: u32,
+                kv_cfg: transformer_mod.KVQuantConfig,
+                unchunked: bool,
+                /// The prefix the hot cache RESTORED into this slot, and the
+                /// capacity its buffers already hold. Those rows are inside
+                /// `mlx_get_active_memory` already — the restore rebound the
+                /// entry's handles by refcount — so billing them again invents
+                /// a copy nobody allocates. Re-read is unnecessary: neither
+                /// moves while this pass runs (eviction PROTECTS the restored
+                /// entry), and both are what the request will prefill against.
+                warm_matched: u64,
+                warm_capacity: u64,
+                /// ...and whether the restore CHECKED THE ENTRY OUT. Without
+                /// it the rows above are refcount-SHARED, the first append
+                /// copies the whole prefix, and crediting them is an
+                /// under-bill on a path that ends in an uncatchable Metal
+                /// abort rather than a 400 (audit B-A3).
+                warm_will_donate: bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) bool,
+                fn call(ctx: ?*anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate);
+                }
+            };
+            var probe = Probe{
+                .cfg = cfg,
+                .seq = slot.full_prompt.len,
+                // Already clamped to the context by the surface that admitted
+                // it — an unclamped `max_tokens` is the omitted sentinel.
+                .max_tokens = slot.max_tokens,
+                .kv_cfg = slot.cache.config,
+                .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+                .warm_matched = hot_matched,
+                .warm_capacity = slot.cache.residentCapacityTokens(),
+                .warm_will_donate = hot_checked_out,
+                .fits = fits_fn,
+            };
+            if (!Probe.call(&probe)) {
+                // The width admission was billed at, read BEFORE anything is
+                // evicted and only on the path that actually evicts: when the
+                // probe already fits, no memory moves and the single ask below
+                // is the whole story. Same hook, same inputs, same live
+                // memory as the probe that just ran, so this IS the admitted
+                // width and not a second opinion (#126).
+                if (prefill_request_chunk) |pick_pre| {
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate);
+                }
+                // Per-MODEL, off the slot — same rule as `commitSlotIfApplicable`
+                // ("Phase D: per-model prefix cache"). `sch.hot_prefix_cache`
+                // is whichever model the inference thread loaded last; in a
+                // multi-model registry that is a DIFFERENT cache, so the pass
+                // evicted a stranger's entries, protected the wrong MRU, and
+                // returned none of the memory this request needs — then
+                // refused it by name. (audit S19)
+                // Captured BY POINTER: the cache is a by-value field on the
+                // LoadedModel, so a `|hc|` capture would evict from a stack
+                // COPY and free nothing. `slot.model` is the registry's own
+                // mutable entry and the inference thread is the cache's sole
+                // mutator, so the mutable borrow is legitimate here.
+                const report = if (slot.model.prefix_cache) |*hc|
+                    // `true` = never evict the entry THIS request restored
+                    // from: its buffers are refcount-shared with the slot's
+                    // cache, so dropping it frees nothing and only throws
+                    // away the hit (the cache records the identity at
+                    // restore; "most recently used" is a different claim).
+                    hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
+                else
+                    prefix_cache_mod.EvictionReport{ .admitted = false };
+                publishHotCacheResidency(sch);
+                // `bytes`, not `accounted_bytes`: what the allocator returned,
+                // not what the cache was billed for. A shared snapshot bills
+                // megabytes and returns none, and a width justified by memory
+                // that never came back is an uncatchable Metal OOM.
+                evicted_live_bytes = report.bytes;
+                if (!report.admitted) {
+                    // Nothing left to give back. Refuse by NAME — the memory
+                    // class, so the client gets a 503 that says so rather
+                    // than a dead connection (or, before the MLX error latch,
+                    // a dead server).
+                    log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
+                    // A refusal quotes the numbers it COMPARED (the estimator
+                    // lives in server.zig, so it does the formatting).
+                    if (prefill_admission_refused_log) |report_fn| {
+                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate);
+                    }
+                    // NOT `error.OutOfMemory`: nothing ran out of anything.
+                    // That name is the MLX working-set latch's, and it sends
+                    // the client a 503 saying the engine "ran out of GPU
+                    // memory during this request and it was abandoned" — for a
+                    // request that was refused before its first forward. This
+                    // one is a request the machine cannot hold: a named 400,
+                    // like the connection thread's own refusal (#353 follow-up).
+                    return error.PrefillDoesNotFit;
+                }
+            }
+        }
+    };
+
+    // The prefill WIDTH for THIS request, chosen HERE and not at load: the
+    // admission pass above has just finished evicting, so this is the first
+    // moment the free memory is the memory the prefill will actually run in.
+    // Falls back to the model's load-time pin when the hook is not installed
+    // or the arch does not opt in (`ModelConfig.perRequestPrefillChunk`).
+    const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {
+        const pin = cfg.pinned_prefill_chunk;
+        const pick = prefill_request_chunk orelse break :blk pin;
+        const reasked = pick(
+            cfg,
+            slot.full_prompt.len,
+            slot.max_tokens,
+            slot.cache.config,
+            generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+            hot_matched,
+            slot.cache.residentCapacityTokens(),
+            hot_checked_out,
+        );
+        // Audit N5. Without an eviction pass this is the only ask; with one it
+        // is the SECOND ask, taken against the memory the pass really
+        // returned. Either way it is the reading taken against LIVE memory and
+        // therefore the one that runs — in both directions (see
+        // `postEvictionPrefillChunk`).
+        const decision = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
+        if (decision.widened) {
+            log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, decision.width, evicted_live_bytes >> 20 });
+        } else if (decision.moved) {
+            log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB — memory moved between the two reads; the re-ask is the live reading, so it runs\n", .{ decision.width, admitted_prefill_chunk, evicted_live_bytes >> 20 });
+        }
+        break :blk decision.width;
+    } else 0;
+
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch };
+    var write_through_ctx = WriteThroughCtx{ .slot = slot };
+    // Per-CHUNK prefill width. The context is this request's config and KV
+    // width; the POLICY and the live probe live in server.zig, reached through
+    // the fourth admission hook. Stack-scoped like `interleave_ctx` — it must
+    // outlive `initWithOptions`, and nothing else may see it.
+    var width_ctx = ChunkWidthCtx{
+        .cfg = slot.model.config,
+        .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
+        .hc = if (slot.model.prefix_cache) |*p| p else null,
+    };
 
     // Ownership of the restored spec caches transfers AT THE CALL:
     // initWithOptions adopts them and frees them via its own errdefers on
@@ -5381,6 +6272,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
+            // The MODEL's head, before this request's opt-out: `slot.mtp` is
+            // the registry's `entry.mtp`, which already ANDs `--no-mtp`. The
+            // serial cell keys on THIS, not on the weights being loaded.
+            .model_has_mtp = slot.mtp != null,
             .mtp_depth = slot.mtp_depth,
             .lookup_prompt = slot.full_prompt,
             .ctx = slot.ctx,
@@ -5398,11 +6293,13 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.audio_token_id, xfm_ptr.config.video_token_id)
             else
                 0,
-            // The prefill width the admission guard billed for THIS model.
-            // Straight off `slot.model.config` — the same object
-            // `server.pinPrefillChunk` writes and `checkAttentionMemory`
-            // reads, so the forward can never run wider than the bill.
-            .pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,
+            // The prefill width the admission guard billed for THIS REQUEST
+            // (`req_prefill_chunk`, chosen above against live post-eviction
+            // memory by the same estimator that admits). It is the model's
+            // load-time pin off `slot.model.config` on every arch that does
+            // not opt in, and whenever the hook is absent — so the forward can
+            // never run wider than something that was billed.
+            .pinned_prefill_chunk = req_prefill_chunk,
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -5419,6 +6316,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else
                 null,
+            // Mechanism 3, SSD-first only.
+            .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
+                .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
+            else
+                null,
+            .chunk_width_hook = if (prefill_chunk_adapt != null)
+                .{ .ctx = &width_ctx, .call = chunkWidthCb, .confirm = chunkWidenConfirmCb }
+            else
+                null,
+            // ...and separately, whether that hook can move anything for THIS
+            // model. The install above is process-wide, so it is not the arch
+            // gate and nothing downstream may read it as one (audit B-A2).
+            .adaptive_chunk_width = adaptiveChunkWidthFor(width_ctx.cfg),
             // Init's argmax-only gate must see logprobs BEFORE the split-
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
@@ -5521,25 +6431,72 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
         var group = batchable_buf[start..end];
+        // ONE predicate for both halves of the pad-waste change: the kv-length
+        // RULE (`batchKvLenOf`) and the SORT that orders by it. Reading them
+        // from one place is what stops a group being ordered by a93e2c0's key
+        // and capped by the new one.
+        const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
         // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
         // how many still fit; the tail decodes serially this tick.
         if (group.len >= 2) {
-            std.sort.pdq(*Slot, group, {}, struct {
-                fn lt(_: void, a: *Slot, b: *Slot) bool {
-                    return a.cache.step < b.cache.step;
-                }
-            }.lt);
+            // ONE read of each slot's true attention KV length. NOT layer 0's
+            // step bookkeeping — that is 0 forever on a linear-layer-0 trunk,
+            // which made this cap dead there; see `batchKvLenOf`. Carried
+            // alongside the slots so the sort key and the waste ratio are
+            // literally the same numbers.
             var kv_lens: [32]u32 = undefined;
-            for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+            // ARCH GATE (PR #363). The STABLE insertion sort is part of the
+            // pad-waste change, not a neutral rewrite: a93e2c0 ordered the
+            // group with `std.sort.pdq`, which is UNSTABLE, so on equal keys
+            // the two sorts hand `batchedKvKeepCount` different slots in the
+            // tail — and the tail is what falls to serial decode, i.e. a
+            // different KERNEL for that slot. Off qwen4_exp every key is
+            // `cache.step`, which is 0 forever on a hybrid trunk, so EVERY key
+            // is equal and the choice of sort decides the whole ordering. That
+            // is the loudest possible version of the difference, on exactly
+            // the archs nobody measured.
+            //
+            // So the ungated arm takes a93e2c0's call verbatim
+            // (`git show a93e2c0:src/scheduler.zig:5530`) and derives the
+            // lengths afterwards, which is also a93e2c0's order of operations.
+            if (gate_batch_kv_len) {
+                for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
+                // Ascending by length, slots and lengths moving together.
+                // Insertion sort: `group.len <= 32`, and this runs once per
+                // decode tick. STABLE, so slots that tie keep arrival order.
+                var i: usize = 1;
+                while (i < group.len) : (i += 1) {
+                    const slot_i = group[i];
+                    const len_i = kv_lens[i];
+                    var j = i;
+                    while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                        group[j] = group[j - 1];
+                        kv_lens[j] = kv_lens[j - 1];
+                    }
+                    group[j] = slot_i;
+                    kv_lens[j] = len_i;
+                }
+            } else {
+                std.sort.pdq(*Slot, group, {}, struct {
+                    fn lt(_: void, a: *Slot, b: *Slot) bool {
+                        return a.cache.step < b.cache.step;
+                    }
+                }.lt);
+                for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+            }
             const keep = batchedKvKeepCount(kv_lens[0..group.len]);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
-                    log.info("[batched] kv-length skew: batching {d} of {d} slots (kv_len {d}..{d}), rest serial\n", .{
-                        keep, group.len, kv_lens[0], kv_lens[group.len - 1],
+                    log.info("[batched] pad-waste cap: kept {d} of {d} slots (waste {d:.2}x, kv_len {d}..{d}), rest serial\n", .{
+                        keep,
+                        group.len,
+                        batchedPadWaste(kv_lens[0..group.len]),
+                        kv_lens[0],
+                        kv_lens[group.len - 1],
                     });
                 }
                 for (group[keep..]) |s| try runSingleDecodeTick(sch, s);
@@ -5713,7 +6670,34 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
 }
 
+/// Every single-slot decode tick funnels through here, so a decode-time MLX
+/// failure is attributed to the slot whose forward raised it.
+///
+/// Without this, `mlx.checkError` was consumed only by the prefill chunk loop
+/// (#353 follow-up): a decode forward that failed left the slot sampling from
+/// buffers Metal never wrote, the request FINISHED 200 with whatever those
+/// bytes decoded to, and the latch sat there until the next request's first
+/// prefill chunk turned it into that innocent request's 503. Two wrong
+/// answers from one failure.
+///
+/// The inner error is preserved unless the latch has something to say — a
+/// latched MLX message is the root cause and the Zig error above it is the
+/// symptom. `checkErrorDecode` clears the latch either way, so nothing leaks
+/// into the next tick or the next request.
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    var inner_err: ?anyerror = null;
+    runSingleDecodeTickInner(sch, slot) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) — failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
+        slot.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
     // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
@@ -5821,12 +6805,20 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    // Regular path.
+    // Regular path. This is also where a request that never armed MTP
+    // (`enable_mtp:false` on a checkpoint that HAS a head) teaches the
+    // round-cost table what a plain serial token costs at this context — the
+    // one number the width planner could never see. The call is unconditional
+    // here but `observeSerialTick` is NOT: it owns every drop rule (contention,
+    // block warmup) AND `serialCellWanted`, which keeps models with no MTP
+    // head from folding a cell nothing will read and rewriting the persisted
+    // table on every request.
     const tok_opt = try gen.next(slot.allocator);
     if (tok_opt == null) {
         finishSlot(sch, slot, gen.finish_reason);
         return;
     }
+    gen.observeSerialTick();
     const t = tok_opt.?;
     // Phase A5: capture per-token logprob. `gen.last_logprob` ownership
     // transfers into slot.logprobs_buf (gen sets the field, we null it here).
@@ -5871,6 +6863,149 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
+    // External review of PR #363, item 3. A decode forward that failed can
+    // still hand back an EOS — Metal returns ZEROS before it aborts, and a
+    // plausible EOS sampled out of buffers it never wrote is what that looks
+    // like. `runSingleDecodeTickInner` finishes the slot on that EOS BEFORE
+    // the tick wrapper reads the latch, so the request answered 200 with
+    // fabricated text and `finish_reason` "stop", and the wrapper's later
+    // `markError` was a no-op against an already-finished slot. S20 guarded
+    // the hot-cache COMMIT against exactly this; the client response was not
+    // guarded at all.
+    //
+    // Stubbed rather than run against a real Slot: the decision is which
+    // terminator gets published, and that needs no mlx.
+    const Stub = struct {
+        finished: ?[]const u8 = null,
+        errored: ?[]const u8 = null,
+        fn markFinished(self: *@This(), reason: []const u8) void {
+            self.finished = reason;
+        }
+        fn markError(self: *@This(), name: []const u8) void {
+            self.errored = name;
+        }
+    };
+
+    // Nothing latched: the ordinary finish, unchanged.
+    var clean = Stub{};
+    publishSlotTerminator(&clean, "stop", null);
+    try testing.expectEqualStrings("stop", clean.finished.?);
+    try testing.expect(clean.errored == null);
+
+    // Latched: no "stop" is published at all. Reverting to an unconditional
+    // `markFinished` turns this red.
+    var poisoned = Stub{};
+    publishSlotTerminator(&poisoned, "stop", "OutOfMemory");
+    try testing.expect(poisoned.finished == null);
+    try testing.expectEqualStrings("OutOfMemory", poisoned.errored.?);
+    // ...and the name carries the CLASS, so the surface answers the memory
+    // 503 rather than a generic engine fault.
+    try testing.expect(Slot.errorNameIsMemory(poisoned.errored.?));
+
+    // A shape bug mid-decode is still a failed request, just not a 503.
+    var shape = Stub{};
+    publishSlotTerminator(&shape, "length", "MlxFailure");
+    try testing.expect(shape.finished == null);
+    try testing.expectEqualStrings("MlxFailure", shape.errored.?);
+    try testing.expect(!Slot.errorNameIsMemory(shape.errored.?));
+}
+
+test "the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher" {
+    // Two halves, both load-bearing. (a) The latch is read before the
+    // response is finalized — a read after `markFinished` is the defect, since
+    // `markError` declines an already-finished slot. (b) The read is a PEEK:
+    // consuming it here would answer THIS slot and let every sibling in a
+    // batched group finish 200 on the same failed forward, because the tick
+    // wrapper would find the latch already clear.
+    const whole = @embedFile("scheduler.zig");
+    const self_test = "\ntest \"the slot terminator reads the MLX latch BEFORE it publishes";
+    const src = whole[0 .. std.mem.indexOf(u8, whole, self_test) orelse whole.len];
+
+    // ONE publisher, and it is the guarded one.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "slot.markFinished" ++ "("));
+    const pub_at = std.mem.indexOf(u8, src, "fn publishSlot" ++ "Terminator(") orelse
+        return error.MissingPublisher;
+    const pub_end = std.mem.indexOfPos(u8, src, pub_at, "\n}\n") orelse return error.MissingPublisherEnd;
+    const pub_body = src[pub_at..pub_end];
+    try testing.expect(std.mem.indexOf(u8, pub_body, "slot.markFinished" ++ "(reason);") != null);
+    try testing.expect(std.mem.indexOf(u8, pub_body, "slot.markError" ++ "(name);") != null);
+
+    const start = std.mem.indexOf(u8, src, "fn finishSlot(") orelse return error.MissingFinishSlot;
+    const end = std.mem.indexOfPos(u8, src, start + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+    const body = src[start..end];
+    const peek = std.mem.indexOf(u8, body, "mlx.peekError" ++ "Name();") orelse
+        return error.FinishSlotDoesNotReadTheLatch;
+    const publish = std.mem.indexOf(u8, body, "publishSlot" ++ "Terminator(slot, reason, latched);") orelse
+        return error.FinishSlotDoesNotPublishThroughTheGuard;
+    try testing.expect(peek < publish);
+    // A CONSUME here would take the latch away from the tick wrapper.
+    try testing.expect(std.mem.indexOf(u8, body, "mlx.checkError" ++ "Decode()") == null);
+    // S20's own guard still reads the (unconsumed) latch on the commit path.
+    const commit_at = std.mem.indexOf(u8, src, "fn commitSlotIfApplicable(") orelse
+        return error.MissingCommitSlot;
+    const commit_end = std.mem.indexOfPos(u8, src, commit_at, "\nfn ") orelse return error.MissingCommitEnd;
+    try testing.expect(std.mem.indexOf(u8, src[commit_at..commit_end], "mlx.errorPending" ++ "()") != null);
+}
+
+test "every slot-end path releases a checked-out hot-cache entry" {
+    // RESTORE BY MOVE hands a slot OWNERSHIP of a hot-cache entry's KV
+    // buffers, so the record outlives its bytes unless every path that ends a
+    // slot releases the checkout. There are exactly TWO such paths and they do
+    // not chain: `finishSlot` (normal finish, stop, loop cut, refusal) and the
+    // inference loop's cleanup drain (a decode-phase cancel that `complete()`
+    // pulled straight into the cleanup queue and which NEVER reaches
+    // finishSlot — the same seam the commit-in-the-drain guard exists for).
+    //
+    // Both releases must be UNCONDITIONAL: "the commit ran" is exactly the
+    // fact this cannot be allowed to depend on, since a pad-only, errored,
+    // oversized-and-declined or refused slot ends without one. In the drain
+    // the release must also sit BEFORE `s.deinit()`, which frees the very
+    // buffers the entry would otherwise still claim.
+    const whole = @embedFile("scheduler.zig");
+    // Everything above this test — the call sites, never this test's own
+    // mentions of them (`@embedFile` reads the file it is written in).
+    // Anchored at a line start: the runPrefill comment NAMES this test, and an
+    // unanchored needle finds that mention first and truncates the source
+    // above every call site it is supposed to count.
+    const self_test = "\ntest \"every slot-end path releases a checked-out hot-cache entry\"";
+    const source = whole[0 .. std.mem.indexOf(u8, whole, self_test) orelse whole.len];
+    try testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, source, "hc.releaseCheckout(@intFromPtr("),
+    );
+
+    {
+        const start = std.mem.indexOf(u8, source, "fn finishSlot(") orelse return error.MissingFinishSlot;
+        const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+        const body = source[start..end];
+        const commit = std.mem.indexOf(u8, body, "commitSlotIfApplicable(sch, slot);") orelse
+            return error.FinishSlotDoesNotCommit;
+        const release = std.mem.indexOf(u8, body, "hc.releaseCheckout(@intFromPtr(slot)") orelse
+            return error.FinishSlotDoesNotRelease;
+        // After the commit (which clears the mark when it reclaims the entry),
+        // so the drop only fires on a slot that ended WITHOUT committing.
+        try testing.expect(commit < release);
+    }
+
+    {
+        const start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse
+            return error.MissingCleanupDrain;
+        const region = source[start..@min(start + 2400, source.len)];
+        const release = std.mem.indexOf(u8, region, "hc.releaseCheckout(@intFromPtr(s)") orelse
+            return error.DrainDoesNotRelease;
+        const deinit_pos = std.mem.indexOf(u8, region, "s.deinit();") orelse return error.MissingDeinit;
+        try testing.expect(release < deinit_pos);
+    }
+
+    // The checkout is only ever TAKEN by the slot-named entry point, so a
+    // future caller cannot opt in without making the release promise.
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "hc.lookupAndRestoreForSlot("),
+    );
 }
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
@@ -6098,7 +7233,24 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
 /// in one kernel pass, sample per-slot, push the OLD next_token_id (= the
 /// token we just committed to cache via the forward), and load the new
 /// sampled id back into next_token_id.
+/// Batched sibling of the single-slot checkpoint. A batched group shares ONE
+/// forward, so a failure in it belongs to every slot in the group — there is
+/// no honest way to blame one of them, and letting the others keep emitting
+/// from the same failed buffers is the bug this exists to prevent.
 fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    var inner_err: ?anyerror = null;
+    runBatchedDecodeTickInner(sch, active) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] batched decode aborted: MLX failure ({s}) — failing all {d} slots in the group\n", .{ @errorName(mlx_err), active.len });
+        for (active) |s| s.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const N = active.len;
     if (N == 0) return;
     const allocator = sch.allocator;
@@ -6379,6 +7531,126 @@ test "the batched group is capped by padding waste before it is dispatched" {
     try testing.expect(std.mem.indexOf(u8, body, "for (group[keep..]) |s| try runSingleDecodeTick") != null);
 }
 
+test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
+    // The defect: `cache.step` advances only inside `update` on GLOBAL layer 0,
+    // so on a linear-layer-0 trunk it reads 0 forever. Fed from `step`, a 1k
+    // slot and a 60k one both reported 0, the waste ratio came out 1.0 for ANY
+    // group and `MAX_PAD_WASTE` never capped: the short slots padded 59k rows
+    // per tick, the unbilled transient this cap exists to bound.
+    //
+    // Four families have a linear global layer 0 — GDN (qwen3_5, qwen3_5_moe,
+    // qwen4_exp, qwen3_next), gated-conv (lfm2*), Mamba2 (nemotron_h), KDA
+    // (bailing_hybrid). The first attention layer sits at a different index in
+    // each, so the length source probes the cache, never an arch list.
+    const lens = [_]usize{ 1_000, 1_000, 60_000 };
+    const first_attn = [_]u32{ 3, 2, 7 }; // GDN / gated-conv / KDA spacings
+    var caches: [3]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    for (lens, first_attn, 0..) |len, fa, i| {
+        caches[i] = try KVCache.init(testing.allocator, 32);
+        built += 1;
+        caches[i].entries[fa].initialized = true;
+        caches[i].entries[fa].offset = len;
+        try testing.expectEqual(@as(usize, 0), caches[i].step); // the trap
+    }
+
+    // The GATED arch (PR #363 item 2). RED before the fix: every entry here
+    // was `cache.step` == 0.
+    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var kv_lens: [3]u32 = undefined;
+    for (caches[0..], 0..) |*c, i| kv_lens[i] = batchKvLenOf(c, &q4);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 60_000 }, &kv_lens);
+
+    // ...and every OTHER hybrid keeps a93e2c0 exactly: `cache.step`, which is
+    // 0 forever here, so the cap stays dead. That is a KNOWN LIMIT off
+    // qwen4_exp — the batched wins on the 27B were measured with the cap dead
+    // and un-batching those streams is unmeasured (docs/gotchas/server-http.md,
+    // the #363 blast-radius ledger). A null config takes the same arm.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "lfm2", "nemotron_h", "bailing_hybrid" }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt };
+        for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, &cfg));
+    }
+    for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, null));
+
+    // With the real lengths the cap fires. All three pads to 3 x 60000 = 180k
+    // against 62k useful (2.9x); the 60k slot falls out and decodes serially,
+    // and the two 1k slots batch at 1.0x waste.
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&kv_lens));
+    try testing.expect(batchedPadWaste(&kv_lens) > MAX_PAD_WASTE);
+
+    // What the defect handed it instead — a group nothing could ever cap,
+    // because a waste ratio over all-zero lengths is 1.0 by construction.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+    try testing.expectEqual(@as(f64, 1.0), batchedPadWaste(&[_]u32{ 0, 0, 0 }));
+}
+
+test "an attention-first trunk's batching lengths are unchanged by the fix" {
+    // Dense / attention-first archs must be byte-identical across this change:
+    // entry 0 is initialized, so the length source is still `step` and the cap
+    // sees exactly the numbers it saw before.
+    const lens = [_]usize{ 1_000, 1_000, 1_000, 100_000 };
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    var caches: [4]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    var kv_lens: [4]u32 = undefined;
+    for (lens, 0..) |len, i| {
+        caches[i] = try KVCache.init(testing.allocator, 8);
+        built += 1;
+        caches[i].step = len;
+        caches[i].entries[0].initialized = true;
+        caches[i].entries[0].offset = len;
+        kv_lens[i] = batchKvLenOf(&caches[i], &llama);
+    }
+    try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
+    // Both arms of the gate agree here — `kvLenForBatching` returns `step`
+    // when entry 0 is initialized, so a dense arch is unchanged whichever
+    // side of the predicate it falls on.
+    var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    for (caches[0..], 0..) |*c, i| try testing.expectEqual(kv_lens[i], batchKvLenOf(c, &q4b));
+    // Same keep count as reading `cache.step` directly — the pre-fix answer.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&kv_lens));
+    try testing.expectEqual(
+        batchedKvKeepCount(&[_]u32{ 1_000, 1_000, 1_000, 100_000 }),
+        batchedKvKeepCount(&kv_lens),
+    );
+}
+
+test "the batched group takes its kv length from the ONE accessor, never cache.step" {
+    // Class guard. `cache.step` is 0 forever on every linear-layer-0 trunk, so
+    // a length read from it makes the pad-waste cap dead on exactly the archs
+    // that batch a GDN/conv/mamba/KDA kernel — silently, since the group still
+    // forms and every byte still matches.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "batchKvLen()") != null);
+    // `cache.step` IS present now — deliberately, as the ungated arm's key
+    // (a93e2c0's). The rule it stands for is unchanged and is now per-arm: the
+    // GATED arm must never read it. Bound the window at the `else`, so a
+    // `cache.step` creeping back into the gated half is still caught.
+    const gated_at = std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {") orelse return error.MissingGate;
+    const else_at = std.mem.indexOfPos(u8, body, gated_at, "\n            } else {") orelse return error.MissingLegacyArm;
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..else_at], "cache.step") == null);
+    // The cap's log names the number it compared, not just its outcome.
+    try testing.expect(std.mem.indexOf(u8, body, "pad-waste cap: kept") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "batchedPadWaste(") != null);
+    // ...and the one accessor is the KVCache's, not a re-derivation.
+    const src_of = std.mem.indexOf(u8, src, "pub fn batchKvLenOf(") orelse return error.MissingAccessor;
+    const of_end = std.mem.indexOfPos(u8, src, src_of, "\n}\n") orelse return error.MissingAccessorEnd;
+    const of_body = src[src_of..of_end];
+    try testing.expect(std.mem.indexOf(u8, of_body, "kvLenForBatching()") != null);
+    // ...and the arch gate is the ONE predicate, in this ONE function. A
+    // second site with its own conjunct is how the two drift.
+    try testing.expect(std.mem.indexOf(u8, of_body, "c.longCtx" ++ "Gated()") != null);
+    // ...and no site in this file hand-rolls the arch instead of asking the
+    // predicate: a second spelling is a second predicate, and the two drift.
+    const impl = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse src.len];
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, impl, "\"qwen4" ++ "_exp\""));
+}
+
 test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
@@ -6623,6 +7895,97 @@ test "inferenceLoop pending drain routes through admitPendingTick" {
     // would mean a path still admits without the gate.
     const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
     try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "S21: a released module head drops the slot's exclusivity, and the MODEL bit is untouched" {
+    // Holding: the slot drives the one per-model head, so it gets the model.
+    try testing.expect(headExclusiveFor(false, true, true, false));
+    // Released (the sticky serial arm): no round, probe or re-entry can
+    // follow, so a second MTP request may be admitted behind it.
+    try testing.expect(!headExclusiveFor(false, true, true, true));
+    // A request that never armed MTP never held the head either way.
+    try testing.expect(!headExclusiveFor(false, true, false, false));
+    try testing.expect(!headExclusiveFor(false, true, false, true));
+    // A KV-only sidecar head is per-REQUEST: it was never exclusive, and S21
+    // is not a way for it to become so.
+    try testing.expect(!headExclusiveFor(false, false, true, false));
+    try testing.expect(!headExclusiveFor(false, false, true, true));
+    // The MODEL-level bit (dsv4's `ownsModuleDecodeState`) is the trunk's own
+    // decode state, not an MTP head. Nothing in a request can hand it back, so
+    // `head_released` must never reach it.
+    try testing.expect(headExclusiveFor(true, false, false, true));
+    try testing.expect(headExclusiveFor(true, true, true, true));
+
+    // And the wiring: the head's module-ownership comes from the ONE shared
+    // predicate, and the release from the generator's own accessor — a second
+    // hand-rolled per-arch conjunct here is exactly the list-of-one this file
+    // already learned about with `modelExclusiveDecode`.
+    const src = @embedFile("scheduler.zig");
+    const fn_at = std.mem.indexOf(u8, src, "fn slotExclusive" ++ "Decode(slot: *const Slot)") orelse
+        return error.MissingSlotExclusive;
+    const body = src[fn_at .. fn_at + 700];
+    try testing.expect(std.mem.indexOf(u8, body, "h.module" ++ "Owned()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "g.mtpModuleHead" ++ "Released()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "head == ." ++ "qwen4") == null);
+}
+
+test "S21: the batched group builder never admits a slot still driving a module-owned head" {
+    const src = @embedFile("scheduler.zig");
+    // The group is built at exactly ONE admission point, and it asks
+    // `batchable`, whose FIRST question is whether the slot's next tick
+    // dispatches the regular path.
+    try testing.expect(std.mem.indexOf(u8, src, "if (sch.batch" ++ "able(s) and batchable_n < batchable_buf.len)") != null);
+    const b_at = std.mem.indexOf(u8, src, "fn batch" ++ "able(self: *const Scheduler") orelse
+        return error.MissingBatchable;
+    const reg_at = std.mem.indexOfPos(u8, src, b_at, "if (!slotTicks" ++ "Regular(slot)) return false;") orelse
+        return error.MissingRegularGate;
+    try testing.expect(reg_at - b_at < 400);
+
+    // A slot still DRIVING the head dispatches `.mtp`, not `.regular`, so it
+    // can never reach a group — this is the property S21 must not break, and
+    // it is why the release is safe: the slot that hands the head back is by
+    // then already ticking regular.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, true, false, false, false, false, false, false));
+    // While it drives the head it also holds the model alone; once released it
+    // holds nothing, which is what lets its neighbours batch.
+    try testing.expect(headExclusiveFor(false, true, true, false));
+    try testing.expect(!headExclusiveFor(false, true, true, true));
+
+    // And the S21 case the gate above CANNOT see: a sticky slot sets
+    // `spec_disabled_runtime` the moment it switches, which makes it batchable
+    // immediately — one plain neighbour on the same model in the very next
+    // tick would carry it into a group, `nextMtp` would never run again, the
+    // release would never land and the head would stay reserved to the end of
+    // the request. So a slot that still OWES the release is held out of the
+    // group for the one tick that lands it.
+    const b_end = std.mem.indexOfPos(u8, src, b_at, "\n};\n") orelse return error.MissingBatchableEnd;
+    try testing.expect(b_end > reg_at); // the window really is the whole fn
+    const body = src[b_at..b_end];
+    const pend_at = std.mem.indexOf(u8, body, "if (slotRelease" ++ "Pending(slot)) return false;") orelse
+        return error.MissingReleasePendingGate;
+    try testing.expect(pend_at + b_at > reg_at); // after the dispatch gate, inside batchable
+    try testing.expect(std.mem.indexOf(u8, src, "return gen.mtpRelease" ++ "Pending();") != null);
+
+    // NOT widened to a blanket `slotExclusiveDecode` veto: a slot disabled for
+    // a NON-adaptive reason (`--max-mtp-ctx`, the acceptance floor) still holds
+    // the head and still batches today, and taking that away is an unmeasured
+    // throughput change. Pinned so the omission is a decision, not an oversight.
+    try testing.expect(std.mem.indexOf(u8, body, "slotExclusive" ++ "Decode(slot)") == null);
+}
+
+test "S21: a released module head is not committed to the prefix cache" {
+    // The commit TRUNCATES the head cache before snapshotting it. On the
+    // qwen4_exp arm that cache is the model's, so a released slot doing this
+    // at request end would trim a history another slot is mid-generation on.
+    const src = @embedFile("scheduler.zig");
+    const blk_at = std.mem.indexOf(u8, src, "const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {") orelse
+        return error.MissingMtpCommit;
+    const rel_at = std.mem.indexOfPos(u8, src, blk_at, "if (gen_ptr.mtpModuleHead" ++ "Released()) break :blk null;") orelse
+        return error.MissingReleaseGuard;
+    const trim_at = std.mem.indexOfPos(u8, src, blk_at, "mc.trun" ++ "cate(committed, slot.model.transformer.?.s)") orelse
+        return error.MissingTrim;
+    try testing.expect(rel_at < trim_at);
 }
 
 test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
@@ -7035,4 +8398,365 @@ test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
     const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
     const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
     try testing.expect(boot != cold);
+}
+
+test "SSD-first behaviour is gated on ONE arch predicate at one place per mechanism" {
+    // Low-blast-radius bar. Every SSD-first mechanism must key on
+    // `HotPrefixCache.ssd_first`, and that field must be set from exactly one
+    // place, from `ModelConfig.ssdFirstCapable()` AND the env switch. If a
+    // second arming site appears, a non-qwen4_exp arch can silently take a new
+    // path.
+    // Scan the CODE, not this test's own literals.
+    const whole = @embedFile("scheduler.zig");
+    const source = whole[0 .. std.mem.indexOf(u8, whole, "test \"SSD-first behaviour is gated") orelse whole.len];
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive("),
+    );
+    // ...and the predicate takes the DISK as an argument, so the mode cannot
+    // arm without a tier to spill into (external review item 4). The
+    // assignment must also sit BELOW the attach block, or `disk != null` is
+    // read before it can be true.
+    const arm_at = std.mem.indexOf(u8, source, "prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(").?;
+    const attach_at = std.mem.indexOf(u8, source, "if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {").?;
+    try testing.expect(attach_at < arm_at);
+    try testing.expect(std.mem.indexOf(u8, source[arm_at..@min(source.len, arm_at + 200)], "prefix_cache.?.disk != null") != null);
+
+    // Mechanism 3 is wired only behind `writeThroughArmed`, which itself
+    // demands ssd_first + a live background writer.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, ".write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))"));
+    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot, new_span: usize) bool {") orelse
+        return error.MissingWriteThroughGate;
+    const ge = std.mem.indexOfPos(u8, source, gs, "\n}\n") orelse return error.MissingWriteThroughGateEnd;
+    const gate = source[gs..ge];
+    try testing.expect(std.mem.indexOf(u8, gate, "if (!hc.ssd_first) return false;") != null);
+    try testing.expect(std.mem.indexOf(u8, gate, "d.writer != null") != null);
+    // The callback re-checks both (it outlives the arming decision).
+    const cs = std.mem.indexOf(u8, source, "fn prefillWriteThroughCb(") orelse return error.MissingWriteThroughCb;
+    const ce = std.mem.indexOfPos(u8, source, cs, "\n}\n") orelse return error.MissingWriteThroughCbEnd;
+    const cb = source[cs..ce];
+    try testing.expect(std.mem.indexOf(u8, cb, "if (!hc.ssd_first) return;") != null);
+    try testing.expect(std.mem.indexOf(u8, cb, "if (d.writer == null) return;") != null);
+}
+
+test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
+    // The measured defect: on a warm turn the whole restored prefix was
+    // re-serialised INSIDE the prefill chunk loop, before the first token, for
+    // a 31-token new span. Below one chunk the write-through protects nothing
+    // a cancel could lose, so the span condition declines and the
+    // end-of-request commit (which runs AFTER the response text) owns the tail.
+    const chunk: u32 = 1024;
+    // Warm turn: a restored 32k prefix plus a 31-token instruction tail.
+    try testing.expect(!writeThroughSpanReached(31, chunk));
+    try testing.expect(!writeThroughSpanReached(0, chunk));
+    // The boundary is inclusive: one whole chunk of new tokens is progress.
+    try testing.expect(!writeThroughSpanReached(1023, chunk));
+    try testing.expect(writeThroughSpanReached(1024, chunk));
+    // A real cold/extending prefill still arms, exactly as before.
+    try testing.expect(writeThroughSpanReached(4096, chunk));
+    try testing.expect(writeThroughSpanReached(65_665, chunk));
+    // The bar is the TIER's chunk width, not a literal: a wider tier declines
+    // a span that a narrower one arms.
+    try testing.expect(writeThroughSpanReached(4096, 4096));
+    try testing.expect(!writeThroughSpanReached(4095, 4096));
+}
+
+test "the write-through span gate is the tier's chunk width, wired from this turn's un-cached span" {
+    // Scan pin: the condition is worthless if the arming site passes the WHOLE
+    // prompt (every warm turn would arm again) or if the gate compares against
+    // a hardcoded width instead of the tier's own `chunk_tokens`.
+    // Needles split so this test never matches its own literals.
+    const whole = @embedFile("scheduler.zig");
+    // Cut at the FIRST test in the file: every needle below also appears as a
+    // literal in the sibling SSD-first scan test.
+    const source = whole[0 .. std.mem.indexOf(u8, whole, "test \"SSD-first behaviour is gated") orelse whole.len];
+    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot, new_span: usize) bool {") orelse
+        return error.MissingWriteThroughGate;
+    const ge = std.mem.indexOfPos(u8, source, gs, "\n}\n") orelse return error.MissingWriteThroughGateEnd;
+    const gate = source[gs..ge];
+    try testing.expect(std.mem.indexOf(u8, gate, "writeThroughSpanReached(new_span, d.chunk" ++ "_tokens)") != null);
+    // `prefill_tokens` is the un-cached tail (`full_prompt[hot_matched..]`) —
+    // the restored prefix must NOT be counted as new span.
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "prefill_" ++ "tokens = slot.full_prompt[hot_matched..];"),
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, ".write_through_hook = if (writeThroughArmed(slot, prefill_" ++ "tokens.len))"),
+    );
+    // Declining is announced once, not per request.
+    try testing.expect(std.mem.indexOf(u8, gate, "write_through_span_declined_logged.swap(true, .monotonic)") != null);
+}
+
+test "the digest snapshot is freed AFTER the inference thread is joined" {
+    // Audit B0. `publishHotCacheDigests` frees the superseded slice on the
+    // inference thread after every finished request, and connection threads
+    // read the live one under `digest_mu`. Freeing it in `deinit` ABOVE the
+    // join raced both — two frees of one pointer, or a reader holding a slice
+    // deinit had already released. Order is the fix, so order is the test.
+    // Needles split: this scan must not match its own literals.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Scheduler) void {") orelse
+        return error.MissingSchedulerDeinit;
+    const body = source[start..];
+    const join = std.mem.indexOf(u8, body, "if (self.inference_" ++ "thread) |t| t.join();") orelse
+        return error.MissingJoin;
+    const free_at = std.mem.indexOf(u8, body, "self.allocator.free(self.hot_cache" ++ "_digests);") orelse
+        return error.MissingDigestFree;
+    try testing.expect(free_at > join);
+    // And it is the ONLY free of that field in deinit — a second one above the
+    // join would satisfy nothing above but reintroduce the race.
+    const rest = body[free_at + 1 ..];
+    try testing.expect(std.mem.indexOf(u8, rest, "self.allocator.free(self.hot_cache" ++ "_digests);") == null);
+}
+
+test "postEvictionPrefillChunk: the re-asked width is the one that runs, in BOTH directions" {
+    // Audit N5. `chooseRequestPrefillChunk` prices the ladder against what is
+    // FREE, and until this the free memory it saw was the memory before the
+    // hot cache gave anything back: a 383k prompt was admitted at the ladder
+    // floor, the eviction pass then returned gigabytes, and the prefill ran at
+    // the floor for its whole length.
+
+    // 1. Admitted at 1024, affords 4096 once the pass has returned memory —
+    //    the request runs at 4096, and the call site logs the widen.
+    {
+        const d = postEvictionPrefillChunk(1024, 4096);
+        try testing.expectEqual(@as(u32, 4096), d.width);
+        try testing.expect(d.widened);
+        try testing.expect(!d.moved);
+    }
+    try testing.expectEqual(@as(u32, 8192), postEvictionPrefillChunk(512, 8192).width);
+
+    // 2. No eviction pass ran (`admitted == 0`, which is also the unpinned
+    //    `pinned_prefill_chunk`): nothing was returned, so there is no second
+    //    reading to compare against and the re-ask is simply the only ask.
+    //    Neither direction is reportable.
+    {
+        const d = postEvictionPrefillChunk(0, 1024);
+        try testing.expectEqual(@as(u32, 1024), d.width);
+        try testing.expect(!d.widened);
+        try testing.expect(!d.moved);
+    }
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(0, 512).width);
+    try testing.expectEqual(@as(u32, 0), postEvictionPrefillChunk(0, 0).width);
+
+    // 3. THE BAR (external review of PR #363): a NARROWER re-ask still wins.
+    //    It shipped as `@max(admitted, reasked)`, sold as an assertion of "an
+    //    eviction only ever returns memory". A max is not an assertion: where
+    //    the invariant holds it is a no-op, and the only case where it does
+    //    anything is the case where the invariant BROKE — memory moved between
+    //    the two reads — where it picks the WIDER of two widths, the one that
+    //    is known to be stale. The re-ask was taken after the pass against
+    //    live memory by the estimator that admits the request; it is what the
+    //    machine affords right now. Widening past that is the uncatchable
+    //    Metal OOM; narrowing only costs throughput. Reverting to `@max` turns
+    //    these two red.
+    {
+        const d = postEvictionPrefillChunk(4096, 1024);
+        try testing.expectEqual(@as(u32, 1024), d.width);
+        try testing.expect(d.moved);
+        try testing.expect(!d.widened);
+    }
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(2048, 512).width);
+
+    // 4. Unchanged memory is a no-op in both directions — the gate-off arm
+    //    (`requestPrefillChunkNow` hands back the load-time pin for every
+    //    non-per-request arch and under an explicit `--prefill-chunk`) reaches
+    //    this with the SAME number twice and must be byte-identical, with
+    //    nothing to log.
+    inline for (.{ 512, 1024, 2048, 4096, 8192 }) |w| {
+        const d = postEvictionPrefillChunk(w, w);
+        try testing.expectEqual(@as(u32, w), d.width);
+        try testing.expect(!d.widened and !d.moved);
+    }
+
+    // 5. NEVER BELOW THE LADDER FLOOR — a property of the CHOOSER, kept by
+    //    this function refusing to compute a width of its own. Whatever the
+    //    ladder's floor rung produces is what comes back out, unmodified; the
+    //    floor itself is pinned in server.zig ("chooseRequestPrefillChunk:
+    //    WIDEST that fits, at the boundary"), which is the only place that
+    //    knows the ladder.
+    inline for (.{ 512, 1024, 2048, 4096, 8192 }) |floor| {
+        try testing.expectEqual(@as(u32, floor), postEvictionPrefillChunk(8192, floor).width);
+    }
+}
+
+test "the per-request width is asked TWICE around the eviction pass, and the pass's live delta is what pays for it" {
+    // The order is the fix: capture the admitted width BEFORE `evictLruToAdmit`,
+    // re-ask AFTER it, and RUN the re-ask. A re-ask that runs before the pass —
+    // or a decision fed a projection instead of the live delta — is the bug
+    // back. Needles ++-split so this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+
+    const capture = "admitted_prefill_chunk = pick_pre(cfg, slot.full_" ++ "prompt.len";
+    const evict = "hc.evictLruToAdmit(slot.full_" ++ "prompt.len, &probe, Probe.call, true)";
+    const returned = "evicted_live_bytes = report" ++ ".bytes;";
+    const clamp = "postEvictionPrefillChunk(admitted_prefill_chunk, " ++ "reasked)";
+
+    const i_capture = std.mem.indexOf(u8, src, capture) orelse return error.CallSiteMoved;
+    const i_evict = std.mem.indexOf(u8, src, evict) orelse return error.CallSiteMoved;
+    const i_returned = std.mem.indexOf(u8, src, returned) orelse return error.CallSiteMoved;
+    const i_clamp = std.mem.indexOf(u8, src, clamp) orelse return error.CallSiteMoved;
+
+    // capture -> evict -> record what came back -> re-ask and decide.
+    try testing.expect(i_capture < i_evict);
+    try testing.expect(i_evict < i_returned);
+    try testing.expect(i_returned < i_clamp);
+
+    // The credit is the ALLOCATOR's delta. `accounted_bytes` is what the cache
+    // was billed for and a shared snapshot returns none of it; `reclaimable`
+    // is a projection. Neither may reach the width.
+    try testing.expect(std.mem.indexOf(u8, src, "evicted_live_bytes = report" ++ ".accounted_bytes") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "evicted_live_bytes = report" ++ ".reclaimable") == null);
+
+    // ONE definition of the decision — a second one is a second rule.
+    var defs: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "pub fn postEviction" ++ "PrefillChunk(")) defs += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), defs);
+
+    // And it decides by taking the RE-ASK, never a max over the pair: the max
+    // is a no-op wherever the eviction invariant holds and picks the stale
+    // width wherever it broke (external review of PR #363). Reintroducing it
+    // turns this red without touching the behaviour tests.
+    const decide_at = std.mem.indexOf(u8, src, "pub fn postEviction" ++ "PrefillChunk(") orelse
+        return error.CallSiteMoved;
+    const decide_end = std.mem.indexOfPos(u8, src, decide_at, "\n}\n") orelse return error.CallSiteMoved;
+    const body = src[decide_at..decide_end];
+    try testing.expect(std.mem.indexOf(u8, body, "@max(") == null);
+    try testing.expect(std.mem.indexOf(u8, body, ".width = re" ++ "asked,") != null);
+}
+
+test "the re-asked width reaches the request's chunk AND is never capped by the adapter" {
+    // The fix is only worth what it REACHES. Two consumers, two different
+    // rules, and a fold that wires one and not the other ships a width nobody
+    // runs:
+    //
+    //   1. The request's own chunk: `req_prefill_chunk` ->
+    //      `InitOptions.pinned_prefill_chunk` -> `effectivePrefillChunk` ->
+    //      `PREFILL_CHUNK` -> `default_chunk` -> `cur_chunk`, the width the
+    //      FIRST chunk forwards at.
+    //   2. The per-CHUNK adapter's ceiling, `cap_adapt`. It is built from the
+    //      arch resolver with the pin left OUT (a literal `0` rung) precisely
+    //      so widening past the request's width is possible — which also means
+    //      it is >= any ladder width the chooser can return, so a re-ask can
+    //      never be clipped by it. If a fold ever makes `cap_adapt` read the
+    //      pin, the widened width becomes its own ceiling and the adapter can
+    //      only narrow. Needles ++-split so this scan cannot satisfy itself.
+    const sched = @embedFile("scheduler.zig");
+    const gen = @embedFile("generate.zig");
+
+    // 1. The scheduler's width is what init is given.
+    try testing.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill" ++ "_chunk,") != null);
+    // ...and it is the width the post-eviction decision returned, never a
+    // number the call site recomputed beside it.
+    try testing.expect(std.mem.indexOf(u8, sched, "break :blk decision" ++ ".width;") != null);
+    // ...which the prefill loop resolves into the width it forwards.
+    try testing.expect(std.mem.indexOf(u8, gen, "options.pinned_prefill" ++ "_chunk,") != null);
+    try testing.expect(std.mem.indexOf(u8, gen, "const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL" ++ "_CHUNK;") != null);
+
+    // 2. The adapter's cap excludes the pin. Assert the shape of the call, not
+    //    just the name: the rung argument is the literal 0 on the line before
+    //    the closing paren.
+    const cap = std.mem.indexOf(u8, gen, "const cap" ++ "_adapt: u32 =") orelse return error.CallSiteMoved;
+    const cap_call = gen[cap..@min(cap + 400, gen.len)];
+    try testing.expect(std.mem.indexOf(u8, cap_call, "effectivePrefill" ++ "Chunk(") != null);
+    try testing.expect(std.mem.indexOf(u8, cap_call, "\n                0,\n            ));") != null);
+    try testing.expect(std.mem.indexOf(u8, cap_call, "pinned_prefill" ++ "_chunk") == null);
+    try testing.expect(std.mem.indexOf(u8, cap_call, "PREFILL" ++ "_CHUNK") == null);
+}
+
+test "hot-cache commit hands the live QSA history to the newest checkpoint BEFORE the commit, after the take" {
+    // The one copy per (slot ∪ entry) contract: the checkpoint list is taken
+    // from the generator, the newest snap takes a VIEW of the slot's live
+    // history, and only then does the cache see the list. A handoff after
+    // the commit would hand the view to a list the cache already owns; one
+    // before the take would run on a list the generator still holds.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
+    const body = source[start..end];
+    const take = std.mem.indexOf(u8, body, "gen_ptr.takeSsmCheckpoints()") orelse return error.MissingTake;
+    const handoff = std.mem.indexOf(u8, body, "transformer_mod.handoffQsaHistory" ++ "ToLatest(cps, ents, xf.s)") orelse return error.MissingHandoff;
+    const commit = std.mem.indexOf(u8, body, "hc.commitWithMediaState(") orelse return error.MissingCommit;
+    try testing.expect(take < handoff and handoff < commit);
+    // Gated on the switch AND idempotent: a snap that already carries history
+    // (the switch off, the prefill attached) is left alone.
+    const gate = std.mem.indexOf(u8, body, "transformer_mod.qsaHistoryShare" ++ "Enabled() and !transformer_mod.checkpointHasQsaHistory(&cps[cps.len - 1])") orelse return error.MissingGate;
+    try testing.expect(gate < handoff);
+    // The failure arm commits without the history rather than aborting the
+    // commit (a QSA arch treats "no history" as a miss).
+    try testing.expect(std.mem.indexOf(u8, body, "QSA history handoff failed") != null);
+}
+
+
+test "every round-cost layout assignment routes through the ONE resolver" {
+    // audit addendum 3 (non-blocker). Two sites own a Transformer at load: the
+    // inference thread's loader here, and `main.zig`'s offline `--prompt`
+    // path. The first spelled the arch conditional inline; the second never
+    // resolved a layout at all and kept the struct default, so the same
+    // qwen4_exp checkpoint planned MTP on the nine-bucket grid under `serve`
+    // and on the six-bucket legacy one offline — different bucket EDGES and no
+    // serial row, from the same weights.
+    //
+    // Scanned in the PRODUCTION WINDOW of each site (`productionDeclSource`),
+    // never the whole file: a test in either file may legitimately build a
+    // table at a chosen layout. Needles ++-split so this test's own source
+    // cannot satisfy them.
+    const Site = struct { src: []const u8, decl: []const u8 };
+    const sites = [_]Site{
+        .{ .src = @embedFile("scheduler.zig"), .decl = "fn doLoadOnInferenceThread(" },
+        .{ .src = @embedFile("main.zig"), .decl = "pub fn main(" },
+    };
+    for (sites) |site| {
+        const window = generate_mod.productionDeclSource(site.src, site.decl) orelse
+            return error.LoadSiteMoved;
+        try testing.expect(generate_mod.windowHasNoTestBlock(window));
+        // The window assigns a layout, and the value is the resolver's.
+        const assign = std.mem.indexOf(u8, window, "round_cost" ++ "_mod.layoutFor(") orelse
+            return error.LoadSiteBypassesTheResolver;
+        _ = assign;
+        // ...and nothing in it spells a Layout tag by hand, which is how the
+        // two paths came to disagree.
+        try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .long") == null);
+        try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .legacy") == null);
+        try testing.expect(std.mem.indexOf(u8, window, "Layout = if (") == null);
+    }
+}
+
+test "the batched group's SORT is gated with its kv-length rule" {
+    // Completeness-sweep item 4. The stable insertion sort is part of the
+    // pad-waste change, not a neutral rewrite: a93e2c0 ordered the group with
+    // `std.sort.pdq`, which is UNSTABLE, so on equal keys the two sorts hand
+    // `batchedKvKeepCount` different slots in the tail — and the tail falls to
+    // SERIAL decode, i.e. a different kernel for that slot.
+    //
+    // Off qwen4_exp every key is `cache.step`, which is 0 forever on a hybrid
+    // trunk, so EVERY key ties and the choice of sort decides the whole
+    // ordering. That is the loudest possible version of the difference, on
+    // exactly the archs nobody measured.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+
+    // ONE predicate for both halves — the rule and the sort that orders by it.
+    try testing.expect(std.mem.indexOf(u8, body, "const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtx" ++ "Gated() else false;") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {") != null);
+
+    // The ungated arm is a93e2c0's call verbatim, keyed on `cache.step`, with
+    // the lengths derived AFTER the sort (a93e2c0's order of operations).
+    const legacy_at = std.mem.indexOf(u8, body, "std.sort.pdq(*Slot, group, {}, struct {") orelse return error.MissingLegacySort;
+    const legacy = body[legacy_at..@min(body.len, legacy_at + 320)];
+    try testing.expect(std.mem.indexOf(u8, legacy, "return a.cache.step < b.cache.step;") != null);
+    try testing.expect(std.mem.indexOf(u8, legacy, "kv_lens[i] = @intCast(g.cache.step);") != null);
+
+    // ...and the gated arm keys on the accessor, never on `step`.
+    const gated_at = std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {").?;
+    try testing.expect(gated_at < legacy_at);
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..legacy_at], "kv_lens[i] = g.batchKvLen();") != null);
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..legacy_at], "cache.step") == null);
 }
