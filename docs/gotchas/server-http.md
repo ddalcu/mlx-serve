@@ -3931,9 +3931,29 @@ and are gated; two are log-only and are recorded as such.
 |---|---|---|---|
 | 12 | `pinPrefillChunk` → `billedPrefillChunk` override precedence, and `chooseRequestPrefillChunk`'s short-circuit | a93e2c0 pinned the machine RUNG and let `generate.effectivePrefillChunk` apply an explicit `--prefill-chunk` / `MLX_SERVE_PREFILL_CHUNK` at forward time. The PR moved that precedence into the PIN — the audit-S8 fix — and the pin is read by the admission bill, by the ungated `clampedPrefixCacheMem` reserve and by `computeMemoryContext`'s **advertised** context, so three numbers moved at once on every arch that sets the flag | `pin_override` is `explicitPrefillChunk()` only when gated, else 0; the chooser asks the arch BEFORE the override |
 | 13 | `pinPrefillChunk` reading `resolvedPrefixCacheMem()` | in a multi-model registry the second model to load pinned its width against the first model's CLAMPED budget — an input a93e2c0 never fed it. Single-model boot is identical, which is why it went unnoticed | ungated reads `legacyPrefixCacheAsk()`, the raw `--prefix-cache-mem` |
-| 14 | the memory-refusal 400 body | gate 4 zeroes both credits off the gate, and the message formats them: every non-qwen4 refusal read "the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere)" on a box with a multi-GB resident cache. Client-visible, and false | `memoryRefusalMessage` — one formatter, two arms, discriminated on `bill.evictable`; the zero arm is a93e2c0's exact sentence, pinned byte for byte |
+| 14 | the memory-refusal 400 body | gate 4 zeroes both credits off the gate, and the message formats them: every non-qwen4 refusal read "the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere)" on a box with a multi-GB resident cache. Client-visible, and false | `memoryRefusalMessage` — one formatter, two arms, discriminated on the ARCH GATE (`config.longCtxGated()`, passed in); the ungated arm is a93e2c0's exact sentence, pinned byte for byte, and the gated arm keeps qwen4's bytes verbatim |
 | 15 | `scheduler`'s batched-group sort | the stable insertion sort replaced `std.sort.pdq`, which is UNSTABLE. On equal keys the two hand `batchedKvKeepCount` different slots in the tail, and the tail falls to SERIAL decode — a different kernel. Off qwen4 every key is `cache.step`, 0 forever on a hybrid, so EVERY key ties and the sort decides the whole ordering | `gate_batch_kv_len`, the same predicate as the kv-length rule, read once per group so a group cannot be ordered by one key and capped by the other |
 | 16 | `round_cost.BUCKET_NAMES[5]` | the legacy grid's top bucket is unbounded `32k+`; the array spells the long grid's `32-64k`. Every `[spec-stats]` / `[mtp-trace]` / adaptive-switch line on a sidecar-MTP pack labelled a 374k request "32-64k" — the number right, the label a lie | `bucketName(layout, b)`; labels only, no cell/edge/plan moves |
+
+**Row 14 was nearly keyed on the wrong thing.** The first shape discriminated
+on `bill.evictable == 0` — "name the cache only when there is a cache", which
+reads better on the merits and is wrong here twice over:
+
+* it CHANGES qwen4's bytes. That arch reaches the refusal arm with an empty hot
+  cache (a large first request, before anything is resident), where it used to
+  render the long sentence with two zeroes; a byte-count discriminator would
+  have silently switched it to a93e2c0's short one. This round's mandate is
+  zero qwen4-path changes, so the gate decides and qwen4 keeps the zeroes.
+* it splits on ONE credit while the guard's arms read BOTH. `evictable == 0`
+  with `reclaimable > 0` is not a state the cache produces (`reclaimable` is
+  residency minus the largest entry, so it is bounded by `evictable`), but
+  nothing in the formatter said so, and `pinnedResidentBytes` couples the two.
+  A message keyed on half of a coupled pair is a latent disagreement with the
+  arm that refused. The gate keys on neither and cannot drift from either.
+
+The merits question — whether a GATED bill on an empty cache should name the
+cache at all — is real and deferred, to a change that can be measured on its
+own rather than folded into an arch gate.
 
 **Known limit of the ungated arm of row 12,** inherited from a93e2c0 and stated
 rather than silently fixed: with `--prefill-chunk` set, a non-qwen4 boot bills
