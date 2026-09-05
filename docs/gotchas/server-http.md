@@ -1670,13 +1670,12 @@ noThinkTailSuffix machinery). `/v1/chat/completions` and `/v1/responses`
 built the same mask with no gate — issue #331 re-found the identical symptom
 via `reasoning_effort` + `response_format`.
 
-Fix: one predicate (`server.schemaMasksThinking`) consulted at all three
-mask-building sites. Tools present = no mask on every surface (tool calls
-must stay reachable), so thinking stays whatever the request resolved.
-"Real reasoning then schema-valid JSON" would need a mask that arms only
-after the think block closes — not built; schema stays a content-only
-contract.
+Fix: defer only for a bare template-opened `<think>`, an atomic `</think>`, and
+no finite response-side reasoning budget. Loop-stop, EOS, and terminal padding
+can force the close through live model state when constrained output still fits.
+All other schema requests keep the thinking-off, token-zero fallback. Tools
+still skip grammar; constraints still skip speculation; ordinary `max_tokens`
+exhaustion is unchanged.
 
-Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
-+ mask-engagement count) and the server.zig source scan pairing every
-`[grammar] enforcing` site with a gate call.
+Guards: `tests/test_json_schema_thinking.sh` and the policy/phase tests in
+`server.zig` and `generate.zig`.

@@ -2202,6 +2202,14 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
     return endsWithThinkOpenTag(trimmed) != null;
 }
 
+/// Narrow form used by generation-side phase switches. A suffixed reasoning
+/// family (for example Hy3's `<think:opensource>`) has a different close token
+/// and must not be armed against Qwen's bare `</think>` boundary.
+pub fn promptTailOpensBareThink(tail: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    return std.mem.endsWith(u8, trimmed, "<think>");
+}
+
 /// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
 /// Thinking-off on an always-thinking template otherwise means generating the
 /// whole reasoning pass and discarding it — the prompt-side commit is what
@@ -11863,6 +11871,8 @@ test "hy3 think: dangling re-opened suffixed opener never leaks" {
 test "hy3 think: promptTailOpensThink recognizes the suffixed opener, not a closed no_think tail" {
     try testing.expect(promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
     try testing.expect(!promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource></think:opensource>"));
+    try testing.expect(!promptTailOpensBareThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
+    try testing.expect(promptTailOpensBareThink("assistant\n<think>\n"));
 }
 
 test "hy3 think: streamThinkGate splits on suffixed close and holds on a partial suffixed re-open" {

@@ -5737,7 +5737,24 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // with no repeat penalty by default and a generous max_tokens, nothing else
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
-    if (loopStopDecision(gen.generated_ids.items)) |stop| {
+    const loop_guard_start = gen.loopGuardStart();
+    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+        if (gen.canForceDeferredConstraintBoundary()) {
+            const boundary = try gen.forceDeferredConstraintBoundary(slot.allocator) orelse {
+                // The hard completion cap won the race with recovery. Preserve
+                // ordinary truncation rather than treating this as an error.
+                finishSlot(sch, slot, "length");
+                return;
+            };
+            slot.pushToken(boundary);
+            slot.completion_tokens += 1;
+            std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+            if (boundary != 0) slot.was_pad_only = false;
+            log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
+            return;
+        }
+        var stop = relative_stop;
+        stop.trim_start += loop_guard_start;
         // Never cut silently: the 2026-07-14 php.html post-mortem took log
         // archaeology because this guard left no trace of having fired. The
         // tier and the trim point are logged too — five cuts in a row is a
@@ -6768,6 +6785,21 @@ test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it"
     try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
     // Trimmed to the honest prefix plus one copy of the cycle.
     try testing.expectEqual(@as(usize, 6), stop.trim_start);
+
+    // Once a deferred boundary has been committed, the old reasoning loop is
+    // outside the guard window and cannot stop the very next answer tick.
+    try ids.append(testing.allocator, 99);
+    const answer_start = ids.items.len;
+    try testing.expect(loopStopDecision(ids.items[answer_start..]) == null);
+
+    // A new loop wholly inside the constrained answer retains the existing
+    // length/repetition result, with an absolute trim point for response code.
+    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+        try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
+    }
+    const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("length", answer_loop.finish_reason);
+    try testing.expect(answer_loop.trim_start + answer_start >= answer_start);
 
     // Healthy output decides nothing at all — no reason, and nothing to trim.
     var healthy: [512]u32 = undefined;
