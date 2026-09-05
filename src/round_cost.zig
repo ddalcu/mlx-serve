@@ -40,6 +40,24 @@ pub const BUCKET_NAMES = [N_BUCKETS][]const u8{
     "32-64k",  "64-128k", "128-256k", "256k+",
 };
 
+/// The label for bucket `b` UNDER `layout`. A name is a claim about the cell's
+/// EDGES, and the two grids disagree about exactly one cell: on `.long` bucket
+/// 5 is 32k-64k, on `.legacy` it is the unbounded top bucket `32k+`
+/// (`nBuckets(.legacy) == 6`). `BUCKET_NAMES` alone spells the long grid, so
+/// every `[spec-stats]`, `[mtp-trace]` and adaptive-switch line on a
+/// sidecar-MTP pack (qwen3.5/3.6/3.8 — every arch but qwen4_exp) reported a
+/// 374k request as sitting in "32-64k". The number is right and the label is a
+/// lie, which is worse than no label: it is the string an operator reads when
+/// deciding whether a bucket crossing should have re-planned.
+///
+/// Names only — no cell, edge or plan moves. `bucketFor` already stops at the
+/// legacy top bucket.
+pub fn bucketName(layout: Layout, b: usize) []const u8 {
+    const n = nBuckets(layout);
+    if (b + 1 == n and n < N_BUCKETS) return "32k+";
+    return BUCKET_NAMES[b];
+}
+
 /// Which bucket grid a table speaks. The split above, the serial row and the
 /// adaptive switch that reads it were all MEASURED on qwen4_exp; every other
 /// arch keeps the six-bucket grid every release through 26.9.1 wrote, so a
@@ -1367,4 +1385,47 @@ test "layoutFor is THE round-cost layout resolver" {
     // resolver matters: two answers = two files, and the second one reads none
     // of the first one's measurements.
     try testing.expect(storeVersion(layoutFor(&long)) != storeVersion(layoutFor(&legacy)));
+}
+
+test "bucketName: the legacy grid's top bucket is 32k+, not 32-64k" {
+    // The legacy layout has SIX buckets and its last one is unbounded; the long
+    // grid splits that span at 64k/128k/256k. `BUCKET_NAMES` alone spells the
+    // long grid, so every `[spec-stats]`, `[mtp-trace]` and adaptive-switch
+    // line on a sidecar-MTP pack (qwen3.5/3.6/3.8 — every arch but qwen4_exp)
+    // labelled a 374k request "32-64k". The number was right and the label was
+    // a lie, which is worse than no label: it is the string an operator reads
+    // when deciding whether a bucket crossing should have re-planned.
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 6), nBuckets(.legacy));
+    try t.expectEqual(@as(usize, 9), nBuckets(.long));
+
+    // The shared edges are shared, so the names agree on 0..4.
+    var b: usize = 0;
+    while (b + 1 < nBuckets(.legacy)) : (b += 1) {
+        try t.expectEqualStrings(BUCKET_NAMES[b], bucketName(.legacy, b));
+        try t.expectEqualStrings(BUCKET_NAMES[b], bucketName(.long, b));
+    }
+    // ...and disagree on exactly one cell: the legacy top bucket.
+    try t.expectEqualStrings("32k+", bucketName(.legacy, 5));
+    try t.expectEqualStrings("32-64k", bucketName(.long, 5));
+
+    // The long grid's own top bucket keeps its name — the rule is "the last
+    // bucket of a SHORTER grid is unbounded", not "index 5 is special".
+    try t.expectEqualStrings("256k+", bucketName(.long, 8));
+
+    // And the label matches where `bucketFor` actually puts a long request on
+    // each grid: on legacy everything past 32k lands in bucket 5.
+    try t.expectEqual(@as(usize, 5), bucketForLayout(374_000, .legacy));
+    try t.expectEqualStrings("32k+", bucketName(.legacy, bucketForLayout(374_000, .legacy)));
+}
+
+test "bucketName: every label site asks the TABLE's layout, never the bare array" {
+    // Class pin. A label is a claim about the cell's EDGES, so a site that
+    // indexes `BUCKET_NAMES` directly is right on qwen4_exp and wrong on every
+    // other arch — and it reads as correct in review, which is why this is a
+    // scan and not a comment.
+    const t = std.testing;
+    const gen = @embedFile("generate.zig");
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, gen, "round_cost.BUCKET_" ++ "NAMES["));
+    try t.expect(std.mem.count(u8, gen, "round_cost.bucket" ++ "Name(self.xfm.round_cost.layout, ") >= 7);
 }

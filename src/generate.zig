@@ -1665,7 +1665,7 @@ pub const Generator = struct {
                     self.mtp_regime.verdict_round,
                     self.mtp_regime.trials,
                     self.mtp_width_trial.trials,
-                    round_cost.BUCKET_NAMES[table_bucket],
+                    round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
@@ -1699,7 +1699,7 @@ pub const Generator = struct {
                     per_draft_pct,
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
                     if (self.spec_disabled_runtime) "true" else "false",
-                    round_cost.BUCKET_NAMES[table_bucket],
+                    round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
@@ -4526,7 +4526,7 @@ pub const Generator = struct {
                         log.info("[dflash] width chooser: standing w{d} ({s}) from {s} {s} (ms/tok)\n", .{
                             ch.current,
                             if (ch.current == 0) "serial" else "block",
-                            round_cost.BUCKET_NAMES[b],
+                            round_cost.bucketName(self.xfm.round_cost.layout, b),
                             self.xfm.round_cost.formatBucket(b, &buf),
                         });
                     }
@@ -5893,7 +5893,7 @@ pub const Generator = struct {
             if (may_reenter) {
                 log.info(
                     "  [mtp] adaptive: kv {d} crossed into bucket {s} -> mtp\n",
-                    .{ self.mtpKvLen(), round_cost.BUCKET_NAMES[b] },
+                    .{ self.mtpKvLen(), round_cost.bucketName(self.xfm.round_cost.layout, b) },
                 );
                 self.spec_disabled_runtime = false;
                 self.spec_disable_reason = .none;
@@ -8757,7 +8757,7 @@ pub const Generator = struct {
                 // stands and the LOG is honest about when the switch bites.
                 log.info(
                     "  [mtp] adaptive: bucket {s} mtp table {d:.2} / window {d:.2} ms/tok (w{d}) vs serial {d:.2} ms/tok -> serial (from the next round)\n",
-                    .{ round_cost.BUCKET_NAMES[b], table_ms_tok.?, window_ms_tok.?, m_lo, serial_ms.? },
+                    .{ round_cost.bucketName(self.xfm.round_cost.layout, b), table_ms_tok.?, window_ms_tok.?, m_lo, serial_ms.? },
                 );
                 self.spec_disabled_runtime = true;
                 self.spec_disable_reason = .adaptive;
@@ -8774,7 +8774,7 @@ pub const Generator = struct {
                 self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
                 log.info(
                     "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
-                    .{ round_cost.BUCKET_NAMES[own], MTP_ADAPTIVE_PROBE_TOKENS },
+                    .{ round_cost.bucketName(self.xfm.round_cost.layout, own), MTP_ADAPTIVE_PROBE_TOKENS },
                 );
                 return true;
             }
@@ -8805,7 +8805,7 @@ pub const Generator = struct {
             self.xfm.round_cost.first_use_logged = true;
             var buf: [256]u8 = undefined;
             log.info("[mtp] cost table: bucket {s} measured {s} (ms/tok) replaces the fitted surface (scale {d:.4} at w{d})\n", .{
-                round_cost.BUCKET_NAMES[src.bucket],
+                round_cost.bucketName(self.xfm.round_cost.layout, src.bucket),
                 self.xfm.round_cost.formatBucket(src.bucket, &buf),
                 src.scale,
                 self.xfm.round_cost.narrowestMeasured(src.bucket) orelse 0,
