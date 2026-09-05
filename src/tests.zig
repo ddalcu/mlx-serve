@@ -35,10 +35,14 @@ test {
     _ = @import("sdxl_unet.zig");
     _ = @import("sdxl_vae.zig");
     _ = @import("sdxl_tokenizer.zig");
+    _ = @import("t5_encoder.zig");
+    _ = @import("t5_tokenizer.zig");
     _ = @import("sdxl_pipeline.zig");
     _ = @import("sdxl_single_file.zig");
     _ = @import("sd3.zig");
-    _ = @import("sd3_vae.zig"); // LANE-B-TEMP
+    _ = @import("sd3_vae.zig");
+    _ = @import("sd3_mmdit.zig");
+    _ = @import("sd3_pipeline.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");
