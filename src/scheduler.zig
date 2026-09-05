@@ -7627,7 +7627,13 @@ test "the batched group takes its kv length from the ONE accessor, never cache.s
     const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "batchKvLen()") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "cache.step") == null);
+    // `cache.step` IS present now — deliberately, as the ungated arm's key
+    // (a93e2c0's). The rule it stands for is unchanged and is now per-arm: the
+    // GATED arm must never read it. Bound the window at the `else`, so a
+    // `cache.step` creeping back into the gated half is still caught.
+    const gated_at = std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {") orelse return error.MissingGate;
+    const else_at = std.mem.indexOfPos(u8, body, gated_at, "\n            } else {") orelse return error.MissingLegacyArm;
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..else_at], "cache.step") == null);
     // The cap's log names the number it compared, not just its outcome.
     try testing.expect(std.mem.indexOf(u8, body, "pad-waste cap: kept") != null);
     try testing.expect(std.mem.indexOf(u8, body, "batchedPadWaste(") != null);

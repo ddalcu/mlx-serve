@@ -5772,17 +5772,27 @@ const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it
 /// (`git show a93e2c0:src/server.zig:3261`), which named no cache at all —
 /// the honest message where the cache is genuinely not part of the decision.
 ///
-/// The discriminator is `bill.evictable`, not the arch: a GATED bill on an
-/// empty cache also carries no cache, and "the cache holds ~0MB" is no more
-/// true there. Caller owns the returned bytes.
+/// The discriminator is the ARCH GATE, not `bill.evictable`, and that is a
+/// deliberate second choice. Keying on the byte count reads better on the
+/// merits — a gated bill on an empty cache also holds nothing, and "~0MB" is
+/// no more true there — but it CHANGES the qwen4_exp message: that arch does
+/// reach this arm with an empty cache (a large first request, before anything
+/// is resident), and it used to render the long sentence with two zeroes. This
+/// round's mandate is zero qwen4-path changes, so the gated arch keeps its
+/// bytes exactly, zeroes and all, and only the ungated arm moves — to
+/// a93e2c0's sentence, which is what it had. Revisit on the merits later,
+/// separately, where it can be measured as its own change.
+///
+/// Caller owns the returned bytes.
 fn memoryRefusalMessage(
     allocator: std.mem.Allocator,
     prompt_len: usize,
     needed_mb: u64,
     avail_mb: u64,
     bill: AdmissionBill,
+    carries_cache: bool,
 ) ![]u8 {
-    if (bill.evictable == 0) {
+    if (!carries_cache) {
         return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
     }
     return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
@@ -6701,7 +6711,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // client-visible 400 stating a falsehood, on exactly the archs the
         // gate exists to leave alone. `memoryRefusalMessage` is the ONE
         // formatter, so the two arms cannot drift.
-        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
+        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.longCtxGated());
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -24255,37 +24265,53 @@ test "memoryRefusalMessage: the 400 names the hot cache only where the bill carr
     const t = std.testing;
     const MB: u64 = 1024 * 1024;
 
-    // Credits structurally zero → a93e2c0's exact sentence, byte for byte
+    // UNGATED → a93e2c0's exact sentence, byte for byte
     // (`git show a93e2c0:src/server.zig:3261`).
-    const bare = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB });
+    const bare = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, false);
     defer t.allocator.free(bare);
     try t.expectEqualStrings(
         "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB available. Reduce prompt size or use a smaller model.",
         bare,
     );
 
-    // Credits present → the message quotes what the guard compared.
+    // GATED → the message quotes what the guard compared.
     const rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
         .needed = 30 * MB,
         .available = 20 * MB,
         .evictable = 1500 * MB,
         .reclaimable = 900 * MB,
-    });
+    }, true);
     defer t.allocator.free(rich);
     try t.expect(std.mem.indexOf(u8, rich, "holds ~1500MB more") != null);
     try t.expect(std.mem.indexOf(u8, rich, "(~900MB") != null);
 
-    // The discriminator is the BILL, not the arch: a gated bill on an empty
-    // cache also gets the honest sentence.
-    const empty = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB, .reclaimable = 0 });
-    defer t.allocator.free(empty);
-    try t.expectEqualStrings(bare, empty);
+    // THE qwen4 BYTE CHECK. The gated arch reaches this arm with an EMPTY hot
+    // cache — a large first request, before anything is resident — and it used
+    // to render the long sentence with two zeroes. Keying the discriminator on
+    // `bill.evictable` would have read better on the merits and silently
+    // changed those bytes, so the gate decides and qwen4 keeps them.
+    const q4_cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, true);
+    defer t.allocator.free(q4_cold);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
+        q4_cold,
+    );
+    // ...and the ungated arm never renders that sentence, at any bill.
+    const ungated_rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, false);
+    defer t.allocator.free(ungated_rich);
+    try t.expectEqualStrings(bare, ungated_rich);
 
     // ONE formatter: the refusal site does not spell either sentence itself.
     const src = @embedFile("server.zig");
     const at = std.mem.indexOf(u8, src, "const msg = try memoryRefusal" ++ "Message(") orelse return error.CallSiteMoved;
-    _ = at;
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "but only ~{d}MB is available and the hot prefix cache"));
+    // The call site asks the ONE predicate, never re-derives the condition.
+    try t.expect(std.mem.indexOf(u8, src[at..@min(src.len, at + 160)], "config.longCtx" ++ "Gated())") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "but only ~{d}MB is available and the hot " ++ "prefix cache"));
 }
 
 test "pinPrefillChunk: the explicit width and the hot-cache ask are both gated" {

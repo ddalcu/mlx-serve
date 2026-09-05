@@ -7059,13 +7059,16 @@ test "ModelConfig: no policy predicate hand-rolls the qwen4_exp literal" {
     // file or one line, so only reachability separates a real pass from the
     // vacuous one this replaces. Every needle below is unreachable under the
     // old `indexOf("\ntest \"")` window.
-    const files = [_]struct { src: []const u8, deep: []const u8 }{
-        // first test at line 104 of 24,129 — the window was the import block
-        .{ .src = @embedFile("server.zig"), .deep = "pub fn prefillAdmissionBill(" },
-        .{ .src = @embedFile("scheduler.zig"), .deep = "pub fn loadRequirementBytes(" },
-        .{ .src = @embedFile("generate.zig"), .deep = "pub fn sampleTokenLazy(" },
-        .{ .src = @embedFile("prefix_cache.zig"), .deep = "fn testWriteCacheLayer(" },
-        .{ .src = @embedFile("kv_disk_cache.zig"), .deep = "fn makeArange(" },
+    const files = [_]struct { src: []const u8, deep: []const u8, exempt: usize }{
+        // first test at line 104 of 24,129 — the window was the import block.
+        // Its three exemptions are `longCtxTestConfig`, `qwen4RequestTestConfig`
+        // and `qwen4ExpOomConfig`: test fixtures at column 0, production by
+        // position and test data by purpose.
+        .{ .src = @embedFile("server.zig"), .deep = "pub fn prefillAdmissionBill(", .exempt = 3 },
+        .{ .src = @embedFile("scheduler.zig"), .deep = "pub fn loadRequirementBytes(", .exempt = 0 },
+        .{ .src = @embedFile("generate.zig"), .deep = "pub fn sampleTokenLazy(", .exempt = 0 },
+        .{ .src = @embedFile("prefix_cache.zig"), .deep = "fn testWriteCacheLayer(", .exempt = 0 },
+        .{ .src = @embedFile("kv_disk_cache.zig"), .deep = "fn makeArange(", .exempt = 0 },
     };
     for (files) |f| {
         var scan = ProdLineScan{ .src = f.src };
@@ -7091,7 +7094,9 @@ test "ModelConfig: no policy predicate hand-rolls the qwen4_exp literal" {
             hits += 1;
         }
         try t.expectEqual(@as(usize, 0), hits);
-        _ = exempt;
+        // The exemption count is EXACT, so a fixture that loses its marker is
+        // caught as a hit and a fourth one that acquires it is caught here.
+        try t.expectEqual(f.exempt, exempt);
         // The scan ran, and it ran deep enough to matter.
         try t.expect(lines > 0);
         try t.expect(saw_deep);
