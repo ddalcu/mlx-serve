@@ -22,6 +22,8 @@ const sdxl_mod = @import("sdxl.zig");
 const sdxl_pipeline = @import("sdxl_pipeline.zig");
 const sdxl_unet = @import("sdxl_unet.zig");
 const sd1_pipeline = @import("sd1_pipeline.zig");
+const sd3_mod = @import("sd3.zig");
+const sd3_pipeline = @import("sd3_pipeline.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -98,7 +100,7 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "sdxl",
-    "sd1",
+    "sd1",       "sd3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -107,6 +109,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "sdxl")) return .image;
     if (std.mem.eql(u8, model_type, "sd1")) return .image;
+    if (std.mem.eql(u8, model_type, "sd3")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -178,6 +181,11 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // SDXL is the same shape — a diffusers repo whose identity lives only in
     // model_index.json. Same predicate discovery uses (`sdxl.indexDeclaresSdxl`),
     // so `list` and the loader cannot disagree about whether a dir is a model.
+    // SD 3.5 first among the diffusers shapes: it is the only one carrying a
+    // THIRD text encoder, so its predicate is the most specific of the three
+    // and an SDXL or SD 1.x engine handed one of these repos would bind a
+    // `unet/` that is not there.
+    if (isSd3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "sd3") catch null;
     if (isSdxlRepo(io, allocator, model_dir)) return allocator.dupe(u8, "sdxl") catch null;
     // SD 1.x is the same shape one level down: a diffusers repo whose
     // identity lives only in model_index.json, and the SDXL check above
@@ -217,6 +225,24 @@ fn isSdxlRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) b
 /// shape as `isSdxlRepo`, minus the single-file fallback: `sdxl_single_file`
 /// converts decode-only and has no SD 1.x key map, so a Civitai/A1111 SD 1.x
 /// checkpoint is not yet a model this server can load.
+/// True when `model_dir` is an SD 3.5 diffusers repo. Delegates to the ONE
+/// predicate (`sd3.indexDeclaresSd3`) discovery also calls — a private copy
+/// here is how `list` and the loader end up disagreeing about whether a dir is
+/// a model.
+fn isSd3Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1 << 20)) catch return false;
+        defer allocator.free(content);
+        return sd3_mod.indexDeclaresSd3(allocator, content);
+    } else |_| {}
+    return false;
+}
+
 fn isSd1Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
     defer allocator.free(path);
@@ -500,6 +526,7 @@ const ImageBackend = union(enum) {
     mage_flow: *mage_flow_mod.Engine,
     sdxl: *sdxl_pipeline.Engine,
     sd1: *sd1_pipeline.Engine,
+    sd3: *sd3_pipeline.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -601,6 +628,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .sd1 = try sd1_pipeline.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "sd3")) {
+                self.backend = .{ .sd3 = try sd3_pipeline.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -614,6 +645,7 @@ pub const ImageEngine = struct {
             .mage_flow => |m| m.deinit(),
             .sdxl => |x| x.deinit(),
             .sd1 => |x| x.deinit(),
+            .sd3 => |x| x.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -625,6 +657,7 @@ pub const ImageEngine = struct {
             .mage_flow => |m| m.s,
             .sdxl => |x| x.s,
             .sd1 => |x| x.s,
+            .sd3 => |x| x.s,
         };
     }
 
@@ -636,6 +669,7 @@ pub const ImageEngine = struct {
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
             .sdxl => 0, // SDXL taps no intermediate encoder layers
             .sd1 => 0, // same reason — no intermediate-layer taps
+            .sd3 => 0, // nor SD 3.5 — its three towers are read at the top only
         };
     }
 
@@ -649,6 +683,7 @@ pub const ImageEngine = struct {
             // converter is decode-only, so `x.vae_enc` is null there.
             .sdxl => |x| x.vae_enc != null,
             .sd1 => |x| x.vae_enc != null,
+            .sd3 => |x| x.vae_enc != null,
         };
     }
 
@@ -661,6 +696,7 @@ pub const ImageEngine = struct {
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
             .sdxl => false, // base SDXL has no instruction-edit training
             .sd1 => false, // base SD 1.x has no instruction-edit training either
+            .sd3 => false, // nor base SD 3.5
         };
     }
 
@@ -697,6 +733,10 @@ pub const ImageEngine = struct {
                 .krea => .krea2,
                 .mage_flow => .generic,
                 .sdxl => .sdxl,
+                // Same unfused stacked-LoRA grammar; the SD 3.5 ecosystem's
+                // adapters target the MMDiT rather than a UNet, so nothing here
+                // can bind yet — see `attachLora` below.
+                .sd3 => .generic,
                 // SD 1.x's UNet is an `sdxl_unet.Unet` too (same module tree,
                 // same kohya/diffusers LDM key convention, just fewer/narrower
                 // stages) — `lora.canonicalizeSdxl`'s index substitution is
@@ -716,6 +756,11 @@ pub const ImageEngine = struct {
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             .sdxl => |x| sdxl_unet.attachLora(&x.unet, &stack),
             .sd1 => |x| sdxl_unet.attachLora(&x.unet, &stack),
+            // 0 matched → `attachLora` reports the adapter as unusable rather
+            // than pretending it applied. SD 3.5 adapters target the MMDiT's
+            // joint blocks, a different module tree from the UNet convention
+            // `lora.canonicalizeSdxl` speaks, so binding them is its own change.
+            .sd3 => 0,
         };
         if (matched == 0) {
             stack.deinit();
@@ -732,6 +777,7 @@ pub const ImageEngine = struct {
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
             .sdxl => |x| sdxl_unet.detachLora(&x.unet),
+            .sd3 => {}, // no LoRA attached — MMDiT adapters are not wired yet
             .sd1 => |x| sdxl_unet.detachLora(&x.unet),
         }
         if (self.lora_stack) |*st| st.deinit();
@@ -781,6 +827,23 @@ pub const ImageEngine = struct {
                     .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
                 }, progress);
             },
+            .sd3 => |x| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
+                break :blk x.generate(prompt, .{
+                    .width = width,
+                    .height = height,
+                    // NULL rather than the resolved `steps`, so a request that
+                    // named none takes the CHECKPOINT's default — 28 on Large,
+                    // 4 on Turbo. See `sd3_pipeline.GenOpts.steps`.
+                    .steps = steps,
+                    .guidance = opts.guidance,
+                    .seed = seed,
+                    .negative_prompt = opts.negative_prompt,
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                }, progress);
+            },
             .sd1 => |x| blk: {
                 if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
                 if (opts.init_image != null and x.vae_enc == null) break :blk error.Img2ImgUnsupported;
@@ -819,6 +882,9 @@ pub const ImageEngine = struct {
             // is to 64 rather than to the 8 the latent arithmetic would allow.
             .sdxl => .{ .w = clampSdxlDim(req_w), .h = clampSdxlDim(req_h) },
             .sd1 => .{ .w = clampSd1Dim(req_w), .h = clampSd1Dim(req_h) },
+            // The VAE downsamples by 8 and the MMDiT patches by 2, so the grid
+            // is exact only on multiples of 16 — the same clamp Krea uses.
+            .sd3 => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 
@@ -832,6 +898,7 @@ pub const ImageEngine = struct {
             .krea, .mage_flow => 2048,
             .sdxl => 2048,
             .sd1 => 1536,
+            .sd3 => 2048,
         };
     }
 
@@ -5434,6 +5501,45 @@ test "media model types: discovery and modality dispatch agree" {
         try std.testing.expect(!discovery.isMediaModelType(mt));
         try std.testing.expect(modalityFromType(mt) == null);
     }
+}
+
+test "sd3: the routing side and discovery classify a repo the SAME way" {
+    // The three diffusers families reach three different engines off ONE file,
+    // and every predicate is shared between `peekModelType` (routing) and
+    // `model_discovery` (listing) precisely because two private copies drift —
+    // leaving a checkpoint the server can load but cannot see, or worse, one it
+    // lists and then binds with the wrong engine.
+    //
+    // SD 3.5 is the specific hazard: it is a diffusers repo with `vae/`,
+    // `text_encoder/` and `text_encoder_2/` just like SDXL, so an SDXL engine
+    // handed one would get all the way to binding a `unet/` that is not there.
+    // What separates them is the declared class plus the THIRD tower.
+    const a = std.testing.allocator;
+    const sd3_index =
+        \\{"_class_name":"StableDiffusion3Pipeline",
+        \\"transformer":["diffusers","SD3Transformer2DModel"],
+        \\"text_encoder":["transformers","CLIPTextModelWithProjection"],
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"],
+        \\"text_encoder_3":["transformers","T5EncoderModel"],
+        \\"vae":["diffusers","AutoencoderKL"]}
+    ;
+    const sdxl_index =
+        \\{"_class_name":"StableDiffusionXLPipeline","unet":["diffusers","UNet2DConditionModel"],
+        \\"text_encoder":["transformers","CLIPTextModel"],
+        \\"text_encoder_2":["transformers","CLIPTextModelWithProjection"],
+        \\"vae":["diffusers","AutoencoderKL"]}
+    ;
+    // Exactly one predicate claims each repo — never zero, never two.
+    try std.testing.expect(sd3_mod.indexDeclaresSd3(a, sd3_index));
+    try std.testing.expect(!sdxl_mod.indexDeclaresSdxl(a, sd3_index));
+    try std.testing.expect(!sdxl_mod.indexDeclaresSd1(a, sd3_index));
+    try std.testing.expect(!sd3_mod.indexDeclaresSd3(a, sdxl_index));
+    try std.testing.expect(sdxl_mod.indexDeclaresSdxl(a, sdxl_index));
+
+    // And "sd3" is a media image type on BOTH sides, the drift the test above
+    // this one exists to catch.
+    try std.testing.expect(discovery.isMediaModelType("sd3"));
+    try std.testing.expectEqual(Modality.image, modalityFromType("sd3").?);
 }
 
 test "stagedPeakBytes: disjoint stages never sum, and resident always carries" {

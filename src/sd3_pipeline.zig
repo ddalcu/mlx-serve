@@ -162,7 +162,7 @@ pub const Engine = struct {
         errdefer self.tok_l.deinit();
         self.tok_g = try clip_tok.load(io, allocator, model_dir, "tokenizer_2");
         errdefer self.tok_g.deinit();
-        self.tok_t5 = try t5_tok_mod.T5Tokenizer.load(io, allocator, model_dir, "tokenizer_3");
+        self.tok_t5 = try t5_tok_mod.load(io, allocator, model_dir, "tokenizer_3");
         errdefer self.tok_t5.deinit();
 
         self.tower_l = try clip.loadTower(io, allocator, s, model_dir, "text_encoder", sdxl.CLIP_L_CONFIG, clip.towerDtype());
@@ -178,10 +178,10 @@ pub const Engine = struct {
             return error.MissingTextProjection;
         }
 
-        self.t5 = try t5_mod.T5Encoder.load(io, allocator, s, model_dir, "text_encoder_3", clip.towerDtype());
+        self.t5 = try t5_mod.load(io, allocator, s, model_dir, "text_encoder_3", clip.towerDtype());
         errdefer self.t5.deinit();
 
-        self.mmdit = try mmdit_mod.Mmdit.load(io, allocator, s, model_dir, ditDtype());
+        self.mmdit = try mmdit_mod.load(io, allocator, s, model_dir, ditDtype());
         errdefer self.mmdit.deinit();
 
         // `force_upcast: true`, exactly as on SDXL — this VAE overflows fp16 on
@@ -350,7 +350,7 @@ pub const Engine = struct {
             _ = mlx.mlx_array_free(latent);
             latent = next;
 
-            if (progress) |p| p.step(@intCast(i - start_step + 1), @intCast(steps - start_step));
+            if (progress) |p| p.emit("denoise", @intCast(i - start_step + 1), @intCast(steps - start_step));
         }
 
         return self.decodeLatent(latent);
@@ -481,9 +481,11 @@ fn padChannels(x: mlx.mlx_array, width: c_int, s: S) !mlx.mlx_array {
 }
 
 fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var f = try std.fs.cwd().openFile(io, path, .{});
-    defer f.close(io);
-    return try f.readToEndAlloc(io, allocator, 1 << 20);
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    return try rs.interface.allocRemaining(allocator, .limited(1 << 20));
 }
 
 /// `scheduler/scheduler_config.json` plus the step/guidance defaults the

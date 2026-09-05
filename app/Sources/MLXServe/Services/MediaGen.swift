@@ -139,6 +139,8 @@ enum FluxVariant: String, Hashable, Codable {
     case sdxlFinetune     // A community SDXL finetune (Illustrious/Pony/NoobAI) — same backend, full guidance
     case sd1              // Stable Diffusion 1.5 — served by the sd1 backend (sdxl_unet/sdxl_vae/sdxl_clip reused at SD 1.x's own config)
     case sdTurbo          // SD-Turbo — an SD 2.1 distill, same sd1 backend + StableDiffusionPipeline shape, different (OpenCLIP-H) tower
+    case sd3              // Stable Diffusion 3.5 Large / Medium — MMDiT + three text encoders, real guidance
+    case sd3Turbo         // SD 3.5 Large Turbo — the same MMDiT distilled to 4 steps, guidance-free
 }
 
 struct ImageQualitySettings: Hashable {
@@ -192,7 +194,9 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// guidance base does, and the anime-SDXL ecosystem leans on negative
     /// prompts harder than base ever did, so withholding the field would be
     /// hiding the control those checkpoints are actually steered with.
-    var supportsNegativePrompt: Bool { variant == .sdxlBase10 || variant == .sdxlFinetune || variant == .sd1 }
+    var supportsNegativePrompt: Bool {
+        variant == .sdxlBase10 || variant == .sdxlFinetune || variant == .sd1 || variant == .sd3
+    }
 
     /// Whether this model reads a `guidance` (CFG scale) override.
     ///
@@ -687,6 +691,76 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// themselves stay defined and tested (`SdxlFinetuneCatalogTests`) so nothing
     /// about their download/load behaviour goes uncovered just because the app
     /// doesn't list them.
+    /// Stable Diffusion 3.5 Medium — MMDiT-X (its first 13 blocks carry a
+    /// second, image-only attention), 24 layers at width 1536. The smallest
+    /// complete SD 3.5 download, and still 16 GB: all three checkpoints share
+    /// the same 9.5 GB T5-XXL tower, so on this family the cheap option is a
+    /// different transformer rather than a narrower quantization.
+    static let sd35Medium = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-3.5-medium",
+        name: "Stable Diffusion 3.5 Medium (~16 GB)",
+        variant: .sd3,
+        configName: "sd3",
+        repo: "stabilityai/stable-diffusion-3.5-medium",
+        approxDownloadGB: 16,
+        approxRAMGB: 20,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 28),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 60),
+        ],
+        defaultQuality: .good,
+        description: "Stable Diffusion 3.5 Medium. A flow-matching MMDiT with three text encoders — two CLIP towers plus T5-XXL — which is what makes it far better at prompt adherence and legible text than the SDXL family. Real guidance and a negative prompt."
+    )
+
+    /// SD 3.5 Large — 38 layers at width 2432, no dual attention.
+    static let sd35Large = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-3.5-large",
+        name: "Stable Diffusion 3.5 Large (~28 GB)",
+        variant: .sd3,
+        configName: "sd3",
+        repo: "stabilityai/stable-diffusion-3.5-large",
+        approxDownloadGB: 28,
+        approxRAMGB: 36,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 28),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 60),
+        ],
+        defaultQuality: .good,
+        description: "The full 8B Stable Diffusion 3.5. The strongest prompt adherence and text rendering of any model here, and the largest — it needs a 48 GB Mac to run comfortably."
+    )
+
+    /// SD 3.5 Large Turbo — the SAME transformer, VAE, towers and declared
+    /// scheduler as Large; 4 steps at guidance 1 is the entire difference, and
+    /// the server reads it off the model dir rather than a config (the two
+    /// repos ship byte-identical configs).
+    static let sd35LargeTurbo = ImageModelPreset(
+        id: "stabilityai/stable-diffusion-3.5-large-turbo",
+        name: "SD 3.5 Large Turbo (~28 GB)",
+        variant: .sd3Turbo,
+        configName: "sd3",
+        repo: "stabilityai/stable-diffusion-3.5-large-turbo",
+        approxDownloadGB: 28,
+        approxRAMGB: 36,
+        resolutions: sdxlResolutions,
+        defaultResolution: sdxlResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 6),
+            .superQuality: .init(steps: 8),
+        ],
+        defaultQuality: .good,
+        description: "SD 3.5 Large distilled to four steps. The same 8B transformer and the same three text encoders, guidance-free — roughly seven times fewer steps than Large, at some cost in fine detail."
+    )
+
     static let all: [ImageModelPreset] = [
         .sdTurbo,                                       // 2 / 4
         .sd15,                                         // 4 / 6
@@ -697,6 +771,8 @@ struct ImageModelPreset: Identifiable, Hashable {
         .mageFlowEditTurbo8bit,                        // 10 / 11
         .flux2Klein9B_Q4,                              // 10 / 16
         .krea2Turbo,                                   // 15 / 24
+        .sd35Medium,                                   // 16 / 20
+        .sd35Large, .sd35LargeTurbo,                   // 28 / 36
     ]
 }
 
@@ -2126,6 +2202,13 @@ extension ImageModelPreset {
         // lower floor and ceiling than SDXL's, not SDXL's grid reused.
         case .sd1, .sdTurbo:
             return ResolutionGrid(alignment: 64, minDim: 256, maxDim: 1536)
+        // Mirrors the server's `.sd3 => clampKreaDim`: the VAE downsamples by 8
+        // and the MMDiT patches by 2, so the patch grid is exact only on
+        // multiples of 16. SD 3.5 trains at ~1 MP like SDXL, but unlike SDXL it
+        // is not bucket-locked — the pos-embed is centre-cropped per request
+        // rather than interpolated, so intermediate sizes stay on-distribution.
+        case .sd3, .sd3Turbo:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         }
     }
 

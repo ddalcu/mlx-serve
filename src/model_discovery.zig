@@ -18,6 +18,7 @@ const log = @import("log.zig");
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
 const sdxl = @import("sdxl.zig");
+const sd3 = @import("sd3.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -91,6 +92,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "sdxl") or
         std.mem.eql(u8, model_type, "sd1") or
+        std.mem.eql(u8, model_type, "sd3") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -149,6 +151,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // SDXL is the same shape: a diffusers repo whose identity lives only in
         // `model_index.json`. Same fallback, keyed on the declared pipeline
         // class (`sdxl.indexDeclaresSdxl`, shared with gen.peekModelType).
+        // SD 3.5 first among the diffusers shapes: it is the only family here
+        // carrying a THIRD text encoder, so its predicate is the most specific
+        // of the three (`sd3.indexDeclaresSd3`, shared with gen.peekModelType).
+        if (peekSd3Index(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "sd3") catch return .missing_or_unparseable };
         if (peekSdxlIndex(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "sdxl") catch return .missing_or_unparseable };
         // SD 1.x is the same shape one level down — same fallback, keyed on
@@ -245,6 +252,18 @@ pub fn peekSdxlIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) 
     const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
     defer allocator.free(bytes);
     return sdxl.indexDeclaresSdxl(allocator, bytes);
+}
+
+/// True when `sub/model_index.json` declares an SD 3.x pipeline. Same shape as
+/// `peekSdxlIndex`, delegating to `sd3.indexDeclaresSd3`.
+pub fn peekSd3Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    return sd3.indexDeclaresSd3(allocator, bytes);
 }
 
 /// True when `sub/model_index.json` declares an SD 1.x pipeline. Same shape

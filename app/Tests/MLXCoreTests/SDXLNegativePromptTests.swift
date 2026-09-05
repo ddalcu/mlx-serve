@@ -42,7 +42,10 @@ final class SDXLNegativePromptTests: XCTestCase {
         // anime-SDXL ecosystem steers with negative prompts more than base does.
         // So the guidance-capable set is two variants, not one. SD 1.5 runs
         // real guidance too — it is the SDXL backend's config, not a distill.
-        let guidanceCapable: Set<FluxVariant> = [.sdxlBase10, .sdxlFinetune, .sd1]
+        // SD 3.5 Large and Medium likewise run real CFG (a batch-2 forward at
+        // guidance ~4.5); only `.sd3Turbo`, the 4-step distill, is guidance-free,
+        // which is exactly the base-vs-distill split this set encodes.
+        let guidanceCapable: Set<FluxVariant> = [.sdxlBase10, .sdxlFinetune, .sd1, .sd3]
         XCTAssertFalse(ImageModelPreset.all.filter { $0.variant == .sdxlFinetune }.isEmpty,
                        "a finetune must be in the catalog or this assertion is vacuous")
         for p in ImageModelPreset.all where p.variant == .sdxlFinetune {

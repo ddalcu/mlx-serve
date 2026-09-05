@@ -512,6 +512,55 @@ extension MediaBundle {
         )
     }
 
+    /// Stable Diffusion 3.5 (Large, Large-Turbo, Medium). The same
+    /// diffusers-multifolder shape as SDXL with a THIRD text encoder, and two
+    /// selection differences that both matter:
+    ///
+    ///   * `text_encoder_3` (T5-XXL) is SHARDED. Its fp16 variant is spelled
+    ///     `model.fp16-00001-of-00002.safetensors` — the marker's separator is
+    ///     `-`, not `.` — and, more importantly, the server resolves a sharded
+    ///     dir through `model.safetensors.index.json`, which names the PLAIN
+    ///     shards. diffusers puts the fp16 shard map in a differently-named
+    ///     file we do not read, so an fp16 shard set would be skipped
+    ///     shard-for-shard and the dir would load as "no usable weights".
+    ///     `keepSafetensors` therefore takes the plain shard names here.
+    ///   * The repos also ship a 16 GB merged root checkpoint and a ComfyUI
+    ///     flat `text_encoders/` drop — a second and third copy of the same
+    ///     weights. Neither basename is in the allowlist, so neither is pulled.
+    ///
+    /// Ready markers name `transformer` rather than `unet`, and `text_encoder_3`
+    /// rather than nothing: a download missing the T5 tower is not servable, and
+    /// leaving it out of the markers would let a half-download read as complete.
+    static func sd3Diffusers(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sd3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: ["onnx/", "openvino/", "text_encoders/"],
+                        keepSafetensors: [
+                            "diffusion_pytorch_model.safetensors",
+                            "diffusion_pytorch_model-00001-of-00002.safetensors",
+                            "diffusion_pytorch_model-00002-of-00002.safetensors",
+                            "model.fp16.safetensors",
+                            "model-00001-of-00002.safetensors",
+                            "model-00002-of-00002.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "model_index.json", "transformer", "vae",
+                        "text_encoder", "text_encoder_2", "text_encoder_3",
+                        "tokenizer", "tokenizer_2", "tokenizer_3", "scheduler",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// One quant variant of a multi-variant SDXL diffusers repo — SceneWorks
     /// ships `bf16/`, `q4/` and `q8/`, each a COMPLETE diffusers SDXL. The
     /// variant is pulled with its nested weight dirs (`recursive` + `subfolder`,
@@ -627,6 +676,8 @@ extension ImageModelPreset {
             // which neither SD 1.x nor SD-Turbo ships (one tower each), so a
             // complete download would read as permanently incomplete.
             return .sd1Diffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .sd3, .sd3Turbo:
+            return .sd3Diffusers(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }

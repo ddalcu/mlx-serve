@@ -84,6 +84,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "h
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "sd1",
+    "sd3",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -120,6 +121,7 @@ enum MediaModality: CaseIterable {
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow" { self = .image; return }
+        if modelType.hasPrefix("sdxl") || modelType == "sd1" || modelType == "sd3" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
@@ -187,6 +189,9 @@ struct HFConfigMeta: Codable {
 private let servedDiffusersClasses: [String: String] = [
     "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
     "StableDiffusionXLPipeline": "sdxl",
+    // SD 3.5 (Large, Large-Turbo, Medium) all declare this one class; what
+    // separates them is the transformer's own config, which the server reads.
+    "StableDiffusion3Pipeline": "sd3",
 ]
 
 struct HFModel: Identifiable, Codable {
